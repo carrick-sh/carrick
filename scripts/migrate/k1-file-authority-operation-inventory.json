@@ -9270,7 +9270,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2267,
+      "line": 2272,
       "categories": [
         "description_guard"
       ],
@@ -9279,7 +9279,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2276,
+      "line": 2281,
       "categories": [
         "description_guard"
       ],
@@ -9288,7 +9288,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2356,
+      "line": 2361,
       "categories": [
         "description_guard"
       ],
@@ -9297,7 +9297,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2461,
+      "line": 2466,
       "categories": [
         "description_guard"
       ],
@@ -9405,7 +9405,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 512,
+      "line": 517,
       "categories": [
         "description_guard"
       ],
@@ -9414,7 +9414,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 614,
+      "line": 619,
       "categories": [
         "description_guard"
       ],
@@ -9423,7 +9423,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 724,
+      "line": 729,
       "categories": [
         "mapping"
       ],
@@ -9432,7 +9432,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 746,
+      "line": 751,
       "categories": [
         "description_guard"
       ],
@@ -9441,7 +9441,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 894,
+      "line": 899,
       "categories": [
         "description_guard"
       ],
@@ -9450,7 +9450,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 1061,
+      "line": 1066,
       "categories": [
         "description_guard"
       ],
@@ -9459,7 +9459,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 1148,
+      "line": 1153,
       "categories": [
         "stream"
       ],
@@ -9468,7 +9468,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 1282,
+      "line": 1287,
       "categories": [
         "description_guard"
       ],
@@ -9477,7 +9477,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 1472,
+      "line": 1477,
       "categories": [
         "description_guard"
       ],
@@ -16707,7 +16707,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/interposer.rs",
-      "line": 566,
+      "line": 576,
       "categories": [
         "mapping"
       ],
@@ -16716,7 +16716,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/interposer.rs",
-      "line": 568,
+      "line": 578,
       "categories": [
         "mapping"
       ],
@@ -16725,7 +16725,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/mod.rs",
-      "line": 169,
+      "line": 200,
       "categories": [
         "mapping"
       ],
@@ -16734,7 +16734,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/mod.rs",
-      "line": 457,
+      "line": 532,
       "categories": [
         "mapping"
       ],
@@ -16743,7 +16743,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/mod.rs",
-      "line": 458,
+      "line": 533,
       "categories": [
         "mapping"
       ],
@@ -16770,7 +16770,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 853,
+      "line": 859,
       "categories": [
         "mapping"
       ],
@@ -16779,7 +16779,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 855,
+      "line": 861,
       "categories": [
         "mapping"
       ],
@@ -16788,7 +16788,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 856,
+      "line": 862,
       "categories": [
         "mapping"
       ],
@@ -16797,7 +16797,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 879,
+      "line": 885,
       "categories": [
         "mapping"
       ],
@@ -16806,7 +16806,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 924,
+      "line": 930,
       "categories": [
         "mapping"
       ],
@@ -16815,7 +16815,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 926,
+      "line": 932,
       "categories": [
         "mapping"
       ],
@@ -16824,7 +16824,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 927,
+      "line": 933,
       "categories": [
         "mapping"
       ],
@@ -16833,7 +16833,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 949,
+      "line": 955,
       "categories": [
         "mapping"
       ],
@@ -16842,7 +16842,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 2414,
+      "line": 2434,
       "categories": [
         "mapping"
       ],
@@ -16851,7 +16851,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 2415,
+      "line": 2435,
       "categories": [
         "mapping"
       ],
@@ -16860,7 +16860,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 2416,
+      "line": 2436,
       "categories": [
         "mapping"
       ],
@@ -16869,7 +16869,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 2417,
+      "line": 2437,
       "categories": [
         "mapping"
       ],
@@ -16878,74 +16878,29 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3699,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mapping = PortMapping {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3705,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let spec = unnamed_bridge_spec(vec![mapping.clone()]);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3710,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".publish_port(lease.id, mapping)",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3722,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mapping = PortMapping {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3728,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let spec = unnamed_bridge_spec(vec![mapping.clone()]);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
       "line": 3731,
       "categories": [
         "mapping"
       ],
-      "text": "provider.publish_port(lease.id, mapping).expect(\"publish\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3745,
-      "categories": [
-        "mapping"
-      ],
       "text": "let mapping = PortMapping {",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3751,
+      "line": 3737,
       "categories": [
         "mapping"
       ],
       "text": "let spec = unnamed_bridge_spec(vec![mapping.clone()]);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
+      "line": 3742,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".publish_port(lease.id, mapping)",
       "scope_kind": "test_or_definition"
     },
     {
@@ -16954,21 +16909,12 @@
       "categories": [
         "mapping"
       ],
-      "text": "provider.publish_port(lease.id, mapping).expect(\"publish\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3837,
-      "categories": [
-        "mapping"
-      ],
       "text": "let mapping = PortMapping {",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3843,
+      "line": 3760,
       "categories": [
         "mapping"
       ],
@@ -16977,7 +16923,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3846,
+      "line": 3763,
       "categories": [
         "mapping"
       ],
@@ -16986,7 +16932,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3905,
+      "line": 3777,
       "categories": [
         "mapping"
       ],
@@ -16995,7 +16941,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3911,
+      "line": 3783,
       "categories": [
         "mapping"
       ],
@@ -17004,7 +16950,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3914,
+      "line": 3786,
       "categories": [
         "mapping"
       ],
@@ -17013,7 +16959,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3957,
+      "line": 3869,
       "categories": [
         "mapping"
       ],
@@ -17022,7 +16968,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3963,
+      "line": 3875,
       "categories": [
         "mapping"
       ],
@@ -17031,7 +16977,61 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3968,
+      "line": 3878,
+      "categories": [
+        "mapping"
+      ],
+      "text": "provider.publish_port(lease.id, mapping).expect(\"publish\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
+      "line": 3937,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mapping = PortMapping {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
+      "line": 3943,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let spec = unnamed_bridge_spec(vec![mapping.clone()]);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
+      "line": 3946,
+      "categories": [
+        "mapping"
+      ],
+      "text": "provider.publish_port(lease.id, mapping).expect(\"publish\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
+      "line": 3989,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mapping = PortMapping {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
+      "line": 3995,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let spec = unnamed_bridge_spec(vec![mapping.clone()]);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
+      "line": 4000,
       "categories": [
         "mapping"
       ],
@@ -17040,7 +17040,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3982,
+      "line": 4014,
       "categories": [
         "mapping"
       ],
@@ -17049,7 +17049,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3988,
+      "line": 4020,
       "categories": [
         "mapping"
       ],
@@ -17058,7 +17058,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 3991,
+      "line": 4023,
       "categories": [
         "mapping"
       ],
@@ -17067,7 +17067,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 4098,
+      "line": 4130,
       "categories": [
         "mapping"
       ],
@@ -17076,7 +17076,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 4104,
+      "line": 4136,
       "categories": [
         "mapping"
       ],
@@ -17085,7 +17085,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 4107,
+      "line": 4139,
       "categories": [
         "mapping"
       ],
@@ -17094,7 +17094,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 4216,
+      "line": 4248,
       "categories": [
         "mapping"
       ],
@@ -17103,7 +17103,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 4222,
+      "line": 4254,
       "categories": [
         "mapping"
       ],
@@ -17112,7 +17112,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 4225,
+      "line": 4257,
       "categories": [
         "mapping"
       ],
@@ -17121,7 +17121,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 4340,
+      "line": 4372,
       "categories": [
         "mapping"
       ],
@@ -17130,7 +17130,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 4349,
+      "line": 4381,
       "categories": [
         "mapping"
       ],
@@ -17139,7 +17139,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 4361,
+      "line": 4393,
       "categories": [
         "mapping"
       ],
@@ -17148,7 +17148,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 4445,
+      "line": 4477,
       "categories": [
         "mapping"
       ],
@@ -17157,7 +17157,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 4451,
+      "line": 4483,
       "categories": [
         "mapping"
       ],
@@ -17166,7 +17166,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 4454,
+      "line": 4486,
       "categories": [
         "mapping"
       ],
@@ -17175,7 +17175,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 5304,
+      "line": 5336,
       "categories": [
         "mapping"
       ],
@@ -17184,7 +17184,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 5311,
+      "line": 5343,
       "categories": [
         "mapping"
       ],
@@ -17193,7 +17193,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 5317,
+      "line": 5349,
       "categories": [
         "mapping"
       ],
@@ -17202,7 +17202,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 5737,
+      "line": 5769,
       "categories": [
         "mapping"
       ],
@@ -17211,7 +17211,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 5743,
+      "line": 5775,
       "categories": [
         "mapping"
       ],
@@ -17220,7 +17220,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 5746,
+      "line": 5778,
       "categories": [
         "mapping"
       ],

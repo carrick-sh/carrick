@@ -3162,15 +3162,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 12476,
-        "byte_start": 12458,
+        "byte_end": 12519,
+        "byte_start": 12501,
         "column": 17,
         "column_end": 35,
         "column_start": 17,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 346,
-        "line_end": 346,
-        "line_start": 346
+        "line": 347,
+        "line_end": 347,
+        "line_start": 347
       }
     },
     {
@@ -3182,15 +3182,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 55058,
-        "byte_start": 55040,
+        "byte_end": 55252,
+        "byte_start": 55234,
         "column": 5,
         "column_end": 23,
         "column_start": 5,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1402,
-        "line_end": 1402,
-        "line_start": 1402
+        "line": 1408,
+        "line_end": 1408,
+        "line_start": 1408
       }
     },
     {
@@ -3202,15 +3202,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 55210,
-        "byte_start": 55192,
+        "byte_end": 55404,
+        "byte_start": 55386,
         "column": 13,
         "column_end": 31,
         "column_start": 13,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1405,
-        "line_end": 1405,
-        "line_start": 1405
+        "line": 1411,
+        "line_end": 1411,
+        "line_start": 1411
       }
     },
     {
@@ -4541,15 +4541,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 15697,
-        "byte_start": 15685,
+        "byte_end": 15891,
+        "byte_start": 15879,
         "column": 29,
         "column_end": 41,
         "column_start": 29,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 423,
-        "line_end": 423,
-        "line_start": 423
+        "line": 429,
+        "line_end": 429,
+        "line_start": 429
       }
     },
     {
@@ -4561,15 +4561,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 15846,
-        "byte_start": 15834,
+        "byte_end": 16040,
+        "byte_start": 16028,
         "column": 35,
         "column_end": 47,
         "column_start": 35,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 427,
-        "line_end": 427,
-        "line_start": 427
+        "line": 433,
+        "line_end": 433,
+        "line_start": 433
       }
     },
     {
@@ -4581,15 +4581,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 17565,
-        "byte_start": 17553,
+        "byte_end": 17759,
+        "byte_start": 17747,
         "column": 31,
         "column_end": 43,
         "column_start": 31,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 472,
-        "line_end": 472,
-        "line_start": 472
+        "line": 478,
+        "line_end": 478,
+        "line_start": 478
       }
     },
     {
@@ -4601,15 +4601,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 48896,
-        "byte_start": 48884,
+        "byte_end": 49090,
+        "byte_start": 49078,
         "column": 23,
         "column_end": 35,
         "column_start": 23,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1264,
-        "line_end": 1264,
-        "line_start": 1264
+        "line": 1270,
+        "line_end": 1270,
+        "line_start": 1270
       }
     },
     {
@@ -4621,15 +4621,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 52425,
-        "byte_start": 52413,
+        "byte_end": 52619,
+        "byte_start": 52607,
         "column": 23,
         "column_end": 35,
         "column_start": 23,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1340,
-        "line_end": 1340,
-        "line_start": 1340
+        "line": 1346,
+        "line_end": 1346,
+        "line_start": 1346
       }
     },
     {
@@ -4641,15 +4641,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 53255,
-        "byte_start": 53243,
+        "byte_end": 53449,
+        "byte_start": 53437,
         "column": 23,
         "column_end": 35,
         "column_start": 23,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1363,
-        "line_end": 1363,
-        "line_start": 1363
+        "line": 1369,
+        "line_end": 1369,
+        "line_start": 1369
       }
     },
     {
@@ -4972,15 +4972,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 56484,
-        "byte_start": 56466,
+        "byte_end": 56678,
+        "byte_start": 56660,
         "column": 11,
         "column_end": 29,
         "column_start": 11,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1439,
-        "line_end": 1439,
-        "line_start": 1439
+        "line": 1445,
+        "line_end": 1445,
+        "line_start": 1445
       }
     },
     {
@@ -4992,15 +4992,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 75753,
-        "byte_start": 75735,
+        "byte_end": 75947,
+        "byte_start": 75929,
         "column": 15,
         "column_end": 33,
         "column_start": 15,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1908,
-        "line_end": 1908,
-        "line_start": 1908
+        "line": 1914,
+        "line_end": 1914,
+        "line_start": 1914
       }
     },
     {
@@ -5012,15 +5012,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 93901,
-        "byte_start": 93883,
+        "byte_end": 94719,
+        "byte_start": 94701,
         "column": 23,
         "column_end": 41,
         "column_start": 23,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 2348,
-        "line_end": 2348,
-        "line_start": 2348
+        "line": 2368,
+        "line_end": 2368,
+        "line_start": 2368
       }
     },
     {
@@ -5072,15 +5072,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 51857,
-        "byte_start": 51843,
+        "byte_end": 52051,
+        "byte_start": 52037,
         "column": 21,
         "column_end": 35,
         "column_start": 21,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1324,
-        "line_end": 1324,
-        "line_start": 1324
+        "line": 1330,
+        "line_end": 1330,
+        "line_start": 1330
       }
     },
     {
@@ -5092,15 +5092,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 52251,
-        "byte_start": 52237,
+        "byte_end": 52445,
+        "byte_start": 52431,
         "column": 21,
         "column_end": 35,
         "column_start": 21,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1332,
-        "line_end": 1332,
-        "line_start": 1332
+        "line": 1338,
+        "line_end": 1338,
+        "line_start": 1338
       }
     },
     {
@@ -5112,15 +5112,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 52789,
-        "byte_start": 52775,
+        "byte_end": 52983,
+        "byte_start": 52969,
         "column": 21,
         "column_end": 35,
         "column_start": 21,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1350,
-        "line_end": 1350,
-        "line_start": 1350
+        "line": 1356,
+        "line_end": 1356,
+        "line_start": 1356
       }
     },
     {
@@ -5132,15 +5132,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 53623,
-        "byte_start": 53609,
+        "byte_end": 53817,
+        "byte_start": 53803,
         "column": 21,
         "column_end": 35,
         "column_start": 21,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1373,
-        "line_end": 1373,
-        "line_start": 1373
+        "line": 1379,
+        "line_end": 1379,
+        "line_start": 1379
       }
     },
     {
@@ -5152,15 +5152,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 53750,
-        "byte_start": 53736,
+        "byte_end": 53944,
+        "byte_start": 53930,
         "column": 13,
         "column_end": 27,
         "column_start": 13,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1378,
-        "line_end": 1378,
-        "line_start": 1378
+        "line": 1384,
+        "line_end": 1384,
+        "line_start": 1384
       }
     },
     {
@@ -5885,15 +5885,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 53702,
-        "byte_start": 53687,
+        "byte_end": 53896,
+        "byte_start": 53881,
         "column": 17,
         "column_end": 32,
         "column_start": 17,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1376,
-        "line_end": 1376,
-        "line_start": 1376
+        "line": 1382,
+        "line_end": 1382,
+        "line_start": 1382
       }
     },
     {
@@ -5905,15 +5905,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 55746,
-        "byte_start": 55731,
+        "byte_end": 55940,
+        "byte_start": 55925,
         "column": 21,
         "column_end": 36,
         "column_start": 21,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1423,
-        "line_end": 1423,
-        "line_start": 1423
+        "line": 1429,
+        "line_end": 1429,
+        "line_start": 1429
       }
     },
     {
@@ -5925,15 +5925,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 56554,
-        "byte_start": 56539,
+        "byte_end": 56748,
+        "byte_start": 56733,
         "column": 47,
         "column_end": 62,
         "column_start": 47,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1440,
-        "line_end": 1440,
-        "line_start": 1440
+        "line": 1446,
+        "line_end": 1446,
+        "line_start": 1446
       }
     },
     {
@@ -5945,15 +5945,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 94422,
-        "byte_start": 94407,
+        "byte_end": 95240,
+        "byte_start": 95225,
         "column": 23,
         "column_end": 38,
         "column_start": 23,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 2359,
-        "line_end": 2359,
-        "line_start": 2359
+        "line": 2379,
+        "line_end": 2379,
+        "line_start": 2379
       }
     },
     {
@@ -6226,15 +6226,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 55647,
-        "byte_start": 55637,
+        "byte_end": 55841,
+        "byte_start": 55831,
         "column": 11,
         "column_end": 21,
         "column_start": 11,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1420,
-        "line_end": 1420,
-        "line_start": 1420
+        "line": 1426,
+        "line_end": 1426,
+        "line_start": 1426
       }
     },
     {
@@ -7298,15 +7298,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 55607,
-        "byte_start": 55598,
+        "byte_end": 55801,
+        "byte_start": 55792,
         "column": 5,
         "column_end": 14,
         "column_start": 5,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1419,
-        "line_end": 1419,
-        "line_start": 1419
+        "line": 1425,
+        "line_end": 1425,
+        "line_start": 1425
       }
     },
     {
@@ -7337,15 +7337,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 32356,
-        "byte_start": 32339,
+        "byte_end": 32550,
+        "byte_start": 32533,
         "column": 28,
         "column_end": 45,
         "column_start": 28,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 859,
-        "line_end": 859,
-        "line_start": 859
+        "line": 865,
+        "line_end": 865,
+        "line_start": 865
       }
     },
     {
@@ -7396,15 +7396,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 35258,
-        "byte_start": 35243,
+        "byte_end": 35452,
+        "byte_start": 35437,
         "column": 17,
         "column_end": 32,
         "column_start": 17,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 931,
-        "line_end": 931,
-        "line_start": 931
+        "line": 937,
+        "line_end": 937,
+        "line_start": 937
       }
     },
     {
@@ -7416,15 +7416,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 86947,
-        "byte_start": 86932,
+        "byte_end": 87141,
+        "byte_start": 87126,
         "column": 21,
         "column_end": 36,
         "column_start": 21,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 2173,
-        "line_end": 2173,
-        "line_start": 2173
+        "line": 2179,
+        "line_end": 2179,
+        "line_start": 2179
       }
     },
     {
@@ -9586,15 +9586,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 14540,
-        "byte_start": 14524,
+        "byte_end": 16781,
+        "byte_start": 16765,
         "column": 60,
         "column_end": 76,
         "column_start": 60,
         "file": "crates/carrick-runtime/src/network/mod.rs",
-        "line": 413,
-        "line_end": 413,
-        "line_start": 413
+        "line": 488,
+        "line_end": 488,
+        "line_start": 488
       }
     },
     {
@@ -9606,15 +9606,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 10727,
-        "byte_start": 10711,
+        "byte_end": 10770,
+        "byte_start": 10754,
         "column": 16,
         "column_end": 32,
         "column_start": 16,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 296,
-        "line_end": 296,
-        "line_start": 296
+        "line": 297,
+        "line_end": 297,
+        "line_start": 297
       }
     },
     {
@@ -9626,15 +9626,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 11008,
-        "byte_start": 10992,
+        "byte_end": 11051,
+        "byte_start": 11035,
         "column": 16,
         "column_end": 32,
         "column_start": 16,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 307,
-        "line_end": 307,
-        "line_start": 307
+        "line": 308,
+        "line_end": 308,
+        "line_start": 308
       }
     },
     {
@@ -9646,15 +9646,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 34751,
-        "byte_start": 34735,
+        "byte_end": 34945,
+        "byte_start": 34929,
         "column": 24,
         "column_end": 40,
         "column_start": 24,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 919,
-        "line_end": 919,
-        "line_start": 919
+        "line": 925,
+        "line_end": 925,
+        "line_start": 925
       }
     },
     {
@@ -9666,15 +9666,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 38228,
-        "byte_start": 38212,
+        "byte_end": 38422,
+        "byte_start": 38406,
         "column": 24,
         "column_end": 40,
         "column_start": 24,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1004,
-        "line_end": 1004,
-        "line_start": 1004
+        "line": 1010,
+        "line_end": 1010,
+        "line_start": 1010
       }
     },
     {
@@ -9686,15 +9686,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 48851,
-        "byte_start": 48835,
+        "byte_end": 49045,
+        "byte_start": 49029,
         "column": 20,
         "column_end": 36,
         "column_start": 20,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1263,
-        "line_end": 1263,
-        "line_start": 1263
+        "line": 1269,
+        "line_end": 1269,
+        "line_start": 1269
       }
     },
     {
@@ -9706,15 +9706,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 55533,
-        "byte_start": 55517,
+        "byte_end": 55727,
+        "byte_start": 55711,
         "column": 9,
         "column_end": 25,
         "column_start": 9,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1416,
-        "line_end": 1416,
-        "line_start": 1416
+        "line": 1422,
+        "line_end": 1422,
+        "line_start": 1422
       }
     },
     {
@@ -9726,15 +9726,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 65154,
-        "byte_start": 65138,
+        "byte_end": 65348,
+        "byte_start": 65332,
         "column": 46,
         "column_end": 62,
         "column_start": 46,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1648,
-        "line_end": 1648,
-        "line_start": 1648
+        "line": 1654,
+        "line_end": 1654,
+        "line_start": 1654
       }
     },
     {
@@ -9746,15 +9746,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 65651,
-        "byte_start": 65635,
+        "byte_end": 65845,
+        "byte_start": 65829,
         "column": 9,
         "column_end": 25,
         "column_start": 9,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1665,
-        "line_end": 1665,
-        "line_start": 1665
+        "line": 1671,
+        "line_end": 1671,
+        "line_start": 1671
       }
     },
     {
@@ -9766,15 +9766,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 66719,
-        "byte_start": 66703,
+        "byte_end": 66913,
+        "byte_start": 66897,
         "column": 30,
         "column_end": 46,
         "column_start": 30,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1685,
-        "line_end": 1685,
-        "line_start": 1685
+        "line": 1691,
+        "line_end": 1691,
+        "line_start": 1691
       }
     },
     {
@@ -9786,15 +9786,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 68564,
-        "byte_start": 68548,
+        "byte_end": 68758,
+        "byte_start": 68742,
         "column": 9,
         "column_end": 25,
         "column_start": 9,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1731,
-        "line_end": 1731,
-        "line_start": 1731
+        "line": 1737,
+        "line_end": 1737,
+        "line_start": 1737
       }
     },
     {
@@ -9806,15 +9806,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 74668,
-        "byte_start": 74652,
+        "byte_end": 74862,
+        "byte_start": 74846,
         "column": 9,
         "column_end": 25,
         "column_start": 9,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 1874,
-        "line_end": 1874,
-        "line_start": 1874
+        "line": 1880,
+        "line_end": 1880,
+        "line_start": 1880
       }
     },
     {
@@ -10410,15 +10410,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 33939,
-        "byte_start": 33919,
+        "byte_end": 34133,
+        "byte_start": 34113,
         "column": 22,
         "column_end": 42,
         "column_start": 22,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 896,
-        "line_end": 896,
-        "line_start": 896
+        "line": 902,
+        "line_end": 902,
+        "line_start": 902
       }
     },
     {
@@ -10430,15 +10430,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 37398,
-        "byte_start": 37378,
+        "byte_end": 37592,
+        "byte_start": 37572,
         "column": 22,
         "column_end": 42,
         "column_start": 22,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 980,
-        "line_end": 980,
-        "line_start": 980
+        "line": 986,
+        "line_end": 986,
+        "line_start": 986
       }
     },
     {
@@ -10450,15 +10450,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 82449,
-        "byte_start": 82429,
+        "byte_end": 82643,
+        "byte_start": 82623,
         "column": 29,
         "column_end": 49,
         "column_start": 29,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 2065,
-        "line_end": 2065,
-        "line_start": 2065
+        "line": 2071,
+        "line_end": 2071,
+        "line_start": 2071
       }
     },
     {
@@ -10922,28 +10922,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 82822,
-        "byte_start": 82809,
-        "column": 17,
-        "column_end": 30,
-        "column_start": 17,
-        "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 2073,
-        "line_end": 2073,
-        "line_start": 2073
-      }
-    },
-    {
-      "catalog_id": "HA-CATALOG-THREAD-SLEEP",
-      "expansion": null,
-      "operation": "std::thread::sleep",
-      "profiles": [
-        "macos-cli-default",
-        "macos-runtime-default"
-      ],
-      "source": {
-        "byte_end": 83012,
-        "byte_start": 82999,
+        "byte_end": 83016,
+        "byte_start": 83003,
         "column": 17,
         "column_end": 30,
         "column_start": 17,
@@ -10962,15 +10942,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 88928,
-        "byte_start": 88915,
+        "byte_end": 83206,
+        "byte_start": 83193,
         "column": 17,
         "column_end": 30,
         "column_start": 17,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 2219,
-        "line_end": 2219,
-        "line_start": 2219
+        "line": 2085,
+        "line_end": 2085,
+        "line_start": 2085
       }
     },
     {
@@ -10982,8 +10962,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 89118,
-        "byte_start": 89105,
+        "byte_end": 89122,
+        "byte_start": 89109,
         "column": 17,
         "column_end": 30,
         "column_start": 17,
@@ -10991,6 +10971,26 @@
         "line": 2225,
         "line_end": 2225,
         "line_start": 2225
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-THREAD-SLEEP",
+      "expansion": null,
+      "operation": "std::thread::sleep",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 89312,
+        "byte_start": 89299,
+        "column": 17,
+        "column_end": 30,
+        "column_start": 17,
+        "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
+        "line": 2231,
+        "line_end": 2231,
+        "line_start": 2231
       }
     },
     {
@@ -11190,15 +11190,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 85066,
-        "byte_start": 85053,
+        "byte_end": 85260,
+        "byte_start": 85247,
         "column": 16,
         "column_end": 29,
         "column_start": 16,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 2122,
-        "line_end": 2122,
-        "line_start": 2122
+        "line": 2128,
+        "line_end": 2128,
+        "line_start": 2128
       }
     },
     {
@@ -11210,15 +11210,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 85257,
-        "byte_start": 85244,
+        "byte_end": 85451,
+        "byte_start": 85438,
         "column": 17,
         "column_end": 30,
         "column_start": 17,
         "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-        "line": 2127,
-        "line_end": 2127,
-        "line_start": 2127
+        "line": 2133,
+        "line_end": 2133,
+        "line_start": 2133
       }
     },
     {
@@ -11546,9 +11546,9 @@
       }
     }
   ],
-  "rows_sha256": "77673e391f658ca2d24483aa2146c6e8b3f9a1d869673902d16eb93dacb00c58",
+  "rows_sha256": "6803e3697a7894417726059c609c2818ef702e52ddca9da4f26724f2d1bf8213",
   "schema": 1,
-  "source_head": "5bb21d0eaab797ac02c1964ca338cded1611dcee",
+  "source_head": "762104fcaeb7122f40335a1309d9ba28561cf4f9",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",

@@ -4171,18 +4171,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:346 in `rooted_at`, `std::fs::create_dir_all` accesses only the authenticated socket-namespace endpoint registry used by `rooted_at`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:347 in `rooted_at`, `std::fs::create_dir_all` accesses only the authenticated socket-namespace endpoint registry used by `rooted_at`.",
     "review_id": "HA-000182",
     "source": {
-      "byte_end": 12476,
-      "byte_start": 12458,
+      "byte_end": 12519,
+      "byte_start": 12501,
       "column": 17,
       "column_end": 35,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 346,
-      "line_end": 346,
-      "line_start": 346
+      "line": 347,
+      "line_end": 347,
+      "line_start": 347
     }
   },
   {
@@ -4198,18 +4198,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1402 in `write_record`, `std::fs::create_dir_all` accesses only the authenticated socket-namespace endpoint registry used by `write_record`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1408 in `write_record`, `std::fs::create_dir_all` accesses only the authenticated socket-namespace endpoint registry used by `write_record`.",
     "review_id": "HA-000183",
     "source": {
-      "byte_end": 55058,
-      "byte_start": 55040,
+      "byte_end": 55252,
+      "byte_start": 55234,
       "column": 5,
       "column_end": 23,
       "column_start": 5,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1402,
-      "line_end": 1402,
-      "line_start": 1402
+      "line": 1408,
+      "line_end": 1408,
+      "line_start": 1408
     }
   },
   {
@@ -4225,18 +4225,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1405 in `write_record`, `std::fs::create_dir_all` accesses only the authenticated socket-namespace endpoint registry used by `write_record`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1411 in `write_record`, `std::fs::create_dir_all` accesses only the authenticated socket-namespace endpoint registry used by `write_record`.",
     "review_id": "HA-000184",
     "source": {
-      "byte_end": 55210,
-      "byte_start": 55192,
+      "byte_end": 55404,
+      "byte_start": 55386,
       "column": 13,
       "column_end": 31,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1405,
-      "line_end": 1405,
-      "line_start": 1405
+      "line": 1411,
+      "line_end": 1411,
+      "line_start": 1411
     }
   },
   {
@@ -6040,18 +6040,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:423 in `service_hosts_entries`, `std::fs::read_dir` accesses only the authenticated socket-namespace endpoint registry used by `service_hosts_entries`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:429 in `service_hosts_entries`, `std::fs::read_dir` accesses only the authenticated socket-namespace endpoint registry used by `service_hosts_entries`.",
     "review_id": "HA-000263",
     "source": {
-      "byte_end": 15697,
-      "byte_start": 15685,
+      "byte_end": 15891,
+      "byte_start": 15879,
       "column": 29,
       "column_end": 41,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 423,
-      "line_end": 423,
-      "line_start": 423
+      "line": 429,
+      "line_end": 429,
+      "line_start": 429
     }
   },
   {
@@ -6067,18 +6067,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:427 in `service_hosts_entries`, `std::fs::read_dir` accesses only the authenticated socket-namespace endpoint registry used by `service_hosts_entries`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:433 in `service_hosts_entries`, `std::fs::read_dir` accesses only the authenticated socket-namespace endpoint registry used by `service_hosts_entries`.",
     "review_id": "HA-000264",
     "source": {
-      "byte_end": 15846,
-      "byte_start": 15834,
+      "byte_end": 16040,
+      "byte_start": 16028,
       "column": 35,
       "column_end": 47,
       "column_start": 35,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 427,
-      "line_end": 427,
-      "line_start": 427
+      "line": 433,
+      "line_end": 433,
+      "line_start": 433
     }
   },
   {
@@ -6094,18 +6094,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:472 in `resolve_service_name`, `std::fs::read_dir` accesses only the authenticated socket-namespace endpoint registry used by `resolve_service_name`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:478 in `resolve_service_name`, `std::fs::read_dir` accesses only the authenticated socket-namespace endpoint registry used by `resolve_service_name`.",
     "review_id": "HA-000265",
     "source": {
-      "byte_end": 17565,
-      "byte_start": 17553,
+      "byte_end": 17759,
+      "byte_start": 17747,
       "column": 31,
       "column_end": 43,
       "column_start": 31,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 472,
-      "line_end": 472,
-      "line_start": 472
+      "line": 478,
+      "line_end": 478,
+      "line_start": 478
     }
   },
   {
@@ -6121,18 +6121,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1264 in `reclaim_stale_endpoint_records`, `std::fs::read_dir` accesses only the authenticated socket-namespace endpoint registry used by `reclaim_stale_endpoint_records`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1270 in `reclaim_stale_endpoint_records`, `std::fs::read_dir` accesses only the authenticated socket-namespace endpoint registry used by `reclaim_stale_endpoint_records`.",
     "review_id": "HA-000266",
     "source": {
-      "byte_end": 48896,
-      "byte_start": 48884,
+      "byte_end": 49090,
+      "byte_start": 49078,
       "column": 23,
       "column_end": 35,
       "column_start": 23,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1264,
-      "line_end": 1264,
-      "line_start": 1264
+      "line": 1270,
+      "line_end": 1270,
+      "line_start": 1270
     }
   },
   {
@@ -6148,18 +6148,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1340 in `reclaim_records_under`, `std::fs::read_dir` accesses only the authenticated socket-namespace endpoint registry used by `reclaim_records_under`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1346 in `reclaim_records_under`, `std::fs::read_dir` accesses only the authenticated socket-namespace endpoint registry used by `reclaim_records_under`.",
     "review_id": "HA-000267",
     "source": {
-      "byte_end": 52425,
-      "byte_start": 52413,
+      "byte_end": 52619,
+      "byte_start": 52607,
       "column": 23,
       "column_end": 35,
       "column_start": 23,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1340,
-      "line_end": 1340,
-      "line_start": 1340
+      "line": 1346,
+      "line_end": 1346,
+      "line_start": 1346
     }
   },
   {
@@ -6175,18 +6175,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1363 in `remove_tree_within_budget`, `std::fs::read_dir` accesses only the authenticated socket-namespace endpoint registry used by `remove_tree_within_budget`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1369 in `remove_tree_within_budget`, `std::fs::read_dir` accesses only the authenticated socket-namespace endpoint registry used by `remove_tree_within_budget`.",
     "review_id": "HA-000268",
     "source": {
-      "byte_end": 53255,
-      "byte_start": 53243,
+      "byte_end": 53449,
+      "byte_start": 53437,
       "column": 23,
       "column_end": 35,
       "column_start": 23,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1363,
-      "line_end": 1363,
-      "line_start": 1363
+      "line": 1369,
+      "line_end": 1369,
+      "line_start": 1369
     }
   },
   {
@@ -6625,18 +6625,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1439 in `remove_record_if_unchanged`, `std::fs::read_to_string` accesses only the authenticated socket-namespace endpoint registry used by `remove_record_if_unchanged`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1445 in `remove_record_if_unchanged`, `std::fs::read_to_string` accesses only the authenticated socket-namespace endpoint registry used by `remove_record_if_unchanged`.",
     "review_id": "HA-000297",
     "source": {
-      "byte_end": 56484,
-      "byte_start": 56466,
+      "byte_end": 56678,
+      "byte_start": 56660,
       "column": 11,
       "column_end": 29,
       "column_start": 11,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1439,
-      "line_end": 1439,
-      "line_start": 1439
+      "line": 1445,
+      "line_end": 1445,
+      "line_start": 1445
     }
   },
   {
@@ -6652,18 +6652,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1908 in `read_namespace_file`, `std::fs::read_to_string` accesses only the authenticated socket-namespace endpoint registry used by `read_namespace_file`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1914 in `read_namespace_file`, `std::fs::read_to_string` accesses only the authenticated socket-namespace endpoint registry used by `read_namespace_file`.",
     "review_id": "HA-000298",
     "source": {
-      "byte_end": 75753,
-      "byte_start": 75735,
+      "byte_end": 75947,
+      "byte_start": 75929,
       "column": 15,
       "column_end": 33,
       "column_start": 15,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1908,
-      "line_end": 1908,
-      "line_start": 1908
+      "line": 1914,
+      "line_end": 1914,
+      "line_start": 1914
     }
   },
   {
@@ -6679,18 +6679,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2348 in `destroy_namespace`, `std::fs::read_to_string` accesses only the authenticated socket-namespace endpoint registry used by `destroy_namespace`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2368 in `destroy_namespace`, `std::fs::read_to_string` accesses only the authenticated socket-namespace endpoint registry used by `destroy_namespace`.",
     "review_id": "HA-000299",
     "source": {
-      "byte_end": 93901,
-      "byte_start": 93883,
+      "byte_end": 94719,
+      "byte_start": 94701,
       "column": 23,
       "column_end": 41,
       "column_start": 23,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 2348,
-      "line_end": 2348,
-      "line_start": 2348
+      "line": 2368,
+      "line_end": 2368,
+      "line_start": 2368
     }
   },
   {
@@ -6760,18 +6760,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1324 in `reclaim_stale_endpoint_records`, `std::fs::remove_dir` accesses only the authenticated socket-namespace endpoint registry used by `reclaim_stale_endpoint_records`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1330 in `reclaim_stale_endpoint_records`, `std::fs::remove_dir` accesses only the authenticated socket-namespace endpoint registry used by `reclaim_stale_endpoint_records`.",
     "review_id": "HA-000302",
     "source": {
-      "byte_end": 51857,
-      "byte_start": 51843,
+      "byte_end": 52051,
+      "byte_start": 52037,
       "column": 21,
       "column_end": 35,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1324,
-      "line_end": 1324,
-      "line_start": 1324
+      "line": 1330,
+      "line_end": 1330,
+      "line_start": 1330
     }
   },
   {
@@ -6787,18 +6787,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1332 in `reclaim_stale_endpoint_records`, `std::fs::remove_dir` accesses only the authenticated socket-namespace endpoint registry used by `reclaim_stale_endpoint_records`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1338 in `reclaim_stale_endpoint_records`, `std::fs::remove_dir` accesses only the authenticated socket-namespace endpoint registry used by `reclaim_stale_endpoint_records`.",
     "review_id": "HA-000303",
     "source": {
-      "byte_end": 52251,
-      "byte_start": 52237,
+      "byte_end": 52445,
+      "byte_start": 52431,
       "column": 21,
       "column_end": 35,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1332,
-      "line_end": 1332,
-      "line_start": 1332
+      "line": 1338,
+      "line_end": 1338,
+      "line_start": 1338
     }
   },
   {
@@ -6814,18 +6814,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1350 in `reclaim_records_under`, `std::fs::remove_dir` accesses only the authenticated socket-namespace endpoint registry used by `reclaim_records_under`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1356 in `reclaim_records_under`, `std::fs::remove_dir` accesses only the authenticated socket-namespace endpoint registry used by `reclaim_records_under`.",
     "review_id": "HA-000304",
     "source": {
-      "byte_end": 52789,
-      "byte_start": 52775,
+      "byte_end": 52983,
+      "byte_start": 52969,
       "column": 21,
       "column_end": 35,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1350,
-      "line_end": 1350,
-      "line_start": 1350
+      "line": 1356,
+      "line_end": 1356,
+      "line_start": 1356
     }
   },
   {
@@ -6841,18 +6841,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1373 in `remove_tree_within_budget`, `std::fs::remove_dir` accesses only the authenticated socket-namespace endpoint registry used by `remove_tree_within_budget`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1379 in `remove_tree_within_budget`, `std::fs::remove_dir` accesses only the authenticated socket-namespace endpoint registry used by `remove_tree_within_budget`.",
     "review_id": "HA-000305",
     "source": {
-      "byte_end": 53623,
-      "byte_start": 53609,
+      "byte_end": 53817,
+      "byte_start": 53803,
       "column": 21,
       "column_end": 35,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1373,
-      "line_end": 1373,
-      "line_start": 1373
+      "line": 1379,
+      "line_end": 1379,
+      "line_start": 1379
     }
   },
   {
@@ -6868,18 +6868,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1378 in `remove_tree_within_budget`, `std::fs::remove_dir` accesses only the authenticated socket-namespace endpoint registry used by `remove_tree_within_budget`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1384 in `remove_tree_within_budget`, `std::fs::remove_dir` accesses only the authenticated socket-namespace endpoint registry used by `remove_tree_within_budget`.",
     "review_id": "HA-000306",
     "source": {
-      "byte_end": 53750,
-      "byte_start": 53736,
+      "byte_end": 53944,
+      "byte_start": 53930,
       "column": 13,
       "column_end": 27,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1378,
-      "line_end": 1378,
-      "line_start": 1378
+      "line": 1384,
+      "line_end": 1384,
+      "line_start": 1384
     }
   },
   {
@@ -7860,18 +7860,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1376 in `remove_tree_within_budget`, `std::fs::remove_file` accesses only the authenticated socket-namespace endpoint registry used by `remove_tree_within_budget`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1382 in `remove_tree_within_budget`, `std::fs::remove_file` accesses only the authenticated socket-namespace endpoint registry used by `remove_tree_within_budget`.",
     "review_id": "HA-000343",
     "source": {
-      "byte_end": 53702,
-      "byte_start": 53687,
+      "byte_end": 53896,
+      "byte_start": 53881,
       "column": 17,
       "column_end": 32,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1376,
-      "line_end": 1376,
-      "line_start": 1376
+      "line": 1382,
+      "line_end": 1382,
+      "line_start": 1382
     }
   },
   {
@@ -7887,18 +7887,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1423 in `write_record_once`, `std::fs::remove_file` accesses only the authenticated socket-namespace endpoint registry used by `write_record_once`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1429 in `write_record_once`, `std::fs::remove_file` accesses only the authenticated socket-namespace endpoint registry used by `write_record_once`.",
     "review_id": "HA-000344",
     "source": {
-      "byte_end": 55746,
-      "byte_start": 55731,
+      "byte_end": 55940,
+      "byte_start": 55925,
       "column": 21,
       "column_end": 36,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1423,
-      "line_end": 1423,
-      "line_start": 1423
+      "line": 1429,
+      "line_end": 1429,
+      "line_start": 1429
     }
   },
   {
@@ -7914,18 +7914,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1440 in `remove_record_if_unchanged`, `std::fs::remove_file` accesses only the authenticated socket-namespace endpoint registry used by `remove_record_if_unchanged`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1446 in `remove_record_if_unchanged`, `std::fs::remove_file` accesses only the authenticated socket-namespace endpoint registry used by `remove_record_if_unchanged`.",
     "review_id": "HA-000345",
     "source": {
-      "byte_end": 56554,
-      "byte_start": 56539,
+      "byte_end": 56748,
+      "byte_start": 56733,
       "column": 47,
       "column_end": 62,
       "column_start": 47,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1440,
-      "line_end": 1440,
-      "line_start": 1440
+      "line": 1446,
+      "line_end": 1446,
+      "line_start": 1446
     }
   },
   {
@@ -7941,18 +7941,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2359 in `destroy_namespace`, `std::fs::remove_file` accesses only the authenticated socket-namespace endpoint registry used by `destroy_namespace`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2379 in `destroy_namespace`, `std::fs::remove_file` accesses only the authenticated socket-namespace endpoint registry used by `destroy_namespace`.",
     "review_id": "HA-000346",
     "source": {
-      "byte_end": 94422,
-      "byte_start": 94407,
+      "byte_end": 95240,
+      "byte_start": 95225,
       "column": 23,
       "column_end": 38,
       "column_start": 23,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 2359,
-      "line_end": 2359,
-      "line_start": 2359
+      "line": 2379,
+      "line_end": 2379,
+      "line_start": 2379
     }
   },
   {
@@ -8320,18 +8320,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1420 in `write_record_once`, `std::fs::rename` accesses only the authenticated socket-namespace endpoint registry used by `write_record_once`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1426 in `write_record_once`, `std::fs::rename` accesses only the authenticated socket-namespace endpoint registry used by `write_record_once`.",
     "review_id": "HA-000360",
     "source": {
-      "byte_end": 55647,
-      "byte_start": 55637,
+      "byte_end": 55841,
+      "byte_start": 55831,
       "column": 11,
       "column_end": 21,
       "column_start": 11,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1420,
-      "line_end": 1420,
-      "line_start": 1420
+      "line": 1426,
+      "line_end": 1426,
+      "line_start": 1426
     }
   },
   {
@@ -9770,18 +9770,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1419 in `write_record_once`, `std::fs::write` accesses only the authenticated socket-namespace endpoint registry used by `write_record_once`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1425 in `write_record_once`, `std::fs::write` accesses only the authenticated socket-namespace endpoint registry used by `write_record_once`.",
     "review_id": "HA-000418",
     "source": {
-      "byte_end": 55607,
-      "byte_start": 55598,
+      "byte_end": 55801,
+      "byte_start": 55792,
       "column": 5,
       "column_end": 14,
       "column_start": 5,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1419,
-      "line_end": 1419,
-      "line_start": 1419
+      "line": 1425,
+      "line_end": 1425,
+      "line_start": 1425
     }
   },
   {
@@ -9823,18 +9823,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:859 in `publish_tcp`, `std::net::TcpListener::bind` accesses only the authenticated socket-namespace endpoint registry used by `publish_tcp`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:865 in `publish_tcp`, `std::net::TcpListener::bind` accesses only the authenticated socket-namespace endpoint registry used by `publish_tcp`.",
     "review_id": "HA-000420",
     "source": {
-      "byte_end": 32356,
-      "byte_start": 32339,
+      "byte_end": 32550,
+      "byte_start": 32533,
       "column": 28,
       "column_end": 45,
       "column_start": 28,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 859,
-      "line_end": 859,
-      "line_start": 859
+      "line": 865,
+      "line_end": 865,
+      "line_start": 865
     }
   },
   {
@@ -9903,18 +9903,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:931 in `publish_udp`, `std::net::UdpSocket::bind` accesses only the authenticated socket-namespace endpoint registry used by `publish_udp`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:937 in `publish_udp`, `std::net::UdpSocket::bind` accesses only the authenticated socket-namespace endpoint registry used by `publish_udp`.",
     "review_id": "HA-000423",
     "source": {
-      "byte_end": 35258,
-      "byte_start": 35243,
+      "byte_end": 35452,
+      "byte_start": 35437,
       "column": 17,
       "column_end": 32,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 931,
-      "line_end": 931,
-      "line_start": 931
+      "line": 937,
+      "line_end": 937,
+      "line_start": 937
     }
   },
   {
@@ -9930,18 +9930,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2173 in `published_udp_loop`, `std::net::UdpSocket::bind` accesses only the authenticated socket-namespace endpoint registry used by `published_udp_loop`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2179 in `published_udp_loop`, `std::net::UdpSocket::bind` accesses only the authenticated socket-namespace endpoint registry used by `published_udp_loop`.",
     "review_id": "HA-000424",
     "source": {
-      "byte_end": 86947,
-      "byte_start": 86932,
+      "byte_end": 87141,
+      "byte_start": 87126,
       "column": 21,
       "column_end": 36,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 2173,
-      "line_end": 2173,
-      "line_start": 2173
+      "line": 2179,
+      "line_end": 2179,
+      "line_start": 2179
     }
   },
   {
@@ -12849,18 +12849,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/mod.rs:413 in `instance_scoped_spec`, `std::process::id` accesses only the authenticated network-namespace backing identity used by `instance_scoped_spec`.",
+    "rationale": "At crates/carrick-runtime/src/network/mod.rs:488 in `instance_scoped_spec`, `std::process::id` accesses only the authenticated network-namespace backing identity used by `instance_scoped_spec`.",
     "review_id": "HA-000538",
     "source": {
-      "byte_end": 14540,
-      "byte_start": 14524,
+      "byte_end": 16781,
+      "byte_start": 16765,
       "column": 60,
       "column_end": 76,
       "column_start": 60,
       "file": "crates/carrick-runtime/src/network/mod.rs",
-      "line": 413,
-      "line_end": 413,
-      "line_start": 413
+      "line": 488,
+      "line_end": 488,
+      "line_start": 488
     }
   },
   {
@@ -12876,18 +12876,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:296 in `drop`, `std::process::id` acts only on the published-port relay helper owned by the current carrier used by `drop`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:297 in `drop`, `std::process::id` acts only on the published-port relay helper owned by the current carrier used by `drop`; no guest identity selects its host target.",
     "review_id": "HA-000539",
     "source": {
-      "byte_end": 10727,
-      "byte_start": 10711,
+      "byte_end": 10770,
+      "byte_start": 10754,
       "column": 16,
       "column_end": 32,
       "column_start": 16,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 296,
-      "line_end": 296,
-      "line_start": 296
+      "line": 297,
+      "line_end": 297,
+      "line_start": 297
     }
   },
   {
@@ -12903,18 +12903,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:307 in `drop`, `std::process::id` acts only on the published-port relay helper owned by the current carrier used by `drop`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:308 in `drop`, `std::process::id` acts only on the published-port relay helper owned by the current carrier used by `drop`; no guest identity selects its host target.",
     "review_id": "HA-000540",
     "source": {
-      "byte_end": 11008,
-      "byte_start": 10992,
+      "byte_end": 11051,
+      "byte_start": 11035,
       "column": 16,
       "column_end": 32,
       "column_start": 16,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 307,
-      "line_end": 307,
-      "line_start": 307
+      "line": 308,
+      "line_end": 308,
+      "line_start": 308
     }
   },
   {
@@ -12930,18 +12930,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:919 in `publish_tcp`, `std::process::id` acts only on the published-port relay helper owned by the current carrier used by `publish_tcp`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:925 in `publish_tcp`, `std::process::id` acts only on the published-port relay helper owned by the current carrier used by `publish_tcp`; no guest identity selects its host target.",
     "review_id": "HA-000541",
     "source": {
-      "byte_end": 34751,
-      "byte_start": 34735,
+      "byte_end": 34945,
+      "byte_start": 34929,
       "column": 24,
       "column_end": 40,
       "column_start": 24,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 919,
-      "line_end": 919,
-      "line_start": 919
+      "line": 925,
+      "line_end": 925,
+      "line_start": 925
     }
   },
   {
@@ -12957,18 +12957,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1004 in `publish_udp`, `std::process::id` acts only on the published-port relay helper owned by the current carrier used by `publish_udp`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1010 in `publish_udp`, `std::process::id` acts only on the published-port relay helper owned by the current carrier used by `publish_udp`; no guest identity selects its host target.",
     "review_id": "HA-000542",
     "source": {
-      "byte_end": 38228,
-      "byte_start": 38212,
+      "byte_end": 38422,
+      "byte_start": 38406,
       "column": 24,
       "column_end": 40,
       "column_start": 24,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1004,
-      "line_end": 1004,
-      "line_start": 1004
+      "line": 1010,
+      "line_end": 1010,
+      "line_start": 1010
     }
   },
   {
@@ -12984,18 +12984,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1263 in `reclaim_stale_endpoint_records`, the host result from `std::process::id` determines the guest socket-namespace record reclamation result used by `reclaim_stale_endpoint_records`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1269 in `reclaim_stale_endpoint_records`, the host result from `std::process::id` determines the guest socket-namespace record reclamation result used by `reclaim_stale_endpoint_records`.",
     "review_id": "HA-000543",
     "source": {
-      "byte_end": 48851,
-      "byte_start": 48835,
+      "byte_end": 49045,
+      "byte_start": 49029,
       "column": 20,
       "column_end": 36,
       "column_start": 20,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1263,
-      "line_end": 1263,
-      "line_start": 1263
+      "line": 1269,
+      "line_end": 1269,
+      "line_start": 1269
     }
   },
   {
@@ -13011,18 +13011,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1416 in `write_record_once`, `std::process::id` accesses only the authenticated socket-namespace endpoint record used by `write_record_once`.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1422 in `write_record_once`, `std::process::id` accesses only the authenticated socket-namespace endpoint record used by `write_record_once`.",
     "review_id": "HA-000544",
     "source": {
-      "byte_end": 55533,
-      "byte_start": 55517,
+      "byte_end": 55727,
+      "byte_start": 55711,
       "column": 9,
       "column_end": 25,
       "column_start": 9,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1416,
-      "line_end": 1416,
-      "line_start": 1416
+      "line": 1422,
+      "line_end": 1422,
+      "line_start": 1422
     }
   },
   {
@@ -13038,18 +13038,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1648 in `encode_service_name`, the host result from `std::process::id` determines the guest service-name record liveness keyed by its encoded host PID.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1654 in `encode_service_name`, the host result from `std::process::id` determines the guest service-name record liveness keyed by its encoded host PID.",
     "review_id": "HA-000545",
     "source": {
-      "byte_end": 65154,
-      "byte_start": 65138,
+      "byte_end": 65348,
+      "byte_start": 65332,
       "column": 46,
       "column_end": 62,
       "column_start": 46,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1648,
-      "line_end": 1648,
-      "line_start": 1648
+      "line": 1654,
+      "line_end": 1654,
+      "line_start": 1654
     }
   },
   {
@@ -13065,18 +13065,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1665 in `encode_listener_reservation`, the host result from `std::process::id` determines the guest listener-reservation liveness keyed by its encoded host PID.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1671 in `encode_listener_reservation`, the host result from `std::process::id` determines the guest listener-reservation liveness keyed by its encoded host PID.",
     "review_id": "HA-000546",
     "source": {
-      "byte_end": 65651,
-      "byte_start": 65635,
+      "byte_end": 65845,
+      "byte_start": 65829,
       "column": 9,
       "column_end": 25,
       "column_start": 9,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1665,
-      "line_end": 1665,
-      "line_start": 1665
+      "line": 1671,
+      "line_end": 1671,
+      "line_start": 1671
     }
   },
   {
@@ -13092,18 +13092,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1685 in `instance_id`, `std::process::id` acts only on the diagnostic instance identity for socket-namespace provenance; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1691 in `instance_id`, `std::process::id` acts only on the diagnostic instance identity for socket-namespace provenance; no guest identity selects its host target.",
     "review_id": "HA-000547",
     "source": {
-      "byte_end": 66719,
-      "byte_start": 66703,
+      "byte_end": 66913,
+      "byte_start": 66897,
       "column": 30,
       "column_end": 46,
       "column_start": 30,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1685,
-      "line_end": 1685,
-      "line_start": 1685
+      "line": 1691,
+      "line_end": 1691,
+      "line_start": 1691
     }
   },
   {
@@ -13119,18 +13119,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1731 in `encode_endpoint_record`, the host result from `std::process::id` determines the guest endpoint-record liveness keyed by its encoded host PID.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1737 in `encode_endpoint_record`, the host result from `std::process::id` determines the guest endpoint-record liveness keyed by its encoded host PID.",
     "review_id": "HA-000548",
     "source": {
-      "byte_end": 68564,
-      "byte_start": 68548,
+      "byte_end": 68758,
+      "byte_start": 68742,
       "column": 9,
       "column_end": 25,
       "column_start": 9,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1731,
-      "line_end": 1731,
-      "line_start": 1731
+      "line": 1737,
+      "line_end": 1737,
+      "line_start": 1737
     }
   },
   {
@@ -13146,18 +13146,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1874 in `warn_rejected_record`, `std::process::id` acts only on the NSREJECT diagnostic event carrier PID; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:1880 in `warn_rejected_record`, `std::process::id` acts only on the NSREJECT diagnostic event carrier PID; no guest identity selects its host target.",
     "review_id": "HA-000549",
     "source": {
-      "byte_end": 74668,
-      "byte_start": 74652,
+      "byte_end": 74862,
+      "byte_start": 74846,
       "column": 9,
       "column_end": 25,
       "column_start": 9,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 1874,
-      "line_end": 1874,
-      "line_start": 1874
+      "line": 1880,
+      "line_end": 1880,
+      "line_start": 1880
     }
   },
   {
@@ -13960,18 +13960,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:896 in `publish_tcp`, `std::thread::Builder::new` acts only on the published-port relay helper owned by the current carrier used by `publish_tcp`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:902 in `publish_tcp`, `std::thread::Builder::new` acts only on the published-port relay helper owned by the current carrier used by `publish_tcp`; no guest identity selects its host target.",
     "review_id": "HA-000583",
     "source": {
-      "byte_end": 33939,
-      "byte_start": 33919,
+      "byte_end": 34133,
+      "byte_start": 34113,
       "column": 22,
       "column_end": 42,
       "column_start": 22,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 896,
-      "line_end": 896,
-      "line_start": 896
+      "line": 902,
+      "line_end": 902,
+      "line_start": 902
     }
   },
   {
@@ -13987,18 +13987,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:980 in `publish_udp`, `std::thread::Builder::new` acts only on the published-port relay helper owned by the current carrier used by `publish_udp`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:986 in `publish_udp`, `std::thread::Builder::new` acts only on the published-port relay helper owned by the current carrier used by `publish_udp`; no guest identity selects its host target.",
     "review_id": "HA-000584",
     "source": {
-      "byte_end": 37398,
-      "byte_start": 37378,
+      "byte_end": 37592,
+      "byte_start": 37572,
       "column": 22,
       "column_end": 42,
       "column_start": 22,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 980,
-      "line_end": 980,
-      "line_start": 980
+      "line": 986,
+      "line_end": 986,
+      "line_start": 986
     }
   },
   {
@@ -14014,18 +14014,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2065 in `published_tcp_accept_loop`, `std::thread::Builder::new` acts only on the published-port relay helper owned by the current carrier used by `published_tcp_accept_loop`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2071 in `published_tcp_accept_loop`, `std::thread::Builder::new` acts only on the published-port relay helper owned by the current carrier used by `published_tcp_accept_loop`; no guest identity selects its host target.",
     "review_id": "HA-000585",
     "source": {
-      "byte_end": 82449,
-      "byte_start": 82429,
+      "byte_end": 82643,
+      "byte_start": 82623,
       "column": 29,
       "column_end": 49,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 2065,
-      "line_end": 2065,
-      "line_start": 2065
+      "line": 2071,
+      "line_end": 2071,
+      "line_start": 2071
     }
   },
   {
@@ -14654,18 +14654,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2073 in `published_tcp_accept_loop`, `std::thread::sleep` acts only on the published-port relay helper owned by the current carrier used by `published_tcp_accept_loop`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2079 in `published_tcp_accept_loop`, `std::thread::sleep` acts only on the published-port relay helper owned by the current carrier used by `published_tcp_accept_loop`; no guest identity selects its host target.",
     "review_id": "HA-000609",
     "source": {
-      "byte_end": 82822,
-      "byte_start": 82809,
+      "byte_end": 83016,
+      "byte_start": 83003,
       "column": 17,
       "column_end": 30,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 2073,
-      "line_end": 2073,
-      "line_start": 2073
+      "line": 2079,
+      "line_end": 2079,
+      "line_start": 2079
     }
   },
   {
@@ -14681,45 +14681,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2079 in `published_tcp_accept_loop`, `std::thread::sleep` acts only on the published-port relay helper owned by the current carrier used by `published_tcp_accept_loop`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2085 in `published_tcp_accept_loop`, `std::thread::sleep` acts only on the published-port relay helper owned by the current carrier used by `published_tcp_accept_loop`; no guest identity selects its host target.",
     "review_id": "HA-000610",
     "source": {
-      "byte_end": 83012,
-      "byte_start": 82999,
+      "byte_end": 83206,
+      "byte_start": 83193,
       "column": 17,
       "column_end": 30,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 2079,
-      "line_end": 2079,
-      "line_start": 2079
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-THREAD-SLEEP",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
-      "resource": "published-port relay helper owned by the current carrier used by `published_udp_loop`"
-    },
-    "expansion": null,
-    "operation": "std::thread::sleep",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2219 in `published_udp_loop`, `std::thread::sleep` acts only on the published-port relay helper owned by the current carrier used by `published_udp_loop`; no guest identity selects its host target.",
-    "review_id": "HA-000611",
-    "source": {
-      "byte_end": 88928,
-      "byte_start": 88915,
-      "column": 17,
-      "column_end": 30,
-      "column_start": 17,
-      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 2219,
-      "line_end": 2219,
-      "line_start": 2219
+      "line": 2085,
+      "line_end": 2085,
+      "line_start": 2085
     }
   },
   {
@@ -14736,10 +14709,10 @@
       "macos-runtime-default"
     ],
     "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2225 in `published_udp_loop`, `std::thread::sleep` acts only on the published-port relay helper owned by the current carrier used by `published_udp_loop`; no guest identity selects its host target.",
-    "review_id": "HA-000612",
+    "review_id": "HA-000611",
     "source": {
-      "byte_end": 89118,
-      "byte_start": 89105,
+      "byte_end": 89122,
+      "byte_start": 89109,
       "column": 17,
       "column_end": 30,
       "column_start": 17,
@@ -14747,6 +14720,33 @@
       "line": 2225,
       "line_end": 2225,
       "line_start": 2225
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-SLEEP",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "published-port relay helper owned by the current carrier used by `published_udp_loop`"
+    },
+    "expansion": null,
+    "operation": "std::thread::sleep",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2231 in `published_udp_loop`, `std::thread::sleep` acts only on the published-port relay helper owned by the current carrier used by `published_udp_loop`; no guest identity selects its host target.",
+    "review_id": "HA-000612",
+    "source": {
+      "byte_end": 89312,
+      "byte_start": 89299,
+      "column": 17,
+      "column_end": 30,
+      "column_start": 17,
+      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
+      "line": 2231,
+      "line_end": 2231,
+      "line_start": 2231
     }
   },
   {
@@ -15013,18 +15013,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2122 in `proxy_tcp_stream`, `std::thread::spawn` acts only on the published-port relay helper owned by the current carrier used by `proxy_tcp_stream`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2128 in `proxy_tcp_stream`, `std::thread::spawn` acts only on the published-port relay helper owned by the current carrier used by `proxy_tcp_stream`; no guest identity selects its host target.",
     "review_id": "HA-000623",
     "source": {
-      "byte_end": 85066,
-      "byte_start": 85053,
+      "byte_end": 85260,
+      "byte_start": 85247,
       "column": 16,
       "column_end": 29,
       "column_start": 16,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 2122,
-      "line_end": 2122,
-      "line_start": 2122
+      "line": 2128,
+      "line_end": 2128,
+      "line_start": 2128
     }
   },
   {
@@ -15040,18 +15040,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2127 in `proxy_tcp_stream`, `std::thread::spawn` acts only on the published-port relay helper owned by the current carrier used by `proxy_tcp_stream`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/network/socket_namespace.rs:2133 in `proxy_tcp_stream`, `std::thread::spawn` acts only on the published-port relay helper owned by the current carrier used by `proxy_tcp_stream`; no guest identity selects its host target.",
     "review_id": "HA-000624",
     "source": {
-      "byte_end": 85257,
-      "byte_start": 85244,
+      "byte_end": 85451,
+      "byte_start": 85438,
       "column": 17,
       "column_end": 30,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
-      "line": 2127,
-      "line_end": 2127,
-      "line_start": 2127
+      "line": 2133,
+      "line_end": 2133,
+      "line_start": 2133
     }
   },
   {
