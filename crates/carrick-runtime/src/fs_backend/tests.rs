@@ -2907,3 +2907,51 @@ fn chmod_on_a_socket_marker_node_replaces_its_creation_mode() {
     assert_eq!(durable.kind, RootFsEntryKind::Socket);
     assert_eq!(durable.mode & 0o7777, 0o600);
 }
+
+/// The trusted dirent stream must enumerate through its OWN open-file
+/// description. Round 2 of hostfs-opens made `open_trusted_dir_fd` answer a
+/// cache hit with `F_DUPFD`, and `read_host_dir_entries` then `dup`ed that
+/// again and `rewinddir`ed: every listing of one directory shared ONE seek
+/// offset, so two guest processes listing `lib-dynload` at the same time each
+/// saw a subset (`ModuleNotFoundError: No module named '_struct'` in the
+/// multiprocessing spawn tests, 2 of 15 runs on the hostfs binaries, 0 of 12
+/// before, 2026-09-13). Deterministic witness: enumerating through fd A must
+/// leave a sibling cache-hit fd B's offset untouched.
+#[cfg(target_os = "macos")]
+#[test]
+fn trusted_dirent_stream_owns_its_seek_offset() {
+    use std::os::fd::AsRawFd;
+    let (b, _scratch) = host_backend();
+    b.make_dir("/d").unwrap();
+    for i in 0..300 {
+        b.create_file(&format!("/d/entry-{i:04}")).unwrap();
+    }
+    let a = b.open_trusted_dir_fd("/d").expect("trusted dirfd");
+    let sibling = b
+        .open_trusted_dir_fd("/d")
+        .expect("trusted dirfd (cache hit)");
+    let listed = read_host_dir_entries(a.as_raw_fd(), "/d").expect("trusted stream");
+    assert_eq!(listed.len(), 300);
+    let sibling_offset = unsafe { libc::lseek(sibling.as_raw_fd(), 0, libc::SEEK_CUR) };
+    assert_eq!(
+        sibling_offset, 0,
+        "enumerating through one trusted dirfd moved a sibling's shared offset"
+    );
+    // And the symptom itself: concurrent listings of one directory are each
+    // complete.
+    let backend = std::sync::Arc::new(b);
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let backend = std::sync::Arc::clone(&backend);
+            std::thread::spawn(move || {
+                for _ in 0..50 {
+                    let rows = backend.stream_dirents("/d").expect("stream");
+                    assert_eq!(rows.len(), 300, "a concurrent listing lost entries");
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}
