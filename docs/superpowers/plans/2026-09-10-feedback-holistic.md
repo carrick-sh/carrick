@@ -1013,3 +1013,15 @@ commits and is re-checked at the next vet.
   the instance kqueue; red-first "instance fd not readable after a
   delivered edge with unread data"; epoll/ppoll line-exact probes judge;
   three net_http timings + poll share receipt. Wait service untouched.
+- 2026-09-13 07:45, owner directive: "we only need to use host syscalls for
+  host related things; if it stays in the Linux boundary we can replace with
+  our own abstraction" → the in-zone loopback TCP plan
+  (`docs/superpowers/plans/2026-09-13-in-zone-loopback-tcp.md`). Every
+  AF_INET socket is host-backed today; go-net_http's connections are
+  loopback inside one carrier (50 `httptest`/`newLocalListener` sites), so
+  the row's host `poll`/`kevent`/`write`/`close` (~25% of carrier CPU) is
+  on the wrong side of the line. Dispatched in parallel, file-disjoint:
+  Task 1 `inzone-registry-sep13` (network/: registry + `ConnectTarget::
+  InZone`) and Task 3 `inzone-semantics-sep13` (in-memory INET stream
+  semantics). Task 2 (dispatcher wiring) follows Task 1; Task 4 the
+  `inzonetcp` line-exact probe.
