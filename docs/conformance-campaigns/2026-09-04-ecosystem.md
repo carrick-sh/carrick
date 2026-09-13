@@ -3783,3 +3783,49 @@ gains most); the other rows are within run-to-run noise. Receipts for the
 two defects: multiprocessing 12/12 on this pin (2/15 REGRESSION on the
 round-2 binaries, 0/12 before them), probe gate 46/46 with the compose
 smoke green inside the loaded gate.
+
+## 2026-09-13 12:10 — in-zone loopback TCP landed; the net_http row does not move
+
+Main 1323fe921 (pin 321070a2c32be845) keeps every guest↔guest loopback TCP
+connection inside the carrier (`network/inzone.rs` registry, in-memory
+INET stream semantics, dispatcher wiring, the line-exact `inzonetcp`
+probe and nine fixes the probe, go-net_http and the full probe gate
+exposed — see the controller plan). Gates on the landed tree: probes
+46/46, `just test`, go-net_http ×2 1316/1316. Paired scorecard
+(`measure-sep13c.sh`, candidate 321070a2c32be845 vs the pre-in-zone main
+457da5fb6521ff7b, 40/40 MATCH; values are carrick/Docker wall ratios):
+
+| row | base w4 | cand w4 | cand/base | base w1 | cand w1 |
+|---|---|---|---|---|---|
+| cpython-tarfile | 3.19 | 3.19 | 1.01 | 2.77 | 2.82 |
+| go-net_http | 3.18 | 3.14 | 0.99 | 3.44 | 3.84 |
+| cpython-multiprocessing_main_handling | 3.09 | 3.09 | 0.98 | 2.17 | 2.24 |
+| cpython-compile | 3.10 | 3.12 | 1.00 | 2.22 | 2.21 |
+| cpython-importlib | 2.57 | 2.55 | 0.99 | 1.97 | 1.97 |
+
+Flat. The kernel-aware profile on the new pin
+(`target/perf/perf2x-sep12/prof-mpnh/inz-1.1116.ksamp`, owner-attributed
+with `owner-stacks.py`) says why: the host-socket syscalls did leave the
+row — `kevent` 2.2% → 0.7%, `close` 1.7% → 0.7%, socket `write`s gone
+from the dispatcher — but they were ~3% of carrier CPU, not the ~25% the
+plan attributed to "host poll/kevent/write/close". The two big owners
+were misattributed and are unchanged:
+
+| owner | pre-in-zone | in-zone | what it is |
+|---|---|---|---|
+| `poll` | 9.3% | 9.6% | 6.4% the carrier-wait reactor thread's `poll` over every pollable registration each cycle, 2.4% `recheck_registration`'s `poll(0)`, 0.8% `epoll_pwait`'s own probe |
+| `write` | 4.4% | 4.5% | control-pipe wakes into the reactor: 2.2% from the executor loop, 1.2% from `recheck_registration`; only 0.7% is guest `write(2)` |
+| `hv_trap` | 26.7% | 30.8% | the trap boundary itself |
+| `snapshot_vcpu_from`/`restore_vcpu_into` | ~7% | ~7% | lazy-state residency traffic |
+
+So the go-net_http row is bounded by the wait-service reactor (a
+`poll(2)` set rebuilt per cycle plus one control-pipe `write` per wake ≈
+14% of carrier CPU) and by the trap/register cost, not by where the
+sockets live. The in-zone work stands on correctness grounds (Linux
+semantics on loopback, no host socket per guest connection) and it was
+the prerequisite for the reactor lever: with every wait now carrick-owned
+the reactor's job is one persistent kqueue and no control pipe, which is
+the parked `reactor-kqueue` design (five rounds, `reactor-kqueue-parked`
+memory) — its EPOLLET livelock finding is fixed (EV_CLEAR), its lost-wake
+class now has a named shape (probe-after-enroll on the wait authority's
+interest), so it is the next row lever.
