@@ -81,7 +81,7 @@ impl Kernel {
     /// which is how they came to disagree about the same process; sharing this
     /// makes disagreement unrepresentable.
     ///
-    /// The zombie arm is the behaviour change. [`Zombie`] has carried
+    /// The zombie arm is the behaviour change. [`crate::kernel::objects::Zombie`] has carried
     /// `process_group` and `session` since it was introduced and nothing ever
     /// read them, so a guest that had not yet reaped a child and asked
     /// `getpgid(child)` got ESRCH — Linux answers with the group the child was

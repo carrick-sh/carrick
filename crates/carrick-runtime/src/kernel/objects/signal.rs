@@ -733,7 +733,7 @@ impl SignalWaitReservation {
     }
 }
 
-/// Exact signal leaf bundle captured from one [`super::core::KernelContext`].
+/// Exact signal leaf bundle captured from one [`crate::kernel::KernelContext`].
 /// The facade contains operations only; all state and revisions remain in the
 /// referenced Kernel objects.
 #[derive(Clone, Debug)]
