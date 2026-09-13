@@ -2834,3 +2834,38 @@ fn test_mkdir_mode_fidelity_under_host_umask() {
         );
     }
 }
+
+/// Per-directory marker tracking must survive `rename`/`link`: a socket
+/// marker node moved or linked into a directory that never saw
+/// `create_socket` must make that directory interference-tracked, so the
+/// trusted dirent stream refuses it and the layered path classifies the
+/// entry from its xattrs (guest-visible `d_type`/`lstat` stay `S_IFSOCK`,
+/// verified against the Docker oracle on 2026-09-12). Without the stamp the
+/// stream would report the moved marker as a regular file.
+#[cfg(target_os = "macos")]
+#[test]
+fn moved_marker_node_keeps_the_destination_directory_interference_tracked() {
+    let (backend, scratch) = host_backend();
+    backend.make_dir("/a").unwrap();
+    backend.make_dir("/b").unwrap();
+    backend.make_dir("/c").unwrap();
+    backend.create_socket("/a/sock", 0o600).unwrap();
+    assert!(backend.dir_has_overlay_interference("/a"));
+    assert!(!backend.dir_has_overlay_interference("/b"));
+    assert!(!backend.dir_has_overlay_interference("/c"));
+
+    assert!(backend.rename_overlay_entry("/a/sock", "/b/sock").unwrap());
+    assert!(
+        backend.dir_has_overlay_interference("/b"),
+        "rename must stamp the destination directory"
+    );
+    backend.hard_link("/b/sock", "/c/sock2").unwrap();
+    assert!(
+        backend.dir_has_overlay_interference("/c"),
+        "hard link must stamp the destination directory"
+    );
+    // Durable: a sibling backend on the same scratch reads the stamps.
+    let reattached = HostFsBackend::attach(scratch.path()).unwrap();
+    assert!(reattached.dir_has_overlay_interference("/b"));
+    assert!(reattached.dir_has_overlay_interference("/c"));
+}
