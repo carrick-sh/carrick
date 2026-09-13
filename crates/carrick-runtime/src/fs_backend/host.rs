@@ -5735,12 +5735,14 @@ impl FsBackend for HostFsBackend {
                     let owner_ok = if is_dir { owner_ok_dir } else { owner_ok_file };
                     let on_disk_mode = st.st_mode as u32 & 0o7777;
                     let native_mode = if owner_ok { mode } else { mode | 0o700 };
-                    if on_disk_mode == native_mode
-                        && owner_ok
-                        && !self
-                            .meta_xattr_seen
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                    {
+                    // Sound only while NO entry under the root can carry a
+                    // guest mode xattr that stat would prefer over the
+                    // on-disk mode. That is exactly `serves_plain_metadata`:
+                    // socket/device marker nodes carry a mode xattr under the
+                    // marker-nodes flag, not the metadata flag, so the
+                    // metadata flag alone is the wrong guard (bindunixnode
+                    // read the bind-time mode after chmod, 2026-09-12).
+                    if on_disk_mode == native_mode && owner_ok && self.serves_plain_metadata() {
                         return Ok(());
                     }
                 }

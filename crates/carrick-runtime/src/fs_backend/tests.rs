@@ -2869,3 +2869,41 @@ fn moved_marker_node_keeps_the_destination_directory_interference_tracked() {
     assert!(reattached.dir_has_overlay_interference("/b"));
     assert!(reattached.dir_has_overlay_interference("/c"));
 }
+
+/// `chmod` on a socket marker node must win over the mode xattr the node
+/// was created with. The `set_mode` fast path ("on-disk mode already equals
+/// the requested owner-rwx mode, so nothing to write") is only sound when
+/// NO entry under the root carries a guest mode xattr — the same predicate
+/// as `serves_plain_metadata`. Marker nodes carry one under the
+/// marker-nodes root flag, not the metadata flag, so guarding the fast path
+/// on the metadata flag alone left the bind-time mode in place: the
+/// `bindunixnode` probe read `chmod_bits_600=false` where main and the
+/// Docker oracle read `true` (2026-09-12).
+#[cfg(target_os = "macos")]
+#[test]
+fn chmod_on_a_socket_marker_node_replaces_its_creation_mode() {
+    let (backend, scratch) = host_backend();
+    backend.create_socket("/sock", 0o755).unwrap();
+    let before = backend.metadata("/sock").unwrap();
+    assert_eq!(before.kind, RootFsEntryKind::Socket);
+    assert_eq!(before.mode & 0o7777, 0o755);
+
+    backend.set_mode("/sock", 0o600).unwrap();
+    let after = backend.metadata("/sock").unwrap();
+    assert_eq!(
+        after.kind,
+        RootFsEntryKind::Socket,
+        "chmod must keep S_IFSOCK"
+    );
+    assert_eq!(
+        after.mode & 0o7777,
+        0o600,
+        "chmod must replace the bind-time mode"
+    );
+
+    // Durable: a reattached backend reads the new mode, not the xattr.
+    let reattached = HostFsBackend::attach(scratch.path()).unwrap();
+    let durable = reattached.metadata("/sock").unwrap();
+    assert_eq!(durable.kind, RootFsEntryKind::Socket);
+    assert_eq!(durable.mode & 0o7777, 0o600);
+}
