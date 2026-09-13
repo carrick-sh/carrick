@@ -79,6 +79,16 @@ pub(crate) struct PureSocketState {
     pub so_error: Option<i32>,
     pub so_rcvtimeo: Option<Duration>,
     pub so_sndtimeo: Option<Duration>,
+    pub so_rcvbuf: usize,
+    pub so_sndbuf: usize,
+    pub so_rcvbuf_explicit: Option<usize>,
+    pub so_sndbuf_explicit: Option<usize>,
+    pub tcp_nodelay: bool,
+    pub so_keepalive: bool,
+    pub tcp_keepidle: i32,
+    pub tcp_keepintvl: i32,
+    pub tcp_keepcnt: i32,
+    pub so_linger: (i32, i32),
     pub mock_service: Option<Arc<dyn MockService>>,
     pub mock_peer_closed: bool,
     pub connection_record: Option<Arc<Mutex<ConnectionRecordState>>>,
@@ -146,6 +156,16 @@ impl PureSocketInner {
                 so_error: None,
                 so_rcvtimeo: None,
                 so_sndtimeo: None,
+                so_rcvbuf: DEFAULT_STREAM_BUFFER_CAPACITY,
+                so_sndbuf: DEFAULT_STREAM_BUFFER_CAPACITY,
+                so_rcvbuf_explicit: None,
+                so_sndbuf_explicit: None,
+                tcp_nodelay: false,
+                so_keepalive: false,
+                tcp_keepidle: 7200,
+                tcp_keepintvl: 75,
+                tcp_keepcnt: 9,
+                so_linger: (0, 0),
                 mock_service: None,
                 mock_peer_closed: false,
                 connection_record: None,
@@ -188,6 +208,16 @@ impl PureSocketInner {
                 so_error: None,
                 so_rcvtimeo: None,
                 so_sndtimeo: None,
+                so_rcvbuf: DEFAULT_STREAM_BUFFER_CAPACITY,
+                so_sndbuf: DEFAULT_STREAM_BUFFER_CAPACITY,
+                so_rcvbuf_explicit: None,
+                so_sndbuf_explicit: None,
+                tcp_nodelay: false,
+                so_keepalive: false,
+                tcp_keepidle: 7200,
+                tcp_keepintvl: 75,
+                tcp_keepcnt: 9,
+                so_linger: (0, 0),
                 mock_service: Some(mock),
                 mock_peer_closed: false,
                 connection_record: record,
@@ -290,6 +320,97 @@ impl PureSocketInner {
 
     pub(crate) fn get_sndtimeo(&self) -> Option<Duration> {
         self.state.lock().so_sndtimeo
+    }
+
+    pub(crate) fn so_sndbuf(&self) -> usize {
+        self.state.lock().so_sndbuf
+    }
+
+    pub(crate) fn set_so_sndbuf(&self, val: usize) {
+        let mut state = self.state.lock();
+        state.so_sndbuf = val;
+        state.so_sndbuf_explicit = Some(val);
+    }
+
+    pub(crate) fn so_sndbuf_explicit(&self) -> Option<usize> {
+        self.state.lock().so_sndbuf_explicit
+    }
+
+    pub(crate) fn so_rcvbuf(&self) -> usize {
+        self.state.lock().so_rcvbuf
+    }
+
+    pub(crate) fn set_so_rcvbuf(&self, val: usize) {
+        let mut state = self.state.lock();
+        state.so_rcvbuf = val;
+        state.so_rcvbuf_explicit = Some(val);
+    }
+
+    pub(crate) fn so_rcvbuf_explicit(&self) -> Option<usize> {
+        self.state.lock().so_rcvbuf_explicit
+    }
+
+    pub(crate) fn is_listening(&self) -> bool {
+        self.state.lock().listening
+    }
+
+    pub(crate) fn tcp_nodelay(&self) -> bool {
+        self.state.lock().tcp_nodelay
+    }
+
+    pub(crate) fn set_tcp_nodelay(&self, val: bool) {
+        self.state.lock().tcp_nodelay = val;
+    }
+
+    pub(crate) fn so_keepalive(&self) -> bool {
+        self.state.lock().so_keepalive
+    }
+
+    pub(crate) fn set_so_keepalive(&self, val: bool) {
+        self.state.lock().so_keepalive = val;
+    }
+
+    pub(crate) fn tcp_keepidle(&self) -> i32 {
+        self.state.lock().tcp_keepidle
+    }
+
+    pub(crate) fn set_tcp_keepidle(&self, val: i32) {
+        self.state.lock().tcp_keepidle = val;
+    }
+
+    pub(crate) fn tcp_keepintvl(&self) -> i32 {
+        self.state.lock().tcp_keepintvl
+    }
+
+    pub(crate) fn set_tcp_keepintvl(&self, val: i32) {
+        self.state.lock().tcp_keepintvl = val;
+    }
+
+    pub(crate) fn tcp_keepcnt(&self) -> i32 {
+        self.state.lock().tcp_keepcnt
+    }
+
+    pub(crate) fn set_tcp_keepcnt(&self, val: i32) {
+        self.state.lock().tcp_keepcnt = val;
+    }
+
+    pub(crate) fn so_linger(&self) -> (i32, i32) {
+        self.state.lock().so_linger
+    }
+
+    pub(crate) fn set_so_linger(&self, val: (i32, i32)) {
+        self.state.lock().so_linger = val;
+    }
+
+    pub(crate) fn outq_bytes(&self) -> usize {
+        let state = self.state.lock();
+        if state.mock_service.is_some() {
+            state.request_buf.len()
+        } else if let Some(peer) = state.peer.as_ref().and_then(|p| p.upgrade()) {
+            peer.state.lock().stream_buf.len()
+        } else {
+            0
+        }
     }
 
     pub(crate) fn bind(
@@ -420,12 +541,14 @@ impl PureSocketInner {
             return Err(LINUX_EPIPE);
         }
 
+        let send_cap = state.so_sndbuf;
+
         // Mock Service Interception Path
         if let Some(mock) = state.mock_service.clone() {
             if state.mock_peer_closed {
                 return Err(LINUX_EPIPE);
             }
-            let available = DEFAULT_STREAM_BUFFER_CAPACITY.saturating_sub(state.request_buf.len());
+            let available = send_cap.saturating_sub(state.request_buf.len());
             if available == 0 && !data.is_empty() {
                 return Err(LINUX_EAGAIN);
             }
@@ -482,7 +605,7 @@ impl PureSocketInner {
             return Err(LINUX_EPIPE);
         }
 
-        let available = DEFAULT_STREAM_BUFFER_CAPACITY.saturating_sub(peer_state.stream_buf.len());
+        let available = send_cap.saturating_sub(peer_state.stream_buf.len());
         if available == 0 && !data.is_empty() {
             return Err(LINUX_EAGAIN);
         }
@@ -500,6 +623,15 @@ impl PureSocketInner {
         &self,
         buf: &mut [u8],
         max_rights: usize,
+    ) -> Result<(usize, Vec<Arc<OpenFile>>), LinuxErrno> {
+        self.recv_stream_flags(buf, max_rights, false)
+    }
+
+    pub(crate) fn recv_stream_flags(
+        &self,
+        buf: &mut [u8],
+        max_rights: usize,
+        peek: bool,
     ) -> Result<(usize, Vec<Arc<OpenFile>>), LinuxErrno> {
         let mut state = self.state.lock();
         if state.shutdown_read {
@@ -526,6 +658,13 @@ impl PureSocketInner {
         }
 
         let to_read = buf.len().min(state.stream_buf.len());
+        if peek {
+            for (i, slot) in buf.iter_mut().take(to_read).enumerate() {
+                *slot = state.stream_buf[i];
+            }
+            return Ok((to_read, Vec::new()));
+        }
+
         for slot in buf.iter_mut().take(to_read) {
             *slot = state.stream_buf.pop_front().unwrap_or(0);
         }
@@ -643,31 +782,39 @@ impl PureSocketInner {
 
         if self.socket_type == LINUX_SOCK_STREAM || self.socket_type == LINUX_SOCK_SEQPACKET {
             let has_mock = state.mock_service.is_some();
-            let peer_alive = if has_mock {
-                !state.mock_peer_closed
+            let (peer_shut_wr, peer_shut_rd, peer_dropped) = if has_mock {
+                (state.mock_peer_closed, state.mock_peer_closed, false)
+            } else if let Some(peer_weak) = &state.peer {
+                if let Some(peer) = peer_weak.upgrade() {
+                    let p = peer.state.lock();
+                    (p.shutdown_write, p.shutdown_read, false)
+                } else {
+                    (true, true, true)
+                }
             } else {
-                state
-                    .peer
-                    .as_ref()
-                    .and_then(|p| p.upgrade())
-                    .is_some_and(|p| !p.state.lock().shutdown_write)
+                (false, false, false)
             };
 
-            if !state.stream_buf.is_empty() || state.shutdown_read || !peer_alive {
+            if !state.stream_buf.is_empty() || state.shutdown_read || peer_shut_wr {
                 mask |= LINUX_EPOLLIN;
             }
-            if !state.shutdown_write && peer_alive {
+            if !state.shutdown_write && !peer_shut_rd {
                 if has_mock {
-                    mask |= LINUX_EPOLLOUT;
+                    if state.request_buf.len() < state.so_sndbuf {
+                        mask |= LINUX_EPOLLOUT;
+                    }
                 } else if let Some(peer) = state.peer.as_ref().and_then(|p| p.upgrade()) {
                     let peer_used = peer.state.lock().stream_buf.len();
-                    if peer_used < DEFAULT_STREAM_BUFFER_CAPACITY {
+                    if peer_used < state.so_sndbuf {
                         mask |= LINUX_EPOLLOUT;
                     }
                 }
             }
-            if !peer_alive {
-                mask |= LINUX_EPOLLHUP | LINUX_EPOLLRDHUP;
+            if peer_shut_wr {
+                mask |= LINUX_EPOLLRDHUP;
+            }
+            if peer_dropped || (peer_shut_wr && peer_shut_rd) {
+                mask |= LINUX_EPOLLHUP;
             }
         } else {
             if !state.dgram_queue.is_empty() {
@@ -772,6 +919,7 @@ impl UnixSocketRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linux_abi::{LINUX_AF_INET, LINUX_IPPROTO_TCP};
     use crate::network::interposer::HttpMock;
 
     #[test]
@@ -889,5 +1037,86 @@ mod tests {
         // Subsequent read on EOF returns 0
         let (eof_len, _) = sock.recv_stream(&mut buf, 0).unwrap();
         assert_eq!(eof_len, 0);
+    }
+
+    #[test]
+    fn inet_stream_peer_shut_wr_poll_mask_epollrdhup_and_recv_buffered_then_eof() {
+        let (s1, s2) = PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+        let sent = s1.send_stream(b"in-flight", Vec::new()).unwrap();
+        assert_eq!(sent, 9);
+        s1.shutdown(LINUX_SHUT_WR).unwrap();
+
+        let mask = s2.poll_mask();
+        assert_eq!(mask & LINUX_EPOLLIN, LINUX_EPOLLIN, "must be readable");
+        assert_eq!(
+            mask & LINUX_EPOLLRDHUP,
+            LINUX_EPOLLRDHUP,
+            "must report peer shutdown(SHUT_WR)"
+        );
+        assert_eq!(
+            mask & LINUX_EPOLLHUP,
+            0,
+            "peer shutdown(SHUT_WR) is half-close, not HUP"
+        );
+
+        let mut buf = [0u8; 16];
+        let (read, _) = s2.recv_stream(&mut buf, 0).unwrap();
+        assert_eq!(read, 9);
+        assert_eq!(&buf[..read], b"in-flight");
+
+        let (read_eof, _) = s2.recv_stream(&mut buf, 0).unwrap();
+        assert_eq!(
+            read_eof, 0,
+            "subsequent read after draining buffer must return 0 (EOF)"
+        );
+    }
+
+    #[test]
+    fn inet_stream_so_sndbuf_bounds_send_and_clears_epollout() {
+        let (s1, s2) = PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+        assert_eq!(s1.so_sndbuf(), DEFAULT_STREAM_BUFFER_CAPACITY);
+
+        // Cap send buffer to 4096 bytes
+        s1.set_so_sndbuf(4096);
+        assert_eq!(s1.so_sndbuf(), 4096);
+        assert_eq!(s1.poll_mask() & LINUX_EPOLLOUT, LINUX_EPOLLOUT);
+
+        // Fill buffer to capacity
+        let data = vec![0x42u8; 4096];
+        let sent = s1.send_stream(&data, Vec::new()).unwrap();
+        assert_eq!(sent, 4096);
+
+        // Buffer full: EPOLLOUT cleared, send returns EAGAIN
+        assert_eq!(
+            s1.poll_mask() & LINUX_EPOLLOUT,
+            0,
+            "full send buffer must clear EPOLLOUT"
+        );
+        assert_eq!(s1.send_stream(b"overflow", Vec::new()), Err(LINUX_EAGAIN));
+
+        // Drain 1024 bytes from peer
+        let mut buf = [0u8; 1024];
+        let (read, _) = s2.recv_stream(&mut buf, 0).unwrap();
+        assert_eq!(read, 1024);
+
+        // Space freed: EPOLLOUT restored, send succeeds
+        assert_eq!(
+            s1.poll_mask() & LINUX_EPOLLOUT,
+            LINUX_EPOLLOUT,
+            "draining buffer must restore EPOLLOUT"
+        );
+        assert_eq!(s1.send_stream(b"more", Vec::new()).unwrap(), 4);
     }
 }
