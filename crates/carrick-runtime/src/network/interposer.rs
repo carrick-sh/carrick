@@ -396,6 +396,7 @@ pub struct NetworkInterposer {
     capture_payloads: bool,
     max_records: usize,
     next_conn_id: Arc<AtomicU64>,
+    fallback_inzone: crate::network::inzone::InZoneRegistry,
 }
 
 impl Default for NetworkInterposer {
@@ -423,6 +424,7 @@ impl NetworkInterposer {
             capture_payloads: false,
             max_records: 1024,
             next_conn_id: Arc::new(AtomicU64::new(1)),
+            fallback_inzone: crate::network::inzone::InZoneRegistry::default(),
         }
     }
 
@@ -537,6 +539,14 @@ impl NetworkInterposer {
 }
 
 impl NetworkProvider for NetworkInterposer {
+    fn inzone(&self) -> &crate::network::inzone::InZoneRegistry {
+        if let Some(inner) = &self.inner {
+            inner.inzone()
+        } else {
+            &self.fallback_inzone
+        }
+    }
+
     fn create_namespace(&self, spec: &NetworkNamespaceSpec) -> Result<NetworkLease, String> {
         if let Some(inner) = &self.inner {
             inner.create_namespace(spec)
@@ -590,6 +600,19 @@ impl NetworkProvider for NetworkInterposer {
         requested: GuestSocketAddr,
         protocol: PortProtocol,
     ) -> Result<ConnectTarget, String> {
+        if protocol == PortProtocol::Tcp {
+            let scope = match namespace_id {
+                Some(id) => crate::network::inzone::InZoneScope::Namespace(id.clone()),
+                None => crate::network::inzone::InZoneScope::CarrierHost,
+            };
+            if let Some(listener) = self.inzone().resolve(&scope, requested) {
+                return Ok(ConnectTarget::InZone {
+                    listener,
+                    target: requested,
+                });
+            }
+        }
+
         let ip = requested.0.ip();
         let port = requested.0.port();
 

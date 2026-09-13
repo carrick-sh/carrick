@@ -37,6 +37,7 @@ pub struct SocketNamespaceProvider {
     fork_tracked_fds: Arc<Mutex<HashSet<RawFd>>>,
     published_tcp: Mutex<HashMap<NetworkLeaseId, Vec<PublishedTcpProxy>>>,
     published_udp: Mutex<HashMap<NetworkLeaseId, Vec<PublishedUdpProxy>>>,
+    inzone: super::inzone::InZoneRegistry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -358,7 +359,12 @@ impl SocketNamespaceProvider {
             fork_tracked_fds: Arc::new(Mutex::new(HashSet::new())),
             published_tcp: Mutex::new(HashMap::new()),
             published_udp: Mutex::new(HashMap::new()),
+            inzone: super::inzone::InZoneRegistry::default(),
         }
+    }
+
+    pub fn inzone(&self) -> &super::inzone::InZoneRegistry {
+        &self.inzone
     }
 
     pub fn register_virtual_endpoint(
@@ -2229,6 +2235,10 @@ fn published_udp_loop(
 }
 
 impl NetworkProvider for SocketNamespaceProvider {
+    fn inzone(&self) -> &super::inzone::InZoneRegistry {
+        &self.inzone
+    }
+
     fn try_fork_guard(&self) -> Option<super::NetworkForkGuard<'_>> {
         match self.fork_gate.try_lock() {
             Ok(guard) => Some(super::NetworkForkGuard::real(guard)),
@@ -2314,6 +2324,11 @@ impl NetworkProvider for SocketNamespaceProvider {
         lease_specs.insert(lease_id, spec.clone());
         drop(lease_specs);
         if let Some(namespace_id) = spec.namespace_id.clone() {
+            let scope = super::inzone::InZoneScope::Namespace(namespace_id.clone());
+            for attachment in effective_attachments(spec) {
+                self.inzone
+                    .register_scope_address(&scope, std::net::IpAddr::V4(attachment.ipv4));
+            }
             let mut namespaces = self
                 .namespaces
                 .lock()
@@ -2337,7 +2352,12 @@ impl NetworkProvider for SocketNamespaceProvider {
             published_udp.remove(&lease_id);
         }
         if let Ok(mut lease_specs) = self.lease_specs.lock() {
-            lease_specs.remove(&lease_id);
+            if let Some(spec) = lease_specs.remove(&lease_id) {
+                if let Some(namespace_id) = spec.namespace_id {
+                    let scope = super::inzone::InZoneScope::Namespace(namespace_id);
+                    self.inzone.unregister_scope(&scope);
+                }
+            }
         }
         let mut removed_paths = HashSet::new();
         if let Ok(mut owned) = self.owned_endpoint_files.lock()
@@ -2446,6 +2466,18 @@ impl NetworkProvider for SocketNamespaceProvider {
         requested: GuestSocketAddr,
         protocol: PortProtocol,
     ) -> Result<ConnectTarget, String> {
+        if protocol == PortProtocol::Tcp {
+            let scope = match namespace_id {
+                Some(id) => super::inzone::InZoneScope::Namespace(id.clone()),
+                None => super::inzone::InZoneScope::CarrierHost,
+            };
+            if let Some(listener) = self.inzone.resolve(&scope, requested) {
+                return Ok(ConnectTarget::InZone {
+                    listener,
+                    target: requested,
+                });
+            }
+        }
         let Some(namespace_id) = namespace_id else {
             return Ok(ConnectTarget::Unchanged);
         };
