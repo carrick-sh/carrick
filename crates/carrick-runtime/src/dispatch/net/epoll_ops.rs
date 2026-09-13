@@ -214,17 +214,6 @@ impl<'a> NetView<'a> {
         )
     }
 
-    #[allow(dead_code)]
-    fn fd_supports_read_lowat(&self, fd: i32) -> bool {
-        let Some(open_file) = self.open_file(fd) else {
-            return false;
-        };
-        matches!(
-            open_file.description.read().as_deref(),
-            Some(OpenDescription::HostSocket { .. })
-        )
-    }
-
     pub(super) fn fd_is_listening_socket(&self, fd: i32) -> bool {
         let Some(open_file) = self.open_file(fd) else {
             return false;
@@ -267,7 +256,6 @@ impl<'a> NetView<'a> {
         fd: i32,
         events: u32,
         last_ready: u32,
-        _last_read_avail: u64,
         write_backpressured: bool,
     ) -> carrick_hal::event::Interest {
         // Wire→typed seam: the guest event word is a raw u32; epoll ACCEPTS
@@ -341,7 +329,6 @@ impl<'a> NetView<'a> {
         let mut union_interest = carrick_hal::event::Interest::default();
         let mut any_level = false;
         let mut any_edge = false;
-        let mut read_lowat: Option<Option<u64>> = None;
         for (&other, slot) in interest.iter() {
             if self.host_fd_for_poll(other) != Some(host_fd) {
                 continue;
@@ -359,27 +346,17 @@ impl<'a> NetView<'a> {
                 other,
                 slot.event.events,
                 slot.last_ready,
-                slot.last_read_avail,
                 slot.write_backpressured,
             );
             union_interest.read |= effective.read;
             union_interest.write |= effective.write;
             union_interest.oob |= effective.oob;
-            if effective.read {
-                read_lowat = match (read_lowat, effective.read_lowat) {
-                    (None, lowat) => Some(lowat),
-                    (Some(Some(current)), Some(next)) => Some(Some(current.min(next))),
-                    (Some(_), None) => Some(None),
-                    (current, Some(_)) => current,
-                };
-            }
         }
         union_interest.mode = if any_edge && !any_level {
             carrick_hal::event::TriggerMode::Edge
         } else {
             carrick_hal::event::TriggerMode::Level
         };
-        union_interest.read_lowat = read_lowat.flatten();
         let (survivor_fd, survivor_gen) = survivor.unwrap_or((-1, 0));
         let effective_bits = u32::from(union_interest.read)
             | (u32::from(union_interest.write) << 1)
@@ -1879,16 +1856,16 @@ mod epoll_interest_tests {
         let dispatcher = SyscallDispatcher::new();
         let events = LINUX_EPOLLET | LINUX_EPOLLIN | LINUX_EPOLLOUT;
 
-        let fresh = dispatcher.epoll_effective_interest(12345, events, 0, 0, false);
+        let fresh = dispatcher.epoll_effective_interest(12345, events, 0, false);
         assert!(fresh.read);
         assert!(fresh.write);
 
-        let latched = dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLOUT, 0, false);
+        let latched = dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLOUT, false);
         assert!(latched.read);
         assert!(!latched.write);
 
         let backpressured =
-            dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLOUT, 0, true);
+            dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLOUT, true);
         assert!(backpressured.read);
         assert!(backpressured.write);
 
@@ -1896,7 +1873,6 @@ mod epoll_interest_tests {
             12345,
             LINUX_EPOLLIN | LINUX_EPOLLOUT,
             LINUX_EPOLLOUT,
-            0,
             false,
         );
         assert!(level.read);
@@ -1917,14 +1893,12 @@ mod epoll_interest_tests {
             12345,
             events,
             LINUX_EPOLLIN | LINUX_EPOLLHUP,
-            0,
             false,
         );
         assert!(!hup_latched.read);
         assert!(!hup_latched.write);
 
-        let err_latched =
-            dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLERR, 0, false);
+        let err_latched = dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLERR, false);
         assert!(!err_latched.read);
         assert!(!err_latched.write);
 
@@ -1932,14 +1906,13 @@ mod epoll_interest_tests {
             12345,
             events,
             LINUX_EPOLLIN | LINUX_EPOLLHUP,
-            0,
             true,
         );
         assert!(!backpressured.read);
         assert!(backpressured.write);
 
         let in_latched_zero =
-            dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLIN, 0, false);
+            dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLIN, false);
         assert!(in_latched_zero.read);
         assert!(in_latched_zero.write);
     }
@@ -3087,7 +3060,7 @@ impl<'a> NetView<'a> {
                     let reg_gen = next_epoll_reg_gen();
                     if let Some(host_fd) = host_fd {
                         let ev_events = event.events;
-                        let effective = this.epoll_effective_interest(fd, ev_events, 0, 0, false);
+                        let effective = this.epoll_effective_interest(fd, ev_events, 0, false);
                         let register = kqueue.with_mux(|mux| {
                             mux.register_io(
                                 host_fd.get(),
@@ -3205,7 +3178,7 @@ impl<'a> NetView<'a> {
                     let host_poll_source = slot.host_poll_source;
                     if let Some(host_fd) = host_fd {
                         let effective =
-                            this.epoll_effective_interest(fd, event.events, 0, 0, false);
+                            this.epoll_effective_interest(fd, event.events, 0, false);
                         let register = kqueue.with_mux(|mux| {
                             mux.register_io(
                                 host_fd.get(),
