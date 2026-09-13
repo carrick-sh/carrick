@@ -294,8 +294,9 @@ impl<'a> NetView<'a> {
                         // first: a negative or oversized addrlen is EINVAL and
                         // an unreadable address with a positive addrlen is
                         // EFAULT, before any byte is queued (probe
-                        // `streamdestmatrix`, cases 2.8-2.10).
-                        if dest_addr != 0 || dest_len != 0 {
+                        // `streamdestmatrix`, cases 2.8-2.10). A NULL pointer
+                        // means "no address" whatever the length says (2.11).
+                        if dest_addr != 0 {
                             if (dest_len as i32) < 0 || dest_len as usize > LINUX_SOCKADDR_STORAGE_MAX {
                                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                             }
