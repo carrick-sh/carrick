@@ -847,3 +847,6 @@ commits and is re-checked at the next vet.
   open bounds). Also fixed on main: `just doc` red from three intra-doc
   links broken by the splits (b9f4feeeb) — `just ci` is green-capable
   again.
+- 2026-09-12 18:45, `just ci` GREEN on main 53054ebc9 (fmt, clippy,
+  lint-domains, deny, check-matrix, check, doc, test, test-integration) —
+  first full local gate pass since the doc links broke in the splits.
