@@ -949,3 +949,12 @@ commits and is re-checked at the next vet.
   on the round-2 binaries); probe gate 46/46 with
   `docker_compose_shared_network_namespace_smoke` green inside the loaded
   gate. Paired scorecard `measure-sep13b.sh` on this pin follows.
+- 2026-09-13 02:50, net_http re-profiled on 457da5fb6521ff7b
+  (`prof-mpnh/nhk-*`, corrected `ksamp-agg.py`): guest+HVF 26.7%, register
+  traffic ~14% (snapshot 10.1%, restore 3.8%; was ~30%), host `poll(2)` 9.1%
+  + `kevent` 2.2% under the carrier wait service's reactor, which rebuilds a
+  `pollfd` set of every pollable registration per cycle. Brief
+  `reactor-kqueue.md` dispatched (worker `reactor-kqueue-sep13`, worktree
+  `agy-reactor-kqueue-sep13` from 6debb1639): one persistent kqueue per wait
+  service, EV_ADD/EV_DELETE on the registration lifecycle, O(ready) cycles,
+  guest epoll semantics untouched (kqueue = wake source only).
