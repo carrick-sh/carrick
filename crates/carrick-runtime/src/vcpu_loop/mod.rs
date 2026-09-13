@@ -437,8 +437,8 @@ pub(crate) use terminal::ProcessExitClaim;
 pub(crate) use terminal::{
     CloneAdmissionChangeSubscription, CloneAdmissionGate, CloneAdmissionPermit, CloneEnrollment,
     ExecCloneAdmission, ExecTerminalHandoff, FatalSignalAuthority, FatalSignalRecord,
-    ForkCloneAdmission, ProcessExitClaimReceipt, VcpuLoopOutcome, core_note_resume_pair,
-    try_claim_persistent_process_exit_with,
+    ForkCloneAdmission, ForkCloseAttempt, ProcessExitClaimReceipt, VcpuLoopOutcome,
+    core_note_resume_pair, try_claim_persistent_process_exit_with,
 };
 
 pub(crate) mod outcome;

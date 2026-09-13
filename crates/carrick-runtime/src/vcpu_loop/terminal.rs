@@ -245,7 +245,7 @@ impl CloneAdmissionGate {
         self: &Arc<Self>,
         owner: ThreadId,
         generation: u64,
-    ) -> Result<Option<ForkCloneAdmission>, RuntimeError> {
+    ) -> Result<ForkCloseAttempt, RuntimeError> {
         let mut state = self.state.lock();
         let close = CloneAdmissionClose::Fork { owner, generation };
         if state.generation != generation || state.closing.is_some_and(|current| current != close) {
@@ -259,9 +259,11 @@ impl CloneAdmissionGate {
         // permit belongs to a thread clone admitted before the fork close and
         // must finish normally before the task snapshot can be reserved.
         if state.in_flight != 1 {
-            return Ok(None);
+            return Ok(ForkCloseAttempt::PermitsInFlight {
+                observed_epoch: state.change_epoch,
+            });
         }
-        Ok(Some(ForkCloneAdmission {
+        Ok(ForkCloseAttempt::Closed(ForkCloneAdmission {
             gate: Arc::clone(self),
             owner,
             generation,
@@ -371,7 +373,7 @@ impl CloneAdmissionPermit {
     pub(crate) fn try_close_for_fork(
         &self,
         owner: ThreadId,
-    ) -> Result<Option<ForkCloneAdmission>, RuntimeError> {
+    ) -> Result<ForkCloseAttempt, RuntimeError> {
         if self.kind != (CloneAdmissionKind::ProcessFork { owner }) {
             return Err(RuntimeError::Unsupported(
                 "fork close requires the matching process-fork permit".to_owned(),
@@ -402,6 +404,31 @@ impl Drop for CloneAdmissionPermit {
         drop(state);
         for callback in callbacks {
             callback();
+        }
+    }
+}
+
+/// Outcome of a process fork asking the gate to close clone admission.
+pub(crate) enum ForkCloseAttempt {
+    Closed(ForkCloneAdmission),
+    /// Thread clones admitted before this close still hold permits. A
+    /// permit's release publishes the gate's change epoch and nothing else
+    /// (the kernel reservation epoch moves only when a task-set reservation
+    /// commits or drops, which a clone that backs off never held), so the
+    /// fork must park on `observed_epoch` — read under the same lock as the
+    /// permit count, so a release between this read and the subscription is
+    /// observed as a moved epoch, never missed.
+    PermitsInFlight {
+        observed_epoch: u64,
+    },
+}
+
+impl ForkCloseAttempt {
+    #[cfg(test)]
+    pub(crate) fn closed(self) -> Option<ForkCloneAdmission> {
+        match self {
+            Self::Closed(admission) => Some(admission),
+            Self::PermitsInFlight { .. } => None,
         }
     }
 }
@@ -1186,6 +1213,60 @@ mod tests {
         assert!(gate.enroll_thread_clone().admitted().is_some());
     }
 
+    /// A fork close that yields to an in-flight thread-clone permit must be
+    /// woken by THAT permit's release. Permits publish only the gate's
+    /// change epoch; the kernel reservation epoch moves only when a
+    /// `TaskSetReservation` commits or drops, and a clone that backs off at
+    /// `reserve_thread_clone` / `try_reserve_publication` never held one.
+    /// The winner parked on the reservation epoch and the loser parked on
+    /// the fork token, so forkexecstorm hung at its first vfork
+    /// (`fes3cap/cap-1-7`, 2026-09-12). The epoch is read under the same
+    /// lock as the count, so subscribing to it is exact.
+    #[test]
+    fn fork_close_behind_a_thread_clone_permit_wakes_on_that_permits_release() {
+        let gate = Arc::new(CloneAdmissionGate::default());
+        let owner = ThreadId::synthetic_for_tests(1007);
+        let existing_clone = gate
+            .enroll_thread_clone()
+            .admitted()
+            .expect("existing clone admission");
+        let process_fork = gate
+            .enroll_process_fork(owner)
+            .admitted()
+            .expect("process fork admission");
+        let ForkCloseAttempt::PermitsInFlight { observed_epoch } =
+            process_fork.try_close_for_fork(owner).expect("fork close")
+        else {
+            panic!("fork close must yield while an admitted clone publishes");
+        };
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::clone(&wakes);
+        let subscription = gate.subscribe_change(
+            observed_epoch,
+            Arc::new(move || {
+                wake.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        assert!(
+            subscription.is_some(),
+            "the epoch read under the close lock is current"
+        );
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        drop(existing_clone);
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "releasing the clone permit must wake the parked fork close"
+        );
+        let fork = process_fork
+            .try_close_for_fork(owner)
+            .expect("retry fork close")
+            .closed()
+            .expect("no permits left in flight");
+        drop(fork);
+        drop(process_fork);
+    }
+
     #[test]
     fn clone_enrollment_defers_behind_a_fork_close_and_wakes_on_reopen() {
         let gate = Arc::new(CloneAdmissionGate::default());
@@ -1196,6 +1277,7 @@ mod tests {
         let fork_close = process_fork
             .try_close_for_fork(owner)
             .expect("fork close")
+            .closed()
             .expect("no clone in flight");
 
         let CloneEnrollment::Deferred { observed_epoch } = gate.enroll_thread_clone() else {
@@ -1263,7 +1345,11 @@ mod tests {
             .expect("existing clone admission");
 
         assert!(
-            process_fork.try_close_for_fork(owner).unwrap().is_none(),
+            process_fork
+                .try_close_for_fork(owner)
+                .unwrap()
+                .closed()
+                .is_none(),
             "fork close must yield while an admitted clone publishes"
         );
         assert!(
@@ -1278,6 +1364,7 @@ mod tests {
         let fork = process_fork
             .try_close_for_fork(owner)
             .expect("retry fork close")
+            .closed()
             .expect("fork admission drain");
         assert!(!process_fork.is_cancelled());
         drop(fork);
