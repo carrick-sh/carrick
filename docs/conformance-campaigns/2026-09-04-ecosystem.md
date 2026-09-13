@@ -3758,3 +3758,28 @@ workers (the harness's `--workers` is the guest's regrtest parallelism and
 the suite is a single test file). Per-fault cost, not fault count, is the
 lever there; the carrier spends roughly 6 µs of user CPU per fault under
 the sampler. Parked behind the net_http executor-boundary work.
+
+## 2026-09-13 02:20 — lazy vCPU state landed; two gate-found defects fixed
+
+Main 457da5fb6521ff7b carries the residency-keyed lazy vCPU save/restore
+(598c987be..aeec3e384, three worker rounds; director review in the
+controller), the carrier teardown-window fix (614b2de8a) and the trusted
+dirent stream's own-description fix (6906c19cc). Paired scorecard
+(`measure-sep13b.sh`, candidate 457da5fb6521ff7b vs base 3c8dbee5b686c49d,
+40/40 MATCH, wall seconds):
+
+| row | base w4 | cand w4 | cand/base | base w1 | cand w1 |
+|---|---|---|---|---|---|
+| go-net_http | 3.63 | 3.18 | 0.95 | 3.73 | 2.84 |
+| cpython-tarfile | 5.06 | 3.10 | 0.62 | 4.68 | 2.81 |
+| cpython-multiprocessing_main_handling | 3.50 | 3.02 | 0.86 | 2.60 | 2.23 |
+| cpython-compile | 6.27 | 2.87 | 0.47 | 4.87 | 2.13 |
+| cpython-importlib | 3.09 | 2.49 | 0.83 | 2.10 | 1.95 |
+
+Against the 21:30 table on 67e536aace35f82e: net_http w4 3.44 → 3.18 s,
+w1 3.80 → 2.84 s (the register-traffic share fell from ~30% to ~12% of
+carrier CPU; the w1 row, where every block is a same-executor reclaim,
+gains most); the other rows are within run-to-run noise. Receipts for the
+two defects: multiprocessing 12/12 on this pin (2/15 REGRESSION on the
+round-2 binaries, 0/12 before them), probe gate 46/46 with the compose
+smoke green inside the loaded gate.
