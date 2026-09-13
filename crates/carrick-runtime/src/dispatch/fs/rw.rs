@@ -968,7 +968,16 @@ impl<'a> FsView<'a> {
                                 return Ok(DispatchOutcome::Returned { value: 0 });
                             }
                         }
-                        Err(LINUX_EAGAIN) => return Ok(DispatchOutcome::errno(LINUX_EAGAIN)),
+                        Err(LINUX_EAGAIN) => {
+                            if nonblocking {
+                                return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                            }
+                            return Ok(crate::dispatch::net::wait_in_memory_slot(
+                                &this.captured_file_table(),
+                                fd.0,
+                                socket.get_rcvtimeo(),
+                            ));
+                        }
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     }
                 }
@@ -1180,6 +1189,16 @@ impl<'a> FsView<'a> {
                                 }
                             }
                             Err(LINUX_EAGAIN) if total > 0 => break,
+                            Err(LINUX_EAGAIN) => {
+                                if nonblocking {
+                                    return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                                }
+                                return Ok(crate::dispatch::net::wait_in_memory_slot(
+                                    &this.captured_file_table(),
+                                    fd.0,
+                                    socket.get_rcvtimeo(),
+                                ));
+                            }
                             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                         }
                     }
@@ -2452,6 +2471,13 @@ impl<'a> FsView<'a> {
                                         written,
                                     ));
                                 }
+                                Err(LINUX_EAGAIN) if !nonblocking => {
+                                    return Ok(crate::dispatch::net::wait_in_memory_slot(
+                                        &this.captured_file_table(),
+                                        fd,
+                                        socket.get_sndtimeo(),
+                                    ));
+                                }
                                 Err(LINUX_EPIPE) => {
                                     let outcome = DispatchOutcome::errno(LINUX_EPIPE);
                                     return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
@@ -3107,6 +3133,13 @@ impl<'a> FsView<'a> {
                                     Ok(written) => {
                                         this.notify_inmem_epoll();
                                         outcome = DispatchOutcome::returned_len_or_errno(written);
+                                    }
+                                    Err(LINUX_EAGAIN) if !nonblocking => {
+                                        outcome = crate::dispatch::net::wait_in_memory_slot(
+                                            &this.captured_file_table(),
+                                            fd,
+                                            socket.get_sndtimeo(),
+                                        );
                                     }
                                     Err(LINUX_EPIPE) => {
                                         outcome = DispatchOutcome::errno(LINUX_EPIPE);
