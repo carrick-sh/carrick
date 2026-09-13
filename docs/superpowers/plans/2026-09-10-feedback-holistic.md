@@ -1120,3 +1120,15 @@ commits and is re-checked at the next vet.
   inzonetcp, socketpartialsend, streamdestmatrix MATCH; go-net_http x2
   1316/1316. Running `just conformance-probes` + `just test` for the
   landing.
+- 2026-09-13 12:05, in-zone loopback TCP LANDED in full (main 1323fe921,
+  pushed): probe `inzonetcp` + blessed oracle, the worker's OOB/EPOLLPRI
+  and splice fixes, and the director's seven (poll fast path, reset read
+  once, ABBA pair lock, blocking wait on the socket's queue, lost-wakeup
+  probe-after-enroll, sendto destination validation, NULL destination).
+  Gates on the landed tree: `just conformance-probes` 46/46 (PROBES_EXIT=0,
+  every generic shard MATCH), `just test` green, go-net_http x2 1316/1316.
+  Pin 321070a2c32be845 (`target/perf/closing/`). Task 5 running:
+  `measure-sep13c.sh` (cand 321070a2c32be845 vs pre-in-zone
+  457da5fb6521ff7b, five rows, w4 x3 alternating + w1), log
+  `target/conformance/eco-load/measure-sep13c.log`. Probe worktree and
+  branch removed; worktrees clean.
