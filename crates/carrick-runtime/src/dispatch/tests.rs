@@ -7533,6 +7533,387 @@ mod scm_rights_tests {
     }
 }
 
+#[cfg(test)]
+mod inzone_tcp {
+    use super::*;
+    use crate::compat::CompatReporter;
+    use carrick_abi::{
+        LINUX_AF_INET, LINUX_ECONNRESET, LINUX_POLLIN, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET,
+        LINUX_SO_ERROR,
+    };
+
+    const SYS_CLOSE: u64 = 57;
+    const SYS_READ: u64 = 63;
+    const SYS_WRITE: u64 = 64;
+    const SYS_SOCKET: u64 = 198;
+    const SYS_BIND: u64 = 200;
+    const SYS_LISTEN: u64 = 201;
+    const SYS_ACCEPT: u64 = 202;
+    const SYS_CONNECT: u64 = 203;
+    const SYS_GETSOCKNAME: u64 = 204;
+    const SYS_GETPEERNAME: u64 = 205;
+    const SYS_GETSOCKOPT: u64 = 209;
+
+    const MEM_BASE: u64 = 0x4000_0000;
+    const MEM_LEN: usize = 0x4000;
+    const ADDR_SCRATCH: u64 = MEM_BASE;
+    const ADDRLEN_SCRATCH: u64 = MEM_BASE + 0x40;
+    const DATA_SCRATCH: u64 = MEM_BASE + 0x100;
+
+    struct InZoneGuest {
+        dispatcher: SyscallDispatcher,
+        reporter: CompatReporter,
+        mem: LinearMemory,
+    }
+
+    impl InZoneGuest {
+        fn new() -> Self {
+            Self {
+                dispatcher: SyscallDispatcher::new(),
+                reporter: CompatReporter::default(),
+                mem: LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]),
+            }
+        }
+
+        fn call(&mut self, nr: u64, args: [u64; 6]) -> DispatchOutcome {
+            let kernel = self.dispatcher.capture_one_task_context().unwrap();
+            self.dispatcher
+                .dispatch(
+                    &kernel,
+                    SyscallRequest::new(nr, SyscallArgs(args)),
+                    &mut self.mem,
+                    &self.reporter,
+                )
+                .expect("dispatch")
+        }
+
+        fn ok(&mut self, nr: u64, args: [u64; 6]) -> i64 {
+            match self.call(nr, args) {
+                DispatchOutcome::Returned { value } => value,
+                other => panic!("syscall {nr} failed: {other:?}"),
+            }
+        }
+
+        fn make_sockaddr_in(&mut self, addr: u64, port: u16, ip: [u8; 4]) {
+            let mut sa = Vec::with_capacity(16);
+            sa.extend_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+            sa.extend_from_slice(&port.to_be_bytes());
+            sa.extend_from_slice(&ip);
+            sa.extend_from_slice(&[0u8; 8]);
+            self.mem.write_bytes(addr, &sa).unwrap();
+        }
+
+        fn read_sockaddr_in(&self, addr: u64) -> (u16, [u8; 4]) {
+            let bytes = self.mem.read_bytes(addr, 16).unwrap();
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let ip = [bytes[4], bytes[5], bytes[6], bytes[7]];
+            (port, ip)
+        }
+    }
+
+    #[test]
+    fn connect_accept_pairs_in_zone_with_no_host_accept() {
+        let mut g = InZoneGuest::new();
+        let listen_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        assert!(listen_fd >= 3);
+
+        g.make_sockaddr_in(ADDR_SCRATCH, 0, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
+            0
+        );
+
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKNAME,
+                [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+            ),
+            0
+        );
+        let (port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+        assert_ne!(port, 0);
+
+        let client_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        assert!(client_fd >= 3);
+
+        g.make_sockaddr_in(ADDR_SCRATCH, port, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+
+        // Client must be replaced with InMemorySocket
+        let client_of = g.dispatcher.open_file(client_fd).unwrap();
+        let client_desc = client_of.description();
+        let client_guard = client_desc.read().unwrap();
+        assert!(
+            matches!(&*client_guard, OpenDescription::InMemorySocket { .. }),
+            "client description must be InMemorySocket"
+        );
+        drop(client_guard);
+
+        // Accept connection
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        let accepted_fd = g.ok(
+            SYS_ACCEPT,
+            [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+        ) as i32;
+        assert!(accepted_fd >= 3);
+
+        let accepted_of = g.dispatcher.open_file(accepted_fd).unwrap();
+        let accepted_desc = accepted_of.description();
+        let accepted_guard = accepted_desc.read().unwrap();
+        assert!(
+            matches!(&*accepted_guard, OpenDescription::InMemorySocket { .. }),
+            "accepted description must be InMemorySocket"
+        );
+        drop(accepted_guard);
+
+        // Data round trip
+        g.mem.write_bytes(DATA_SCRATCH, b"hello in-zone").unwrap();
+        assert_eq!(
+            g.ok(SYS_WRITE, [client_fd as u64, DATA_SCRATCH, 13, 0, 0, 0]),
+            13
+        );
+        let read_scratch = DATA_SCRATCH + 0x50;
+        assert_eq!(
+            g.ok(SYS_READ, [accepted_fd as u64, read_scratch, 64, 0, 0, 0]),
+            13
+        );
+        assert_eq!(
+            &g.mem.read_bytes(read_scratch, 13).unwrap(),
+            b"hello in-zone"
+        );
+
+        // getpeername(accepted) == getsockname(client)
+        let addr_accepted_peer = ADDR_SCRATCH;
+        let len_accepted_peer = ADDRLEN_SCRATCH;
+        g.mem.write_bytes(len_accepted_peer, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETPEERNAME,
+                [
+                    accepted_fd as u64,
+                    addr_accepted_peer,
+                    len_accepted_peer,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        let (peer_port, peer_ip) = g.read_sockaddr_in(addr_accepted_peer);
+
+        let addr_client_local = ADDR_SCRATCH + 0x20;
+        let len_client_local = ADDRLEN_SCRATCH + 0x10;
+        g.mem.write_bytes(len_client_local, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKNAME,
+                [
+                    client_fd as u64,
+                    addr_client_local,
+                    len_client_local,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        let (client_port, client_ip) = g.read_sockaddr_in(addr_client_local);
+
+        assert_eq!((peer_port, peer_ip), (client_port, client_ip));
+
+        // Host socket must have had no host accept performed
+        let listen_of = g.dispatcher.open_file(listen_fd).unwrap();
+        let listen_desc = listen_of.description();
+        let listen_guard = listen_desc.read().unwrap();
+        if let OpenDescription::HostSocket { host_fd, .. } = &*listen_guard {
+            let mut pfd = libc::pollfd {
+                fd: host_fd.raw(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+            assert_eq!(rc, 0, "host listener must have no connections on host queue");
+        }
+    }
+
+    #[test]
+    fn readiness_agrees_when_one_connection_is_queued() {
+        let mut g = InZoneGuest::new();
+        let listen_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+
+        g.make_sockaddr_in(ADDR_SCRATCH, 0, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
+            0
+        );
+
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKNAME,
+                [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+            ),
+            0
+        );
+        let (port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+
+        // Before connect: no POLLIN
+        let poll_revents = g.dispatcher.poll_ready_events(listen_fd, LINUX_POLLIN);
+        assert_eq!(poll_revents & LINUX_POLLIN, 0);
+        let epoll_revents = g
+            .dispatcher
+            .epoll_ready_events(listen_fd, carrick_abi::LINUX_EPOLLIN);
+        assert_eq!(epoll_revents & carrick_abi::LINUX_EPOLLIN, 0);
+
+        // Connect client
+        let client_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        g.make_sockaddr_in(ADDR_SCRATCH, port, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+
+        // With one queued in-zone connection: both poll and readiness report readable
+        let poll_revents_after = g.dispatcher.poll_ready_events(listen_fd, LINUX_POLLIN);
+        let epoll_revents_after = g
+            .dispatcher
+            .epoll_ready_events(listen_fd, carrick_abi::LINUX_EPOLLIN);
+        assert_ne!(
+            poll_revents_after & LINUX_POLLIN,
+            0,
+            "poll_ready_events must report POLLIN"
+        );
+        assert_ne!(
+            epoll_revents_after & carrick_abi::LINUX_EPOLLIN,
+            0,
+            "epoll_ready_events must report EPOLLIN"
+        );
+    }
+
+    #[test]
+    fn closing_listener_with_queued_half_gives_econnreset_eof() {
+        let mut g = InZoneGuest::new();
+        let listen_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+
+        g.make_sockaddr_in(ADDR_SCRATCH, 0, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
+            0
+        );
+
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKNAME,
+                [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+            ),
+            0
+        );
+        let (port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+
+        let client_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        g.make_sockaddr_in(ADDR_SCRATCH, port, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+
+        // Close listener while connection is queued
+        assert_eq!(g.ok(SYS_CLOSE, [listen_fd as u64, 0, 0, 0, 0, 0]), 0);
+
+        // Client read must return EOF (0 bytes) or ECONNRESET
+        let read_res = g.call(SYS_READ, [client_fd as u64, DATA_SCRATCH, 64, 0, 0, 0]);
+        match read_res {
+            DispatchOutcome::Returned { value } => {
+                assert_eq!(value, 0, "client read must return 0 (EOF)")
+            }
+            DispatchOutcome::Errno { errno } => {
+                assert_eq!(errno, LINUX_ECONNRESET, "or ECONNRESET")
+            }
+            other => panic!("unexpected read outcome: {other:?}"),
+        }
+
+        // SO_ERROR on client must read ECONNRESET once, then 0
+        let optval = ADDR_SCRATCH;
+        let optlen = ADDRLEN_SCRATCH;
+        g.mem.write_bytes(optlen, &4u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKOPT,
+                [
+                    client_fd as u64,
+                    LINUX_SOL_SOCKET as u64,
+                    LINUX_SO_ERROR as u64,
+                    optval,
+                    optlen,
+                    0,
+                ],
+            ),
+            0
+        );
+        let err_bytes = g.mem.read_bytes(optval, 4).unwrap();
+        let err = i32::from_ne_bytes([err_bytes[0], err_bytes[1], err_bytes[2], err_bytes[3]]);
+        assert_eq!(err, LINUX_ECONNRESET.get(), "SO_ERROR must be ECONNRESET");
+
+        // Second SO_ERROR reads 0
+        g.mem.write_bytes(optlen, &4u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKOPT,
+                [
+                    client_fd as u64,
+                    LINUX_SOL_SOCKET as u64,
+                    LINUX_SO_ERROR as u64,
+                    optval,
+                    optlen,
+                    0,
+                ],
+            ),
+            0
+        );
+        let err_bytes2 = g.mem.read_bytes(optval, 4).unwrap();
+        let err2 =
+            i32::from_ne_bytes([err_bytes2[0], err_bytes2[1], err_bytes2[2], err_bytes2[3]]);
+        assert_eq!(err2, 0, "SO_ERROR second read must be 0");
+    }
+}
+
 
 
 

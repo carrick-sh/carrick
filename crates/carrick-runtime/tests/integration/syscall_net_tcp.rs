@@ -364,3 +364,240 @@ fn so_reuseport_and_bufsize_report_guest_values_not_host_widening() {
         "explicit SO_REUSEPORT must read back"
     );
 }
+
+#[test]
+fn loopback_tcp_echo_round_trip() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x2000]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let call = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            &d.capture_one_task_context().unwrap(),
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    // 1. Create listener socket: socket(AF_INET, SOCK_STREAM, 0)
+    let listen_fd = match call(&mut dispatcher, &mut memory, 198, [2, 1, 0, 0, 0, 0]) {
+        DispatchOutcome::Returned { value } => value as u64,
+        o => panic!("socket(AF_INET, SOCK_STREAM): {o:?}"),
+    };
+
+    // 2. Bind to 127.0.0.1:0
+    let bind_addr_ptr = 0x4000;
+    let mut sockaddr = [0u8; 16];
+    sockaddr[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
+    sockaddr[2..4].copy_from_slice(&0u16.to_be_bytes()); // port 0
+    sockaddr[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    memory.write_bytes(bind_addr_ptr, &sockaddr).unwrap();
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            200,
+            [listen_fd, bind_addr_ptr, 16, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // 3. Listen with backlog 16
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            201,
+            [listen_fd, 16, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // 4. getsockname to find bound port
+    let gsn_addr_ptr = 0x4100;
+    let gsn_len_ptr = 0x4120;
+    memory
+        .write_bytes(gsn_len_ptr, &16u32.to_ne_bytes())
+        .unwrap();
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            204,
+            [listen_fd, gsn_addr_ptr, gsn_len_ptr, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let gsn_bytes = memory.read_bytes(gsn_addr_ptr, 16).unwrap();
+    let port = u16::from_be_bytes([gsn_bytes[2], gsn_bytes[3]]);
+    assert_ne!(port, 0, "listener must have bound a non-zero port");
+
+    // 5. Create client socket: socket(AF_INET, SOCK_STREAM, 0)
+    let client_fd = match call(&mut dispatcher, &mut memory, 198, [2, 1, 0, 0, 0, 0]) {
+        DispatchOutcome::Returned { value } => value as u64,
+        o => panic!("client socket: {o:?}"),
+    };
+
+    // 6. Connect client to 127.0.0.1:port
+    let connect_addr_ptr = 0x4200;
+    let mut connect_sa = [0u8; 16];
+    connect_sa[0..2].copy_from_slice(&2u16.to_ne_bytes());
+    connect_sa[2..4].copy_from_slice(&port.to_be_bytes());
+    connect_sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    memory.write_bytes(connect_addr_ptr, &connect_sa).unwrap();
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            203,
+            [client_fd, connect_addr_ptr, 16, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 },
+        "connect to in-zone listener should succeed immediately"
+    );
+
+    // 7. Accept on listener
+    let accept_peer_ptr = 0x4300;
+    let accept_len_ptr = 0x4320;
+    memory
+        .write_bytes(accept_len_ptr, &16u32.to_ne_bytes())
+        .unwrap();
+    let accepted_fd = match call(
+        &mut dispatcher,
+        &mut memory,
+        202,
+        [listen_fd, accept_peer_ptr, accept_len_ptr, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        o => panic!("accept: {o:?}"),
+    };
+
+    // Verify accept returned client's address
+    let peer_bytes = memory.read_bytes(accept_peer_ptr, 16).unwrap();
+    let peer_port = u16::from_be_bytes([peer_bytes[2], peer_bytes[3]]);
+    assert_ne!(
+        peer_port, 0,
+        "accepted peer port must be non-zero ephemeral port"
+    );
+    assert_eq!(&peer_bytes[4..8], &[127, 0, 0, 1]);
+
+    // 8. Client writes "ping in-zone tcp"
+    let send_buf_ptr = 0x4400;
+    let ping_msg = b"ping in-zone tcp";
+    memory.write_bytes(send_buf_ptr, ping_msg).unwrap();
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            64, // write
+            [client_fd, send_buf_ptr, ping_msg.len() as u64, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned {
+            value: ping_msg.len() as i64
+        }
+    );
+
+    // 9. Accepted reads "ping in-zone tcp"
+    let recv_buf_ptr = 0x4500;
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            63, // read
+            [accepted_fd, recv_buf_ptr, 128, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned {
+            value: ping_msg.len() as i64
+        }
+    );
+    assert_eq!(
+        &memory.read_bytes(recv_buf_ptr, ping_msg.len()).unwrap()[..],
+        ping_msg
+    );
+
+    // 10. Accepted writes echo back: "pong in-zone tcp"
+    let pong_msg = b"pong in-zone tcp";
+    memory.write_bytes(send_buf_ptr, pong_msg).unwrap();
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            64,
+            [accepted_fd, send_buf_ptr, pong_msg.len() as u64, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned {
+            value: pong_msg.len() as i64
+        }
+    );
+
+    // 11. Client reads echo back
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            63,
+            [client_fd, recv_buf_ptr, 128, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned {
+            value: pong_msg.len() as i64
+        }
+    );
+    assert_eq!(
+        &memory.read_bytes(recv_buf_ptr, pong_msg.len()).unwrap()[..],
+        pong_msg
+    );
+
+    // 12. getsockname(client) == getpeername(accepted)
+    let client_gsn_ptr = 0x4600;
+    let client_gsn_len = 0x4620;
+    memory
+        .write_bytes(client_gsn_len, &16u32.to_ne_bytes())
+        .unwrap();
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            204,
+            [client_fd, client_gsn_ptr, client_gsn_len, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let client_sockname = memory.read_bytes(client_gsn_ptr, 16).unwrap();
+
+    let accepted_gpn_ptr = 0x4700;
+    let accepted_gpn_len = 0x4720;
+    memory
+        .write_bytes(accepted_gpn_len, &16u32.to_ne_bytes())
+        .unwrap();
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            205,
+            [accepted_fd, accepted_gpn_ptr, accepted_gpn_len, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let accepted_peername = memory.read_bytes(accepted_gpn_ptr, 16).unwrap();
+    assert_eq!(client_sockname, accepted_peername);
+
+    // 13. Clean close
+    assert_eq!(
+        call(&mut dispatcher, &mut memory, 57, [client_fd, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            57,
+            [accepted_fd, 0, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        call(&mut dispatcher, &mut memory, 57, [listen_fd, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+}
