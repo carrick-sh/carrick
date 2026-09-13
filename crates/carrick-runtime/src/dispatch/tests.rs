@@ -8127,9 +8127,14 @@ mod inzone_tcp {
         // Nothing was delivered by the rejected calls.
         let poll_in = g.dispatcher.poll_ready_events(server_fd, LINUX_POLLIN);
         assert_eq!(poll_in & LINUX_POLLIN, 0, "rejected sendto must not deliver");
-        // An unreadable address with addrlen 0 and a valid ignored destination both deliver.
+        // An unreadable address with addrlen 0, a NULL address with a positive
+        // addrlen, and a valid ignored destination all deliver.
         assert_eq!(
             g.ok(SYS_SENDTO, [client_fd as u64, DATA_SCRATCH, 7, 0, unmapped, 0]),
+            7
+        );
+        assert_eq!(
+            g.ok(SYS_SENDTO, [client_fd as u64, DATA_SCRATCH, 7, 0, 0, 16]),
             7
         );
         assert_eq!(
