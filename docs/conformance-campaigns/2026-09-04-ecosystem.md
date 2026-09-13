@@ -3666,3 +3666,35 @@ alias lock order) are closed. Distance to the 2x bar at w4: compile 3.73,
 tarfile 3.62, net_http 3.53, multiprocessing 3.24, importlib 2.71; at w1
 importlib 1.88 (under), multiprocessing 2.17, compile 2.62. Next targets
 are compile and tarfile, from fresh profiles on this binary.
+
+## 2026-09-12 21:30 — hostfs-opens landed; two more fork-barrier lost wakeups closed
+
+`hostfs-opens` round 2 landed (52420d8ca..4ea079b9d): host `openat`
+amplification on mkdir/dirents/stat (fchmodat after mkdirat for mode
+fidelity, per-directory marker tracking instead of a tree-wide flag,
+`mkdir_under_parent`, cached-dirfd reuse in `open_trusted_dir_fd` /
+`validate_parents_fast`), plus two director fixes found by the gate and by
+review: rename/link propagate the per-directory marker stamp, and the
+`set_mode` fast path guards on `serves_plain_metadata` (the branch gate
+read `bindunixnode` `chmod_bits_600=false`: marker nodes carry their mode
+xattr under the marker-nodes root flag, so chmod on a bound socket
+returned early). Branch receipts (binary 2ec35ff48af18a88, tarfile row
+profiled): mkdir mode table exact vs the oracle (0o777/775/2775 under
+umask 0), tarfile 15.2 → 13.2/13.4 s wall, `__openat` 51.5% → 18.7% of
+samples, `layered_directory_entries` 26.7% → 5.2%; residue getdents64
+~24%, mkdirat 17.3% inclusive.
+
+The branch gate then exposed a pre-existing hang class on main:
+`forkexecstorm` stuck at its FIRST vfork (attempted N, spawned 0) until
+its supervisor SIGKILLs the group and the teardown aborts the carrier.
+Live captures (`carrick debug lldb-run --deadline-seconds 6`, eight-way;
+only a hung run dumps) named two lost wakeups in the fork-barrier /
+clone-admission triangle: the fork LOSER spun on `subscribe_quiesce`
+after c40654c00 (fixed 3dbd77c72, `subscribe_fork_release`), and the fork
+WINNER parked on the kernel reservation epoch after yielding to a
+thread-clone permit whose release publishes only the admission epoch
+(fixed 36ae60e53, `ForkCloseAttempt::PermitsInFlight`). Receipts:
+forkexecstorm eight-way ×6 = 48/48 on c54325cc70b4a47f (4 hung of 48
+before); probe gate 46/46 on c54325cc70b4a47f and on the merged main
+67e536aace35f82e. Paired scorecard (`measure-sep12d.sh`, candidate
+67e536aace35f82e vs base 3c8dbee5b686c49d) running; table follows.
