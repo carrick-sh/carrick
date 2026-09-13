@@ -3547,16 +3547,10 @@ impl SyscallDispatcher {
         fd: i32,
         events: u32,
         last_ready: u32,
-        last_read_avail: u64,
         write_backpressured: bool,
     ) -> carrick_hal::event::Interest {
-        self.net_view().epoll_effective_interest(
-            fd,
-            events,
-            last_ready,
-            last_read_avail,
-            write_backpressured,
-        )
+        self.net_view()
+            .epoll_effective_interest(fd, events, last_ready, write_backpressured)
     }
 
     #[inline]

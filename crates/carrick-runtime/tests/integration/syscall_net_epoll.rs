@@ -2357,19 +2357,16 @@ fn epoll_et_unread_data_does_not_spin_and_waits_for_next_edge() {
         &reporter,
     );
 
-    // Give host network stack time to establish connection
-    std::thread::sleep(std::time::Duration::from_millis(20));
-
-    // First epoll_pwait returns the edge for client 1
+    // First epoll_pwait returns the edge for client 1 (the wait helper parks on
+    // the instance kqueue until the loopback handshake lands; the 1 s cap turns
+    // a lost wake into a failure, not a hang).
     assert_eq!(
-        dispatcher
-            .dispatch(
-                &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(22, SyscallArgs::from([epfd, 0x4100, 4, 100, 0, 0])),
-                &mut memory,
-                &reporter,
-            )
-            .unwrap(),
+        dispatch_with_wait(
+            &mut dispatcher,
+            SyscallRequest::new(22, SyscallArgs::from([epfd, 0x4100, 4, 1000, 0, 0])),
+            &mut memory,
+            &reporter,
+        ),
         DispatchOutcome::Returned { value: 1 }
     );
     let first = read_epoll_event(&memory, 0x4100);
@@ -2454,10 +2451,9 @@ fn epoll_et_unread_data_does_not_spin_and_waits_for_next_edge() {
         &mut memory,
         &reporter,
     );
-    std::thread::sleep(std::time::Duration::from_millis(20));
-
-    // Now kq_fd MUST be readable because new connection arrived!
-    let host_ready_after_connect = unsafe { libc::poll(&mut host_pollfd, 1, 100) };
+    // Now kq_fd MUST become readable because a new connection arrived (bounded
+    // 1 s wait: a lost edge is a failure, not a hang).
+    let host_ready_after_connect = unsafe { libc::poll(&mut host_pollfd, 1, 1000) };
     assert_eq!(
         host_ready_after_connect, 1,
         "instance kqueue fd must become readable when new connection arrives"
