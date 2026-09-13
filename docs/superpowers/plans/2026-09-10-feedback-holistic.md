@@ -969,3 +969,20 @@ commits and is re-checked at the next vet.
   as readiness. Round 2 (fan-out, error filtering, missing gates) sent;
   round 3 (`EV_ONESHOT` per enrollment, no double publish, spin test)
   queued behind it.
+- 2026-09-13 05:05, `reactor-kqueue-sep13` rounds 2–3 (fan-out map, error
+  filtering, EV_ONESHOT delivery; 5eb37ee06, 2a6cc64eb) still wedge:
+  go-net_http harness 540 s TIMEOUT / 14.5 s / 540 s TIMEOUT on
+  432df2f7a17342d0. Live captures `target/perf/perf2x-sep12/kqcap/kqc-{2,4}`
+  (deadline dump): reactor parked in `kevent`, ring tail = thousands of
+  `EPWAIT ready=0 timeout=-1` / `EPWFD fd=<instance kqueue> events=0x1`
+  pairs — the guest is woken from an infinite epoll wait, finds nothing it
+  may report, re-enrolls, is woken again. Root cause is pre-existing and
+  only exposed by O(ready) wakes: guest EPOLLET is emulated by a software
+  latch (read-side via FIONREAD growth) while the instance kqueue registers
+  the interest LEVEL-triggered, so after a delivered edge with unread bytes
+  the instance fd stays readable and any wait on it returns at once (the
+  old poll reactor spun on this too, slowly). Round 4 brief: register
+  EPOLLET read interests on the instance kqueue with `EV_CLEAR` (Linux ET
+  semantics in-kernel), red-first "instance fd not readable after a
+  delivered edge with unread data", the epoll/ppoll line-exact probes as
+  judges, three harness timings with any TIMEOUT captured.
