@@ -39,10 +39,22 @@ pub struct ControlEndpoint {
     socket: PathBuf,
 }
 
+/// Where the owning carrier is in its life. `TearingDown` names the window
+/// between the control server stopping admission (container teardown after
+/// the guest executors join) and the terminal receipt being persisted: the
+/// container state still reads Running there, and a client must wait for
+/// the receipt instead of treating the closed socket as an error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum OwnerPhase {
+    Serving,
+    TearingDown,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CurrentOwner {
     pub pid: u32,
     pub nonce: ControlNonce,
+    pub phase: OwnerPhase,
 }
 
 impl ControlEndpoint {
@@ -136,9 +148,31 @@ impl ControlEndpoint {
 
     pub fn publish_bound_owner(&self, nonce: ControlNonce) -> Result<(), EndpointError> {
         fs::set_permissions(&self.socket, fs::Permissions::from_mode(FILE_MODE))?;
+        self.write_owner_record(nonce, OwnerPhase::Serving)
+    }
+
+    /// Rewrite the owner record as `TearingDown` (atomically, like the
+    /// publication) so a client authenticating the same nonce learns the
+    /// carrier is between admission stop and its terminal receipt. Only the
+    /// current owner may do this; anything else leaves the record untouched.
+    pub fn mark_tearing_down_if_owner(&self, nonce: ControlNonce) -> Result<(), EndpointError> {
+        match self.read_owner()? {
+            Some(owner) if owner.pid == std::process::id() && owner.nonce == nonce => {
+                self.write_owner_record(nonce, OwnerPhase::TearingDown)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn write_owner_record(
+        &self,
+        nonce: ControlNonce,
+        phase: OwnerPhase,
+    ) -> Result<(), EndpointError> {
         let owner = OwnerRecord {
             pid: std::process::id(),
             nonce,
+            phase,
         };
         let path = self.owner_path();
         let temporary = self.directory.join(format!("owner.{}.tmp", nonce.hex()));
@@ -166,6 +200,7 @@ impl ControlEndpoint {
         Ok(CurrentOwner {
             pid: owner.pid,
             nonce: owner.nonce,
+            phase: owner.phase,
         })
     }
 
@@ -231,6 +266,7 @@ fn validate_owned_private_directory(
 struct OwnerRecord {
     pid: u32,
     nonce: ControlNonce,
+    phase: OwnerPhase,
 }
 
 fn remove_file(path: &Path) -> Result<(), EndpointError> {
@@ -327,6 +363,7 @@ mod tests {
             CurrentOwner {
                 pid: u32::MAX,
                 nonce,
+                phase: OwnerPhase::Serving,
             }
         );
     }
