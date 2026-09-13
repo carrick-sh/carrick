@@ -4471,6 +4471,14 @@ impl FsBackend for HostFsBackend {
                         };
                     }
                 } else {
+                    unsafe {
+                        libc::fchmodat(
+                            parent_fd.as_raw_fd(),
+                            leaf_name.as_ptr(),
+                            native_mode,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        );
+                    }
                     let flags = libc::O_RDONLY
                         | libc::O_DIRECTORY
                         | libc::O_CLOEXEC
@@ -4499,6 +4507,10 @@ impl FsBackend for HostFsBackend {
                     Some(refused) => Err(BackendError::Host(refused)),
                     None => Err(BackendError::Io),
                 };
+            }
+        } else {
+            unsafe {
+                libc::fchmodat(pfd, name_c.as_ptr(), native_mode, libc::AT_SYMLINK_NOFOLLOW);
             }
         }
         self.clear_whiteout_normalized(rel.as_path());
