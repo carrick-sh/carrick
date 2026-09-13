@@ -10,6 +10,9 @@ use carrick_abi::{LINUX_AF_PACKET, LINUX_SOL_PACKET};
 use super::support::*;
 use super::*;
 
+const LINUX_DEFAULT_SOCKBUF: i32 = 212_992;
+const LINUX_TCP_INFO: i32 = 11;
+
 const MCAST_JOIN_GROUP: i32 = 42;
 const MCAST_BLOCK_SOURCE: i32 = 43;
 const MCAST_UNBLOCK_SOURCE: i32 = 44;
@@ -79,6 +82,299 @@ fn mcast_setsockopt_outcome(
     }
 }
 
+fn setsockopt_in_memory(
+    socket: &std::sync::Arc<crate::dispatch::net::unix_pure::PureSocketInner>,
+    memory: &impl CurrentMmMemory,
+    level: i32,
+    optname: i32,
+    optval_addr: u64,
+    optlen: u32,
+) -> DispatchOutcome {
+    if level == LINUX_SOL_SOCKET {
+        match optname {
+            LINUX_SO_KEEPALIVE => {
+                if optlen < 4 {
+                    return DispatchOutcome::errno(LINUX_EINVAL);
+                }
+                let Ok(b) = memory.read_bytes(optval_addr, 4) else {
+                    return DispatchOutcome::errno(LINUX_EFAULT);
+                };
+                let val = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+                socket.set_so_keepalive(val != 0);
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_SO_RCVBUF => {
+                if optlen < 4 {
+                    return DispatchOutcome::errno(LINUX_EINVAL);
+                }
+                let Ok(b) = memory.read_bytes(optval_addr, 4) else {
+                    return DispatchOutcome::errno(LINUX_EFAULT);
+                };
+                let val = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+                socket.set_so_rcvbuf(val.max(0) as usize);
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_SO_SNDBUF => {
+                if optlen < 4 {
+                    return DispatchOutcome::errno(LINUX_EINVAL);
+                }
+                let Ok(b) = memory.read_bytes(optval_addr, 4) else {
+                    return DispatchOutcome::errno(LINUX_EFAULT);
+                };
+                let val = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+                socket.set_so_sndbuf(val.max(0) as usize);
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_SO_LINGER => {
+                if (optlen as usize) < std::mem::size_of::<i32>() * 2 {
+                    return DispatchOutcome::errno(LINUX_EINVAL);
+                }
+                let Ok(b) = memory.read_bytes(optval_addr, 8) else {
+                    return DispatchOutcome::errno(LINUX_EFAULT);
+                };
+                let onoff = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+                let linger = i32::from_ne_bytes([b[4], b[5], b[6], b[7]]);
+                socket.set_so_linger((onoff, linger));
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_SO_RCVTIMEO | LINUX_SO_SNDTIMEO => {
+                if (optlen as usize) < 16 {
+                    return DispatchOutcome::errno(LINUX_EINVAL);
+                }
+                let Ok(b) = memory.read_bytes(optval_addr, 16) else {
+                    return DispatchOutcome::errno(LINUX_EFAULT);
+                };
+                let Ok(sec_bytes) = b[0..8].try_into() else {
+                    return DispatchOutcome::errno(LINUX_EINVAL);
+                };
+                let sec = i64::from_ne_bytes(sec_bytes);
+                let Ok(usec_bytes) = b[8..16].try_into() else {
+                    return DispatchOutcome::errno(LINUX_EINVAL);
+                };
+                let usec = i64::from_ne_bytes(usec_bytes);
+                let dur = if sec < 0 || usec < 0 {
+                    return DispatchOutcome::errno(LINUX_EINVAL);
+                } else if sec == 0 && usec == 0 {
+                    None
+                } else {
+                    Some(
+                        std::time::Duration::from_secs(sec as u64)
+                            + std::time::Duration::from_micros(usec as u64),
+                    )
+                };
+                if optname == LINUX_SO_RCVTIMEO {
+                    socket.set_rcvtimeo(dur);
+                } else {
+                    socket.set_sndtimeo(dur);
+                }
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_SO_REUSEADDR | LINUX_SO_REUSEPORT | crate::linux_abi::LINUX_SO_PASSCRED => {
+                DispatchOutcome::Returned { value: 0 }
+            }
+            _ => DispatchOutcome::Returned { value: 0 },
+        }
+    } else if level == crate::linux_abi::LINUX_SOL_TCP {
+        if socket.family == crate::linux_abi::LINUX_AF_UNIX {
+            return DispatchOutcome::errno(LINUX_ENOPROTOOPT);
+        }
+        if socket.family != crate::linux_abi::LINUX_AF_INET
+            && socket.family != crate::linux_abi::LINUX_AF_INET6
+        {
+            return DispatchOutcome::errno(LINUX_ENOPROTOOPT);
+        }
+        match optname {
+            LINUX_TCP_NODELAY => {
+                if optlen < 4 {
+                    return DispatchOutcome::errno(LINUX_EINVAL);
+                }
+                let Ok(b) = memory.read_bytes(optval_addr, 4) else {
+                    return DispatchOutcome::errno(LINUX_EFAULT);
+                };
+                let val = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+                socket.set_tcp_nodelay(val != 0);
+                DispatchOutcome::Returned { value: 0 }
+            }
+            crate::linux_abi::LINUX_TCP_KEEPIDLE => {
+                if optlen < 4 {
+                    return DispatchOutcome::errno(LINUX_EINVAL);
+                }
+                let Ok(b) = memory.read_bytes(optval_addr, 4) else {
+                    return DispatchOutcome::errno(LINUX_EFAULT);
+                };
+                let val = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+                socket.set_tcp_keepidle(val);
+                DispatchOutcome::Returned { value: 0 }
+            }
+            crate::linux_abi::LINUX_TCP_KEEPINTVL => {
+                if optlen < 4 {
+                    return DispatchOutcome::errno(LINUX_EINVAL);
+                }
+                let Ok(b) = memory.read_bytes(optval_addr, 4) else {
+                    return DispatchOutcome::errno(LINUX_EFAULT);
+                };
+                let val = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+                socket.set_tcp_keepintvl(val);
+                DispatchOutcome::Returned { value: 0 }
+            }
+            crate::linux_abi::LINUX_TCP_KEEPCNT => {
+                if optlen < 4 {
+                    return DispatchOutcome::errno(LINUX_EINVAL);
+                }
+                let Ok(b) = memory.read_bytes(optval_addr, 4) else {
+                    return DispatchOutcome::errno(LINUX_EFAULT);
+                };
+                let val = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+                socket.set_tcp_keepcnt(val);
+                DispatchOutcome::Returned { value: 0 }
+            }
+            _ => DispatchOutcome::Returned { value: 0 },
+        }
+    } else if socket.family == crate::linux_abi::LINUX_AF_UNIX {
+        DispatchOutcome::errno(LINUX_ENOPROTOOPT)
+    } else {
+        DispatchOutcome::Returned { value: 0 }
+    }
+}
+
+fn getsockopt_in_memory<M: CurrentMmMemory>(
+    socket: &std::sync::Arc<crate::dispatch::net::unix_pure::PureSocketInner>,
+    memory: &mut M,
+    level: i32,
+    optname: i32,
+    optval_addr: u64,
+    optlen_addr: u64,
+) -> Result<DispatchOutcome, DispatchError> {
+    if level == LINUX_SOL_SOCKET {
+        match optname {
+            LINUX_SO_TYPE => write_sockopt_value(
+                memory,
+                optval_addr,
+                optlen_addr,
+                &socket.socket_type.to_ne_bytes(),
+            ),
+            crate::linux_abi::LINUX_SO_DOMAIN => write_sockopt_value(
+                memory,
+                optval_addr,
+                optlen_addr,
+                &socket.family.to_ne_bytes(),
+            ),
+            crate::linux_abi::LINUX_SO_PROTOCOL => write_sockopt_value(
+                memory,
+                optval_addr,
+                optlen_addr,
+                &socket.protocol.to_ne_bytes(),
+            ),
+            LINUX_SO_ACCEPTCONN => {
+                let val: i32 = if socket.is_listening() { 1 } else { 0 };
+                write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
+            }
+            LINUX_SO_ERROR => {
+                let val: i32 = socket.take_so_error().unwrap_or(0);
+                write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
+            }
+            LINUX_SO_KEEPALIVE => {
+                let val: i32 = if socket.so_keepalive() { 1 } else { 0 };
+                write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
+            }
+            LINUX_SO_RCVBUF => {
+                let val: i32 = socket
+                    .so_rcvbuf_explicit()
+                    .map_or(LINUX_DEFAULT_SOCKBUF, |v| v.saturating_mul(2) as i32);
+                write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
+            }
+            LINUX_SO_SNDBUF => {
+                let val: i32 = socket
+                    .so_sndbuf_explicit()
+                    .map_or(LINUX_DEFAULT_SOCKBUF, |v| v.saturating_mul(2) as i32);
+                write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
+            }
+            LINUX_SO_LINGER => {
+                let (onoff, linger) = socket.so_linger();
+                let mut b = [0u8; 8];
+                b[0..4].copy_from_slice(&onoff.to_ne_bytes());
+                b[4..8].copy_from_slice(&linger.to_ne_bytes());
+                write_sockopt_value(memory, optval_addr, optlen_addr, &b)
+            }
+            LINUX_SO_RCVTIMEO | LINUX_SO_SNDTIMEO => {
+                let dur = if optname == LINUX_SO_RCVTIMEO {
+                    socket.get_rcvtimeo()
+                } else {
+                    socket.get_sndtimeo()
+                };
+                let tv_sec = dur.map(|d| d.as_secs() as i64).unwrap_or(0);
+                let tv_usec = dur.map(|d| d.subsec_micros() as i64).unwrap_or(0);
+                let mut tv_bytes = [0u8; 16];
+                tv_bytes[0..8].copy_from_slice(&tv_sec.to_ne_bytes());
+                tv_bytes[8..16].copy_from_slice(&tv_usec.to_ne_bytes());
+                write_sockopt_value(memory, optval_addr, optlen_addr, &tv_bytes)
+            }
+            LINUX_SO_REUSEADDR | LINUX_SO_REUSEPORT => {
+                let val: i32 = 0;
+                write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
+            }
+            _ => {
+                let val: i32 = 0;
+                write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
+            }
+        }
+    } else if level == crate::linux_abi::LINUX_SOL_TCP {
+        if socket.family == crate::linux_abi::LINUX_AF_UNIX {
+            return Ok(DispatchOutcome::errno(LINUX_ENOPROTOOPT));
+        }
+        if socket.family != crate::linux_abi::LINUX_AF_INET
+            && socket.family != crate::linux_abi::LINUX_AF_INET6
+        {
+            return Ok(DispatchOutcome::errno(LINUX_ENOPROTOOPT));
+        }
+        match optname {
+            LINUX_TCP_NODELAY => {
+                let val: i32 = if socket.tcp_nodelay() { 1 } else { 0 };
+                write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
+            }
+            crate::linux_abi::LINUX_TCP_KEEPIDLE => {
+                let val = socket.tcp_keepidle();
+                write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
+            }
+            crate::linux_abi::LINUX_TCP_KEEPINTVL => {
+                let val = socket.tcp_keepintvl();
+                write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
+            }
+            crate::linux_abi::LINUX_TCP_KEEPCNT => {
+                let val = socket.tcp_keepcnt();
+                write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
+            }
+            LINUX_TCP_INFO => {
+                let state_val: u8 = if socket.is_listening() {
+                    10 // TCP_LISTEN
+                } else {
+                    let p = socket.state.lock();
+                    let peer_closed = p.peer.as_ref().and_then(|weak| weak.upgrade()).is_none();
+                    if peer_closed || (p.shutdown_read && p.shutdown_write) {
+                        7 // TCP_CLOSE
+                    } else if p.shutdown_write {
+                        5 // TCP_FIN_WAIT2
+                    } else {
+                        1 // TCP_ESTABLISHED
+                    }
+                };
+                let mut info = [0u8; 128];
+                info[0] = state_val;
+                write_sockopt_value(memory, optval_addr, optlen_addr, &info)
+            }
+            _ => {
+                let val: i32 = 0;
+                write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
+            }
+        }
+    } else if socket.family == crate::linux_abi::LINUX_AF_UNIX {
+        Ok(DispatchOutcome::errno(LINUX_ENOPROTOOPT))
+    } else {
+        let val: i32 = 0;
+        write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
+    }
+}
+
 impl<'a> NetView<'a> {
     define_syscall! {
         fn setsockopt(this, cx, fd: Fd, level: u64, optname: u64, optval: GuestPtr, optlen: u64) {
@@ -110,8 +406,10 @@ impl<'a> NetView<'a> {
                         drop(desc);
                         return Ok(socket.setsockopt(memory, level, optname, optval_addr, optlen));
                     }
-                    if matches!(&*desc, OpenDescription::InMemorySocket { .. }) {
-                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    if let OpenDescription::InMemorySocket { socket, .. } = &*desc {
+                        let socket = Arc::clone(socket);
+                        drop(desc);
+                        return Ok(setsockopt_in_memory(&socket, memory, level, optname, optval_addr, optlen));
                     }
                     if !matches!(&*desc, OpenDescription::HostSocket { .. }) {
                         return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
@@ -518,18 +816,7 @@ impl<'a> NetView<'a> {
                     if let OpenDescription::InMemorySocket { socket, .. } = &*desc {
                         let socket = Arc::clone(socket);
                         drop(desc);
-                        let val: i32 = if level == LINUX_SOL_SOCKET {
-                            match optname {
-                                LINUX_SO_TYPE => socket.socket_type,
-                                crate::linux_abi::LINUX_SO_DOMAIN => socket.family,
-                                crate::linux_abi::LINUX_SO_PROTOCOL => socket.protocol,
-                                LINUX_SO_ERROR => socket.take_so_error().unwrap_or(0),
-                                _ => 0,
-                            }
-                        } else {
-                            0
-                        };
-                        return write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes());
+                        return getsockopt_in_memory(&socket, memory, level, optname, optval_addr, optlen_addr);
                     }
                     if let OpenDescription::Packet { socket, .. } = &*desc {
                         let socket = Arc::clone(socket);
@@ -601,7 +888,6 @@ impl<'a> NetView<'a> {
                     || optname == LINUX_SO_ACCEPTCONN
                     || optname == crate::linux_abi::LINUX_SO_PASSCRED)
             {
-                const LINUX_DEFAULT_SOCKBUF: i32 = 212_992;
                 let Some(open_file) = this.open_file(fd) else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
@@ -987,5 +1273,188 @@ mod ipv6_addrform_tests {
             dispatcher.host_socket_lookup(fd).unwrap().0.get(),
             old_host.get()
         );
+    }
+}
+
+#[cfg(test)]
+mod in_memory_sockopt_tests {
+    use super::*;
+    use crate::dispatch::net::unix_pure::{LinuxUcred, PureSocketInner};
+    use crate::dispatch::{
+        CompatReporter, LinearMemory, OpenDescription, OpenDescriptionBase, OpenFile, SyscallArgs,
+        SyscallRequest,
+    };
+    use crate::linux_abi::{
+        LINUX_AF_INET, LINUX_AF_UNIX, LINUX_ENOPROTOOPT, LINUX_IPPROTO_TCP, LINUX_O_RDWR,
+        LINUX_SOCK_STREAM, LINUX_SOL_TCP, LINUX_TCP_NODELAY,
+    };
+    use parking_lot::RwLock;
+
+    #[test]
+    fn inet_in_memory_socket_tcp_nodelay_round_trip_and_af_unix_enoprotoopt() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+
+        // 1. AF_UNIX in-memory socket: TCP_NODELAY must return ENOPROTOOPT
+        let u1 = PureSocketInner::new_with_family(
+            LINUX_AF_UNIX,
+            LINUX_SOCK_STREAM,
+            0,
+            LinuxUcred::default(),
+        );
+        let unix_fd = dispatcher
+            .install_fd_at_or_above(
+                3,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::InMemorySocket {
+                        base: OpenDescriptionBase::new(0),
+                        socket: u1,
+                    })),
+                    LINUX_O_RDWR,
+                    0,
+                ),
+            )
+            .unwrap();
+
+        let base = 0x5000u64;
+        let mut memory = LinearMemory::new(base, vec![0u8; 0x1000]);
+        memory.write_bytes(base, &1i32.to_ne_bytes()).unwrap();
+
+        // setsockopt(unix_fd, SOL_TCP, TCP_NODELAY) -> ENOPROTOOPT
+        let out_unix_set = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    208,
+                    SyscallArgs::from([
+                        unix_fd as u64,
+                        LINUX_SOL_TCP as u64,
+                        LINUX_TCP_NODELAY as u64,
+                        base,
+                        4,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out_unix_set, DispatchOutcome::errno(LINUX_ENOPROTOOPT));
+
+        // getsockopt(unix_fd, SOL_TCP, TCP_NODELAY) -> ENOPROTOOPT
+        memory.write_bytes(base + 8, &4u32.to_ne_bytes()).unwrap();
+        let out_unix_get = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    209,
+                    SyscallArgs::from([
+                        unix_fd as u64,
+                        LINUX_SOL_TCP as u64,
+                        LINUX_TCP_NODELAY as u64,
+                        base,
+                        base + 8,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out_unix_get, DispatchOutcome::errno(LINUX_ENOPROTOOPT));
+
+        // 2. AF_INET in-memory socket: TCP_NODELAY set/get round-trips
+        let (s1, _s2) = PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+        let inet_fd = dispatcher
+            .install_fd_at_or_above(
+                4,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::InMemorySocket {
+                        base: OpenDescriptionBase::new(0),
+                        socket: s1,
+                    })),
+                    LINUX_O_RDWR,
+                    0,
+                ),
+            )
+            .unwrap();
+
+        // getsockopt initially returns 0
+        memory.write_bytes(base + 8, &4u32.to_ne_bytes()).unwrap();
+        let out_inet_get0 = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    209,
+                    SyscallArgs::from([
+                        inet_fd as u64,
+                        LINUX_SOL_TCP as u64,
+                        LINUX_TCP_NODELAY as u64,
+                        base,
+                        base + 8,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out_inet_get0, DispatchOutcome::Returned { value: 0 });
+        let val0 = i32::from_ne_bytes(memory.read_bytes(base, 4).unwrap().try_into().unwrap());
+        assert_eq!(val0, 0);
+
+        // setsockopt TCP_NODELAY = 1
+        memory.write_bytes(base, &1i32.to_ne_bytes()).unwrap();
+        let out_inet_set = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    208,
+                    SyscallArgs::from([
+                        inet_fd as u64,
+                        LINUX_SOL_TCP as u64,
+                        LINUX_TCP_NODELAY as u64,
+                        base,
+                        4,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out_inet_set, DispatchOutcome::Returned { value: 0 });
+
+        // getsockopt returns 1
+        memory.write_bytes(base, &0i32.to_ne_bytes()).unwrap();
+        memory.write_bytes(base + 8, &4u32.to_ne_bytes()).unwrap();
+        let out_inet_get1 = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    209,
+                    SyscallArgs::from([
+                        inet_fd as u64,
+                        LINUX_SOL_TCP as u64,
+                        LINUX_TCP_NODELAY as u64,
+                        base,
+                        base + 8,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out_inet_get1, DispatchOutcome::Returned { value: 0 });
+        let val1 = i32::from_ne_bytes(memory.read_bytes(base, 4).unwrap().try_into().unwrap());
+        assert_eq!(val1, 1);
     }
 }

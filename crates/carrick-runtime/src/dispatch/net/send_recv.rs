@@ -628,7 +628,8 @@ impl<'a> NetView<'a> {
                         let socket = Arc::clone(socket);
                         drop(open);
                         let mut target_buf = vec![0u8; len];
-                        match socket.recv_stream(&mut target_buf, 0) {
+                        let peek = flags & LinuxMsgFlags::PEEK.bits() != 0;
+                        match socket.recv_stream_flags(&mut target_buf, 0, peek) {
                             Ok((read_len, _rights)) => {
                                 if read_len > 0 {
                                     if memory.write_bytes(buf_addr, &target_buf[..read_len]).is_err() {
@@ -870,7 +871,12 @@ impl<'a> NetView<'a> {
         }
 
         fn sendmsg(this, cx, fd: Fd, msg: GuestPtr, flags: u64) {
-            this.sendmsg_inner(cx.kernel, fd.0, msg.0, flags as i32, &*cx.memory)
+            let outcome = this.sendmsg_inner(cx.kernel, fd.0, msg.0, flags as i32, &*cx.memory)?;
+            if (flags as i32 & LINUX_MSG_NOSIGNAL) == 0 {
+                Ok(this.raise_sigpipe_on_epipe(cx, outcome))
+            } else {
+                Ok(outcome)
+            }
         }
 
         fn recvmsg(this, cx, fd: Fd, msg: GuestPtr, flags: u64) {
@@ -1299,7 +1305,8 @@ impl<'a> NetView<'a> {
             let iovecs = read_iovecs(memory, msg.iov, msg.iovlen as usize)?;
             let total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
             let mut target_buf = vec![0u8; total];
-            match socket.recv_stream(&mut target_buf, 0) {
+            let peek = flags & LinuxMsgFlags::PEEK.bits() != 0;
+            match socket.recv_stream_flags(&mut target_buf, 0, peek) {
                 Ok((read_len, _rights)) => {
                     let mut remaining = read_len;
                     let mut cursor = 0usize;
@@ -1832,5 +1839,212 @@ mod recvmmsg_tests {
             !matches!(out, DispatchOutcome::Errno { errno } if errno == LINUX_EINVAL),
             "NULL timeout must not be rejected as malformed, got {out:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod inet_in_memory_socket_tests {
+    use super::*;
+    use crate::dispatch::net::unix_pure::{LinuxUcred, PureSocketInner};
+    use crate::dispatch::{
+        CompatReporter, LinearMemory, OpenDescription, OpenDescriptionBase, OpenFile, SyscallArgs,
+        SyscallRequest,
+    };
+    use crate::linux_abi::{
+        LINUX_AF_INET, LINUX_EPIPE, LINUX_IPPROTO_TCP, LINUX_MSG_NOSIGNAL, LINUX_MSG_PEEK,
+        LINUX_O_RDWR, LINUX_SIGPIPE, LINUX_SOCK_STREAM,
+    };
+    use parking_lot::RwLock;
+
+    #[test]
+    fn inet_in_memory_socket_closed_peer_send_epipe_and_sigpipe() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let (s1, s2) = PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+
+        let fd1 = dispatcher
+            .install_fd_at_or_above(
+                3,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::InMemorySocket {
+                        base: OpenDescriptionBase::new(0),
+                        socket: s1,
+                    })),
+                    LINUX_O_RDWR,
+                    0,
+                ),
+            )
+            .unwrap();
+
+        // Drop peer s2 so peer is fully closed
+        drop(s2);
+
+        let base = 0x2000u64;
+        let mut memory = LinearMemory::new(base, vec![b'a'; 0x1000]);
+
+        // sendto without MSG_NOSIGNAL -> EPIPE and marks SIGPIPE pending
+        context
+            .thread()
+            .update_signal_state(|s| s.replace_pending_entries(&[]));
+        let out = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(206, SyscallArgs::from([fd1 as u64, base, 10, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out, DispatchOutcome::errno(LINUX_EPIPE));
+        assert!(
+            context
+                .thread()
+                .signal_state()
+                .pending()
+                .contains(LINUX_SIGPIPE),
+            "send without MSG_NOSIGNAL on closed peer must raise SIGPIPE"
+        );
+
+        // sendto with MSG_NOSIGNAL -> EPIPE but does NOT mark SIGPIPE
+        context
+            .thread()
+            .update_signal_state(|s| s.replace_pending_entries(&[]));
+        let out_nosig = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    206,
+                    SyscallArgs::from([fd1 as u64, base, 10, LINUX_MSG_NOSIGNAL as u64, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out_nosig, DispatchOutcome::errno(LINUX_EPIPE));
+        assert!(
+            !context
+                .thread()
+                .signal_state()
+                .pending()
+                .contains(LINUX_SIGPIPE),
+            "send with MSG_NOSIGNAL on closed peer must not raise SIGPIPE"
+        );
+
+        // sendmsg without MSG_NOSIGNAL on closed peer -> EPIPE and marks SIGPIPE pending
+        context
+            .thread()
+            .update_signal_state(|s| s.replace_pending_entries(&[]));
+        let msg_addr = base + 0x100;
+        let iov_addr = base + 0x200;
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&base.to_ne_bytes());
+        iov[8..16].copy_from_slice(&10u64.to_ne_bytes());
+        memory.write_bytes(iov_addr, &iov).unwrap();
+
+        let mut msghdr = [0u8; 56];
+        msghdr[16..24].copy_from_slice(&iov_addr.to_ne_bytes());
+        msghdr[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        memory.write_bytes(msg_addr, &msghdr).unwrap();
+
+        let out_msg = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(211, SyscallArgs::from([fd1 as u64, msg_addr, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out_msg, DispatchOutcome::errno(LINUX_EPIPE));
+        assert!(
+            context
+                .thread()
+                .signal_state()
+                .pending()
+                .contains(LINUX_SIGPIPE),
+            "sendmsg without MSG_NOSIGNAL on closed peer must raise SIGPIPE"
+        );
+    }
+
+    #[test]
+    fn inet_in_memory_socket_recv_msg_peek_does_not_consume() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let (s1, s2) = PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+
+        let _fd1 = dispatcher
+            .install_fd_at_or_above(
+                3,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::InMemorySocket {
+                        base: OpenDescriptionBase::new(0),
+                        socket: Arc::clone(&s1),
+                    })),
+                    LINUX_O_RDWR,
+                    0,
+                ),
+            )
+            .unwrap();
+
+        let fd2 = dispatcher
+            .install_fd_at_or_above(
+                4,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::InMemorySocket {
+                        base: OpenDescriptionBase::new(0),
+                        socket: Arc::clone(&s2),
+                    })),
+                    LINUX_O_RDWR,
+                    0,
+                ),
+            )
+            .unwrap();
+
+        s1.send_stream(b"peek-payload", Vec::new()).unwrap();
+
+        let base = 0x3000u64;
+        let mut memory = LinearMemory::new(base, vec![0u8; 0x1000]);
+
+        // First recv with MSG_PEEK
+        let out_peek = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    207,
+                    SyscallArgs::from([fd2 as u64, base, 12, LINUX_MSG_PEEK as u64, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out_peek, DispatchOutcome::Returned { value: 12 });
+        assert_eq!(&memory.read_bytes(base, 12).unwrap(), b"peek-payload");
+
+        // Clear memory buffer
+        memory.write_bytes(base, &[0u8; 12]).unwrap();
+
+        // Second recv without MSG_PEEK — bytes must still be there!
+        let out_normal = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(207, SyscallArgs::from([fd2 as u64, base, 12, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out_normal, DispatchOutcome::Returned { value: 12 });
+        assert_eq!(&memory.read_bytes(base, 12).unwrap(), b"peek-payload");
     }
 }

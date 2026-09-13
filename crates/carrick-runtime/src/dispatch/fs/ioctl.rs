@@ -6,6 +6,10 @@
 use super::*;
 use crate::linux_abi::LINUX_TIOCSIG;
 
+pub const LINUX_SIOCOUTQ: u64 = 0x5411;
+#[allow(dead_code)]
+pub const LINUX_SIOCINQ: u64 = LINUX_FIONREAD;
+
 pub(crate) fn resolve_tiocspgrp(
     context: &crate::kernel::KernelContext,
     namespace_id: i32,
@@ -1254,7 +1258,7 @@ impl<'a> FsView<'a> {
                     Ok(TtyFdKind::Other) => DispatchOutcome::errno(LINUX_ENOTTY),
                     Err(errno) => DispatchOutcome::errno(errno),
                 },
-                LINUX_FIONREAD => {
+                LINUX_FIONREAD | LINUX_SIOCOUTQ => {
                     // Stdio, eventfd, timerfd, epoll, pipe writer, directory, regular file,
                     // synthetic file: writing 0 ("nothing pending") is benign. In-memory pipe
                     // reader gets the buffered byte count from the carrick pipe buffer; a host
@@ -1262,6 +1266,16 @@ impl<'a> FsView<'a> {
                     // guest sees the kernel's actual queued-byte count.
                     let available: i32 = match this.open_file(fd.0).as_ref() {
                         Some(open_file) => match open_file.description.read().as_deref() {
+                            Some(OpenDescription::InMemorySocket { socket, .. }) => {
+                                if ioctl_request == LINUX_SIOCOUTQ {
+                                    i32::try_from(socket.outq_bytes()).unwrap_or(i32::MAX)
+                                } else {
+                                    i32::try_from(socket.buffered_bytes()).unwrap_or(i32::MAX)
+                                }
+                            }
+                            _ if ioctl_request == LINUX_SIOCOUTQ => {
+                                return Ok(DispatchOutcome::errno(LINUX_ENOTTY));
+                            }
                             // Linux answers FIONREAD on EITHER end of a pipe
                             // with the queued byte count (LTP `pipe12` asks the
                             // write end after filling the pipe).
@@ -1302,7 +1316,12 @@ impl<'a> FsView<'a> {
                             _ => 0,
                         },
                         // stdio fd (already validated above) or any other valid fd: 0.
-                        None => 0,
+                        None => {
+                            if ioctl_request == LINUX_SIOCOUTQ {
+                                return Ok(DispatchOutcome::errno(LINUX_ENOTTY));
+                            }
+                            0
+                        }
                     };
                     write_packed(&mut *cx.memory, arg, &available.to_le_bytes())
                 }
@@ -1571,5 +1590,208 @@ impl<'a> FsView<'a> {
             })
 
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::net::unix_pure::{LinuxUcred, PureSocketInner};
+    use crate::dispatch::{
+        CompatReporter, LinearMemory, OpenDescription, OpenDescriptionBase, OpenFile, SyscallArgs,
+        SyscallDispatcher, SyscallRequest,
+    };
+    use crate::linux_abi::{LINUX_AF_INET, LINUX_IPPROTO_TCP, LINUX_O_RDWR, LINUX_SOCK_STREAM};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    #[test]
+    fn inet_in_memory_socket_fionread_and_siocoutq() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+
+        let (s1, s2) = PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+
+        let fd1 = dispatcher
+            .install_fd_at_or_above(
+                3,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::InMemorySocket {
+                        base: OpenDescriptionBase::new(0),
+                        socket: Arc::clone(&s1),
+                    })),
+                    LINUX_O_RDWR,
+                    0,
+                ),
+            )
+            .unwrap();
+
+        let fd2 = dispatcher
+            .install_fd_at_or_above(
+                4,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::InMemorySocket {
+                        base: OpenDescriptionBase::new(0),
+                        socket: Arc::clone(&s2),
+                    })),
+                    LINUX_O_RDWR,
+                    0,
+                ),
+            )
+            .unwrap();
+
+        let base = 0x3000u64;
+        let mut memory = LinearMemory::new(base, vec![0u8; 0x1000]);
+
+        // FIONREAD on fd2 initially returns 0
+        let out = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    29, // ioctl
+                    SyscallArgs::from([fd2 as u64, LINUX_FIONREAD, base, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out, DispatchOutcome::Returned { value: 0 });
+        let bytes = memory.read_bytes(base, 4).unwrap();
+        assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), 0);
+
+        // s1 sends 15 bytes to s2
+        s1.send_stream(b"hello in-memory", Vec::new()).unwrap();
+
+        // FIONREAD on fd2 (receiver) should report 15 bytes
+        let out = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([fd2 as u64, LINUX_FIONREAD, base, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out, DispatchOutcome::Returned { value: 0 });
+        let bytes = memory.read_bytes(base, 4).unwrap();
+        assert_eq!(
+            i32::from_le_bytes(bytes.try_into().unwrap()),
+            15,
+            "FIONREAD on receiver must report queued bytes"
+        );
+
+        // SIOCINQ on fd2 should also report 15 bytes (SIOCINQ == FIONREAD)
+        let out = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([fd2 as u64, LINUX_SIOCINQ, base, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out, DispatchOutcome::Returned { value: 0 });
+        let bytes = memory.read_bytes(base, 4).unwrap();
+        assert_eq!(
+            i32::from_le_bytes(bytes.try_into().unwrap()),
+            15,
+            "SIOCINQ on receiver must report queued bytes"
+        );
+
+        // SIOCOUTQ on fd1 (sender) should report 15 unsent/unacknowledged bytes
+        let out = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([fd1 as u64, LINUX_SIOCOUTQ, base, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out, DispatchOutcome::Returned { value: 0 });
+        let bytes = memory.read_bytes(base, 4).unwrap();
+        assert_eq!(
+            i32::from_le_bytes(bytes.try_into().unwrap()),
+            15,
+            "SIOCOUTQ on sender must report bytes waiting in peer buffer"
+        );
+
+        // SIOCOUTQ on fd2 (receiver) should report 0 bytes
+        let out = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([fd2 as u64, LINUX_SIOCOUTQ, base, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out, DispatchOutcome::Returned { value: 0 });
+        let bytes = memory.read_bytes(base, 4).unwrap();
+        assert_eq!(
+            i32::from_le_bytes(bytes.try_into().unwrap()),
+            0,
+            "SIOCOUTQ on receiver must be 0"
+        );
+
+        // Receiver reads 5 bytes
+        let mut recv_buf = [0u8; 5];
+        let (n, _rights) = s2.recv_stream(&mut recv_buf, 0).unwrap();
+        assert_eq!(n, 5);
+
+        // FIONREAD on fd2 should now report 10 bytes
+        let out = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([fd2 as u64, LINUX_FIONREAD, base, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out, DispatchOutcome::Returned { value: 0 });
+        let bytes = memory.read_bytes(base, 4).unwrap();
+        assert_eq!(
+            i32::from_le_bytes(bytes.try_into().unwrap()),
+            10,
+            "FIONREAD after partial read must report remaining bytes"
+        );
+
+        // SIOCOUTQ on fd1 should now report 10 bytes
+        let out = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([fd1 as u64, LINUX_SIOCOUTQ, base, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out, DispatchOutcome::Returned { value: 0 });
+        let bytes = memory.read_bytes(base, 4).unwrap();
+        assert_eq!(
+            i32::from_le_bytes(bytes.try_into().unwrap()),
+            10,
+            "SIOCOUTQ after partial read must report remaining bytes"
+        );
     }
 }
