@@ -3737,3 +3737,24 @@ Carrier user-CPU profiles on this pin (`target/perf/perf2x-sep12/prof-mpnh`,
   `vcpu-lazy-state-sep12`): residency-keyed lazy save/restore — snapshot only
   when the vCPU loads a different thread, overlay only when the thread lands
   elsewhere, one typed accessor materializes for every register consumer.
+
+Multiprocessing row, corrected split (`hvpatch-exec-cpu-sampling.d`, which
+keeps the user stack under kernel-mode samples; `prof-mpnh/mpk-1`,
+`ksamp-agg.py`): guest+HVF (`hv_trap` in kernel mode) 42%, host kernel
+work 17% (contended-mutex sleeps 3.9%, host `openat` 3.5%, getdents 1.6%),
+carrick user 41%. The earlier "78% guest" reading came from the user-only
+ranking counting the `hv_trap` entry as a user leaf. Inside the carrick
+share the largest named cluster is the memory-fault path: `perform_frame_cow`
+6.8%, sparse first-touch materialization (`resolve_mutating_fault` →
+`ensure_sparse_mmap_backing_censused` → `materialize_sparse_mmap_extent_inner`)
+5.8%, `mmap` 4.1%, `resolve_frame_cow_fault` 1.1%; then detached process
+retirement 3.4%, fork preparation 2.7%, execve 1.0%. The fault census
+(`hvpatch-fault-class-census.d`, `mpf-1`) counts 261,780 EL0 aborts in the
+row (194k mmap translation-on-write, 44k mmap permission, 15.9k heap) over
+only 3,563 distinct 4 KiB pages: the census keys on address, not process,
+and the row forks ~120 children, so the "repeat" ratio is process count,
+not lost mappings. The row uses ~1.9 host cores at both one and four
+workers (the harness's `--workers` is the guest's regrtest parallelism and
+the suite is a single test file). Per-fault cost, not fault count, is the
+lever there; the carrier spends roughly 6 µs of user CPU per fault under
+the sampler. Parked behind the net_http executor-boundary work.
