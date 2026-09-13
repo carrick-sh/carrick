@@ -551,6 +551,15 @@ fn main() {
         let write_after_shut_wr_errno = if w_rc < 0 { errno() } else { 0 };
 
         libc::shutdown(accepted_fd, libc::SHUT_RDWR);
+        // The client socket is non-blocking since case 4: wait (bounded) for the
+        // peer's FIN to land before reading, so the line is the kernel's answer
+        // and not a race against loopback delivery.
+        let mut pfd_client_fin = libc::pollfd {
+            fd: client_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let _ = libc::poll(&mut pfd_client_fin, 1, 5000);
         let mut c_buf = [0u8; 16];
         let c_rc = libc::recv(client_fd, c_buf.as_mut_ptr().cast(), c_buf.len(), 0);
         let (client_recv_after_peer_shutdown_ret, client_recv_after_peer_shutdown_errno) =
