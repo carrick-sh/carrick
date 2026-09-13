@@ -1149,7 +1149,11 @@ impl CarrierWaitService {
             fd_authority,
             ..
         } = &probe
-            && let WaitFdAuthority::Logical { strict, watched } = fd_authority
+            && let WaitFdAuthority::Logical {
+                strict,
+                watched,
+                interest,
+            } = fd_authority
         {
             for authority in strict.iter().chain(watched) {
                 let callback_weak = weak.clone();
@@ -1178,6 +1182,24 @@ impl CarrierWaitService {
                     });
                     self.inner
                         .attach_subscription(token, ProducerSubscription::WaitQueue(enrollment));
+                    // A carrick-owned object has no level-triggered host fd to
+                    // poll: the syscall checked readiness, then returned this
+                    // wait, and a wake between that check and the enrollment
+                    // above would otherwise be lost (a blocking recv on an
+                    // in-memory socket whose peer wrote in the gap). Probe the
+                    // description once, now that the enrollment is live; the
+                    // syscall re-checks under its own lock when re-dispatched.
+                    if *interest != 0 {
+                        let want = carrick_abi::LinuxEpollEvents::from_bits_retain(u32::from(
+                            *interest as u16,
+                        ));
+                        if !description
+                            .readiness(want, &crate::kernel::NoReadinessContext)
+                            .is_empty()
+                        {
+                            self.inner.publish_event(token, ContinuationEvent::Ready);
+                        }
+                    }
                 }
             }
         }

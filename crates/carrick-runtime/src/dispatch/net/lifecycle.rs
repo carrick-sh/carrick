@@ -1230,7 +1230,11 @@ impl<'a> NetView<'a> {
                 completion,
             } if inzone_listener.is_some() => {
                 let files = self.captured_file_table();
-                let fds = match WaitFds::raw_one(host_fd, libc::POLLIN)
+                // The host listen fd is one wake source; the `-1` entry carries
+                // the interest the wait service probes the description with
+                // after enrolling on the in-zone queue, so a connection paired
+                // between accept's check and the enrollment is not lost.
+                let fds = match WaitFds::raw(vec![(host_fd, libc::POLLIN), (-1, libc::POLLIN)])
                     .with_redispatch_and_watched_slots(&files, [fd], [fd])
                 {
                     Ok(fds) => fds,

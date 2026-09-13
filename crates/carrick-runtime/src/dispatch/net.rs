@@ -828,9 +828,10 @@ impl<'a> NetView<'a> {
     pub(in crate::dispatch) fn wait_in_memory_slot(
         &self,
         guest_fd: i32,
+        events: i16,
         timeout: Option<std::time::Duration>,
     ) -> DispatchOutcome {
-        wait_in_memory_slot(&self.captured_file_table(), guest_fd, timeout)
+        wait_in_memory_slot(&self.captured_file_table(), guest_fd, events, timeout)
     }
 
     /// Whether a host-I/O op on `fd` with these guest `msg_flags` should report
@@ -3633,9 +3634,12 @@ impl SyscallDispatcher {
 pub(in crate::dispatch) fn wait_in_memory_slot(
     files: &crate::kernel::FileTable,
     guest_fd: i32,
+    events: i16,
     timeout: Option<std::time::Duration>,
 ) -> DispatchOutcome {
-    let fds = match WaitFds::raw_one(-1, 0).with_redispatch_and_watched_slots(
+    // `-1` carries no host fd; its `events` are the interest the wait service
+    // probes the description with once the wait-queue enrollment is live.
+    let fds = match WaitFds::raw_one(-1, events).with_redispatch_and_watched_slots(
         files,
         [guest_fd],
         [guest_fd],
