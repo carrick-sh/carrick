@@ -1291,13 +1291,21 @@ where
         // starts and then remain registered while waiting for the reservation,
         // forming a circular wait with sibling quiescence.
         if coordinator.clone_admission.is_none() {
-            let observed = parent_process.kernel_graph().reservation_epoch();
             match process_fork_admission.try_close_for_fork(self.this_tid) {
-                Ok(Some(admission)) => coordinator.clone_admission = Some(admission),
-                Ok(None) => {
+                Ok(super::ForkCloseAttempt::Closed(admission)) => {
+                    coordinator.clone_admission = Some(admission);
+                }
+                // Park on the ADMISSION gate's epoch: the permits we yield to
+                // publish that epoch when they release, and a clone that
+                // backs off (task busy, publication busy) publishes nothing
+                // else. Parking on the kernel reservation epoch here stranded
+                // the winner, and with it the loser on the fork token and the
+                // deferred clone behind the close (forkexecstorm hang at the
+                // first vfork, `fes3cap/cap-1-7`, 2026-09-12).
+                Ok(super::ForkCloseAttempt::PermitsInFlight { observed_epoch }) => {
                     let wake_scheduler = Arc::clone(&scheduler);
-                    let subscription = parent_process.kernel_graph().subscribe_reservation_change(
-                        observed,
+                    let subscription = kernel.clone_admission.subscribe_change(
+                        observed_epoch,
                         Arc::new(move || {
                             let _ = if is_external_exec {
                                 wake_scheduler.wake_control(wake_thread)
@@ -1310,7 +1318,7 @@ where
                         request,
                         coordinator: Some(coordinator),
                         external_exec,
-                        _subscription: ProcessForkRetrySubscription::Reservation {
+                        _subscription: ProcessForkRetrySubscription::Admission {
                             _subscription: subscription,
                         },
                     });
@@ -2931,6 +2939,35 @@ mod pt_pause_tests {
         assert!(!prepare.contains("QuiesceEnrollment::Ready(_) => continue"));
     }
 
+    /// A fork close that yields to in-flight clone permits parks on the
+    /// clone-admission change epoch those permits publish, never on the
+    /// kernel reservation epoch (which a backing-off clone never moves).
+    #[test]
+    fn process_fork_close_retry_parks_on_the_admission_epoch() {
+        let source = include_str!("quiesce.rs");
+        let prepare = expect_test(
+            expect_test(
+                source.split("pub(super) fn prepare_in_process_fork").nth(1),
+                "prepare_in_process_fork missing from quiesce.rs",
+            )
+            .split("\n#[cfg(test)]")
+            .next(),
+            "prepare_in_process_fork body missing from quiesce.rs",
+        );
+        let close_at = prepare
+            .find("try_close_for_fork(self.this_tid)")
+            .expect("the fork closes clone admission");
+        let close_end = prepare[close_at..]
+            .find("let parent_pid = parent_process.pid();")
+            .expect("the close block ends before the fork stages")
+            + close_at;
+        let close_block = &prepare[close_at..close_end];
+        assert!(close_block.contains("ForkCloseAttempt::PermitsInFlight { observed_epoch }"));
+        assert!(close_block.contains("kernel.clone_admission.subscribe_change("));
+        assert!(close_block.contains("ProcessForkRetrySubscription::Admission"));
+        assert!(!close_block.contains("subscribe_reservation_change"));
+    }
+
     #[test]
     fn process_fork_uses_identity_lease_subscription() {
         let source = include_str!("quiesce.rs");
@@ -3255,6 +3292,7 @@ mod pt_pause_tests {
         let close = sibling
             .try_close_for_fork(owner)
             .expect("fork close")
+            .closed()
             .expect("no clones in flight");
 
         let outcome = try_begin_hvpatch_process_fork_with_admission(barrier, tid(1_614), &gate);
