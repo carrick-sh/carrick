@@ -2572,3 +2572,117 @@ fn host_all_opens_are_nonblocking() {
         assert!(is_nonblocking(file.as_raw_fd()), "immutable-lower open");
     }
 }
+
+/// (a) `mkdir` of a new child under a 2,000-sibling directory issues <= 1 host `openat`.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_mkdir_2000_siblings_host_openat_budget() {
+    use crate::vfs::Vfs as _;
+    let (backend, _scratch) = host_backend();
+    let mut vfs = crate::vfs::RootFsVfs::new();
+    vfs.set_overlay(Box::new(backend));
+
+    vfs.mkdir("/wide", 0o755).unwrap();
+    for i in 0..2000 {
+        let p = format!("/wide/f_{i:04}");
+        vfs.create_file(&p).unwrap();
+    }
+    // Warm up the directory handle / resolver
+    let _ = vfs.dentry_stat("/wide", false);
+
+    reset_test_host_openat_count();
+
+    // Emulate directory creation with mode (as in mkdirat)
+    vfs.mkdir("/wide/new_child", 0o755).unwrap();
+    let _ = vfs.set_mode("/wide/new_child", 0o755);
+
+    let opens = test_host_openat_count();
+    assert!(
+        opens <= 1,
+        "mkdir under 2,000-sibling dir issued {opens} host openat calls (budget <= 1)"
+    );
+}
+
+/// (b) `getdents64` over a 2,000-entry directory issues <= 2 host `openat` and
+/// <= 1 host stat per entry *only* when the stream reports `DT_UNKNOWN`.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_getdents64_2000_entries_host_openat_and_stat_budget() {
+    let (backend, _scratch) = host_backend();
+    let lower = RootFs::from_layers(std::iter::empty::<crate::rootfs::LayerSource>()).unwrap();
+
+    backend.make_dir("/wide").unwrap();
+    for i in 0..2000 {
+        let p = format!("/wide/f_{i:04}");
+        backend.create_file(&p).unwrap();
+    }
+
+    reset_test_host_openat_count();
+    reset_test_host_stat_count();
+
+    // Stream directory entries as getdents64 does via try_layered_stream_dirents with fallback
+    let entries =
+        try_layered_stream_dirents(&backend, Some(&lower), "/wide").unwrap_or_else(|| {
+            layered_directory_entries(&backend, Some(&lower), "/wide").unwrap_or_default()
+        });
+
+    assert_eq!(entries.len(), 2000);
+    let opens = test_host_openat_count();
+    let stats = test_host_stat_count();
+
+    assert!(
+        opens <= 2,
+        "getdents64 over 2,000-entry dir issued {opens} host openat calls (budget <= 2)"
+    );
+    // On APFS, readdir yields DT_REG for files, so 0 per-entry stats are needed.
+    assert_eq!(
+        stats, 0,
+        "getdents64 over 2,000-entry dir issued {stats} host stat calls when types are known (budget 0)"
+    );
+}
+
+/// (c) `stat` of an existing path resolved through `namei` issues 0 host `openat`
+/// (`fstatat` on parent dirfd; `stat_cache_get_or_fill` must not open).
+#[cfg(target_os = "macos")]
+#[test]
+fn test_stat_existing_path_namei_zero_host_openat() {
+    let (backend, _scratch) = host_backend();
+
+    backend.make_dir("/wide").unwrap();
+    for i in 0..2000 {
+        let p = format!("/wide/f_{i:04}");
+        backend.create_file(&p).unwrap();
+    }
+
+    // Set an owner on one entry so that the tree metadata markers are stamped
+    // and serves_plain_metadata() returns false.
+    backend
+        .set_owner("/wide/f_0000", Some(NsUid::new(1000)), None)
+        .unwrap();
+    assert!(
+        !backend.serves_plain_metadata(),
+        "tree must have metadata markers stamped"
+    );
+
+    // Warm up the parent dirfd in dir_cache
+    let _ = backend.stat_cache_get_or_fill(Path::new("wide/f_0001"));
+
+    reset_test_host_openat_count();
+    reset_test_host_stat_count();
+
+    // Stat an existing file in the directory
+    let res = backend.stat_cache_get_or_fill(Path::new("wide/f_0002"));
+    assert!(res.is_some(), "stat should succeed");
+
+    let opens = test_host_openat_count();
+    let stats = test_host_stat_count();
+
+    assert_eq!(
+        opens, 0,
+        "stat of existing path issued {opens} host openat calls (budget 0)"
+    );
+    assert_eq!(
+        stats, 1,
+        "stat of existing path issued {stats} host stat calls (expected 1 fstatat)"
+    );
+}
