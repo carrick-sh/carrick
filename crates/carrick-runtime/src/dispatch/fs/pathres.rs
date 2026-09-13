@@ -561,14 +561,25 @@ impl<'a> FsView<'a> {
         } else {
             match self.open_file(dirfd as i32).as_ref() {
                 Some(open_file) => match open_file.description.read().as_deref() {
-                    Some(OpenDescription::Directory { path: dir, .. }) => {
+                    Some(OpenDescription::Directory {
+                        path: dir,
+                        trusted_host_dir,
+                        ..
+                    }) => {
                         // A relative *at op through a dirfd whose directory has
                         // since been removed (rmdir) resolves to ENOENT on Linux:
                         // the open fd persists but its path no longer exists.
                         // carrick keeps the Directory description cached, so
                         // re-verify the anchor still exists in the layered view
                         // (symlinkat01/linkat01 deldirfd cases → ENOENT).
-                        if self.layered_metadata(dir).is_err() {
+                        if let Some(trusted) = trusted_host_dir {
+                            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                            if unsafe { libc::fstat(trusted.fd.raw(), &mut st) } != 0
+                                || st.st_nlink == 0
+                            {
+                                return Err(LINUX_ENOENT);
+                            }
+                        } else if self.layered_metadata(dir).is_err() {
                             return Err(LINUX_ENOENT);
                         }
                         (dir.clone(), path)
@@ -604,7 +615,9 @@ impl<'a> FsView<'a> {
             } else {
                 parent_norm
             };
-            if self.fs.rootfs_vfs.dentry_cache.has_dir(parent_norm) {
+            if self.fs.rootfs_vfs.dentry_cache.has_dir(parent_norm)
+                || (dirfd != LINUX_AT_FDCWD && parent_norm == anchor)
+            {
                 return Ok(abs);
             }
         }

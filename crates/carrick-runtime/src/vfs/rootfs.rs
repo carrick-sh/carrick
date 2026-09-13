@@ -50,7 +50,7 @@ use crate::linux_abi::{
 };
 use crate::rootfs::{RootFs, RootFsEntryKind, RootFsError, RootFsMetadata};
 use std::ffi::CString;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 
 use super::{
@@ -1371,7 +1371,7 @@ impl RootFsVfs {
             .unwrap_or(false)
     }
 
-    fn resolved_parent(&self, path: &str) -> Result<ResolvedParent, VfsError> {
+    pub(crate) fn resolved_parent(&self, path: &str) -> Result<ResolvedParent, VfsError> {
         let path_obj = std::path::Path::new(path);
         let leaf_os = path_obj.file_name().ok_or(LINUX_ENOENT)?;
         let leaf_str = leaf_os.to_str().ok_or(LINUX_EINVAL)?;
@@ -1382,9 +1382,6 @@ impl RootFsVfs {
         } else {
             parent_path
         };
-        if !self.is_directory(parent_path) {
-            return Err(LINUX_ENOENT);
-        }
         let parent_fd = if self.overlay.serves_dentry_cache() {
             Some(self.dentry_cache.get_or_open_dir_fd(
                 parent_path,
@@ -1392,6 +1389,9 @@ impl RootFsVfs {
                 self.rootfs.as_ref(),
             )?)
         } else {
+            if !self.is_directory(parent_path) {
+                return Err(LINUX_ENOENT);
+            }
             None
         };
         let rel = crate::fs_backend::NormalizedRelPath::from_normalized_str(path);
@@ -1400,6 +1400,63 @@ impl RootFsVfs {
             leaf,
             rel,
         })
+    }
+
+    pub(crate) fn mkdir_under_parent(
+        &self,
+        parent: &ResolvedParent,
+        path: &str,
+        mode: u32,
+    ) -> Result<(), VfsError> {
+        if let Some(ref pfd) = parent.parent_fd {
+            #[cfg(test)]
+            crate::fs_backend::host::record_test_host_stat();
+            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+            let rc = unsafe {
+                libc::fstatat(
+                    pfd.as_raw_fd(),
+                    parent.leaf.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc == 0 {
+                let leaf_str = parent.leaf.to_str().unwrap_or("");
+                if !self.overlay.has_whiteout_in_dir(pfd.as_raw_fd(), leaf_str) {
+                    return Err(LINUX_EEXIST);
+                }
+            } else if self
+                .dentry_cache
+                .lower_has_entry(path, self.rootfs.as_ref())
+            {
+                return Err(LINUX_EEXIST);
+            }
+            self.overlay
+                .make_dir_at(Some(pfd), Some(&parent.leaf), &parent.rel, mode)
+                .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+            self.dentry_cache.entry_created(path, None);
+            return Ok(());
+        }
+
+        match self.overlay.lookup_kind(path) {
+            Some(OverlayEntryKind::Dir) | Some(OverlayEntryKind::File) => {
+                return Err(LINUX_EEXIST);
+            }
+            Some(OverlayEntryKind::Deleted) => {}
+            None => {
+                if self
+                    .dentry_cache
+                    .lower_has_entry(path, self.rootfs.as_ref())
+                {
+                    return Err(LINUX_EEXIST);
+                }
+            }
+        }
+        self.overlay
+            .make_dir_at(None, Some(&parent.leaf), &parent.rel, mode)
+            .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+        self.dentry_cache.entry_created(path, None);
+        Ok(())
     }
 }
 
@@ -1734,34 +1791,8 @@ impl Vfs for RootFsVfs {
     }
 
     fn mkdir(&self, path: &str, mode: u32) -> Result<(), VfsError> {
-        // Layered EEXIST: an existing overlay or rootfs entry (file
-        // or dir) at `path` blocks mkdir. A tombstone clears the
-        // rootfs view so a re-create is allowed.
-        match self.overlay.lookup_kind(path) {
-            Some(OverlayEntryKind::Dir) | Some(OverlayEntryKind::File) => {
-                return Err(LINUX_EEXIST);
-            }
-            Some(OverlayEntryKind::Deleted) => {}
-            None => {
-                if self
-                    .dentry_cache
-                    .lower_has_entry(path, self.rootfs.as_ref())
-                {
-                    return Err(LINUX_EEXIST);
-                }
-            }
-        }
         let parent = self.resolved_parent(path)?;
-        self.overlay
-            .make_dir_at(
-                parent.parent_fd.as_deref(),
-                Some(&parent.leaf),
-                &parent.rel,
-                mode,
-            )
-            .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
-        self.dentry_cache.entry_created(path, None);
-        Ok(())
+        self.mkdir_under_parent(&parent, path, mode)
     }
 
     fn unlink(&self, path: &str) -> Result<(), VfsError> {

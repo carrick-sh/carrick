@@ -4498,20 +4498,6 @@ impl FsBackend for HostFsBackend {
                             libc::AT_SYMLINK_NOFOLLOW,
                         );
                     }
-                    let flags = libc::O_RDONLY
-                        | libc::O_DIRECTORY
-                        | libc::O_CLOEXEC
-                        | libc::O_NONBLOCK
-                        | libc::O_NOFOLLOW;
-                    let raw = unsafe {
-                        host_openat!(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0)
-                    };
-                    if raw >= 0 {
-                        let fd =
-                            std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
-                        let generation = crate::fs_resolve_cache::current_dir_generation();
-                        self.publish_dir_fd(rel.as_path(), &fd, generation);
-                    }
                 }
                 self.clear_whiteout_normalized(rel.as_path());
                 crate::fs_resolve_cache::bump_generation();
