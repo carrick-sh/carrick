@@ -2765,7 +2765,21 @@ pub(crate) fn unregister_alias_entries(
                 continue;
             }
             to_process.sort_unstable_by_key(|&(pos, _, _)| pos);
-            to_process.reverse();
+
+            let inserted_count_est: usize = to_process
+                .iter()
+                .map(|&(_, _, entry)| {
+                    let has_head = entry.start < va;
+                    let has_tail = entry.start.saturating_add(entry.size as u64) > end;
+                    usize::from(has_head) + usize::from(has_tail)
+                })
+                .sum();
+            let exact_capacity = rows
+                .len()
+                .saturating_sub(to_process.len())
+                .saturating_add(inserted_count_est);
+            let mut new_rows = Vec::with_capacity(exact_capacity);
+            let mut last_copied = 0;
 
             for (pos, seq, entry) in to_process {
                 let entry_end = entry.start.saturating_add(entry.size as u64);
@@ -2795,23 +2809,18 @@ pub(crate) fn unregister_alias_entries(
                 for (_, frag) in &fragments {
                     bucket.replay.insert(replay_mapping_key(*frag));
                 }
-                match fragments.len() {
-                    0 => {
-                        note_alias_rows_moved(rows.len().saturating_sub(pos + 1));
-                        rows.remove(pos);
-                    }
-                    1 => {
-                        rows[pos] = fragments[0];
-                    }
-                    2 => {
-                        rows[pos] = fragments[0];
-                        note_alias_rows_moved(rows.len().saturating_sub(pos + 1));
-                        rows.insert(pos + 1, fragments[1]);
-                    }
-                    _ => unreachable!(),
+                if pos > last_copied {
+                    new_rows.extend_from_slice(&rows[last_copied..pos]);
                 }
+                new_rows.extend(fragments.iter().copied());
+                last_copied = pos.saturating_add(1);
                 mutations.push((seq, entry, fragments));
             }
+            if last_copied < rows.len() {
+                new_rows.extend_from_slice(&rows[last_copied..]);
+            }
+            note_alias_rows_moved(new_rows.len());
+            *rows = new_rows;
         }
         for (seq, entry, fragments) in mutations {
             // Every exact key this mutation can disturb: the row's own key, and
