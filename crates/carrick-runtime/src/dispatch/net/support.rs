@@ -119,11 +119,17 @@ pub(super) fn epoll_interest_for(events: LinuxEpollEvents) -> carrick_hal::event
     let read = events
         .intersects(LinuxEpollEvents::IN | LinuxEpollEvents::RDHUP | LinuxEpollEvents::PRI)
         || !write;
+    let mode = if events.contains(LinuxEpollEvents::ET) {
+        carrick_hal::event::TriggerMode::Edge
+    } else {
+        carrick_hal::event::TriggerMode::Level
+    };
     carrick_hal::event::Interest {
         read,
         write,
         oob: events.contains(LinuxEpollEvents::PRI),
         read_lowat: None,
+        mode,
     }
 }
 
@@ -3278,7 +3284,7 @@ mod tests {
     #[cfg(feature = "platform-macos")]
     #[test]
     fn epoll_interest_selection_preserves_hup_err_observability() {
-        use carrick_hal::event::Interest;
+        use carrick_hal::event::{Interest, TriggerMode};
         assert_eq!(
             epoll_interest_for(LinuxEpollEvents::empty()),
             Interest {
@@ -3286,6 +3292,7 @@ mod tests {
                 write: false,
                 oob: false,
                 read_lowat: None,
+                mode: TriggerMode::Level,
             }
         );
         assert_eq!(
@@ -3295,6 +3302,7 @@ mod tests {
                 write: false,
                 oob: false,
                 read_lowat: None,
+                mode: TriggerMode::Level,
             }
         );
         assert_eq!(
@@ -3304,6 +3312,7 @@ mod tests {
                 write: true,
                 oob: false,
                 read_lowat: None,
+                mode: TriggerMode::Level,
             }
         );
         assert_eq!(
@@ -3313,6 +3322,7 @@ mod tests {
                 write: true,
                 oob: false,
                 read_lowat: None,
+                mode: TriggerMode::Level,
             }
         );
         assert_eq!(
@@ -3322,6 +3332,17 @@ mod tests {
                 write: false,
                 oob: true,
                 read_lowat: None,
+                mode: TriggerMode::Level,
+            }
+        );
+        assert_eq!(
+            epoll_interest_for(LinuxEpollEvents::IN | LinuxEpollEvents::ET),
+            Interest {
+                read: true,
+                write: false,
+                oob: false,
+                read_lowat: None,
+                mode: TriggerMode::Edge,
             }
         );
     }
