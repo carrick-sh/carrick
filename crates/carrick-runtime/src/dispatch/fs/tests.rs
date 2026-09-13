@@ -1594,6 +1594,47 @@ fn trusted_upper_only_directory_seeds_the_lane_and_streams() {
     assert!(names.contains(&"sub"), "{names:?}");
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn test_mkdirat_under_resolved_parent_zero_openat_budget() {
+    let (_scratch, mut dispatcher) = trusted_lane_fixture();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    // Warm up / resolve parent directory fd in dentry cache
+    let parent_dfd = lane_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/walk",
+        LINUX_O_RDONLY | LINUX_O_DIRECTORY,
+    );
+    assert!(parent_dfd >= 0, "open /walk: {parent_dfd}");
+
+    crate::fs_backend::host::reset_test_host_openat_count();
+    crate::fs_backend::host::reset_test_host_stat_count();
+
+    memory.write_bytes(0x4200, b"new_child\0").unwrap();
+    let mk = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        34, // mkdirat
+        [parent_dfd as u64, 0x4200, 0o755, 0, 0, 0],
+    );
+    assert_eq!(mk, 0, "mkdirat /walk/new_child: {mk}");
+
+    let opens = crate::fs_backend::host::test_host_openat_count();
+    let stats = crate::fs_backend::host::test_host_stat_count();
+
+    assert_eq!(
+        opens, 0,
+        "mkdirat under resolved parent issued {opens} host openat calls (budget 0)"
+    );
+    assert!(
+        stats <= 1,
+        "mkdirat under resolved parent issued {stats} host stat calls (budget <= 1)"
+    );
+}
+
 /// A directory listing is taken when the guest READS it, not when it opens
 /// it (Linux `getdents64` walks the live dentry tree; `rewinddir` re-reads).
 /// Two consequences the old open-time snapshot got wrong — and one cost:

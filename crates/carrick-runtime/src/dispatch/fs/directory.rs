@@ -873,8 +873,27 @@ impl<'a> FsView<'a> {
             // S_ISGID itself (so a shared-group subtree propagates).
             // Otherwise the new dir's group is the creator's egid.
             let mut inherited_gid = false;
+            let parent_res = this.fs.rootfs_vfs.resolved_parent(&resolved);
+            let parent_info = match parent_res {
+                Ok(p) => p,
+                Err(e) => return Ok(DispatchOutcome::errno(e)),
+            };
+
             const S_ISGID: u32 = 0o2000;
-            if let Some(parent) = Path::new(&resolved).parent() {
+            if let Some(ref pfd) = parent_info.parent_fd {
+                use std::os::fd::AsRawFd;
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                if unsafe { libc::fstat(pfd.as_raw_fd(), &mut st) } == 0 {
+                    let (xattr_mode, _, xattr_gid, _) =
+                        crate::fs_backend::host::fd_carrick_meta(pfd.as_raw_fd());
+                    let pmode = xattr_mode.unwrap_or(st.st_mode as u32);
+                    if pmode & S_ISGID != 0 {
+                        create_mode |= S_ISGID;
+                        owner_gid = xattr_gid.unwrap_or(carrick_abi::NsGid::new(st.st_gid));
+                        inherited_gid = true;
+                    }
+                }
+            } else if let Some(parent) = Path::new(&resolved).parent() {
                 let parent_str = display_rootfs_path(parent);
                 if let Ok(pmd) = this.layered_metadata(&parent_str)
                     && pmd.mode & S_ISGID != 0
@@ -889,10 +908,13 @@ impl<'a> FsView<'a> {
                 }
             }
             // Layered existence + parent-exists checks live inside
-            // RootFsVfs::mkdir; the dispatcher only handles synthetic
-            // path shadowing.
-            use crate::vfs::Vfs as _;
-            match this.fs.rootfs_vfs.mkdir(&resolved, create_mode) {
+            // RootFsVfs::mkdir_under_parent; the dispatcher only handles
+            // synthetic path shadowing.
+            match this
+                .fs
+                .rootfs_vfs
+                .mkdir_under_parent(&parent_info, &resolved, create_mode)
+            {
                 Ok(()) => {
                     // Only invoke set_mode if the mode requires xattr storage
                     // (e.g. owner permissions lack read/write/execute).

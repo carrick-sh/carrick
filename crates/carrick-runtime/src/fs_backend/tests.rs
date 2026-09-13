@@ -2604,6 +2604,36 @@ fn test_mkdir_2000_siblings_host_openat_budget() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn test_mkdir_under_resolved_parent_zero_openat_budget() {
+    use crate::vfs::Vfs as _;
+    let (backend, _scratch) = host_backend();
+    let mut vfs = crate::vfs::RootFsVfs::new();
+    vfs.set_overlay(Box::new(backend));
+
+    vfs.mkdir("/parent", 0o755).unwrap();
+    // Warm up / resolve parent directory fd in dentry cache
+    let _ = vfs.resolved_parent("/parent/dummy").unwrap();
+
+    reset_test_host_openat_count();
+    reset_test_host_stat_count();
+
+    vfs.mkdir("/parent/child", 0o755).unwrap();
+
+    let opens = test_host_openat_count();
+    let stats = test_host_stat_count();
+
+    assert_eq!(
+        opens, 0,
+        "mkdir under resolved parent issued {opens} host openat calls (budget 0)"
+    );
+    assert!(
+        stats <= 1,
+        "mkdir under resolved parent issued {stats} host stat calls (budget <= 1)"
+    );
+}
+
 /// (b) `getdents64` over a 2,000-entry directory issues <= 2 host `openat` and
 /// <= 1 host stat per entry *only* when the stream reports `DT_UNKNOWN`.
 #[cfg(target_os = "macos")]
