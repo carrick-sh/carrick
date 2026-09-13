@@ -921,3 +921,26 @@ commits and is re-checked at the next vet.
   8.3% → 3.7% of carrier CPU (two runs); windowcoherence, forkexecstorm,
   execfromthread eight-way ×3 under lldb-run = 72/72 clean. Gate and
   paired scorecard on the merged main follow.
+- 2026-09-13 02:10, two defects the merged-main gate and scorecard
+  surfaced, both fixed on main from evidence rather than retry:
+  - `docker_compose_shared_network_namespace_smoke` red under gate load
+    ("owner record is missing" on `compose down`): container teardown's
+    `quiesce` released the control endpoint's owner record before
+    `complete` persisted the terminal receipt, so the state read Running
+    with no owner. Fixed 614b2de8a: the record carries a typed
+    `OwnerPhase` (`Serving`/`TearingDown`), `quiesce` marks it instead of
+    releasing, the client answers `ControlOutcome::TearingDown`, and the
+    stop path waits for the receipt (red-first assertion in
+    `managed_guard_quiesces_before_publishing_the_terminal_outcome`).
+  - `cpython-multiprocessing_main_handling` REGRESSION (spawned
+    interpreter: `No module named '_struct'`), bracketed to the
+    hostfs-opens round-2 binaries (2/15 vs 0/12 on the pins before): the
+    cached trusted dirfd was handed out as `dup`s sharing one seek offset
+    and the enumerator `rewinddir`ed it, so concurrent listings of one
+    directory each saw a subset. Fixed 6906c19cc: the enumerator opens
+    its own description (`openat(fd, ".")`), and an unclassifiable
+    `DT_UNKNOWN` entry falls back to the layered listing instead of being
+    dropped (red-first `trusted_dirent_stream_owns_its_seek_offset`).
+  Paired scorecard on ab97e9df5825ce19 (lazy vCPU state) before these:
+  net_http 3.39 s w4 / 3.24 s w1 (was 3.44 / 3.80), 39/40 MATCH + the
+  multiprocessing regression above.
