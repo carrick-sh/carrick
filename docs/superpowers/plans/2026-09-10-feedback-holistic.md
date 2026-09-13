@@ -894,3 +894,18 @@ commits and is re-checked at the next vet.
   only by a capture with all executors idle.
 - 2026-09-12 21:20, probe gate on main c54325cc70b4a47f (36ae60e53, both
   fork-barrier fixes): 46/46, no DIFF. `hostfs-opens` lands on top next.
+- 2026-09-13 00:45, `vcpu-lazy-state-sep12` (net_http executor-boundary
+  register traffic, ~30% of carrier CPU) rounds 1–2 reviewed against live
+  data: a net_http ring shows 44.6% of loads are safe same-executor
+  reclaims and 26.0% are "executor record says resident but the thread ran
+  elsewhere" (round 1 reaffirmed stale registers there). Round 2 added the
+  token-keyed reaffirm and a cross-executor wait, but flushed on
+  `queued_len()==0` (kills the fast path) and broadcast a control poke to
+  every CPU; its own gate then died on `windowcoherence` with
+  `cross-executor residency materialization timed out` — director capture
+  `target/perf/perf2x-sep12/lazy-wc/wc1` shows every executor parked idle:
+  the owner parked without flushing (`take_row` finds nothing local while
+  `queued_len() > 0`). Round 3 brief: targeted flush request on the owner's
+  registration + single-CPU nudge, checked as the park predicate; no idle
+  flush; no broadcast. Two wedged interactive `lldb --batch` sessions killed
+  to unwedge the worker; the brief now mandates `carrick debug lldb-run`.
