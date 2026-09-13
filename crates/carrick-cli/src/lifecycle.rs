@@ -1634,6 +1634,11 @@ fn send_logical_signal(
             "container {} logical init identity changed; refusing to signal a stale task",
             container::short_id(id)
         ),
+        // The carrier stopped admission and is persisting its terminal
+        // receipt: the logical init is already past signalling, and the
+        // caller's terminal-receipt wait observes the outcome. Linux/docker
+        // treat a signal to an exiting container the same way: accepted.
+        ControlOutcome::TearingDown => Ok(()),
         ControlOutcome::InvalidSignal => bail!(
             "container {} rejected invalid Linux signal {linux_signal}",
             container::short_id(id)
@@ -1728,9 +1733,11 @@ fn wait_for_terminal_receipt(
         }
         match carrick_runtime::kernel::control::send(id, expected, ControlOperation::Status) {
             Ok(ControlOutcome::Alive) => {}
-            Ok(ControlOutcome::NotRunning) => {
-                // The kernel task has stopped; require its carrier to persist
-                // the authoritative terminal receipt before reporting success.
+            Ok(ControlOutcome::NotRunning) | Ok(ControlOutcome::TearingDown) => {
+                // The kernel task has stopped (or the carrier is between
+                // admission stop and its receipt); require its carrier to
+                // persist the authoritative terminal receipt before reporting
+                // success.
             }
             Ok(ControlOutcome::StaleIncarnation) => bail!(
                 "container {} carrier incarnation changed while awaiting terminal state",

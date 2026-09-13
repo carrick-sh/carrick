@@ -16,7 +16,7 @@ pub use archive::{
     ArchiveControlError, ArchiveMetadata, ArchiveReadStart, ArchiveRequest, ArchiveRuntime,
     CarrierArchiveControl, MAX_ARCHIVE_CHUNK_BYTES,
 };
-pub use endpoint::{ControlEndpoint, EndpointError};
+pub use endpoint::{ControlEndpoint, EndpointError, OwnerPhase};
 pub use exec::{
     CarrierExecAdmission, ExecAdmissionError, ExecAdmissionInstallError, ExecAdmissionSlot,
     ExecAttach, ExecCapability, ExecEnvVar, ExecRequest, ExecResult, ExecRuntime, ExecStatus,
@@ -125,6 +125,10 @@ pub enum ControlOutcome {
     NotRunning,
     StaleIncarnation,
     StaleTask,
+    /// Client-side only: the owner record names this incarnation but the
+    /// carrier has stopped admission and not yet persisted its terminal
+    /// receipt. Wait for the receipt; do not signal, exec or fail.
+    TearingDown,
     InvalidSignal,
     InvalidSchema,
     InvalidExec,
@@ -188,6 +192,9 @@ pub struct CarrierControlServer {
     archive_slot: Option<Arc<ArchiveAdmissionSlot>>,
     shutdown: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
+    /// Set by `quiesce_admission`: the owner record is `TearingDown` and
+    /// belongs to the managed guard until the terminal receipt is durable.
+    retain_owner_on_drop: bool,
 }
 
 /// Run-lifetime guard for one managed carrier. Terminal state is persisted
@@ -197,6 +204,8 @@ pub struct ManagedCarrierControl {
     container_id: String,
     state: crate::container::CarrierControlState,
     server: Option<CarrierControlServer>,
+    endpoint: ControlEndpoint,
+    nonce: ControlNonce,
     completed: bool,
 }
 
@@ -289,7 +298,11 @@ impl CarrierControlServer {
                         eprintln!("carrier control test connection failed: {_error}");
                     }
                 }
-                thread_endpoint.release_if_owner(nonce);
+                // Ownership of the record is the server's, not the accept
+                // loop's: `shutdown` releases it, and a teardown quiesce keeps
+                // it (marked `TearingDown`) until the terminal receipt is
+                // durable.
+                drop(thread_endpoint);
             }) {
             Ok(join) => join,
             Err(error) => {
@@ -305,6 +318,7 @@ impl CarrierControlServer {
             archive_slot,
             shutdown,
             join: Some(join),
+            retain_owner_on_drop: false,
         })
     }
 
@@ -325,6 +339,22 @@ impl CarrierControlServer {
     }
 
     pub fn shutdown(&mut self) {
+        self.stop_admission();
+        self.endpoint.release_if_owner(self.nonce);
+    }
+
+    /// Stop accepting control requests but KEEP the owner record, marked
+    /// `TearingDown`: the terminal receipt has not been persisted yet, so the
+    /// container still reads Running and a client must be able to learn, by
+    /// name, that it should wait for the receipt. `shutdown` (or the managed
+    /// guard's completion) releases the record afterwards.
+    pub(crate) fn quiesce_admission(&mut self) {
+        self.stop_admission();
+        let _ = self.endpoint.mark_tearing_down_if_owner(self.nonce);
+        self.retain_owner_on_drop = true;
+    }
+
+    fn stop_admission(&mut self) {
         if self.shutdown.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -332,13 +362,19 @@ impl CarrierControlServer {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
-        self.endpoint.release_if_owner(self.nonce);
     }
 }
 
 impl Drop for CarrierControlServer {
     fn drop(&mut self) {
-        self.shutdown();
+        if self.retain_owner_on_drop {
+            // Quiesced for teardown: the owner record stays `TearingDown`
+            // until the managed guard persists the terminal receipt and
+            // releases it (`ManagedCarrierControl::complete` / drop).
+            self.stop_admission();
+        } else {
+            self.shutdown();
+        }
     }
 }
 
@@ -369,10 +405,14 @@ impl ManagedCarrierControl {
         state.terminal_control = None;
         state.launch_ticket = None;
         state.persist()?;
+        let endpoint = server.endpoint.clone();
+        let nonce = server.nonce;
         Ok(Self {
             container_id: container_id.to_owned(),
             state: control_state,
             server: Some(server),
+            endpoint,
+            nonce,
             completed: false,
         })
     }
@@ -389,6 +429,9 @@ impl ManagedCarrierControl {
         if let Some(mut server) = self.server.take() {
             server.shutdown();
         }
+        // After `quiesce` the server is gone and the record is `TearingDown`;
+        // the receipt is durable now, so the record can go.
+        self.endpoint.release_if_owner(self.nonce);
         Ok(())
     }
 
@@ -399,7 +442,10 @@ impl ManagedCarrierControl {
     /// once teardown itself has succeeded or failed.
     pub(crate) fn quiesce(&mut self) {
         if let Some(mut server) = self.server.take() {
-            server.shutdown();
+            server.quiesce_admission();
+            // Dropping the server releases its exec/archive authorities; the
+            // owner record survives it, marked `TearingDown`.
+            drop(server);
         }
     }
 
@@ -431,6 +477,7 @@ impl Drop for ManagedCarrierControl {
         if let Some(mut server) = self.server.take() {
             server.shutdown();
         }
+        self.endpoint.release_if_owner(self.nonce);
     }
 }
 
@@ -459,6 +506,9 @@ pub fn send_at(
         Err(EndpointError::StaleOwnerNonce) => return Ok(ControlOutcome::StaleIncarnation),
         Err(error) => return Err(error.into()),
     };
+    if owner.phase == endpoint::OwnerPhase::TearingDown {
+        return Ok(ControlOutcome::TearingDown);
+    }
     let mut stream = UnixStream::connect(endpoint.socket_path())?;
     let peer = carrick_portable::peer_credentials(stream.as_raw_fd())?;
     let uid = unsafe { libc::geteuid() };
@@ -1417,6 +1467,23 @@ mod tests {
         let draining = crate::container::ContainerState::load(&id).expect("draining state");
         assert_eq!(draining.status, crate::container::ContainerStatus::Running);
         assert_eq!(draining.exit_code, None);
+        // The teardown window is NAMED, not an error: the state still reads
+        // Running (the terminal receipt comes from `complete`), so a stop that
+        // lands here must learn the carrier is tearing down and wait for the
+        // receipt. Before this, `quiesce` released the owner record and the
+        // compose smoke test's `down` failed under gate load with "owner
+        // record is missing" (2026-09-13).
+        assert_eq!(
+            send(
+                &id,
+                &guard.state,
+                ControlOperation::Signal {
+                    linux_signal: carrick_abi::LINUX_SIGTERM,
+                },
+            )
+            .expect("a tearing-down carrier answers by name"),
+            ControlOutcome::TearingDown,
+        );
 
         guard.complete(42).expect("complete after quiesce");
         let exited = crate::container::ContainerState::load(&id).expect("terminal state");
