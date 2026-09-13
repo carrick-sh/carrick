@@ -252,6 +252,7 @@ where
     // executor's own command channel is honored HERE, after the terminal that
     // consumed it has fully settled.
     let mut deferred_stop = false;
+    let mut was_control_poked = false;
     loop {
         if deferred_stop {
             return Ok(());
@@ -260,9 +261,18 @@ where
         {
             return Ok(());
         }
+        if registration.is_spare() || scheduler.queued_len() == 0 || was_control_poked {
+            backend
+                .flush_resident_task()
+                .map_err(|error| error.to_string())?;
+        }
+        was_control_poked = false;
         let mut running = match scheduler.take(registration) {
             Ok(running) => running,
-            Err(crate::kernel::RunQueueError::ControlPoked) => continue,
+            Err(crate::kernel::RunQueueError::ControlPoked) => {
+                was_control_poked = true;
+                continue;
+            }
             Err(crate::kernel::RunQueueError::Closed) => return Ok(()),
             Err(error) => return Err(error.to_string()),
         };
@@ -348,6 +358,11 @@ where
                 return Err(with_settlement_error(error.to_string(), settlement));
             }
         };
+        if let Some(TaskCpuResidency::Resident { executor, .. }) = task.binding().cpu_residency() {
+            if executor != executor_id {
+                scheduler.poke_executor_control();
+            }
+        }
         if let Err(error) = backend.load(&task) {
             // A load refused because the address space is retiring is not this
             // executor's failure: another thread in the group called `execve`

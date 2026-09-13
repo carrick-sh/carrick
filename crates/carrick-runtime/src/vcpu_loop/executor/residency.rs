@@ -97,28 +97,3 @@ impl TaskCpuResidency {
         }
     }
 }
-
-/// The authoritative typed accessor for obtaining materialized CPU register state.
-///
-/// Any consumer that needs the register file — a claim by a different executor,
-/// fork/clone/vfork child construction, exec, signal delivery/sigframe construction,
-/// ptrace, crash capture, kernel-debug snapshot, executor destroy — must obtain a
-/// materialized state through this accessor. No path may read a `Resident` token
-/// as if it were registers.
-#[allow(dead_code)]
-pub(crate) fn materialize_task_state<E: crate::vcpu_loop::executor::backend::PersistentExecutor>(
-    residency: &mut TaskCpuResidency,
-    executor: &mut E,
-) -> Result<GuestCpuState, TrapError> {
-    match residency {
-        TaskCpuResidency::Materialized(cpu) => Ok(cpu.clone()),
-        TaskCpuResidency::Resident {
-            executor: _,
-            generation,
-        } => {
-            let cpu = executor.snapshot_resident_task(*generation)?;
-            *residency = TaskCpuResidency::Materialized(cpu.clone());
-            Ok(cpu)
-        }
-    }
-}

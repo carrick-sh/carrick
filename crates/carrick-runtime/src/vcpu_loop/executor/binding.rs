@@ -64,6 +64,13 @@ pub trait PersistentTaskBinding {
 
     fn set_cpu_residency(&self, _residency: super::residency::TaskCpuResidency) {}
 
+    fn wait_for_materialized(
+        &self,
+        _thread: ThreadKey,
+    ) -> Result<Option<carrick_hal::threaded::GuestCpuState>, TrapError> {
+        Ok(None)
+    }
+
     fn mark_exec_transferred(&self) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "task binding has no exec-transfer terminal authority".to_owned(),
@@ -150,6 +157,24 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         let _ = residency;
+    }
+
+    fn wait_for_materialized(
+        &self,
+        thread: ThreadKey,
+    ) -> Result<Option<carrick_hal::threaded::GuestCpuState>, TrapError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let handle = self.inspect_backend::<super::backend::HvpatchTaskEngineBindingState, _>(
+                |state| Ok(state.residency_handle()),
+            )?;
+            handle.wait_for_materialized(thread)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = thread;
+            Ok(None)
+        }
     }
 
     fn mark_exec_transferred(&self) -> Result<(), TrapError> {
