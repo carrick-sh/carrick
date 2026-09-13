@@ -208,10 +208,14 @@ impl<'a> NetView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return false;
         };
-        matches!(
-            open_file.description.read().as_deref(),
-            Some(OpenDescription::HostSocket { .. })
-        )
+        match open_file.description.read().as_deref() {
+            Some(OpenDescription::HostSocket { .. }) => true,
+            Some(OpenDescription::InMemorySocket { socket, .. }) => {
+                (socket.family == LINUX_AF_INET || socket.family == LINUX_AF_INET6)
+                    && socket.socket_type == carrick_abi::LINUX_SOCK_STREAM
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn fd_is_listening_socket(&self, fd: i32) -> bool {

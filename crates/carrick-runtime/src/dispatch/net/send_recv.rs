@@ -293,6 +293,29 @@ impl<'a> NetView<'a> {
                             Ok(b) => b,
                             Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                         };
+                        if (flags & LinuxMsgFlags::OOB.bits()) != 0 {
+                            if socket.family == LINUX_AF_UNIX {
+                                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                            }
+                            if socket.socket_type != LINUX_SOCK_STREAM {
+                                return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+                            }
+                            match socket.send_oob(&bytes) {
+                                Ok(written) => {
+                                    this.notify_inmem_epoll();
+                                    return Ok(DispatchOutcome::returned_len(written)?);
+                                }
+                                Err(LINUX_EPIPE) => {
+                                    let outcome = DispatchOutcome::errno(LINUX_EPIPE);
+                                    if (flags & LINUX_MSG_NOSIGNAL) == 0 {
+                                        return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
+                                    } else {
+                                        return Ok(outcome);
+                                    }
+                                }
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            }
+                        }
                         match socket.send_stream(&bytes, Vec::new()) {
                             Ok(written) => {
                                 this.notify_inmem_epoll();
@@ -627,6 +650,39 @@ impl<'a> NetView<'a> {
                         drop(open);
                         let mut target_buf = vec![0u8; len];
                         let peek = flags & LinuxMsgFlags::PEEK.bits() != 0;
+                        if (flags & LinuxMsgFlags::OOB.bits()) != 0 {
+                            if socket.family == LINUX_AF_UNIX {
+                                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                            }
+                            match socket.recv_oob(&mut target_buf, peek) {
+                                Ok(read_len) => {
+                                    if read_len > 0
+                                        && memory
+                                            .write_bytes(buf_addr, &target_buf[..read_len])
+                                            .is_err()
+                                    {
+                                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                                    }
+                                    if let Some(peer) = socket.peer_addr() {
+                                        if src_addr != 0 && src_len_addr != 0 {
+                                            if let Some(sockaddr_bytes) =
+                                                socket_addr_to_linux_sockaddr(peer)
+                                            {
+                                                let _ = write_linux_sockaddr(
+                                                    memory,
+                                                    src_addr,
+                                                    src_len_addr,
+                                                    &sockaddr_bytes,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    this.notify_inmem_epoll();
+                                    return Ok(DispatchOutcome::returned_len(read_len)?);
+                                }
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            }
+                        }
                         match socket.recv_stream_flags(&mut target_buf, 0, peek) {
                             Ok((read_len, _rights)) => {
                                 if read_len > 0 {
@@ -917,6 +973,21 @@ impl<'a> NetView<'a> {
                     Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                 };
                 data.extend_from_slice(&chunk);
+            }
+            if (flags & LinuxMsgFlags::OOB.bits()) != 0 {
+                if socket.family == LINUX_AF_UNIX {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if socket.socket_type != LINUX_SOCK_STREAM {
+                    return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+                }
+                match socket.send_oob(&data) {
+                    Ok(written) => {
+                        self.notify_inmem_epoll();
+                        return Ok(DispatchOutcome::returned_len(written)?);
+                    }
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                }
             }
             match socket.send_stream(&data, Vec::new()) {
                 Ok(written) => {
@@ -1304,7 +1375,17 @@ impl<'a> NetView<'a> {
             let total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
             let mut target_buf = vec![0u8; total];
             let peek = flags & LinuxMsgFlags::PEEK.bits() != 0;
-            match socket.recv_stream_flags(&mut target_buf, 0, peek) {
+            let res = if (flags & LinuxMsgFlags::OOB.bits()) != 0 {
+                if socket.family == LINUX_AF_UNIX {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                socket
+                    .recv_oob(&mut target_buf, peek)
+                    .map(|len| (len, Vec::new()))
+            } else {
+                socket.recv_stream_flags(&mut target_buf, 0, peek)
+            };
+            match res {
                 Ok((read_len, _rights)) => {
                     let mut remaining = read_len;
                     let mut cursor = 0usize;
