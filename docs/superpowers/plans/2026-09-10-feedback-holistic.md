@@ -944,3 +944,8 @@ commits and is re-checked at the next vet.
   Paired scorecard on ab97e9df5825ce19 (lazy vCPU state) before these:
   net_http 3.39 s w4 / 3.24 s w1 (was 3.44 / 3.80), 39/40 MATCH + the
   multiprocessing regression above.
+- 2026-09-13 02:30, receipts on main 457da5fb6521ff7b (both fixes):
+  `cpython-multiprocessing_main_handling` 12/12 MATCH (was 2/15 REGRESSION
+  on the round-2 binaries); probe gate 46/46 with
+  `docker_compose_shared_network_namespace_smoke` green inside the loaded
+  gate. Paired scorecard `measure-sep13b.sh` on this pin follows.
