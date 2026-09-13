@@ -300,6 +300,8 @@ pub struct HostFsBackend {
     /// (`create_socket`/`create_device` stamp the marker BEFORE creating the
     /// node).
     marker_absent_gen: std::sync::atomic::AtomicU64,
+    /// In-memory set of directory relative paths that contain marker nodes.
+    marker_dirs: parking_lot::RwLock<std::collections::HashSet<std::path::PathBuf>>,
     /// Sticky fast answer for "does any entry carry guest metadata xattrs"
     /// (mode/uid/gid): mirrors `marker_seen`/`marker_absent_gen` over
     /// [`CARRICK_HAS_META_XATTRS_XATTR`], stamped by `set_mode`/`set_owner`
@@ -1017,6 +1019,7 @@ impl HostFsBackend {
             fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
             marker_seen: std::sync::atomic::AtomicBool::new(false),
             marker_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            marker_dirs: parking_lot::RwLock::new(std::collections::HashSet::new()),
             meta_xattr_seen: std::sync::atomic::AtomicBool::new(false),
             meta_xattr_absent_gen: std::sync::atomic::AtomicU64::new(0),
             whiteout_seen: std::sync::atomic::AtomicBool::new(false),
@@ -1078,6 +1081,7 @@ impl HostFsBackend {
             fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
             marker_seen: std::sync::atomic::AtomicBool::new(false),
             marker_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            marker_dirs: parking_lot::RwLock::new(std::collections::HashSet::new()),
             meta_xattr_seen: std::sync::atomic::AtomicBool::new(false),
             meta_xattr_absent_gen: std::sync::atomic::AtomicU64::new(0),
             whiteout_seen: std::sync::atomic::AtomicBool::new(false),
@@ -2375,6 +2379,28 @@ impl HostFsBackend {
         self.stamp_root_marker(CARRICK_HAS_MARKER_NODES_XATTR, &self.marker_seen);
     }
 
+    pub(crate) fn has_marker_nodes(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.marker_seen.load(Relaxed) {
+            return true;
+        }
+        let now = crate::fs_resolve_cache::current_marker_generation();
+        if self.marker_absent_gen.load(Relaxed) == now {
+            return false;
+        }
+        match self.root_marker_xattr(CARRICK_HAS_MARKER_NODES_XATTR) {
+            RootMarker::Present => {
+                self.marker_seen.store(true, Relaxed);
+                true
+            }
+            RootMarker::Absent => {
+                self.marker_absent_gen.store(now, Relaxed);
+                false
+            }
+            RootMarker::Unknown => true,
+        }
+    }
+
     fn may_have_whiteouts(&self) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         if self.whiteout_seen.load(Relaxed) {
@@ -3254,6 +3280,11 @@ const CARRICK_HAS_FIFO_XATTR: &[u8] = b"user.carrick.has_fifo\0";
 /// streaming in every sibling). Hidden from the guest's xattr syscalls like
 /// every `user.carrick.*` name.
 const CARRICK_HAS_MARKER_NODES_XATTR: &[u8] = b"user.carrick.has_marker_nodes\0";
+/// Marker xattr on a DIRECTORY recording that a marker node (socket/device) has
+/// been created directly under it. While absent, `read_host_dir_entries` knows
+/// that DT_REG entries in this directory are genuine regular files without
+/// checking xattrs.
+const CARRICK_DIR_HAS_MARKERS_XATTR: &[u8] = b"user.carrick.dir_has_markers\0";
 /// Root marker: some entry carries per-file guest METADATA xattrs (mode from
 /// chmod, uid/gid from chown). While ABSENT, a host stat of a plain entry IS
 /// the guest-visible answer, so the trusted dispatch lanes may skip their
@@ -4310,44 +4341,32 @@ impl FsBackend for HostFsBackend {
                 }
                 RootMarker::Unknown => false,
             };
-        meta_absent && !self.dir_has_overlay_interference("/")
+        meta_absent && !self.has_marker_nodes()
     }
 
     fn note_meta_xattr_written(&self) {
         self.stamp_root_marker(CARRICK_HAS_META_XATTRS_XATTR, &self.meta_xattr_seen);
     }
 
-    fn dir_has_overlay_interference(&self, _dir: &str) -> bool {
-        // The scratch tree is the merged truth for the host backend (rootfs
-        // materialized, deletions are real unlinks), so the only thing that
-        // can make a raw host directory stream lie is a MARKER node (socket/
-        // device — a regular file whose guest type lives in xattrs). Tracked
-        // root-level like the FIFO marker: `create_socket`/`create_device`
-        // stamp the durable root xattr (bumping the shared marker generation)
-        // BEFORE creating the node, so "marker generation unchanged since the
-        // last absent reading" proves no marker node appeared anywhere. Coarse (any
-        // marker node anywhere disables streaming everywhere) but exact —
-        // and walk workloads do not bind sockets or mknod devices.
-        use std::sync::atomic::Ordering::Relaxed;
-        if self.marker_seen.load(Relaxed) {
-            return true;
-        }
-        let now = crate::fs_resolve_cache::current_marker_generation();
-        if self.marker_absent_gen.load(Relaxed) == now {
+    fn dir_has_overlay_interference(&self, dir: &str) -> bool {
+        use std::os::fd::AsRawFd;
+        if !self.has_marker_nodes() {
             return false;
         }
-        match self.root_marker_xattr(CARRICK_HAS_MARKER_NODES_XATTR) {
-            RootMarker::Present => {
-                self.marker_seen.store(true, Relaxed);
-                true
-            }
-            RootMarker::Absent => {
-                self.marker_absent_gen.store(now, Relaxed);
-                false
-            }
-            // Marker mechanism unavailable: fail CLOSED (no streaming).
-            RootMarker::Unknown => true,
+        let Some(normalized) = normalize(dir) else {
+            return true;
+        };
+        let rel = Self::rel_path(&normalized).unwrap_or_else(|| Path::new(""));
+        if self.marker_dirs.read().contains(rel) {
+            return true;
         }
+        if let Ok(dir_fd) = self.dir_fd_for(rel) {
+            if fget_u32_xattr(dir_fd.as_raw_fd(), CARRICK_DIR_HAS_MARKERS_XATTR).is_some() {
+                self.marker_dirs.write().insert(rel.to_path_buf());
+                return true;
+            }
+        }
+        false
     }
 
     fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
@@ -4608,6 +4627,9 @@ impl FsBackend for HostFsBackend {
             .and_then(cstring_from_osstr)
             .ok_or(BackendError::Invalid)?;
         self.stamp_marker_node_marker();
+        fset_u32_xattr(parent_fd.as_raw_fd(), CARRICK_DIR_HAS_MARKERS_XATTR, 1);
+        let parent_rel = rel.parent().unwrap_or_else(|| Path::new(""));
+        self.marker_dirs.write().insert(parent_rel.to_path_buf());
         crate::fs_resolve_cache::bump_generation();
         let flags =
             libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
@@ -4639,6 +4661,9 @@ impl FsBackend for HostFsBackend {
             }
         };
         self.stamp_marker_node_marker();
+        fset_u32_xattr(parent_fd.as_raw_fd(), CARRICK_DIR_HAS_MARKERS_XATTR, 1);
+        let parent_rel = rel.parent().unwrap_or_else(|| Path::new(""));
+        self.marker_dirs.write().insert(parent_rel.to_path_buf());
         crate::fs_resolve_cache::bump_generation();
         let flags =
             libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
@@ -6697,6 +6722,30 @@ pub(crate) fn read_host_dir_entries(
     // fdopendir adopts the fd's CURRENT offset; the dup shares the
     // original's, so rewind to read the whole directory.
     unsafe { libc::rewinddir(dirp.0) };
+
+    let dir_has_markers = fget_u32_xattr(host_dir_fd, CARRICK_DIR_HAS_MARKERS_XATTR).is_some();
+    let mut dir_path_buf = [0u8; libc::PATH_MAX as usize];
+    let dir_host_path = if dir_has_markers {
+        let rc = unsafe {
+            libc::fcntl(
+                host_dir_fd,
+                libc::F_GETPATH,
+                dir_path_buf.as_mut_ptr() as *mut libc::c_char,
+            )
+        };
+        if rc >= 0 {
+            let len = dir_path_buf
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(dir_path_buf.len());
+            std::str::from_utf8(&dir_path_buf[..len]).ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut out = Vec::new();
     loop {
         // SAFETY: dirp.0 is a live DIR*; readdir returns null at end.
@@ -6727,7 +6776,36 @@ pub(crate) fn read_host_dir_entries(
         }
         let kind = match d_type {
             libc::DT_DIR => RootFsEntryKind::Directory,
-            libc::DT_REG => RootFsEntryKind::File,
+            libc::DT_REG => {
+                if dir_has_markers {
+                    if let Some(host_dir) = dir_host_path {
+                        let full = format!("{host_dir}/{name}\0");
+                        let (mode, _uid, _gid, is_sock) =
+                            path_carrick_meta(full.as_ptr() as *const libc::c_char);
+                        if is_sock {
+                            RootFsEntryKind::Socket
+                        } else if let Some(m) = mode {
+                            match m & crate::linux_abi::LINUX_S_IFMT {
+                                s if s == crate::linux_abi::LINUX_S_IFCHR => {
+                                    RootFsEntryKind::CharDevice
+                                }
+                                s if s == crate::linux_abi::LINUX_S_IFBLK => return None,
+                                s if s == crate::linux_abi::LINUX_S_IFIFO => RootFsEntryKind::Fifo,
+                                s if s == crate::linux_abi::LINUX_S_IFSOCK => {
+                                    RootFsEntryKind::Socket
+                                }
+                                _ => RootFsEntryKind::File,
+                            }
+                        } else {
+                            RootFsEntryKind::File
+                        }
+                    } else {
+                        return None;
+                    }
+                } else {
+                    RootFsEntryKind::File
+                }
+            }
             libc::DT_LNK => RootFsEntryKind::Symlink,
             libc::DT_FIFO => RootFsEntryKind::Fifo,
             libc::DT_SOCK => RootFsEntryKind::Socket,
