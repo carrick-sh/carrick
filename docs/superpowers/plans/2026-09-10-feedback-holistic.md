@@ -986,3 +986,9 @@ commits and is re-checked at the next vet.
   semantics in-kernel), red-first "instance fd not readable after a
   delivered edge with unread data", the epoll/ppoll line-exact probes as
   judges, three harness timings with any TIMEOUT captured.
+- 2026-09-13 06:15, `reactor-kqueue-sep13` round 4 (EV_CLEAR) in progress;
+  its turn wedged on two of its own hung test processes (one spinning 18
+  min: the reactor retrying a non-EINTR `kqueue.wait` error forever under
+  its new shutdown test; one parked 55 min on a barrier from an abandoned
+  run). Director killed both, stopped the turn, and sent round 5 (exit the
+  reactor on a non-EINTR error; kill any test over 5 minutes).
