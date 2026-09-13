@@ -1083,3 +1083,19 @@ commits and is re-checked at the next vet.
   `just conformance-probes` + `just test` on that tree, then Task 5
   paired measure `measure-sep13c.sh` (cand 781e8349f09c3928 vs the
   pre-in-zone main pin 457da5fb6521ff7b).
+- 2026-09-13 10:15, gates on pin 781e8349f09c3928 (probe branch): `just test`
+  green; `just conformance-probes` has FOUR in-zone reds — loopback TCP
+  used to run over host sockets and these probes now exercise the
+  in-memory INET stream: `epollpri` (no OOB byte / EPOLLPRI in-memory),
+  `spliceunixpoll` (splice makes no progress against an InMemorySocket),
+  `socketpartialsend` (a BLOCKING `read(2)` on the accepted in-memory
+  socket returned EAGAIN to the guest — the wait shape is missing),
+  `streamdestmatrix` (in-memory `sendto` skips the negative/oversized/
+  EFAULT length validation the host path performs). The wiring worker had
+  attributed the last two to "Task 3 in flight"; Task 3 is landed and they
+  still fail, so that claim was wrong. Dispatched `inzone-gaps-sep13`
+  (brief `inzone-gaps.md`, worktree from `agy/inzone-probe-sep13`
+  314fd9a72) with the exact red lines and the five judges; the probe
+  branch does not land until all five MATCH. Task 5 measure script
+  `measure-sep13c.sh` is written (cand 781e8349f09c3928 vs 457da5fb6521ff7b)
+  and waits for a quiet host.
