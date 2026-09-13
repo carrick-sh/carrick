@@ -3874,18 +3874,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net/support.rs:1422 in `unix_socket_host_path`, `std::fs::create_dir_all` accesses only the run-scoped network backing directory used by `unix_socket_host_path`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net/support.rs:1428 in `unix_socket_host_path`, `std::fs::create_dir_all` accesses only the run-scoped network backing directory used by `unix_socket_host_path`.",
     "review_id": "HA-000172",
     "source": {
-      "byte_end": 63482,
-      "byte_start": 63459,
+      "byte_end": 63667,
+      "byte_start": 63644,
       "column": 13,
       "column_end": 36,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
-      "line": 1422,
-      "line_end": 1422,
-      "line_start": 1422
+      "line": 1428,
+      "line_end": 1428,
+      "line_start": 1428
     }
   },
   {
@@ -3901,18 +3901,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net/support.rs:1460 in `autobind_unix_host_path`, `std::fs::create_dir_all` accesses only the run-scoped network backing directory used by `autobind_unix_host_path`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net/support.rs:1466 in `autobind_unix_host_path`, `std::fs::create_dir_all` accesses only the run-scoped network backing directory used by `autobind_unix_host_path`.",
     "review_id": "HA-000173",
     "source": {
-      "byte_end": 65255,
-      "byte_start": 65232,
+      "byte_end": 65440,
+      "byte_start": 65417,
       "column": 13,
       "column_end": 36,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
-      "line": 1460,
-      "line_end": 1460,
-      "line_start": 1460
+      "line": 1466,
+      "line_end": 1466,
+      "line_start": 1466
     }
   },
   {
