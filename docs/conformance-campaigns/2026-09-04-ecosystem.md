@@ -3700,7 +3700,7 @@ before); probe gate 46/46 on c54325cc70b4a47f and on the merged main
 67e536aace35f82e vs base 3c8dbee5b686c49d) running; table follows.
 
 Paired scorecard (`measure-sep12d.sh` under zsh, candidate 67e536aace35f82e
-vs base 3c8dbee5b686c49d, 40/40 MATCH, wall seconds):
+vs base 3c8dbee5b686c49d, 40/40 MATCH; the table values are carrick/Docker wall ratios, not seconds):
 
 | row | base w4 | cand w4 | cand/base | base w1 | cand w1 |
 |---|---|---|---|---|---|
@@ -3766,7 +3766,7 @@ Main 457da5fb6521ff7b carries the residency-keyed lazy vCPU save/restore
 controller), the carrier teardown-window fix (614b2de8a) and the trusted
 dirent stream's own-description fix (6906c19cc). Paired scorecard
 (`measure-sep13b.sh`, candidate 457da5fb6521ff7b vs base 3c8dbee5b686c49d,
-40/40 MATCH, wall seconds):
+40/40 MATCH; the table values are carrick/Docker wall ratios, not seconds):
 
 | row | base w4 | cand w4 | cand/base | base w1 | cand w1 |
 |---|---|---|---|---|---|
