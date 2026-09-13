@@ -4,10 +4,14 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use parking_lot::Mutex;
+
 use carrick_fatal::carrick_fatal;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use carrick_hal::ThreadedEngine as _;
 
+#[path = "residency.rs"]
+pub mod residency;
 use crate::kernel::objects::{
     ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState, ThreadExecutionLease,
     ThreadKey,
@@ -20,6 +24,7 @@ use crate::vcpu_loop::executor::binding::{
 use crate::vcpu_loop::executor::settlement::{
     ExecutorCpuReceipt, ExecutorExit, ExecutorSaveError, RunnableTask, SavedRunnable,
 };
+pub use residency::*;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct HvpatchPersistentExecutorFactory {
@@ -36,6 +41,15 @@ impl HvpatchPersistentExecutorFactory {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct HvpatchResidentTaskRecord {
+    thread: ThreadKey,
+    #[allow(dead_code)]
+    generation: ExecutionGeneration,
+    binding: Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
+    metadata: carrick_aarch64::Aarch64ResidentTaskMetadata,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct HvpatchPersistentExecutor {
     executor_id: ExecutorId,
     lifecycle: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vmm>,
@@ -47,11 +61,14 @@ pub(crate) struct HvpatchPersistentExecutor {
     receipt: ExecutorCpuReceipt,
     raw_vcpu_id: u64,
     owner_thread_port: u32,
+    residency_generation: ResidencyGeneration,
+    resident_task: Option<HvpatchResidentTaskRecord>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct HvpatchTaskEngineBindingState {
     payload: HvpatchTaskEngineBindingPayload,
+    residency: Mutex<Option<TaskCpuResidency>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -83,6 +100,7 @@ impl HvpatchTaskEngineBindingState {
     ) -> Self {
         Self {
             payload: HvpatchTaskEngineBindingPayload::Resident(Box::new(state)),
+            residency: Mutex::new(None),
         }
     }
 
@@ -91,6 +109,7 @@ impl HvpatchTaskEngineBindingState {
     ) -> Self {
         Self {
             payload: HvpatchTaskEngineBindingPayload::TaskOnly(Box::new(state)),
+            residency: Mutex::new(None),
         }
     }
 
@@ -274,7 +293,16 @@ impl HvpatchTaskEngineBindingState {
     pub(crate) fn test_only() -> Self {
         Self {
             payload: HvpatchTaskEngineBindingPayload::Test,
+            residency: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn residency(&self) -> Option<TaskCpuResidency> {
+        self.residency.lock().clone()
+    }
+
+    pub(crate) fn set_residency(&self, residency: TaskCpuResidency) {
+        *self.residency.lock() = Some(residency);
     }
 }
 
@@ -296,6 +324,8 @@ impl PersistentExecutorFactory for HvpatchPersistentExecutorFactory {
             receipt: ExecutorCpuReceipt::default(),
             raw_vcpu_id,
             owner_thread_port,
+            residency_generation: ResidencyGeneration::INITIAL,
+            resident_task: None,
         })
     }
 }
@@ -344,6 +374,21 @@ pub(crate) trait PersistentExecutor: 'static {
     fn audit_boundary(&mut self) -> Result<(), TrapError>;
 
     fn destroy(self) -> Result<(), TrapError>;
+
+    #[allow(dead_code)]
+    fn residency_generation(&self) -> super::residency::ResidencyGeneration {
+        super::residency::ResidencyGeneration::INITIAL
+    }
+
+    #[allow(dead_code)]
+    fn snapshot_resident_task(
+        &mut self,
+        _generation: super::residency::ResidencyGeneration,
+    ) -> Result<carrick_hal::threaded::GuestCpuState, TrapError> {
+        Err(TrapError::Hypervisor(
+            "persistent executor does not support resident snapshot".to_owned(),
+        ))
+    }
 }
 
 pub struct ExactHardwareKick {
@@ -480,6 +525,21 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             .vcpu
             .take()
             .ok_or_else(|| TrapError::Hypervisor("HVPatch executor lost worker vCPU".into()))?;
+        let is_same_resident = match self.resident_task.take() {
+            Some(resident) => {
+                if resident.thread == task.thread_key() {
+                    Some(resident)
+                } else {
+                    let evicted_cpu = resident.metadata.snapshot_guest_cpu(&vcpu)?;
+                    resident
+                        .binding
+                        .set_cpu_residency(TaskCpuResidency::Materialized(evicted_cpu));
+                    self.residency_generation = self.residency_generation.next();
+                    None
+                }
+            }
+            None => None,
+        };
         let engine = match state.payload {
             HvpatchTaskEngineBindingPayload::Resident(state) => {
                 let lifecycle = self.lifecycle.as_mut().ok_or_else(|| {
@@ -516,10 +576,17 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         };
         self.current = Some(engine);
         self.binding = Some(Arc::clone(task.binding()));
-        self.current
-            .as_mut()
-            .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost attached engine".into()))?
-            .overlay_task_state_on_live_executor(cpu)?;
+        if let Some(resident) = is_same_resident {
+            self.current
+                .as_mut()
+                .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost attached engine".into()))?
+                .reaffirm_resident_task_state_on_live_executor(cpu, &resident.metadata)?;
+        } else {
+            self.current
+                .as_mut()
+                .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost attached engine".into()))?
+                .overlay_task_state_on_live_executor(cpu)?;
+        }
         task.binding().service_pending_cow_invalidation(
             &cow_invalidation_observer,
             |generation| {
@@ -637,10 +704,6 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 lease,
             ));
         };
-        let cpu = match engine.snapshot_task_state_from_live_executor() {
-            Ok(cpu) => cpu,
-            Err(error) => return Err(ExecutorSaveError::new(error, lease)),
-        };
         let (mm, asid_generation) = match lease.task_state_authority() {
             Ok(authority) => authority,
             Err(error) => {
@@ -650,16 +713,26 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 ));
             }
         };
-        if let Err(error) = lease.replace_task_state(MigratableTaskState {
-            cpu,
-            mm,
-            asid_generation,
-        }) {
-            return Err(ExecutorSaveError::new(
-                TrapError::Hypervisor(error.to_string()),
-                lease,
-            ));
-        }
+        let metadata = match engine.extract_resident_task_metadata_for_lazy_save() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let cpu = match engine.snapshot_task_state_from_live_executor() {
+                    Ok(cpu) => cpu,
+                    Err(_) => return Err(ExecutorSaveError::new(error, lease)),
+                };
+                if let Err(replace_err) = lease.replace_task_state(MigratableTaskState {
+                    cpu,
+                    mm,
+                    asid_generation,
+                }) {
+                    return Err(ExecutorSaveError::new(
+                        TrapError::Hypervisor(replace_err.to_string()),
+                        lease,
+                    ));
+                }
+                return Err(ExecutorSaveError::new(error, lease));
+            }
+        };
         if let Err(error) = engine.restore_persistent_executor_invariants() {
             return Err(ExecutorSaveError::new(error, lease));
         }
@@ -703,6 +776,16 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 carrick_vmm_hvf::hvf_aarch64_engine::detach_task_engine(engine, lifecycle);
             (HvpatchTaskEngineBindingState::initial(state), vcpu)
         };
+        backend.set_residency(TaskCpuResidency::Resident {
+            executor: self.executor_id,
+            generation: self.residency_generation,
+        });
+        self.resident_task = Some(HvpatchResidentTaskRecord {
+            thread: lease.thread_key(),
+            generation: lease.generation(),
+            binding: Arc::clone(&binding),
+            metadata,
+        });
         if let Err(error) = restore_worker_vcpu_before_binding_publication(
             &mut self.vcpu,
             vcpu,
@@ -806,6 +889,16 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             }
             self.vcpu = Some(vcpu);
         }
+        if let Some(resident) = self.resident_task.take() {
+            if let Some(vcpu) = self.vcpu.as_ref() {
+                if let Ok(cpu) = resident.metadata.snapshot_guest_cpu(vcpu) {
+                    resident
+                        .binding
+                        .set_cpu_residency(TaskCpuResidency::Materialized(cpu));
+                    self.residency_generation = self.residency_generation.next();
+                }
+            }
+        }
         let mut vcpu = self
             .vcpu
             .take()
@@ -816,5 +909,30 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             .ok_or_else(|| TrapError::Hypervisor("destroy missing worker lifecycle".into()))?;
         carrick_vmm_hvf::hvf_aarch64_engine::destroy_worker_vcpu(lifecycle, &mut vcpu);
         Ok(())
+    }
+
+    fn residency_generation(&self) -> ResidencyGeneration {
+        self.residency_generation
+    }
+
+    fn snapshot_resident_task(
+        &mut self,
+        generation: ResidencyGeneration,
+    ) -> Result<carrick_hal::threaded::GuestCpuState, TrapError> {
+        if generation != self.residency_generation {
+            return Err(TrapError::Hypervisor("stale residency generation".into()));
+        }
+        let Some(resident) = self.resident_task.take() else {
+            return Err(TrapError::Hypervisor("no resident task on executor".into()));
+        };
+        let vcpu = self.vcpu.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor("snapshot resident task missing worker vCPU".into())
+        })?;
+        let cpu = resident.metadata.snapshot_guest_cpu(vcpu)?;
+        resident
+            .binding
+            .set_cpu_residency(TaskCpuResidency::Materialized(cpu.clone()));
+        self.residency_generation = self.residency_generation.next();
+        Ok(cpu)
     }
 }

@@ -90,6 +90,45 @@ struct FakeBinding {
         parking_lot::Mutex<Option<crate::hvpatch::PendingAddressSpaceRetirement>>,
     retire_detached_address_space_gate: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     retire_detached_address_space_resume: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    residency: parking_lot::Mutex<super::residency::TaskCpuResidency>,
+}
+
+fn test_guest_cpu_state(marker: u64) -> GuestCpuState {
+    GuestCpuState::from_aarch64_v1(Aarch64TaskCpuStateV1 {
+        gprs: std::array::from_fn(|index| marker + index as u64),
+        pc: marker + 0x1000,
+        pstate: marker + 0x2000,
+        trap_pc: marker + 0x2100,
+        trap_pstate: marker + 0x2200,
+        sp_el0: marker + 0x3000,
+        elr_el1: marker + 0x3100,
+        spsr_el1: marker + 0x3200,
+        ttbr0: marker + 0x4000,
+        ttbr1: marker + 0x5000,
+        tcr: marker + 0x6000,
+        sctlr_el1: marker + 0x6100,
+        mair_el1: marker + 0x6200,
+        vbar_el1: marker + 0x6300,
+        cpacr_el1: marker + 0x6400,
+        cntkctl_el1: marker + 0x6500,
+        tpidr_el1: marker + 0x6600,
+        actlr_el1: marker + 0x7000,
+        tpidr_el0: marker + 0x8000,
+        tpidrro_el0: marker + 0x9000,
+        contextidr_el1: marker + 0xa000,
+        vregs: std::array::from_fn(|index| marker as u128 + index as u128),
+        fpsr: marker as u32,
+        fpcr: marker as u32 + 1,
+        pending_resume_pc: Some(marker + 0xb000),
+        last_syscall_nr: Some(marker),
+        last_syscall_orig_x0: marker + 2,
+        last_fault_esr: marker + 3,
+        last_exit_class: marker,
+        is_forked_child: false,
+        syscall_continuation: None,
+        mm_generation: 1,
+        asid_generation: 1,
+    })
 }
 
 impl FakeBinding {
@@ -112,6 +151,9 @@ impl FakeBinding {
             pending_address_space_retirement: parking_lot::Mutex::new(None),
             retire_detached_address_space_gate: parking_lot::Mutex::new(None),
             retire_detached_address_space_resume: parking_lot::Mutex::new(None),
+            residency: parking_lot::Mutex::new(super::residency::TaskCpuResidency::Materialized(
+                test_guest_cpu_state(marker),
+            )),
         })
     }
 
@@ -223,6 +265,14 @@ impl PersistentTaskBinding for FakeBinding {
         }
         Ok(root_ticket.map(|ticket| ticket.complete_for_test()))
     }
+
+    fn cpu_residency(&self) -> Option<super::residency::TaskCpuResidency> {
+        Some(self.residency.lock().clone())
+    }
+
+    fn set_cpu_residency(&self, residency: super::residency::TaskCpuResidency) {
+        *self.residency.lock() = residency;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -267,6 +317,7 @@ struct FakeFactory {
     owner_dirty_fds: Arc<parking_lot::Mutex<Vec<(i32, i32)>>>,
     destroy_mode: Arc<AtomicUsize>,
     snapshot_count: Arc<AtomicUsize>,
+    overlay_count: Arc<AtomicUsize>,
     concurrent_loads: Arc<parking_lot::Mutex<BTreeSet<(ThreadKey, ExecutionGeneration)>>>,
     inherited_state: Arc<parking_lot::Mutex<Vec<InheritedStateRow>>>,
     retired_bindings: Arc<parking_lot::Mutex<Vec<(ThreadKey, ExecutionGeneration)>>>,
@@ -451,6 +502,8 @@ struct FakeExecutor {
     tls: u64,
     user_ns: u64,
     system_ns: u64,
+    residency_generation: super::residency::ResidencyGeneration,
+    resident_task: Option<(ThreadKey, ExecutionGeneration, Arc<FakeBinding>)>,
 }
 
 struct BoundaryAuditProbe;
@@ -688,6 +741,8 @@ impl PersistentExecutorFactory for FakeFactory {
             tls: 0,
             user_ns: 0,
             system_ns: 0,
+            residency_generation: super::residency::ResidencyGeneration::INITIAL,
+            resident_task: None,
         })
     }
 }
@@ -726,6 +781,24 @@ impl PersistentExecutor for FakeExecutor {
         }
         self.factory
             .record(BackendEventKind::Load, self.id, Some(key));
+        let is_same_resident = match self.resident_task.take() {
+            Some((res_thread, _res_gen, res_binding)) => {
+                if res_thread == key.0 {
+                    true
+                } else {
+                    self.factory.snapshot_count.fetch_add(1, Ordering::SeqCst);
+                    let state = test_guest_cpu_state(res_binding.marker);
+                    res_binding
+                        .set_cpu_residency(super::residency::TaskCpuResidency::Materialized(state));
+                    self.residency_generation = self.residency_generation.next();
+                    false
+                }
+            }
+            None => false,
+        };
+        if !is_same_resident {
+            self.factory.overlay_count.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -862,7 +935,11 @@ impl PersistentExecutor for FakeExecutor {
             .concurrent_loads
             .lock()
             .remove(&(thread, generation));
-        self.factory.snapshot_count.fetch_add(1, Ordering::SeqCst);
+        binding.set_cpu_residency(super::residency::TaskCpuResidency::Resident {
+            executor: self.id,
+            generation: self.residency_generation,
+        });
+        self.resident_task = Some((thread, generation, Arc::clone(&binding)));
         if binding.save_fails.load(Ordering::SeqCst) {
             return Err(ExecutorSaveError::new(
                 TrapError::Hypervisor("injected save failure".to_owned()),
@@ -973,6 +1050,12 @@ impl PersistentExecutor for FakeExecutor {
 
     fn destroy(mut self) -> Result<(), TrapError> {
         assert_eq!(thread::current().id(), self.owner);
+        if let Some((_thread, _gen, res_binding)) = self.resident_task.take() {
+            self.factory.snapshot_count.fetch_add(1, Ordering::SeqCst);
+            let state = test_guest_cpu_state(res_binding.marker);
+            res_binding.set_cpu_residency(super::residency::TaskCpuResidency::Materialized(state));
+            self.residency_generation = self.residency_generation.next();
+        }
         if let Some(cleanup) = self.owner_dirty_cleanup.take() {
             cleanup();
         }
@@ -985,6 +1068,33 @@ impl PersistentExecutor for FakeExecutor {
             2 => panic!("injected executor destroy panic"),
             _ => Ok(()),
         }
+    }
+
+    fn residency_generation(&self) -> super::residency::ResidencyGeneration {
+        self.residency_generation
+    }
+
+    fn snapshot_resident_task(
+        &mut self,
+        generation: super::residency::ResidencyGeneration,
+    ) -> Result<GuestCpuState, TrapError> {
+        if generation != self.residency_generation {
+            return Err(TrapError::Hypervisor(
+                "stale residency generation".to_owned(),
+            ));
+        }
+        let Some((_thread, _gen, resident_binding)) = self.resident_task.take() else {
+            return Err(TrapError::Hypervisor(
+                "no resident task on executor".to_owned(),
+            ));
+        };
+        self.factory.snapshot_count.fetch_add(1, Ordering::SeqCst);
+        let state = test_guest_cpu_state(resident_binding.marker);
+        resident_binding.set_cpu_residency(super::residency::TaskCpuResidency::Materialized(
+            state.clone(),
+        ));
+        self.residency_generation = self.residency_generation.next();
+        Ok(state)
     }
 }
 
@@ -5531,4 +5641,257 @@ fn terminal_retirement_does_not_hold_topology_lock_across_detached_cleanup() {
         context.thread().execution_state(),
         ThreadExecutionState::Exited { .. }
     ));
+}
+
+#[test]
+fn test_lazy_vcpu_same_executor_reclaim_skips_snapshot_and_overlay() {
+    let (kernel, context) = bootstrap(15_001);
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(201, [Step::Block, Step::Exit]);
+    factory.install(&context, Arc::clone(&binding));
+    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+    let authority = enqueue_root(&scheduler, &context, publish(&context, 201));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while binding.progress.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(binding.progress.load(Ordering::SeqCst), 1);
+
+    assert_eq!(
+        factory.snapshot_count.load(Ordering::SeqCst),
+        0,
+        "lazy save on block boundary must not snapshot vCPU registers"
+    );
+
+    factory.overlay_count.store(0, Ordering::SeqCst);
+
+    scheduler
+        .wake(context.thread().key())
+        .expect("wake blocked resident task");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while binding.progress.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(binding.progress.load(Ordering::SeqCst), 2);
+
+    assert_eq!(
+        factory.snapshot_count.load(Ordering::SeqCst),
+        0,
+        "re-claim by same executor without intervening load must take 0 snapshots"
+    );
+    assert_eq!(
+        factory.overlay_count.load(Ordering::SeqCst),
+        0,
+        "re-claim by same executor without intervening load must perform 0 overlays"
+    );
+
+    drop(authority);
+    pool.shutdown().expect("clean pool shutdown");
+}
+
+#[test]
+fn test_lazy_vcpu_intervening_load_materializes_resident_task() {
+    let (kernel, first) = bootstrap(15_002);
+    let second = sibling(&kernel, &first, 25_002);
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let factory = Arc::new(FakeFactory::default());
+
+    let first_binding = FakeBinding::new(202, [Step::Block, Step::Exit]);
+    let second_binding = FakeBinding::new(203, [Step::Block, Step::Exit]);
+    factory.install(&first, Arc::clone(&first_binding));
+    factory.install(&second, Arc::clone(&second_binding));
+
+    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+
+    let first_auth = enqueue_root(&scheduler, &first, publish(&first, 202));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while first_binding.progress.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(first_binding.progress.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        factory.snapshot_count.load(Ordering::SeqCst),
+        0,
+        "first task parked without snapshot"
+    );
+
+    let second_auth = enqueue_root(&scheduler, &second, publish(&second, 203));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while second_binding.progress.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(second_binding.progress.load(Ordering::SeqCst), 1);
+
+    assert_eq!(
+        factory.snapshot_count.load(Ordering::SeqCst),
+        1,
+        "intervening load of task B must force exactly ONE snapshot of parked task A"
+    );
+
+    factory.overlay_count.store(0, Ordering::SeqCst);
+
+    scheduler.wake(first.thread().key()).expect("wake task A");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while first_binding.progress.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(first_binding.progress.load(Ordering::SeqCst), 2);
+
+    assert_eq!(
+        factory.overlay_count.load(Ordering::SeqCst),
+        1,
+        "returning task A must perform exactly ONE overlay"
+    );
+
+    scheduler.wake(second.thread().key()).expect("wake task B");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while second_binding.progress.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    drop((first_auth, second_auth));
+    pool.shutdown().expect("clean pool shutdown");
+}
+
+#[test]
+fn test_lazy_vcpu_typed_accessor_forces_materialization() {
+    let (kernel, context) = bootstrap(15_003);
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(204, [Step::Block, Step::Exit]);
+    factory.install(&context, Arc::clone(&binding));
+    let generation = publish(&context, 204);
+    let worker = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
+    let registration = scheduler.register_executor(worker).unwrap();
+    let mut executor = factory.create(registration.id()).unwrap();
+    let authority = enqueue_root(&scheduler, &context, generation);
+    let mut running = scheduler.take(&registration).unwrap();
+    let lease = running.take_lease();
+
+    let task = RunnableTask {
+        thread: context.thread().key(),
+        generation,
+        lease: &lease,
+        binding: Arc::clone(&binding),
+    };
+    executor.load(&task).unwrap();
+    let need_resched = AtomicBool::new(false);
+    let publish_test_descendant = |_c: Arc<crate::kernel::Thread>, _g: ExecutionGeneration| Ok(());
+    let mut submission = ExecutorSubmissionContext {
+        scheduler: &scheduler,
+        publish_test_descendant: &publish_test_descendant,
+        current: None,
+        lease: Some(lease),
+        exec_replacement: None,
+    };
+    let exit = executor
+        .run_until_boundary(&need_resched, &mut submission)
+        .unwrap();
+    assert!(matches!(exit, ExecutorExit::Blocked(_)));
+    let lease = submission.take_execution_lease().unwrap();
+    let _saved = executor.save(lease).unwrap();
+
+    assert_eq!(factory.snapshot_count.load(Ordering::SeqCst), 0);
+    let mut residency = binding.cpu_residency().expect("residency recorded");
+    assert!(matches!(
+        residency,
+        super::residency::TaskCpuResidency::Resident { .. }
+    ));
+
+    let materialized_cpu = super::residency::materialize_task_state(&mut residency, &mut executor)
+        .expect("materialize via typed accessor");
+
+    assert_eq!(
+        factory.snapshot_count.load(Ordering::SeqCst),
+        1,
+        "typed accessor on Resident task must force exactly ONE snapshot"
+    );
+    assert!(matches!(
+        residency,
+        super::residency::TaskCpuResidency::Materialized(_)
+    ));
+
+    let second_call_cpu = super::residency::materialize_task_state(&mut residency, &mut executor)
+        .expect("materialize idempotent");
+    assert_eq!(
+        factory.snapshot_count.load(Ordering::SeqCst),
+        1,
+        "subsequent calls on materialized state must not snapshot again"
+    );
+    assert_eq!(materialized_cpu, second_call_cpu);
+
+    drop(authority);
+}
+
+#[test]
+fn test_lazy_vcpu_executor_destroy_materializes_resident_task() {
+    let (kernel, context) = bootstrap(15_004);
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(205, [Step::Block, Step::Exit]);
+    factory.install(&context, Arc::clone(&binding));
+    let generation = publish(&context, 205);
+    let worker = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
+    let registration = scheduler.register_executor(worker).unwrap();
+    let mut executor = factory.create(registration.id()).unwrap();
+    let authority = enqueue_root(&scheduler, &context, generation);
+    let mut running = scheduler.take(&registration).unwrap();
+    let lease = running.take_lease();
+
+    let task = RunnableTask {
+        thread: context.thread().key(),
+        generation,
+        lease: &lease,
+        binding: Arc::clone(&binding),
+    };
+    executor.load(&task).unwrap();
+    let need_resched = AtomicBool::new(false);
+    let publish_test_descendant = |_c: Arc<crate::kernel::Thread>, _g: ExecutionGeneration| Ok(());
+    let mut submission = ExecutorSubmissionContext {
+        scheduler: &scheduler,
+        publish_test_descendant: &publish_test_descendant,
+        current: None,
+        lease: Some(lease),
+        exec_replacement: None,
+    };
+    let exit = executor
+        .run_until_boundary(&need_resched, &mut submission)
+        .unwrap();
+    assert!(matches!(exit, ExecutorExit::Blocked(_)));
+    let lease = submission.take_execution_lease().unwrap();
+    let _saved = executor.save(lease).unwrap();
+
+    assert_eq!(factory.snapshot_count.load(Ordering::SeqCst), 0);
+
+    executor.destroy().expect("destroy executor");
+
+    assert_eq!(
+        factory.snapshot_count.load(Ordering::SeqCst),
+        1,
+        "executor destroy with resident task must materialize it"
+    );
+    let residency = binding.cpu_residency().expect("residency recorded");
+    assert!(matches!(
+        residency,
+        super::residency::TaskCpuResidency::Materialized(_)
+    ));
+
+    drop(authority);
+}
+
+#[test]
+fn test_lazy_vcpu_source_shape_no_guest_cpu_from_resident_lease() {
+    let residency_source = include_str!("residency.rs");
+    assert!(
+        !residency_source.contains("pub fn cpu(&self) -> &GuestCpuState"),
+        "TaskCpuResidency must not expose a naked cpu() accessor that could read Resident"
+    );
+    assert!(
+        !residency_source.contains("pub fn guest_cpu_state(&self) -> GuestCpuState"),
+        "TaskCpuResidency must not construct GuestCpuState from Resident without materialize"
+    );
+    assert!(residency_source.contains("pub fn materialize_with"));
+    assert!(residency_source.contains("fn materialize_task_state"));
 }

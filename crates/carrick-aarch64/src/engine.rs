@@ -308,6 +308,29 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         Ok(())
     }
 
+    pub fn reaffirm_resident_task_state_on_live_executor(
+        &mut self,
+        state: &GuestCpuState,
+        metadata: &Aarch64ResidentTaskMetadata,
+    ) -> Result<(), TrapError> {
+        let GuestCpuState::Aarch64V1(state) = state else {
+            return Err(TrapError::Hypervisor(
+                "AArch64 persistent executor rejected non-AArch64 V1 state".to_owned(),
+            ));
+        };
+        self.validate_task_metadata(state)?;
+        self.vm
+            .install_task_continuation_for_executor_switch(&mut self.vcpu, metadata.continuation)?;
+        self.pending_resume_pc = metadata.pending_resume_pc;
+        self.last_syscall_nr = metadata.last_syscall_nr;
+        self.last_syscall_orig_x0 = metadata.last_syscall_orig_x0;
+        self.last_fault_esr = metadata.last_fault_esr;
+        self.last_exit_class = metadata.last_exit_class;
+        self.is_forked_child = metadata.is_forked_child;
+        self.validate_loaded_task_runtime_projection()?;
+        Ok(())
+    }
+
     fn validate_loaded_task_runtime_projection(&self) -> Result<(), TrapError> {
         let Some(process_asid) = self.process_asid else {
             return Ok(());
@@ -351,6 +374,25 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 self.asid_generation,
             )?,
         ))
+    }
+
+    pub fn extract_resident_task_metadata_for_lazy_save(
+        &mut self,
+    ) -> Result<Aarch64ResidentTaskMetadata, TrapError> {
+        let continuation = self
+            .vm
+            .take_task_continuation_for_executor_switch(&mut self.vcpu)?;
+        Ok(Aarch64ResidentTaskMetadata {
+            pending_resume_pc: self.pending_resume_pc,
+            last_syscall_nr: self.last_syscall_nr,
+            last_syscall_orig_x0: self.last_syscall_orig_x0,
+            last_fault_esr: self.last_fault_esr,
+            last_exit_class: self.last_exit_class,
+            is_forked_child: self.is_forked_child,
+            continuation,
+            mm_generation: self.mm_generation,
+            asid_generation: self.asid_generation,
+        })
     }
 
     pub fn restore_persistent_executor_invariants(&mut self) -> Result<(), TrapError> {
@@ -535,6 +577,39 @@ fn aarch64_task_state_from_snapshot(
         mm_generation,
         asid_generation,
     })
+}
+
+#[derive(Clone, Debug)]
+pub struct Aarch64ResidentTaskMetadata {
+    pub pending_resume_pc: Option<u64>,
+    pub last_syscall_nr: Option<u64>,
+    pub last_syscall_orig_x0: u64,
+    pub last_fault_esr: u64,
+    pub last_exit_class: u64,
+    pub is_forked_child: bool,
+    pub continuation: Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>,
+    pub mm_generation: u64,
+    pub asid_generation: u64,
+}
+
+impl Aarch64ResidentTaskMetadata {
+    pub fn snapshot_guest_cpu<V: Aarch64Vcpu>(&self, vcpu: &V) -> Result<GuestCpuState, TrapError> {
+        let snapshot = vcpu.snapshot()?;
+        Ok(GuestCpuState::from_aarch64_v1(
+            aarch64_task_state_from_snapshot(
+                &snapshot,
+                self.pending_resume_pc,
+                self.last_syscall_nr,
+                self.last_syscall_orig_x0,
+                self.last_fault_esr,
+                self.last_exit_class,
+                self.is_forked_child,
+                self.continuation,
+                self.mm_generation,
+                self.asid_generation,
+            )?,
+        ))
+    }
 }
 
 /// Overlay one migratable task image onto a destination executor snapshot.

@@ -58,6 +58,12 @@ pub trait PersistentTaskBinding {
         false
     }
 
+    fn cpu_residency(&self) -> Option<super::residency::TaskCpuResidency> {
+        None
+    }
+
+    fn set_cpu_residency(&self, _residency: super::residency::TaskCpuResidency) {}
+
     fn mark_exec_transferred(&self) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "task binding has no exec-transfer terminal authority".to_owned(),
@@ -118,6 +124,32 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
 
     fn address_space_is_retiring(&self) -> bool {
         crate::vcpu_loop::continuation::HvpatchTaskBinding::address_space_is_retiring(self)
+    }
+
+    fn cpu_residency(&self) -> Option<super::residency::TaskCpuResidency> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inspect_backend::<super::backend::HvpatchTaskEngineBindingState, _>(|state| {
+                Ok(state.residency())
+            })
+            .ok()
+            .flatten()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        None
+    }
+
+    fn set_cpu_residency(&self, residency: super::residency::TaskCpuResidency) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let _ =
+                self.inspect_backend::<super::backend::HvpatchTaskEngineBindingState, _>(|state| {
+                    state.set_residency(residency);
+                    Ok(())
+                });
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let _ = residency;
     }
 
     fn mark_exec_transferred(&self) -> Result<(), TrapError> {
