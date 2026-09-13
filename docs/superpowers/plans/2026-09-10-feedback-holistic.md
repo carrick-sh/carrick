@@ -829,3 +829,5 @@ commits and is re-checked at the next vet.
   of samples; munmap owner 22.3% → 11%; guest execution share 58.8% →
   69%. Probe gate to run on the merged main together with the hostfs
   landing.
+- 2026-09-12 18:00, probe gate on the merged main fe4e624d9815d209 (with
+  the alias-unregister landing): 46/46, no probe DIFF.
