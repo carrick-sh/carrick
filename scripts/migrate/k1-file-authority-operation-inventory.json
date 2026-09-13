@@ -941,7 +941,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/directory.rs",
-      "line": 1254,
+      "line": 1258,
       "categories": [
         "mapping"
       ],
@@ -12009,7 +12009,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/fs_backend/host.rs",
-      "line": 5409,
+      "line": 5531,
       "categories": [
         "mapping"
       ],
@@ -12018,7 +12018,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 722,
+      "line": 723,
       "categories": [
         "mapping"
       ],
