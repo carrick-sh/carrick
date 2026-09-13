@@ -173,18 +173,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:54 in `for_container_id`, `libc::geteuid` acts only on the current operator credential scoping the private control endpoint in `for_container_id` at line 53; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:66 in `for_container_id`, `libc::geteuid` acts only on the current operator credential scoping the private control endpoint in `for_container_id` at line 53; no guest identity selects its host target.",
     "review_id": "HA-000008",
     "source": {
-      "byte_end": 1806,
-      "byte_start": 1793,
+      "byte_end": 2340,
+      "byte_start": 2327,
       "column": 28,
       "column_end": 41,
       "column_start": 28,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 54,
-      "line_end": 54,
-      "line_start": 54
+      "line": 66,
+      "line_end": 66,
+      "line_start": 66
     }
   },
   {
@@ -200,18 +200,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:218 in `validate_owned_private_directory`, `libc::geteuid` acts only on the current carrier credential authenticating the private control directory in `validate_owned_private_directory` at line 208; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:253 in `validate_owned_private_directory`, `libc::geteuid` acts only on the current carrier credential authenticating the private control directory in `validate_owned_private_directory` at line 208; no guest identity selects its host target.",
     "review_id": "HA-000009",
     "source": {
-      "byte_end": 8143,
-      "byte_start": 8130,
+      "byte_end": 9579,
+      "byte_start": 9566,
       "column": 24,
       "column_end": 37,
       "column_start": 24,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 218,
-      "line_end": 218,
-      "line_start": 218
+      "line": 253,
+      "line_end": 253,
+      "line_start": 253
     }
   },
   {
@@ -227,18 +227,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/mod.rs:464 in `send_at`, `libc::geteuid` acts only on the same-UID carrier-control peer authentication boundary used by `send_at` at line 453; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/mod.rs:514 in `send_at`, `libc::geteuid` acts only on the same-UID carrier-control peer authentication boundary used by `send_at` at line 453; no guest identity selects its host target.",
     "review_id": "HA-000010",
     "source": {
-      "byte_end": 14873,
-      "byte_start": 14860,
+      "byte_end": 17255,
+      "byte_start": 17242,
       "column": 24,
       "column_end": 37,
       "column_start": 24,
       "file": "crates/carrick-runtime/src/kernel/control/mod.rs",
-      "line": 464,
-      "line_end": 464,
-      "line_start": 464
+      "line": 514,
+      "line_end": 514,
+      "line_start": 514
     }
   },
   {
@@ -254,18 +254,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/mod.rs:667 in `authenticate`, `libc::geteuid` acts only on the same-UID carrier-control peer authentication boundary used by `authenticate` at line 656; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/mod.rs:717 in `authenticate`, `libc::geteuid` acts only on the same-UID carrier-control peer authentication boundary used by `authenticate` at line 656; no guest identity selects its host target.",
     "review_id": "HA-000011",
     "source": {
-      "byte_end": 22757,
-      "byte_start": 22744,
+      "byte_end": 25139,
+      "byte_start": 25126,
       "column": 24,
       "column_end": 37,
       "column_start": 24,
       "file": "crates/carrick-runtime/src/kernel/control/mod.rs",
-      "line": 667,
-      "line_end": 667,
-      "line_start": 667
+      "line": 717,
+      "line_end": 717,
+      "line_start": 717
     }
   },
   {
@@ -1901,18 +1901,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/lifecycle.rs:2512 in `emit_appended`, `std::fs::File::open` accesses only the validated container log file.",
+    "rationale": "At crates/carrick-cli/src/lifecycle.rs:2519 in `emit_appended`, `std::fs::File::open` accesses only the validated container log file.",
     "review_id": "HA-000086",
     "source": {
-      "byte_end": 95873,
-      "byte_start": 95854,
+      "byte_end": 96347,
+      "byte_start": 96328,
       "column": 18,
       "column_end": 37,
       "column_start": 18,
       "file": "crates/carrick-cli/src/lifecycle.rs",
-      "line": 2512,
-      "line_end": 2512,
-      "line_start": 2512
+      "line": 2519,
+      "line_end": 2519,
+      "line_start": 2519
     }
   },
   {
@@ -2065,18 +2065,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:155 in `publish_bound_owner`, `std::fs::File::open` accesses only the run-scoped authenticated carrier-control socket and owner record used by `publish_bound_owner` at line 140.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:189 in `publish_bound_owner`, `std::fs::File::open` accesses only the run-scoped authenticated carrier-control socket and owner record used by `publish_bound_owner` at line 140.",
     "review_id": "HA-000094",
     "source": {
-      "byte_end": 5970,
-      "byte_start": 5956,
+      "byte_end": 7374,
+      "byte_start": 7360,
       "column": 9,
       "column_end": 23,
       "column_start": 9,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 155,
-      "line_end": 155,
-      "line_start": 155
+      "line": 189,
+      "line_end": 189,
+      "line_start": 189
     }
   },
   {
@@ -2545,18 +2545,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:145 in `publish_bound_owner`, `std::fs::OpenOptions::new` accesses only the run-scoped authenticated carrier-control socket and owner record used by `publish_bound_owner` at line 130.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:179 in `publish_bound_owner`, `std::fs::OpenOptions::new` accesses only the run-scoped authenticated carrier-control socket and owner record used by `publish_bound_owner` at line 130.",
     "review_id": "HA-000114",
     "source": {
-      "byte_end": 5489,
-      "byte_start": 5469,
+      "byte_end": 6893,
+      "byte_start": 6873,
       "column": 24,
       "column_end": 44,
       "column_start": 24,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 145,
-      "line_end": 145,
-      "line_start": 145
+      "line": 179,
+      "line_end": 179,
+      "line_start": 179
     }
   },
   {
@@ -3107,18 +3107,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:148 in `publish_bound_owner`, `std::fs::OpenOptions::open` accesses only the run-scoped authenticated carrier-control socket and owner record used by `publish_bound_owner` at line 133.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:182 in `publish_bound_owner`, `std::fs::OpenOptions::open` accesses only the run-scoped authenticated carrier-control socket and owner record used by `publish_bound_owner` at line 133.",
     "review_id": "HA-000137",
     "source": {
-      "byte_end": 5564,
-      "byte_start": 5560,
+      "byte_end": 6968,
+      "byte_start": 6964,
       "column": 14,
       "column_end": 18,
       "column_start": 14,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 148,
-      "line_end": 148,
-      "line_start": 148
+      "line": 182,
+      "line_end": 182,
+      "line_start": 182
     }
   },
   {
@@ -3322,18 +3322,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:205 in `ensure_owned_private_directory`, `std::fs::create_dir` accesses only the run-scoped authenticated carrier-control socket and owner record used by `ensure_owned_private_directory` at line 195.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:240 in `ensure_owned_private_directory`, `std::fs::create_dir` accesses only the run-scoped authenticated carrier-control socket and owner record used by `ensure_owned_private_directory` at line 195.",
     "review_id": "HA-000146",
     "source": {
-      "byte_end": 7720,
-      "byte_start": 7706,
+      "byte_end": 9156,
+      "byte_start": 9142,
       "column": 13,
       "column_end": 27,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 205,
-      "line_end": 205,
-      "line_start": 205
+      "line": 240,
+      "line_end": 240,
+      "line_start": 240
     }
   },
   {
@@ -4861,18 +4861,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/lifecycle.rs:2481 in `logs`, `std::fs::read` accesses only the validated container log file.",
+    "rationale": "At crates/carrick-cli/src/lifecycle.rs:2488 in `logs`, `std::fs::read` accesses only the validated container log file.",
     "review_id": "HA-000214",
     "source": {
-      "byte_end": 94556,
-      "byte_start": 94543,
+      "byte_end": 95030,
+      "byte_start": 95017,
       "column": 16,
       "column_end": 29,
       "column_start": 16,
       "file": "crates/carrick-cli/src/lifecycle.rs",
-      "line": 2481,
-      "line_end": 2481,
-      "line_start": 2481
+      "line": 2488,
+      "line_end": 2488,
+      "line_start": 2488
     }
   },
   {
@@ -5290,18 +5290,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:97 in `claim`, `std::fs::read` accesses only the run-scoped authenticated carrier-control socket and owner record used by `claim` at line 96.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:109 in `claim`, `std::fs::read` accesses only the run-scoped authenticated carrier-control socket and owner record used by `claim` at line 96.",
     "review_id": "HA-000233",
     "source": {
-      "byte_end": 3214,
-      "byte_start": 3206,
+      "byte_end": 3748,
+      "byte_start": 3740,
       "column": 15,
       "column_end": 23,
       "column_start": 15,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 97,
-      "line_end": 97,
-      "line_start": 97
+      "line": 109,
+      "line_end": 109,
+      "line_start": 109
     }
   },
   {
@@ -5317,18 +5317,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:191 in `read_owner`, `std::fs::read` accesses only the run-scoped authenticated carrier-control socket and owner record used by `read_owner` at line 181.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:226 in `read_owner`, `std::fs::read` accesses only the run-scoped authenticated carrier-control socket and owner record used by `read_owner` at line 181.",
     "review_id": "HA-000234",
     "source": {
-      "byte_end": 7105,
-      "byte_start": 7097,
+      "byte_end": 8541,
+      "byte_start": 8533,
       "column": 15,
       "column_end": 23,
       "column_start": 15,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 191,
-      "line_end": 191,
-      "line_start": 191
+      "line": 226,
+      "line_end": 226,
+      "line_start": 226
     }
   },
   {
@@ -7779,18 +7779,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:237 in `remove_file`, `std::fs::remove_file` accesses only the run-scoped authenticated carrier-control socket and owner record used by `remove_file` at line 227.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:273 in `remove_file`, `std::fs::remove_file` accesses only the run-scoped authenticated carrier-control socket and owner record used by `remove_file` at line 227.",
     "review_id": "HA-000340",
     "source": {
-      "byte_end": 8700,
-      "byte_start": 8685,
+      "byte_end": 10159,
+      "byte_start": 10144,
       "column": 11,
       "column_end": 26,
       "column_start": 11,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 237,
-      "line_end": 237,
-      "line_start": 237
+      "line": 273,
+      "line_end": 273,
+      "line_start": 273
     }
   },
   {
@@ -8266,18 +8266,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:152 in `publish_bound_owner`, `std::fs::rename` accesses only the run-scoped authenticated carrier-control socket and owner record used by `publish_bound_owner` at line 137.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:186 in `publish_bound_owner`, `std::fs::rename` accesses only the run-scoped authenticated carrier-control socket and owner record used by `publish_bound_owner` at line 137.",
     "review_id": "HA-000358",
     "source": {
-      "byte_end": 5785,
-      "byte_start": 5775,
+      "byte_end": 7189,
+      "byte_start": 7179,
       "column": 9,
       "column_end": 19,
       "column_start": 9,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 152,
-      "line_end": 152,
-      "line_start": 152
+      "line": 186,
+      "line_end": 186,
+      "line_start": 186
     }
   },
   {
@@ -8644,18 +8644,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:138 in `publish_bound_owner`, `std::fs::set_permissions` accesses only the run-scoped authenticated carrier-control socket and owner record used by `publish_bound_owner` at line 123.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:150 in `publish_bound_owner`, `std::fs::set_permissions` accesses only the run-scoped authenticated carrier-control socket and owner record used by `publish_bound_owner` at line 123.",
     "review_id": "HA-000372",
     "source": {
-      "byte_end": 5168,
-      "byte_start": 5149,
+      "byte_end": 5702,
+      "byte_start": 5683,
       "column": 9,
       "column_end": 28,
       "column_start": 9,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 138,
-      "line_end": 138,
-      "line_start": 138
+      "line": 150,
+      "line_end": 150,
+      "line_start": 150
     }
   },
   {
@@ -8671,18 +8671,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:149 in `publish_bound_owner`, `std::fs::set_permissions` accesses only the run-scoped authenticated carrier-control socket and owner record used by `publish_bound_owner` at line 134.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:183 in `publish_bound_owner`, `std::fs::set_permissions` accesses only the run-scoped authenticated carrier-control socket and owner record used by `publish_bound_owner` at line 134.",
     "review_id": "HA-000373",
     "source": {
-      "byte_end": 5606,
-      "byte_start": 5587,
+      "byte_end": 7010,
+      "byte_start": 6991,
       "column": 9,
       "column_end": 28,
       "column_start": 9,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 149,
-      "line_end": 149,
-      "line_start": 149
+      "line": 183,
+      "line_end": 183,
+      "line_start": 183
     }
   },
   {
@@ -8698,18 +8698,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:206 in `ensure_owned_private_directory`, `std::fs::set_permissions` accesses only the run-scoped authenticated carrier-control socket and owner record used by `ensure_owned_private_directory` at line 196.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:241 in `ensure_owned_private_directory`, `std::fs::set_permissions` accesses only the run-scoped authenticated carrier-control socket and owner record used by `ensure_owned_private_directory` at line 196.",
     "review_id": "HA-000374",
     "source": {
-      "byte_end": 7760,
-      "byte_start": 7741,
+      "byte_end": 9196,
+      "byte_start": 9177,
       "column": 13,
       "column_end": 32,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 206,
-      "line_end": 206,
-      "line_start": 206
+      "line": 241,
+      "line_end": 241,
+      "line_start": 241
     }
   },
   {
@@ -8725,18 +8725,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:225 in `validate_owned_private_directory`, `std::fs::set_permissions` accesses only the run-scoped authenticated carrier-control socket and owner record used by `validate_owned_private_directory` at line 215.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:260 in `validate_owned_private_directory`, `std::fs::set_permissions` accesses only the run-scoped authenticated carrier-control socket and owner record used by `validate_owned_private_directory` at line 215.",
     "review_id": "HA-000375",
     "source": {
-      "byte_end": 8408,
-      "byte_start": 8389,
+      "byte_end": 9844,
+      "byte_start": 9825,
       "column": 5,
       "column_end": 24,
       "column_start": 5,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 225,
-      "line_end": 225,
-      "line_start": 225
+      "line": 260,
+      "line_end": 260,
+      "line_start": 260
     }
   },
   {
@@ -9076,18 +9076,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:125 in `claim`, `std::fs::symlink_metadata` accesses only the run-scoped authenticated carrier-control socket and owner record used by `claim` at line 110.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:137 in `claim`, `std::fs::symlink_metadata` accesses only the run-scoped authenticated carrier-control socket and owner record used by `claim` at line 110.",
     "review_id": "HA-000394",
     "source": {
-      "byte_end": 4710,
-      "byte_start": 4690,
+      "byte_end": 5244,
+      "byte_start": 5224,
       "column": 20,
       "column_end": 40,
       "column_start": 20,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 125,
-      "line_end": 125,
-      "line_start": 125
+      "line": 137,
+      "line_end": 137,
+      "line_start": 137
     }
   },
   {
@@ -9103,18 +9103,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:202 in `ensure_owned_private_directory`, `std::fs::symlink_metadata` accesses only the run-scoped authenticated carrier-control socket and owner record used by `ensure_owned_private_directory` at line 192.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:237 in `ensure_owned_private_directory`, `std::fs::symlink_metadata` accesses only the run-scoped authenticated carrier-control socket and owner record used by `ensure_owned_private_directory` at line 192.",
     "review_id": "HA-000395",
     "source": {
-      "byte_end": 7543,
-      "byte_start": 7523,
+      "byte_end": 8979,
+      "byte_start": 8959,
       "column": 11,
       "column_end": 31,
       "column_start": 11,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 202,
-      "line_end": 202,
-      "line_start": 202
+      "line": 237,
+      "line_end": 237,
+      "line_start": 237
     }
   },
   {
@@ -9130,18 +9130,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:207 in `ensure_owned_private_directory`, `std::fs::symlink_metadata` accesses only the run-scoped authenticated carrier-control socket and owner record used by `ensure_owned_private_directory` at line 197.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:242 in `ensure_owned_private_directory`, `std::fs::symlink_metadata` accesses only the run-scoped authenticated carrier-control socket and owner record used by `ensure_owned_private_directory` at line 197.",
     "review_id": "HA-000396",
     "source": {
-      "byte_end": 7860,
-      "byte_start": 7840,
+      "byte_end": 9296,
+      "byte_start": 9276,
       "column": 28,
       "column_end": 48,
       "column_start": 28,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 207,
-      "line_end": 207,
-      "line_start": 207
+      "line": 242,
+      "line_end": 242,
+      "line_start": 242
     }
   },
   {
@@ -12471,18 +12471,45 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:140 in `publish_bound_owner`, `std::process::id` acts only on the nonce-bound current carrier-control owner identity used by `publish_bound_owner` at line 125; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:160 in `publish_bound_owner`, `std::process::id` acts only on the nonce-bound current carrier-control owner identity used by `publish_bound_owner` at line 125; no guest identity selects its host target.",
     "review_id": "HA-000525",
     "source": {
-      "byte_end": 5291,
-      "byte_start": 5275,
+      "byte_end": 6314,
+      "byte_start": 6298,
+      "column": 41,
+      "column_end": 57,
+      "column_start": 41,
+      "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
+      "line": 160,
+      "line_end": 160,
+      "line_start": 160
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-PROCESS-ID",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "nonce-bound current carrier-control owner identity checked by `mark_tearing_down_if_owner` before rewriting the record as TearingDown"
+    },
+    "expansion": null,
+    "operation": "std::process::id",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:173 in `mark_tearing_down_if_owner`, `std::process::id` acts only on the nonce-bound current carrier-control owner identity (the record is rewritten as `TearingDown` only when pid and nonce match this carrier); no guest identity selects its host target.",
+    "review_id": "HA-000652",
+    "source": {
+      "byte_end": 6676,
+      "byte_start": 6660,
       "column": 18,
       "column_end": 34,
       "column_start": 18,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 140,
-      "line_end": 140,
-      "line_start": 140
+      "line": 173,
+      "line_end": 173,
+      "line_start": 173
     }
   },
   {
@@ -12498,18 +12525,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:177 in `release_if_owner`, `std::process::id` acts only on the nonce-bound current carrier-control owner identity used by `release_if_owner` at line 167; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/endpoint.rs:212 in `release_if_owner`, `std::process::id` acts only on the nonce-bound current carrier-control owner identity used by `release_if_owner` at line 167; no guest identity selects its host target.",
     "review_id": "HA-000526",
     "source": {
-      "byte_end": 6680,
-      "byte_start": 6664,
+      "byte_end": 8116,
+      "byte_start": 8100,
       "column": 47,
       "column_end": 63,
       "column_start": 47,
       "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "line": 177,
-      "line_end": 177,
-      "line_start": 177
+      "line": 212,
+      "line_end": 212,
+      "line_start": 212
     }
   },
   {
@@ -12525,18 +12552,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/mod.rs:364 in `start`, `std::process::id` acts only on the nonce-bound current carrier-control owner identity used by `start` at line 364; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/mod.rs:400 in `start`, `std::process::id` acts only on the nonce-bound current carrier-control owner identity used by `start` at line 364; no guest identity selects its host target.",
     "review_id": "HA-000527",
     "source": {
-      "byte_end": 11128,
-      "byte_start": 11112,
+      "byte_end": 12855,
+      "byte_start": 12839,
       "column": 27,
       "column_end": 43,
       "column_start": 27,
       "file": "crates/carrick-runtime/src/kernel/control/mod.rs",
-      "line": 364,
-      "line_end": 364,
-      "line_start": 364
+      "line": 400,
+      "line_end": 400,
+      "line_start": 400
     }
   },
   {
@@ -13852,18 +13879,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/control/mod.rs:270 in `start_at_inner`, `std::thread::Builder::new` acts only on the carrier-owned authenticated control server thread used by `start_at_inner` at line 270; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/kernel/control/mod.rs:279 in `start_at_inner`, `std::thread::Builder::new` acts only on the carrier-owned authenticated control server thread used by `start_at_inner` at line 270; no guest identity selects its host target.",
     "review_id": "HA-000581",
     "source": {
-      "byte_end": 8027,
-      "byte_start": 8002,
+      "byte_end": 8509,
+      "byte_start": 8484,
       "column": 26,
       "column_end": 51,
       "column_start": 26,
       "file": "crates/carrick-runtime/src/kernel/control/mod.rs",
-      "line": 270,
-      "line_end": 270,
-      "line_start": 270
+      "line": 279,
+      "line_end": 279,
+      "line_start": 279
     }
   },
   {
@@ -14309,18 +14336,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/lifecycle.rs:1776 in `wait_for_terminal_receipt`, `std::thread::sleep` acts only on the current launcher carrier identity used by `wait_for_terminal_receipt` at line 1707; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/lifecycle.rs:1783 in `wait_for_terminal_receipt`, `std::thread::sleep` acts only on the current launcher carrier identity used by `wait_for_terminal_receipt` at line 1707; no guest identity selects its host target.",
     "review_id": "HA-000597",
     "source": {
-      "byte_end": 69406,
-      "byte_start": 69388,
+      "byte_end": 69880,
+      "byte_start": 69862,
       "column": 9,
       "column_end": 27,
       "column_start": 9,
       "file": "crates/carrick-cli/src/lifecycle.rs",
-      "line": 1776,
-      "line_end": 1776,
-      "line_start": 1776
+      "line": 1783,
+      "line_end": 1783,
+      "line_start": 1783
     }
   },
   {
@@ -14335,18 +14362,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/lifecycle.rs:1941 in `run_control_exec_capture`, `std::thread::sleep` acts only on the current launcher carrier identity used by `run_control_exec_capture` at line 1860; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/lifecycle.rs:1948 in `run_control_exec_capture`, `std::thread::sleep` acts only on the current launcher carrier identity used by `run_control_exec_capture` at line 1860; no guest identity selects its host target.",
     "review_id": "HA-000598",
     "source": {
-      "byte_end": 75274,
-      "byte_start": 75256,
+      "byte_end": 75748,
+      "byte_start": 75730,
       "column": 17,
       "column_end": 35,
       "column_start": 17,
       "file": "crates/carrick-cli/src/lifecycle.rs",
-      "line": 1941,
-      "line_end": 1941,
-      "line_start": 1941
+      "line": 1948,
+      "line_end": 1948,
+      "line_start": 1948
     }
   },
   {
@@ -14361,18 +14388,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/lifecycle.rs:2058 in `wait_one`, `std::thread::sleep` acts only on the current container-lifecycle polling thread used by `wait_one`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/lifecycle.rs:2065 in `wait_one`, `std::thread::sleep` acts only on the current container-lifecycle polling thread used by `wait_one`; no guest identity selects its host target.",
     "review_id": "HA-000599",
     "source": {
-      "byte_end": 79580,
-      "byte_start": 79562,
+      "byte_end": 80054,
+      "byte_start": 80036,
       "column": 9,
       "column_end": 27,
       "column_start": 9,
       "file": "crates/carrick-cli/src/lifecycle.rs",
-      "line": 2058,
-      "line_end": 2058,
-      "line_start": 2058
+      "line": 2065,
+      "line_end": 2065,
+      "line_start": 2065
     }
   },
   {
@@ -14387,18 +14414,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/lifecycle.rs:2503 in `logs`, `std::thread::sleep` acts only on the current container-lifecycle polling thread used by `logs`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/lifecycle.rs:2510 in `logs`, `std::thread::sleep` acts only on the current container-lifecycle polling thread used by `logs`; no guest identity selects its host target.",
     "review_id": "HA-000600",
     "source": {
-      "byte_end": 95420,
-      "byte_start": 95402,
+      "byte_end": 95894,
+      "byte_start": 95876,
       "column": 9,
       "column_end": 27,
       "column_start": 9,
       "file": "crates/carrick-cli/src/lifecycle.rs",
-      "line": 2503,
-      "line_end": 2503,
-      "line_start": 2503
+      "line": 2510,
+      "line_end": 2510,
+      "line_start": 2510
     }
   },
   {
