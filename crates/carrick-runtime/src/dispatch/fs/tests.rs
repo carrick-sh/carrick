@@ -1740,6 +1740,26 @@ fn trusted_upper_only_directory_seeds_the_lane_and_streams() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn host_mkdirat_existing_root_returns_eexist() {
+    let (_scratch, mut dispatcher) = trusted_lane_fixture();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    for (address, path) in [(0x4200, "/"), (0x4300, "///")] {
+        memory
+            .write_bytes(address, format!("{path}\0").as_bytes())
+            .unwrap();
+        let result = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            34,
+            [LINUX_AT_FDCWD, address, 0o755, 0, 0, 0],
+        );
+        assert_eq!(result, -i64::from(LINUX_EEXIST.get()), "mkdirat({path:?})");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn test_mkdirat_under_resolved_parent_zero_openat_budget() {
     let (_scratch, mut dispatcher) = trusted_lane_fixture();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
