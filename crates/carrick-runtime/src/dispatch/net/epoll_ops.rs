@@ -439,13 +439,11 @@ impl<'a> NetView<'a> {
         &self,
         fd: i32,
         requested: u32,
-    ) -> Option<crate::dispatch::fd_table::ListenerReadinessSample> {
+    ) -> Option<crate::kernel::objects::ListenerReadinessSample> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read()?;
-        crate::dispatch::fd_table::listening_socket_readiness_sample(
-            &open,
-            carrick_abi::LinuxEpollEvents::from_bits_retain(requested),
-        )
+        open_file
+            .description
+            .listener_readiness(carrick_abi::LinuxEpollEvents::from_bits_retain(requested))
     }
 
     /// Consumption-based EPOLLET re-arm for the Linux lane's sampled epoll
