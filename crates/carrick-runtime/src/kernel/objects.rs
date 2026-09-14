@@ -255,6 +255,14 @@ pub(crate) enum PipeCapacityMutationError {
     AccountingMismatch,
 }
 
+/// Owned readiness facts sampled by a listening socket's backing authority.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ListenerReadinessSample {
+    pub(crate) ready: LinuxEpollEvents,
+    pub(crate) host_ready: LinuxEpollEvents,
+    pub(crate) inzone: Option<crate::network::inzone::ListenerReadinessSnapshot>,
+}
+
 pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
     fn is_epoll(&self) -> bool;
 
@@ -286,6 +294,11 @@ pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
         interest: LinuxEpollEvents,
         cx: &dyn ReadinessContext,
     ) -> LinuxEpollEvents;
+
+    /// Sample listener arrival facts without exposing its backing or guard.
+    fn listener_readiness(&self, _interest: LinuxEpollEvents) -> Option<ListenerReadinessSample> {
+        None
+    }
 
     fn on_first_fd_ref(&self) {}
 
@@ -987,6 +1000,16 @@ impl FileDescription {
                 interest & (LinuxEpollEvents::IN | LinuxEpollEvents::OUT)
             }
             FileDescriptionKind::Epoll(_) => LinuxEpollEvents::empty(),
+        }
+    }
+
+    pub(crate) fn listener_readiness(
+        &self,
+        interest: LinuxEpollEvents,
+    ) -> Option<ListenerReadinessSample> {
+        match &self.kind {
+            FileDescriptionKind::Concrete(backing) => backing.0.listener_readiness(interest),
+            FileDescriptionKind::Regular | FileDescriptionKind::Epoll(_) => None,
         }
     }
 

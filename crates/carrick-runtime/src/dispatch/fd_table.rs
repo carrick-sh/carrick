@@ -146,14 +146,7 @@ pub(super) struct EpollInterest {
     pub(super) _callback_enrollment: Option<Arc<crate::kernel::WaitCallbackEnrollment>>,
 }
 
-/// The listener-local facts that belong to one readiness observation.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct ListenerReadinessSample {
-    pub(super) ready: LinuxEpollEvents,
-    /// Host poll readiness only; excludes the in-zone queue contribution.
-    pub(super) host_ready: LinuxEpollEvents,
-    pub(super) inzone: Option<crate::network::inzone::ListenerReadinessSnapshot>,
-}
+use crate::kernel::objects::ListenerReadinessSample;
 
 #[derive(Debug)]
 pub(super) struct EventFdState {
@@ -1978,6 +1971,10 @@ pub(super) fn listening_socket_readiness_sample(
 }
 
 impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
+    fn listener_readiness(&self, interest: LinuxEpollEvents) -> Option<ListenerReadinessSample> {
+        listening_socket_readiness_sample(&self.read(), interest)
+    }
+
     fn is_epoll(&self) -> bool {
         matches!(
             &*self.read(),
