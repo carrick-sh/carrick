@@ -3593,6 +3593,8 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
     // Handlers go in the nop tail right after the 16-slot (2 KiB) vector table.
     const HANDLER_BASE: usize = 16 * AARCH64_VECTOR_SLOT_SIZE; // 0x800
     const PAGE_HANDLER_LEN: usize = 14 * 4;
+    const GETTID_HANDLER_LEN: usize = 15 * 4;
+    const FSTAT_CEILING_COUNTED_HANDLER_LEN: usize = 26 * 4;
     let base = LINUX_IDENTITY_PAGE_BASE;
     let (lo, mid, hi) = (
         (base & 0xFFFF) as u16,
@@ -3678,7 +3680,7 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
         enc_beq((cursor + 4) as u64, gettid_handler as u64),
     );
     cursor += 8;
-    let fstat_handler = gettid_handler + PAGE_HANDLER_LEN;
+    let fstat_handler = gettid_handler + GETTID_HANDLER_LEN;
     if fd_ceiling {
         // fstat(80) is argument-bearing, so it has its own guard that preserves
         // x0..x5 on every host-dispatch fallback.  Unlike the identity entries it
@@ -3760,7 +3762,11 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
         "shim dispatcher overruns its 0x80 vector slot"
     );
     debug_assert!(
-        gettid_handler + 60 <= MAILBOX_HANDLER_OFFSET,
+        if fd_ceiling {
+            fstat_handler + FSTAT_CEILING_COUNTED_HANDLER_LEN
+        } else {
+            gettid_handler + GETTID_HANDLER_LEN
+        } <= MAILBOX_HANDLER_OFFSET,
         "shim handlers overrun into the mailbox handler region"
     );
     bytes
@@ -6244,6 +6250,53 @@ mod el1_shim_tests {
                 "a counted EL1 fstat must update the mapped counter and return Linux -EBADF"
             );
         }
+    }
+
+    #[test]
+    fn fd_ceiling_shim_gettid_erets_before_fstat_handler() {
+        let bytes = el1_vectors_bytes_shim_fd_ceiling();
+        let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
+        let gettid = (dispatch..dispatch + AARCH64_VECTOR_SLOT_SIZE)
+            .step_by(4)
+            .find_map(|pc| {
+                (decode_cmp_x8(rd_u32(&bytes, pc)) == Some(GETTID_NR)).then(|| {
+                    decode_beq(rd_u32(&bytes, pc + 4), pc + 4)
+                        .expect("gettid comparison must branch to its handler")
+                })
+            })
+            .expect("gettid comparison missing");
+        let fstat = fstat_handler(&bytes, dispatch);
+
+        assert_eq!(
+            rd_u32(&bytes, gettid + 56),
+            ERET,
+            "gettid must return its CONTEXTIDR value before entering the fstat ceiling guard"
+        );
+        assert!(
+            gettid + 60 <= fstat,
+            "gettid's 60-byte handler must not overlap fstat: gettid={gettid:#x} fstat={fstat:#x}"
+        );
+
+        // A valid tid may exceed the fd ceiling. The emitted fast path must
+        // still return it directly; falling through here would reinterpret the
+        // tid as fstat's fd and turn it into -EBADF.
+        let contextidr = 96_u64;
+        let fd_ceiling = 8_u32;
+        assert!(contextidr > u64::from(fd_ceiling));
+        assert_eq!(rd_u32(&bytes, gettid + 48), MRS_CONTEXTIDR_EL1_X0);
+        assert_eq!(
+            decode_cbz_x0(rd_u32(&bytes, gettid + 52), gettid + 52),
+            Some(
+                (dispatch..dispatch + AARCH64_VECTOR_SLOT_SIZE)
+                    .step_by(4)
+                    .find(|&pc| rd_u32(&bytes, pc) == HVC2)
+                    .expect("host fallthrough missing")
+            )
+        );
+        assert_ne!(
+            contextidr, 0,
+            "stamped gettid must not take the cbz fallback"
+        );
     }
 
     /// The shim dispatcher must service EXACTLY the per-process identity syscalls
