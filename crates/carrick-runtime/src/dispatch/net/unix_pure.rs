@@ -19,9 +19,9 @@ use std::time::Duration;
 use crate::dispatch::OpenFile;
 use crate::linux_abi::{
     LINUX_AF_UNIX, LINUX_EADDRINUSE, LINUX_EAGAIN, LINUX_ECONNREFUSED, LINUX_EDESTADDRREQ,
-    LINUX_EINVAL, LINUX_ENOTCONN, LINUX_EOPNOTSUPP, LINUX_EPIPE, LINUX_EPOLLERR, LINUX_EPOLLHUP,
-    LINUX_EPOLLIN, LINUX_EPOLLOUT, LINUX_EPOLLPRI, LINUX_EPOLLRDHUP, LINUX_SOCK_DGRAM,
-    LINUX_SOCK_SEQPACKET, LINUX_SOCK_STREAM, LinuxErrno,
+    LINUX_EINVAL, LINUX_EISCONN, LINUX_ENOTCONN, LINUX_EOPNOTSUPP, LINUX_EPIPE, LINUX_EPOLLERR,
+    LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLOUT, LINUX_EPOLLPRI, LINUX_EPOLLRDHUP,
+    LINUX_SOCK_DGRAM, LINUX_SOCK_SEQPACKET, LINUX_SOCK_STREAM, LinuxErrno,
 };
 use crate::network::interposer::{ConnectionRecordState, MockService};
 use carrick_abi::{LINUX_AF_INET, LINUX_AF_INET6, LINUX_IPPROTO_TCP};
@@ -331,6 +331,91 @@ impl PureSocketInner {
 
     pub(crate) fn peer_addr(&self) -> Option<SocketAddr> {
         self.state.lock().peer_sockaddr
+    }
+
+    pub(crate) fn disconnect_tcp_reset(&self) -> Result<(), LinuxErrno> {
+        if self.socket_type != LINUX_SOCK_STREAM
+            || self.protocol != LINUX_IPPROTO_TCP
+            || !matches!(self.family, LINUX_AF_INET | LINUX_AF_INET6)
+        {
+            return Err(LINUX_EINVAL);
+        }
+        let peer = self.peer_half().ok_or(LINUX_ENOTCONN)?;
+        let (mut state, mut peer_state) = self.lock_with_peer(&peer);
+        let self_points_to_peer = state
+            .peer
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|live| Arc::ptr_eq(&live, &peer));
+        let peer_points_to_self = peer_state
+            .peer
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|live| std::ptr::eq(Arc::as_ptr(&live), self));
+        if !self_points_to_peer || !peer_points_to_self {
+            return Err(LINUX_ENOTCONN);
+        }
+        state.peer = None;
+        state.peer_sockaddr = None;
+        state.peer_creds = None;
+        state.stream_buf.clear();
+        state.stream_rights.clear();
+        state.shutdown_read = false;
+        state.shutdown_write = false;
+        state.tcp_peer_terminal = TcpPeerTerminal::Open;
+        state.tcp_send_terminal = false;
+        state.so_error = None;
+        peer_state.peer = None;
+        peer_state.tcp_peer_terminal = TcpPeerTerminal::Reset;
+        peer_state.tcp_send_terminal = true;
+        peer_state.so_error = Some(carrick_abi::LINUX_ECONNRESET.get());
+        drop(peer_state);
+        drop(state);
+        peer.notify_waiters();
+        self.notify_waiters();
+        Ok(())
+    }
+
+    pub(crate) fn new_inet_peer(
+        &self,
+        creds: LinuxUcred,
+    ) -> Result<Arc<PureSocketInner>, LinuxErrno> {
+        if self.socket_type != LINUX_SOCK_STREAM
+            || self.protocol != LINUX_IPPROTO_TCP
+            || !matches!(self.family, LINUX_AF_INET | LINUX_AF_INET6)
+        {
+            return Err(LINUX_EINVAL);
+        }
+        Ok(Self::new_with_family(
+            self.family,
+            self.socket_type,
+            self.protocol,
+            creds,
+        ))
+    }
+
+    pub(crate) fn attach_inet_peer_with(
+        self: &Arc<Self>,
+        peer: &Arc<PureSocketInner>,
+        commit: impl FnOnce() -> Result<(), LinuxErrno>,
+    ) -> Result<(), LinuxErrno> {
+        let (mut state, mut peer_state) = self.lock_with_peer(peer);
+        if state.peer.as_ref().and_then(Weak::upgrade).is_some() {
+            return Err(LINUX_EISCONN);
+        }
+        commit()?;
+        state.peer = Some(Arc::downgrade(peer));
+        state.peer_creds = Some(peer_state.creds);
+        state.tcp_pair = true;
+        state.tcp_peer_terminal = TcpPeerTerminal::Open;
+        state.tcp_send_terminal = false;
+        state.shutdown_read = false;
+        state.shutdown_write = false;
+        state.so_error = None;
+        peer_state.peer = Some(Arc::downgrade(self));
+        peer_state.peer_creds = Some(state.creds);
+        peer_state.tcp_pair = true;
+        Ok(())
     }
 
     pub(crate) fn take_so_error(&self) -> Option<i32> {

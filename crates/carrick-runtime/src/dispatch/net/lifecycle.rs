@@ -787,6 +787,93 @@ impl<'a> NetView<'a> {
         Ok(())
     }
 
+    fn reconnect_disconnected_inzone_stream(
+        &self,
+        fd: i32,
+        requested: std::net::SocketAddr,
+    ) -> Result<DispatchOutcome, LinuxErrno> {
+        let ConnectTarget::InZone { listener, target } = self
+            .network
+            .provider
+            .resolve_connect(
+                self.network.spec.namespace_id.as_ref(),
+                GuestSocketAddr(requested),
+                PortProtocol::Tcp,
+            )
+            .map_err(|_| carrick_abi::LINUX_ECONNREFUSED)?
+        else {
+            return Err(LINUX_ENOTSOCK);
+        };
+        let open_file = self.open_file(fd).ok_or(LINUX_EBADF)?;
+        let description = open_file.description();
+        let (socket, local, cleanup) = {
+            let open = description.read().ok_or(LINUX_ENOTSOCK)?;
+            let OpenDescription::InMemorySocket { base, socket } = &*open else {
+                return Err(LINUX_ENOTSOCK);
+            };
+            if socket.peer_addr().is_some() {
+                return Err(LINUX_EISCONN);
+            }
+            (
+                Arc::clone(socket),
+                socket
+                    .local_addr()
+                    .ok_or(carrick_abi::LINUX_EADDRNOTAVAIL)?,
+                base.inzone_cleanup()
+                    .ok_or(carrick_abi::LINUX_EADDRNOTAVAIL)?,
+            )
+        };
+        let admission = listener
+            .reserve_admission()
+            .ok_or(carrick_abi::LINUX_ECONNREFUSED)?;
+        let creds = self.cred_snapshot();
+        let ucred = crate::dispatch::net::unix_pure::LinuxUcred {
+            pid: self.identity_pid() as i32,
+            uid: creds.euid.raw(),
+            gid: creds.egid.raw(),
+        };
+        let server = socket.new_inet_peer(ucred)?;
+        {
+            let mut state = server.state.lock();
+            state.local_sockaddr = Some(target.0);
+            state.peer_sockaddr = Some(local);
+            state.inzone_cleanup = Some(Arc::clone(&cleanup));
+        }
+        let key = crate::network::SocketKey::for_in_memory(Arc::as_ptr(&socket) as usize as u64);
+        let mut open = description.write().ok_or(LINUX_EBADF)?;
+        let OpenDescription::InMemorySocket { base, socket: live } = &mut *open else {
+            return Err(LINUX_EBADF);
+        };
+        if !Arc::ptr_eq(live, &socket) || live.peer_addr().is_some() {
+            return Err(LINUX_EAGAIN);
+        }
+        socket.attach_inet_peer_with(&server, || {
+            self.network
+                .provider
+                .record_socket_addresses(
+                    self.network.spec.namespace_id.as_ref(),
+                    key,
+                    Some(GuestSocketAddr(local)),
+                    None,
+                    Some(target),
+                    PortProtocol::Tcp,
+                )
+                .map_err(|_| carrick_abi::LINUX_EADDRNOTAVAIL)
+        })?;
+        {
+            let mut state = socket.state.lock();
+            state.peer_sockaddr = Some(target.0);
+        }
+        base.set_connected(true);
+        base.set_connect_in_progress(false);
+        base.clear_socket_error_after_send();
+        let _ = base.take_pending_socket_error();
+        drop(open);
+        admission.enqueue(server);
+        self.notify_inmem_epoll();
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
     pub(super) fn queue_socket_error_after_send(&self, fd: i32) {
         if let Some(open_file) = self.open_file(fd)
             && let Some(mut open) = open_file.description.write()
@@ -2537,12 +2624,39 @@ impl<'a> NetView<'a> {
                 };
                 if let Some((family, is_stream, is_listening, has_peer)) = in_memory_stream {
                     let host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
+                    if host_sockaddr_family(&host_addr) == libc::AF_UNSPEC as u16
+                        && matches!(family, LINUX_AF_INET | LINUX_AF_INET6)
+                        && is_stream
+                        && !is_listening
+                        && has_peer
+                    {
+                        let open_file = this.open_file(fd).ok_or(LINUX_EBADF)?;
+                        let description = open_file.description();
+                        let mut open = description.write().ok_or(LINUX_ENOTSOCK)?;
+                        let OpenDescription::InMemorySocket { base, socket } = &mut *open else {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
+                        };
+                        socket.disconnect_tcp_reset()?;
+                        base.set_connected(false);
+                        base.set_connect_in_progress(false);
+                        base.clear_socket_error_after_send();
+                        let _ = base.take_pending_socket_error();
+                        drop(open);
+                        this.notify_inmem_epoll();
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
                     let compatible_inet_family = matches!(family, LINUX_AF_INET | LINUX_AF_INET6)
                         && linux_to_host_af(family).is_ok_and(|host_family| {
                             host_sockaddr_family(&host_addr) == host_family as u16
                         });
                     if compatible_inet_family && is_stream && !is_listening && has_peer {
                         return Ok(DispatchOutcome::errno(LINUX_EISCONN));
+                    }
+                    if compatible_inet_family && is_stream && !is_listening && !has_peer {
+                        let Some(requested) = host_sockaddr_to_socket_addr(&host_addr) else {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        };
+                        return Ok(this.reconnect_disconnected_inzone_stream(fd, requested)?);
                     }
                     return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
                 }

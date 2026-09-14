@@ -55,6 +55,11 @@ fn set_nonblock(fd: i32) {
     }
 }
 
+unsafe fn poll_readable(fd: i32) -> i32 {
+    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    libc::poll(&mut pfd, 1, 5000)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SockFamily {
     V4,
@@ -347,6 +352,90 @@ unsafe fn perform_nonblocking_connect(
         so_error: if gso_rc == 0 { so_err } else { gso_err },
         completed,
     }
+}
+
+unsafe fn run_tcp_disconnect_case(family: SockFamily, disconnect_accepted: bool) {
+    let af = if family == SockFamily::V4 { libc::AF_INET } else { libc::AF_INET6 };
+    let (mut target, addrlen) = if family == SockFamily::V4 {
+        EndpointHelper::loopback_storage_v4(0)
+    } else {
+        EndpointHelper::loopback_storage_v6(0)
+    };
+    let listener = libc::socket(af, libc::SOCK_STREAM, 0);
+    let bind_rc = libc::bind(listener, (&target as *const libc::sockaddr_storage).cast(), addrlen);
+    let listen_rc = if bind_rc == 0 { libc::listen(listener, 4) } else { -1 };
+    let (_, _, bound, _) = EndpointHelper::getsockname(listener);
+    EndpointHelper::set_port_be(&mut target, EndpointHelper::get_port_be(&bound));
+    let client = libc::socket(af, libc::SOCK_STREAM, 0);
+    set_nonblock(client);
+    let initial = perform_nonblocking_connect(client, (&target as *const libc::sockaddr_storage).cast(), addrlen);
+    let accept_poll_rc = poll_readable(listener);
+    let accepted = if accept_poll_rc > 0 { libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut()) } else { -1 };
+    if accepted >= 0 { set_nonblock(accepted); }
+    let (disconnect_fd, old_peer) = if disconnect_accepted { (accepted, client) } else { (client, accepted) };
+    let alias = libc::dup(disconnect_fd);
+    let (_, _, local_before, _) = EndpointHelper::getsockname(disconnect_fd);
+    let queued_write_rc = libc::send(disconnect_fd, b"queued".as_ptr().cast(), 6, libc::MSG_DONTWAIT);
+    let queued_write_errno = if queued_write_rc < 0 { errno() } else { 0 };
+    let mut unspec: libc::sockaddr_storage = std::mem::zeroed();
+    unspec.ss_family = libc::AF_UNSPEC as libc::sa_family_t;
+    let disconnect_rc = libc::connect(disconnect_fd, (&unspec as *const libc::sockaddr_storage).cast(), addrlen);
+    let disconnect_errno = if disconnect_rc < 0 { errno() } else { 0 };
+    let (peername_rc, peername_errno, _, _) = EndpointHelper::getpeername(disconnect_fd);
+    let (alias_peername_rc, alias_peername_errno, _, _) = EndpointHelper::getpeername(alias);
+    let peer_poll_rc = poll_readable(old_peer);
+    let mut queued = [0u8; 6];
+    let queued_recv_rc = libc::recv(old_peer, queued.as_mut_ptr().cast(), 6, libc::MSG_DONTWAIT);
+    let queued_recv_errno = if queued_recv_rc < 0 { errno() } else { 0 };
+    let mut byte = 0u8;
+    let reset_recv_rc = libc::recv(old_peer, (&mut byte as *mut u8).cast(), 1, libc::MSG_DONTWAIT);
+    let reset_recv_errno = if reset_recv_rc < 0 { errno() } else { 0 };
+    let (_, _, local_after, _) = EndpointHelper::getsockname(disconnect_fd);
+    let local_port_retained = EndpointHelper::get_port_be(&local_before) == EndpointHelper::get_port_be(&local_after);
+    let reconnect = perform_nonblocking_connect(disconnect_fd, (&target as *const libc::sockaddr_storage).cast(), addrlen);
+    let reconnect_accept_poll_rc = poll_readable(listener);
+    let new_peer = if reconnect_accept_poll_rc > 0 { libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut()) } else { -1 };
+    if new_peer >= 0 { set_nonblock(new_peer); }
+    libc::close(old_peer);
+    let new_write_rc = libc::send(disconnect_fd, b"r".as_ptr().cast(), 1, libc::MSG_DONTWAIT);
+    let new_write_errno = if new_write_rc < 0 { errno() } else { 0 };
+    let new_peer_poll_rc = poll_readable(new_peer);
+    let new_read_rc = libc::recv(new_peer, (&mut byte as *mut u8).cast(), 1, libc::MSG_DONTWAIT);
+    let new_read_errno = if new_read_rc < 0 { errno() } else { 0 };
+    let name = match (family, disconnect_accepted) {
+        (SockFamily::V4, false) => "tcp_disconnect_v4_client",
+        (SockFamily::V4, true) => "tcp_disconnect_v4_accepted",
+        (SockFamily::V6, false) => "tcp_disconnect_v6_client",
+        (SockFamily::V6, true) => "tcp_disconnect_v6_accepted",
+    };
+    println!("{name}_setup={}", listen_rc == 0 && initial.completed && accepted >= 0);
+    println!("{name}_disconnect_rc={disconnect_rc}");
+    println!("{name}_disconnect_errno={disconnect_errno}");
+    println!("{name}_peername_rc={peername_rc}");
+    println!("{name}_peername_errno={peername_errno}");
+    println!("{name}_alias_peername_rc={alias_peername_rc}");
+    println!("{name}_alias_peername_errno={alias_peername_errno}");
+    println!("{name}_queued_write_rc={queued_write_rc}");
+    println!("{name}_queued_write_errno={queued_write_errno}");
+    println!("{name}_peer_poll_rc={peer_poll_rc}");
+    println!("{name}_queued_recv_rc={queued_recv_rc}");
+    println!("{name}_queued_recv_errno={queued_recv_errno}");
+    println!("{name}_queued_matches={}", queued == *b"queued");
+    println!("{name}_reset_recv_rc={reset_recv_rc}");
+    println!("{name}_reset_recv_errno={reset_recv_errno}");
+    println!("{name}_local_port_retained={local_port_retained}");
+    println!("{name}_reconnect_errno={}", if reconnect.completed { 0 } else { reconnect.initial_errno });
+    println!("{name}_reconnect_accept_poll_rc={reconnect_accept_poll_rc}");
+    println!("{name}_new_write_rc={new_write_rc}");
+    println!("{name}_new_write_errno={new_write_errno}");
+    println!("{name}_new_peer_poll_rc={new_peer_poll_rc}");
+    println!("{name}_new_read_rc={new_read_rc}");
+    println!("{name}_new_read_errno={new_read_errno}");
+    println!("{name}_new_byte={byte}");
+    if alias >= 0 { libc::close(alias); }
+    if disconnect_fd >= 0 { libc::close(disconnect_fd); }
+    if new_peer >= 0 { libc::close(new_peer); }
+    if listener >= 0 { libc::close(listener); }
 }
 
 unsafe fn perform_nonblocking_accept(listener_fd: i32) -> i32 {
@@ -1790,6 +1879,14 @@ fn main() {
             so_domain = so_domain,
             so_protocol = so_protocol,
         );
+
+        // ---------------------------------------------------------------------
+        // Case 11: tcp_disconnect_reconnect (independent disposable pairs)
+        // ---------------------------------------------------------------------
+        run_tcp_disconnect_case(SockFamily::V4, false);
+        run_tcp_disconnect_case(SockFamily::V4, true);
+        run_tcp_disconnect_case(SockFamily::V6, false);
+        run_tcp_disconnect_case(SockFamily::V6, true);
 
         if client_fd >= 0 {
             libc::close(client_fd);
