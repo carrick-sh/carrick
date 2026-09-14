@@ -168,7 +168,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             libc::close(fds[1]);
         }
 
-        let DispatchOutcome::BlockingHostWrite(write) = outcome else {
+        let DispatchOutcome::BlockingWrite(write) = outcome else {
             panic!("large pipe write should hand off after partial progress, got {outcome:?}");
         };
         assert!(
@@ -350,7 +350,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let bytes = vec![0x5A; 4096];
         let expected_ptr = bytes.as_ptr();
         let expected_capacity = bytes.capacity();
-        let write = BlockingHostWrite::from_vec(
+        let write = BlockingWrite::from_vec(
             fds[1],
             bytes,
             128,

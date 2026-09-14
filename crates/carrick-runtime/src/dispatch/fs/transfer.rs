@@ -682,6 +682,9 @@ impl<'a> FsView<'a> {
         // `sendfile(1, infile, ...)` writes the file contents to the
         // dispatcher's internal stdout instead of the pipe write end.
         if let Some(open_file) = self.open_file(fd) {
+            let Some(io_lease) = open_file.description.retain_fd_lease() else {
+                return DispatchOutcome::errno(LINUX_EBADF);
+            };
             // Regular-file destinations need the overlay writeback to happen
             // AFTER the description borrow is dropped, so use the same
             // collect-then-write pattern as `write`. Non-file arms return
@@ -696,6 +699,7 @@ impl<'a> FsView<'a> {
                 };
                 match &mut *open {
                     OpenDescription::PipeWriter { pipe, .. } => {
+                        let pipe = Arc::clone(pipe);
                         let flags = if nonblocking {
                             open_file.description.common().status_flags() | LINUX_O_NONBLOCK
                         } else {
@@ -707,7 +711,17 @@ impl<'a> FsView<'a> {
                         else {
                             return DispatchOutcome::errno(LINUX_EBADF);
                         };
-                        return write_pipe(bytes, pipe, flags, fd, wait_authority, || false);
+                        drop(open);
+                        return write_pipe(
+                            bytes,
+                            &pipe,
+                            io_lease,
+                            flags,
+                            tid,
+                            wait_authority,
+                            || false,
+                            None,
+                        );
                     }
                     OpenDescription::HostPipe {
                         base,

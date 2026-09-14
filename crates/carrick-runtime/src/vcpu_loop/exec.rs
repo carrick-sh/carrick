@@ -3705,14 +3705,9 @@ pub(crate) mod tests {
 
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let write = crate::dispatch::BlockingHostWrite::for_tests(
-            fds[1],
-            vec![1, 2, 3, 4],
-            2,
-            this_tid,
-            true,
-        )
-        .expect("partial blocking write");
+        let write =
+            crate::dispatch::BlockingWrite::for_tests(fds[1], vec![1, 2, 3, 4], 2, this_tid, true)
+                .expect("partial blocking write");
         assert_eq!(unsafe { libc::close(fds[0]) }, 0);
         assert_eq!(unsafe { libc::close(fds[1]) }, 0);
 
@@ -3753,7 +3748,7 @@ pub(crate) mod tests {
                 &mut engine,
                 &mut control,
                 frame,
-                DispatchOutcome::BlockingHostWrite(write),
+                DispatchOutcome::BlockingWrite(write),
             )
             .expect("production blocking-write continuation")
         };

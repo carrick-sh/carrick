@@ -164,10 +164,17 @@ condition.
 
 ## 5. Threads, Executors, and vCPU Leases
 
-Each logical guest thread has a host pthread representation so it can block on
-host facilities without a global scheduler lock. Hardware vCPUs are different:
-they are bounded, reclaimable leases managed by the carrier rather than
-permanent property of a Linux thread.
+Logical guest threads run on a bounded pool of persistent host executor
+workers. They do not each require a dedicated host pthread. Hardware vCPUs are
+bounded, reclaimable leases managed by the carrier rather than permanent
+property of a Linux thread.
+
+A blocking operation represented by a continuation lets its worker service
+another runnable guest thread. An inline host wait inside a syscall handler
+does not: it retains execution capacity and can starve the guest task whose
+progress would satisfy the wait. Extra parked workers alone do not provide a
+blocking-call handoff. The partial-progress pipe-write failure demonstrated
+this distinction with every bound worker blocked and its reader runnable.
 
 A runnable guest thread acquires an appropriate vCPU lease, projects its task
 and address-space state, enters the guest, and returns to Carrick on a trap,

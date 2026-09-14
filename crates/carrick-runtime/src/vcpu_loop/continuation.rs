@@ -21,7 +21,7 @@ use carrick_guest_mem::{GuestVa, SharedFutexLocation};
 use parking_lot::Mutex;
 
 use crate::dispatch::{
-    BlockingHostWrite, BlockingRecordLock, DispatchOutcome, FdWaitCompletion, SyscallRequest,
+    BlockingRecordLock, BlockingWrite, DispatchOutcome, FdWaitCompletion, SyscallRequest,
     WaitFdAuthority, WaitFds,
 };
 use crate::kernel::objects::{ExecutionGeneration, ThreadKey};
@@ -483,7 +483,7 @@ fn detail_diagnostic(detail: &ContinuationDetail) -> String {
             registrations.len(),
             fd_authority_diagnostic(fd_authority)
         ),
-        ContinuationDetail::HostWrite(_) => "host-write".to_owned(),
+        ContinuationDetail::BlockingWrite(_) => "blocking-write".to_owned(),
         ContinuationDetail::RecordLock(_) => "record-lock".to_owned(),
         ContinuationDetail::Process { selector, .. } => match selector {
             ChildSelector::Exact(task) => {
@@ -525,11 +525,15 @@ fn probe_diagnostic(probe: &ReadinessProbe) -> (String, Vec<DiagnosticPollFd>) {
             format!("shared-word addr={:#x}", generation.addr),
             Vec::new(),
         ),
-        ReadinessProbe::HostWrite { host_fd, .. } => (
-            format!("host-write fd={host_fd}"),
+        ReadinessProbe::BlockingWrite {
+            poll_fd,
+            poll_events,
+            ..
+        } => (
+            format!("blocking-write fd={poll_fd} events={poll_events:#x}"),
             vec![DiagnosticPollFd {
-                fd: *host_fd,
-                events: libc::POLLOUT,
+                fd: *poll_fd,
+                events: *poll_events,
             }],
         ),
         ReadinessProbe::RecordLock { .. } => ("record-lock".to_owned(), Vec::new()),
@@ -696,7 +700,7 @@ pub(in crate::vcpu_loop) enum ContinuationDetail {
         fd_authority: WaitFdAuthority,
         sig_mask: WaitSigMask,
     },
-    HostWrite(Arc<Mutex<BlockingHostWrite>>),
+    BlockingWrite(Arc<Mutex<BlockingWrite>>),
     RecordLock(Arc<BlockingRecordLock>),
     Process {
         selector: ChildSelector,
@@ -791,7 +795,7 @@ pub enum BlockedContinuation {
     WaitOnFds(ContinuationState),
     WaitOnFdsSelect(ContinuationState),
     WaitOnPollFds(ContinuationState),
-    BlockingHostWrite(ContinuationState),
+    BlockingWrite(ContinuationState),
     BlockingRecordLock(ContinuationState),
     WaitOnProcExit(ContinuationState),
     WaitOnProcState(ContinuationState),
@@ -811,7 +815,7 @@ pub enum ContinuationFamily {
     WaitOnFds,
     WaitOnFdsSelect,
     WaitOnPollFds,
-    BlockingHostWrite,
+    BlockingWrite,
     BlockingRecordLock,
     WaitOnProcExit,
     WaitOnProcState,
@@ -834,7 +838,7 @@ impl ContinuationFamily {
             Self::WaitOnFds => 6,
             Self::WaitOnFdsSelect => 7,
             Self::WaitOnPollFds => 8,
-            Self::BlockingHostWrite => 9,
+            Self::BlockingWrite => 9,
             Self::BlockingRecordLock => 10,
             Self::WaitOnProcExit => 11,
             Self::WaitOnProcState => 12,
@@ -858,7 +862,7 @@ impl ContinuationFamily {
             Self::WaitOnFds => "wait-on-fds",
             Self::WaitOnFdsSelect => "wait-on-fds-select",
             Self::WaitOnPollFds => "wait-on-poll-fds",
-            Self::BlockingHostWrite => "blocking-host-write",
+            Self::BlockingWrite => "blocking-write",
             Self::BlockingRecordLock => "blocking-record-lock",
             Self::WaitOnProcExit => "wait-on-proc-exit",
             Self::WaitOnProcState => "wait-on-proc-state",
@@ -893,7 +897,7 @@ pub const fn is_blocking_dispatch_outcome(outcome: &DispatchOutcome) -> bool {
             | DispatchOutcome::SharedFutexWaitv { .. }
             | DispatchOutcome::WaitOnSharedWord { .. }
             | DispatchOutcome::WaitOnFds { .. }
-            | DispatchOutcome::BlockingHostWrite(_)
+            | DispatchOutcome::BlockingWrite(_)
             | DispatchOutcome::BlockingRecordLock(_)
             | DispatchOutcome::WaitOnProcExit { .. }
             | DispatchOutcome::WaitOnProcState { .. }
@@ -1100,11 +1104,11 @@ impl BlockedContinuation {
                     ))
                 }
             },
-            DispatchOutcome::BlockingHostWrite(write) => Self::BlockingHostWrite(new_state(
+            DispatchOutcome::BlockingWrite(write) => Self::BlockingWrite(new_state(
                 None,
                 Vec::new(),
                 Some(WaitSigMask::NONE),
-                ContinuationDetail::HostWrite(Arc::new(Mutex::new(write))),
+                ContinuationDetail::BlockingWrite(Arc::new(Mutex::new(write))),
             )),
             DispatchOutcome::BlockingRecordLock(lock) => Self::BlockingRecordLock(new_state(
                 None,
@@ -1290,7 +1294,7 @@ impl BlockedContinuation {
             | Self::WaitOnFds(state)
             | Self::WaitOnFdsSelect(state)
             | Self::WaitOnPollFds(state)
-            | Self::BlockingHostWrite(state)
+            | Self::BlockingWrite(state)
             | Self::BlockingRecordLock(state)
             | Self::WaitOnProcExit(state)
             | Self::WaitOnProcState(state)
@@ -1311,7 +1315,7 @@ impl BlockedContinuation {
             | Self::WaitOnFds(state)
             | Self::WaitOnFdsSelect(state)
             | Self::WaitOnPollFds(state)
-            | Self::BlockingHostWrite(state)
+            | Self::BlockingWrite(state)
             | Self::BlockingRecordLock(state)
             | Self::WaitOnProcExit(state)
             | Self::WaitOnProcState(state)
@@ -1332,7 +1336,7 @@ impl BlockedContinuation {
             Self::WaitOnFds(_) => ContinuationFamily::WaitOnFds,
             Self::WaitOnFdsSelect(_) => ContinuationFamily::WaitOnFdsSelect,
             Self::WaitOnPollFds(_) => ContinuationFamily::WaitOnPollFds,
-            Self::BlockingHostWrite(_) => ContinuationFamily::BlockingHostWrite,
+            Self::BlockingWrite(_) => ContinuationFamily::BlockingWrite,
             Self::BlockingRecordLock(_) => ContinuationFamily::BlockingRecordLock,
             Self::WaitOnProcExit(_) => ContinuationFamily::WaitOnProcExit,
             Self::WaitOnProcState(_) => ContinuationFamily::WaitOnProcState,
@@ -1530,9 +1534,9 @@ impl BlockedContinuation {
                         ^ registration.generation;
                 }
             }
-            ContinuationDetail::HostWrite(write) => {
+            ContinuationDetail::BlockingWrite(write) => {
                 let write = write.lock();
-                fingerprint ^= write.host_fd() as u64 ^ write.offset() as u64;
+                fingerprint ^= write.poll_fd() as u64 ^ write.offset() as u64;
             }
             ContinuationDetail::RecordLock(lock) => {
                 fingerprint ^= std::mem::size_of_val(lock) as u64;
@@ -1760,9 +1764,9 @@ impl BlockedContinuation {
             ContinuationEvent::Ready => match producer_completion {
                 Some(
                     outcome @ (DispatchOutcome::Returned { .. } | DispatchOutcome::Errno { .. }),
-                ) if family == ContinuationFamily::BlockingHostWrite => {
+                ) if family == ContinuationFamily::BlockingWrite => {
                     let write = match &self.state().detail {
-                        ContinuationDetail::HostWrite(write) => write.lock().clone(),
+                        ContinuationDetail::BlockingWrite(write) => write.lock().clone(),
                         _ => unreachable!("blocking-write family without write state"),
                     };
                     ContinuationCompletion::BlockingWrite {
@@ -1797,9 +1801,11 @@ impl BlockedContinuation {
                         };
                         ContinuationCompletion::Return(index)
                     }
-                    ContinuationFamily::BlockingHostWrite => {
+                    ContinuationFamily::BlockingWrite => {
                         let offset = match &self.state().detail {
-                            ContinuationDetail::HostWrite(write) => write.lock().offset() as i64,
+                            ContinuationDetail::BlockingWrite(write) => {
+                                write.lock().offset() as i64
+                            }
                             _ => 0,
                         };
                         ContinuationCompletion::RedispatchWithPartial(offset)
@@ -1848,9 +1854,9 @@ impl BlockedContinuation {
                 ContinuationFamily::WaitOnFdsSelect | ContinuationFamily::WaitOnSleep => {
                     ContinuationCompletion::ReturnWithGuestWrites(0, self.guest_outputs().to_vec())
                 }
-                ContinuationFamily::BlockingHostWrite => {
+                ContinuationFamily::BlockingWrite => {
                     let offset = match &self.state().detail {
-                        ContinuationDetail::HostWrite(write) => write.lock().offset() as i64,
+                        ContinuationDetail::BlockingWrite(write) => write.lock().offset() as i64,
                         _ => 0,
                     };
                     ContinuationCompletion::Return(offset)
@@ -1887,7 +1893,7 @@ impl BlockedContinuation {
                     && deliverable_action
                         .is_some_and(|action| action.sa_flags & carrick_abi::LINUX_SA_RESTART != 0);
                 let partial_write_progress = match &self.state().detail {
-                    ContinuationDetail::HostWrite(write) => write.lock().offset() != 0,
+                    ContinuationDetail::BlockingWrite(write) => write.lock().offset() != 0,
                     _ => false,
                 };
                 let restart = if family != ContinuationFamily::WaitOnSignals
@@ -1899,9 +1905,9 @@ impl BlockedContinuation {
                 } else {
                     RestartDecision::NoRestart
                 };
-                let completion = if family == ContinuationFamily::BlockingHostWrite {
+                let completion = if family == ContinuationFamily::BlockingWrite {
                     let offset = match &self.state().detail {
-                        ContinuationDetail::HostWrite(write) => write.lock().offset() as i64,
+                        ContinuationDetail::BlockingWrite(write) => write.lock().offset() as i64,
                         _ => 0,
                     };
                     if offset != 0 {
@@ -2074,7 +2080,7 @@ pub enum ContinuationCompletion {
     ReturnWithGuestWrites(i64, Vec<GuestOutputRange>),
     ErrnoWithGuestWrites(LinuxErrno, Vec<GuestOutputRange>),
     BlockingWrite {
-        write: BlockingHostWrite,
+        write: BlockingWrite,
         outcome: BlockingWriteOutcome,
     },
     InterruptedSleep {

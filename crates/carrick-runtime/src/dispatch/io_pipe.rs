@@ -12,7 +12,7 @@ use carrick_guest_mem::CurrentMmMemory;
 use super::abi_args::HostFd;
 use super::fd_table::{HostFdRef, HostWriteKind};
 use super::fs;
-use super::outcome::{BlockingHostWrite, DispatchOutcome, FdWaitCompletion};
+use super::outcome::{BlockingWrite, DispatchOutcome, FdWaitCompletion};
 use super::wait_authority::{WaitFdAuthority, WaitFds};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,14 +387,14 @@ fn write_host_pipe_payload(
                         ) {
                             return DispatchOutcome::returned_len_or_errno(offset);
                         }
-                        return match BlockingHostWrite::from_vec(
+                        return match BlockingWrite::from_vec(
                             host_fd,
                             payload.into_owned(),
                             offset,
                             tid,
                             sigpipe_on_epipe,
                         ) {
-                            Ok(write) => DispatchOutcome::BlockingHostWrite(write),
+                            Ok(write) => DispatchOutcome::BlockingWrite(write),
                             Err(_) => DispatchOutcome::returned_len_or_errno(offset),
                         };
                     }
@@ -470,14 +470,14 @@ fn write_host_pipe_payload(
                     ) {
                         return DispatchOutcome::returned_len_or_errno(offset);
                     }
-                    return match BlockingHostWrite::from_vec(
+                    return match BlockingWrite::from_vec(
                         host_fd,
                         payload.into_owned(),
                         offset,
                         tid,
                         sigpipe_on_epipe,
                     ) {
-                        Ok(write) => DispatchOutcome::BlockingHostWrite(write),
+                        Ok(write) => DispatchOutcome::BlockingWrite(write),
                         Err(_) => DispatchOutcome::returned_len_or_errno(offset),
                     };
                 }
@@ -503,14 +503,14 @@ fn write_host_pipe_payload(
                 ) || crate::fork_quiesce::is_quiescing()
                 {
                     if crate::fork_quiesce::is_quiescing() {
-                        return match BlockingHostWrite::from_vec(
+                        return match BlockingWrite::from_vec(
                             host_fd,
                             payload.into_owned(),
                             offset,
                             tid,
                             sigpipe_on_epipe,
                         ) {
-                            Ok(write) => DispatchOutcome::BlockingHostWrite(write),
+                            Ok(write) => DispatchOutcome::BlockingWrite(write),
                             Err(_) => DispatchOutcome::returned_len_or_errno(offset),
                         };
                     }

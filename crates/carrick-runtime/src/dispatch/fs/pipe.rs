@@ -53,6 +53,104 @@ pub(crate) struct PipeInner {
 
 pub(crate) type PipeRef = Arc<PipeInner>;
 
+/// Exact publication authority captured before a write parks. It avoids
+/// resolving a numeric guest fd after close or reuse.
+pub(crate) struct PipeWriteNotification {
+    kind: PipeWriteNotificationKind,
+}
+
+impl PipeWriteNotification {
+    pub(crate) fn new(
+        epoll_registry: crate::dispatch::EpollWakeRegistry,
+        kernel: Arc<crate::kernel::Kernel>,
+        source_fd: i32,
+    ) -> Self {
+        Self {
+            kind: PipeWriteNotificationKind::Live {
+                epoll_registry,
+                kernel,
+                source_fd,
+            },
+        }
+    }
+
+    fn publish(&self, pipe: &PipeInner, bytes: usize) {
+        match &self.kind {
+            PipeWriteNotificationKind::Live {
+                epoll_registry,
+                kernel,
+                source_fd,
+            } => {
+                crate::dispatch::epoll_shim::notify_inmem_epoll(epoll_registry);
+                crate::dispatch::fs::locks::fasync_notify_pipe_write(
+                    kernel,
+                    pipe.pipe_id(),
+                    *source_fd,
+                    bytes,
+                );
+            }
+            #[cfg(test)]
+            PipeWriteNotificationKind::Test => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn for_tests() -> Self {
+        Self {
+            kind: PipeWriteNotificationKind::Test,
+        }
+    }
+}
+
+enum PipeWriteNotificationKind {
+    Live {
+        epoll_registry: crate::dispatch::EpollWakeRegistry,
+        kernel: Arc<crate::kernel::Kernel>,
+        source_fd: i32,
+    },
+    #[cfg(test)]
+    Test,
+}
+
+/// Functional writer-end ownership retained while a blocked large write is
+/// driven by the continuation reactor. Holding only [`PipeRef`] is not enough:
+/// a concurrent final `close(2)` would otherwise drop the writer description's
+/// fd reference and publish EOF before this syscall finished its bytes.
+pub(crate) struct PipeWriteEndpointLease {
+    _description_lease: crate::kernel::objects::FileDescriptionFdLease,
+    pipe: PipeRef,
+    readiness_fd: HostFdRef,
+    notification: PipeWriteNotification,
+}
+
+impl PipeWriteEndpointLease {
+    pub(crate) fn retain(
+        description_lease: crate::kernel::objects::FileDescriptionFdLease,
+        pipe: PipeRef,
+        readiness_fd: HostFdRef,
+        notification: PipeWriteNotification,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            _description_lease: description_lease,
+            pipe,
+            readiness_fd,
+            notification,
+        })
+    }
+
+    pub(crate) fn pipe(&self) -> &PipeRef {
+        &self.pipe
+    }
+
+    pub(crate) fn readiness_fd(&self) -> &HostFdRef {
+        &self.readiness_fd
+    }
+
+    pub(crate) fn publish_progress(&self, bytes: usize) {
+        self.notification.publish(&self.pipe, bytes);
+    }
+}
+
 pub(crate) fn pipe_writer_is_writable(state: &PipeState) -> bool {
     state.capacity.saturating_sub(state.buffer.len()) >= PIPE_BUF
 }
@@ -419,10 +517,12 @@ pub(crate) fn tee_in_memory_pipes(
 pub(crate) fn write_pipe(
     bytes: &[u8],
     pipe: &PipeRef,
+    writer_lease: crate::kernel::objects::FileDescriptionFdLease,
     status_flags: u64,
-    _fd: i32,
+    tid: crate::thread::ThreadId,
     authority: super::WaitFdAuthority,
     is_interrupted: impl Fn() -> bool,
+    notification: Option<PipeWriteNotification>,
 ) -> DispatchOutcome {
     let nonblocking = status_flags & LINUX_O_NONBLOCK != 0;
     let length = bytes.len();
@@ -498,15 +598,35 @@ pub(crate) fn write_pipe(
             return DispatchOutcome::errno(LINUX_EAGAIN);
         }
 
-        // Blocking write with no space left: wait for reader to consume or signal to interrupt.
+        // A > PIPE_BUF write which made progress must retain that exact
+        // endpoint and resume at `written` through the continuation reactor.
+        // Sleeping this executor in 20ms Condvar slices strands other runnable
+        // guest work behind the bounded vCPU pool.
         if is_interrupted() {
             break;
         }
-        pipe.changed
-            .wait_for(&mut state, std::time::Duration::from_millis(20));
-        if is_interrupted() {
+        let Some(readiness_fd) = pipe.write_poll_fd_locked(&state) else {
             break;
-        }
+        };
+        let Some(notification) = notification else {
+            break;
+        };
+        let endpoint = PipeWriteEndpointLease::retain(
+            writer_lease,
+            Arc::clone(pipe),
+            readiness_fd,
+            notification,
+        );
+        drop(state);
+        pipe.changed.notify_all();
+        endpoint.publish_progress(written);
+        return DispatchOutcome::BlockingWrite(crate::dispatch::BlockingWrite::in_memory_pipe(
+            endpoint,
+            bytes.to_vec(),
+            written,
+            tid,
+            true,
+        ));
     }
 
     pipe.update_readiness_locked(&state);
@@ -586,6 +706,42 @@ mod tests {
     use super::*;
     use crate::dispatch::{InternalWaitKind, WaitFdAuthority};
 
+    fn write_pipe_for_test(
+        bytes: &[u8],
+        pipe: &PipeRef,
+        status_flags: u64,
+        fd: i32,
+        authority: WaitFdAuthority,
+        is_interrupted: impl Fn() -> bool,
+    ) -> DispatchOutcome {
+        let description = Arc::new(
+            crate::kernel::FileDescription::concrete_with_status_flags(
+                Arc::new(parking_lot::RwLock::new(OpenDescription::PipeWriter {
+                    base: OpenDescriptionBase::new(LINUX_O_WRONLY | status_flags),
+                    pipe: Arc::clone(pipe),
+                })),
+                LINUX_O_WRONLY | status_flags,
+            )
+            .expect("test pipe writer description"),
+        );
+        description.retain_fd_ref();
+        let lease = description
+            .retain_fd_lease()
+            .expect("test writer has an fd reference");
+        let outcome = write_pipe(
+            bytes,
+            pipe,
+            lease,
+            status_flags,
+            crate::thread::ThreadId::synthetic_for_tests(fd),
+            authority,
+            is_interrupted,
+            None,
+        );
+        description.release_fd_ref();
+        outcome
+    }
+
     fn write_readiness_is_signaled(pipe: &PipeInner) -> bool {
         let fd = pipe.write_poll_fd().expect("write readiness fd");
         let mut pollfd = libc::pollfd {
@@ -602,7 +758,7 @@ mod tests {
         let tid = crate::thread::ThreadId::synthetic_for_tests(1);
 
         let data = b"hello, in-memory pipe!";
-        let out = write_pipe(
+        let out = write_pipe_for_test(
             data,
             &pipe,
             0,
@@ -627,7 +783,7 @@ mod tests {
 
         assert!(write_readiness_is_signaled(&pipe));
         assert_eq!(
-            write_pipe(&payload, &pipe, LINUX_O_NONBLOCK, 4, authority, || false),
+            write_pipe_for_test(&payload, &pipe, LINUX_O_NONBLOCK, 4, authority, || false),
             DispatchOutcome::returned_len_or_errno(PIPE_BUF)
         );
         assert!(!write_readiness_is_signaled(&pipe));
@@ -662,7 +818,7 @@ mod tests {
 
         // Fill 5000 bytes
         let data = vec![0x42u8; 5000];
-        let out = write_pipe(
+        let out = write_pipe_for_test(
             &data,
             &pipe,
             0,
@@ -686,7 +842,7 @@ mod tests {
 
         // Close all readers
         pipe.state.lock().readers = 0;
-        let out = write_pipe(
+        let out = write_pipe_for_test(
             b"test",
             &pipe,
             0,
@@ -719,7 +875,7 @@ mod tests {
         // Fill pipe to capacity
         let data = vec![0xaa; 4096];
         assert_eq!(
-            write_pipe(
+            write_pipe_for_test(
                 &data,
                 &pipe,
                 LINUX_O_NONBLOCK,
@@ -732,7 +888,7 @@ mod tests {
 
         // Write to full nonblocking pipe -> EAGAIN
         assert_eq!(
-            write_pipe(
+            write_pipe_for_test(
                 b"more",
                 &pipe,
                 LINUX_O_NONBLOCK,
@@ -750,13 +906,13 @@ mod tests {
         let authority = WaitFdAuthority::internal(InternalWaitKind::CarrierControl);
         let fill = vec![0x33; 65536];
         assert_eq!(
-            write_pipe(&fill, &pipe, 0, 4, authority.clone(), || false),
+            write_pipe_for_test(&fill, &pipe, 0, 4, authority.clone(), || false),
             DispatchOutcome::Returned { value: 65536 }
         );
 
         // Pipe is now completely full (65536 bytes). A blocking write of 65536 bytes
         // must park via WaitOnFds rather than spinning or returning 0.
-        let out = write_pipe(&fill, &pipe, 0, 4, authority.clone(), || false);
+        let out = write_pipe_for_test(&fill, &pipe, 0, 4, authority.clone(), || false);
         let host_fd = pipe.write_poll_fd().expect("write poll fd");
         assert_eq!(
             out,
@@ -777,13 +933,224 @@ mod tests {
         let authority = WaitFdAuthority::internal(InternalWaitKind::CarrierControl);
         let fill = vec![0x44; 4096];
         assert_eq!(
-            write_pipe(&fill, &pipe, 0, 4, authority.clone(), || false),
+            write_pipe_for_test(&fill, &pipe, 0, 4, authority.clone(), || false),
             DispatchOutcome::Returned { value: 4096 }
         );
 
         // Pipe is full; write interrupted immediately must return EINTR, not 0.
-        let out = write_pipe(b"blocked", &pipe, 0, 4, authority, || true);
+        let out = write_pipe_for_test(b"blocked", &pipe, 0, 4, authority, || true);
         assert_eq!(out, DispatchOutcome::errno(LINUX_EINTR));
+    }
+
+    #[test]
+    fn parked_large_write_keeps_writer_functional_after_numeric_close() {
+        let pipe = Arc::new(PipeInner::new(14, PIPE_BUF));
+        // The reader end is live independently of the writer description
+        // constructed below.
+        pipe.state.lock().readers = 1;
+        let description = Arc::new(
+            crate::kernel::FileDescription::concrete_with_status_flags(
+                Arc::new(parking_lot::RwLock::new(OpenDescription::PipeWriter {
+                    base: OpenDescriptionBase::new(LINUX_O_WRONLY),
+                    pipe: Arc::clone(&pipe),
+                })),
+                LINUX_O_WRONLY,
+            )
+            .expect("writer description"),
+        );
+        description.retain_fd_ref();
+        let lease = description
+            .retain_fd_lease()
+            .expect("admit live writer before pipe lock");
+
+        let payload = vec![0x7c; PIPE_BUF * 2];
+        let mut blocked = match write_pipe(
+            &payload,
+            &pipe,
+            lease,
+            0,
+            crate::thread::ThreadId::synthetic_for_tests(14),
+            WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+            || false,
+            Some(PipeWriteNotification::for_tests()),
+        ) {
+            DispatchOutcome::BlockingWrite(write) => write,
+            other => panic!("expected parked partial write, got {other:?}"),
+        };
+
+        // The numeric fd closes while the continuation is parked. Its exact
+        // functional lease keeps the writer endpoint live, so the reader must
+        // not observe EOF before the staged suffix lands.
+        description.release_fd_ref();
+        assert_eq!(description.fd_ref_count(), 1);
+        assert_eq!(pipe.state.lock().writers, 1);
+
+        let mut first = vec![0; PIPE_BUF];
+        assert_eq!(
+            read_pipe_bytes(
+                &mut first,
+                &pipe,
+                LINUX_O_NONBLOCK,
+                crate::thread::ThreadId::synthetic_for_tests(14),
+            ),
+            Ok(PIPE_BUF)
+        );
+        assert_eq!(first, vec![0x7c; PIPE_BUF]);
+        match crate::dispatch::drive_blocking_write(&mut blocked) {
+            crate::dispatch::BlockingWriteStep::Done(DispatchOutcome::Returned { value }) => {
+                assert_eq!(value, payload.len() as i64);
+            }
+            _ => panic!("expected completed blocked write"),
+        }
+        drop(blocked);
+        assert_eq!(description.fd_ref_count(), 0);
+        assert_eq!(pipe.state.lock().writers, 0);
+    }
+
+    #[test]
+    fn aggregate_fault_truncates_staged_current_suffix_at_copy_boundary() {
+        let pipe = Arc::new(PipeInner::new(16, PIPE_BUF));
+        pipe.state.lock().readers = 1;
+        let description = Arc::new(
+            crate::kernel::FileDescription::concrete_with_status_flags(
+                Arc::new(parking_lot::RwLock::new(OpenDescription::PipeWriter {
+                    base: OpenDescriptionBase::new(LINUX_O_WRONLY),
+                    pipe: Arc::clone(&pipe),
+                })),
+                LINUX_O_WRONLY,
+            )
+            .expect("writer description"),
+        );
+        description.retain_fd_ref();
+        let lease = description.retain_fd_lease().expect("live writer");
+        let current = vec![0x6b; PIPE_BUF + 1];
+        let mut blocked = match write_pipe(
+            &current,
+            &pipe,
+            lease,
+            0,
+            crate::thread::ThreadId::synthetic_for_tests(16),
+            WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+            || false,
+            Some(PipeWriteNotification::for_tests()),
+        ) {
+            DispatchOutcome::BlockingWrite(write) => {
+                // A 32-byte valid next iovec followed by EFAULT has a 4KiB
+                // aggregate boundary: the uncommitted byte of `current` and
+                // all staged tail bytes are excluded.
+                write.with_in_memory_pipe_writev_boundary(vec![0x6c; 32], 0, PIPE_BUF)
+            }
+            other => panic!("expected parked write, got {other:?}"),
+        };
+        description.release_fd_ref();
+        // If the aggregate boundary falls below bytes already copied into the
+        // pipe, the continuation cannot retract them.
+        let irreversible =
+            blocked
+                .clone()
+                .with_in_memory_pipe_writev_boundary(Vec::new(), 1, PIPE_BUF);
+        assert_eq!(irreversible.offset, PIPE_BUF);
+        assert_eq!(irreversible.bytes.len(), PIPE_BUF);
+        let mut first = vec![0; PIPE_BUF];
+        assert_eq!(
+            read_pipe_bytes(
+                &mut first,
+                &pipe,
+                LINUX_O_NONBLOCK,
+                crate::thread::ThreadId::synthetic_for_tests(16),
+            ),
+            Ok(PIPE_BUF)
+        );
+        assert_eq!(first, vec![0x6b; PIPE_BUF]);
+        match crate::dispatch::drive_blocking_write(&mut blocked) {
+            crate::dispatch::BlockingWriteStep::Done(DispatchOutcome::Returned { value }) => {
+                assert_eq!(value, PIPE_BUF as i64);
+            }
+            _ => panic!("expected copy-boundary completion"),
+        }
+    }
+
+    #[test]
+    fn aggregate_blocking_write_excludes_unadmitted_later_vectors() {
+        let pipe = Arc::new(PipeInner::new(15, PIPE_BUF));
+        pipe.state.lock().readers = 1;
+        let description = Arc::new(
+            crate::kernel::FileDescription::concrete_with_status_flags(
+                Arc::new(parking_lot::RwLock::new(OpenDescription::PipeWriter {
+                    base: OpenDescriptionBase::new(LINUX_O_WRONLY),
+                    pipe: Arc::clone(&pipe),
+                })),
+                LINUX_O_WRONLY,
+            )
+            .expect("writer description"),
+        );
+        description.retain_fd_ref();
+        let lease = description.retain_fd_lease().expect("live writer");
+        let current = vec![0x41; PIPE_BUF * 2];
+        let mut blocked = match write_pipe(
+            &current,
+            &pipe,
+            lease,
+            0,
+            crate::thread::ThreadId::synthetic_for_tests(15),
+            WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+            || false,
+            Some(PipeWriteNotification::for_tests()),
+        ) {
+            DispatchOutcome::BlockingWrite(write) => {
+                // Three bytes preceded this current iovec. A later fault
+                // retains only complete aggregate copy blocks.
+                write.with_in_memory_pipe_writev_boundary(Vec::new(), 3, PIPE_BUF * 2)
+            }
+            other => panic!("expected parked write, got {other:?}"),
+        };
+        description.release_fd_ref();
+
+        let mut first = vec![0; PIPE_BUF];
+        assert_eq!(
+            read_pipe_bytes(
+                &mut first,
+                &pipe,
+                LINUX_O_NONBLOCK,
+                crate::thread::ThreadId::synthetic_for_tests(15),
+            ),
+            Ok(PIPE_BUF)
+        );
+        let crate::dispatch::BlockingWriteStep::Done(outcome) =
+            crate::dispatch::drive_blocking_write(&mut blocked)
+        else {
+            panic!("second pipe progress must complete the admitted aggregate");
+        };
+        assert_eq!(
+            outcome,
+            // The current vector's final three bytes belong to the incomplete
+            // aggregate copy block after the later fault and are not visible.
+            DispatchOutcome::returned_len_or_errno(PIPE_BUF * 2)
+        );
+        let mut second = vec![0; PIPE_BUF - 3];
+        assert_eq!(
+            read_pipe_bytes(
+                &mut second,
+                &pipe,
+                LINUX_O_NONBLOCK,
+                crate::thread::ThreadId::synthetic_for_tests(15),
+            ),
+            Ok(PIPE_BUF - 3)
+        );
+        assert_eq!(second, vec![0x41; PIPE_BUF - 3]);
+        // The physical pipe has only the retained current-vector bytes;
+        // the logical prefix of three came from an earlier writev vector.
+        assert_eq!(3 + first.len() + second.len(), PIPE_BUF * 2);
+        let mut tail = [0; 1];
+        assert_eq!(
+            read_pipe_bytes(
+                &mut tail,
+                &pipe,
+                LINUX_O_NONBLOCK,
+                crate::thread::ThreadId::synthetic_for_tests(15),
+            ),
+            Err(LINUX_EAGAIN)
+        );
     }
 
     #[test]
@@ -794,7 +1161,7 @@ mod tests {
         // EINTR (a signal handler writing one wake-up byte while a second
         // signal is pending is exactly this case).
         assert_eq!(
-            write_pipe(b"x", &pipe, 0, 4, authority.clone(), || true),
+            write_pipe_for_test(b"x", &pipe, 0, 4, authority.clone(), || true),
             DispatchOutcome::Returned { value: 1 }
         );
         assert_eq!(pipe.buffered_bytes(), 1);
@@ -805,7 +1172,7 @@ mod tests {
         let pipe = Arc::new(PipeInner::new_connected(12, 4096));
         let authority = WaitFdAuthority::internal(InternalWaitKind::CarrierControl);
         assert_eq!(
-            write_pipe(&[], &pipe, 0, 4, authority, || false),
+            write_pipe_for_test(&[], &pipe, 0, 4, authority, || false),
             DispatchOutcome::Returned { value: 0 }
         );
     }

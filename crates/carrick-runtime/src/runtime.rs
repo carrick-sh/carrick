@@ -1108,7 +1108,7 @@ where
 
         match outcome {
             DispatchOutcome::WaitOnFds { .. }
-            | DispatchOutcome::BlockingHostWrite(_)
+            | DispatchOutcome::BlockingWrite(_)
             | DispatchOutcome::BlockingRecordLock(_)
             | DispatchOutcome::WaitOnProcExit { .. }
             | DispatchOutcome::WaitOnProcState { .. }
@@ -1683,11 +1683,11 @@ where
             || dispatch(dispatcher, kernel_context, syscall, memory, reporter),
         )?;
         match outcome {
-            DispatchOutcome::BlockingHostWrite(mut write) => {
+            DispatchOutcome::BlockingWrite(mut write) => {
                 waiter.ensure_full();
                 loop {
-                    match crate::dispatch::drive_blocking_host_write(&mut write) {
-                        crate::dispatch::BlockingHostWriteStep::Done(outcome) => {
+                    match crate::dispatch::drive_blocking_write(&mut write) {
+                        crate::dispatch::BlockingWriteStep::Done(outcome) => {
                             return Ok(raise_sigpipe_for_blocking_write(
                                 dispatcher,
                                 kernel_context,
@@ -1695,9 +1695,12 @@ where
                                 outcome,
                             ));
                         }
-                        crate::dispatch::BlockingHostWriteStep::Wait => {
+                        crate::dispatch::BlockingWriteStep::Wait => {
                             match waiter.wait(
-                                &[crate::io_wait::WaitFd::raw(write.host_fd(), libc::POLLOUT)],
+                                &[crate::io_wait::WaitFd::raw(
+                                    write.poll_fd(),
+                                    write.poll_events(),
+                                )],
                                 None,
                                 carrick_abi::SigBlockMask::NONE,
                             ) {
@@ -2797,7 +2800,7 @@ mod tests {
         ));
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let write = crate::dispatch::BlockingHostWrite::for_tests(
+        let write = crate::dispatch::BlockingWrite::for_tests(
             fds[1],
             vec![1, 2, 3, 4],
             2,
@@ -2820,7 +2823,7 @@ mod tests {
             &reporter,
             &mut waiter,
             |_, _, _, _, _| {
-                Ok(DispatchOutcome::BlockingHostWrite(
+                Ok(DispatchOutcome::BlockingWrite(
                     write.take().expect("handler runs once"),
                 ))
             },
