@@ -1631,7 +1631,22 @@ impl RootFsVfs {
             &crate::vfs::namespace_mutation::NamespaceMutationPermit<'_>,
         ) -> Result<R, E>,
     ) -> Result<Result<R, E>, LinuxErrno> {
+        self.check_mkdir_target(path)?;
         self.with_namespace_batch(&[path], true, operation)
+    }
+
+    /// Reject an attempt to create the filesystem root after confirming that
+    /// the layered namespace still resolves it. Root has no parent/leaf pair,
+    /// so it cannot enter the ordinary namespace-mutation transaction.
+    fn check_mkdir_target(&self, path: &str) -> Result<(), VfsError> {
+        let mut components = std::path::Path::new(path).components();
+        if matches!(components.next(), Some(std::path::Component::RootDir))
+            && components.next().is_none()
+        {
+            self.lookup(path)?;
+            return Err(LINUX_EEXIST);
+        }
+        Ok(())
     }
 
     pub(crate) fn mkdir_admitted(
@@ -2031,16 +2046,7 @@ impl Vfs for RootFsVfs {
     }
 
     fn mkdir(&self, path: &str, mode: u32) -> Result<(), VfsError> {
-        let mut components = std::path::Path::new(path).components();
-        if matches!(components.next(), Some(std::path::Component::RootDir))
-            && components.next().is_none()
-        {
-            self.lookup(path)?;
-            return Err(LINUX_EEXIST);
-        }
-        self.with_namespace_batch(&[path], true, |permit| {
-            self.mkdir_admitted(permit, path, mode)
-        })??;
+        self.with_mkdir_transaction(path, |permit| self.mkdir_admitted(permit, path, mode))??;
         Ok(())
     }
 
