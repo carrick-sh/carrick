@@ -611,6 +611,9 @@ impl NetworkProvider for NetworkInterposer {
                     target: requested,
                 });
             }
+            if self.inzone().owns_endpoint(&scope, requested) {
+                return Ok(ConnectTarget::Denied(carrick_abi::LINUX_ECONNREFUSED));
+            }
         }
 
         let ip = requested.0.ip();

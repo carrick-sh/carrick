@@ -281,6 +281,13 @@ pub(super) struct OpenDescriptionBase {
     /// to emulate Linux UDP wildcard-rebind from SO_REUSEADDR. (audit M4)
     so_reuseaddr: bool,
     so_reuseport: bool,
+    /// Linux-visible IPV6_V6ONLY intent, needed when an in-zone bind decides
+    /// whether an IPv6 wildcard also owns the IPv4 port space.
+    ipv6_v6only: bool,
+    /// The compat-zone local endpoint when the host carrier was rebound or a
+    /// local refusal synthesized. It belongs to the open description so dup
+    /// and numeric-fd reuse cannot change its authority.
+    guest_local: Option<crate::network::GuestSocketAddr>,
     /// Guest-set SO_RCVBUF / SO_SNDBUF (the raw value passed to setsockopt).
     /// `None` = never set. getsockopt reports Linux's doubled value (2×) of what
     /// was set, rather than the host's actual buffer size (which carrick widens
@@ -345,6 +352,8 @@ impl OpenDescriptionBase {
             fs_identity: None,
             so_reuseaddr: false,
             so_reuseport: false,
+            ipv6_v6only: false,
+            guest_local: None,
             ipv6_multicast_if: None,
             so_rcvbuf: None,
             so_sndbuf: None,
@@ -422,6 +431,18 @@ impl OpenDescriptionBase {
     }
     pub(super) fn set_so_reuseport(&mut self, on: bool) {
         self.so_reuseport = on;
+    }
+    pub(super) fn ipv6_v6only(&self) -> bool {
+        self.ipv6_v6only
+    }
+    pub(super) fn set_ipv6_v6only(&mut self, on: bool) {
+        self.ipv6_v6only = on;
+    }
+    pub(super) fn guest_local(&self) -> Option<crate::network::GuestSocketAddr> {
+        self.guest_local
+    }
+    pub(super) fn set_guest_local(&mut self, local: Option<crate::network::GuestSocketAddr>) {
+        self.guest_local = local;
     }
 
     /// Guest-set SO_RCVBUF / SO_SNDBUF, or `None` if never set (audit M5).
@@ -507,6 +528,13 @@ impl OpenDescriptionBase {
         cleanup: Option<std::sync::Arc<dyn InZoneCleanup>>,
     ) {
         self.inzone_cleanup = cleanup;
+    }
+
+    /// A bound in-zone endpoint owns this lease.  Connect transfers the same
+    /// lease into both connection halves; it must not manufacture a second
+    /// number-only reservation for an already-bound host socket.
+    pub(super) fn inzone_cleanup(&self) -> Option<std::sync::Arc<dyn InZoneCleanup>> {
+        self.inzone_cleanup.clone()
     }
 }
 
@@ -2988,6 +3016,50 @@ mod tests {
         ));
         description.release_fd_ref();
         assert!(matches!(&*backing.read(), OpenDescription::Closed { .. }));
+    }
+
+    #[test]
+    fn in_memory_tcp_fin_waits_for_last_fd_and_in_flight_socket_reference() {
+        let (owned, peer) = crate::dispatch::net::unix_pure::PureSocketInner::pair_with_family(
+            carrick_abi::LINUX_AF_INET,
+            carrick_abi::LINUX_SOCK_STREAM,
+            carrick_abi::LINUX_IPPROTO_TCP,
+            crate::dispatch::net::unix_pure::LinuxUcred::default(),
+            crate::dispatch::net::unix_pure::LinuxUcred::default(),
+        );
+        let operation_socket = Arc::clone(&owned);
+        let backing = Arc::new(RwLock::new(OpenDescription::InMemorySocket {
+            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+            socket: owned,
+        }));
+        let description = kernel_file_description(Arc::clone(&backing), 0);
+        description.retain_fd_ref();
+        description.retain_fd_ref();
+
+        let mut buf = [0u8; 1];
+        description.release_fd_ref();
+        assert_eq!(description.fd_ref_count(), 1);
+        assert_eq!(
+            peer.recv_stream(&mut buf, 0).unwrap_err(),
+            crate::linux_abi::LINUX_EAGAIN,
+            "closing one duplicate must not publish FIN"
+        );
+
+        description.release_fd_ref();
+        assert_eq!(description.fd_ref_count(), 0);
+        assert!(matches!(&*backing.read(), OpenDescription::Closed { .. }));
+        assert_eq!(
+            peer.recv_stream(&mut buf, 0).unwrap_err(),
+            crate::linux_abi::LINUX_EAGAIN,
+            "an admitted operation reference must keep the endpoint alive"
+        );
+
+        drop(operation_socket);
+        assert_eq!(
+            peer.recv_stream(&mut buf, 0).unwrap().0,
+            0,
+            "the final resource release publishes TCP FIN"
+        );
     }
 
     #[test]

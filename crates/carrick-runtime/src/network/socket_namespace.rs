@@ -2477,6 +2477,14 @@ impl NetworkProvider for SocketNamespaceProvider {
                     target: requested,
                 });
             }
+            // A registry-owned bind is part of Carrick's Linux socket graph.
+            // Do not ask Darwin to decide readiness for its non-listening
+            // endpoint: Darwin leaves a nonlistener connect pending while
+            // Linux publishes POLLERR and ECONNREFUSED.  An unowned endpoint
+            // still falls through to a real host service in CarrierHost.
+            if self.inzone.owns_endpoint(&scope, requested) {
+                return Ok(ConnectTarget::Denied(carrick_abi::LINUX_ECONNREFUSED));
+            }
         }
         let Some(namespace_id) = namespace_id else {
             return Ok(ConnectTarget::Unchanged);

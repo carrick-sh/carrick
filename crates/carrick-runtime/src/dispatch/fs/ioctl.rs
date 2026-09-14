@@ -1428,7 +1428,32 @@ impl<'a> FsView<'a> {
                     },
                     None => DispatchOutcome::errno(LINUX_ENOTTY),
                 },
-                LINUX_SIOCATMARK => match this.host_socket_lookup(fd.0) {
+                LINUX_SIOCATMARK => {
+                    // In-zone TCP has an urgent cursor of its own; consulting
+                    // host_socket_lookup would misclassify it as ENOTTY.
+                    if let Some(open_file) = this.open_file(fd.0)
+                        && let Some(open) = open_file.description.read()
+                        && let OpenDescription::InMemorySocket { socket, .. } = &*open
+                    {
+                        if socket.socket_type != LINUX_SOCK_STREAM
+                            || !matches!(
+                                socket.family,
+                                carrick_abi::LINUX_AF_INET | carrick_abi::LINUX_AF_INET6
+                            )
+                            || socket.protocol != carrick_abi::LINUX_IPPROTO_TCP
+                        {
+                            DispatchOutcome::errno(LINUX_ENOTTY)
+                        } else if arg == 0 {
+                            DispatchOutcome::errno(LINUX_EFAULT)
+                        } else {
+                            write_packed(
+                                &mut *cx.memory,
+                                arg,
+                                &(socket.at_oob_mark() as i32).to_le_bytes(),
+                            )
+                        }
+                    } else {
+                        match this.host_socket_lookup(fd.0) {
                     Ok(_) => {
                         // SIOCATMARK reports whether the next read sits at the
                         // out-of-band mark. It is a STREAM-only op: Linux returns
@@ -1450,7 +1475,9 @@ impl<'a> FsView<'a> {
                     // ENOTTY for SIOCATMARK, not ENOTSOCK (sockioctl01 "not a
                     // socket" resets the expected errno to ENOTTY).
                     Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
-                },
+                        }
+                    }
+                }
                 LINUX_SIOCGIFCONF => match this.host_socket_lookup(fd.0) {
                     Ok(_) => {
                         // struct ifconf: ifc_len (off 0, i32), ifc_buf (off 8, ptr).

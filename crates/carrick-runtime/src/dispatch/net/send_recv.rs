@@ -1997,7 +1997,8 @@ mod inet_in_memory_socket_tests {
         let base = 0x2000u64;
         let mut memory = LinearMemory::new(base, vec![b'a'; 0x1000]);
 
-        // sendto without MSG_NOSIGNAL -> EPIPE and marks SIGPIPE pending
+        // Linux admits the first write after a received FIN; the resulting
+        // reset makes later writes fail. The admitted write raises no SIGPIPE.
         context
             .thread()
             .update_signal_state(|s| s.replace_pending_entries(&[]));
@@ -2009,17 +2010,17 @@ mod inet_in_memory_socket_tests {
                 &reporter,
             )
             .unwrap();
-        assert_eq!(out, DispatchOutcome::errno(LINUX_EPIPE));
+        assert_eq!(out, DispatchOutcome::returned_len(10).unwrap());
         assert!(
-            context
+            !context
                 .thread()
                 .signal_state()
                 .pending()
                 .contains(LINUX_SIGPIPE),
-            "send without MSG_NOSIGNAL on closed peer must raise SIGPIPE"
+            "the admitted first send after FIN must not raise SIGPIPE"
         );
 
-        // sendto with MSG_NOSIGNAL -> EPIPE but does NOT mark SIGPIPE
+        // The next send observes EPIPE; MSG_NOSIGNAL suppresses SIGPIPE.
         context
             .thread()
             .update_signal_state(|s| s.replace_pending_entries(&[]));

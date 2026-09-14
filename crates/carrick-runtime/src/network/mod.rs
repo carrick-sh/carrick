@@ -349,6 +349,9 @@ impl NetworkProvider for HostNetworkProvider {
                     target: requested,
                 });
             }
+            if self.inzone.owns_endpoint(&scope, requested) {
+                return Ok(ConnectTarget::Denied(carrick_abi::LINUX_ECONNREFUSED));
+            }
         }
         Ok(ConnectTarget::Unchanged)
     }
@@ -425,6 +428,9 @@ impl NetworkProvider for NoNetworkProvider {
                     listener,
                     target: requested,
                 });
+            }
+            if self.inzone.owns_endpoint(&scope, requested) {
+                return Ok(ConnectTarget::Denied(carrick_abi::LINUX_ECONNREFUSED));
             }
         }
         Ok(ConnectTarget::Denied(carrick_abi::LINUX_ENETUNREACH))
@@ -737,5 +743,34 @@ mod tests {
             ConnectTarget::Denied(carrick_abi::LINUX_ENETUNREACH)
         );
         assert!(!network.provider.capabilities().outbound_connectivity);
+    }
+
+    #[test]
+    fn host_provider_refuses_only_registry_owned_nonlistener_endpoint() {
+        let provider = HostNetworkProvider::new();
+        let scope = inzone::InZoneScope::CarrierHost;
+        let owned = GuestSocketAddr("127.0.0.1:49470".parse().unwrap());
+        let lease = provider
+            .inzone()
+            .try_claim_bound_port(&scope, owned.0, false, false, false)
+            .expect("claim guest bind");
+        assert_eq!(
+            provider
+                .resolve_connect(None, owned, PortProtocol::Tcp)
+                .unwrap(),
+            ConnectTarget::Denied(carrick_abi::LINUX_ECONNREFUSED)
+        );
+        assert_eq!(
+            provider
+                .resolve_connect(
+                    None,
+                    GuestSocketAddr("127.0.0.1:49471".parse().unwrap()),
+                    PortProtocol::Tcp
+                )
+                .unwrap(),
+            ConnectTarget::Unchanged,
+            "a real host service remains eligible for host routing"
+        );
+        provider.inzone().release_port(lease);
     }
 }
