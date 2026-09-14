@@ -121,6 +121,23 @@ measurements. The supported commands, schema, measured overhead, current long
 poles, and interruption behavior are recorded in the
 [native DSR profile report](native-dsr-dtrace-profile.md).
 
+### HVPatch low-rate carrier CPU profile
+
+`carrick trace --profile hvpatch-carrier-cpu-low-rate --trace-out FILE -- …`
+captures one complete profile-97 user-stack aggregation for the traced Carrick
+carrier and its descendants. It is a broad execution-shape diagnostic: a stack
+through `Vcpu::run` remains an opaque combined guest-execution/HVF/trampoline
+bucket, not an attribution to a Rust service path. Background CPU is allowed;
+this profile has no quiet-host precondition, and its elapsed time is not a
+performance measurement.
+
+The profile requires `--trace-out` so its raw stack population survives. Rust
+renders the bundled D-template SHA-256 into the raw header, then refuses a
+missing or mismatched header, DTrace drops or interruption, non-exit root,
+timeout, producer error, zero population, malformed stack blocks, or a sum of
+stack counts that differs from `sample-population`. The raw capture is the
+evidence; the CLI summary only reports its validated closure.
+
 ### The Darwin kernel amplification ledger (`native-amplification`)
 
 `carrick trace --profile native-amplification` answers "how much Darwin kernel

@@ -33,6 +33,17 @@ const AMP1_IMAGE: &str = "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaa
 const AMP1_TARGET_ARGV_SHA256: &str =
     "3333333333333333333333333333333333333333333333333333333333333333";
 
+const HVP_CARRIER_LOW_RATE_PROGRAM: &str =
+    include_str!("../../../scripts/dtrace/hvpatch-carrier-cpu-low-rate.d");
+
+fn carrier_low_rate_program_sha256() -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{:x}",
+        Sha256::digest(HVP_CARRIER_LOW_RATE_PROGRAM.as_bytes())
+    )
+}
+
 fn amp1_stream() -> String {
     AMP1_FIXTURE
         .replace("@PROGRAM_SHA256@", &amp1_program_sha256())
@@ -50,6 +61,84 @@ fn validate_amp1(contents: &str, extra_args: &[&str]) -> assert_cmd::assert::Ass
         .arg(file.path())
         .args(extra_args);
     command.assert()
+}
+
+fn carrier_low_rate_stream() -> String {
+    [
+        &format!(
+            "HVPCARRIERLOW|header|program_sha256={}",
+            carrier_low_rate_program_sha256()
+        ),
+        "HVPCARRIERLOW|summary|status=ok|root_exited=1|bounded=0|errors=0|saw_sample=1",
+        "HVPCARRIERLOW|sample-population|count=5",
+        "HVPCARRIERLOW|section=user-stacks",
+        "              carrick`first_frame+0x1",
+        "              libsystem_kernel.dylib`mach_msg2_trap+0x8",
+        "              3",
+        "",
+        "              carrick`second_frame+0x2",
+        "              2",
+        "",
+    ]
+    .join("\n")
+}
+
+fn validate_carrier_low_rate(contents: &str, extra_args: &[&str]) -> assert_cmd::assert::Assert {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut file, contents.as_bytes()).unwrap();
+    let mut command = cli();
+    command
+        .arg("__hvpatch-carrier-cpu-low-rate-validate")
+        .arg("--input")
+        .arg(file.path())
+        .args(extra_args);
+    command.assert()
+}
+
+#[test]
+fn hvpatch_carrier_low_rate_accepts_only_a_closed_complete_stack_population() {
+    validate_carrier_low_rate(&carrier_low_rate_stream(), &[])
+        .success()
+        .stdout(contains("HVPCARRIERLOW_VALID samples=5"));
+
+    for corrupt in [
+        carrier_low_rate_stream().replace("root_exited=1", "root_exited=0"),
+        carrier_low_rate_stream().replace("bounded=0", "bounded=1"),
+        carrier_low_rate_stream().replace("errors=0", "errors=1"),
+        carrier_low_rate_stream().replace("saw_sample=1", "saw_sample=0"),
+        carrier_low_rate_stream().replace(&carrier_low_rate_program_sha256(), &"00".repeat(32)),
+        carrier_low_rate_stream().replace("sample-population|count=5", "sample-population|count=4"),
+        carrier_low_rate_stream().replace("              2\n", ""),
+    ] {
+        validate_carrier_low_rate(&corrupt, &[]).failure();
+    }
+
+    validate_carrier_low_rate(&carrier_low_rate_stream(), &["--aggregation-drops", "1"])
+        .failure()
+        .stderr(contains("not lossless"));
+}
+
+#[test]
+fn hvpatch_carrier_low_rate_requires_a_retained_raw_capture() {
+    assert_eq!(
+        HVP_CARRIER_LOW_RATE_PROGRAM
+            .matches("/* CARRICK_HVPCARRIERLOW_PROGRAM_SHA256 */")
+            .count(),
+        1,
+        "the Rust launcher must render exactly one immutable-template digest slot"
+    );
+    cli()
+        .args([
+            "trace",
+            "--profile",
+            "hvpatch-carrier-cpu-low-rate",
+            "--",
+            "run-elf",
+            "/tmp/fixture",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("requires --trace-out"));
 }
 
 #[test]

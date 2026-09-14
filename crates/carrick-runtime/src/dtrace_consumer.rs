@@ -104,6 +104,9 @@ pub const BUNDLED_HVPATCH_IDENTITY_HOST_SAFETY_D: &str =
 /// Authenticated HVPatch global-frame fork/COW structural receipt.
 pub const BUNDLED_HVPATCH_FRAME_COW_D: &str =
     include_str!("../../../scripts/dtrace/hvpatch-frame-cow.d");
+/// Complete low-rate HVPatch carrier user-stack aggregation.
+pub const BUNDLED_HVPATCH_CARRIER_CPU_LOW_RATE_D: &str =
+    include_str!("../../../scripts/dtrace/hvpatch-carrier-cpu-low-rate.d");
 pub const BUNDLED_NATIVE_WALL_D: &str = include_str!("../../../scripts/dtrace/native-wall.d");
 pub const BUNDLED_NATIVE_SHAPE_D: &str =
     include_str!("../../../scripts/dtrace/native-shape-census.d");
