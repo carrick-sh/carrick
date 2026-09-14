@@ -2776,6 +2776,14 @@
       "fingerprint": "ab0b08b97611e117782a41f621e4ace1ab4d3cc389433a60a25ff4abe830222f",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static park_for_slot::GATE_MUTEX in crates/carrick-vmm-hvf/src/trap/vcpu_gate.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "symbol": "fresh_file_object_id::NEXT",
+      "fingerprint": "a9778af5ccd1c6630d44c1e80c649fc3ac982ad5cc21d72bb30a021510749473",
+      "classification": "monotonic_allocator",
+      "rationale": "Process-wide identity allocation for retained in-memory file objects. The counter contains no guest filesystem state or current-container authority; contents, metadata and namespace ownership remain in per-object and backend state. Distinct backends need distinct identities when their handles meet in an executable registry."
     }
   ]
 }

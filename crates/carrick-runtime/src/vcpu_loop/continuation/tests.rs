@@ -286,7 +286,7 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
             "HVPatch continuation path retains prohibited host-blocking authority: {prohibited}"
         );
     }
-    assert_eq!(DISPATCH_FAMILIES.len() + 1, 19);
+    assert_eq!(DISPATCH_FAMILIES.len() + 1, 20);
     // The transitional runner pool and its ambient thread-locals are gone.
     // Nothing on the persistent executor ever published them, so every read
     // already answered None/false; they are deleted rather than left as a
@@ -675,6 +675,9 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
         ContinuationFamily::Semop => {
             DispatchOutcome::BlockingSemop(crate::dispatch::blocking_semop_for_continuation_test())
         }
+        ContinuationFamily::Mqueue => DispatchOutcome::BlockingMqueue(
+            crate::dispatch::blocking_mqueue_for_continuation_test(tid),
+        ),
         ContinuationFamily::FdWait => {
             let wait = match crate::dispatch::fd_wait::BlockingFdWait::new(
                 crate::dispatch::fd_wait::BlockingFdWaitKind::Poll {
@@ -723,7 +726,7 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
     }
 }
 
-const DISPATCH_FAMILIES: [ContinuationFamily; 18] = [
+const DISPATCH_FAMILIES: [ContinuationFamily; 19] = [
     ContinuationFamily::FutexWait,
     ContinuationFamily::FutexWaitv,
     ContinuationFamily::SharedFutexWait,
@@ -735,6 +738,7 @@ const DISPATCH_FAMILIES: [ContinuationFamily; 18] = [
     ContinuationFamily::BlockingWrite,
     ContinuationFamily::TimerFdRead,
     ContinuationFamily::Semop,
+    ContinuationFamily::Mqueue,
     ContinuationFamily::FdWait,
     ContinuationFamily::BlockingRecordLock,
     ContinuationFamily::WaitOnProcExit,
@@ -755,7 +759,7 @@ fn continuation_family_event_codes_are_stable_unique_and_nonzero() {
     assert!(codes.iter().all(|code| *code != 0));
     codes.sort_unstable();
     codes.dedup();
-    assert_eq!(codes, (1_u8..=19).collect::<Vec<_>>());
+    assert_eq!(codes, (1_u8..=20).collect::<Vec<_>>());
 }
 
 fn assert_send_static<T: Send + 'static>(_: &T) {}
@@ -804,6 +808,7 @@ fn exhaustive_real_dispatch_shapes_become_owned_send_static_continuations() {
                     | ContinuationFamily::BlockingWrite
                     | ContinuationFamily::TimerFdRead
                     | ContinuationFamily::Semop
+                    | ContinuationFamily::Mqueue
                     | ContinuationFamily::FdWait
                     | ContinuationFamily::BlockingRecordLock
                     | ContinuationFamily::WaitOnProcExit
@@ -1840,6 +1845,12 @@ fn timeout_signal_exec_exit_and_drop_cleanup_are_literal_for_every_family() {
                 assert!(
                     semop.deadline().is_none(),
                     "an untimed retained semop must remain pending on a synthetic timeout"
+                );
+            }
+            (ContinuationFamily::Mqueue, ContinuationCompletion::Mqueue(mqueue)) => {
+                assert!(
+                    mqueue.plan().deadline.is_none(),
+                    "an untimed retained mqueue operation must remain pending on a synthetic timeout"
                 );
             }
             (ContinuationFamily::FdWait, ContinuationCompletion::FdWait { wait, .. }) => {

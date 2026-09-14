@@ -5,7 +5,27 @@
 //! existing call sites.
 //! Free functions reached via `use super::*`.
 use super::*;
+use crate::exec_helpers::parse_shebang;
 use crate::linux_abi::LinuxErrno;
+
+pub(crate) struct LoadedExecImage {
+    pub(crate) image: AddressSpace,
+    pub(crate) source: crate::dispatch::executable_authority::ExecSource,
+}
+
+fn host_io_errno(error: std::io::Error) -> LinuxErrno {
+    error
+        .raw_os_error()
+        .map(crate::host_to_linux_errno)
+        .unwrap_or(crate::linux_abi::LINUX_EIO)
+}
+
+fn exec_source_errno(error: crate::dispatch::executable_authority::ExecSourceError) -> LinuxErrno {
+    match error {
+        crate::dispatch::executable_authority::ExecSourceError::Linux(errno) => errno,
+        crate::dispatch::executable_authority::ExecSourceError::Host(error) => host_io_errno(error),
+    }
+}
 
 fn is_aarch64_elf_head(bytes: &[u8]) -> bool {
     const EI_DATA: usize = 5;
@@ -52,6 +72,7 @@ fn finalize_hvf_exec_base(
 
 pub(crate) fn load_execve_image(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     path: &str,
     // argv/env are opaque BYTE strings (Linux ABI), not UTF-8. `path` is a
     // String (resolved against the String/Path fs layer); argv[0] / shebang
@@ -59,7 +80,7 @@ pub(crate) fn load_execve_image(
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
     requires_syscall_traps: bool,
-) -> Result<AddressSpace, LinuxErrno> {
+) -> Result<LoadedExecImage, LinuxErrno> {
     use crate::linux_abi::{LINUX_ENOENT, LINUX_ENOEXEC};
     let argv = if argv.is_empty() {
         vec![path.as_bytes().to_vec()]
@@ -78,14 +99,51 @@ pub(crate) fn load_execve_image(
     // its interpreter (shared with the initial entrypoint load via
     // `resolve_shebang`).
     let abs_path = dispatcher.resolve_exec_path(path);
-    dispatcher.check_exec_target(&abs_path)?;
+    let host_fallback = dispatcher.exec_host_fs_fallback();
+    let acquire_source = |path: &str| {
+        dispatcher
+            .acquire_exec_source(context, path)
+            .or_else(|error| {
+                if !host_fallback {
+                    return Err(error);
+                }
+                let file = std::fs::File::open(path)
+                    .map_err(crate::dispatch::executable_authority::ExecSourceError::Host)?;
+                crate::dispatch::executable_authority::ExecSource::host(file, path.to_owned())
+                    .map_err(crate::dispatch::executable_authority::ExecSourceError::Host)
+            })
+    };
+    let named_source = acquire_source(&abs_path).map_err(exec_source_errno)?;
+    dispatcher.check_exec_source(&abs_path, &named_source)?;
     // fanotify FAN_OPEN_EXEC, emitted after validation so a failed execve
     // generates nothing — the event means "this image is being executed", and
     // an ENOENT/EACCES target never is. Placed before shebang resolution so
     // `abs_path` is still the file the guest actually named.
     dispatcher.fanotify_notify_exec(&abs_path);
     let named_target = abs_path.clone();
-    let (path, argv) = resolve_shebang(dispatcher, abs_path, argv)?;
+    let mut path = abs_path;
+    let mut argv = argv;
+    let mut source = named_source;
+    for _ in 0..4 {
+        let head = source.read_head(256).map_err(host_io_errno)?;
+        if !head.starts_with(b"#!") {
+            break;
+        }
+        let Some((interpreter, optional_argument)) = parse_shebang(&head) else {
+            return Err(crate::linux_abi::LINUX_ENOENT);
+        };
+        let mut next_argv = Vec::with_capacity(argv.len() + 3);
+        next_argv.push(interpreter.clone().into_bytes());
+        if let Some(argument) = optional_argument {
+            next_argv.push(argument.into_bytes());
+        }
+        next_argv.push(path.into_bytes());
+        next_argv.extend(argv.into_iter().skip(1));
+        path = interpreter;
+        argv = next_argv;
+        source = acquire_source(&path).map_err(exec_source_errno)?;
+        dispatcher.check_exec_source(&path, &source)?;
+    }
     // Executing a `#!` script also opens its INTERPRETER for execution, and
     // Linux reports that as a second FAN_OPEN_EXEC. Skip it for a plain binary,
     // where `resolve_shebang` hands back the same path it was given.
@@ -101,7 +159,6 @@ pub(crate) fn load_execve_image(
     // host) is ON only for a bare RunElf boot; a container run keeps it OFF so
     // an execve target absent from the container fs ENOENTs instead of escaping
     // to the matching HOST binary. See `SyscallDispatcher::exec_host_fs_fallback`.
-    let host_fallback = dispatcher.exec_host_fs_fallback();
     let host_read = |p: &str| -> Option<Vec<u8>> {
         if host_fallback {
             std::fs::read(p).ok()
@@ -114,18 +171,21 @@ pub(crate) fn load_execve_image(
     // The cache is deliberately limited to direct little-endian AArch64 ELFs.
     // Rosetta redirects rewrite argv and carry target-specific AT_BASE state;
     // mutable/foreign images stay on the uncached path below.
-    let cache_key = dispatcher
-        .read_exec_file_head(&path, 20)
+    let cache_key = source
+        .read_head(20)
+        .ok()
         .filter(|head| is_aarch64_elf_head(head))
         .and_then(|_| {
-            dispatcher.hvpatch_exec_cache_key(&path, vdso_enabled, requires_syscall_traps, false)
+            source.hvpatch_cache_key(
+                dispatcher.linux_page_size(),
+                vdso_enabled,
+                requires_syscall_traps,
+                false,
+            )
         });
     let (base, argv) = if cache_key.is_some() {
         let base = dispatcher.with_hvpatch_exec_cache(cache_key, || {
-            let raw_bytes = dispatcher
-                .read_exec_file(&path)
-                .or_else(|| host_read(&path))
-                .ok_or(LINUX_ENOENT)?;
+            let raw_bytes = source.read_all().map_err(host_io_errno)?;
             let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|interpreter| {
                 dispatcher
                     .read_exec_file(interpreter)
@@ -137,10 +197,7 @@ pub(crate) fn load_execve_image(
         })?;
         (base, argv)
     } else {
-        let raw_bytes = dispatcher
-            .read_exec_file(&path)
-            .or_else(|| host_read(&path))
-            .ok_or(LINUX_ENOENT)?;
+        let raw_bytes = source.read_all().map_err(host_io_errno)?;
         // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style), so a
         // later guest exec remains translated rather than being parsed as arm64.
         let mut needs_at_base = false;
@@ -175,14 +232,13 @@ pub(crate) fn load_execve_image(
     let image = base
         .with_linux_initial_stack_execfn_page_size(argv, env, path.as_bytes(), linux_page_size)
         .map_err(|_| LINUX_ENOENT)?;
-    Ok(image)
+    Ok(LoadedExecImage { image, source })
 }
 
 // Shebang resolution and the signal-death / stop helpers live in the
 // cross-platform `exec_helpers` module. Re-export them here so the call sites
 // in `runtime.rs` (`use exec::{…}`) and the vcpu_loop macOS import
 // (`use crate::runtime::exec::{…}`) resolve without change.
-pub(super) use crate::exec_helpers::resolve_shebang;
 pub(crate) use crate::exec_helpers::{
     forked_child_die_by_signal, stop_after_traced_exec, stop_by_signal,
 };

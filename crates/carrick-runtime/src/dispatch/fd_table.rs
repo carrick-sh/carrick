@@ -1224,6 +1224,11 @@ pub(super) enum OpenDescription {
         contents: Vec<u8>,
         offset: usize,
     },
+    ProcExecutable {
+        base: OpenDescriptionBase,
+        executable: crate::dispatch::executable_authority::CurrentExecutable,
+        offset: usize,
+    },
     InMemoryFile {
         base: OpenDescriptionBase,
         path: String,
@@ -1702,6 +1707,7 @@ impl OpenDescription {
             Self::InMemoryFile { .. } => "in_memory_file",
             Self::Directory { .. } => "directory",
             Self::SyntheticFile { .. } => "synthetic_file",
+            Self::ProcExecutable { .. } => "proc_executable",
             Self::SyntheticDevice { .. } => "synthetic_device",
             Self::EventFd { .. } => "eventfd",
             Self::TimerFd { .. } => "timerfd",
@@ -1747,6 +1753,24 @@ impl OpenDescription {
         }
     }
 
+    pub(super) fn retained_exec_source(
+        &self,
+    ) -> Option<&crate::dispatch::executable_authority::ExecSource> {
+        match self {
+            Self::ProcExecutable { executable, .. } => Some(executable.source()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn retained_executable(
+        &self,
+    ) -> Option<&crate::dispatch::executable_authority::CurrentExecutable> {
+        match self {
+            Self::ProcExecutable { executable, .. } => Some(executable),
+            _ => None,
+        }
+    }
+
     /// The `readlink(/proc/self/fd/N)` target for an fd with NO backing guest
     /// path — pipes, sockets, and the anonymous-inode fds (eventfd/epoll/…).
     /// Path-backed descriptions return `None` so the caller resolves them via
@@ -1756,6 +1780,9 @@ impl OpenDescription {
     /// Without this, `readlink /proc/self/fd/{1,2}` on a pipe/socket returned an
     /// empty string, breaking 'are we piped?' and fd-introspection heuristics.
     pub(super) fn readlink_target(&self) -> Option<String> {
+        if let OpenDescription::ProcExecutable { executable, .. } = self {
+            return Some(executable.display_path());
+        }
         let label = match self {
             OpenDescription::Closed { .. } => return None,
             OpenDescription::File { .. }
@@ -1765,6 +1792,7 @@ impl OpenDescription {
             | OpenDescription::SyntheticDevice { .. }
             | OpenDescription::VirtualConsole { .. }
             | OpenDescription::HostFile { .. } => return None,
+            OpenDescription::ProcExecutable { .. } => unreachable!(),
             OpenDescription::EventFd { .. } => "anon_inode:[eventfd]".to_owned(),
             OpenDescription::TimerFd { .. } => "anon_inode:[timerfd]".to_owned(),
             OpenDescription::Epoll { .. } => "anon_inode:[eventpoll]".to_owned(),
@@ -1906,6 +1934,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::File { .. } | OpenDescription::InMemoryFile { .. } => Kind::File,
             OpenDescription::Directory { .. } => Kind::Directory,
             OpenDescription::SyntheticFile { .. } => Kind::SyntheticFile,
+            OpenDescription::ProcExecutable { .. } => Kind::File,
             OpenDescription::SyntheticDevice { .. } | OpenDescription::VirtualConsole { .. } => {
                 Kind::SyntheticDevice
             }
@@ -1934,6 +1963,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::File { offset, .. }
             | OpenDescription::Directory { offset, .. }
             | OpenDescription::SyntheticFile { offset, .. }
+            | OpenDescription::ProcExecutable { offset, .. }
             | OpenDescription::InMemoryFile { offset, .. } => u64::try_from(*offset).ok(),
             OpenDescription::HostFile { host_fd, .. } => super::fs::host_fd_offset(host_fd.view()),
             _ => None,
@@ -1954,6 +1984,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::HostFile { metadata, .. } => {
                 Some(metadata.path.to_string_lossy().into_owned())
             }
+            OpenDescription::ProcExecutable { executable, .. } => Some(executable.display_path()),
             _ => None,
         };
         let pipe_id = match &*description {
@@ -1999,6 +2030,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::File { .. }
             | OpenDescription::InMemoryFile { .. }
             | OpenDescription::SyntheticFile { .. } => interest & LinuxEpollEvents::IN,
+            OpenDescription::ProcExecutable { .. } => interest & LinuxEpollEvents::IN,
             OpenDescription::SyntheticDevice { .. } | OpenDescription::VirtualConsole { .. } => {
                 interest & (LinuxEpollEvents::IN | LinuxEpollEvents::OUT)
             }
@@ -2714,6 +2746,7 @@ pub(super) fn host_stream_stat_label(identity: u64, linux_type: u32) -> String {
 
 #[derive(Debug, Clone)]
 pub(super) enum OpenStatSource {
+    Error(carrick_abi::LinuxErrno),
     Record(StatRecord),
     HostFile {
         /// Borrowed Copy VIEW of the description's owned fd (see
@@ -2819,6 +2852,7 @@ impl OpenDescription {
             Self::HostFile { base, .. } => base
                 .fs_identity()
                 .unwrap_or(crate::vfs::FsIdentity::Overlay),
+            Self::ProcExecutable { .. } => crate::vfs::FsIdentity::Overlay,
             _ => crate::vfs::FsIdentity::AnonInode,
         }
     }
@@ -2878,6 +2912,48 @@ impl OpenDescription {
                 if let Some(ino) = crate::vfs::proc::ns_link_inode(path) {
                     record.ino = ino;
                 }
+                OpenStatSource::Record(record)
+            }
+            OpenDescription::ProcExecutable { executable, .. } => {
+                if let Some(fd) = executable.source().host_fd() {
+                    let (_, mode, _, _, len) = match executable.source().stat_fields() {
+                        Ok(fields) => fields,
+                        Err(error) => {
+                            return OpenStatSource::Error(
+                                error
+                                    .raw_os_error()
+                                    .map(crate::host_to_linux_errno)
+                                    .unwrap_or(crate::linux_abi::LINUX_EIO),
+                            );
+                        }
+                    };
+                    return OpenStatSource::HostFile {
+                        host_fd: HostFd(fd),
+                        metadata: RootFsMetadata {
+                            path: std::path::PathBuf::from(executable.display_path()),
+                            kind: RootFsEntryKind::File,
+                            mode,
+                            size: len,
+                        },
+                    };
+                }
+                let (ino, mode, uid, gid, len) = match executable.source().stat_fields() {
+                    Ok(fields) => fields,
+                    Err(error) => {
+                        return OpenStatSource::Error(
+                            error
+                                .raw_os_error()
+                                .map(crate::host_to_linux_errno)
+                                .unwrap_or(crate::linux_abi::LINUX_EIO),
+                        );
+                    }
+                };
+                let mut record =
+                    StatRecord::synthetic(&executable.display_path(), len, LINUX_S_IFREG | mode);
+                record.ino = ino;
+                record.nlink = u32::from(!executable.is_deleted());
+                record.uid = uid;
+                record.gid = gid;
                 OpenStatSource::Record(record)
             }
             OpenDescription::InMemoryFile { path, contents, .. } => {

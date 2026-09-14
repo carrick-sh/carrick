@@ -20,9 +20,9 @@ use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::{GuestVa, SharedFutexLocation};
 use parking_lot::Mutex;
 
-use crate::dispatch::BlockingSemop;
 use crate::dispatch::fd_wait::BlockingFdWait;
 use crate::dispatch::format_time::{BlockingTimerFdRead, TimerFdPollSource};
+use crate::dispatch::{BlockingMqueue, BlockingSemop};
 use crate::dispatch::{
     BlockingRecordLock, BlockingWrite, DispatchOutcome, FdWaitCompletion, SyscallRequest,
     WaitFdAuthority, WaitFds,
@@ -489,6 +489,7 @@ fn detail_diagnostic(detail: &ContinuationDetail) -> String {
         ContinuationDetail::BlockingWrite(_) => "blocking-write".to_owned(),
         ContinuationDetail::TimerFdRead(_) => "timerfd-read".to_owned(),
         ContinuationDetail::Semop(_) => "sysv-semop".to_owned(),
+        ContinuationDetail::Mqueue(_) => "posix-mqueue".to_owned(),
         ContinuationDetail::FdWait(_) => "retained-fd-wait".to_owned(),
         ContinuationDetail::RecordLock(_) => "record-lock".to_owned(),
         ContinuationDetail::Process { selector, .. } => match selector {
@@ -544,6 +545,7 @@ fn probe_diagnostic(probe: &ReadinessProbe) -> (String, Vec<DiagnosticPollFd>) {
         ),
         ReadinessProbe::TimerFdRead { .. } => ("timerfd-read".to_owned(), Vec::new()),
         ReadinessProbe::Semop { .. } => ("sysv-semop".to_owned(), Vec::new()),
+        ReadinessProbe::Mqueue { .. } => ("posix-mqueue".to_owned(), Vec::new()),
         ReadinessProbe::RecordLock { .. } => ("record-lock".to_owned(), Vec::new()),
         ReadinessProbe::TaskWake { task, observed, .. } => (
             task.upgrade().map_or_else(
@@ -736,6 +738,7 @@ pub(in crate::vcpu_loop) enum ContinuationDetail {
     BlockingWrite(Arc<Mutex<BlockingWrite>>),
     TimerFdRead(Arc<Mutex<Option<BlockingTimerFdRead>>>),
     Semop(Arc<Mutex<Option<BlockingSemop>>>),
+    Mqueue(Arc<Mutex<Option<BlockingMqueue>>>),
     FdWait(Arc<Mutex<Option<BlockingFdWait>>>),
     RecordLock(Arc<BlockingRecordLock>),
     Process {
@@ -834,6 +837,7 @@ pub enum BlockedContinuation {
     BlockingWrite(ContinuationState),
     TimerFdRead(ContinuationState),
     Semop(ContinuationState),
+    Mqueue(ContinuationState),
     FdWait(ContinuationState),
     BlockingRecordLock(ContinuationState),
     WaitOnProcExit(ContinuationState),
@@ -857,6 +861,7 @@ pub enum ContinuationFamily {
     BlockingWrite,
     TimerFdRead,
     Semop,
+    Mqueue,
     FdWait,
     BlockingRecordLock,
     WaitOnProcExit,
@@ -883,6 +888,7 @@ impl ContinuationFamily {
             Self::BlockingWrite => 9,
             Self::TimerFdRead => 10,
             Self::Semop => 19,
+            Self::Mqueue => 20,
             Self::FdWait => 18,
             Self::BlockingRecordLock => 11,
             Self::WaitOnProcExit => 12,
@@ -910,6 +916,7 @@ impl ContinuationFamily {
             Self::BlockingWrite => "blocking-write",
             Self::TimerFdRead => "timerfd-read",
             Self::Semop => "sysv-semop",
+            Self::Mqueue => "posix-mqueue",
             Self::FdWait => "retained-fd-wait",
             Self::BlockingRecordLock => "blocking-record-lock",
             Self::WaitOnProcExit => "wait-on-proc-exit",
@@ -948,6 +955,7 @@ pub const fn is_blocking_dispatch_outcome(outcome: &DispatchOutcome) -> bool {
             | DispatchOutcome::BlockingWrite(_)
             | DispatchOutcome::BlockingTimerFdRead(_)
             | DispatchOutcome::BlockingSemop(_)
+            | DispatchOutcome::BlockingMqueue(_)
             | DispatchOutcome::BlockingFdWait { .. }
             | DispatchOutcome::BlockingRecordLock(_)
             | DispatchOutcome::WaitOnProcExit { .. }
@@ -1193,6 +1201,12 @@ impl BlockedContinuation {
                 Some(WaitSigMask::NONE),
                 ContinuationDetail::Semop(Arc::new(Mutex::new(Some(semop)))),
             )),
+            DispatchOutcome::BlockingMqueue(mqueue) => Self::Mqueue(new_state(
+                mqueue.plan().deadline,
+                Vec::new(),
+                Some(WaitSigMask::NONE),
+                ContinuationDetail::Mqueue(Arc::new(Mutex::new(Some(mqueue)))),
+            )),
             DispatchOutcome::BlockingFdWait { wait, sig_mask } => Self::FdWait(new_state(
                 fd_wait_deadline(wait.caller_deadline(), &wait.timer_sources()),
                 Vec::new(),
@@ -1386,6 +1400,7 @@ impl BlockedContinuation {
             | Self::BlockingWrite(state)
             | Self::TimerFdRead(state)
             | Self::Semop(state)
+            | Self::Mqueue(state)
             | Self::FdWait(state)
             | Self::BlockingRecordLock(state)
             | Self::WaitOnProcExit(state)
@@ -1410,6 +1425,7 @@ impl BlockedContinuation {
             | Self::BlockingWrite(state)
             | Self::TimerFdRead(state)
             | Self::Semop(state)
+            | Self::Mqueue(state)
             | Self::FdWait(state)
             | Self::BlockingRecordLock(state)
             | Self::WaitOnProcExit(state)
@@ -1434,6 +1450,7 @@ impl BlockedContinuation {
             Self::BlockingWrite(_) => ContinuationFamily::BlockingWrite,
             Self::TimerFdRead(_) => ContinuationFamily::TimerFdRead,
             Self::Semop(_) => ContinuationFamily::Semop,
+            Self::Mqueue(_) => ContinuationFamily::Mqueue,
             Self::FdWait(_) => ContinuationFamily::FdWait,
             Self::BlockingRecordLock(_) => ContinuationFamily::BlockingRecordLock,
             Self::WaitOnProcExit(_) => ContinuationFamily::WaitOnProcExit,
@@ -1646,6 +1663,9 @@ impl BlockedContinuation {
             }
             ContinuationDetail::Semop(semop) => {
                 fingerprint ^= Arc::as_ptr(semop) as usize as u64;
+            }
+            ContinuationDetail::Mqueue(mqueue) => {
+                fingerprint ^= Arc::as_ptr(mqueue) as usize as u64;
             }
             ContinuationDetail::FdWait(wait) => {
                 fingerprint ^= Arc::as_ptr(wait) as usize as u64;
@@ -1950,6 +1970,14 @@ impl BlockedContinuation {
                         .ok_or(ContinuationResumeError::MissingContinuation)?;
                         ContinuationCompletion::Semop(semop)
                     }
+                    ContinuationFamily::Mqueue => {
+                        let mqueue = match &self.state().detail {
+                            ContinuationDetail::Mqueue(mqueue) => mqueue.lock().take(),
+                            _ => None,
+                        }
+                        .ok_or(ContinuationResumeError::MissingContinuation)?;
+                        ContinuationCompletion::Mqueue(mqueue)
+                    }
                     ContinuationFamily::FdWait => {
                         let wait = match &self.state().detail {
                             ContinuationDetail::FdWait(wait) => wait.lock().take(),
@@ -2028,6 +2056,14 @@ impl BlockedContinuation {
                     .ok_or(ContinuationResumeError::MissingContinuation)?;
                     ContinuationCompletion::Semop(semop)
                 }
+                ContinuationFamily::Mqueue => {
+                    let mqueue = match &self.state().detail {
+                        ContinuationDetail::Mqueue(mqueue) => mqueue.lock().take(),
+                        _ => None,
+                    }
+                    .ok_or(ContinuationResumeError::MissingContinuation)?;
+                    ContinuationCompletion::Mqueue(mqueue)
+                }
                 ContinuationFamily::FdWait => {
                     let wait = match &self.state().detail {
                         ContinuationDetail::FdWait(wait) => wait.lock().take(),
@@ -2074,6 +2110,11 @@ impl BlockedContinuation {
                     ContinuationDetail::BlockingWrite(write) => write.lock().offset() != 0,
                     _ => false,
                 };
+                if let ContinuationDetail::Mqueue(mqueue) = &self.state().detail {
+                    if let Some(mqueue) = mqueue.lock().as_ref() {
+                        mqueue.cancel();
+                    }
+                }
                 let restart = if family != ContinuationFamily::WaitOnSignals
                     && !partial_write_progress
                     && restart_class != RestartClass::Never
@@ -2263,6 +2304,7 @@ pub enum ContinuationCompletion {
     },
     TimerFdRead(BlockingTimerFdRead),
     Semop(BlockingSemop),
+    Mqueue(BlockingMqueue),
     FdWait {
         wait: BlockingFdWait,
         sig_mask: WaitSigMask,

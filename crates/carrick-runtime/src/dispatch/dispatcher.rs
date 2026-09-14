@@ -679,7 +679,31 @@ impl SyscallDispatcher {
         argv: Vec<String>,
         env: Vec<Vec<u8>>,
     ) {
-        let path = path.into();
+        self.set_executable_identity_inner(path.into(), argv, env, None);
+    }
+
+    pub(crate) fn set_executable_identity_with_source(
+        &self,
+        path: impl Into<String>,
+        argv: Vec<String>,
+        env: Vec<Vec<u8>>,
+        source: super::executable_authority::ExecSource,
+    ) {
+        self.set_executable_identity_inner(
+            path.into(),
+            argv,
+            env,
+            Some(source.into_current(&self.fs.executable_authorities)),
+        );
+    }
+
+    fn set_executable_identity_inner(
+        &self,
+        path: String,
+        argv: Vec<String>,
+        env: Vec<Vec<u8>>,
+        current_executable: Option<super::executable_authority::CurrentExecutable>,
+    ) {
         // `/proc/self/exe` MUST resolve to an absolute path: the Linux kernel
         // always stores the absolute, resolved executable path regardless of how
         // execve was called. glibc's dynamic loader asserts this
@@ -696,6 +720,7 @@ impl SyscallDispatcher {
         };
         let mut proc = self.proc.lock();
         proc.executable_path = abs.clone();
+        proc.current_executable = current_executable;
         proc.argv = if argv.is_empty() { vec![abs] } else { argv };
         let base = path.rsplit('/').next().unwrap_or(&path);
         proc.task_name = linux_task_name_from_bytes(base.as_bytes());
@@ -705,6 +730,12 @@ impl SyscallDispatcher {
         // so the flag tracks the current image across execve (x86 -> native and
         // native -> x86).
         proc.binfmt_interpreted = false;
+    }
+
+    pub(crate) fn current_executable(
+        &self,
+    ) -> Option<super::executable_authority::CurrentExecutable> {
+        self.proc.lock().current_executable.clone()
     }
 
     pub(crate) fn current_exec_env(&self) -> Vec<Vec<u8>> {

@@ -165,6 +165,7 @@ impl<'a> FsView<'a> {
                 | OpenDescription::InMemoryFile { .. }
                 | OpenDescription::HostFile { .. }
                 | OpenDescription::SyntheticFile { .. }
+                | OpenDescription::ProcExecutable { .. }
                 | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }

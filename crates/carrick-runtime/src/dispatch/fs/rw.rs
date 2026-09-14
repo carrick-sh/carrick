@@ -24,6 +24,22 @@ enum PwritevPayloads {
     Staged(Vec<Vec<u8>>),
 }
 
+fn retained_executable_bytes(
+    executable: &crate::dispatch::executable_authority::CurrentExecutable,
+    offset: usize,
+    max: usize,
+) -> Result<Vec<u8>, LinuxErrno> {
+    executable
+        .source()
+        .read_range(offset, max)
+        .map_err(|error| {
+            error
+                .raw_os_error()
+                .map(crate::host_to_linux_errno)
+                .unwrap_or(crate::linux_abi::LINUX_EIO)
+        })
+}
+
 fn prepare_pwritev_payloads(
     memory: &impl CurrentMmMemory,
     iovecs: &[LinuxIovec],
@@ -422,6 +438,31 @@ impl<'a> FsView<'a> {
                     }
                     (*file_offset as i64, contents.len() as i64)
                 }
+                OpenDescription::ProcExecutable {
+                    executable,
+                    offset: file_offset,
+                    ..
+                } => {
+                    let file_size = executable.source().len().map_err(|error| {
+                        error
+                            .raw_os_error()
+                            .map(crate::host_to_linux_errno)
+                            .unwrap_or(crate::linux_abi::LINUX_EIO)
+                    })?;
+                    if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
+                        if offset < 0 || offset as usize >= file_size {
+                            return Ok(DispatchOutcome::errno(LINUX_ENXIO));
+                        }
+                        let next = if whence == LINUX_SEEK_DATA {
+                            offset
+                        } else {
+                            file_size as i64
+                        };
+                        *file_offset = next as usize;
+                        return Ok(DispatchOutcome::returned_offset_or_errno(next));
+                    }
+                    (*file_offset as i64, file_size as i64)
+                }
                 OpenDescription::InMemoryFile {
                     contents,
                     offset: file_offset,
@@ -524,6 +565,7 @@ impl<'a> FsView<'a> {
                 OpenDescription::File { offset, .. }
                 | OpenDescription::Directory { offset, .. }
                 | OpenDescription::SyntheticFile { offset, .. }
+                | OpenDescription::ProcExecutable { offset, .. }
                 | OpenDescription::InMemoryFile { offset, .. } => *offset = next as usize,
                 OpenDescription::HostFile { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -775,6 +817,14 @@ impl<'a> FsView<'a> {
                             (length, buf)
                         }
                     };
+                    (read_len, bytes)
+                }
+                OpenDescription::ProcExecutable {
+                    executable, offset, ..
+                } => {
+                    let bytes = retained_executable_bytes(executable, *offset, length)?;
+                    let read_len = bytes.len();
+                    *offset += read_len;
                     (read_len, bytes)
                 }
                 OpenDescription::VirtualConsole { .. } => (0, Vec::new()),
@@ -1304,6 +1354,17 @@ impl<'a> FsView<'a> {
                     *offset += read_len;
                     read_len
                 }
+                OpenDescription::ProcExecutable {
+                    executable, offset, ..
+                } => {
+                    let total = iovecs.iter().try_fold(0usize, |total, iovec| {
+                        total.checked_add(usize::try_from(iovec.iov_len).map_err(|_| LINUX_EINVAL)?).ok_or(LINUX_EINVAL)
+                    })?;
+                    let contents = retained_executable_bytes(executable, *offset, total)?;
+                    let read_len = read_from_contents_at(memory, &contents, 0, &iovecs)?;
+                    *offset += read_len;
+                    read_len
+                }
                 OpenDescription::InMemoryFile {
                     contents, offset, ..
                 } => {
@@ -1431,6 +1492,9 @@ impl<'a> FsView<'a> {
                     .take(length)
                     .copied()
                     .collect(),
+                OpenDescription::ProcExecutable { executable, .. } => {
+                    retained_executable_bytes(executable, offset, length)?
+                }
                 OpenDescription::InMemoryFile { contents, .. } => contents
                     .read()
                     .read_range(offset, length),
@@ -1613,6 +1677,13 @@ impl<'a> FsView<'a> {
                 }
                 OpenDescription::SyntheticFile { contents, .. } => {
                     read_from_contents_at(memory, contents, offset, &iovecs)?
+                }
+                OpenDescription::ProcExecutable { executable, .. } => {
+                    let total = iovecs.iter().try_fold(0usize, |total, iovec| {
+                        total.checked_add(usize::try_from(iovec.iov_len).map_err(|_| LINUX_EINVAL)?).ok_or(LINUX_EINVAL)
+                    })?;
+                    let contents = retained_executable_bytes(executable, offset, total)?;
+                    read_from_contents_at(memory, &contents, 0, &iovecs)?
                 }
                 OpenDescription::InMemoryFile { contents, .. } => {
                     let data = contents.read();
@@ -1866,7 +1937,8 @@ impl<'a> FsView<'a> {
                 OpenDescription::Closed { .. }
                 | OpenDescription::File { .. }
                 | OpenDescription::InMemoryFile { .. }
-                | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
+                | OpenDescription::SyntheticFile { .. }
+                | OpenDescription::ProcExecutable { .. } => LINUX_EBADF,
                 OpenDescription::HostFile { writable, .. } if !*writable => LINUX_EBADF,
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
                 OpenDescription::Directory { .. } => LINUX_EISDIR,
@@ -2165,7 +2237,8 @@ impl<'a> FsView<'a> {
                 OpenDescription::Closed { .. }
                 | OpenDescription::File { .. }
                 | OpenDescription::InMemoryFile { .. }
-                | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
+                | OpenDescription::SyntheticFile { .. }
+                | OpenDescription::ProcExecutable { .. } => LINUX_EBADF,
                 OpenDescription::HostFile { writable, .. } if !*writable => LINUX_EBADF,
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
                 OpenDescription::Directory { .. } => LINUX_EISDIR,

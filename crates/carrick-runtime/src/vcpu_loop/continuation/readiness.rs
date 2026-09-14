@@ -17,8 +17,8 @@ use super::{
     ExecutionGeneration, FutexSource, FutexWait, MmId, OwnedFdRegistration, TaskKey, ThreadKey,
     VforkParentWait, WaitFdAuthority,
 };
-use crate::dispatch::BlockingSemop;
 use crate::dispatch::format_time::{BlockingTimerFdRead, TimerFdPollSource, TimerFdReadPlan};
+use crate::dispatch::{BlockingMqueue, BlockingSemop};
 use crate::dispatch::{BlockingRecordLock, BlockingWrite, DispatchOutcome};
 use crate::kernel::{Kernel, Task};
 
@@ -371,6 +371,13 @@ pub(in crate::vcpu_loop) enum ReadinessProbe {
         deadline: Option<Instant>,
         generation: u64,
     },
+    Mqueue {
+        mqueue: Arc<Mutex<Option<BlockingMqueue>>>,
+        deadline: Option<Instant>,
+        generation: u64,
+        clock_generation: u64,
+        virtual_due: Option<std::time::Duration>,
+    },
     RecordLock {
         lock: Arc<BlockingRecordLock>,
         completion: Arc<Mutex<Option<DispatchOutcome>>>,
@@ -669,6 +676,16 @@ impl ReadinessProbe {
                     generation,
                 }
             }
+            ContinuationDetail::Mqueue(mqueue) => {
+                let plan = mqueue.lock().as_ref().map(BlockingMqueue::plan);
+                Self::Mqueue {
+                    mqueue: Arc::clone(mqueue),
+                    deadline: plan.and_then(|plan| plan.deadline),
+                    generation: plan.map_or(u64::MAX, |plan| plan.queue_generation),
+                    clock_generation: plan.map_or(u64::MAX, |plan| plan.clock_generation),
+                    virtual_due: plan.and_then(|plan| plan.virtual_due),
+                }
+            }
             // Enroll against the generation the CHILD SCAN observed, never
             // the one the capture re-read: the capture happens after the
             // syscall has already decided to block, so a child that exits in
@@ -817,6 +834,9 @@ impl ReadinessProbe {
                 .is_some_and(|deadline| Instant::now() >= deadline)
                 .then_some(ContinuationEvent::Timeout),
             Self::Semop { deadline, .. } => deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+                .then_some(ContinuationEvent::Timeout),
+            Self::Mqueue { deadline, .. } => deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
                 .then_some(ContinuationEvent::Timeout),
             Self::RecordLock { lock, completion } => {

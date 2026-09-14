@@ -1046,6 +1046,7 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
                 17 => "vfork-parent",
                 18 => "fd-wait",
                 19 => "semop",
+                20 => "mqueue",
                 _ => "unknown",
             };
             format!("HVPBLOCK pid={a} tid={b} native_nr={number} family={family}")

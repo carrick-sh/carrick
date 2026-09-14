@@ -1088,6 +1088,7 @@ impl RootFsVfs {
                         return Ok(OpenDispatchResult::RootFsBackedFile {
                             metadata,
                             contents: SharedFileContents {
+                                object_id: crate::fs_backend::fresh_file_object_id(),
                                 len: contents.len(),
                                 base: contents,
                                 dirty: std::collections::BTreeMap::new(),

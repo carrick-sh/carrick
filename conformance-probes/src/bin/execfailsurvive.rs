@@ -27,8 +27,251 @@
 //! later lines print at all is itself the survival assertion.
 
 use conformance_probes::{current_disposition, errno, install_ign, report};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::time::{Duration, Instant};
+
+const EXEC_STRING_CHILD: &[u8] = b"--exec-string-child";
+const EXEC_STRING_UNEXPECTED_SUCCESS: &[u8] = b"--exec-string-unexpected-success";
+const EXEC_WAIT: Duration = Duration::from_secs(5);
+const EXEC_ERRNO_READ_ERROR: i32 = -1001;
+const EXEC_ERRNO_SHORT_READ: i32 = -1002;
+const EXEC_POLL: libc::timespec = libc::timespec {
+    tv_sec: 0,
+    tv_nsec: 10_000_000,
+};
+
+fn exec_string_child_status() -> Option<i32> {
+    let args: Vec<_> = std::env::args_os().collect();
+    if args.get(1).map(|arg| arg.as_bytes()) == Some(EXEC_STRING_UNEXPECTED_SUCCESS) {
+        return Some(105);
+    }
+    if args.get(1).map(|arg| arg.as_bytes()) != Some(EXEC_STRING_CHILD) {
+        return None;
+    }
+    let Some(kind) = args.get(2).map(|arg| arg.as_bytes()) else {
+        return Some(101);
+    };
+    let Some(expected_len) = args
+        .get(3)
+        .and_then(|arg| std::str::from_utf8(arg.as_bytes()).ok())
+        .and_then(|arg| arg.parse::<usize>().ok())
+    else {
+        return Some(102);
+    };
+    let valid = match kind {
+        b"argv" => {
+            args.len() == 5
+                && args[4].as_bytes().len() == expected_len
+                && args[4].as_bytes().iter().all(|byte| *byte == 0xfe)
+        }
+        b"env" => {
+            let value = std::env::var_os("X");
+            args.len() == 4
+                && expected_len >= 2
+                && value.as_ref().is_some_and(|value| {
+                    value.as_bytes().len() == expected_len - 2
+                        && value.as_bytes().iter().all(|byte| *byte == 0xfe)
+                })
+        }
+        _ => false,
+    };
+    Some(if valid { 0 } else { 103 })
+}
+
+fn sleep_exec_poll() {
+    unsafe {
+        libc::nanosleep(&EXEC_POLL, std::ptr::null_mut());
+    }
+}
+
+fn wait_exec_child(pid: libc::pid_t) -> i32 {
+    let deadline = Instant::now() + EXEC_WAIT;
+    loop {
+        let mut status = 0;
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if rc == pid {
+            return status;
+        }
+        if rc == -1 && errno() != libc::EINTR {
+            return -1;
+        }
+        if Instant::now() >= deadline {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            let reap_deadline = Instant::now() + EXEC_WAIT;
+            loop {
+                let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if rc == pid {
+                    return status;
+                }
+                if rc == -1 && errno() != libc::EINTR {
+                    return -1;
+                }
+                if Instant::now() >= reap_deadline {
+                    return -2;
+                }
+                sleep_exec_poll();
+            }
+        }
+        sleep_exec_poll();
+    }
+}
+
+struct ExecStringOutcome {
+    success: bool,
+    wait_status: i32,
+    exec_errno: i32,
+}
+
+fn write_exec_errno(fd: libc::c_int, value: i32) {
+    let bytes = value.to_ne_bytes();
+    unsafe {
+        libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+    }
+}
+
+fn exec_string_success_at(path: &CStr, kind: &str, payload_len: usize) -> ExecStringOutcome {
+    let mut pipe_fds = [-1; 2];
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
+        return ExecStringOutcome {
+            success: false,
+            wait_status: -3,
+            exec_errno: errno(),
+        };
+    }
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let fork_errno = errno();
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+        return ExecStringOutcome {
+            success: false,
+            wait_status: -4,
+            exec_errno: fork_errno,
+        };
+    }
+    if pid == 0 {
+        unsafe {
+            libc::close(pipe_fds[0]);
+        }
+        let arg0 = c"execfailsurvive";
+        let marker = c"--exec-string-child";
+        let kind = CString::new(kind).expect("static exec string kind");
+        let len = CString::new(payload_len.to_string()).expect("decimal payload length");
+        let payload = CString::new(vec![0xfe; payload_len]).expect("non-NUL payload");
+        let env = if kind.as_bytes() == b"env" {
+            let mut entry = Vec::with_capacity(payload_len);
+            entry.extend_from_slice(b"X=");
+            entry.resize(payload_len, 0xfe);
+            Some(CString::new(entry).expect("non-NUL environment entry"))
+        } else {
+            None
+        };
+        let argv_payload = (kind.as_bytes() == b"argv").then_some(payload.as_ptr());
+        let argv = [
+            arg0.as_ptr(),
+            marker.as_ptr(),
+            kind.as_ptr(),
+            len.as_ptr(),
+            argv_payload.unwrap_or(std::ptr::null()),
+            std::ptr::null(),
+        ];
+        let envp = [
+            env.as_ref()
+                .map_or(std::ptr::null(), |entry| entry.as_ptr()),
+            std::ptr::null(),
+        ];
+        unsafe {
+            libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            write_exec_errno(pipe_fds[1], errno());
+            libc::_exit(104);
+        }
+    }
+    unsafe {
+        libc::close(pipe_fds[1]);
+    }
+    let wait_status = wait_exec_child(pid);
+    let mut exec_errno = 0_i32;
+    if wait_status >= 0 {
+        let read = unsafe {
+            libc::read(
+                pipe_fds[0],
+                (&mut exec_errno as *mut i32).cast(),
+                std::mem::size_of::<i32>(),
+            )
+        };
+        if read == -1 {
+            exec_errno = EXEC_ERRNO_READ_ERROR;
+        } else if read != 0 && read != std::mem::size_of::<i32>() as isize {
+            exec_errno = EXEC_ERRNO_SHORT_READ;
+        }
+    }
+    unsafe {
+        libc::close(pipe_fds[0]);
+    }
+    ExecStringOutcome {
+        success: wait_status >= 0
+            && libc::WIFEXITED(wait_status)
+            && libc::WEXITSTATUS(wait_status) == 0,
+        wait_status,
+        exec_errno,
+    }
+}
+
+fn exec_string_success(kind: &str, payload_len: usize) -> ExecStringOutcome {
+    let Ok(path) = std::env::current_exe() else {
+        return ExecStringOutcome {
+            success: false,
+            wait_status: -5,
+            exec_errno: 0,
+        };
+    };
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return ExecStringOutcome {
+            success: false,
+            wait_status: -6,
+            exec_errno: 0,
+        };
+    };
+    exec_string_success_at(&path, kind, payload_len)
+}
+
+fn exec_string_expecting_failure(kind: &str, payload_len: usize) -> i32 {
+    let path = c"/proc/self/exe";
+    let arg0 = c"execfailsurvive";
+    let unexpected_success = c"--exec-string-unexpected-success";
+    let payload = CString::new(vec![0xfe; payload_len]).expect("non-NUL payload");
+    let env = if kind == "env" {
+        let mut entry = Vec::with_capacity(payload_len);
+        entry.extend_from_slice(b"X=");
+        entry.resize(payload_len, 0xfe);
+        Some(CString::new(entry).expect("non-NUL environment entry"))
+    } else {
+        None
+    };
+    let argv = [
+        arg0.as_ptr(),
+        unexpected_success.as_ptr(),
+        (kind == "argv")
+            .then_some(payload.as_ptr())
+            .unwrap_or(std::ptr::null()),
+        std::ptr::null(),
+    ];
+    let envp = [
+        env.as_ref()
+            .map_or(std::ptr::null(), |entry| entry.as_ptr()),
+        std::ptr::null(),
+    ];
+    unsafe {
+        libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+    }
+    errno()
+}
 
 /// State the old image must still have after every failed exec.
 struct Image {
@@ -103,6 +346,10 @@ fn write_file(path: &str, contents: &[u8], mode: u32) -> bool {
 }
 
 fn main() {
+    if let Some(status) = exec_string_child_status() {
+        std::process::exit(status);
+    }
+
     // The fd whose survival every case checks. Its content is the marker
     // `intact()` reads back, so a recycled or reopened fd cannot pass.
     let keep_path = "/tmp/execfail-keep";
@@ -172,4 +419,31 @@ fn main() {
     // the caller is still the same process running the same image.
     report!(survived_all = true);
     report!(final_image_intact = image.intact());
+
+    let argv_8192 = exec_string_success("argv", 8192);
+    report!(argv_8192_exec = argv_8192.success);
+    report!(argv_8192_wait_status = argv_8192.wait_status);
+    report!(argv_8192_exec_errno = argv_8192.exec_errno);
+    let argv_131071 = exec_string_success("argv", 131071);
+    report!(argv_131071_exec = argv_131071.success);
+    report!(argv_131071_wait_status = argv_131071.wait_status);
+    report!(argv_131071_exec_errno = argv_131071.exec_errno);
+    let env_8192 = exec_string_success("env", 8192);
+    report!(env_8192_exec = env_8192.success);
+    report!(env_8192_wait_status = env_8192.wait_status);
+    report!(env_8192_exec_errno = env_8192.exec_errno);
+    let env_131071 = exec_string_success("env", 131071);
+    report!(env_131071_exec = env_131071.success);
+    report!(env_131071_wait_status = env_131071.wait_status);
+    report!(env_131071_exec_errno = env_131071.exec_errno);
+
+    let proc_self_exe = exec_string_success_at(c"/proc/self/exe", "argv", 16);
+    report!(proc_self_exe_exec = proc_self_exe.success);
+    report!(proc_self_exe_wait_status = proc_self_exe.wait_status);
+    report!(proc_self_exe_exec_errno = proc_self_exe.exec_errno);
+
+    report!(argv_131072_errno = exec_string_expecting_failure("argv", 131072));
+    report!(argv_131072_image_intact = image.intact());
+    report!(env_131072_errno = exec_string_expecting_failure("env", 131072));
+    report!(env_131072_image_intact = image.intact());
 }

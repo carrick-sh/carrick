@@ -300,6 +300,25 @@ impl<'a> FsView<'a> {
                 }
                 ReopenAction::CopyDescription(Box::new(new_desc), new_common, fd_flags)
             }
+            OpenDescription::ProcExecutable {
+                executable, base, ..
+            } => {
+                if is_writable || flags & LINUX_O_TRUNC != 0 {
+                    ReopenAction::Errno(LINUX_EACCES)
+                } else {
+                    let new_desc = OpenDescription::ProcExecutable {
+                        base: OpenDescriptionBase::new(0).with_fs_identity(
+                            base.fs_identity().unwrap_or(crate::vfs::FsIdentity::Proc),
+                        ),
+                        executable: executable.clone(),
+                        offset: 0,
+                    };
+                    let new_common = Arc::new(crate::kernel::DescriptionCommon::new(
+                        flags & !LINUX_O_CLOEXEC,
+                    ));
+                    ReopenAction::CopyDescription(Box::new(new_desc), new_common, fd_flags)
+                }
+            }
             OpenDescription::File {
                 path,
                 metadata,
@@ -503,6 +522,12 @@ impl<'a> FsView<'a> {
                     target_path: path.clone(),
                     fallback_unlinked: None,
                 },
+                OpenDescription::ProcExecutable { .. } => self.prepare_reopen_copy(
+                    open_ref,
+                    open_file.description.common(),
+                    flags,
+                    fd_flags,
+                ),
                 _ => self.prepare_reopen_copy(
                     open_ref,
                     open_file.description.common(),
@@ -612,7 +637,8 @@ impl<'a> FsView<'a> {
             Some(
                 OpenDescription::File { offset, .. }
                 | OpenDescription::SyntheticFile { offset, .. }
-                | OpenDescription::Directory { offset, .. },
+                | OpenDescription::Directory { offset, .. }
+                | OpenDescription::ProcExecutable { offset, .. },
             ) => *offset as u64,
             Some(OpenDescription::HostFile { host_fd, .. }) => {
                 host_fd_offset(host_fd.view()).unwrap_or(0)
@@ -657,6 +683,28 @@ impl<'a> FsView<'a> {
                 contents,
                 offset: 0,
                 base: OpenDescriptionBase::new(status),
+            })),
+            status,
+            linux_fd_flags_from_open_flags(flags),
+        );
+        match self.install_fd_at_or_above(0, open_file) {
+            Ok(fd) => DispatchOutcome::returned_i32(fd),
+            Err(_) => DispatchOutcome::errno(linux_errno::EMFILE),
+        }
+    }
+
+    pub(in crate::dispatch) fn install_proc_executable_source(
+        &self,
+        _path: &str,
+        executable: crate::dispatch::executable_authority::CurrentExecutable,
+        flags: u64,
+    ) -> DispatchOutcome {
+        let status = flags & !LINUX_O_CLOEXEC;
+        let open_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::ProcExecutable {
+                offset: 0,
+                base: OpenDescriptionBase::new(status),
+                executable,
             })),
             status,
             linux_fd_flags_from_open_flags(flags),

@@ -450,6 +450,18 @@ impl<'a> FsView<'a> {
                     });
                 }
 
+                if proc_self_magic_link(&resolved, visible_self) == Some("exe")
+                    && !open_flags.contains(LinuxOpenFlags::NOFOLLOW)
+                    && let Some(current) = self.proc.lock().current_executable.clone()
+                {
+                    let outcome = self.install_proc_executable_source(&resolved, current, flags);
+                    return Ok(PathLookup {
+                        resolved_path: resolved,
+                        fast_path: FastPathKind::None,
+                        target: LookupTarget::OpenOutcome(outcome),
+                    });
+                }
+
                 let mut path = match proc_self_magic_link(&resolved, visible_self) {
                     Some("exe") => {
                         let proc_ctx = self.synthetic_proc_context(context);

@@ -576,20 +576,29 @@ where
     // x86 target ("rosetta error: Unable to open /proc/self/exe"), and uutils-
     // coreutils (Ubuntu 26.04) derives its locale dir from it. Identity is set
     // AFTER resolution so the recorded exe is the real binary, not the bare name.
-    dispatcher.set_executable_identity(
+    let path: &str = &resolved;
+    let executable_source = dispatcher
+        .with_kernel_credentials(&launch_context, || {
+            dispatcher.acquire_exec_source(&launch_context, path)
+        })
+        .map_err(|error| {
+            let error = match error {
+                crate::dispatch::executable_authority::ExecSourceError::Linux(errno) => {
+                    std::io::Error::from_raw_os_error(errno.get())
+                }
+                crate::dispatch::executable_authority::ExecSourceError::Host(error) => error,
+            };
+            RuntimeError::AddressSpace(AddressSpaceError::Io(error))
+        })?;
+    let bytes = executable_source
+        .read_all()
+        .map_err(AddressSpaceError::Io)?;
+    dispatcher.set_executable_identity_with_source(
         resolved.clone(),
         argv_for_cmdline,
         env.iter().map(|s| s.as_bytes().to_vec()).collect(),
+        executable_source,
     );
-    let path: &str = &resolved;
-    let bytes = dispatcher
-        .with_kernel_credentials(&launch_context, || dispatcher.read_exec_file(path))
-        .ok_or_else(|| {
-            RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                path.to_owned(),
-            )))
-        })?;
     // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style). argv is
     // already opaque bytes (Linux ABI).
     let mut needs_at_base = false;
@@ -1111,6 +1120,7 @@ where
             | DispatchOutcome::BlockingWrite(_)
             | DispatchOutcome::BlockingTimerFdRead(_)
             | DispatchOutcome::BlockingSemop(_)
+            | DispatchOutcome::BlockingMqueue(_)
             | DispatchOutcome::BlockingFdWait { .. }
             | DispatchOutcome::BlockingRecordLock(_)
             | DispatchOutcome::WaitOnProcExit { .. }
@@ -1190,6 +1200,7 @@ where
                 let loaded = dispatcher.with_kernel_credentials(&kernel_context, || {
                     load_execve_image(
                         &dispatcher,
+                        &kernel_context,
                         &path,
                         argv,
                         env,
@@ -1197,7 +1208,10 @@ where
                     )
                 });
                 match loaded {
-                    Ok(new_image) => {
+                    Ok(crate::runtime::exec::LoadedExecImage {
+                        image: new_image,
+                        source: executable_source,
+                    }) => {
                         crate::probes::execve_loaded(
                             &path,
                             new_image.entry(),
@@ -1206,7 +1220,12 @@ where
                         );
                         let prepared_kernel_exec =
                             dispatcher.prepare_one_task_kernel_exec(&kernel_context)?;
-                        dispatcher.set_executable_identity(path.clone(), proc_argv, proc_env);
+                        dispatcher.set_executable_identity_with_source(
+                            path.clone(),
+                            proc_argv,
+                            proc_env,
+                            executable_source,
+                        );
                         dispatcher.reset_signal_handlers_on_execve(&kernel_context);
                         // Reset and refresh memory proc state as one VMA generation.
                         let prepared_dispatch_mm_exec = apply_exec_image_proc_state(
@@ -2894,6 +2913,8 @@ mod tests {
             std::thread::current().name().unwrap_or("test")
         ));
         std::fs::write(&path, synthetic_exec_elf()).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = path.to_string_lossy().into_owned();
         let path_address = 0x1000;
         let argv_address = 0x2000;

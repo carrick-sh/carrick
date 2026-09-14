@@ -453,6 +453,7 @@ impl<'a> FsView<'a> {
             match &*open {
                 OpenDescription::File { .. }
                 | OpenDescription::SyntheticFile { .. }
+                | OpenDescription::ProcExecutable { .. }
                 | OpenDescription::HostFile { .. } => false,
                 OpenDescription::Directory { .. } => true,
                 _ => return,
@@ -502,6 +503,7 @@ impl<'a> FsView<'a> {
                 | OpenDescription::HostFile { writable, .. } => *writable,
                 // A synthetic file or a directory is always read-only.
                 OpenDescription::SyntheticFile { .. } | OpenDescription::Directory { .. } => false,
+                OpenDescription::ProcExecutable { .. } => false,
                 _ => return,
             };
             let mask = if writable {
@@ -591,6 +593,7 @@ impl<'a> FsView<'a> {
             match &*open {
                 OpenDescription::File { .. }
                 | OpenDescription::SyntheticFile { .. }
+                | OpenDescription::ProcExecutable { .. }
                 | OpenDescription::HostFile { .. } => false,
                 OpenDescription::Directory { .. } => true,
                 // A pipe/socket/eventfd read is not a filesystem-object event.
@@ -627,6 +630,7 @@ impl<'a> FsView<'a> {
                 | OpenDescription::HostFile { writable, .. } => *writable,
                 // A synthetic file or a directory is always read-only.
                 OpenDescription::SyntheticFile { .. } | OpenDescription::Directory { .. } => false,
+                OpenDescription::ProcExecutable { .. } => false,
                 _ => return,
             };
             let events = if writable {
@@ -821,6 +825,7 @@ impl<'a> FsView<'a> {
                 }
             }
             OpenDescription::HostFile { .. } | OpenDescription::File { .. } => Some(LINUX_EBADF),
+            OpenDescription::ProcExecutable { .. } => Some(LINUX_EBADF),
             // Linux's null and zero character devices expose a splice-write
             // sink when opened writable (LTP splice09). They are synthetic in
             // Carrick, so the host cannot supply that file operation for us.

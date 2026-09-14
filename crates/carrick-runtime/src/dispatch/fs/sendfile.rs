@@ -102,13 +102,35 @@ impl<'a> FsView<'a> {
         }
         match (self.host_fd_dev_ino(a), self.host_fd_dev_ino(b)) {
             (Some(x), Some(y)) => x == y,
+            _ if self.is_proc_executable_fd(a) || self.is_proc_executable_fd(b) => {
+                match (self.fd_stat_record(a), self.fd_stat_record(b)) {
+                    (Ok(a), Ok(b)) => a.fs_identity == b.fs_identity && a.ino == b.ino,
+                    _ => false,
+                }
+            }
             _ => false,
         }
+    }
+
+    fn is_proc_executable_fd(&self, fd: i32) -> bool {
+        self.open_file(fd)
+            .and_then(|file| {
+                file.description
+                    .read()
+                    .map(|open| matches!(&*open, OpenDescription::ProcExecutable { .. }))
+            })
+            .unwrap_or(false)
     }
 
     fn host_fd_dev_ino(&self, fd: i32) -> Option<(i64, u64)> {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read()?;
+        if let OpenDescription::ProcExecutable { executable, .. } = &*open {
+            return executable
+                .source()
+                .host_identity()
+                .map(|(device, inode)| (device as i64, inode));
+        }
         let OpenDescription::HostFile { host_fd, .. } = &*open else {
             return None;
         };
@@ -174,6 +196,7 @@ impl<'a> FsView<'a> {
             OpenDescription::File { offset, .. }
             | OpenDescription::InMemoryFile { offset, .. }
             | OpenDescription::SyntheticFile { offset, .. } => Ok(Ok(*offset)),
+            OpenDescription::ProcExecutable { offset, .. } => Ok(Ok(*offset)),
             // HostFile: current offset is the kernel's; query via lseek.
             OpenDescription::HostFile { host_fd, .. } => {
                 match (unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) })
@@ -261,6 +284,15 @@ impl<'a> FsView<'a> {
                 let write_len = available.len().min(want);
                 available[..write_len].to_vec()
             }
+            OpenDescription::ProcExecutable { executable, .. } => executable
+                .source()
+                .read_range(offset, want)
+                .map_err(|error| {
+                    error
+                        .raw_os_error()
+                        .map(crate::host_to_linux_errno)
+                        .unwrap_or(crate::linux_abi::LINUX_EIO)
+                })?,
             OpenDescription::InMemoryFile { contents, .. } => {
                 let data = contents.read();
                 data.read_range(offset, want)
@@ -428,6 +460,9 @@ impl<'a> FsView<'a> {
                         }
                         | OpenDescription::SyntheticFile {
                             offset: current, ..
+                        }
+                        | OpenDescription::ProcExecutable {
+                            offset: current, ..
                         } => *current = offset,
                         // HostFile reads via `pread` (sendfile_bytes), which does
                         // NOT advance the kernel offset; advance it explicitly so a
@@ -580,7 +615,8 @@ impl<'a> FsView<'a> {
                 {
                     match &mut *open {
                         OpenDescription::File { offset, .. }
-                        | OpenDescription::SyntheticFile { offset, .. } => *offset = new_in,
+                        | OpenDescription::SyntheticFile { offset, .. }
+                        | OpenDescription::ProcExecutable { offset, .. } => *offset = new_in,
                         OpenDescription::HostFile { host_fd, .. } => {
                             unsafe {
                                 libc::lseek(host_fd.raw(), new_in as libc::off_t, libc::SEEK_SET)

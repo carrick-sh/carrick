@@ -264,6 +264,16 @@ impl<'a> FsView<'a> {
         {
             return Ok(DispatchOutcome::errno(LINUX_EROFS));
         }
+        let moved_executable = self.executable_object_id_at(&resolved_old);
+        let replaced_executable = self.executable_object_id_at(&resolved_new);
+        let same_executable_object =
+            moved_executable.is_some() && moved_executable == replaced_executable;
+        let moved_directory = self
+            .layered_metadata(&resolved_old)
+            .is_ok_and(|metadata| metadata.kind == RootFsEntryKind::Directory);
+        let replaced_directory = self
+            .layered_metadata(&resolved_new)
+            .is_ok_and(|metadata| metadata.kind == RootFsEntryKind::Directory);
         // RENAME_EXCHANGE: atomically swap two EXISTING entries. Both must
         // exist (a missing side → ENOENT, renameat201 case 3); the swap lands
         // in the writable overlay backend, which preserves each entry's
@@ -295,6 +305,15 @@ impl<'a> FsView<'a> {
                 .exchange_with_flags(&resolved_old, &resolved_new)
             {
                 Ok(()) => {
+                    if !same_executable_object && (moved_directory || replaced_directory) {
+                        self.notify_executable_directory_exchange(&resolved_old, &resolved_new);
+                    }
+                    if !same_executable_object && let Some(object_id) = moved_executable {
+                        self.notify_executable_rename(object_id, &resolved_old, &resolved_new);
+                    }
+                    if !same_executable_object && let Some(object_id) = replaced_executable {
+                        self.notify_executable_rename(object_id, &resolved_new, &resolved_old);
+                    }
                     if !self.fs.inotify_registry.is_empty() {
                         // A swap is two moves: each name now holds the other's
                         // object, so emit IN_MOVED_FROM/IN_MOVED_TO for both
@@ -335,7 +354,18 @@ impl<'a> FsView<'a> {
                     return Ok(DispatchOutcome::errno(LINUX_EEXIST));
                 }
                 return match mnew.vfs.rename(&mold.full_path, &mnew.full_path) {
-                    Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                    Ok(()) => {
+                        if !same_executable_object && moved_directory {
+                            self.notify_executable_directory_rename(&resolved_old, &resolved_new);
+                        }
+                        if !same_executable_object && let Some(object_id) = moved_executable {
+                            self.notify_executable_rename(object_id, &resolved_old, &resolved_new);
+                        }
+                        if !same_executable_object && let Some(object_id) = replaced_executable {
+                            self.notify_executable_unlink(object_id, &resolved_new);
+                        }
+                        Ok(DispatchOutcome::Returned { value: 0 })
+                    }
                     Err(errno) => Ok(DispatchOutcome::errno(errno)),
                 };
             }
@@ -358,6 +388,15 @@ impl<'a> FsView<'a> {
             .rename_with_flags(&resolved_old, &resolved_new, no_replace)
         {
             Ok(()) => {
+                if !same_executable_object && moved_directory {
+                    self.notify_executable_directory_rename(&resolved_old, &resolved_new);
+                }
+                if !same_executable_object && let Some(object_id) = moved_executable {
+                    self.notify_executable_rename(object_id, &resolved_old, &resolved_new);
+                }
+                if !same_executable_object && let Some(object_id) = replaced_executable {
+                    self.notify_executable_unlink(object_id, &resolved_new);
+                }
                 if !self.fs.inotify_registry.is_empty() {
                     // IN_MOVED_FROM (old name) + IN_MOVED_TO (new name), cookie-
                     // tied, to watches on the respective parent directories.
@@ -559,8 +598,11 @@ impl<'a> FsView<'a> {
                     // the chain like Docker/Linux do; a non-symlink path is returned
                     // unchanged, and a resolution failure falls back to the raw path.
                     "exe" => {
-                        let exe = this.proc.lock().executable_path.clone();
-                        this.canonicalize_following(&exe).unwrap_or(exe)
+                        let proc = this.proc.lock();
+                        proc.current_executable
+                            .as_ref()
+                            .map(|current| current.display_path())
+                            .unwrap_or_else(|| proc.executable_path.clone())
                     }
                     // /proc/self/cwd → the guest working dir; /proc/self/root → the
                     // guest root. Both come from the captured Kernel FsContext.
@@ -571,6 +613,15 @@ impl<'a> FsView<'a> {
                 // /proc/this/fd/{0,1,2} → /dev/pts/N when the guest's stdio is the
                 // `carrick run -t` controlling pty. This is what glibc `ttyname(3)`
                 // reads, so `tty(1)` and tty-name lookups resolve.
+                t
+            } else if let Some(t) = proc_self_fd_number(&path, visible_self).and_then(|n| {
+                this.open_file(n).and_then(|f| {
+                    f.description.read().and_then(|g| {
+                        g.retained_executable()
+                            .map(crate::dispatch::executable_authority::CurrentExecutable::display_path)
+                    })
+                })
+            }) {
                 t
             } else if let Some(t) = proc_self_fd_number(&path, visible_self).and_then(|n| {
                 this.lookup_recorded_fd_open_path(n).or_else(|| {
@@ -1292,6 +1343,7 @@ impl<'a> FsView<'a> {
             // shares (`legacyfs`: unlink of the second name must lower the
             // first name's nlink). One `fstatat` on a cache miss.
             let _ = this.fs.rootfs_vfs.dentry_stat(&resolved, false);
+            let unlinked_executable = this.executable_object_id_at(&resolved);
             if let Some(m) = this.fs.vfs_mounts.resolve(&resolved)
                 && m.vfs.overridable()
             {
@@ -1305,7 +1357,12 @@ impl<'a> FsView<'a> {
                 // backing) — that's still a successful detach. Only a non-ENOENT
                 // error from a real overlay file should surface.
                 return match overlay_result {
-                    Ok(()) | Err(LINUX_ENOENT) => Ok(DispatchOutcome::Returned { value: 0 }),
+                    Ok(()) | Err(LINUX_ENOENT) => {
+                        if let Some(object_id) = unlinked_executable {
+                            this.notify_executable_unlink(object_id, &resolved);
+                        }
+                        Ok(DispatchOutcome::Returned { value: 0 })
+                    }
                     Err(errno) => Ok(DispatchOutcome::errno(errno)),
                 };
             }
@@ -1338,6 +1395,9 @@ impl<'a> FsView<'a> {
             };
             match result {
                 Ok(()) => {
+                    if let Some(object_id) = unlinked_executable {
+                        this.notify_executable_unlink(object_id, &resolved);
+                    }
                     // inotify: IN_DELETE (name) to a watch on the parent dir.
                     this.inotify_child(
                         &resolved,
