@@ -17,6 +17,7 @@ fn main() {
     poll_invalid_probe();
     pipe2_nonblock_probe();
     poll_multi_probe();
+    timerfd_worker_progress_probe();
 }
 
 /// eventfd: create with initial value 0, write 5, read it back (read returns 5
@@ -321,6 +322,237 @@ fn timerfd_probe() {
         println!("timerfd_fired={}", count >= 1);
     }
     unsafe { libc::close(tfd) };
+
+    // A failed copyout must leave a pending expiration readable.  Use a
+    // nonblocking descriptor so the unfired observation has a concrete errno
+    // and polling bounds the later one-shot expiry.
+    let fault_fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_NONBLOCK) };
+    if fault_fd < 0 {
+        println!("timerfd_fault_create=ERR:{}", errno());
+        return;
+    }
+    let mut unfired: u64 = 0;
+    let unfired_read = unsafe { libc::read(fault_fd, &mut unfired as *mut u64 as *mut _, 8) };
+    println!(
+        "timerfd_unfired_nonblock_errno={}",
+        if unfired_read == -1 { errno() } else { 0 }
+    );
+    let fault_spec = libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        },
+    };
+    if unsafe { libc::timerfd_settime(fault_fd, 0, &fault_spec, std::ptr::null_mut()) } != 0 {
+        println!("timerfd_fault_settime=ERR:{}", errno());
+        unsafe { libc::close(fault_fd) };
+        return;
+    }
+    let mut fault_poll = libc::pollfd {
+        fd: fault_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut fault_poll, 1, 50) };
+    println!("timerfd_fault_ready={ready}");
+    println!("timerfd_fault_revents={}", fault_poll.revents);
+    let fault_read = unsafe { libc::read(fault_fd, 1_usize as *mut _, 8) };
+    let fault_errno = if fault_read == -1 { errno() } else { 0 };
+    let mut after_fault: u64 = 0;
+    let after_fault_read =
+        unsafe { libc::read(fault_fd, &mut after_fault as *mut u64 as *mut _, 8) };
+    let after_fault_errno = if after_fault_read == -1 { errno() } else { 0 };
+    println!("timerfd_fault_read_rc={fault_read}");
+    println!("timerfd_fault_read_errno={fault_errno}");
+    println!("timerfd_after_fault_read_rc={after_fault_read}");
+    println!("timerfd_after_fault_read_errno={after_fault_errno}");
+    println!(
+        "timerfd_after_fault_expirations={}",
+        if after_fault_read == 8 {
+            after_fault
+        } else {
+            0
+        }
+    );
+    unsafe { libc::close(fault_fd) };
+}
+
+/// Thirty-two readers each block on an initially disarmed timerfd.  After all
+/// readers reach the barrier, the parent alone arms every timer.  Therefore no
+/// worker owns a deadline that can hide executor starvation: scheduling the
+/// runnable parent is necessary for any read to complete.
+///
+/// The parent polls a completion pipe for at most five seconds before joining.
+/// If Carrick occupies every executor in the blocking reads, the parent never
+/// gets to arm the timers and this function emits no completion result.  It is
+/// the final observation in `main`, so `main` returns immediately after this
+/// function returns; the external conformance harness must bound and reap that
+/// full-starvation case.
+fn timerfd_worker_progress_probe() {
+    const WORKERS: usize = 32;
+    let mut timer_fds = [-1_i32; WORKERS];
+    for fd in &mut timer_fds {
+        *fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, 0) };
+        if *fd < 0 {
+            let error = errno();
+            for close_fd in timer_fds {
+                if close_fd >= 0 {
+                    unsafe { libc::close(close_fd) };
+                }
+            }
+            println!("timerfd_worker_setup_errno={error}");
+            return;
+        }
+    }
+
+    let mut completions = [-1_i32; 2];
+    if unsafe { libc::pipe(completions.as_mut_ptr()) } != 0 {
+        let error = errno();
+        for fd in timer_fds {
+            unsafe { libc::close(fd) };
+        }
+        println!("timerfd_worker_setup_errno={error}");
+        return;
+    }
+    let [completion_read, completion_write] = completions;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS + 1));
+    let mut workers = Vec::with_capacity(WORKERS);
+    for fd in timer_fds {
+        let barrier = std::sync::Arc::clone(&barrier);
+        let worker_completion = completion_write;
+        let worker = std::thread::Builder::new().spawn(move || {
+            barrier.wait();
+            let mut expirations = 0_u64;
+            let read = unsafe { libc::read(fd, &mut expirations as *mut u64 as *mut _, 8) };
+            let ok = read == 8 && expirations == 1;
+            let marker = [u8::from(ok)];
+            // The parent observes exactly one marker per reader before any
+            // join; the pipe has ample room for this fixed 32-byte cohort.
+            let _ = unsafe { libc::write(worker_completion, marker.as_ptr() as *const _, 1) };
+            (read, expirations)
+        });
+        match worker {
+            Ok(worker) => workers.push(worker),
+            Err(error) => {
+                for fd in timer_fds {
+                    unsafe { libc::close(fd) };
+                }
+                unsafe {
+                    libc::close(completion_read);
+                    libc::close(completion_write);
+                }
+                println!(
+                    "timerfd_worker_setup_errno={}",
+                    error.raw_os_error().unwrap_or(-1)
+                );
+                // Existing workers are fixed-size-barrier waiters.  Returning
+                // ends this diagnostic process, so the OS reclaims them and
+                // their descriptors; close does not pretend to cancel a read.
+                return;
+            }
+        }
+    }
+
+    barrier.wait();
+    println!("timerfd_worker_startup={WORKERS}");
+    // Staging makes the read cohort runnable without giving a worker a timer
+    // it could use to mask a parent scheduling failure.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    let spec = libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        },
+    };
+    let arm_failures = timer_fds
+        .iter()
+        .filter(|fd| unsafe { libc::timerfd_settime(**fd, 0, &spec, std::ptr::null_mut()) } != 0)
+        .count();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut completion_count = 0_usize;
+    let mut completion_successes = 0_usize;
+    while completion_count < WORKERS && std::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let mut pollfd = libc::pollfd {
+            fd: completion_read,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, remaining.as_millis().min(100) as i32) };
+        if ready <= 0 {
+            continue;
+        }
+        let mut markers = [0_u8; WORKERS];
+        let read = unsafe {
+            libc::read(
+                completion_read,
+                markers.as_mut_ptr() as *mut _,
+                markers.len(),
+            )
+        };
+        if read <= 0 {
+            break;
+        }
+        let read = read as usize;
+        completion_count += read;
+        completion_successes += markers[..read]
+            .iter()
+            .filter(|marker| **marker == 1)
+            .count();
+    }
+
+    println!("timerfd_worker_arm_failures={arm_failures}");
+    println!("timerfd_worker_completion_count={completion_count}");
+    println!("timerfd_worker_completion_successes={completion_successes}");
+    if completion_count != WORKERS {
+        for fd in timer_fds {
+            unsafe { libc::close(fd) };
+        }
+        unsafe {
+            libc::close(completion_read);
+            libc::close(completion_write);
+        }
+        // Do not join a reader that did not report completion: Linux close is
+        // not a portable cancellation primitive for a blocked read.
+        return;
+    }
+
+    let mut read_successes = 0_usize;
+    let mut expiration_ones = 0_usize;
+    let mut read_failures = 0_usize;
+    for worker in workers {
+        match worker.join() {
+            Ok((8, 1)) => {
+                read_successes += 1;
+                expiration_ones += 1;
+            }
+            Ok((8, _)) => {
+                read_successes += 1;
+                read_failures += 1;
+            }
+            _ => read_failures += 1,
+        }
+    }
+    for fd in timer_fds {
+        unsafe { libc::close(fd) };
+    }
+    unsafe {
+        libc::close(completion_read);
+        libc::close(completion_write);
+    }
+    println!("timerfd_worker_read_successes={read_successes}");
+    println!("timerfd_worker_expirations_one={expiration_ones}");
+    println!("timerfd_worker_read_failures={read_failures}");
 }
 
 /// poll on an invalid fd → revents has POLLNVAL set.

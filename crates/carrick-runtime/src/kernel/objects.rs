@@ -4,6 +4,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
+#[cfg(test)]
 use std::time::Duration;
 
 use carrick_abi::{LinuxEpollEvents, LinuxSiginfo, NsGid, NsUid};
@@ -306,11 +307,41 @@ pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
         None
     }
 
-    fn timerfd_remaining_timeout(&self) -> Option<Duration> {
-        None
-    }
-
     fn as_any(&self) -> &dyn Any;
+}
+
+/// Typed work that is coupled to the terminal functional lifetime of an open
+/// file description.
+///
+/// Registration is serialized with `retain_fd_lease` and final reference
+/// release.  Implementations must not retain the description itself: terminal
+/// retirement must be able to drain this list without an ownership cycle.
+pub(crate) trait FileDescriptionFinalizer: std::fmt::Debug + Send + Sync {
+    /// A description-local key used to avoid retaining the same finalizer for
+    /// every operation on one open-file description.
+    fn key(&self) -> FileDescriptionFinalizerKey;
+
+    /// Run exactly once when the description loses its final functional fd
+    /// reference. This is called after the lifecycle lock is released.
+    fn finalize(&self);
+}
+
+/// Opaque identity for one terminal description finalizer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileDescriptionFinalizerKey {
+    finalizer_type: std::any::TypeId,
+    primary: usize,
+    secondary: usize,
+}
+
+impl FileDescriptionFinalizerKey {
+    pub(crate) fn typed<T: 'static>(primary: usize, secondary: usize) -> Self {
+        Self {
+            finalizer_type: std::any::TypeId::of::<T>(),
+            primary,
+            secondary,
+        }
+    }
 }
 
 struct OpaqueFileDescriptionBacking(Arc<dyn FileDescriptionBacking>);
@@ -776,6 +807,7 @@ impl DescriptionCommon {
 #[derive(Debug, Default)]
 struct DescriptionLifecycle {
     mapping_refs: usize,
+    terminal_finalizers: Vec<Arc<dyn FileDescriptionFinalizer>>,
 }
 
 /// Keeps a mapped file's backing alive without retaining a logical fd slot.
@@ -965,13 +997,6 @@ impl FileDescription {
         }
     }
 
-    pub(crate) fn timerfd_remaining_timeout(&self) -> Option<Duration> {
-        match &self.kind {
-            FileDescriptionKind::Concrete(backing) => backing.0.timerfd_remaining_timeout(),
-            _ => None,
-        }
-    }
-
     pub(crate) fn register_epoll_owner(self: &Arc<Self>, owner: &Arc<Self>, registration_fd: i32) {
         self.epoll_registrations
             .lock()
@@ -1076,16 +1101,52 @@ impl FileDescription {
         })
     }
 
+    /// Attach final work to this exact live description.
+    ///
+    /// Callers must hold a `FileDescriptionFdLease` while registering and
+    /// installing the associated state. A terminal description cannot accept a
+    /// new finalizer, and repeated operations carrying the same description
+    /// key retain one callback only.
+    pub(crate) fn register_terminal_finalizer(
+        &self,
+        finalizer: Arc<dyn FileDescriptionFinalizer>,
+    ) -> bool {
+        let mut lifecycle = self.lifecycle_transition.lock();
+        if self.common.fd_refs() == 0 {
+            return false;
+        }
+        if lifecycle
+            .terminal_finalizers
+            .iter()
+            .any(|current| current.key() == finalizer.key())
+        {
+            return true;
+        }
+        lifecycle.terminal_finalizers.push(finalizer);
+        true
+    }
+
     pub(crate) fn release_fd_ref(&self) {
-        let lifecycle = self.lifecycle_transition.lock();
-        let count = self.common.release_fd_ref();
-        if count == 0 {
-            if let FileDescriptionKind::Concrete(backing) = &self.kind {
-                backing.0.on_last_fd_ref();
-                if lifecycle.mapping_refs == 0 {
-                    backing.0.on_last_resource_ref();
+        let terminal_finalizers = {
+            let mut lifecycle = self.lifecycle_transition.lock();
+            let count = self.common.release_fd_ref();
+            if count == 0 {
+                if let FileDescriptionKind::Concrete(backing) = &self.kind {
+                    backing.0.on_last_fd_ref();
+                    if lifecycle.mapping_refs == 0 {
+                        backing.0.on_last_resource_ref();
+                    }
                 }
+                std::mem::take(&mut lifecycle.terminal_finalizers)
+            } else {
+                Vec::new()
             }
+        };
+        // A finalizer may take subsystem state (for example logical-record
+        // locks). Do not nest that under `lifecycle_transition`; the terminal
+        // count has already made further lease admission impossible.
+        for finalizer in terminal_finalizers {
+            finalizer.finalize();
         }
         self.revision.publish();
     }
@@ -1227,9 +1288,28 @@ pub(crate) struct FileDescriptionFdLease {
     description: Arc<FileDescription>,
 }
 
+impl Clone for FileDescriptionFdLease {
+    fn clone(&self) -> Self {
+        // This lease itself keeps the description functionally live, so this
+        // increment cannot resurrect a retired endpoint.
+        self.description.retain_fd_ref();
+        Self {
+            description: Arc::clone(&self.description),
+        }
+    }
+}
+
 impl Drop for FileDescriptionFdLease {
     fn drop(&mut self) {
         self.description.release_fd_ref();
+    }
+}
+
+impl FileDescriptionFdLease {
+    /// The exact description whose functional lifetime this lease pins.
+    /// Callers must not re-resolve the numeric fd after asynchronous admission.
+    pub(crate) fn description(&self) -> &Arc<FileDescription> {
+        &self.description
     }
 }
 
@@ -1265,10 +1345,6 @@ impl FileSlot {
     #[allow(dead_code)]
     pub(crate) fn wait_queue(&self) -> Option<Arc<super::wait_set::WaitQueue>> {
         self.description.wait_queue()
-    }
-
-    pub(crate) fn timerfd_remaining_timeout(&self) -> Option<Duration> {
-        self.description.timerfd_remaining_timeout()
     }
 }
 
@@ -1684,6 +1760,26 @@ impl FileTable {
         })
     }
 
+    /// Snapshot one live slot and its authenticated identity under the same
+    /// table read guard. The returned `FileSlot` is only a classification
+    /// snapshot; asynchronous admission must use [`Self::retain_slot_lease`].
+    pub(crate) fn capture_open_slot_authority(
+        &self,
+        number: FileSlotNumber,
+    ) -> Option<(FileSlot, FileSlotAuthority)> {
+        let slots = self.open_files.read();
+        let slot = slots.get(&number.raw())?;
+        Some((
+            slot.clone(),
+            FileSlotAuthority {
+                table: self.id,
+                number,
+                slot_generation: slot.generation,
+                description: slot.description.id(),
+            },
+        ))
+    }
+
     pub fn is_bare_stdio_open(&self, raw: i32) -> bool {
         (0..3).contains(&raw) && !self.lock_closed_stdio()[raw as usize]
     }
@@ -1749,6 +1845,40 @@ impl FileTable {
         }
         let open_files = self.open_files.read();
         Self::resolve_slot_from_guard(&open_files, authority)
+    }
+
+    /// Retain a functional I/O lease only if `authority` still names the same
+    /// live slot. Holding the table read guard through the retain makes close
+    /// or reuse linearize either wholly before admission (stale → `None`) or
+    /// after the exact description has been pinned.
+    pub(crate) fn retain_slot_lease(
+        &self,
+        authority: FileSlotAuthority,
+    ) -> Option<FileDescriptionFdLease> {
+        if authority.table != self.id {
+            return None;
+        }
+        let open_files = self.open_files.read();
+        let description = Self::resolve_slot_from_guard(&open_files, authority)?;
+        description.retain_fd_lease()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_slot_lease_with_hook<F>(
+        &self,
+        authority: FileSlotAuthority,
+        on_guard_acquired: F,
+    ) -> Option<FileDescriptionFdLease>
+    where
+        F: FnOnce(),
+    {
+        if authority.table != self.id {
+            return None;
+        }
+        let open_files = self.open_files.read();
+        on_guard_acquired();
+        let description = Self::resolve_slot_from_guard(&open_files, authority)?;
+        description.retain_fd_lease()
     }
 
     #[cfg(test)]
@@ -2626,6 +2756,93 @@ mod tests {
             .resolve_slot_authority(token2)
             .expect("resolve token 2");
         assert!(Arc::ptr_eq(&resolved2, &desc2));
+    }
+
+    #[test]
+    fn slot_lease_rejects_stale_authority_after_reuse() {
+        let ids = ObjectIdRegistry::new();
+        let table = FileTable::new(ids.file_table_id().expect("table id"));
+        let number = FileSlotNumber::for_open_fd(3).expect("fd 3");
+        let original = Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("original description"),
+        ));
+        // Model an alias held by another numeric fd: closing this slot alone
+        // must not retire the original description.
+        original.retain_fd_ref();
+        table.install(number, Arc::clone(&original), false);
+        let authority = table
+            .capture_slot_authority(number)
+            .expect("original authority");
+        let replacement = Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("replacement description"),
+        ));
+        table.install(number, replacement, false);
+
+        assert!(table.resolve_slot_authority(authority).is_none());
+        assert!(
+            table.retain_slot_lease(authority).is_none(),
+            "a stale authority must never retain the old alias or replacement"
+        );
+    }
+
+    #[test]
+    fn slot_lease_reader_wins_before_queued_reuse_and_pins_exact_description() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+        let number = FileSlotNumber::for_open_fd(3).expect("fd 3");
+        let original = Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("original description"),
+        ));
+        original.retain_fd_ref();
+        table.install(number, Arc::clone(&original), false);
+        let authority = table.capture_slot_authority(number).expect("authority");
+
+        let (reader_holding_tx, reader_holding_rx) = std::sync::mpsc::channel();
+        let (release_reader_tx, release_reader_rx) = std::sync::mpsc::channel();
+        let (lease_tx, lease_rx) = std::sync::mpsc::channel();
+        let reader_table = Arc::clone(&table);
+        let reader = std::thread::spawn(move || {
+            let lease = reader_table.retain_slot_lease_with_hook(authority, || {
+                reader_holding_tx.send(()).expect("reader entered guard");
+                release_reader_rx.recv().expect("release reader");
+            });
+            lease_tx.send(lease).expect("return lease");
+        });
+        reader_holding_rx.recv().expect("reader holds table guard");
+
+        let replacement = Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("replacement description"),
+        ));
+        let (writer_started_tx, writer_started_rx) = std::sync::mpsc::channel();
+        let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
+        let writer_table = Arc::clone(&table);
+        let writer = std::thread::spawn(move || {
+            writer_started_tx.send(()).expect("writer started");
+            writer_table
+                .write_open_files()
+                .insert(number.raw(), FileSlot::new(replacement, 0));
+            writer_done_tx.send(()).expect("writer done");
+        });
+        writer_started_rx.recv().expect("writer queued");
+        assert!(
+            writer_done_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "reuse must wait for exact lease admission"
+        );
+
+        release_reader_tx.send(()).expect("release reader");
+        let lease = lease_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reader returned")
+            .expect("live original lease");
+        assert!(Arc::ptr_eq(lease.description(), &original));
+        reader.join().expect("reader joined");
+        writer_done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("writer completed after reader");
+        writer.join().expect("writer joined");
+        assert!(table.retain_slot_lease(authority).is_none());
     }
 
     #[test]

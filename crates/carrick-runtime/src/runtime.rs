@@ -1109,6 +1109,9 @@ where
         match outcome {
             DispatchOutcome::WaitOnFds { .. }
             | DispatchOutcome::BlockingWrite(_)
+            | DispatchOutcome::BlockingTimerFdRead(_)
+            | DispatchOutcome::BlockingSemop(_)
+            | DispatchOutcome::BlockingFdWait { .. }
             | DispatchOutcome::BlockingRecordLock(_)
             | DispatchOutcome::WaitOnProcExit { .. }
             | DispatchOutcome::WaitOnProcState { .. }

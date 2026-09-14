@@ -198,6 +198,8 @@ impl SyscallDispatcher {
                 }
             });
             timer.expirations = 0;
+            drop(timer);
+            state.publish_change();
             state.changed.notify_all();
             state.wait_queue.wake_all();
             Ok(DispatchOutcome::Returned { value: 0 })

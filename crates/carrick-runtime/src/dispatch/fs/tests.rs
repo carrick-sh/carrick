@@ -3,6 +3,7 @@
 use super::*;
 use crate::dispatch::ThreadCtx;
 use crate::dispatch::dispatcher::FsCrossSubsystem;
+use std::sync::Arc;
 
 fn two_namespaced_roots_for_async_owner() -> (
     Arc<crate::kernel::Kernel>,
@@ -4375,6 +4376,138 @@ fn hvpatch_flock_shared_and_exclusive_semantics() {
 
     // Now OFD 1 can acquire exclusive
     assert_eq!(locks.try_flock(file.clone(), 0x1000, true), Ok(()));
+}
+
+#[test]
+fn flock_wait_lease_retires_its_exact_description_after_slot_close() {
+    let ids = crate::kernel::ObjectIdRegistry::new();
+    let locks = Arc::new(LogicalRecordLocks::default());
+    let file = LeaseFileId::Path("/test-flock-wait-retirement".to_owned());
+    let held_owner = 0x1000;
+    assert_eq!(locks.try_flock(file.clone(), held_owner, true), Ok(()));
+
+    let description = Arc::new(crate::kernel::FileDescription::regular(
+        ids.file_description_id().expect("waiter description"),
+    ));
+    // Model the slot from which the flock continuation was admitted.
+    description.retain_fd_ref();
+    let lease = description.retain_fd_lease().expect("live waiter lease");
+    let waiter_owner = register_logical_lock_retirement(&lease, &locks, file.clone())
+        .expect("register terminal retirement");
+    let waiter = LogicalFlockWait::new(
+        Arc::clone(&locks),
+        file.clone(),
+        waiter_owner,
+        true,
+        crate::thread::ThreadId::synthetic_for_tests(4_401),
+        lease,
+    );
+
+    // Closing the numeric slot does not make the parked operation re-resolve a
+    // reused fd; its exact description remains alive through the wait lease.
+    description.release_fd_ref();
+    assert_eq!(description.fd_ref_count(), 1);
+    assert_eq!(waiter.try_acquire(), Err(LINUX_EAGAIN));
+
+    locks.release_ofd(&file, held_owner);
+    assert_eq!(waiter.try_acquire(), Ok(()));
+    drop(waiter);
+
+    // The continuation lease was the final functional reference, so terminal
+    // retirement releases the flock it acquired before a later description can
+    // observe the file.
+    assert_eq!(locks.try_flock(file, 0x3000, true), Ok(()));
+}
+
+#[test]
+fn flock_retirement_waits_for_final_duplicate_reference() {
+    let ids = crate::kernel::ObjectIdRegistry::new();
+    let locks = Arc::new(LogicalRecordLocks::default());
+    let file = LeaseFileId::Path("/test-flock-nonfinal-duplicate".to_owned());
+    let description = Arc::new(crate::kernel::FileDescription::regular(
+        ids.file_description_id().expect("duplicated description"),
+    ));
+    // Two slots share one open-file description, as dup/fork aliases do.
+    description.retain_fd_ref();
+    description.retain_fd_ref();
+    let lease = description.retain_fd_lease().expect("live duplicate lease");
+    let owner = register_logical_lock_retirement(&lease, &locks, file.clone())
+        .expect("register terminal retirement");
+    assert_eq!(locks.try_flock(file.clone(), owner, true), Ok(()));
+
+    description.release_fd_ref();
+    drop(lease);
+    assert_eq!(description.fd_ref_count(), 1);
+    assert_eq!(
+        locks.try_flock(file.clone(), 0x4000, true),
+        Err(LINUX_EAGAIN)
+    );
+
+    description.release_fd_ref();
+    assert_eq!(locks.try_flock(file, 0x4000, true), Ok(()));
+}
+
+#[test]
+fn terminal_retirement_finalizes_each_logical_lock_registry_once() {
+    let ids = crate::kernel::ObjectIdRegistry::new();
+    let description = Arc::new(crate::kernel::FileDescription::regular(
+        ids.file_description_id().expect("shared description"),
+    ));
+    description.retain_fd_ref();
+    let lease = description.retain_fd_lease().expect("live lease");
+    let locks_a = Arc::new(LogicalRecordLocks::default());
+    let locks_b = Arc::new(LogicalRecordLocks::default());
+    let file = LeaseFileId::Path("/test-flock-two-registries".to_owned());
+    let owner_a = register_logical_lock_retirement(&lease, &locks_a, file.clone())
+        .expect("register registry a");
+    let owner_b = register_logical_lock_retirement(&lease, &locks_b, file.clone())
+        .expect("register registry b");
+    assert_eq!(owner_a, owner_b, "one open description owns both entries");
+    assert_eq!(locks_a.try_flock(file.clone(), owner_a, true), Ok(()));
+    assert_eq!(locks_b.try_flock(file.clone(), owner_b, true), Ok(()));
+
+    description.release_fd_ref();
+    drop(lease);
+    assert_eq!(locks_a.try_flock(file.clone(), 0x5000, true), Ok(()));
+    assert_eq!(locks_b.try_flock(file, 0x6000, true), Ok(()));
+}
+
+#[test]
+fn terminal_retirement_releases_flock_and_ofd_record_locks() {
+    let ids = crate::kernel::ObjectIdRegistry::new();
+    let locks = Arc::new(LogicalRecordLocks::default());
+    let description = Arc::new(crate::kernel::FileDescription::regular(
+        ids.file_description_id().expect("lock description"),
+    ));
+    description.retain_fd_ref();
+    let lease = description.retain_fd_lease().expect("live lease");
+    let file = LeaseFileId::Path("/test-flock-ofd-retirement".to_owned());
+    let owner = register_logical_lock_retirement(&lease, &locks, file.clone())
+        .expect("register terminal retirement");
+    assert_eq!(locks.try_flock(file.clone(), owner, true), Ok(()));
+    let range = LogicalRecordLockRange { start: 0, end: 10 };
+    assert_eq!(
+        locks.try_set(LogicalRecordLockRequest {
+            file: file.clone(),
+            owner: LogicalRecordLockOwner::Ofd(owner),
+            range,
+            write: true,
+        }),
+        Ok(())
+    );
+
+    description.release_fd_ref();
+    drop(lease);
+    assert_eq!(locks.try_flock(file.clone(), 0x7000, true), Ok(()));
+    assert_eq!(
+        locks.try_set(LogicalRecordLockRequest {
+            file,
+            owner: LogicalRecordLockOwner::Ofd(0x7000),
+            range,
+            write: true,
+        }),
+        Ok(())
+    );
 }
 
 #[test]

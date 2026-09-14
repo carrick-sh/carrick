@@ -6067,6 +6067,8 @@ mod container_clock_tests {
 
     const SYS_TIMERFD_CREATE: u64 = 85;
     const SYS_TIMERFD_SETTIME: u64 = 86;
+    const SYS_CLOSE: u64 = 57;
+    const SYS_READ: u64 = 63;
     const SYS_CLOCK_SETTIME: u64 = 112;
     const SYS_CLOCK_GETTIME: u64 = 113;
     const SYS_CLOCK_ADJTIME: u64 = 266;
@@ -6656,12 +6658,22 @@ mod container_clock_tests {
         memory: &mut LinearMemory,
         deadline: Duration,
     ) -> Arc<TimerFdState> {
+        let (_, state, _) = armed_absolute_timerfd_with_flags(dispatcher, memory, deadline, 0);
+        state
+    }
+
+    fn armed_absolute_timerfd_with_flags(
+        dispatcher: &mut SyscallDispatcher,
+        memory: &mut LinearMemory,
+        deadline: Duration,
+        flags: u64,
+    ) -> (u64, Arc<TimerFdState>, Arc<crate::kernel::FileDescription>) {
         let reporter = CompatReporter::default();
         let context = dispatcher.capture_one_task_context().expect("task context");
         let fd = match dispatcher
             .dispatch(
                 &context,
-                SyscallRequest::new(SYS_TIMERFD_CREATE, SyscallArgs([LINUX_CLOCK_REALTIME, 0, 0, 0, 0, 0])),
+                SyscallRequest::new(SYS_TIMERFD_CREATE, SyscallArgs([LINUX_CLOCK_REALTIME, flags, 0, 0, 0, 0])),
                 memory,
                 &reporter,
             )
@@ -6690,11 +6702,14 @@ mod container_clock_tests {
             DispatchOutcome::Returned { value: 0 }
         );
         let open_file = dispatcher.open_file(fd as i32).expect("timerfd open file");
-        let open = open_file.description.read().expect("timerfd open description");
+        let description = open_file.description();
+        let open = description.read().expect("timerfd open description");
         let OpenDescription::TimerFd { state, .. } = &*open else {
             panic!("fd {fd} is not a timerfd");
         };
-        Arc::clone(state)
+        let state = Arc::clone(state);
+        drop(open);
+        (fd, state, description)
     }
 
     #[test]
@@ -6718,6 +6733,135 @@ mod container_clock_tests {
 
         assert_eq!(timerfd_ready_count(&timer_a), 1, "A's timerfd follows A's clock");
         assert_eq!(timerfd_ready_count(&timer_b), 0, "B's timerfd is bound to B's clock");
+    }
+
+    #[test]
+    fn timerfd_ready_bad_destination_consumes_expiration() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let deadline = wall_now() + Duration::from_secs(3600);
+        let (fd, _state, _) = armed_absolute_timerfd_with_flags(
+            &mut dispatcher,
+            &mut memory,
+            deadline,
+            LINUX_TFD_NONBLOCK,
+        );
+        let reporter = CompatReporter::default();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+
+        context
+            .task()
+            .container()
+            .clock()
+            .set_realtime_offset_ns(Duration::from_secs(7200).as_nanos() as i64);
+
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(SYS_READ, SyscallArgs([fd, MEM_BASE - 8, 8, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .expect("dispatch ready timerfd read to invalid destination"),
+            DispatchOutcome::errno(LINUX_EFAULT)
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(SYS_READ, SyscallArgs([fd, TIMESPEC_ADDR, 8, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .expect("dispatch nonblocking timerfd read after EFAULT"),
+            DispatchOutcome::errno(LINUX_EAGAIN),
+            "the failed copyout consumes the ready expiration"
+        );
+    }
+
+    #[test]
+    fn blocking_timerfd_read_keeps_its_description_across_close_and_fd_reuse() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let first_deadline = wall_now() + Duration::from_secs(3600);
+        let (fd, _old_state, old_description) =
+            armed_absolute_timerfd_with_flags(&mut dispatcher, &mut memory, first_deadline, 0);
+        let reporter = CompatReporter::default();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+
+        let blocked_read = match dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(SYS_READ, SyscallArgs([fd, TIMESPEC_ADDR, 8, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch blocking timerfd read")
+        {
+            DispatchOutcome::BlockingTimerFdRead(read) => read,
+            other => panic!("expected blocking timerfd read, got {other:?}"),
+        };
+
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(SYS_CLOSE, SyscallArgs([fd, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .expect("close old timerfd"),
+            DispatchOutcome::Returned { value: 0 }
+        );
+
+        let second_deadline = first_deadline + Duration::from_secs(7200);
+        let (reused_fd, new_state, new_description) = armed_absolute_timerfd_with_flags(
+            &mut dispatcher,
+            &mut memory,
+            second_deadline,
+            LINUX_TFD_NONBLOCK,
+        );
+        assert_eq!(reused_fd, fd, "timerfd slot must be reused for this regression");
+        assert!(
+            !Arc::ptr_eq(&old_description, &new_description),
+            "the reused slot must name a different file description"
+        );
+
+        context
+            .task()
+            .container()
+            .clock()
+            .set_realtime_offset_ns(Duration::from_secs(7200).as_nanos() as i64);
+        assert_eq!(timerfd_ready_count(&new_state), 0, "new timer must remain unready");
+
+        match blocked_read.complete(&mut memory) {
+            super::format_time::TimerFdReadStep::Done(DispatchOutcome::Returned { value }) => {
+                assert_eq!(value, 8)
+            }
+            other => panic!("old timerfd continuation did not complete from its own timer: {other:?}"),
+        }
+        let expirations = u64::from_le_bytes(
+            memory
+                .read_bytes(TIMESPEC_ADDR, 8)
+                .expect("read old timerfd result")
+                .try_into()
+                .expect("timerfd result width"),
+        );
+        assert_eq!(expirations, 1);
+
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(SYS_READ, SyscallArgs([reused_fd, TIMESPEC_ADDR, 8, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .expect("read reused nonblocking timerfd"),
+            DispatchOutcome::errno(LINUX_EAGAIN),
+            "the reused descriptor must not satisfy the old continuation"
+        );
     }
 }
 
@@ -8340,4 +8484,3 @@ mod inzone_tcp {
         assert_eq!(read_back, b"spliced-data");
     }
 }
-

@@ -286,7 +286,7 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
             "HVPatch continuation path retains prohibited host-blocking authority: {prohibited}"
         );
     }
-    assert_eq!(DISPATCH_FAMILIES.len() + 1, 16);
+    assert_eq!(DISPATCH_FAMILIES.len() + 1, 19);
     // The transitional runner pool and its ambient thread-locals are gone.
     // Nothing on the persistent executor ever published them, so every read
     // already answered None/false; they are deleted rather than left as a
@@ -669,6 +669,28 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
             close_pair(fds);
             DispatchOutcome::BlockingWrite(write)
         }
+        ContinuationFamily::TimerFdRead => DispatchOutcome::BlockingTimerFdRead(
+            crate::dispatch::format_time::timerfd_read_for_continuation_test(),
+        ),
+        ContinuationFamily::Semop => {
+            DispatchOutcome::BlockingSemop(crate::dispatch::blocking_semop_for_continuation_test())
+        }
+        ContinuationFamily::FdWait => {
+            let wait = match crate::dispatch::fd_wait::BlockingFdWait::new(
+                crate::dispatch::fd_wait::BlockingFdWaitKind::Poll {
+                    entries: Vec::new(),
+                },
+                None,
+                WaitFds::empty(),
+            ) {
+                Ok(wait) => wait,
+                Err(errno) => panic!("empty retained fd wait must admit: errno {errno:?}"),
+            };
+            DispatchOutcome::BlockingFdWait {
+                wait,
+                sig_mask: WaitSigMask::NONE,
+            }
+        }
         ContinuationFamily::BlockingRecordLock => {
             let contention = crate::dispatch::RecordLockContentionFixture::new();
             DispatchOutcome::BlockingRecordLock(contention.waiter(tid, 1))
@@ -701,7 +723,7 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
     }
 }
 
-const DISPATCH_FAMILIES: [ContinuationFamily; 15] = [
+const DISPATCH_FAMILIES: [ContinuationFamily; 18] = [
     ContinuationFamily::FutexWait,
     ContinuationFamily::FutexWaitv,
     ContinuationFamily::SharedFutexWait,
@@ -711,6 +733,9 @@ const DISPATCH_FAMILIES: [ContinuationFamily; 15] = [
     ContinuationFamily::WaitOnFdsSelect,
     ContinuationFamily::WaitOnPollFds,
     ContinuationFamily::BlockingWrite,
+    ContinuationFamily::TimerFdRead,
+    ContinuationFamily::Semop,
+    ContinuationFamily::FdWait,
     ContinuationFamily::BlockingRecordLock,
     ContinuationFamily::WaitOnProcExit,
     ContinuationFamily::WaitOnProcState,
@@ -730,7 +755,7 @@ fn continuation_family_event_codes_are_stable_unique_and_nonzero() {
     assert!(codes.iter().all(|code| *code != 0));
     codes.sort_unstable();
     codes.dedup();
-    assert_eq!(codes, (1_u8..=16).collect::<Vec<_>>());
+    assert_eq!(codes, (1_u8..=19).collect::<Vec<_>>());
 }
 
 fn assert_send_static<T: Send + 'static>(_: &T) {}
@@ -777,6 +802,9 @@ fn exhaustive_real_dispatch_shapes_become_owned_send_static_continuations() {
                     | ContinuationFamily::WaitOnFdsSelect
                     | ContinuationFamily::WaitOnPollFds
                     | ContinuationFamily::BlockingWrite
+                    | ContinuationFamily::TimerFdRead
+                    | ContinuationFamily::Semop
+                    | ContinuationFamily::FdWait
                     | ContinuationFamily::BlockingRecordLock
                     | ContinuationFamily::WaitOnProcExit
                     | ContinuationFamily::WaitOnProcState
@@ -1801,8 +1829,26 @@ fn timeout_signal_exec_exit_and_drop_cleanup_are_literal_for_every_family() {
             ) => assert_eq!(errno, LINUX_ETIMEDOUT),
             (ContinuationFamily::WaitOnFds, ContinuationCompletion::Return(-11))
             | (ContinuationFamily::WaitOnPollFds, ContinuationCompletion::Return(0))
-            | (ContinuationFamily::BlockingWrite, ContinuationCompletion::Return(2))
-            | (
+            | (ContinuationFamily::BlockingWrite, ContinuationCompletion::Return(2)) => {}
+            (ContinuationFamily::TimerFdRead, ContinuationCompletion::TimerFdRead(read)) => {
+                assert!(
+                    !read.plan().ready,
+                    "disarmed timerfd remains pending after timeout"
+                );
+            }
+            (ContinuationFamily::Semop, ContinuationCompletion::Semop(semop)) => {
+                assert!(
+                    semop.deadline().is_none(),
+                    "an untimed retained semop must remain pending on a synthetic timeout"
+                );
+            }
+            (ContinuationFamily::FdWait, ContinuationCompletion::FdWait { wait, .. }) => {
+                // Timeout hands the admitted operation back to the dispatcher.
+                // Dropping it here proves that this terminal test does not retain
+                // its exact-description leases past the completion boundary.
+                drop(wait);
+            }
+            (
                 ContinuationFamily::WaitOnSharedWord
                 | ContinuationFamily::BlockingRecordLock
                 | ContinuationFamily::WaitOnProcExit
@@ -2030,6 +2076,71 @@ fn fd_wait_subscription_rejects_close_reuse_before_redispatch() {
         ids.file_description_id().expect("successor description"),
     ));
     files.install(number, successor, false);
+    assert_eq!(
+        await_event(&service, token).expect("slot replacement readiness"),
+        ContinuationEvent::Ready
+    );
+    assert_eq!(
+        continuation.resume(ContinuationEvent::Ready, &context),
+        Err(ContinuationResumeError::StaleFileSlot)
+    );
+    close_pair(fds);
+}
+
+#[test]
+fn retained_fd_wait_rejects_close_reuse_before_sampling_its_pinned_target() {
+    let (kernel, context) = bootstrap(15_227);
+    let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+    let service = CarrierWaitService::new(scheduler);
+    let generation = publish(&context, 0x553);
+    let files = context.resources().files();
+    let number = crate::kernel::FileSlotNumber::for_open_fd(0).expect("stdin slot");
+    let ids = crate::kernel::ObjectIdRegistry::new();
+    files.install(
+        number,
+        Arc::new(crate::kernel::FileDescription::regular(
+            ids.file_description_id().expect("original description"),
+        )),
+        false,
+    );
+    let authority = files
+        .capture_slot_authority(number)
+        .expect("exact stdin authority");
+    let fds = pipe_pair();
+    let wait = match crate::dispatch::fd_wait::BlockingFdWait::new(
+        crate::dispatch::fd_wait::BlockingFdWaitKind::Poll {
+            entries: Vec::new(),
+        },
+        None,
+        WaitFds::raw_one(fds[0], libc::POLLIN).with_slot_authorities(vec![authority]),
+    ) {
+        Ok(wait) => wait,
+        Err(errno) => panic!("retained fd wait admission failed: errno {errno:?}"),
+    };
+    let mut continuation = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::BlockingFdWait {
+            wait,
+            sig_mask: WaitSigMask::NONE,
+        },
+        capture(&context, generation, ContinuationBackend::Hvpatch),
+    )
+    .expect("retained fd wait continuation");
+    let mut registration = service.prepare_registration(&continuation);
+    service
+        .enroll(&mut registration)
+        .expect("enroll retained fd wait");
+    let token = registration.wake_token();
+    continuation
+        .attach_registration(registration)
+        .expect("attach exact registration");
+
+    files.install(
+        number,
+        Arc::new(crate::kernel::FileDescription::regular(
+            ids.file_description_id().expect("successor description"),
+        )),
+        false,
+    );
     assert_eq!(
         await_event(&service, token).expect("slot replacement readiness"),
         ContinuationEvent::Ready
@@ -5322,13 +5433,7 @@ fn controller_mixed_ppoll_netlink_real_service_wake() {
         .dispatch(&context, req, &mut memory, &reporter)
         .unwrap();
     assert!(
-        matches!(
-            &outcome,
-            DispatchOutcome::WaitOnFds {
-                completion: FdWaitCompletion::Poll { .. },
-                ..
-            }
-        ),
+        matches!(&outcome, DispatchOutcome::BlockingFdWait { .. }),
         "mixed ppoll must yield: {outcome:?}"
     );
     let generation = publish(&context, 0x982);
@@ -5400,16 +5505,14 @@ fn controller_mixed_ppoll_netlink_real_service_wake() {
     }
     let event = event.unwrap().expect("real producer wake");
     assert_eq!(event, ContinuationEvent::Ready);
-    assert_eq!(
-        continuation.resume(event, &context).unwrap().completion,
-        ContinuationCompletion::Redispatch
-    );
-    assert_eq!(
-        dispatcher
-            .dispatch(&context, req, &mut memory, &reporter)
-            .unwrap(),
-        DispatchOutcome::Returned { value: 1 }
-    );
+    let completion = continuation.resume(event, &context).unwrap().completion;
+    let ContinuationCompletion::FdWait { wait, .. } = completion else {
+        panic!("mixed ppoll must complete its retained operation: {completion:?}");
+    };
+    assert!(matches!(
+        wait.complete(&mut memory, &dispatcher),
+        crate::dispatch::fd_wait::BlockingFdWaitStep::Done(DispatchOutcome::Returned { value: 1 })
+    ));
 }
 
 #[test]

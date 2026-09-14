@@ -20,6 +20,9 @@ use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::{GuestVa, SharedFutexLocation};
 use parking_lot::Mutex;
 
+use crate::dispatch::BlockingSemop;
+use crate::dispatch::fd_wait::BlockingFdWait;
+use crate::dispatch::format_time::{BlockingTimerFdRead, TimerFdPollSource};
 use crate::dispatch::{
     BlockingRecordLock, BlockingWrite, DispatchOutcome, FdWaitCompletion, SyscallRequest,
     WaitFdAuthority, WaitFds,
@@ -484,6 +487,9 @@ fn detail_diagnostic(detail: &ContinuationDetail) -> String {
             fd_authority_diagnostic(fd_authority)
         ),
         ContinuationDetail::BlockingWrite(_) => "blocking-write".to_owned(),
+        ContinuationDetail::TimerFdRead(_) => "timerfd-read".to_owned(),
+        ContinuationDetail::Semop(_) => "sysv-semop".to_owned(),
+        ContinuationDetail::FdWait(_) => "retained-fd-wait".to_owned(),
         ContinuationDetail::RecordLock(_) => "record-lock".to_owned(),
         ContinuationDetail::Process { selector, .. } => match selector {
             ChildSelector::Exact(task) => {
@@ -536,6 +542,8 @@ fn probe_diagnostic(probe: &ReadinessProbe) -> (String, Vec<DiagnosticPollFd>) {
                 events: *poll_events,
             }],
         ),
+        ReadinessProbe::TimerFdRead { .. } => ("timerfd-read".to_owned(), Vec::new()),
+        ReadinessProbe::Semop { .. } => ("sysv-semop".to_owned(), Vec::new()),
         ReadinessProbe::RecordLock { .. } => ("record-lock".to_owned(), Vec::new()),
         ReadinessProbe::TaskWake { task, observed, .. } => (
             task.upgrade().map_or_else(
@@ -665,6 +673,25 @@ fn own_wait_fds(fds: &WaitFds) -> Result<Vec<OwnedFdRegistration>, ContinuationB
         .collect()
 }
 
+fn fd_wait_deadline(
+    caller_deadline: Option<Instant>,
+    timer_sources: &[TimerFdPollSource],
+) -> Option<Instant> {
+    timer_sources
+        .iter()
+        .fold(caller_deadline, |deadline, source| {
+            let timer_deadline = source
+                .plan()
+                .host_timeout
+                .map(|timeout| Instant::now() + timeout);
+            match (deadline, timer_deadline) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+                (None, None) => None,
+            }
+        })
+}
+
 #[derive(Debug)]
 pub(in crate::vcpu_loop) enum ContinuationDetail {
     Futex {
@@ -692,6 +719,9 @@ pub(in crate::vcpu_loop) enum ContinuationDetail {
         fd_authority: WaitFdAuthority,
         on_timeout: i64,
         sig_mask: WaitSigMask,
+        timer_sources: Vec<TimerFdPollSource>,
+        caller_deadline: Option<Instant>,
+        timerfd_admission_stale: bool,
     },
     Select {
         #[allow(dead_code)]
@@ -699,8 +729,14 @@ pub(in crate::vcpu_loop) enum ContinuationDetail {
         file_table: Arc<crate::kernel::objects::FileTable>,
         fd_authority: WaitFdAuthority,
         sig_mask: WaitSigMask,
+        timer_sources: Vec<TimerFdPollSource>,
+        caller_deadline: Option<Instant>,
+        timerfd_admission_stale: bool,
     },
     BlockingWrite(Arc<Mutex<BlockingWrite>>),
+    TimerFdRead(Arc<Mutex<Option<BlockingTimerFdRead>>>),
+    Semop(Arc<Mutex<Option<BlockingSemop>>>),
+    FdWait(Arc<Mutex<Option<BlockingFdWait>>>),
     RecordLock(Arc<BlockingRecordLock>),
     Process {
         selector: ChildSelector,
@@ -796,6 +832,9 @@ pub enum BlockedContinuation {
     WaitOnFdsSelect(ContinuationState),
     WaitOnPollFds(ContinuationState),
     BlockingWrite(ContinuationState),
+    TimerFdRead(ContinuationState),
+    Semop(ContinuationState),
+    FdWait(ContinuationState),
     BlockingRecordLock(ContinuationState),
     WaitOnProcExit(ContinuationState),
     WaitOnProcState(ContinuationState),
@@ -816,6 +855,9 @@ pub enum ContinuationFamily {
     WaitOnFdsSelect,
     WaitOnPollFds,
     BlockingWrite,
+    TimerFdRead,
+    Semop,
+    FdWait,
     BlockingRecordLock,
     WaitOnProcExit,
     WaitOnProcState,
@@ -839,13 +881,16 @@ impl ContinuationFamily {
             Self::WaitOnFdsSelect => 7,
             Self::WaitOnPollFds => 8,
             Self::BlockingWrite => 9,
-            Self::BlockingRecordLock => 10,
-            Self::WaitOnProcExit => 11,
-            Self::WaitOnProcState => 12,
-            Self::WaitOnHvpatchChild => 13,
-            Self::WaitOnSignals => 14,
-            Self::WaitOnSleep => 15,
-            Self::VforkParent => 16,
+            Self::TimerFdRead => 10,
+            Self::Semop => 19,
+            Self::FdWait => 18,
+            Self::BlockingRecordLock => 11,
+            Self::WaitOnProcExit => 12,
+            Self::WaitOnProcState => 13,
+            Self::WaitOnHvpatchChild => 14,
+            Self::WaitOnSignals => 15,
+            Self::WaitOnSleep => 16,
+            Self::VforkParent => 17,
         }
     }
 
@@ -863,6 +908,9 @@ impl ContinuationFamily {
             Self::WaitOnFdsSelect => "wait-on-fds-select",
             Self::WaitOnPollFds => "wait-on-poll-fds",
             Self::BlockingWrite => "blocking-write",
+            Self::TimerFdRead => "timerfd-read",
+            Self::Semop => "sysv-semop",
+            Self::FdWait => "retained-fd-wait",
             Self::BlockingRecordLock => "blocking-record-lock",
             Self::WaitOnProcExit => "wait-on-proc-exit",
             Self::WaitOnProcState => "wait-on-proc-state",
@@ -898,6 +946,9 @@ pub const fn is_blocking_dispatch_outcome(outcome: &DispatchOutcome) -> bool {
             | DispatchOutcome::WaitOnSharedWord { .. }
             | DispatchOutcome::WaitOnFds { .. }
             | DispatchOutcome::BlockingWrite(_)
+            | DispatchOutcome::BlockingTimerFdRead(_)
+            | DispatchOutcome::BlockingSemop(_)
+            | DispatchOutcome::BlockingFdWait { .. }
             | DispatchOutcome::BlockingRecordLock(_)
             | DispatchOutcome::WaitOnProcExit { .. }
             | DispatchOutcome::WaitOnProcState { .. }
@@ -1053,8 +1104,9 @@ impl BlockedContinuation {
                 FdWaitCompletion::Fd { on_timeout } => {
                     let registrations = own_wait_fds(&fds)?;
                     let fd_authority = exact_slot_authorities(&fds)?;
+                    let caller_deadline = deadline(timeout);
                     Self::WaitOnFds(new_state(
-                        deadline(timeout),
+                        caller_deadline,
                         Vec::new(),
                         Some(sig_mask),
                         ContinuationDetail::Fds {
@@ -1063,12 +1115,18 @@ impl BlockedContinuation {
                             fd_authority,
                             on_timeout,
                             sig_mask,
+                            timer_sources: Vec::new(),
+                            caller_deadline,
+                            timerfd_admission_stale: false,
                         },
                     ))
                 }
                 FdWaitCompletion::Select { clear_on_timeout } => {
                     let registrations = own_wait_fds(&fds)?;
                     let fd_authority = exact_slot_authorities(&fds)?;
+                    let timer_sources = Vec::new();
+                    let timerfd_admission_stale = false;
+                    let caller_deadline = deadline(timeout);
                     let outputs = clear_on_timeout
                         .into_iter()
                         .map(|(address, len)| {
@@ -1076,7 +1134,7 @@ impl BlockedContinuation {
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     Self::WaitOnFdsSelect(new_state(
-                        deadline(timeout),
+                        fd_wait_deadline(caller_deadline, &timer_sources),
                         outputs,
                         Some(sig_mask),
                         ContinuationDetail::Select {
@@ -1084,14 +1142,20 @@ impl BlockedContinuation {
                             file_table: Arc::clone(&file_table),
                             fd_authority,
                             sig_mask,
+                            timer_sources,
+                            caller_deadline,
+                            timerfd_admission_stale,
                         },
                     ))
                 }
                 FdWaitCompletion::Poll { on_timeout } => {
                     let registrations = own_wait_fds(&fds)?;
                     let fd_authority = exact_slot_authorities(&fds)?;
+                    let timer_sources = Vec::new();
+                    let timerfd_admission_stale = false;
+                    let caller_deadline = deadline(timeout);
                     Self::WaitOnPollFds(new_state(
-                        deadline(timeout),
+                        fd_wait_deadline(caller_deadline, &timer_sources),
                         Vec::new(),
                         Some(sig_mask),
                         ContinuationDetail::Fds {
@@ -1100,6 +1164,9 @@ impl BlockedContinuation {
                             fd_authority,
                             on_timeout,
                             sig_mask,
+                            timer_sources,
+                            caller_deadline,
+                            timerfd_admission_stale,
                         },
                     ))
                 }
@@ -1109,6 +1176,28 @@ impl BlockedContinuation {
                 Vec::new(),
                 Some(WaitSigMask::NONE),
                 ContinuationDetail::BlockingWrite(Arc::new(Mutex::new(write))),
+            )),
+            DispatchOutcome::BlockingTimerFdRead(read) => {
+                let plan = read.plan();
+                let deadline = plan.host_timeout.map(|duration| Instant::now() + duration);
+                Self::TimerFdRead(new_state(
+                    deadline,
+                    Vec::new(),
+                    Some(WaitSigMask::NONE),
+                    ContinuationDetail::TimerFdRead(Arc::new(Mutex::new(Some(read)))),
+                ))
+            }
+            DispatchOutcome::BlockingSemop(semop) => Self::Semop(new_state(
+                semop.deadline(),
+                Vec::new(),
+                Some(WaitSigMask::NONE),
+                ContinuationDetail::Semop(Arc::new(Mutex::new(Some(semop)))),
+            )),
+            DispatchOutcome::BlockingFdWait { wait, sig_mask } => Self::FdWait(new_state(
+                fd_wait_deadline(wait.caller_deadline(), &wait.timer_sources()),
+                Vec::new(),
+                Some(sig_mask),
+                ContinuationDetail::FdWait(Arc::new(Mutex::new(Some(wait)))),
             )),
             DispatchOutcome::BlockingRecordLock(lock) => Self::BlockingRecordLock(new_state(
                 None,
@@ -1295,6 +1384,9 @@ impl BlockedContinuation {
             | Self::WaitOnFdsSelect(state)
             | Self::WaitOnPollFds(state)
             | Self::BlockingWrite(state)
+            | Self::TimerFdRead(state)
+            | Self::Semop(state)
+            | Self::FdWait(state)
             | Self::BlockingRecordLock(state)
             | Self::WaitOnProcExit(state)
             | Self::WaitOnProcState(state)
@@ -1316,6 +1408,9 @@ impl BlockedContinuation {
             | Self::WaitOnFdsSelect(state)
             | Self::WaitOnPollFds(state)
             | Self::BlockingWrite(state)
+            | Self::TimerFdRead(state)
+            | Self::Semop(state)
+            | Self::FdWait(state)
             | Self::BlockingRecordLock(state)
             | Self::WaitOnProcExit(state)
             | Self::WaitOnProcState(state)
@@ -1337,6 +1432,9 @@ impl BlockedContinuation {
             Self::WaitOnFdsSelect(_) => ContinuationFamily::WaitOnFdsSelect,
             Self::WaitOnPollFds(_) => ContinuationFamily::WaitOnPollFds,
             Self::BlockingWrite(_) => ContinuationFamily::BlockingWrite,
+            Self::TimerFdRead(_) => ContinuationFamily::TimerFdRead,
+            Self::Semop(_) => ContinuationFamily::Semop,
+            Self::FdWait(_) => ContinuationFamily::FdWait,
             Self::BlockingRecordLock(_) => ContinuationFamily::BlockingRecordLock,
             Self::WaitOnProcExit(_) => ContinuationFamily::WaitOnProcExit,
             Self::WaitOnProcState(_) => ContinuationFamily::WaitOnProcState,
@@ -1537,6 +1635,20 @@ impl BlockedContinuation {
             ContinuationDetail::BlockingWrite(write) => {
                 let write = write.lock();
                 fingerprint ^= write.poll_fd() as u64 ^ write.offset() as u64;
+            }
+            ContinuationDetail::TimerFdRead(read) => {
+                if let Some(read) = read.lock().as_ref() {
+                    fingerprint ^= read
+                        .plan()
+                        .deadline
+                        .map_or(0, |deadline| deadline.as_nanos() as u64);
+                }
+            }
+            ContinuationDetail::Semop(semop) => {
+                fingerprint ^= Arc::as_ptr(semop) as usize as u64;
+            }
+            ContinuationDetail::FdWait(wait) => {
+                fingerprint ^= Arc::as_ptr(wait) as usize as u64;
             }
             ContinuationDetail::RecordLock(lock) => {
                 fingerprint ^= std::mem::size_of_val(lock) as u64;
@@ -1744,6 +1856,18 @@ impl BlockedContinuation {
                 WaitFdAuthority::Empty | WaitFdAuthority::Internal(_) => true,
                 WaitFdAuthority::Missing => false,
             },
+            ContinuationDetail::FdWait(wait) => wait.lock().as_ref().is_some_and(|wait| match wait
+                .authority()
+            {
+                WaitFdAuthority::Logical { strict, .. } => strict.iter().all(|authority| {
+                    self.state()
+                        .authority
+                        .file_table
+                        .validate_slot_authority(*authority)
+                }),
+                WaitFdAuthority::Empty | WaitFdAuthority::Internal(_) => true,
+                WaitFdAuthority::Missing => false,
+            }),
             _ => true,
         };
         if !exact_file_slots_live {
@@ -1810,6 +1934,33 @@ impl BlockedContinuation {
                         };
                         ContinuationCompletion::RedispatchWithPartial(offset)
                     }
+                    ContinuationFamily::TimerFdRead => {
+                        let read = match &self.state().detail {
+                            ContinuationDetail::TimerFdRead(read) => read.lock().take(),
+                            _ => None,
+                        }
+                        .ok_or(ContinuationResumeError::MissingContinuation)?;
+                        ContinuationCompletion::TimerFdRead(read)
+                    }
+                    ContinuationFamily::Semop => {
+                        let semop = match &self.state().detail {
+                            ContinuationDetail::Semop(semop) => semop.lock().take(),
+                            _ => None,
+                        }
+                        .ok_or(ContinuationResumeError::MissingContinuation)?;
+                        ContinuationCompletion::Semop(semop)
+                    }
+                    ContinuationFamily::FdWait => {
+                        let wait = match &self.state().detail {
+                            ContinuationDetail::FdWait(wait) => wait.lock().take(),
+                            _ => None,
+                        }
+                        .ok_or(ContinuationResumeError::MissingContinuation)?;
+                        ContinuationCompletion::FdWait {
+                            wait,
+                            sig_mask: signal_masks.temporary.unwrap_or(WaitSigMask::NONE),
+                        }
+                    }
                     ContinuationFamily::VforkParent => {
                         match self
                             .vfork_child()
@@ -1860,6 +2011,33 @@ impl BlockedContinuation {
                         _ => 0,
                     };
                     ContinuationCompletion::Return(offset)
+                }
+                ContinuationFamily::TimerFdRead => {
+                    let read = match &self.state().detail {
+                        ContinuationDetail::TimerFdRead(read) => read.lock().take(),
+                        _ => None,
+                    }
+                    .ok_or(ContinuationResumeError::MissingContinuation)?;
+                    ContinuationCompletion::TimerFdRead(read)
+                }
+                ContinuationFamily::Semop => {
+                    let semop = match &self.state().detail {
+                        ContinuationDetail::Semop(semop) => semop.lock().take(),
+                        _ => None,
+                    }
+                    .ok_or(ContinuationResumeError::MissingContinuation)?;
+                    ContinuationCompletion::Semop(semop)
+                }
+                ContinuationFamily::FdWait => {
+                    let wait = match &self.state().detail {
+                        ContinuationDetail::FdWait(wait) => wait.lock().take(),
+                        _ => None,
+                    }
+                    .ok_or(ContinuationResumeError::MissingContinuation)?;
+                    ContinuationCompletion::FdWait {
+                        wait,
+                        sig_mask: signal_masks.temporary.unwrap_or(WaitSigMask::NONE),
+                    }
                 }
                 _ => ContinuationCompletion::Redispatch,
             },
@@ -2082,6 +2260,12 @@ pub enum ContinuationCompletion {
     BlockingWrite {
         write: BlockingWrite,
         outcome: BlockingWriteOutcome,
+    },
+    TimerFdRead(BlockingTimerFdRead),
+    Semop(BlockingSemop),
+    FdWait {
+        wait: BlockingFdWait,
+        sig_mask: WaitSigMask,
     },
     InterruptedSleep {
         remaining: Option<(GuestOutputRange, Duration)>,

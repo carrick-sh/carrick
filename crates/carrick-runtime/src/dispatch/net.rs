@@ -865,7 +865,7 @@ impl<'a> NetView<'a> {
     /// This special case stays outside the `FileDescription::readiness` authority
     /// because fds 0/1/2 with no installed description have no backing description
     /// object to query. Absent non-stdio descriptors report `POLLNVAL`.
-    fn bare_stdio_poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {
+    pub(super) fn bare_stdio_poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {
         if is_stdio_fd(fd) {
             // fd 1/2 are always writable (we either buffer or stream
             // straight to host write). For fd 0 we have to actually
@@ -2950,23 +2950,11 @@ impl<'a> NetView<'a> {
                     }
                 }
                 if !any && timeout_ms != 0 {
-                    let mut timeout = if timeout_ms < 0 {
+                    let timeout = if timeout_ms < 0 {
                         None
                     } else {
                         Some(std::time::Duration::from_millis(timeout_ms as u64))
                     };
-                    for (fd, _) in &owners {
-                        if *fd >= 0 {
-                            if let Some(open_file) = this.open_file(*fd) {
-                                if let Some(rem) = open_file.timerfd_remaining_timeout() {
-                                    timeout = match timeout {
-                                        None => Some(rem),
-                                        Some(prev) => Some(prev.min(rem)),
-                                    };
-                                }
-                            }
-                        }
-                    }
                     let mut wait_targets = Vec::new();
                     for (i, (fd, _)) in owners.iter().enumerate() {
                         if *fd < 0 {
@@ -2976,16 +2964,6 @@ impl<'a> NetView<'a> {
                             wait_targets.push((target.host_fd, target.host_events));
                         }
                     }
-                    let mut clear_on_timeout: Vec<(u64, usize)> = Vec::new();
-                    if let Some(s) = &read_set {
-                        clear_on_timeout.push((readfds_addr, s.len()));
-                    }
-                    if let Some(s) = &write_set {
-                        clear_on_timeout.push((writefds_addr, s.len()));
-                    }
-                    if let Some(s) = &except_set {
-                        clear_on_timeout.push((exceptfds_addr, s.len()));
-                    }
                     let files = this.captured_file_table();
                     let wait_fds = match WaitFds::raw(wait_targets)
                         .with_guest_slots(&files, owners.iter().map(|(fd, _)| *fd))
@@ -2993,12 +2971,37 @@ impl<'a> NetView<'a> {
                         Ok(wait_fds) => wait_fds,
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
-                    return Ok(DispatchOutcome::WaitOnFds {
-                        fds: wait_fds,
-                        timeout,
-                        sig_mask,
-                        completion: FdWaitCompletion::Select { clear_on_timeout },
-                    });
+                    let mut entries = Vec::with_capacity(owners.len());
+                    for (fd, requested) in &owners {
+                        let source = if files.is_bare_stdio_open(*fd) {
+                            crate::dispatch::fd_wait::RetainedFdSource::BareStdio
+                        } else {
+                            let authority = crate::kernel::FileSlotNumber::for_open_fd(*fd)
+                                .ok()
+                                .and_then(|number| files.capture_slot_authority(number));
+                            let Some(lease) = authority.and_then(|slot| files.retain_slot_lease(slot)) else {
+                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            };
+                            crate::dispatch::fd_wait::RetainedFdSource::Leased(lease)
+                        };
+                        entries.push(crate::dispatch::fd_wait::RetainedSelectFd {
+                            fd: *fd,
+                            requested: *requested as u8,
+                            source,
+                        });
+                    }
+                    let kind = crate::dispatch::fd_wait::BlockingFdWaitKind::Select {
+                        entries,
+                        read: read_set.map(|input| crate::dispatch::fd_wait::RetainedFdSet { address: readfds_addr, input }),
+                        write: write_set.map(|input| crate::dispatch::fd_wait::RetainedFdSet { address: writefds_addr, input }),
+                        except: except_set.map(|input| crate::dispatch::fd_wait::RetainedFdSet { address: exceptfds_addr, input }),
+                    };
+                    let caller_deadline = timeout.map(|duration| std::time::Instant::now() + duration);
+                    let wait = match crate::dispatch::fd_wait::BlockingFdWait::new(kind, caller_deadline, wait_fds) {
+                        Ok(wait) => wait,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    };
+                    return Ok(DispatchOutcome::BlockingFdWait { wait, sig_mask });
                 }
             }
 
@@ -3356,23 +3359,11 @@ impl<'a> NetView<'a> {
                 return Ok(DispatchOutcome::Returned { value: ready });
             }
 
-            let mut timeout = if timeout_ms < 0 {
+            let timeout = if timeout_ms < 0 {
                 None
             } else {
                 Some(std::time::Duration::from_millis(timeout_ms as u64))
             };
-            for pollfd in &fds {
-                if pollfd.fd >= 0 {
-                    if let Some(open_file) = this.open_file(pollfd.fd) {
-                        if let Some(rem) = open_file.timerfd_remaining_timeout() {
-                            timeout = match timeout {
-                                None => Some(rem),
-                                Some(prev) => Some(prev.min(rem)),
-                            };
-                        }
-                    }
-                }
-            }
             let mut wait_targets = Vec::new();
             for pollfd in &fds {
                 if pollfd.fd < 0 {
@@ -3389,12 +3380,32 @@ impl<'a> NetView<'a> {
                 Ok(wait_fds) => wait_fds,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            return Ok(DispatchOutcome::WaitOnFds {
-                fds: wait_fds,
-                timeout,
-                sig_mask,
-                completion: FdWaitCompletion::Poll { on_timeout: 0 },
-            });
+            let caller_deadline = timeout.map(|duration| std::time::Instant::now() + duration);
+            let entries = fds.iter().zip(addresses.iter()).map(|(pollfd, address)| -> Result<_, carrick_abi::LinuxErrno> {
+                let source = if pollfd.fd < 0 {
+                    crate::dispatch::fd_wait::RetainedFdSource::Negative
+                } else if files.is_bare_stdio_open(pollfd.fd) {
+                    crate::dispatch::fd_wait::RetainedFdSource::BareStdio
+                } else {
+                    let slot = crate::kernel::FileSlotNumber::for_open_fd(pollfd.fd).ok()
+                        .and_then(|number| files.capture_slot_authority(number));
+                    match slot.and_then(|slot| files.retain_slot_lease(slot)) {
+                        Some(lease) => crate::dispatch::fd_wait::RetainedFdSource::Leased(lease),
+                        None => return Err(LINUX_EBADF),
+                    }
+                };
+                Ok(crate::dispatch::fd_wait::RetainedPollFd { guest_fd: pollfd.fd, events: pollfd.events, address: *address, source })
+            }).collect::<Result<Vec<_>, _>>();
+            let entries = match entries { Ok(entries) => entries, Err(errno) => return Ok(DispatchOutcome::errno(errno)) };
+            let wait = match crate::dispatch::fd_wait::BlockingFdWait::new(
+                crate::dispatch::fd_wait::BlockingFdWaitKind::Poll { entries },
+                caller_deadline,
+                wait_fds,
+            ) {
+                Ok(wait) => wait,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            return Ok(DispatchOutcome::BlockingFdWait { wait, sig_mask });
         }
     }
 }
@@ -3446,6 +3457,9 @@ forward_net_handlers! {
 
 #[allow(dead_code)]
 impl SyscallDispatcher {
+    pub(in crate::dispatch) fn bare_stdio_poll_ready_events(&self, fd: i32, events: i16) -> i16 {
+        self.net_view().bare_stdio_poll_ready_events(fd, events)
+    }
     #[inline]
     pub(in crate::dispatch) fn host_socket_install(
         &self,

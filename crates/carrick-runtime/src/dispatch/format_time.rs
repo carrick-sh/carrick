@@ -17,11 +17,263 @@ use carrick_guest_mem::CurrentMmMemory;
 
 use crate::linux_abi::LinuxErrno;
 
+#[cfg(test)]
+use super::fd_table::{OpenDescription, OpenDescriptionBase, kernel_file_description};
 use super::fd_table::{TimerFdInner, TimerFdState};
 use super::{
     DispatchOutcome, GuestPtr, read_kernel_struct, time, write_kernel_struct,
     write_kernel_struct_raw,
 };
+
+/// Exact timerfd read retained while a blocking read is parked outside the
+/// dispatcher.  The functional lease keeps this particular description alive
+/// if its numeric slot is closed or reused before the timer becomes ready.
+#[derive(Clone, Debug)]
+pub struct BlockingTimerFdRead {
+    state: std::sync::Arc<TimerFdState>,
+    _lease: crate::kernel::objects::FileDescriptionFdLease,
+    address: u64,
+    deterministic_waiter:
+        Option<std::sync::Arc<crate::kernel::container::DeterministicWaiterSubscription>>,
+}
+
+/// Exact timerfd authority retained by a poll/select operation.
+///
+/// A timerfd deadline is a readiness edge, never the caller's poll timeout.
+/// Keeping the description lease here lets the continuation re-plan that edge
+/// after a rearm without consulting a numeric descriptor which may have been
+/// closed and reused meanwhile.
+#[derive(Clone, Debug)]
+pub(crate) struct TimerFdPollSource {
+    state: std::sync::Arc<TimerFdState>,
+    _lease: crate::kernel::objects::FileDescriptionFdLease,
+}
+
+/// The timer's observable state at continuation registration.  The deadline
+/// itself, rather than a host `Instant`, is the stable value: a registration
+/// must redispatch if `timerfd_settime` changed it in the gap before the queue
+/// subscription became live.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TimerFdReadPlan {
+    pub(crate) host_timeout: Option<Duration>,
+    pub(crate) virtual_due: Option<Duration>,
+    pub(crate) ready: bool,
+    pub(crate) deadline: Option<Duration>,
+    pub(crate) expirations: u64,
+    pub(crate) timer_generation: u64,
+    pub(crate) clock_generation: u64,
+}
+
+impl PartialEq for BlockingTimerFdRead {
+    fn eq(&self, other: &Self) -> bool {
+        self.address == other.address && std::sync::Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+impl Eq for BlockingTimerFdRead {}
+
+#[derive(Debug)]
+pub enum TimerFdReadStep {
+    Done(DispatchOutcome),
+    Wait(BlockingTimerFdRead),
+}
+
+impl BlockingTimerFdRead {
+    pub(crate) fn plan(&self) -> TimerFdReadPlan {
+        timerfd_plan(&self.state)
+    }
+
+    pub(crate) fn enroll_deterministic_waiter(
+        &mut self,
+        due: Option<Duration>,
+        callback: impl Fn() + Send + Sync + 'static,
+    ) {
+        if self.deterministic_waiter.is_none() {
+            self.deterministic_waiter = self
+                .state
+                .clock
+                .enroll_deterministic_waiter(due, callback)
+                .map(std::sync::Arc::new);
+        }
+    }
+
+    pub(crate) fn subscribe_change(
+        &self,
+        expected_generation: u64,
+        callback: std::sync::Arc<dyn Fn(u64) + Send + Sync + 'static>,
+    ) -> super::fd_table::TimerFdChangeEnrollment {
+        self.state.subscribe_change(expected_generation, callback)
+    }
+
+    pub(crate) fn state_clock(&self) -> &std::sync::Arc<crate::kernel::container::ClockDomain> {
+        &self.state.clock
+    }
+
+    pub(crate) fn complete(self, memory: &mut impl CurrentMmMemory) -> TimerFdReadStep {
+        let mut timer = self.state.inner.lock();
+        if refresh_timerfd_locked(&self.state.clock, &mut timer) == 0 {
+            drop(timer);
+            return TimerFdReadStep::Wait(self);
+        }
+        let value = LinuxTimerfdExpirations {
+            expirations: timer.expirations,
+        };
+        // Linux consumes the ready expiration before attempting the guest
+        // copyout: a bad destination returns EFAULT, and a later nonblocking
+        // read observes EAGAIN rather than the old count.
+        timer.expirations = 0;
+        if write_kernel_struct_raw(memory, self.address, &value).is_err() {
+            return TimerFdReadStep::Done(DispatchOutcome::errno(LINUX_EFAULT));
+        }
+        TimerFdReadStep::Done(DispatchOutcome::returned_len_or_errno(
+            core::mem::size_of::<LinuxTimerfdExpirations>(),
+        ))
+    }
+}
+
+impl TimerFdPollSource {
+    pub(in crate::dispatch) fn new(
+        state: std::sync::Arc<TimerFdState>,
+        lease: crate::kernel::objects::FileDescriptionFdLease,
+    ) -> Self {
+        Self {
+            state,
+            _lease: lease,
+        }
+    }
+
+    pub(crate) fn plan(&self) -> TimerFdReadPlan {
+        timerfd_plan(&self.state)
+    }
+
+    pub(crate) fn subscribe_change(
+        &self,
+        expected_generation: u64,
+        callback: std::sync::Arc<dyn Fn(u64) + Send + Sync + 'static>,
+    ) -> super::fd_table::TimerFdChangeEnrollment {
+        self.state.subscribe_change(expected_generation, callback)
+    }
+
+    pub(crate) fn state_clock(&self) -> &std::sync::Arc<crate::kernel::container::ClockDomain> {
+        &self.state.clock
+    }
+}
+
+/// Classify a lease-held description without a second fd-table lookup.
+pub(crate) fn timerfd_poll_source_from_lease(
+    lease: crate::kernel::objects::FileDescriptionFdLease,
+) -> Option<TimerFdPollSource> {
+    let open = lease.description().read()?;
+    let state = match &*open {
+        super::fd_table::OpenDescription::TimerFd { state, .. } => std::sync::Arc::clone(state),
+        _ => return None,
+    };
+    drop(open);
+    Some(TimerFdPollSource::new(state, lease))
+}
+
+fn timerfd_plan(state: &TimerFdState) -> TimerFdReadPlan {
+    let (clock_generation, plan) = state.clock.with_clock_change_snapshot(|| {
+        let mut timer = state.inner.lock();
+        let ready = refresh_timerfd_locked(&state.clock, &mut timer) > 0;
+        let deadline = timer.deadline;
+        let host_timeout = if ready {
+            Some(Duration::ZERO)
+        } else if state.clock.is_deterministic()
+            || (state.clock.is_frozen()
+                && matches!(
+                    timer.clock_id,
+                    LINUX_CLOCK_REALTIME
+                        | LINUX_CLOCK_REALTIME_COARSE
+                        | LINUX_CLOCK_REALTIME_ALARM
+                        | LINUX_CLOCK_TAI
+                ))
+        {
+            None
+        } else {
+            deadline.and_then(|deadline| {
+                linux_clock_duration(&state.clock, timer.clock_id)
+                    .map(|now| state.clock.scale_timeout(deadline.saturating_sub(now)))
+            })
+        };
+        let virtual_due = state
+            .clock
+            .is_deterministic()
+            .then(|| {
+                deadline.map(|deadline| match timer.clock_id {
+                    LINUX_CLOCK_REALTIME | LINUX_CLOCK_REALTIME_ALARM | LINUX_CLOCK_TAI => {
+                        deadline.saturating_sub(state.clock.realtime_epoch_duration())
+                    }
+                    _ => deadline,
+                })
+            })
+            .flatten();
+        TimerFdReadPlan {
+            host_timeout,
+            virtual_due,
+            ready,
+            deadline,
+            expirations: timer.expirations,
+            timer_generation: state.change_generation(),
+            clock_generation: 0,
+        }
+    });
+    TimerFdReadPlan {
+        clock_generation,
+        ..plan
+    }
+}
+
+pub(super) fn begin_timerfd_read(
+    memory: &mut impl CurrentMmMemory,
+    address: u64,
+    length: usize,
+    state: std::sync::Arc<TimerFdState>,
+    lease: crate::kernel::objects::FileDescriptionFdLease,
+    nonblocking: bool,
+) -> TimerFdReadStep {
+    if length < core::mem::size_of::<LinuxTimerfdExpirations>() {
+        return TimerFdReadStep::Done(DispatchOutcome::errno(LINUX_EINVAL));
+    }
+    let read = BlockingTimerFdRead {
+        state,
+        _lease: lease,
+        address,
+        deterministic_waiter: None,
+    };
+    match read.complete(memory) {
+        TimerFdReadStep::Wait(_read) if nonblocking => {
+            TimerFdReadStep::Done(DispatchOutcome::errno(LINUX_EAGAIN))
+        }
+        step => step,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn timerfd_read_for_continuation_test() -> BlockingTimerFdRead {
+    let state = std::sync::Arc::new(TimerFdState::new(
+        std::sync::Arc::new(crate::kernel::container::ClockDomain::system()),
+        LINUX_CLOCK_MONOTONIC,
+    ));
+    let description = kernel_file_description(
+        std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::TimerFd {
+            state: std::sync::Arc::clone(&state),
+            base: OpenDescriptionBase::new(0),
+        })),
+        0,
+    );
+    description.retain_fd_ref();
+    let lease = description
+        .retain_fd_lease()
+        .expect("live test description");
+    description.release_fd_ref();
+    BlockingTimerFdRead {
+        state,
+        _lease: lease,
+        address: 0,
+        deterministic_waiter: None,
+    }
+}
 
 pub(crate) enum DynamicCpuClock {
     /// Per-thread CPU clock → target thread kernel CPU accounting.
@@ -545,59 +797,6 @@ pub(super) fn linux_timeval_from_duration(duration: Duration) -> LinuxTimeval {
         duration.as_secs() as i64,
         i64::from(duration.subsec_micros()),
     )
-}
-
-pub(super) fn read_timerfd(
-    memory: &mut impl CurrentMmMemory,
-    address: u64,
-    length: usize,
-    state: &TimerFdState,
-    nonblocking: bool,
-) -> DispatchOutcome {
-    if length < core::mem::size_of::<LinuxTimerfdExpirations>() {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EINVAL,
-        };
-    }
-
-    let mut timer = state.inner.lock();
-    loop {
-        let ready = refresh_timerfd_locked(&state.clock, &mut timer);
-        if ready > 0 {
-            let value = LinuxTimerfdExpirations {
-                expirations: timer.expirations,
-            };
-            if write_kernel_struct_raw(memory, address, &value).is_err() {
-                return DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                };
-            }
-            timer.expirations = 0;
-            return DispatchOutcome::returned_len_or_errno(core::mem::size_of::<
-                LinuxTimerfdExpirations,
-            >());
-        }
-
-        if nonblocking {
-            return DispatchOutcome::Errno {
-                errno: LINUX_EAGAIN,
-            };
-        }
-
-        let Some(deadline) = timer.deadline else {
-            state.changed.wait(&mut timer);
-            continue;
-        };
-        let Some(now) = linux_clock_duration(&state.clock, timer.clock_id) else {
-            state.changed.wait(&mut timer);
-            continue;
-        };
-        let wait = deadline.saturating_sub(now);
-        if wait.is_zero() {
-            continue;
-        }
-        state.changed.wait_for(&mut timer, wait);
-    }
 }
 
 pub(super) fn refresh_timerfd_locked(

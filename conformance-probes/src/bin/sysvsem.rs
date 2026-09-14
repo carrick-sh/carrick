@@ -27,6 +27,121 @@ fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
+/// Final observation: workers have no timeout or independent release source.
+/// The harness bounds complete scheduler starvation; a running parent bounds
+/// completion collection before joining only workers that have finished.
+unsafe fn semop_worker_progress() {
+    const WORKERS: usize = 32;
+    let semid = libc::syscall(SYS_SEMGET, libc::IPC_PRIVATE, 1, IPC_CREAT | 0o600) as i32;
+    if semid < 0 {
+        println!("semop_worker_setup_errno={}", errno());
+        return;
+    }
+    let mut pipe = [-1; 2];
+    if libc::pipe(pipe.as_mut_ptr()) != 0 {
+        let error = errno();
+        semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
+        println!("semop_worker_setup_errno={error}");
+        return;
+    }
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS + 1));
+    let mut workers = Vec::with_capacity(WORKERS);
+    for _ in 0..WORKERS {
+        let barrier = std::sync::Arc::clone(&barrier);
+        let completion = pipe[1];
+        match std::thread::Builder::new().spawn(move || {
+            barrier.wait();
+            let op = Sembuf {
+                sem_num: 0,
+                sem_op: -1,
+                sem_flg: 0,
+            };
+            let rc = unsafe { libc::syscall(SYS_SEMOP, semid, &op, 1) };
+            let marker = [u8::from(rc == 0)];
+            unsafe {
+                libc::write(completion, marker.as_ptr().cast(), 1);
+            }
+            rc
+        }) {
+            Ok(worker) => workers.push(worker),
+            Err(error) => {
+                println!(
+                    "semop_worker_setup_errno={}",
+                    error.raw_os_error().unwrap_or(-1)
+                );
+                semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+                // Already created workers remain at the barrier. This is the
+                // final observation; returning from main terminates them.
+                return;
+            }
+        }
+    }
+    barrier.wait();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let release = Sembuf {
+        sem_num: 0,
+        sem_op: WORKERS as i16,
+        sem_flg: 0,
+    };
+    reset_errno();
+    let release_rc = libc::syscall(SYS_SEMOP, semid, &release, 1);
+    let release_errno = errno();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut completed = 0;
+    let mut successes = 0;
+    while completed < WORKERS && std::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let mut pollfd = libc::pollfd {
+            fd: pipe[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = libc::poll(&mut pollfd, 1, remaining.as_millis().min(100) as i32);
+        if ready < 0 && errno() != libc::EINTR {
+            break;
+        }
+        if ready <= 0 || pollfd.revents & libc::POLLIN == 0 {
+            continue;
+        }
+        let mut marker = [0u8; WORKERS];
+        let read = libc::read(pipe[0], marker.as_mut_ptr().cast(), WORKERS);
+        if read <= 0 {
+            break;
+        }
+        completed += read as usize;
+        successes += marker[..read as usize].iter().filter(|&&b| b == 1).count();
+    }
+    // A marker precedes the thread's return. Bound that last transition too;
+    // never use a join as an unbounded completion wait.
+    while completed == WORKERS
+        && workers.iter().any(|w| !w.is_finished())
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    let finished = workers.iter().all(|w| w.is_finished());
+    let mut joined = 0;
+    if finished {
+        for worker in workers {
+            if matches!(worker.join(), Ok(0)) {
+                joined += 1;
+            }
+        }
+    }
+    let value = semctl(semid, 0, GETVAL, core::ptr::null_mut());
+    let removed = semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
+    libc::close(pipe[0]);
+    libc::close(pipe[1]);
+    report!(semop_worker_parent_release_rc = release_rc);
+    report!(semop_worker_parent_release_errno = release_errno);
+    report!(semop_worker_successes = successes);
+    report!(semop_worker_joined = joined);
+    report!(semop_worker_final_value = value);
+    report!(semop_worker_remove_rc = removed);
+}
+
 unsafe fn reset_errno() {
     #[cfg(any(target_env = "gnu", target_env = "musl"))]
     {
@@ -64,16 +179,17 @@ unsafe fn wait_child_success(pid: libc::pid_t) -> bool {
 
 unsafe fn semop_rmid_wakes_child(sem_num: u16, initial_value: i32, sem_op: i16) -> bool {
     let nsems = i32::from(sem_num) + 1;
-    let semid = libc::syscall(
-        SYS_SEMGET,
-        libc::IPC_PRIVATE,
-        nsems,
-        IPC_CREAT | 0o600,
-    ) as i32;
+    let semid = libc::syscall(SYS_SEMGET, libc::IPC_PRIVATE, nsems, IPC_CREAT | 0o600) as i32;
     if semid < 0 {
         return false;
     }
-    if semctl(semid, i32::from(sem_num), SETVAL, initial_value as *mut libc::c_void) != 0 {
+    if semctl(
+        semid,
+        i32::from(sem_num),
+        SETVAL,
+        initial_value as *mut libc::c_void,
+    ) != 0
+    {
         semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
         return false;
     }
@@ -266,7 +382,10 @@ unsafe fn semctl_getpid_child_visible_as_zombie() -> (i32, bool) {
     semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
     (
         child_state,
-        reaped && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 && last_pid == pid as i64,
+        reaped
+            && libc::WIFEXITED(status)
+            && libc::WEXITSTATUS(status) == 0
+            && last_pid == pid as i64,
     )
 }
 
@@ -516,9 +635,7 @@ fn main() {
         report!(sem_stat_any_errno = stat_errno);
         report!(sem_stat_nsems_ok = sem_nsems == 2);
         report!(setval_getval = setval_ret == 0 && getval_ret == 5);
-        report!(
-            setall_getall = setall_ret == 0 && getall_ret == 0 && getall_values == [3, 7]
-        );
+        report!(setall_getall = setall_ret == 0 && getall_ret == 0 && getall_values == [3, 7]);
         report!(semop_decrement = semop_ret == 0 && semop_value == 1);
         report!(semop_e2big_ret = e2big_ret);
         report!(semop_e2big_errno = e2big_errno);
@@ -538,5 +655,6 @@ fn main() {
         report!(semtimedop_positive_overflow_erange = timed_overflow);
         report!(semctl_rmid_owner_ignores_mode = rmid_ignores_mode);
         report!(proc_sysvipc_sem_present = proc_sem.contains("semid"));
+        semop_worker_progress();
     }
 }
