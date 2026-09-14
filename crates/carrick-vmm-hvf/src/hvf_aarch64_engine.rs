@@ -309,6 +309,15 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         result
     }
 
+    fn pending_syscall_return(&self) -> Result<Option<i64>, TrapError> {
+        if self.mailbox.transport() == HvfSyscallTransport::Legacy {
+            return Ok(None);
+        }
+        self.mailbox.pending_normal_return().map_err(|error| {
+            TrapError::Hypervisor(format!("mailbox pending-return validation failed: {error}"))
+        })
+    }
+
     fn prepare_register_resume(&mut self) -> Result<(), TrapError> {
         self.mailbox
             .publish_register_resume_if_outstanding()

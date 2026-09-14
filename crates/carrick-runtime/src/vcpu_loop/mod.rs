@@ -658,6 +658,7 @@ impl KernelState {
         self: &Arc<Self>,
         futex: Arc<FutexTable>,
         kicker: Arc<dyn VcpuRegistry>,
+        platform_futex: Arc<dyn PlatformFutex>,
     ) {
         let (Some(process), Some(directory)) =
             (self.hvpatch_process.as_ref(), self.hvpatch_runtime.as_ref())
@@ -678,6 +679,8 @@ impl KernelState {
         signal_context.task().set_waker(Arc::new(HvpatchTaskWaker {
             futex,
             kicker,
+            platform_futex,
+            signal_pump: Arc::clone(&self.signal_pump),
             signal_arrival: Arc::clone(&self.signal_arrival),
         }));
         directory.register_endpoint(process.task_key(), Arc::downgrade(self), binding);

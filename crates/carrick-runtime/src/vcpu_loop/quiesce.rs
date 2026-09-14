@@ -2246,7 +2246,7 @@ where
         let mut child_state = ThreadRuntimeState::<E>::new(
             Arc::clone(&child_registry),
             Arc::clone(&child_futex),
-            child_platform_futex,
+            Arc::clone(&child_platform_futex),
             Arc::clone(&self.platform_futex_factory),
             child_kernel.process_fork_barrier.clone(),
             child_kernel.crash_capture.clone(),
@@ -2354,8 +2354,11 @@ where
                     "prepare dormant process child failed: child_pid={child_pid}, error={error}"
                 );
             });
-        child_kernel
-            .register_hvpatch_runtime_endpoint(Arc::clone(&child_futex), Arc::clone(&child_kicker));
+        child_kernel.register_hvpatch_runtime_endpoint(
+            Arc::clone(&child_futex),
+            Arc::clone(&child_kicker),
+            child_platform_futex,
+        );
         if let Err(error) = child_kernel.admit_external_exec(child_context.task().key()) {
             return Err(ops.fail_stop(error));
         }

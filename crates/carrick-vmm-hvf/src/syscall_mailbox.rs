@@ -177,6 +177,8 @@ pub enum MailboxConsumeError {
     AlreadyParked,
     #[error("AArch64 syscall mailbox binding is not parked")]
     NotParked,
+    #[error("AArch64 syscall mailbox binding has no live slot")]
+    NoLiveSlot,
 }
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -673,6 +675,80 @@ impl MailboxBinding {
         self.state()
             .store(MailboxState::ResponseReady.raw(), Ordering::Release);
         Ok(())
+    }
+
+    /// Read a normal return that this exact binding has published but the EL1
+    /// trampoline has not consumed. This is the authoritative x0 source when a
+    /// signal replaces a mailbox return before `eret` reaches EL0.
+    pub fn pending_normal_return(&self) -> Result<Option<i64>, MailboxConsumeError> {
+        if self.lease.is_none() {
+            return Err(MailboxConsumeError::NoLiveSlot);
+        }
+        let state = self.state().load(Ordering::Acquire);
+        match MailboxState::try_from(state) {
+            Ok(MailboxState::ResponseReady) => {}
+            Ok(MailboxState::Idle | MailboxState::RequestReady) => return Ok(None),
+            Err(unknown) => {
+                return Err(MailboxConsumeError::Protocol(
+                    MailboxProtocolError::UnexpectedState {
+                        expected: MailboxState::ResponseReady,
+                        actual: unknown.0,
+                    },
+                ));
+            }
+        }
+        // SAFETY: the acquire above observes the host-published response and
+        // this binding owns the mapped slot for its entire lifetime.
+        let (magic, version, size, generation, sequence, action, value) = unsafe {
+            let mailbox = self.host.as_ptr();
+            (
+                core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).magic)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).version)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).size)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).generation)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).response_action)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).return_value)),
+            )
+        };
+        if magic != AARCH64_SYSCALL_MAILBOX_MAGIC {
+            return Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::WrongMagic { actual: magic },
+            ));
+        }
+        if version != AARCH64_SYSCALL_MAILBOX_VERSION {
+            return Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::WrongVersion { actual: version },
+            ));
+        }
+        if size != AARCH64_SYSCALL_MAILBOX_SIZE as u32 {
+            return Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::WrongSize { actual: size },
+            ));
+        }
+        if generation != self.generation {
+            return Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::StaleGeneration {
+                    expected: self.generation,
+                    actual: generation,
+                },
+            ));
+        }
+        if sequence != self.last_sequence {
+            return Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::ResponseSequenceMismatch {
+                    expected: self.last_sequence,
+                    actual: sequence,
+                },
+            ));
+        }
+        match MailboxResponseAction::try_from(action) {
+            Ok(MailboxResponseAction::NormalReturn) => Ok(Some(value as i64)),
+            Ok(MailboxResponseAction::RegistersPrepared) => Ok(None),
+            Err(unknown) => Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::UnknownResponseAction(unknown.0),
+            )),
+        }
     }
 
     pub fn publish_registers_prepared(&mut self) -> Result<(), MailboxConsumeError> {
@@ -1329,6 +1405,44 @@ mod tests {
         binding
             .publish_register_resume_if_outstanding()
             .expect("idle resume");
+    }
+
+    #[test]
+    fn pending_normal_return_is_exact_and_register_resume_supersedes_it() {
+        let (mut binding, mut mailbox) = binding();
+        publish_valid_request(&binding, &mut mailbox);
+        binding.take_request().unwrap().expect("request");
+        binding.publish_normal_return(-77).expect("normal return");
+        assert_eq!(binding.pending_normal_return().unwrap(), Some(-77));
+
+        binding
+            .publish_register_resume_if_outstanding()
+            .expect("signal prepared registers");
+        assert_eq!(binding.pending_normal_return().unwrap(), None);
+    }
+
+    #[test]
+    fn pending_normal_return_rejects_stale_generation_and_sequence() {
+        let (mut binding, mut mailbox) = binding();
+        publish_valid_request(&binding, &mut mailbox);
+        binding.take_request().unwrap().expect("request");
+        binding.publish_normal_return(91).expect("normal return");
+
+        mailbox.generation = mailbox.generation.wrapping_add(1);
+        assert!(matches!(
+            binding.pending_normal_return(),
+            Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::StaleGeneration { .. }
+            ))
+        ));
+        mailbox.generation = binding.generation();
+        mailbox.sequence = mailbox.sequence.wrapping_add(1);
+        assert!(matches!(
+            binding.pending_normal_return(),
+            Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::ResponseSequenceMismatch { .. }
+            ))
+        ));
     }
 
     #[test]

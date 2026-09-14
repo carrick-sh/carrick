@@ -3801,6 +3801,62 @@ where
         if !entered_guest {
             return Ok(executor::ExecutorExit::Syscall);
         }
+        // Close the publication-vs-entry race for kernel-originated wakes. The
+        // participant first publishes `in_guest`, then checks debt belonging to
+        // this exact registration enrollment. A publication after the prior
+        // host-side signal check therefore either observes us in guest and
+        // kicks, or is observed here before the engine can enter.
+        if let Some(debt) = self.state.kicker.kernel_wake_debt_for(self.state.this_tid) {
+            self.state.in_guest.leave_guest();
+            // At EL0 this is a kick-style interruption and the live PC/PSTATE
+            // are authoritative. At EL1 the engine is parked in Carrick's
+            // syscall/ERET trampoline, so treating that PC as guest code would
+            // corrupt the in-flight return; use the syscall-boundary ELR/SPSR
+            // path instead. This is the same invariant enforced inside HVF's
+            // run-until-syscall kick handling.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let interrupted_pc = if carrick_hal::ExecLevel::from_pstate(
+                engine
+                    .get_reg(carrick_hal::Reg::Pstate)
+                    .map_err(|error| TrapError::Hypervisor(error.to_string()))?,
+            )
+            .is_guest()
+            {
+                Some(engine.current_pc()?)
+            } else {
+                None
+            };
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let interrupted_pc = Some(engine.current_pc()?);
+            let signal_context = self
+                .kernel
+                .dispatcher
+                .capture_kernel_context(self.state.linux_tid)
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "capture kernel-wake signal context: {error}"
+                    ))
+                })?;
+            let outcome = service_signals_threaded(
+                &self.kernel,
+                &signal_context,
+                engine,
+                self.state.this_tid,
+                self.state.fatal_image_generation,
+                None,
+                interrupted_pc,
+                None,
+                None,
+                self.traps,
+            )?;
+            self.state
+                .kicker
+                .acknowledge_kernel_wake_debt(self.state.this_tid, debt);
+            if let Some(outcome) = outcome {
+                return Ok(self.enter_terminal_with_outcome(engine, outcome));
+            }
+            return Ok(executor::ExecutorExit::Syscall);
+        }
         self.state
             .publish_thread_run_state(crate::run_state::RunState::Running, 'R');
         if let Some(thread) = self.state.kernel_thread.as_ref() {

@@ -308,7 +308,16 @@ pub fn spawn_signal_pump(
     kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
     futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
 ) -> SignalPump {
-    spawn_signal_pump_inner(kicker, futex, true)
+    spawn_signal_pump_inner(kicker, futex, true, None)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn spawn_signal_pump_with_kernel_retry(
+    kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
+    futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
+    retry: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+) -> SignalPump {
+    spawn_signal_pump_inner(kicker, futex, true, Some(retry))
 }
 
 /// Spawn only the host-signal/xsignal wake half of the macOS pump. The native
@@ -321,7 +330,7 @@ pub fn spawn_signal_wake_pump(
     kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
     futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
 ) -> SignalPump {
-    spawn_signal_pump_inner(kicker, futex, false)
+    spawn_signal_pump_inner(kicker, futex, false, None)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -404,6 +413,7 @@ fn spawn_signal_pump_inner(
     kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
     futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
     monitor_hvf_events: bool,
+    kernel_retry: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> SignalPump {
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let exited = ExitSignal::new();
@@ -484,6 +494,9 @@ fn spawn_signal_pump_inner(
             let mut retry_armed = durable_signal_retry_is_owed();
             thread_ready.raise();
             while thread_running.load(std::sync::atomic::Ordering::SeqCst) {
+                if let Some(retry) = kernel_retry.as_ref() {
+                    retry_armed |= retry();
+                }
                 // Pipes and kqueue user events are notifications, never the
                 // source of truth. Reconcile before the FIRST wait and every
                 // subsequent wait so pre-start publication, fork pipe
@@ -495,7 +508,7 @@ fn spawn_signal_pump_inner(
                         kicker.as_ref(),
                         futex.as_ref(),
                     );
-                    retry_armed = durable_signal_retry_is_owed();
+                    retry_armed |= durable_signal_retry_is_owed();
                 }
                 // Reconcile registered timers with the armed slots BEFORE waiting,
                 // so a just-armed (or re-armed) timer is registered in this
@@ -557,7 +570,9 @@ fn spawn_signal_pump_inner(
                     // A one-shot HVF exit can be swallowed at EL1. Retry only
                     // vCPUs that are still in guest code; once every target is
                     // back in host code, disarm the timeout and genuinely park.
-                    retry_armed = retry_durable_signal_kicks(kicker.as_ref());
+                    let host_retry_owed = retry_durable_signal_kicks(kicker.as_ref());
+                    let kernel_retry_owed = kernel_retry.as_ref().is_some_and(|retry| retry());
+                    retry_armed = host_retry_owed || kernel_retry_owed;
                     continue;
                 }
                 for event in out.iter().take(n) {

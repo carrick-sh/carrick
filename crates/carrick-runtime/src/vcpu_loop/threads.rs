@@ -764,6 +764,7 @@ where
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 2);
         crate::run_state::clear_guest_tid(self.this_tid.raw());
         self.kicker.unregister(self.this_tid);
+        self.kicker.retire_kernel_wake_debt(self.this_tid);
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 3);
         crate::host_signal::forget_thread(self.this_tid.raw());
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 4);

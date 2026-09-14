@@ -248,6 +248,12 @@ pub trait Aarch64Vcpu {
         Ok(())
     }
 
+    /// Return an ordinary syscall result still owned by a backend response
+    /// mailbox. Register-return backends keep the default: x0 is already live.
+    fn pending_syscall_return(&self) -> Result<Option<i64>, TrapError> {
+        Ok(None)
+    }
+
     /// Publish that the host has replaced the live register resume context.
     ///
     /// Most backends return directly through their register file and need no

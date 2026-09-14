@@ -76,6 +76,8 @@ pub(crate) struct HvpatchTaskWaker {
     /// boundary where it polls. Process-scoped, which is correct here: the
     /// waker is registered per Linux process with that process's own kicker.
     pub(crate) kicker: Arc<dyn VcpuRegistry>,
+    pub(crate) platform_futex: Arc<dyn carrick_hal::PlatformFutex>,
+    pub(crate) signal_pump: Arc<dyn carrick_hal::SignalPumpControl>,
     /// Writes the wake pipes every parked `ThreadWaiter` kqueue watches.
     pub(crate) signal_arrival: Arc<dyn SignalArrival>,
 }
@@ -88,6 +90,8 @@ impl std::fmt::Debug for HvpatchTaskWaker {
 
 impl crate::kernel::TaskWaker for HvpatchTaskWaker {
     fn wake_task(&self) {
+        self.signal_pump
+            .publish_kernel_wake(&self.kicker, &self.platform_futex);
         self.futex.notify_signal_pending();
         // Shared (`MAP_SHARED`) futex waiters park in the CARRIER-wide table,
         // not this process's — a wake that only pokes `self.futex` leaves a

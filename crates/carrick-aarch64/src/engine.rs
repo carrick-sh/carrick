@@ -2630,6 +2630,10 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                 self.get_reg(Reg::Pc)
                     .map_err(|error| TrapError::Hypervisor(error.to_string()))
             })?;
+        let pending_syscall_retval =
+            pending_syscall_retval_for_boundary(pending_syscall_retval, interrupted_pc, || {
+                self.vcpu.pending_syscall_return()
+            })?;
         // The interrupted PSTATE to save into the sigframe: KICK path (interrupted_pc
         // set, EL0) → the live CPSR we just read; SYSCALL/eret path → SPSR_EL1 where
         // the `svc`/sigreturn-svc latched the EL0 PSTATE. Single-sourced (F7); reuse
@@ -2686,6 +2690,18 @@ fn signal_interrupted_pc_for_live_level(
         interrupted_pc.map_or_else(|| live_pc().map(Some), |pc| Ok(Some(pc)))
     } else {
         Ok(None)
+    }
+}
+
+fn pending_syscall_retval_for_boundary(
+    caller: Option<i64>,
+    interrupted_pc: Option<u64>,
+    backend: impl FnOnce() -> Result<Option<i64>, TrapError>,
+) -> Result<Option<i64>, TrapError> {
+    if caller.is_none() && interrupted_pc.is_none() {
+        backend()
+    } else {
+        Ok(caller)
     }
 }
 
@@ -4460,6 +4476,25 @@ mod tests {
         .expect("EL1 signal route");
 
         assert_eq!(pc, None);
+    }
+
+    #[test]
+    fn el1_signal_recovers_backend_mailbox_return_only_when_caller_has_none() {
+        let recovered = pending_syscall_retval_for_boundary(None, None, || Ok(Some(-77)))
+            .expect("EL1 mailbox authority");
+        assert_eq!(recovered, Some(-77));
+
+        let explicit = pending_syscall_retval_for_boundary(Some(42), None, || {
+            panic!("caller-owned return must win")
+        })
+        .expect("caller return");
+        assert_eq!(explicit, Some(42));
+
+        let el0 = pending_syscall_retval_for_boundary(None, Some(0x4000), || {
+            panic!("EL0 signal must preserve live x0")
+        })
+        .expect("EL0 live-register authority");
+        assert_eq!(el0, None);
     }
 
     #[test]

@@ -418,7 +418,11 @@ where
         shared_hvpatch_runtime,
         None,
     ));
-    kernel.register_hvpatch_runtime_endpoint(Arc::clone(&futex), Arc::clone(&kicker));
+    kernel.register_hvpatch_runtime_endpoint(
+        Arc::clone(&futex),
+        Arc::clone(&kicker),
+        Arc::clone(&platform_futex),
+    );
     let mut control_exec = None;
     // Mutating carrier control is mandatory for a managed detached container.
     // Publish Running only after the socket is bound and the exact root task has
