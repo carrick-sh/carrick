@@ -48,18 +48,45 @@ impl PartialEq for PinnedHostFd {
 
 impl Eq for PinnedHostFd {}
 
+/// Exact write target retained across a blocking-write continuation.
+///
+/// A host target owns a duplicated descriptor. An in-memory-pipe target owns
+/// both the exact writer description's functional reference and the readiness
+/// fd which represents that pipe's writable level. Neither variant ever
+/// resolves a numeric guest fd after the syscall has parked.
+#[derive(Clone)]
+pub(crate) enum BlockingWriteTarget {
+    Host(Arc<PinnedHostFd>),
+    InMemoryPipe(Arc<crate::dispatch::fs::pipe::PipeWriteEndpointLease>),
+}
+
+impl PartialEq for BlockingWriteTarget {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Host(left), Self::Host(right)) => left == right,
+            (Self::InMemoryPipe(left), Self::InMemoryPipe(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for BlockingWriteTarget {}
+
 #[derive(Clone, PartialEq, Eq, Serialize)]
-pub struct BlockingHostWrite {
+pub struct BlockingWrite {
     #[serde(skip_serializing)]
-    pub(in crate::dispatch) host_fd: Arc<PinnedHostFd>,
+    pub(in crate::dispatch) target: BlockingWriteTarget,
     #[serde(skip_serializing)]
     pub(in crate::dispatch) bytes: Vec<u8>,
+    /// Bytes already committed by earlier segments of the same writev call.
+    /// `offset` is relative to `bytes`; Linux receives their sum.
+    pub(in crate::dispatch) committed_prefix: usize,
     pub(in crate::dispatch) offset: usize,
     pub(in crate::dispatch) tid: crate::thread::ThreadId,
     pub(in crate::dispatch) sigpipe_on_epipe: bool,
 }
 
-impl BlockingHostWrite {
+impl BlockingWrite {
     pub(crate) fn from_vec(
         host_fd: i32,
         bytes: Vec<u8>,
@@ -68,20 +95,31 @@ impl BlockingHostWrite {
         sigpipe_on_epipe: bool,
     ) -> Result<Self, LinuxErrno> {
         Ok(Self {
-            host_fd: Arc::new(PinnedHostFd::new(host_fd)?),
+            target: BlockingWriteTarget::Host(Arc::new(PinnedHostFd::new(host_fd)?)),
             bytes,
             offset,
+            committed_prefix: 0,
             tid,
             sigpipe_on_epipe,
         })
     }
 
-    pub(crate) fn host_fd(&self) -> i32 {
-        self.host_fd.as_raw_fd()
+    pub(crate) fn poll_fd(&self) -> i32 {
+        match &self.target {
+            BlockingWriteTarget::Host(host_fd) => host_fd.as_raw_fd(),
+            BlockingWriteTarget::InMemoryPipe(endpoint) => endpoint.readiness_fd().raw(),
+        }
+    }
+
+    pub(crate) fn poll_events(&self) -> i16 {
+        match &self.target {
+            BlockingWriteTarget::Host(_) => libc::POLLOUT,
+            BlockingWriteTarget::InMemoryPipe(_) => libc::POLLIN,
+        }
     }
 
     pub(crate) fn offset(&self) -> usize {
-        self.offset
+        self.committed_prefix.saturating_add(self.offset)
     }
 
     pub(crate) fn tid(&self) -> crate::thread::ThreadId {
@@ -90,6 +128,53 @@ impl BlockingHostWrite {
 
     pub(crate) fn sigpipe_on_epipe(&self) -> bool {
         self.sigpipe_on_epipe
+    }
+
+    pub(crate) fn in_memory_pipe(
+        endpoint: Arc<crate::dispatch::fs::pipe::PipeWriteEndpointLease>,
+        bytes: Vec<u8>,
+        offset: usize,
+        tid: crate::thread::ThreadId,
+        sigpipe_on_epipe: bool,
+    ) -> Self {
+        Self {
+            target: BlockingWriteTarget::InMemoryPipe(endpoint),
+            bytes,
+            offset,
+            committed_prefix: 0,
+            tid,
+            sigpipe_on_epipe,
+        }
+    }
+
+    /// Extend an in-memory pipe continuation with staged writev bytes, then
+    /// retain only the aggregate prefix that the pipe copy completed before a
+    /// later guest-memory fault. `boundary` is the guest-visible byte count
+    /// from the start of this writev call.
+    pub(crate) fn with_in_memory_pipe_writev_boundary(
+        mut self,
+        tail: Vec<u8>,
+        committed_prefix: usize,
+        boundary: usize,
+    ) -> Self {
+        debug_assert!(matches!(self.target, BlockingWriteTarget::InMemoryPipe(_)));
+        self.bytes.extend_from_slice(&tail);
+        self.committed_prefix = committed_prefix;
+        // `offset` has already been published to the pipe and cannot be
+        // undone. The boundary can otherwise cut the parked current iovec as
+        // well as later staged vectors.
+        let retained = boundary
+            .saturating_sub(committed_prefix)
+            .max(self.offset)
+            .min(self.bytes.len());
+        self.bytes.truncate(retained);
+        self
+    }
+
+    pub(crate) fn with_writev_tail(mut self, tail: Vec<u8>, committed_prefix: usize) -> Self {
+        self.bytes.extend_from_slice(&tail);
+        self.committed_prefix = committed_prefix;
+        self
     }
 
     #[cfg(test)]
@@ -105,12 +190,12 @@ impl BlockingHostWrite {
     }
 }
 
-impl std::fmt::Debug for BlockingHostWrite {
+impl std::fmt::Debug for BlockingWrite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BlockingHostWrite")
-            .field("host_fd", &self.host_fd.as_raw_fd())
+        f.debug_struct("BlockingWrite")
+            .field("poll_fd", &self.poll_fd())
             .field("bytes_len", &self.bytes.len())
-            .field("offset", &self.offset)
+            .field("offset", &self.offset())
             .field("tid", &self.tid)
             .field("sigpipe_on_epipe", &self.sigpipe_on_epipe)
             .finish()
@@ -141,63 +226,115 @@ impl std::fmt::Debug for BlockingRecordLock {
     }
 }
 
-pub(crate) enum BlockingHostWriteStep {
+pub(crate) enum BlockingWriteStep {
     Done(DispatchOutcome),
     Wait,
 }
 
-pub(crate) fn drive_blocking_host_write(write: &mut BlockingHostWrite) -> BlockingHostWriteStep {
+pub(crate) fn drive_blocking_write(write: &mut BlockingWrite) -> BlockingWriteStep {
+    // Copy the target handle before mutating progress.  A parked continuation
+    // owns this handle, so the clone keeps the same descriptor/endpoint
+    // authority without borrowing `write.target` across the progress update.
+    match write.target.clone() {
+        BlockingWriteTarget::Host(host_fd) => drive_host_blocking_write(write, &host_fd),
+        BlockingWriteTarget::InMemoryPipe(endpoint) => drive_in_memory_pipe_write(write, &endpoint),
+    }
+}
+
+fn drive_host_blocking_write(
+    write: &mut BlockingWrite,
+    host_fd: &Arc<PinnedHostFd>,
+) -> BlockingWriteStep {
     loop {
         if write.offset >= write.bytes.len() {
-            return BlockingHostWriteStep::Done(DispatchOutcome::returned_len_or_errno(
-                write.bytes.len(),
+            return BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(
+                write.committed_prefix + write.bytes.len(),
             ));
         }
-        // BLOCKING-IO-OK: BlockingHostWrite pins a dup of a host fd that was
+        // BLOCKING-IO-OK: BlockingWrite pins a dup of a host fd that was
         // adopted non-blocking before the handoff; EAGAIN returns Wait below.
         let n = unsafe {
             libc::write(
-                write.host_fd(),
+                host_fd.as_raw_fd(),
                 write.bytes[write.offset..].as_ptr() as *const _,
                 write.bytes.len() - write.offset,
             )
         };
-        crate::probes::host_pipe_io(write.host_fd(), 1, n as i64);
+        crate::probes::host_pipe_io(host_fd.as_raw_fd(), 1, n as i64);
         if let Err(errno) = n.host_syscall_errno() {
             if errno == LINUX_EAGAIN || errno == LINUX_EINTR {
                 if crate::host_signal::has_unblocked_pending_for(
                     write.tid.raw(),
                     SigBlockMask::NONE,
                 ) {
-                    return BlockingHostWriteStep::Done(DispatchOutcome::returned_len_or_errno(
-                        write.offset,
+                    return BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(
+                        write.offset(),
                     ));
                 }
-                return BlockingHostWriteStep::Wait;
+                return BlockingWriteStep::Wait;
             }
-            if write.offset > 0 {
-                return BlockingHostWriteStep::Done(DispatchOutcome::returned_len_or_errno(
-                    write.offset,
+            if write.offset() > 0 {
+                return BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(
+                    write.offset(),
                 ));
             }
-            return BlockingHostWriteStep::Done(DispatchOutcome::Errno { errno });
+            return BlockingWriteStep::Done(DispatchOutcome::Errno { errno });
         }
         if n == 0 {
-            return BlockingHostWriteStep::Done(DispatchOutcome::returned_len_or_errno(
-                write.offset,
-            ));
+            return BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(write.offset()));
         }
         write.offset += n as usize;
         if write.offset >= write.bytes.len() {
-            return BlockingHostWriteStep::Done(DispatchOutcome::returned_len_or_errno(
-                write.bytes.len(),
+            return BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(
+                write.committed_prefix + write.bytes.len(),
             ));
         }
         if crate::host_signal::has_unblocked_pending_for(write.tid.raw(), SigBlockMask::NONE) {
-            return BlockingHostWriteStep::Done(DispatchOutcome::returned_len_or_errno(
-                write.offset,
-            ));
+            return BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(write.offset()));
         }
+    }
+}
+
+fn drive_in_memory_pipe_write(
+    write: &mut BlockingWrite,
+    endpoint: &Arc<crate::dispatch::fs::pipe::PipeWriteEndpointLease>,
+) -> BlockingWriteStep {
+    if write.offset >= write.bytes.len() {
+        return BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(
+            write.committed_prefix + write.bytes.len(),
+        ));
+    }
+
+    let pipe = endpoint.pipe();
+    let mut state = pipe.state.lock();
+    if state.readers == 0 {
+        return if write.offset() == 0 {
+            BlockingWriteStep::Done(DispatchOutcome::errno(carrick_abi::LINUX_EPIPE))
+        } else {
+            BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(write.offset()))
+        };
+    }
+    let available = state.capacity.saturating_sub(state.buffer.len());
+    if available == 0 {
+        return BlockingWriteStep::Wait;
+    }
+    let chunk = (write.bytes.len() - write.offset).min(available);
+    state
+        .buffer
+        .extend(&write.bytes[write.offset..write.offset + chunk]);
+    write.offset += chunk;
+    pipe.update_readiness_locked(&state);
+    drop(state);
+    pipe.changed.notify_all();
+    endpoint.publish_progress(chunk);
+    if write.offset >= write.bytes.len() {
+        BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(
+            write.committed_prefix + write.bytes.len(),
+        ))
+    } else if crate::host_signal::has_unblocked_pending_for(write.tid.raw(), SigBlockMask::NONE) {
+        BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(write.offset()))
+    } else {
+        BlockingWriteStep::Wait
     }
 }
 
@@ -548,7 +685,7 @@ pub enum DispatchOutcome {
     /// threads that may close the read end or deliver the interrupting signal.
     /// The runtime owns this staged continuation, waits for POLLOUT with the
     /// dispatcher lock released, and completes with the Linux-visible result.
-    BlockingHostWrite(BlockingHostWrite),
+    BlockingWrite(BlockingWrite),
     /// A blocking record-lock `fcntl(F_SETLKW/F_OFD_SETLKW)`. The dispatcher
     /// parsed and validated the guest `struct flock`, but the host call may
     /// sleep until a sibling thread releases a conflicting lock. Execute it in

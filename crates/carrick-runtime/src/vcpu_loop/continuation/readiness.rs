@@ -17,7 +17,7 @@ use super::{
     ExecutionGeneration, FutexSource, FutexWait, MmId, OwnedFdRegistration, TaskKey, ThreadKey,
     VforkParentWait, WaitFdAuthority,
 };
-use crate::dispatch::{BlockingHostWrite, BlockingRecordLock, DispatchOutcome};
+use crate::dispatch::{BlockingRecordLock, BlockingWrite, DispatchOutcome};
 use crate::kernel::{Kernel, Task};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,9 +351,10 @@ pub(in crate::vcpu_loop) enum ReadinessProbe {
         value: u32,
         deadline: Option<Instant>,
     },
-    HostWrite {
-        host_fd: i32,
-        write: Arc<Mutex<BlockingHostWrite>>,
+    BlockingWrite {
+        poll_fd: i32,
+        poll_events: i16,
+        write: Arc<Mutex<BlockingWrite>>,
         completion: Arc<Mutex<Option<DispatchOutcome>>>,
     },
     RecordLock {
@@ -537,7 +538,7 @@ impl ReadinessProbe {
     /// re-examining it on every cycle is the O(live blocked tasks) scan
     /// [`super::wait_service::ReactorWorkSet`] exists to remove.
     pub(in crate::vcpu_loop) const fn contributes_pollfds(&self) -> bool {
-        matches!(self, Self::Fds { .. } | Self::HostWrite { .. })
+        matches!(self, Self::Fds { .. } | Self::BlockingWrite { .. })
     }
 
     pub(in crate::vcpu_loop) fn from_continuation(continuation: &BlockedContinuation) -> Self {
@@ -577,10 +578,14 @@ impl ReadinessProbe {
                 value: *value,
                 deadline: state.deadline,
             },
-            ContinuationDetail::HostWrite(write) => {
-                let host_fd = write.lock().host_fd();
-                Self::HostWrite {
-                    host_fd,
+            ContinuationDetail::BlockingWrite(write) => {
+                let (poll_fd, poll_events) = {
+                    let write_guard = write.lock();
+                    (write_guard.poll_fd(), write_guard.poll_events())
+                };
+                Self::BlockingWrite {
+                    poll_fd,
+                    poll_events,
                     write: Arc::clone(write),
                     completion: Arc::clone(&state.producer_completion),
                 }
@@ -698,14 +703,14 @@ impl ReadinessProbe {
                     .is_none_or(|current| current != *value)
                     .then_some(ContinuationEvent::Ready)
             }
-            Self::HostWrite {
+            Self::BlockingWrite {
                 write, completion, ..
             } => {
                 let outcome = {
                     let mut write = write.lock();
-                    match crate::dispatch::drive_blocking_host_write(&mut write) {
-                        crate::dispatch::BlockingHostWriteStep::Done(outcome) => Some(outcome),
-                        crate::dispatch::BlockingHostWriteStep::Wait => None,
+                    match crate::dispatch::drive_blocking_write(&mut write) {
+                        crate::dispatch::BlockingWriteStep::Done(outcome) => Some(outcome),
+                        crate::dispatch::BlockingWriteStep::Wait => None,
                     }
                 };
                 if let Some(outcome) = outcome {

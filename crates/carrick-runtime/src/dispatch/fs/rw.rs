@@ -7,6 +7,7 @@ use std::sync::Arc;
 use carrick_abi::*;
 use carrick_guest_mem::CurrentMmMemory;
 
+use super::pipe::PipeWriteNotification;
 use super::*;
 use crate::dispatch::fd_table::{DirListing, HostFdRef, HostWriteKind, is_anon_overlay_path};
 use crate::dispatch::{HostPipeWriteTarget, WaitFdAuthority, write_host_pipe_owned};
@@ -176,6 +177,21 @@ pub(crate) fn punch_unwritten_host_blocks(
     _write_offset: u64,
 ) -> Result<(), LinuxErrno> {
     Ok(())
+}
+
+/// Guest-visible aggregate boundary completed by the in-memory pipe iterator
+/// before it encounters a later writev copy fault. Linux copies in guest-page
+/// blocks across iovecs, so the partial final block is not published.
+fn writev_pipe_fault_boundary(
+    total_before_current: usize,
+    current_len: usize,
+    tail_len: usize,
+) -> usize {
+    total_before_current
+        .saturating_add(current_len)
+        .saturating_add(tail_len)
+        / crate::dispatch::fs::pipe::PIPE_BUF
+        * crate::dispatch::fs::pipe::PIPE_BUF
 }
 
 impl<'a> FsView<'a> {
@@ -2251,6 +2267,9 @@ impl<'a> FsView<'a> {
             // confirmed there's no open description do we fall back to the
             // dispatcher's built-in stdout/stderr buffers.
             if let Some(open_file) = this.open_file(fd) {
+                let Some(io_lease) = open_file.description.retain_fd_lease() else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
                 // Take an inner scope so the borrow on the description ends
                 // before we touch this.fs.rootfs_vfs.overlay (writable File path below).
                 enum FileWriteback {
@@ -2301,8 +2320,9 @@ impl<'a> FsView<'a> {
                             let outcome = write_pipe(
                                 &bytes,
                                 &pipe,
+                                io_lease,
                                 flags,
-                                fd,
+                                tid,
                                 wait_authority,
                                 || {
                                     this.has_deliverable_dispatch_pending_for_wait(
@@ -2311,6 +2331,11 @@ impl<'a> FsView<'a> {
                                         carrick_abi::WaitSigMask::NONE,
                                     )
                                 },
+                                Some(PipeWriteNotification::new(
+                                    Arc::clone(this.captured_file_table().epoll_wake_registry()),
+                                    Arc::clone(cx.kernel.kernel()),
+                                    fd,
+                                )),
                             );
                             if let DispatchOutcome::Returned { value } = outcome {
                                 if value > 0 {
@@ -2933,7 +2958,7 @@ impl<'a> FsView<'a> {
             }
 
             let mut total = 0usize;
-            for iovec in iovecs {
+            for (iovec_index, iovec) in iovecs.iter().enumerate() {
                 let iov_base = iovec.iov_base;
                 let iov_len = usize::try_from(iovec.iov_len)
                     .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
@@ -2957,11 +2982,18 @@ impl<'a> FsView<'a> {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                 };
+                // Preserve this before any destination arm takes ownership of
+                // `bytes`; a parked in-memory pipe continuation uses it to
+                // compute the aggregate copy boundary after a later iovec fault.
+                let current_iovec_len = bytes.len();
                 // Mirror `write`: check open_files FIRST so post-dup3
                 // redirects (eg `dup3(pipe_write, 1)`) actually plumb
                 // through the redirected description rather than the
                 // built-in stdout buffer.
                 if let Some(open_file) = this.open_file(fd) {
+                    let Some(io_lease) = open_file.description.retain_fd_lease() else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
                     enum FileWriteback {
                         Range {
                             path: String,
@@ -2996,6 +3028,7 @@ impl<'a> FsView<'a> {
                                 writeback = None;
                             }
                             OpenDescription::PipeWriter { pipe, .. } => {
+                                let pipe = Arc::clone(pipe);
                                 let Some(wait_authority) = this
                                     .captured_slot_authority(fd)
                                     .map(WaitFdAuthority::logical)
@@ -3003,11 +3036,14 @@ impl<'a> FsView<'a> {
                                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                                 };
                                 let tid = cx.tid();
+                                let flags = open_file.description.common().status_flags();
+                                drop(open);
                                 outcome = write_pipe(
                                     &bytes,
-                                    pipe,
-                                    open_file.description.common().status_flags(),
-                                    fd,
+                                    &pipe,
+                                    io_lease,
+                                    flags,
+                                    tid,
                                     wait_authority,
                                     || {
                                         this.has_deliverable_dispatch_pending_for_wait(
@@ -3016,6 +3052,13 @@ impl<'a> FsView<'a> {
                                             carrick_abi::WaitSigMask::NONE,
                                         )
                                     },
+                                    Some(PipeWriteNotification::new(
+                                        Arc::clone(
+                                            this.captured_file_table().epoll_wake_registry(),
+                                        ),
+                                        Arc::clone(cx.kernel.kernel()),
+                                        fd,
+                                    )),
                                 );
                                 writeback = None;
                             }
@@ -3289,6 +3332,66 @@ impl<'a> FsView<'a> {
                             .rootfs_vfs
                             .write_file_range(&path, offset, &bytes, final_size);
                     }
+                    if let DispatchOutcome::BlockingWrite(write) = outcome {
+                        // `write_pipe` has committed a prefix of this iovec.
+                        // The continuation must retain the rest of the writev
+                        // aggregate in-order; completing only this iovec would
+                        // report a short count after the reactor has delivered
+                        // later bytes.  Stage the tail exactly once at the park
+                        // boundary, after the ordinary sequential reads have
+                        // already established this iovec's prefix.
+                        let mut tail = Vec::new();
+                        for remaining in iovecs.iter().skip(iovec_index + 1) {
+                            let remaining_len = usize::try_from(remaining.iov_len).map_err(|_| {
+                                DispatchError::LengthTooLarge(remaining.iov_len)
+                            })?;
+                            if remaining_len == 0 {
+                                continue;
+                            }
+                            match memory.read_bytes(remaining.iov_base, remaining_len) {
+                                Ok(bytes) => tail.extend_from_slice(&bytes),
+                                Err(_) => {
+                                    // The pipe iterator commits full guest-page
+                                    // copy blocks across the writev aggregate.
+                                    // A fault discards only the incomplete final
+                                    // block, not every valid later iovec. Keep
+                                    // the staged suffix through that aggregate
+                                    // boundary. The boundary may cut the staged
+                                    // suffix of the current iovec; only bytes at
+                                    // or before the continuation offset were
+                                    // already committed and are irreversible.
+                                    let boundary = writev_pipe_fault_boundary(
+                                        total,
+                                        current_iovec_len,
+                                        tail.len(),
+                                    );
+                                    let write = match &write.target {
+                                        crate::dispatch::outcome::BlockingWriteTarget::InMemoryPipe(_) => {
+                                            write.with_in_memory_pipe_writev_boundary(
+                                                tail, total, boundary,
+                                            )
+                                        }
+                                        crate::dispatch::outcome::BlockingWriteTarget::Host(_) => {
+                                            write.with_writev_tail(tail, total)
+                                        }
+                                    };
+                                    return Ok(DispatchOutcome::BlockingWrite(write));
+                                }
+                            }
+                        }
+                        let boundary = total
+                            .saturating_add(current_iovec_len)
+                            .saturating_add(tail.len());
+                        let write = match &write.target {
+                            crate::dispatch::outcome::BlockingWriteTarget::InMemoryPipe(_) => {
+                                write.with_in_memory_pipe_writev_boundary(tail, total, boundary)
+                            }
+                            crate::dispatch::outcome::BlockingWriteTarget::Host(_) => {
+                                write.with_writev_tail(tail, total)
+                            }
+                        };
+                        return Ok(DispatchOutcome::BlockingWrite(write));
+                    }
                     let DispatchOutcome::Returned { value } = outcome else {
                         // EAGAIN/EPIPE on this iovec. writev(2) is atomic across
                         // iovecs: if EARLIER iovecs were already written (total >
@@ -3337,5 +3440,38 @@ impl<'a> FsView<'a> {
 
         }
 
+    }
+}
+
+#[cfg(test)]
+mod writev_pipe_copy_tests {
+    use super::writev_pipe_fault_boundary;
+    use crate::dispatch::fs::pipe::PIPE_BUF;
+
+    #[test]
+    fn later_fault_keeps_only_completed_aggregate_copy_blocks() {
+        let first = 256 * 1024;
+        assert_eq!(writev_pipe_fault_boundary(0, first - 1, PIPE_BUF), first);
+        assert_eq!(
+            writev_pipe_fault_boundary(0, first, PIPE_BUF),
+            first + PIPE_BUF
+        );
+        assert_eq!(
+            writev_pipe_fault_boundary(0, first + 1, PIPE_BUF),
+            first + PIPE_BUF
+        );
+        assert_eq!(
+            writev_pipe_fault_boundary(0, first, PIPE_BUF + 1),
+            first + PIPE_BUF
+        );
+        assert_eq!(writev_pipe_fault_boundary(0, first + 1, 32), first);
+    }
+
+    #[test]
+    fn later_fault_never_truncates_the_already_admitted_current_vector() {
+        assert_eq!(
+            writev_pipe_fault_boundary(3, PIPE_BUF * 2, PIPE_BUF),
+            PIPE_BUF * 3
+        );
     }
 }

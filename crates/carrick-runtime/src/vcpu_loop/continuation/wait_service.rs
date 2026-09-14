@@ -20,7 +20,7 @@ use super::{
     ContinuationRegistration, ContinuationResumeError, ContinuationWakeToken, ReadinessProbe,
     SignalReadinessProbe, next_nonzero,
 };
-use crate::dispatch::{BlockingHostWrite, DispatchOutcome, WaitFdAuthority};
+use crate::dispatch::{BlockingWrite, DispatchOutcome, WaitFdAuthority};
 use crate::kernel::Scheduler;
 use crate::kernel::objects::ThreadKey;
 use crate::run_result::RuntimeError;
@@ -644,9 +644,9 @@ impl CarrierWaitServiceInner {
     fn run_reactor(weak: Weak<Self>) {
         enum FdSource {
             Ready(ContinuationWakeToken),
-            HostWrite(
+            BlockingWrite(
                 ContinuationWakeToken,
-                Arc<Mutex<BlockingHostWrite>>,
+                Arc<Mutex<BlockingWrite>>,
                 Arc<Mutex<Option<DispatchOutcome>>>,
                 Arc<RegistrationOperationGate>,
             ),
@@ -689,17 +689,18 @@ impl CarrierWaitServiceInner {
                                 sources.push(FdSource::Ready(entry.token));
                             }
                         }
-                        ReadinessProbe::HostWrite {
-                            host_fd,
+                        ReadinessProbe::BlockingWrite {
+                            poll_fd,
+                            poll_events,
                             write,
                             completion,
                         } => {
                             pollfds.push(libc::pollfd {
-                                fd: *host_fd,
-                                events: libc::POLLOUT,
+                                fd: *poll_fd,
+                                events: *poll_events,
                                 revents: 0,
                             });
-                            sources.push(FdSource::HostWrite(
+                            sources.push(FdSource::BlockingWrite(
                                 entry.token,
                                 Arc::clone(write),
                                 Arc::clone(completion),
@@ -803,7 +804,7 @@ impl CarrierWaitServiceInner {
                     FdSource::Ready(token) => {
                         inner.publish_event(token, ContinuationEvent::Ready);
                     }
-                    FdSource::HostWrite(token, write, completion, gate) => {
+                    FdSource::BlockingWrite(token, write, completion, gate) => {
                         #[cfg(test)]
                         if let Some(hook) = inner.test_hooks.before_host_write_drive.lock().as_ref()
                         {
@@ -818,11 +819,11 @@ impl CarrierWaitServiceInner {
                                 {
                                     hook();
                                 }
-                                match crate::dispatch::drive_blocking_host_write(&mut write) {
-                                    crate::dispatch::BlockingHostWriteStep::Done(outcome) => {
+                                match crate::dispatch::drive_blocking_write(&mut write) {
+                                    crate::dispatch::BlockingWriteStep::Done(outcome) => {
                                         Some(outcome)
                                     }
-                                    crate::dispatch::BlockingHostWriteStep::Wait => None,
+                                    crate::dispatch::BlockingWriteStep::Wait => None,
                                 }
                             };
                             let done = outcome.is_some();

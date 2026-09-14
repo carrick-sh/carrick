@@ -1058,6 +1058,24 @@ impl FileDescription {
         self.revision.publish();
     }
 
+    /// Retain an exact live descriptor authority for asynchronous I/O.
+    ///
+    /// The check and increment share `lifecycle_transition` with final close:
+    /// callers can therefore retain a live endpoint before acquiring an
+    /// endpoint-specific lock, but can never resurrect a description after its
+    /// final fd reference has published its close side effects.
+    pub(crate) fn retain_fd_lease(self: &Arc<Self>) -> Option<FileDescriptionFdLease> {
+        let _guard = self.lifecycle_transition.lock();
+        if self.common.fd_refs() == 0 {
+            return None;
+        }
+        self.common.retain_fd_ref();
+        self.revision.publish();
+        Some(FileDescriptionFdLease {
+            description: Arc::clone(self),
+        })
+    }
+
     pub(crate) fn release_fd_ref(&self) {
         let lifecycle = self.lifecycle_transition.lock();
         let count = self.common.release_fd_ref();
@@ -1199,6 +1217,19 @@ impl FileDescription {
         deadline: std::time::Instant,
     ) -> Option<FileDescriptionObservation> {
         self.snapshot_until(deadline)
+    }
+}
+
+/// A functional descriptor reference retained for a syscall that may complete
+/// after its numeric fd has been closed or reused.
+#[derive(Debug)]
+pub(crate) struct FileDescriptionFdLease {
+    description: Arc<FileDescription>,
+}
+
+impl Drop for FileDescriptionFdLease {
+    fn drop(&mut self) {
+        self.description.release_fd_ref();
     }
 }
 

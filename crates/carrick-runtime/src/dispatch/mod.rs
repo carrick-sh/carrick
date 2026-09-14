@@ -709,13 +709,13 @@ pub(crate) use wait_authority::{InternalWaitKind, WaitFdAuthority};
 
 pub mod outcome;
 pub use outcome::{
-    BlockingHostWrite, BlockingRecordLock, DispatchError, DispatchOutcome, FdWaitCompletion,
+    BlockingRecordLock, BlockingWrite, DispatchError, DispatchOutcome, FdWaitCompletion,
     LinearMemory, SharedFutexTarget,
 };
 #[allow(unused_imports)]
 pub(crate) use outcome::{
-    BlockingHostWriteStep, BlockingRecordLockStep, drive_blocking_host_write,
-    drive_blocking_record_lock, lower_handler_result, try_drive_blocking_record_lock,
+    BlockingRecordLockStep, BlockingWriteStep, drive_blocking_record_lock, drive_blocking_write,
+    lower_handler_result, try_drive_blocking_record_lock,
 };
 
 pub mod request;

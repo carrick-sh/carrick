@@ -465,7 +465,7 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
 }
 
 use crate::compat::SyscallArgs;
-use crate::dispatch::{BlockingHostWrite, DispatchOutcome, SyscallRequest, WaitFds};
+use crate::dispatch::{BlockingWrite, DispatchOutcome, SyscallRequest, WaitFds};
 use crate::kernel::objects::{
     BlockedReason, ExecutionGeneration, MigratableTaskState, ThreadExecutionState,
 };
@@ -662,12 +662,12 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
             sig_mask: WaitSigMask::NONE,
             completion: FdWaitCompletion::Poll { on_timeout: 0 },
         },
-        ContinuationFamily::BlockingHostWrite => {
+        ContinuationFamily::BlockingWrite => {
             let fds = pipe_pair();
-            let write = BlockingHostWrite::for_tests(fds[1], vec![1, 2, 3, 4], 2, tid, true)
+            let write = BlockingWrite::for_tests(fds[1], vec![1, 2, 3, 4], 2, tid, true)
                 .expect("pinned partial write");
             close_pair(fds);
-            DispatchOutcome::BlockingHostWrite(write)
+            DispatchOutcome::BlockingWrite(write)
         }
         ContinuationFamily::BlockingRecordLock => {
             let contention = crate::dispatch::RecordLockContentionFixture::new();
@@ -710,7 +710,7 @@ const DISPATCH_FAMILIES: [ContinuationFamily; 15] = [
     ContinuationFamily::WaitOnFds,
     ContinuationFamily::WaitOnFdsSelect,
     ContinuationFamily::WaitOnPollFds,
-    ContinuationFamily::BlockingHostWrite,
+    ContinuationFamily::BlockingWrite,
     ContinuationFamily::BlockingRecordLock,
     ContinuationFamily::WaitOnProcExit,
     ContinuationFamily::WaitOnProcState,
@@ -776,7 +776,7 @@ fn exhaustive_real_dispatch_shapes_become_owned_send_static_continuations() {
                 ContinuationFamily::WaitOnFds
                     | ContinuationFamily::WaitOnFdsSelect
                     | ContinuationFamily::WaitOnPollFds
-                    | ContinuationFamily::BlockingHostWrite
+                    | ContinuationFamily::BlockingWrite
                     | ContinuationFamily::BlockingRecordLock
                     | ContinuationFamily::WaitOnProcExit
                     | ContinuationFamily::WaitOnProcState
@@ -1801,7 +1801,7 @@ fn timeout_signal_exec_exit_and_drop_cleanup_are_literal_for_every_family() {
             ) => assert_eq!(errno, LINUX_ETIMEDOUT),
             (ContinuationFamily::WaitOnFds, ContinuationCompletion::Return(-11))
             | (ContinuationFamily::WaitOnPollFds, ContinuationCompletion::Return(0))
-            | (ContinuationFamily::BlockingHostWrite, ContinuationCompletion::Return(2))
+            | (ContinuationFamily::BlockingWrite, ContinuationCompletion::Return(2))
             | (
                 ContinuationFamily::WaitOnSharedWord
                 | ContinuationFamily::BlockingRecordLock
@@ -1827,7 +1827,7 @@ fn timeout_signal_exec_exit_and_drop_cleanup_are_literal_for_every_family() {
             .resume(ContinuationEvent::Signal, &context)
             .expect("signal result");
         match (&family, &interrupted.completion) {
-            (ContinuationFamily::BlockingHostWrite, ContinuationCompletion::Return(2)) => {}
+            (ContinuationFamily::BlockingWrite, ContinuationCompletion::Return(2)) => {}
             (
                 ContinuationFamily::WaitOnSleep,
                 ContinuationCompletion::InterruptedSleep { remaining },
@@ -2404,7 +2404,7 @@ fn shared_reactor_drives_write_record_signal_and_vfork_sources() {
     let service = CarrierWaitService::new(scheduler);
 
     let pipe = pipe_pair();
-    let write = BlockingHostWrite::for_tests(
+    let write = BlockingWrite::for_tests(
         pipe[1],
         vec![1, 2, 3, 4],
         2,
@@ -2413,7 +2413,7 @@ fn shared_reactor_drives_write_record_signal_and_vfork_sources() {
     )
     .expect("write state");
     let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        DispatchOutcome::BlockingHostWrite(write),
+        DispatchOutcome::BlockingWrite(write),
         capture(&context, generation, ContinuationBackend::Hvpatch),
     )
     .expect("write continuation");
@@ -3274,7 +3274,7 @@ fn partial_blocking_write_never_restarts_after_caught_sa_restart_signal() {
         .signal_authority()
         .enqueue_thread_standard(signal, None);
     let fds = pipe_pair();
-    let write = BlockingHostWrite::for_tests(
+    let write = BlockingWrite::for_tests(
         fds[1],
         vec![1, 2, 3, 4],
         2,
@@ -3284,7 +3284,7 @@ fn partial_blocking_write_never_restarts_after_caught_sa_restart_signal() {
     .expect("partial blocking write");
     close_pair(fds);
     let continuation = BlockedContinuation::from_dispatch_outcome(
-        DispatchOutcome::BlockingHostWrite(write),
+        DispatchOutcome::BlockingWrite(write),
         capture(&context, generation, ContinuationBackend::Hvpatch),
     )
     .expect("partial write continuation");
@@ -3758,7 +3758,7 @@ fn deterministic_rendezvous_enrollment_vs_reactor_host_write_interleaving() {
     let dummy = fill_pipe(pipe[1]);
 
     let payload = vec![11, 22, 33, 44];
-    let write = BlockingHostWrite::for_tests(
+    let write = BlockingWrite::for_tests(
         pipe[1],
         payload.clone(),
         0,
@@ -3767,7 +3767,7 @@ fn deterministic_rendezvous_enrollment_vs_reactor_host_write_interleaving() {
     )
     .expect("write state");
     let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        DispatchOutcome::BlockingHostWrite(write),
+        DispatchOutcome::BlockingWrite(write),
         capture(&context, generation, ContinuationBackend::Hvpatch),
     )
     .expect("write continuation");
@@ -3842,7 +3842,7 @@ fn cancellation_during_inflight_host_write_competing_with_ready_event_drains_saf
     let dummy = fill_pipe(pipe[1]);
 
     let payload = vec![1, 2, 3, 4, 5];
-    let write = BlockingHostWrite::for_tests(
+    let write = BlockingWrite::for_tests(
         pipe[1],
         payload.clone(),
         0,
@@ -3851,7 +3851,7 @@ fn cancellation_during_inflight_host_write_competing_with_ready_event_drains_saf
     )
     .expect("write state");
     let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        DispatchOutcome::BlockingHostWrite(write),
+        DispatchOutcome::BlockingWrite(write),
         capture(&context, generation, ContinuationBackend::Hvpatch),
     )
     .expect("write continuation");
@@ -3878,7 +3878,7 @@ fn cancellation_during_inflight_host_write_competing_with_ready_event_drains_saf
     drain_pipe(pipe[0], dummy.len());
     service.nudge_reactor_for_test();
 
-    // Wait until reactor is inside drive_blocking_host_write (holding OperationClaimGuard)
+    // Wait until reactor is inside drive_blocking_write (holding OperationClaimGuard)
     drive_started_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("reactor started drive");
@@ -4373,7 +4373,7 @@ fn event_future_cancelled_observation_drains_inflight_operation_safely() {
     let dummy = fill_pipe(pipe[1]);
 
     let payload = vec![9, 8, 7, 6];
-    let write = BlockingHostWrite::for_tests(
+    let write = BlockingWrite::for_tests(
         pipe[1],
         payload.clone(),
         0,
@@ -4382,7 +4382,7 @@ fn event_future_cancelled_observation_drains_inflight_operation_safely() {
     )
     .expect("write state");
     let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        DispatchOutcome::BlockingHostWrite(write),
+        DispatchOutcome::BlockingWrite(write),
         capture(&context, generation, ContinuationBackend::Hvpatch),
     )
     .expect("write continuation");
@@ -4524,7 +4524,7 @@ fn cancellation_before_drive_prevents_fresh_host_work() {
     let dummy = fill_pipe(pipe[1]);
 
     let payload = vec![9, 8, 7, 6];
-    let write = BlockingHostWrite::for_tests(
+    let write = BlockingWrite::for_tests(
         pipe[1],
         payload.clone(),
         0,
@@ -4533,7 +4533,7 @@ fn cancellation_before_drive_prevents_fresh_host_work() {
     )
     .expect("write state");
     let continuation = BlockedContinuation::from_dispatch_outcome(
-        DispatchOutcome::BlockingHostWrite(write),
+        DispatchOutcome::BlockingWrite(write),
         capture(&context, generation, ContinuationBackend::Hvpatch),
     )
     .expect("write continuation");
@@ -4848,7 +4848,7 @@ fn unrelated_waiter_progress_during_concurrent_host_write() {
     let service = CarrierWaitService::new(scheduler);
 
     let pipe = pipe_pair();
-    let write = BlockingHostWrite::for_tests(
+    let write = BlockingWrite::for_tests(
         pipe[1],
         vec![1, 2, 3, 4],
         0,
@@ -4857,7 +4857,7 @@ fn unrelated_waiter_progress_during_concurrent_host_write() {
     )
     .expect("write state");
     let write_cont = BlockedContinuation::from_dispatch_outcome(
-        DispatchOutcome::BlockingHostWrite(write),
+        DispatchOutcome::BlockingWrite(write),
         capture(&context, generation, ContinuationBackend::Hvpatch),
     )
     .expect("write continuation");
@@ -4865,7 +4865,7 @@ fn unrelated_waiter_progress_during_concurrent_host_write() {
     service.enroll(&mut write_reg).expect("enroll write");
 
     let write_arc = match &write_cont.state().detail {
-        ContinuationDetail::HostWrite(w) => Arc::clone(w),
+        ContinuationDetail::BlockingWrite(w) => Arc::clone(w),
         _ => unreachable!(),
     };
 
@@ -4952,7 +4952,7 @@ fn lock_ordering_opposing_locks_rendezvous_completes_without_deadlock() {
     let dummy = fill_pipe(pipe[1]);
 
     let payload = vec![1, 2, 3, 4];
-    let write = BlockingHostWrite::for_tests(
+    let write = BlockingWrite::for_tests(
         pipe[1],
         payload.clone(),
         0,
@@ -4961,7 +4961,7 @@ fn lock_ordering_opposing_locks_rendezvous_completes_without_deadlock() {
     )
     .expect("write state");
     let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        DispatchOutcome::BlockingHostWrite(write),
+        DispatchOutcome::BlockingWrite(write),
         capture(&context, generation, ContinuationBackend::Hvpatch),
     )
     .expect("write continuation");
@@ -4981,7 +4981,7 @@ fn lock_ordering_opposing_locks_rendezvous_completes_without_deadlock() {
     let (recheck_unblock_tx, recheck_unblock_rx) = std::sync::mpsc::sync_channel(1);
     let recheck_unblock_rx = Arc::new(std::sync::Mutex::new(recheck_unblock_rx));
 
-    // 1. Real reactor hook inside drive_blocking_host_write while holding write lock & claim
+    // 1. Real reactor hook inside drive_blocking_write while holding write lock & claim
     service.set_inside_host_write_hook(move || {
         let _ = reactor_reached_tx.send(());
         let _ = reactor_unblock_rx
@@ -4999,7 +4999,7 @@ fn lock_ordering_opposing_locks_rendezvous_completes_without_deadlock() {
             .recv_timeout(Duration::from_secs(5));
     });
 
-    // Drain pipe so real reactor wakes and executes drive_blocking_host_write
+    // Drain pipe so real reactor wakes and executes drive_blocking_write
     drain_pipe(pipe[0], dummy.len());
     service.nudge_reactor_for_test();
 

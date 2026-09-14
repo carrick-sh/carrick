@@ -1713,7 +1713,7 @@ where
                 // closed rather than re-entering a host wait: the retired lanes
                 // parked a host thread here through `CompatibilityThreadWaiter`,
                 // which is exactly the authority HVPatch must not take.
-                blocking @ (DispatchOutcome::BlockingHostWrite(_)
+                blocking @ (DispatchOutcome::BlockingWrite(_)
                 | DispatchOutcome::BlockingRecordLock(_)
                 | DispatchOutcome::WaitOnFds { .. }
                 | DispatchOutcome::WaitOnProcExit { .. }

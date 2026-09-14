@@ -1086,26 +1086,53 @@ impl<'a> FsView<'a> {
         let Some(pipe_id) = self.host_pipe_pipe_id(fd) else {
             return;
         };
-        let Some(owner) = carrick_signal_core::fasync::lookup(pipe_id) else {
-            return;
-        };
-        let sig = owner.sig;
-        let owner = crate::kernel::objects::CapturedAsyncIoOwner {
-            visible: crate::kernel::objects::AsyncIoOwner {
-                owner_pid: owner.owner_pid,
-                owner_type: owner.owner_type,
-            },
-            target: crate::kernel::objects::AsyncIoTarget {
-                container_id: owner.container_id,
-                target_id: owner.target_id,
-                target_generation: owner.target_generation,
-                thread_id: owner.thread_id,
-                thread_generation: owner.thread_generation,
-            },
-        };
-        self.send_async_owner_signal(context, owner, sig, fd);
+        fasync_notify_pipe_write(context.kernel(), pipe_id, fd, written as usize);
     }
+}
 
+/// Publish a pipe readiness edge from retained operation identity. Unlike
+/// [`SyscallDispatcher::fasync_notify_after_write`], this never resolves a
+/// numeric guest fd after the operation has parked.
+pub(in crate::dispatch) fn fasync_notify_pipe_write(
+    kernel: &Arc<crate::kernel::Kernel>,
+    pipe_id: u64,
+    fd: i32,
+    written: usize,
+) {
+    if written == 0 || !carrick_signal_core::fasync::any_armed() {
+        return;
+    }
+    let Some(owner) = carrick_signal_core::fasync::lookup(pipe_id) else {
+        return;
+    };
+    let sig = owner.sig;
+    let owner = crate::kernel::objects::CapturedAsyncIoOwner {
+        visible: crate::kernel::objects::AsyncIoOwner {
+            owner_pid: owner.owner_pid,
+            owner_type: owner.owner_type,
+        },
+        target: crate::kernel::objects::AsyncIoTarget {
+            container_id: owner.container_id,
+            target_id: owner.target_id,
+            target_generation: owner.target_generation,
+            thread_id: owner.thread_id,
+            thread_generation: owner.thread_generation,
+        },
+    };
+    if owner.visible.owner_pid == 0 {
+        return;
+    }
+    let signum = if sig == 0 { LINUX_SIGIO } else { sig };
+    let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
+        return;
+    };
+    let info = carrick_abi::LinuxSiginfo::sigpoll(signum, carrick_abi::LINUX_POLL_MSG, 0, fd);
+    let _ = owner.post_kernel_signal(kernel, signal, Some(info));
+}
+
+// Descriptor-control handlers share the filesystem view and its captured
+// file-table authority.
+impl<'a> FsView<'a> {
     /// Pipe-identity token used to coordinate FASYNC readiness between reader
     /// and writer descriptors. For a `HostPipe` this is the synthetic
     /// allocation-time `pipe_id` carried in its description (authoritative on

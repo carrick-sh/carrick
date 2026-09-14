@@ -148,8 +148,8 @@ Two conventions to keep in mind:
   bytes.
 - **Signals** — `crates/carrick-runtime/src/dispatch/signal.rs` (Linux↔macOS signum translation, sigreturn trampoline).
 - **Threads / futex** — `carrick-thread`; fork barrier
-  `crates/carrick-vmm-hvf/src/fork_quiesce.rs`. HVPatch has one host pthread per
-  logical guest thread but only a bounded, reclaimable set of HVF vCPU leases.
+  `crates/carrick-vmm-hvf/src/fork_quiesce.rs`. HVPatch schedules logical guest
+  threads on a bounded persistent executor pool with reclaimable HVF vCPU leases.
   Process-fork admission must win before waiting for a child-vCPU lease; fork
   participates in exec/exit cancellation; ordinary losing transactions lower
   to guest `EAGAIN`; and a selected long blocking wait releases its lease even
@@ -509,6 +509,19 @@ so **a test with two live guest processes is worth more than any number of
 single-process cases** ([`docs/identity-and-scope-domains.md`](docs/identity-and-scope-domains.md)).
 
 ### Authority follows the execution lane, never the host process
+
+**A guest wait must release guest execution capacity.** HVPatch runs logical
+threads on a bounded persistent executor pool. A syscall handler must not park
+its host worker waiting for another guest task to make progress. Return an
+owned continuation, including after partial I/O: retain the exact functional
+endpoint lifetime, completed byte offset, and syscall completion authority.
+Restarting a partially completed operation from offset zero corrupts streams;
+returning an artificial short write is not a substitute for suspension. A
+32-writer pipe test exposed this when ten workers blocked inside `write_pipe`
+while the reader was already runnable and eight spare workers remained parked.
+Validate this contract with enough concurrent blocking operations to exhaust
+the bound pool, using the ordinary executor configuration. Increasing the pool
+size only moves the failure point.
 
 HVPatch keeps every Linux task in one carrier, so Darwin PID/process-owned
 state describes the carrier, not a Linux process. Put Linux process semantics in

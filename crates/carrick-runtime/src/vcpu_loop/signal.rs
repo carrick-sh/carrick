@@ -29,7 +29,7 @@ pub(crate) fn signal_wait_expired(deadline: Option<Instant>) -> bool {
 pub(crate) fn raise_sigpipe_for_blocking_write(
     dispatcher: &SyscallDispatcher,
     context: &crate::kernel::KernelContext,
-    write: &crate::dispatch::BlockingHostWrite,
+    write: &crate::dispatch::BlockingWrite,
     outcome: DispatchOutcome,
 ) -> DispatchOutcome {
     if write.sigpipe_on_epipe()
@@ -47,7 +47,7 @@ pub(crate) fn raise_sigpipe_for_blocking_write(
 }
 
 pub(crate) fn partial_write_interrupt_outcome(
-    write: &crate::dispatch::BlockingHostWrite,
+    write: &crate::dispatch::BlockingWrite,
 ) -> DispatchOutcome {
     if write.offset() > 0 {
         DispatchOutcome::Returned {
@@ -1247,16 +1247,15 @@ mod tests {
                 break;
             }
         }
-        let mut write =
-            crate::dispatch::BlockingHostWrite::for_tests(fds[1], vec![0x5a], 0, tid, true)
-                .expect("pin blocked pipe writer");
+        let mut write = crate::dispatch::BlockingWrite::for_tests(fds[1], vec![0x5a], 0, tid, true)
+            .expect("pin blocked pipe writer");
         assert!(matches!(
-            crate::dispatch::drive_blocking_host_write(&mut write),
-            crate::dispatch::BlockingHostWriteStep::Wait
+            crate::dispatch::drive_blocking_write(&mut write),
+            crate::dispatch::BlockingWriteStep::Wait
         ));
         assert_eq!(unsafe { libc::close(fds[0]) }, 0);
-        let crate::dispatch::BlockingHostWriteStep::Done(outcome) =
-            crate::dispatch::drive_blocking_host_write(&mut write)
+        let crate::dispatch::BlockingWriteStep::Done(outcome) =
+            crate::dispatch::drive_blocking_write(&mut write)
         else {
             panic!("closed reader must complete the blocked write");
         };
