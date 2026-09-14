@@ -1485,6 +1485,10 @@ impl<'a> NetView<'a> {
 #[cfg(test)]
 mod icmp_ping_tests {
     use super::*;
+    use crate::dispatch::{
+        CompatReporter, DispatchOutcome, LinearMemory, SyscallArgs, SyscallRequest,
+    };
+    use carrick_guest_mem::GuestMemory;
 
     #[test]
     fn loopback_echo_reply_is_queued_with_valid_checksum() {
@@ -1516,6 +1520,125 @@ mod icmp_ping_tests {
         assert_eq!(reply[1], 0);
         assert_eq!(internet_checksum(&reply), 0);
         assert_eq!(source, socket_addr_to_linux_sockaddr(loopback).unwrap());
+    }
+
+    #[test]
+    fn bind_zero_skips_host_occupied_ephemeral_candidate_without_leaking_lease() {
+        let blocker = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(blocker >= 0);
+        let blocker_addr = libc::sockaddr_in {
+            #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+            sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 32768u16.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            },
+            sin_zero: [0; 8],
+        };
+        assert_eq!(
+            unsafe {
+                libc::bind(
+                    blocker,
+                    &blocker_addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of_val(&blocker_addr) as libc::socklen_t,
+                )
+            },
+            0
+        );
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+        let fd = match dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    198,
+                    SyscallArgs::from([LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("socket failed: {other:?}"),
+        };
+        let mut guest_addr = [0u8; 16];
+        guest_addr[..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+        guest_addr[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        memory.write_bytes(0x4000, &guest_addr).unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
+                    SyscallRequest::new(200, SyscallArgs::from([fd as u64, 0x4000, 16, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let scope = crate::network::inzone::InZoneScope::CarrierHost;
+        assert!(
+            !dispatcher
+                .network
+                .provider
+                .inzone()
+                .port_in_use(&scope, 32768),
+            "failed candidate lease leaked"
+        );
+        memory.write_bytes(0x4020, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
+                    SyscallRequest::new(
+                        204,
+                        SyscallArgs::from([fd as u64, 0x4010, 0x4020, 0, 0, 0])
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let bound = memory.read_bytes(0x4010, 16).unwrap();
+        assert_ne!(u16::from_be_bytes([bound[2], bound[3]]), 32768);
+
+        let explicit_fd = match dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    198,
+                    SyscallArgs::from([LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("second socket failed: {other:?}"),
+        };
+        guest_addr[2..4].copy_from_slice(&32768u16.to_be_bytes());
+        memory.write_bytes(0x4000, &guest_addr).unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
+                    SyscallRequest::new(
+                        200,
+                        SyscallArgs::from([explicit_fd as u64, 0x4000, 16, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::errno(linux_errno::EADDRINUSE)
+        );
+        unsafe { libc::close(blocker) };
     }
 }
 
@@ -1811,11 +1934,12 @@ impl<'a> NetView<'a> {
             };
             let mut host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
             let mut logical_inzone_bind: Option<(std::net::SocketAddr, bool)> = None;
+            let mut ephemeral_retry = None;
             // Reserve an explicit guest endpoint before the host bind.  The
             // same registry lock is used by ephemeral allocation, so an
             // in-zone connect cannot choose this port in the host-bind gap.
             // A failed host bind drops this guard without publication.
-            let inzone_pending = if (family == LINUX_AF_INET || family == LINUX_AF_INET6)
+            let mut inzone_pending = if (family == LINUX_AF_INET || family == LINUX_AF_INET6)
                 && let Some(requested) = host_sockaddr_to_socket_addr(&host_addr)
                 && bind_protocol == Some(PortProtocol::Tcp)
             {
@@ -1835,6 +1959,13 @@ impl<'a> NetView<'a> {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 let (guest_bound, lease) = if requested.port() == 0 {
+                    ephemeral_retry = Some((
+                        scope.clone(),
+                        requested.ip(),
+                        reuseaddr,
+                        reuseport,
+                        ipv6_v6only,
+                    ));
                     let Some(lease) = this.network.provider.inzone().allocate_ephemeral_for_bind(
                         &scope,
                         requested.ip(),
@@ -1842,7 +1973,7 @@ impl<'a> NetView<'a> {
                         reuseport,
                         ipv6_v6only,
                     ) else {
-                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EADDRNOTAVAIL));
+                        return Ok(DispatchOutcome::errno(linux_errno::EADDRINUSE));
                     };
                     let guest_bound = std::net::SocketAddr::new(requested.ip(), lease.port().raw());
                     (guest_bound, lease)
@@ -1968,6 +2099,61 @@ impl<'a> NetView<'a> {
                 )
             };
             let mut bind_result = rc.host_syscall_errno();
+            if bind_result == Err(linux_errno::EADDRINUSE)
+                && let Some((scope, ip, reuseaddr, reuseport, ipv6_v6only)) = ephemeral_retry
+            {
+                for _ in 1..crate::network::inzone::EPHEMERAL_PORT_COUNT {
+                    // Replacing the guard releases the failed logical lease
+                    // before selecting the next candidate.
+                    inzone_pending = None;
+                    let Some(lease) = this.network.provider.inzone().allocate_ephemeral_for_bind(
+                        &scope,
+                        ip,
+                        reuseaddr,
+                        reuseport,
+                        ipv6_v6only,
+                    ) else {
+                        bind_result = Err(linux_errno::EADDRINUSE);
+                        break;
+                    };
+                    let guest_bound = std::net::SocketAddr::new(ip, lease.port().raw());
+                    let fallback_allowed = lease.host_backing_fallback_allowed();
+                    inzone_pending = Some(Arc::new(InZonePortGuard {
+                        network: Arc::clone(this.network),
+                        lease,
+                    }) as Arc<dyn InZoneCleanup>);
+                    let mut candidate_host = guest_bound;
+                    match this.network.provider.materialize_bind(
+                        this.network.spec.namespace_id.as_ref(),
+                        GuestSocketAddr(guest_bound),
+                        PortProtocol::Tcp,
+                    ) {
+                        Ok(BindTarget::Host(host)) => candidate_host = host.0,
+                        Ok(BindTarget::Unchanged) => {}
+                        Err(_) => {
+                            bind_result = Err(carrick_abi::LINUX_EADDRNOTAVAIL);
+                            break;
+                        }
+                    }
+                    let Some(candidate_addr) = socket_addr_to_host_sockaddr(candidate_host) else {
+                        bind_result = Err(carrick_abi::LINUX_EADDRNOTAVAIL);
+                        break;
+                    };
+                    host_addr = candidate_addr;
+                    logical_inzone_bind = Some((guest_bound, fallback_allowed));
+                    bind_result = unsafe {
+                        libc::bind(
+                            host_fd_raw,
+                            host_addr.as_ptr() as *const _,
+                            host_addr.len() as u32,
+                        )
+                    }
+                    .host_syscall_errno();
+                    if bind_result != Err(linux_errno::EADDRINUSE) {
+                        break;
+                    }
+                }
+            }
             if let Err(errno) = bind_result
                 && errno == linux_errno::EADDRINUSE
                 && matches!(

@@ -97,11 +97,345 @@ fn await_event_timeout(
     block_on_timeout(async move { service.event(token).await }, timeout)
 }
 
+fn write_relative_timerfd_spec(
+    memory: &mut crate::dispatch::LinearMemory,
+    address: u64,
+    duration: Duration,
+) {
+    // `struct itimerspec` is two Linux `timespec`s: zero interval followed by
+    // the relative initial expiration.  Keep the arm on the syscall path so
+    // these continuation tests exercise timerfd_settime's notification edge.
+    let mut spec = [0u8; 32];
+    spec[16..24].copy_from_slice(&(duration.as_secs() as i64).to_le_bytes());
+    spec[24..32].copy_from_slice(&i64::from(duration.subsec_nanos()).to_le_bytes());
+    memory
+        .write_bytes(address, &spec)
+        .expect("write timerfd itimerspec");
+}
+
+fn timerfd_continuation_fixture(
+    context: &KernelContext,
+    dispatcher: &mut crate::dispatch::SyscallDispatcher,
+    memory: &mut crate::dispatch::LinearMemory,
+) -> (u64, DispatchOutcome) {
+    let reporter = crate::compat::CompatReporter::default();
+    let fd = match dispatcher
+        .dispatch(
+            context,
+            crate::dispatch::SyscallRequest::new(
+                carrick_abi::syscall::nr::TIMERFD_CREATE.raw(),
+                crate::compat::SyscallArgs([
+                    crate::dispatch::format_time::LINUX_CLOCK_MONOTONIC,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+            memory,
+            &reporter,
+        )
+        .expect("dispatch timerfd_create")
+    {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("timerfd_create failed: {other:?}"),
+    };
+    let read = dispatcher
+        .dispatch(
+            context,
+            crate::dispatch::SyscallRequest::new(
+                carrick_abi::syscall::nr::READ.raw(),
+                crate::compat::SyscallArgs([fd, 0x4000, 8, 0, 0, 0]),
+            ),
+            memory,
+            &reporter,
+        )
+        .expect("dispatch timerfd read");
+    (fd, read)
+}
+
+fn arm_timerfd_through_dispatcher(
+    context: &KernelContext,
+    dispatcher: &mut crate::dispatch::SyscallDispatcher,
+    memory: &mut crate::dispatch::LinearMemory,
+    fd: u64,
+    duration: Duration,
+) {
+    const SPEC_ADDR: u64 = 0x4100;
+    write_relative_timerfd_spec(memory, SPEC_ADDR, duration);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                context,
+                crate::dispatch::SyscallRequest::new(
+                    carrick_abi::syscall::nr::TIMERFD_SETTIME.raw(),
+                    crate::compat::SyscallArgs([fd, 0, SPEC_ADDR, 0, 0, 0]),
+                ),
+                memory,
+                &crate::compat::CompatReporter::default(),
+            )
+            .expect("dispatch timerfd_settime"),
+        DispatchOutcome::Returned { value: 0 }
+    );
+}
+
+fn complete_timerfd_continuation_after_ready(
+    mut continuation: BlockedContinuation,
+    mut event: ContinuationEvent,
+    context: &KernelContext,
+    generation: ExecutionGeneration,
+    service: &CarrierWaitService,
+    memory: &mut crate::dispatch::LinearMemory,
+) -> DispatchOutcome {
+    // A settime notification can win the race before the new deadline.  The
+    // carrier must then re-plan the retained read and await the real expiry;
+    // this is the same completion/re-enrollment handoff as the vCPU loop.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let completion = continuation
+            .resume(event, context)
+            .expect("resume timerfd continuation")
+            .completion;
+        let ContinuationCompletion::TimerFdRead(read) = completion else {
+            panic!("timerfd continuation did not retain its read: {completion:?}");
+        };
+        match read.complete(memory) {
+            crate::dispatch::format_time::TimerFdReadStep::Done(outcome) => return outcome,
+            crate::dispatch::format_time::TimerFdReadStep::Wait(read) => {
+                continuation = BlockedContinuation::from_dispatch_outcome(
+                    DispatchOutcome::BlockingTimerFdRead(read),
+                    capture(context, generation, ContinuationBackend::Hvpatch),
+                )
+                .expect("re-plan timerfd continuation");
+                let mut registration = service.prepare_registration(&continuation);
+                let token = registration.wake_token();
+                service
+                    .enroll(&mut registration)
+                    .expect("re-enroll timerfd read");
+                continuation
+                    .attach_registration(registration)
+                    .expect("attach re-planned timerfd registration");
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .expect("timerfd continuation missed its bounded completion deadline");
+                event = await_event_timeout(service, token, remaining)
+                    .expect("timerfd expiry must wake the re-planned continuation")
+                    .expect("timerfd re-planned wait service event");
+                assert!(
+                    matches!(event, ContinuationEvent::Ready | ContinuationEvent::Timeout),
+                    "timerfd re-plan produced an unrelated continuation event: {event:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn carrier_wait_service_try_new_succeeds() {
     let (kernel, _) = bootstrap(15_469);
     let scheduler = Arc::new(Scheduler::new(kernel));
     assert!(CarrierWaitService::try_new(scheduler).is_ok());
+}
+
+#[test]
+fn timerfd_read_continuation_waits_for_dispatcher_arm_then_completes_read() {
+    let (kernel, context) = bootstrap(15_471);
+    let generation = publish(&context, 0x916);
+    let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0u8; 0x400]);
+    let (fd, read) = timerfd_continuation_fixture(&context, &mut dispatcher, &mut memory);
+    assert!(matches!(read, DispatchOutcome::BlockingTimerFdRead(_)));
+
+    let mut continuation = BlockedContinuation::from_dispatch_outcome(
+        read,
+        capture(&context, generation, ContinuationBackend::Hvpatch),
+    )
+    .expect("timerfd continuation");
+    let service = CarrierWaitService::new(Arc::new(Scheduler::new(Arc::clone(&kernel))));
+    let mut registration = service.prepare_registration(&continuation);
+    let token = registration.wake_token();
+    service
+        .enroll(&mut registration)
+        .expect("enroll timerfd read");
+    continuation
+        .attach_registration(registration)
+        .expect("attach timerfd registration");
+
+    assert_eq!(
+        service
+            .inner
+            .state
+            .lock()
+            .entries
+            .get(&token.continuation)
+            .expect("timerfd registration")
+            .state,
+        RegistrationState::Enrolled,
+        "the disarmed read must be enrolled before timerfd_settime arms it"
+    );
+
+    assert!(
+        await_event_timeout(&service, token, Duration::from_millis(20)).is_none(),
+        "disarmed timerfd read must remain parked"
+    );
+
+    arm_timerfd_through_dispatcher(
+        &context,
+        &mut dispatcher,
+        &mut memory,
+        fd,
+        Duration::from_millis(20),
+    );
+    let event = await_event_timeout(&service, token, Duration::from_secs(1))
+        .expect("timerfd arm must wake the retained continuation")
+        .expect("timerfd wait service event");
+    assert!(
+        matches!(event, ContinuationEvent::Ready | ContinuationEvent::Timeout),
+        "timerfd arm produced an unrelated continuation event: {event:?}"
+    );
+
+    assert_eq!(
+        complete_timerfd_continuation_after_ready(
+            continuation,
+            event,
+            &context,
+            generation,
+            &service,
+            &mut memory,
+        ),
+        DispatchOutcome::Returned { value: 8 }
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            memory
+                .read_bytes(0x4000, 8)
+                .expect("read timerfd expiration bytes")
+                .try_into()
+                .expect("timerfd expiration width")
+        ),
+        1,
+        "the resumed read must copy one timer expiration"
+    );
+}
+
+#[test]
+fn timerfd_rearm_wakes_retained_read_before_old_deadline() {
+    let (kernel, context) = bootstrap(15_472);
+    let generation = publish(&context, 0x917);
+    let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0u8; 0x400]);
+    let reporter = crate::compat::CompatReporter::default();
+    let fd = match dispatcher
+        .dispatch(
+            &context,
+            crate::dispatch::SyscallRequest::new(
+                carrick_abi::syscall::nr::TIMERFD_CREATE.raw(),
+                crate::compat::SyscallArgs([
+                    crate::dispatch::format_time::LINUX_CLOCK_MONOTONIC,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .expect("dispatch timerfd_create")
+    {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("timerfd_create failed: {other:?}"),
+    };
+    arm_timerfd_through_dispatcher(
+        &context,
+        &mut dispatcher,
+        &mut memory,
+        fd,
+        Duration::from_secs(2),
+    );
+    let read = dispatcher
+        .dispatch(
+            &context,
+            crate::dispatch::SyscallRequest::new(
+                carrick_abi::syscall::nr::READ.raw(),
+                crate::compat::SyscallArgs([fd, 0x4000, 8, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .expect("dispatch timerfd read");
+    assert!(matches!(read, DispatchOutcome::BlockingTimerFdRead(_)));
+
+    let mut continuation = BlockedContinuation::from_dispatch_outcome(
+        read,
+        capture(&context, generation, ContinuationBackend::Hvpatch),
+    )
+    .expect("timerfd continuation");
+    let service = CarrierWaitService::new(Arc::new(Scheduler::new(Arc::clone(&kernel))));
+    let mut registration = service.prepare_registration(&continuation);
+    let token = registration.wake_token();
+    service
+        .enroll(&mut registration)
+        .expect("enroll timerfd read");
+    continuation
+        .attach_registration(registration)
+        .expect("attach timerfd registration");
+
+    assert_eq!(
+        service
+            .inner
+            .state
+            .lock()
+            .entries
+            .get(&token.continuation)
+            .expect("timerfd registration")
+            .state,
+        RegistrationState::Enrolled,
+        "the long timer must be enrolled before it is replaced"
+    );
+
+    let rearm_started = Instant::now();
+    arm_timerfd_through_dispatcher(
+        &context,
+        &mut dispatcher,
+        &mut memory,
+        fd,
+        Duration::from_millis(20),
+    );
+    let event = await_event_timeout(&service, token, Duration::from_secs(1))
+        .expect("timerfd rearm must wake the retained continuation")
+        .expect("timerfd wait service event");
+    assert!(
+        matches!(event, ContinuationEvent::Ready | ContinuationEvent::Timeout),
+        "timerfd rearm produced an unrelated continuation event: {event:?}"
+    );
+    assert_eq!(
+        complete_timerfd_continuation_after_ready(
+            continuation,
+            event,
+            &context,
+            generation,
+            &service,
+            &mut memory,
+        ),
+        DispatchOutcome::Returned { value: 8 }
+    );
+    assert!(
+        rearm_started.elapsed() < Duration::from_millis(500),
+        "timerfd rearm waited for its replaced two-second deadline"
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            memory
+                .read_bytes(0x4000, 8)
+                .expect("read timerfd expiration bytes")
+                .try_into()
+                .expect("timerfd expiration width")
+        ),
+        1
+    );
 }
 
 #[test]

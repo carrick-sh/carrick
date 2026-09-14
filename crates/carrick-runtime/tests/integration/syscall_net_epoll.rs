@@ -20,15 +20,15 @@ use carrick_runtime::linux_abi::{
 };
 #[cfg(target_os = "macos")]
 use carrick_runtime::linux_abi::{
-    LINUX_EINTR, LINUX_EPOLLHUP, LINUX_EPOLLOUT, LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK,
-    LINUX_SOL_TCP,
+    LINUX_EINTR, LINUX_EPOLLHUP, LINUX_EPOLLOUT, LINUX_SO_ERROR, LINUX_SOCK_CLOEXEC,
+    LINUX_SOCK_NONBLOCK, LINUX_SOL_SOCKET, LINUX_SOL_TCP,
 };
 #[cfg(target_os = "macos")]
 use carrick_runtime::thread::{FutexTable, ThreadRegistry};
 #[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex, mpsc};
 #[cfg(target_os = "macos")]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use support::*;
 
 #[cfg(target_os = "macos")]
@@ -908,179 +908,6 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
         DispatchOutcome::Returned { value: 0 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn blocking_timerfd_read_waits_until_timer_is_armed() {
-    let dispatcher = Arc::new(SyscallDispatcher::new());
-    let reporter = Arc::new(CompatReporter::default());
-    let registry = Arc::new(ThreadRegistry::new(test_tid(20)));
-    let futex = Arc::new(FutexTable::new());
-    assert_eq!(registry.register_child(20), test_tid(21));
-
-    let mut setup_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
-    let created = dispatcher
-        .dispatch_threaded(
-            &dispatcher.capture_one_task_context().unwrap(),
-            SyscallRequest::new(85, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
-            &mut setup_memory,
-            &reporter,
-            ThreadCtx::new(test_tid(20), &registry, &futex),
-        )
-        .unwrap();
-    let DispatchOutcome::Returned { value: fd } = created else {
-        panic!("expected timerfd_create success, got {created:?}");
-    };
-
-    let (tx, rx) = mpsc::channel();
-    let read_dispatcher = Arc::clone(&dispatcher);
-    let read_reporter = Arc::clone(&reporter);
-    let read_registry = Arc::clone(&registry);
-    let read_futex = Arc::clone(&futex);
-    let reader = std::thread::spawn(move || {
-        let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
-        let outcome = read_dispatcher
-            .dispatch_threaded(
-                &read_dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
-                &mut memory,
-                &read_reporter,
-                ThreadCtx::new(test_tid(20), &read_registry, &read_futex),
-            )
-            .unwrap();
-        let expirations = read_timerfd_expirations(&memory, 0x4000).expirations;
-        tx.send((outcome, expirations)).unwrap();
-    });
-
-    std::thread::sleep(Duration::from_millis(25));
-    assert!(
-        rx.try_recv().is_err(),
-        "blocking timerfd read returned before timer was armed"
-    );
-
-    let mut arm_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
-    let one_shot = LinuxItimerspec {
-        it_interval: LinuxTimespec::new(0, 0),
-        it_value: LinuxTimespec::new(0, 1),
-    };
-    arm_memory.write_bytes(0x4000, one_shot.as_bytes()).unwrap();
-    assert_eq!(
-        dispatcher
-            .dispatch_threaded(
-                &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(86, SyscallArgs::from([fd as u64, 0, 0x4000, 0, 0, 0])),
-                &mut arm_memory,
-                &reporter,
-                ThreadCtx::new(test_tid(21), &registry, &futex),
-            )
-            .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
-    );
-
-    let (outcome, expirations) = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("blocking timerfd reader should wake after arming");
-    assert_eq!(outcome, DispatchOutcome::Returned { value: 8 });
-    assert!(expirations >= 1);
-    reader.join().expect("reader thread panicked");
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
-    let dispatcher = Arc::new(SyscallDispatcher::new());
-    let reporter = Arc::new(CompatReporter::default());
-    let registry = Arc::new(ThreadRegistry::new(test_tid(30)));
-    let futex = Arc::new(FutexTable::new());
-    assert_eq!(registry.register_child(30), test_tid(31));
-
-    let mut setup_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
-    let created = dispatcher
-        .dispatch_threaded(
-            &dispatcher.capture_one_task_context().unwrap(),
-            SyscallRequest::new(85, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
-            &mut setup_memory,
-            &reporter,
-            ThreadCtx::new(test_tid(30), &registry, &futex),
-        )
-        .unwrap();
-    let DispatchOutcome::Returned { value: fd } = created else {
-        panic!("expected timerfd_create success, got {created:?}");
-    };
-
-    let long_timer = LinuxItimerspec {
-        it_interval: LinuxTimespec::new(0, 0),
-        it_value: LinuxTimespec::new(0, 250_000_000),
-    };
-    setup_memory
-        .write_bytes(0x4000, long_timer.as_bytes())
-        .unwrap();
-    assert_eq!(
-        dispatcher
-            .dispatch_threaded(
-                &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(86, SyscallArgs::from([fd as u64, 0, 0x4000, 0, 0, 0])),
-                &mut setup_memory,
-                &reporter,
-                ThreadCtx::new(test_tid(30), &registry, &futex),
-            )
-            .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
-    );
-
-    let (tx, rx) = mpsc::channel();
-    let read_dispatcher = Arc::clone(&dispatcher);
-    let read_reporter = Arc::clone(&reporter);
-    let read_registry = Arc::clone(&registry);
-    let read_futex = Arc::clone(&futex);
-    let reader = std::thread::spawn(move || {
-        let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
-        let outcome = read_dispatcher
-            .dispatch_threaded(
-                &read_dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
-                &mut memory,
-                &read_reporter,
-                ThreadCtx::new(test_tid(30), &read_registry, &read_futex),
-            )
-            .unwrap();
-        tx.send(outcome).unwrap();
-    });
-
-    std::thread::sleep(Duration::from_millis(25));
-    let started = Instant::now();
-    let short_timer = LinuxItimerspec {
-        it_interval: LinuxTimespec::new(0, 0),
-        it_value: LinuxTimespec::new(0, 1),
-    };
-    let mut rearm_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
-    rearm_memory
-        .write_bytes(0x4000, short_timer.as_bytes())
-        .unwrap();
-    assert_eq!(
-        dispatcher
-            .dispatch_threaded(
-                &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(86, SyscallArgs::from([fd as u64, 0, 0x4000, 0, 0, 0])),
-                &mut rearm_memory,
-                &reporter,
-                ThreadCtx::new(test_tid(31), &registry, &futex),
-            )
-            .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
-    );
-
-    assert_eq!(
-        rx.recv_timeout(Duration::from_millis(150))
-            .expect("re-armed timerfd reader should wake promptly"),
-        DispatchOutcome::Returned { value: 8 }
-    );
-    assert!(
-        started.elapsed() < Duration::from_millis(200),
-        "reader waited for the stale long deadline"
-    );
-    reader.join().expect("reader thread panicked");
 }
 
 #[cfg(target_os = "macos")]
@@ -2350,23 +2177,33 @@ fn epoll_et_unread_data_does_not_spin_and_waits_for_next_edge() {
     );
     let client1_fd = 5u64;
     write_sockaddr_in(&mut memory, 0x4030, port);
-    let _ = dispatcher.dispatch(
-        &dispatcher.capture_one_task_context().unwrap(),
-        SyscallRequest::new(203, SyscallArgs::from([client1_fd, 0x4030, 16, 0, 0, 0])),
-        &mut memory,
-        &reporter,
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(203, SyscallArgs::from([client1_fd, 0x4030, 16, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(115)
+        }
     );
+    complete_nonblocking_connect(&mut dispatcher, &mut memory, &reporter, client1_fd);
 
     // First epoll_pwait returns the edge for client 1 (the wait helper parks on
     // the instance kqueue until the loopback handshake lands; the 1 s cap turns
     // a lost wake into a failure, not a hang).
     assert_eq!(
-        dispatch_with_wait(
-            &mut dispatcher,
-            SyscallRequest::new(22, SyscallArgs::from([epfd, 0x4100, 4, 1000, 0, 0])),
-            &mut memory,
-            &reporter,
-        ),
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(22, SyscallArgs::from([epfd, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
         DispatchOutcome::Returned { value: 1 }
     );
     let first = read_epoll_event(&memory, 0x4100);
@@ -2445,30 +2282,48 @@ fn epoll_et_unread_data_does_not_spin_and_waits_for_next_edge() {
     );
     let client2_fd = 6u64;
     write_sockaddr_in(&mut memory, 0x4030, port);
-    let _ = dispatcher.dispatch(
-        &dispatcher.capture_one_task_context().unwrap(),
-        SyscallRequest::new(203, SyscallArgs::from([client2_fd, 0x4030, 16, 0, 0, 0])),
-        &mut memory,
-        &reporter,
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(203, SyscallArgs::from([client2_fd, 0x4030, 16, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(115)
+        }
     );
-    // Now kq_fd MUST become readable because a new connection arrived (bounded
-    // 1 s wait: a lost edge is a failure, not a hang).
+    complete_nonblocking_connect(&mut dispatcher, &mut memory, &reporter, client2_fd);
+    // The instance kqueue must expose the new listener edge before epoll
+    // consumes it; this is a readiness observation only, not its completion.
     let host_ready_after_connect = unsafe { libc::poll(&mut host_pollfd, 1, 1000) };
     assert_eq!(
         host_ready_after_connect, 1,
         "instance kqueue fd must become readable when new connection arrives"
     );
+    assert_eq!(
+        host_pollfd.revents & libc::POLLIN,
+        libc::POLLIN,
+        "new connection must wake the kqueue fd with POLLIN, got revents={:#x}",
+        host_pollfd.revents
+    );
+    assert_eq!(
+        host_pollfd.revents & (libc::POLLNVAL | libc::POLLERR),
+        0,
+        "kqueue readiness observation must not be an invalid/error poll, got revents={:#x}",
+        host_pollfd.revents
+    );
 
     // Next wait returns the fd exactly once:
     assert_eq!(
-        dispatcher
-            .dispatch(
-                &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(22, SyscallArgs::from([epfd, 0x4100, 4, 0, 0, 0])),
-                &mut memory,
-                &reporter,
-            )
-            .unwrap(),
+        dispatch_with_wait(
+            &mut dispatcher,
+            SyscallRequest::new(22, SyscallArgs::from([epfd, 0x4100, 4, 1000, 0, 0])),
+            &mut memory,
+            &reporter,
+        ),
         DispatchOutcome::Returned { value: 1 }
     );
     let second = read_epoll_event(&memory, 0x4100);
@@ -2998,6 +2853,80 @@ fn dispatch_with_wait(
             other => return other,
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn complete_nonblocking_connect(
+    dispatcher: &mut SyscallDispatcher,
+    memory: &mut impl CurrentMmMemory,
+    reporter: &CompatReporter,
+    fd: u64,
+) {
+    const POLL_ADDR: u64 = 0x4300;
+    const TIMEOUT_ADDR: u64 = 0x4320;
+    const ERROR_ADDR: u64 = 0x4340;
+    const ERROR_LEN_ADDR: u64 = 0x4350;
+
+    write_pollfds(
+        memory,
+        POLL_ADDR,
+        [LinuxPollFd {
+            fd: fd as i32,
+            events: LINUX_POLLOUT,
+            revents: 0,
+        }],
+    );
+    memory
+        .write_bytes(TIMEOUT_ADDR, LinuxTimespec::new(1, 0).as_bytes())
+        .expect("write connect completion timeout");
+    assert_eq!(
+        dispatch_with_wait(
+            dispatcher,
+            SyscallRequest::new(73, SyscallArgs::from([POLL_ADDR, 1, TIMEOUT_ADDR, 0, 0, 0])),
+            memory,
+            reporter,
+        ),
+        DispatchOutcome::Returned { value: 1 },
+        "nonblocking connect must become writable within one second"
+    );
+    let pollfd = read_pollfds(memory, POLL_ADDR, 1);
+    assert_eq!(pollfd[0].2 & LINUX_POLLOUT, LINUX_POLLOUT);
+
+    memory
+        .write_bytes(ERROR_LEN_ADDR, &4_u32.to_le_bytes())
+        .expect("write SO_ERROR length");
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    209,
+                    SyscallArgs::from([
+                        fd,
+                        LINUX_SOL_SOCKET as u64,
+                        LINUX_SO_ERROR as u64,
+                        ERROR_ADDR,
+                        ERROR_LEN_ADDR,
+                        0,
+                    ]),
+                ),
+                memory,
+                reporter,
+            )
+            .expect("getsockopt(SO_ERROR)"),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        i32::from_le_bytes(
+            memory
+                .read_bytes(ERROR_ADDR, 4)
+                .expect("read SO_ERROR")
+                .try_into()
+                .expect("SO_ERROR width")
+        ),
+        0,
+        "nonblocking connect completion must report SO_ERROR=0"
+    );
 }
 
 #[cfg(target_os = "macos")]

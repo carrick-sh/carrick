@@ -61,6 +61,17 @@ pub struct InZoneListener {
     queue: Mutex<VecDeque<Arc<PureSocketInner>>>,
     wait_queue: Arc<crate::kernel::WaitQueue>,
     generation: InZoneGeneration,
+    /// Monotonic enqueue sequence for ET consumers. Queue depth alone cannot
+    /// distinguish a new in-zone arrival from an equally deep host accept
+    /// queue, and it can fall when another arrival is accepted.
+    arrival_generation: InZoneGeneration,
+}
+
+/// One coherent accept-queue sample for an epoll readiness decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListenerReadinessSnapshot {
+    pub pending: usize,
+    pub arrival_generation: u64,
 }
 
 impl std::fmt::Debug for InZoneListener {
@@ -85,6 +96,7 @@ impl InZoneListener {
             queue: Mutex::new(VecDeque::new()),
             wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
             generation: InZoneGeneration::new(),
+            arrival_generation: InZoneGeneration::new(),
         }
     }
 
@@ -115,6 +127,7 @@ impl InZoneListener {
             return InZoneEnqueue::BacklogFull;
         }
         queue.push_back(server_half);
+        self.arrival_generation.bump();
         drop(queue);
         self.wait_queue.wake_all();
         InZoneEnqueue::Queued
@@ -141,6 +154,7 @@ impl InZoneListener {
         let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
         self.admissions.fetch_sub(1, Ordering::SeqCst);
         queue.push_back(server_half);
+        self.arrival_generation.bump();
         drop(queue);
         self.wait_queue.wake_all();
     }
@@ -155,6 +169,14 @@ impl InZoneListener {
 
     pub fn pending(&self) -> usize {
         self.queue.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    pub fn readiness_snapshot(&self) -> ListenerReadinessSnapshot {
+        let queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+        ListenerReadinessSnapshot {
+            pending: queue.len(),
+            arrival_generation: self.arrival_generation.get(),
+        }
     }
 
     pub fn wait_queue(&self) -> Arc<crate::kernel::WaitQueue> {
@@ -208,6 +230,7 @@ impl InZonePort {
 
 const EPHEMERAL_PORT_START: u16 = 32768;
 const EPHEMERAL_PORT_END: u16 = 60999;
+pub const EPHEMERAL_PORT_COUNT: usize = (EPHEMERAL_PORT_END - EPHEMERAL_PORT_START + 1) as usize;
 
 fn bindings_overlap(
     left_family: AddrFamily,
@@ -325,8 +348,7 @@ impl InZoneEphemeralPorts {
             IpAddr::V4(_) => AddrFamily::V4,
             IpAddr::V6(_) => AddrFamily::V6,
         };
-        let total = (EPHEMERAL_PORT_END - EPHEMERAL_PORT_START + 1) as usize;
-        for _ in 0..total {
+        for _ in 0..EPHEMERAL_PORT_COUNT {
             let candidate = {
                 let next = self
                     .next_port
@@ -1027,6 +1049,77 @@ mod tests {
         assert!(Arc::ptr_eq(&l.dequeue().unwrap(), &halves[0]));
         assert!(Arc::ptr_eq(&l.dequeue().unwrap(), &halves[1]));
         assert!(l.dequeue().is_none());
+    }
+
+    fn readiness_listener() -> Arc<InZoneListener> {
+        Arc::new(InZoneListener::new(
+            InZoneListenerKey {
+                scope: InZoneScope::CarrierHost,
+                addr: GuestSocketAddr("127.0.0.1:2".parse().unwrap()),
+            },
+            4,
+            false,
+            false,
+        ))
+    }
+
+    fn server_half() -> Arc<PureSocketInner> {
+        PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        )
+        .1
+    }
+
+    #[test]
+    fn readiness_snapshot_advances_with_direct_enqueue() {
+        let listener = readiness_listener();
+        assert_eq!(
+            listener.readiness_snapshot(),
+            ListenerReadinessSnapshot {
+                pending: 0,
+                arrival_generation: 0,
+            }
+        );
+        assert_eq!(listener.enqueue(server_half()), InZoneEnqueue::Queued);
+        assert_eq!(
+            listener.readiness_snapshot(),
+            ListenerReadinessSnapshot {
+                pending: 1,
+                arrival_generation: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn readiness_snapshot_advances_with_reserved_enqueue() {
+        let listener = readiness_listener();
+        listener
+            .reserve_admission()
+            .expect("capacity reservation")
+            .enqueue(server_half());
+        assert_eq!(
+            listener.readiness_snapshot(),
+            ListenerReadinessSnapshot {
+                pending: 1,
+                arrival_generation: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn dequeue_changes_pending_without_advancing_arrival_generation() {
+        let listener = readiness_listener();
+        assert_eq!(listener.enqueue(server_half()), InZoneEnqueue::Queued);
+        let before = listener.readiness_snapshot();
+        assert!(listener.dequeue().is_some());
+        let after = listener.readiness_snapshot();
+        assert_eq!(before.pending, 1);
+        assert_eq!(after.pending, 0);
+        assert_eq!(after.arrival_generation, before.arrival_generation);
     }
 
     #[test]
