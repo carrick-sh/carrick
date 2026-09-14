@@ -114,6 +114,8 @@ BLANKET_RESOURCE_FRAGMENTS = {
     "artifact explicitly authorized by the active cli command",
 }
 MAX_IDENTICAL_RESOURCE_REVIEWS = 12
+MAX_CARGO_FAILURE_DIAGNOSTICS = 3
+MAX_CARGO_FAILURE_DIAGNOSTIC_CHARS = 4_000
 PRODUCT_SOURCE_PATHS = (
     "Cargo.toml",
     "Cargo.lock",
@@ -611,12 +613,54 @@ def _completed_text(
     )
 
 
+def _cargo_failure_diagnostics(stdout: object) -> list[str]:
+    """Return a bounded, diagnostic-only subset of a Cargo JSON stream."""
+    if not isinstance(stdout, str):
+        return []
+    diagnostics: list[str] = []
+    for line in stdout.splitlines():
+        try:
+            row: Any = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, Mapping) or row.get("reason") != "compiler-message":
+            continue
+        message = row.get("message")
+        if not isinstance(message, Mapping) or message.get("level") != "error":
+            continue
+        rendered = message.get("rendered")
+        detail = (
+            rendered
+            if isinstance(rendered, str) and rendered.strip()
+            else message.get("message")
+        )
+        if not isinstance(detail, str) or not detail.strip():
+            continue
+        detail = detail.strip()
+        if len(detail) > MAX_CARGO_FAILURE_DIAGNOSTIC_CHARS:
+            detail = (
+                detail[:MAX_CARGO_FAILURE_DIAGNOSTIC_CHARS]
+                + "\n<compiler diagnostic truncated>"
+            )
+        diagnostics.append(detail)
+        if len(diagnostics) == MAX_CARGO_FAILURE_DIAGNOSTICS:
+            break
+    return diagnostics
+
+
 def _command_failure(label: str, result: subprocess.CompletedProcess[str]) -> None:
     stderr = result.stderr.strip() if isinstance(result.stderr, str) else ""
     detail = stderr or "<captured stderr was empty>"
-    raise InventoryError(
-        f"{label} failed with exit {result.returncode}; captured stderr: {detail}"
-    )
+    failure = f"{label} failed with exit {result.returncode}; captured stderr: {detail}"
+    diagnostics = _cargo_failure_diagnostics(result.stdout)
+    if diagnostics:
+        failure += (
+            "; captured Cargo compiler error(s) from stdout:\n"
+            + "\n---\n".join(diagnostics)
+        )
+        if len(diagnostics) == MAX_CARGO_FAILURE_DIAGNOSTICS:
+            failure += "\n<compiler diagnostic limit reached>"
+    raise InventoryError(failure)
 
 
 def _rustc_verbose_identity(
