@@ -2918,10 +2918,11 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// `statfslifetime`, `syslogstate`, `tty0state`, and `packetv3state` add
 /// filesystem ownership, syslog capability and argument semantics, console
 /// descriptor semantics, and TPACKET_V3 packet socket state coverage. They are
-/// `generic`, moving the authoritative inventory to 535 probe sources: 507
-/// conformance sources (484 generic, 23 dedicated), 27 performance sources,
-/// and one helper. Both libc lanes gate 1014 rows.
-const PROBE_SOURCE_COUNT: usize = 535;
+/// `generic`. `mqueueworkerprogress` and `procexeidentity` add execution-capacity
+/// and retained-executable coverage, bringing the inventory to 537 sources:
+/// 509 conformance sources (486 generic, 23 dedicated), 27 performance sources,
+/// and one helper. Both libc lanes gate 1018 rows.
+const PROBE_SOURCE_COUNT: usize = 537;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4694,9 +4695,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 484);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 507);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1014);
+    assert_eq!(generic.len(), 486);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 509);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1018);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
