@@ -1745,6 +1745,52 @@ class MatrixOrchestrationTest(unittest.TestCase):
                 profile, runner=runner, root=ROOT, current_host="macos"
             )
 
+    def test_run_profile_reports_bounded_cargo_errors_from_stdout(self):
+        profile = self.load().profiles["macos-hvf-default"]
+        runner = FakeRunner()
+        runner.cargo_returncode = 101
+        runner.cargo_stderr = "clippy process context\n"
+        compiler_rows = [
+            {
+                "reason": "compiler-message",
+                "message": {
+                    "level": "error",
+                    "message": f"error-{index}",
+                    "rendered": f"error[E000{index}]: error-{index}\n  --> crates/example.rs:{index + 1}:1\n",
+                },
+            }
+            for index in range(4)
+        ]
+        runner.cargo_stdout = "\n".join(
+            [
+                json.dumps(
+                    {"reason": "build-script-executed", "stdout": "secret=hidden"}
+                ),
+                json.dumps(
+                    {
+                        "reason": "compiler-message",
+                        "message": {"level": "warning", "message": "not an error"},
+                    }
+                ),
+                *(json.dumps(row) for row in compiler_rows),
+            ]
+        )
+
+        with self.assertRaises(self.host_authority.InventoryError) as raised:
+            self.host_authority.run_profile(
+                profile, runner=runner, root=ROOT, current_host="macos"
+            )
+
+        failure = str(raised.exception)
+        self.assertIn("clippy process context", failure)
+        self.assertIn("captured Cargo compiler error(s) from stdout", failure)
+        for index in range(3):
+            self.assertIn(f"error-{index}", failure)
+        self.assertNotIn("error-3", failure)
+        self.assertIn("compiler diagnostic limit reached", failure)
+        self.assertNotIn("not an error", failure)
+        self.assertNotIn("secret=hidden", failure)
+
     def test_run_profile_rejects_malformed_or_empty_json_stdout(self):
         profile = self.load().profiles["macos-hvf-default"]
         for label, stdout in (("malformed", "not json\n"), ("empty", "")):
