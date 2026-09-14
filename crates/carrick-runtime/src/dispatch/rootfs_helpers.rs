@@ -17,6 +17,10 @@ use crate::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata
 use super::DispatchOutcome;
 
 pub(crate) const MAX_GUEST_PATH: usize = 4096;
+/// Linux bounds one `execve(2)` argument or environment string, including its
+/// terminating NUL, to 32 guest pages. This uses Linux's fixed guest page size,
+/// not the host page size (16 KiB on the reference macOS host).
+const MAX_EXEC_STRING_BYTES: usize = 32 * crate::linux_abi::LINUX_PAGE_SIZE as usize;
 
 /// Linux `NLMSG_ALIGNTO` — netlink messages and attributes are 4-byte aligned.
 pub(crate) const NLMSG_ALIGNTO: usize = 4;
@@ -299,7 +303,7 @@ pub(super) fn read_guest_string_array_bytes(
         if ptr == 0 {
             return Ok(out);
         }
-        out.push(read_guest_c_string_bytes(memory, ptr)?);
+        out.push(read_guest_exec_string_bytes(memory, ptr)?);
     }
     Err(LINUX_E2BIG)
 }
@@ -332,6 +336,62 @@ pub(super) fn validate_exec_vector_size(
 #[cfg(test)]
 mod exec_vector_tests {
     use super::*;
+
+    fn one_string_array(payload_len: usize) -> crate::dispatch::LinearMemory {
+        const BASE: u64 = 0x1000;
+        const STRING_OFFSET: usize = 0x100;
+        let string_address = BASE + STRING_OFFSET as u64;
+        let mut bytes = vec![0_u8; STRING_OFFSET + payload_len + 1];
+        bytes[..8].copy_from_slice(&string_address.to_le_bytes());
+        bytes[STRING_OFFSET..STRING_OFFSET + payload_len].fill(b'x');
+        crate::dispatch::LinearMemory::new(BASE, bytes)
+    }
+
+    #[test]
+    fn exec_argument_string_can_exceed_path_max() {
+        const BASE: u64 = 0x1000;
+        let memory = one_string_array(MAX_GUEST_PATH);
+
+        let argv = read_guest_string_array_bytes(&memory, BASE).expect("read long exec argument");
+
+        assert_eq!(argv, vec![vec![b'x'; MAX_GUEST_PATH]]);
+    }
+
+    #[test]
+    fn exec_string_limit_includes_terminating_nul_and_returns_e2big() {
+        const BASE: u64 = 0x1000;
+        let largest = one_string_array(MAX_EXEC_STRING_BYTES - 1);
+        assert_eq!(
+            read_guest_string_array_bytes(&largest, BASE).expect("read largest Linux exec string")
+                [0]
+            .len(),
+            MAX_EXEC_STRING_BYTES - 1
+        );
+
+        let oversized = one_string_array(MAX_EXEC_STRING_BYTES);
+        assert_eq!(
+            read_guest_string_array_bytes(&oversized, BASE),
+            Err(LINUX_E2BIG)
+        );
+    }
+
+    #[test]
+    fn path_limit_and_unmapped_exec_string_errors_are_preserved() {
+        const BASE: u64 = 0x1000;
+        let path = one_string_array(MAX_GUEST_PATH);
+        assert_eq!(
+            read_guest_c_string_bytes(&path, BASE + 0x100),
+            Err(LINUX_ENAMETOOLONG)
+        );
+
+        let mut pointer_only = vec![0_u8; 16];
+        pointer_only[..8].copy_from_slice(&0x9000_u64.to_le_bytes());
+        let unmapped = crate::dispatch::LinearMemory::new(BASE, pointer_only);
+        assert_eq!(
+            read_guest_string_array_bytes(&unmapped, BASE),
+            Err(LINUX_EFAULT)
+        );
+    }
 
     #[test]
     fn exec_vector_rejects_payload_beyond_linux_arg_max() {
@@ -406,14 +466,28 @@ pub(super) fn read_guest_c_string_bytes(
     memory: &impl CurrentMmMemory,
     address: u64,
 ) -> Result<Vec<u8>, LinuxErrno> {
+    read_guest_c_string_bytes_bounded(memory, address, MAX_GUEST_PATH, LINUX_ENAMETOOLONG)
+}
+
+fn read_guest_exec_string_bytes(
+    memory: &impl CurrentMmMemory,
+    address: u64,
+) -> Result<Vec<u8>, LinuxErrno> {
+    read_guest_c_string_bytes_bounded(memory, address, MAX_EXEC_STRING_BYTES, LINUX_E2BIG)
+}
+
+fn read_guest_c_string_bytes_bounded(
+    memory: &impl CurrentMmMemory,
+    address: u64,
+    max_bytes_including_nul: usize,
+    too_long: LinuxErrno,
+) -> Result<Vec<u8>, LinuxErrno> {
     const CHUNK: usize = 256;
     let mut bytes = Vec::new();
     let mut offset = 0usize;
-    while offset < MAX_GUEST_PATH {
-        let address = address
-            .checked_add(offset as u64)
-            .ok_or(LINUX_ENAMETOOLONG)?;
-        let to_read = CHUNK.min(MAX_GUEST_PATH - offset);
+    while offset < max_bytes_including_nul {
+        let address = address.checked_add(offset as u64).ok_or(too_long)?;
+        let to_read = CHUNK.min(max_bytes_including_nul - offset);
         let chunk = match memory.read_bytes(address, to_read) {
             Ok(chunk) => chunk,
             Err(_) if to_read > 1 => memory.read_bytes(address, 1).map_err(|_| LINUX_EFAULT)?,
@@ -426,7 +500,7 @@ pub(super) fn read_guest_c_string_bytes(
         offset += chunk.len();
         bytes.extend_from_slice(&chunk);
     }
-    Err(LINUX_ENAMETOOLONG)
+    Err(too_long)
 }
 
 /// As [`read_guest_c_string_bytes`], carried into a Rust `String` for the paths
