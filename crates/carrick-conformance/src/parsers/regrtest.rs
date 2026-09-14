@@ -150,35 +150,31 @@ impl RegrtestParser {
 
         for line in text.lines() {
             let trimmed = line.trim_end();
-            if let Some((_, _, summary)) = pending_doctest.as_mut() {
+            if let Some((id, ordinal, mut summary)) = pending_doctest.take() {
                 if let Some(completion) = doctest_completion_summary(trimmed) {
-                    if *summary != DoctestSummary::Failed {
-                        *summary = completion;
+                    if summary != DoctestSummary::Failed {
+                        summary = completion;
                     }
+                    pending_doctest = Some((id, ordinal, summary));
                     continue;
                 }
-                if *summary != DoctestSummary::Pending {
+                if summary != DoctestSummary::Pending {
                     let mut outcome = classify(trimmed);
                     if outcome != Outcome::Other {
-                        if *summary == DoctestSummary::Failed {
+                        if summary == DoctestSummary::Failed {
                             outcome = Outcome::Fail;
                         }
-                        let (id, ordinal, _) = pending_doctest
-                            .take()
-                            .expect("pending doctest must still be present");
                         push_assertion(&mut collector, &id, &ordinal, outcome);
                         continue;
                     }
                 }
                 let boundary = result_re.is_match(trimmed)
-                    || (*summary != DoctestSummary::Pending
+                    || (summary != DoctestSummary::Pending
                         && (line_re.is_match(trimmed) || header_re.is_match(trimmed)));
                 if !boundary {
+                    pending_doctest = Some((id, ordinal, summary));
                     continue;
                 }
-                let (id, ordinal, summary) = pending_doctest
-                    .take()
-                    .expect("pending doctest must still be present");
                 let outcome = if summary == DoctestSummary::Failed {
                     Outcome::Fail
                 } else {
@@ -276,35 +272,31 @@ impl VerdictParser for RegrtestParser {
 
         for line in text.lines() {
             let trimmed = line.trim_end();
-            if let Some((_, summary)) = pending_doctest.as_mut() {
+            if let Some((id, mut summary)) = pending_doctest.take() {
                 if let Some(completion) = doctest_completion_summary(trimmed) {
-                    if *summary != DoctestSummary::Failed {
-                        *summary = completion;
+                    if summary != DoctestSummary::Failed {
+                        summary = completion;
                     }
+                    pending_doctest = Some((id, summary));
                     continue;
                 }
-                if *summary != DoctestSummary::Pending {
+                if summary != DoctestSummary::Pending {
                     let mut outcome = classify(trimmed);
                     if outcome != Outcome::Other {
-                        if *summary == DoctestSummary::Failed {
+                        if summary == DoctestSummary::Failed {
                             outcome = Outcome::Fail;
                         }
-                        let (id, _) = pending_doctest
-                            .take()
-                            .expect("pending doctest must still be present");
                         ids.entry(id).or_insert(outcome);
                         continue;
                     }
                 }
                 let boundary = result_re.is_match(trimmed)
-                    || (*summary != DoctestSummary::Pending
+                    || (summary != DoctestSummary::Pending
                         && (line_re.is_match(trimmed) || header_re.is_match(trimmed)));
                 if !boundary {
+                    pending_doctest = Some((id, summary));
                     continue;
                 }
-                let (id, summary) = pending_doctest
-                    .take()
-                    .expect("pending doctest must still be present");
                 let outcome = if summary == DoctestSummary::Failed {
                     Outcome::Fail
                 } else {
