@@ -9025,15 +9025,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 44203,
-        "byte_start": 44187,
+        "byte_end": 45015,
+        "byte_start": 44999,
         "column": 9,
         "column_end": 25,
         "column_start": 9,
         "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-        "line": 1095,
-        "line_end": 1095,
-        "line_start": 1095
+        "line": 1117,
+        "line_end": 1117,
+        "line_start": 1117
       }
     },
     {
@@ -10881,15 +10881,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 113083,
-        "byte_start": 113065,
+        "byte_end": 113895,
+        "byte_start": 113877,
         "column": 29,
         "column_end": 47,
         "column_start": 29,
         "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-        "line": 2536,
-        "line_end": 2536,
-        "line_start": 2536
+        "line": 2558,
+        "line_end": 2558,
+        "line_start": 2558
       }
     },
     {
@@ -11353,15 +11353,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 96295,
-        "byte_start": 96273,
+        "byte_end": 97107,
+        "byte_start": 97085,
         "column": 13,
         "column_end": 35,
         "column_start": 13,
         "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-        "line": 2198,
-        "line_end": 2198,
-        "line_start": 2198
+        "line": 2220,
+        "line_end": 2220,
+        "line_start": 2220
       }
     },
     {
@@ -11585,9 +11585,9 @@
       }
     }
   ],
-  "rows_sha256": "0f77318c19eaf1b9d0d1f65af6cfff5cefe5e487a43bd3d41f4a21b76e2a8db5",
+  "rows_sha256": "f431bbbe2f7cc1a87bd16a8beeb41de1e77f553a363a9168f11ec3c2641ae868",
   "schema": 1,
-  "source_head": "ad73cb84d1e0bd1ce9cef0139fb5632f109583aa",
+  "source_head": "68956b97cf37851aee4a24220948675b226d5a2a",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
