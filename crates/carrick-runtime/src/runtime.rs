@@ -844,7 +844,7 @@ fn with_hvf_syscall_mailbox(
     // identity-page gate decide whether matched calls return in EL1 or fall
     // through to the host dispatcher.
     let identity_fast_path = crate::syscall_shim_enabled();
-    let image = image.with_el1_vectors_mailbox(identity_fast_path)?;
+    let image = image.with_el1_vectors_mailbox_fd_ceiling(identity_fast_path)?;
     // The page is part of the compile-enabled transport shape even when its
     // runtime gate is closed. Boot/fork/exec stampers still publish the task
     // identity there; interceptor/observer visibility keeps the gate at zero
@@ -855,7 +855,9 @@ fn with_hvf_syscall_mailbox(
         image
     };
     let image = image.with_syscall_mailbox_arena()?;
-    image.with_carrier_maintenance_root()
+    image
+        .with_carrier_maintenance_root()?
+        .with_fd_ceiling_control()
 }
 
 /// Construct the immutable HVPatch image boundary shared by initial boots and

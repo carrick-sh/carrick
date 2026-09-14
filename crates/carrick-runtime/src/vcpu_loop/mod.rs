@@ -58,6 +58,7 @@ use crate::trap::{SyscallTrap, TrapError};
 
 pub mod continuation;
 pub mod executor;
+mod fd_ceiling;
 
 const SIGNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
 

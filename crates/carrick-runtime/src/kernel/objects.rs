@@ -10,6 +10,7 @@ use std::time::Duration;
 use carrick_abi::{LinuxEpollEvents, LinuxSiginfo, NsGid, NsUid};
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use super::FdCeilingAuthority;
 use super::ids::{
     FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, LinuxSignal, LinuxTid,
     ObjectIdError, ProcessGroupId, TaskId, TaskSerial, ThreadSerial,
@@ -1643,6 +1644,7 @@ pub(crate) type FileSlotMap = HashMap<i32, FileSlot, BuildHasherDefault<FileSlot
 #[derive(Debug)]
 pub struct FileTable {
     id: FileTableId,
+    fd_ceiling: Arc<FdCeilingAuthority>,
     open_files: RwLock<FileSlotMap>,
     next_fd: Mutex<i32>,
     stdio_cloexec: Mutex<[bool; 3]>,
@@ -1658,8 +1660,13 @@ pub struct FileTable {
 
 impl FileTable {
     pub fn new(id: FileTableId) -> Self {
+        Self::with_fd_ceiling(id, Arc::new(FdCeilingAuthority::new()))
+    }
+
+    pub(super) fn with_fd_ceiling(id: FileTableId, fd_ceiling: Arc<FdCeilingAuthority>) -> Self {
         Self {
             id,
+            fd_ceiling,
             open_files: RwLock::new(FileSlotMap::default()),
             next_fd: Mutex::new(3),
             stdio_cloexec: Mutex::new([false; 3]),
@@ -1676,12 +1683,16 @@ impl FileTable {
 
     pub(super) fn for_fork_copy(id: FileTableId, parent: &Self) -> Self {
         let open_files = parent.open_files.read().clone();
+        if let Some(maximum) = open_files.keys().max() {
+            parent.fd_ceiling.publish(*maximum);
+        }
         for slot in open_files.values() {
             slot.description.retain_fd_ref();
         }
         let epoll_wake_registry = Arc::clone(&parent.epoll_wake_registry);
         Self {
             id,
+            fd_ceiling: Arc::clone(&parent.fd_ceiling),
             open_files: RwLock::new(open_files),
             next_fd: Mutex::new(*parent.next_fd.lock()),
             stdio_cloexec: Mutex::new(*parent.stdio_cloexec.lock()),
@@ -1696,8 +1707,8 @@ impl FileTable {
         }
     }
 
-    pub(super) fn for_external_exec(id: FileTableId) -> Self {
-        Self::new(id)
+    pub(super) fn for_external_exec(id: FileTableId, fd_ceiling: Arc<FdCeilingAuthority>) -> Self {
+        Self::with_fd_ceiling(id, fd_ceiling)
     }
 
     fn for_exec(id: FileTableId, caller: &Self) -> Self {
@@ -1718,6 +1729,9 @@ impl FileTable {
             *closed |= *close_on_exec;
         }
         let epoll_wake_registry = Arc::clone(&caller.epoll_wake_registry);
+        if let Some(maximum) = open_files.keys().max() {
+            caller.fd_ceiling.publish(*maximum);
+        }
         let next_fd = *caller.next_fd.lock();
         let fd_open_paths = caller
             .fd_open_paths
@@ -1734,6 +1748,7 @@ impl FileTable {
             .collect();
         Self {
             id,
+            fd_ceiling: Arc::clone(&caller.fd_ceiling),
             open_files: RwLock::new(open_files),
             next_fd: Mutex::new(next_fd),
             stdio_cloexec: Mutex::new([false; 3]),
@@ -1760,6 +1775,7 @@ impl FileTable {
     ) -> Option<FileSlot> {
         let _mutation = self.mutation_lease();
         let mut open_files = self.open_files.write();
+        self.fd_ceiling.publish(number.raw());
         let replaced = open_files.insert(
             number.raw(),
             FileSlot::new(
@@ -1964,6 +1980,7 @@ impl FileTable {
         FileTableWriteGuard {
             guard,
             _mutation: mutation,
+            fd_ceiling: &self.fd_ceiling,
             revision: &self.revision,
             table: self.id,
             subscriptions: &self.slot_subscriptions,
@@ -2153,6 +2170,7 @@ impl Drop for FileTable {
 pub(crate) struct FileTableWriteGuard<'a> {
     guard: RwLockWriteGuard<'a, FileSlotMap>,
     _mutation: FileTableMutationLease,
+    fd_ceiling: &'a FdCeilingAuthority,
     revision: &'a ObjectRevision,
     table: FileTableId,
     subscriptions: &'a FileSlotSubscriptions,
@@ -2190,6 +2208,7 @@ impl FileTableWriteGuard<'_> {
     pub(crate) fn insert(&mut self, number: i32, mut slot: FileSlot) -> Option<FileSlot> {
         slot.generation = next_file_slot_generation();
         self.mark_replaced(number);
+        self.fd_ceiling.publish(number);
         self.guard.insert(number, slot)
     }
 
@@ -2527,11 +2546,161 @@ pub enum ObjectGraphError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
     use crate::kernel::ids::ObjectIdRegistry;
 
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct TestCeilingPublisher(AtomicU32);
+
+    impl carrick_hal::FdCeilingPublisher for TestCeilingPublisher {
+        fn raise(&self, maximum: u32) {
+            self.0.fetch_max(maximum, Ordering::Release);
+        }
+
+        fn disable(&self) {}
+    }
+
+    #[derive(Debug)]
+    struct PanickingCeilingPublisher(Arc<parking_lot::Mutex<Vec<&'static str>>>);
+
+    impl carrick_hal::FdCeilingPublisher for PanickingCeilingPublisher {
+        fn raise(&self, maximum: u32) {
+            if maximum > 2 {
+                self.0.lock().push("raise");
+                panic!("publication intercept");
+            }
+        }
+
+        fn disable(&self) {}
+    }
+
+    fn regular_description(ids: &ObjectIdRegistry) -> Arc<FileDescription> {
+        Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("description ID"),
+        ))
+    }
+
+    #[test]
+    fn install_publishes_before_slot_visibility() {
+        let ids = ObjectIdRegistry::new();
+        let authority = Arc::new(FdCeilingAuthority::new());
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        authority.register(Arc::new(PanickingCeilingPublisher(Arc::clone(&events))));
+        let table = FileTable::with_fd_ceiling(ids.file_table_id().expect("table ID"), authority);
+        let fd = FileSlotNumber::for_open_fd(9).expect("fd");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            table.install(fd, regular_description(&ids), false);
+        }));
+        assert!(result.is_err());
+        assert_eq!(&*events.lock(), &["raise"]);
+        assert!(table.slot(fd).is_none());
+    }
+
+    #[test]
+    fn write_guard_publishes_before_slot_visibility() {
+        let ids = ObjectIdRegistry::new();
+        let authority = Arc::new(FdCeilingAuthority::new());
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        authority.register(Arc::new(PanickingCeilingPublisher(Arc::clone(&events))));
+        let table = FileTable::with_fd_ceiling(ids.file_table_id().expect("table ID"), authority);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            table
+                .write_open_files()
+                .insert(12, FileSlot::new(regular_description(&ids), 0));
+        }));
+        assert!(result.is_err());
+        assert_eq!(&*events.lock(), &["raise"]);
+        assert!(
+            table
+                .slot(FileSlotNumber::for_open_fd(12).expect("fd"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn copied_tables_share_ceiling_while_standalone_tables_are_isolated() {
+        let ids = ObjectIdRegistry::new();
+        let authority = Arc::new(FdCeilingAuthority::new());
+        let publisher = Arc::new(TestCeilingPublisher::default());
+        authority.register(publisher.clone());
+        let parent =
+            FileTable::with_fd_ceiling(ids.file_table_id().expect("parent table ID"), authority);
+        let child = FileTable::for_fork_copy(ids.file_table_id().expect("child table ID"), &parent);
+        child.install(
+            FileSlotNumber::for_open_fd(47).expect("fd"),
+            regular_description(&ids),
+            false,
+        );
+        assert_eq!(publisher.0.load(Ordering::Acquire), 47);
+
+        let standalone = FileTable::new(ids.file_table_id().expect("standalone table ID"));
+        standalone.install(
+            FileSlotNumber::for_open_fd(63).expect("fd"),
+            regular_description(&ids),
+            false,
+        );
+        assert_eq!(publisher.0.load(Ordering::Acquire), 47);
+    }
+
+    #[test]
+    fn fork_exec_and_external_exec_tables_retain_the_carrier_authority() {
+        let ids = ObjectIdRegistry::new();
+        let authority = Arc::new(FdCeilingAuthority::new());
+        let publisher = Arc::new(TestCeilingPublisher::default());
+        authority.register(publisher.clone());
+        let parent = FileTable::with_fd_ceiling(
+            ids.file_table_id().expect("parent table ID"),
+            Arc::clone(&authority),
+        );
+        let fork = FileTable::for_fork_copy(ids.file_table_id().expect("fork table ID"), &parent);
+        let exec = FileTable::for_exec(ids.file_table_id().expect("exec table ID"), &fork);
+        let external = FileTable::for_external_exec(
+            ids.file_table_id().expect("external table ID"),
+            authority,
+        );
+
+        for (table, fd) in [(&fork, 21), (&exec, 34), (&external, 55)] {
+            table.install(
+                FileSlotNumber::for_open_fd(fd).expect("fd"),
+                regular_description(&ids),
+                false,
+            );
+        }
+        assert_eq!(publisher.0.load(Ordering::Acquire), 55);
+    }
+
+    #[test]
+    fn concurrent_file_table_insertions_publish_the_largest_descriptor() {
+        let ids = ObjectIdRegistry::new();
+        let authority = Arc::new(FdCeilingAuthority::new());
+        let publisher = Arc::new(TestCeilingPublisher::default());
+        authority.register(publisher.clone());
+        let table = Arc::new(FileTable::with_fd_ceiling(
+            ids.file_table_id().expect("table ID"),
+            authority,
+        ));
+        let threads = (3..35)
+            .map(|fd| {
+                let table = Arc::clone(&table);
+                let description = regular_description(&ids);
+                std::thread::spawn(move || {
+                    table.install(
+                        FileSlotNumber::for_open_fd(fd).expect("fd"),
+                        description,
+                        false,
+                    );
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("insertion thread");
+        }
+        assert_eq!(publisher.0.load(Ordering::Acquire), 34);
+        assert_eq!(table.slot_count(), 32);
+    }
 
     #[test]
     fn file_slot_hasher_preserves_the_i32_descriptor_domain() {

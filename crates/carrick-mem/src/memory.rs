@@ -251,6 +251,25 @@ const _: () = assert!(
     "carrier maintenance root escapes the kernel-only first 2 MiB block",
 );
 
+/// Carrier-global descriptor-ceiling control page. EL1 may read this page,
+/// while EL0 cannot reach the kernel-only block and stage-2 denies guest
+/// writes. The host updates both words atomically through the owned carrier
+/// backing.
+pub const LINUX_FD_CEILING_CONTROL_BASE: u64 =
+    LINUX_CARRIER_MAINT_ROOT_BASE + LINUX_CARRIER_MAINT_ROOT_SIZE;
+pub const LINUX_FD_CEILING_CONTROL_SIZE: u64 = 0x4000;
+pub const LINUX_FD_CEILING_OFF_CEILING: u64 = 0;
+pub const LINUX_FD_CEILING_OFF_GATE: u64 = 4;
+pub const FD_CEILING_GATE_UNINITIALIZED: u32 = 0;
+pub const FD_CEILING_GATE_ENABLED: u32 = 1;
+pub const FD_CEILING_GATE_PERMANENTLY_DISABLED: u32 = 2;
+const _: () = assert!(LINUX_FD_CEILING_CONTROL_BASE.is_multiple_of(0x4000));
+const _: () = assert!(
+    (LINUX_FD_CEILING_CONTROL_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_FD_CEILING_CONTROL_SIZE
+        <= LINUX_KERNEL_REGION_SIZE,
+    "fd ceiling control page escapes the kernel-only region",
+);
+
 /// A carrier-owned Stage-1 translation root dedicated to EL1 maintenance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CarrierMaintenanceRoot(pub Gpa);
@@ -1599,11 +1618,27 @@ impl AddressSpace {
         self.with_el1_vectors_from_bytes(el1_vectors_bytes_shim())
     }
 
+    /// Install the identity shim plus the opt-in carrier descriptor-ceiling
+    /// fstat guard.  The caller must have installed the carrier control page.
+    pub fn with_el1_vectors_shim_fd_ceiling(self) -> Result<Self, AddressSpaceError> {
+        self.with_el1_vectors_from_bytes(el1_vectors_bytes_shim_fd_ceiling())
+    }
+
     pub fn with_el1_vectors_mailbox(
         self,
         identity_fast_path: bool,
     ) -> Result<Self, AddressSpaceError> {
         self.with_el1_vectors_from_bytes(el1_vectors_bytes_mailbox(identity_fast_path))
+    }
+
+    /// Install mailbox vectors with the opt-in carrier descriptor-ceiling
+    /// fstat guard.  This is intentionally separate from the universal mailbox
+    /// builder because minimal and non-HVF images do not map its control page.
+    pub fn with_el1_vectors_mailbox_fd_ceiling(
+        self,
+        identity_fast_path: bool,
+    ) -> Result<Self, AddressSpaceError> {
+        self.with_el1_vectors_from_bytes(el1_vectors_bytes_mailbox_fd_ceiling(identity_fast_path))
     }
 
     fn with_el1_vectors_from_bytes(self, bytes: Vec<u8>) -> Result<Self, AddressSpaceError> {
@@ -1773,6 +1808,56 @@ impl AddressSpace {
             },
             shared: false,
             bytes: stage1_carrier_maintenance_page_tables().into(),
+        };
+
+        let AddressSpace {
+            entry,
+            regions,
+            initial_stack_pointer,
+            linux_auxv,
+            linux_auxv_image,
+            el0_trampoline_entry,
+            el1_vectors_base,
+            stage1_page_tables_base,
+            ro_spans,
+            file_mappings,
+        } = self;
+        let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.initial_stack_pointer = initial_stack_pointer;
+        image.linux_auxv = linux_auxv;
+        image.linux_auxv_image = linux_auxv_image;
+        image.el0_trampoline_entry = el0_trampoline_entry;
+        image.el1_vectors_base = el1_vectors_base;
+        image.stage1_page_tables_base = stage1_page_tables_base;
+        image.ro_spans = ro_spans;
+        image.file_mappings = file_mappings;
+        Ok(image)
+    }
+
+    /// Append the carrier-global, host-published descriptor-ceiling page.
+    pub fn with_fd_ceiling_control(self) -> Result<Self, AddressSpaceError> {
+        let start = LINUX_FD_CEILING_CONTROL_BASE;
+        let end = start.checked_add(LINUX_FD_CEILING_CONTROL_SIZE).ok_or(
+            AddressSpaceError::RegionOverflow {
+                start,
+                size: LINUX_FD_CEILING_CONTROL_SIZE,
+            },
+        )?;
+        let mut bytes = vec![0_u8; LINUX_FD_CEILING_CONTROL_SIZE as usize];
+        bytes[LINUX_FD_CEILING_OFF_CEILING as usize..LINUX_FD_CEILING_OFF_CEILING as usize + 4]
+            .copy_from_slice(&2_u32.to_le_bytes());
+        bytes[LINUX_FD_CEILING_OFF_GATE as usize..LINUX_FD_CEILING_OFF_GATE as usize + 4]
+            .copy_from_slice(&FD_CEILING_GATE_UNINITIALIZED.to_le_bytes());
+        let region = MemoryRegion {
+            start,
+            end,
+            perms: SegmentPerms {
+                read: true,
+                write: false,
+                execute: false,
+            },
+            shared: false,
+            bytes: bytes.into(),
         };
 
         let AddressSpace {
@@ -3186,6 +3271,15 @@ pub fn el1_vectors_bytes() -> Vec<u8> {
     bytes
 }
 
+/// Legacy HVC vectors with the opt-in carrier descriptor-ceiling fstat guard.
+/// Callers must map the fail-closed control page before installing this page.
+pub fn el1_vectors_bytes_fd_ceiling() -> Vec<u8> {
+    let mut bytes = el1_vectors_bytes();
+    const HANDLER_BASE: usize = 16 * AARCH64_VECTOR_SLOT_SIZE;
+    write_fstat_ceiling_dispatcher(&mut bytes, HANDLER_BASE, false);
+    bytes
+}
+
 // ---- AArch64 encoders for the EL1 syscall-shim dispatcher ----
 // `cmp x8, #imm` == `subs xzr, x8, #imm` (no shift). imm12 in bits[21:10].
 fn enc_cmp_x8_imm(imm: u16) -> u32 {
@@ -3199,6 +3293,14 @@ fn enc_beq(pc: u64, target: u64) -> u32 {
 fn enc_bne(pc: u64, target: u64) -> u32 {
     let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
     0x5400_0001 | (imm19 << 5)
+}
+fn enc_blt(pc: u64, target: u64) -> u32 {
+    let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
+    0x5400_000B | (imm19 << 5)
+}
+fn enc_bls(pc: u64, target: u64) -> u32 {
+    let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
+    0x5400_0009 | (imm19 << 5)
 }
 fn enc_b(pc: u64, target: u64) -> u32 {
     let imm26 = (((target as i64 - pc as i64) >> 2) as u32) & 0x03FF_FFFF;
@@ -3276,6 +3378,185 @@ fn enc_cmp_w16_imm(imm: u16) -> u32 {
     0x7100_021F | ((u32::from(imm) & 0xFFF) << 10)
 }
 
+// `ldar wt, [xn]`.  The ceiling authority publishes with Release ordering, so
+// the EL1 reader must use the matching acquire load for both the gate and C.
+fn enc_ldar_wt_xn(rt: u32, rn: u32) -> u32 {
+    0x88DF_FC00 | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+// `cmp w0, #imm` / `cmp w0, w16`.
+fn enc_cmp_w0_imm(imm: u16) -> u32 {
+    0x7100_001F | ((u32::from(imm) & 0xFFF) << 10)
+}
+fn enc_cmp_w0_w16() -> u32 {
+    0x6B10_001F
+}
+// `movn x0, #8` materializes the Linux 64-bit return value -EBADF without touching
+// any argument register other than x0 (the syscall return register).
+fn enc_movn_x0_ebadf() -> u32 {
+    0x9280_0100
+}
+
+fn write_x16_address(bytes: &mut [u8], cursor: &mut usize, base: u64) {
+    debug_assert_eq!(
+        base >> 48,
+        0,
+        "EL1 control addresses need only three mov immediates"
+    );
+    let put = |bytes: &mut [u8], off: usize, op: u32| {
+        bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
+    };
+    for (imm, hw) in [
+        ((base & 0xFFFF) as u16, 0),
+        (((base >> 16) & 0xFFFF) as u16, 1),
+        (((base >> 32) & 0xFFFF) as u16, 2),
+    ] {
+        let op = if hw == 0 {
+            enc_movz_xn(16, imm, hw)
+        } else {
+            enc_movk_xn(16, imm, hw)
+        };
+        put(bytes, *cursor, op);
+        *cursor += 4;
+    }
+}
+
+/// Emit the argument-preserving AArch64 fstat(80) fast return.  It returns
+/// `-EBADF` only for a nonnegative fd strictly greater than the carrier's
+/// published maximum while the carrier gate is exactly enabled.  Every other
+/// case restores x16 and takes the supplied ordinary dispatch path.
+fn write_fstat_ceiling_handler(
+    bytes: &mut [u8],
+    handler: usize,
+    fallthrough: usize,
+    count_with_identity_page: bool,
+) {
+    let put = |bytes: &mut [u8], off: usize, op: u32| {
+        bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
+    };
+    let mut cursor = handler;
+    put(bytes, cursor, AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
+    cursor += 4;
+    write_x16_address(
+        bytes,
+        &mut cursor,
+        LINUX_FD_CEILING_CONTROL_BASE + LINUX_FD_CEILING_OFF_GATE,
+    );
+    put(bytes, cursor, enc_ldar_wt_xn(16, 16));
+    cursor += 4;
+    put(
+        bytes,
+        cursor,
+        enc_cmp_w16_imm(FD_CEILING_GATE_ENABLED as u16),
+    );
+    cursor += 4;
+    let gate_closed = cursor;
+    cursor += 4;
+    write_x16_address(bytes, &mut cursor, LINUX_FD_CEILING_CONTROL_BASE);
+    put(bytes, cursor, enc_ldar_wt_xn(16, 16));
+    cursor += 4;
+    // Negative fds must remain on the host path.  They are architecturally
+    // invalid too, but treating their sign-extended x0 as an unsigned large
+    // descriptor would blur the signed ABI decoding contract.
+    put(bytes, cursor, enc_cmp_w0_imm(0));
+    cursor += 4;
+    let negative_fd = cursor;
+    cursor += 4;
+    put(bytes, cursor, enc_cmp_w0_w16());
+    cursor += 4;
+    let in_range = cursor;
+    cursor += 4;
+    if count_with_identity_page {
+        // x0 is no longer an argument after the fd comparisons succeeded.  It
+        // keeps the identity-page base while x16 holds the counter value, so
+        // the store cannot accidentally address the counter value itself.
+        let base = LINUX_IDENTITY_PAGE_BASE;
+        put(bytes, cursor, enc_movz_x0((base & 0xFFFF) as u16, 0));
+        cursor += 4;
+        put(
+            bytes,
+            cursor,
+            enc_movk_x0(((base >> 16) & 0xFFFF) as u16, 1),
+        );
+        cursor += 4;
+        put(
+            bytes,
+            cursor,
+            enc_movk_x0(((base >> 32) & 0xFFFF) as u16, 2),
+        );
+        cursor += 4;
+        put(
+            bytes,
+            cursor,
+            enc_ldr_xt_xn(16, 0, IDENTITY_OFF_SHIM_SYSCALLS),
+        );
+        cursor += 4;
+        put(bytes, cursor, enc_add_xd_xn_imm(16, 16, 1));
+        cursor += 4;
+        put(
+            bytes,
+            cursor,
+            enc_str_xt_xn(16, 0, IDENTITY_OFF_SHIM_SYSCALLS),
+        );
+        cursor += 4;
+    }
+    put(bytes, cursor, enc_movn_x0_ebadf());
+    cursor += 4;
+    put(bytes, cursor, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
+    cursor += 4;
+    put(bytes, cursor, AARCH64_ERET_OPCODE);
+    cursor += 4;
+    let fallback = cursor;
+    put(bytes, cursor, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
+    cursor += 4;
+    put(bytes, cursor, enc_b(cursor as u64, fallthrough as u64));
+
+    put(
+        bytes,
+        gate_closed,
+        enc_bne(gate_closed as u64, fallback as u64),
+    );
+    put(
+        bytes,
+        negative_fd,
+        enc_blt(negative_fd as u64, fallback as u64),
+    );
+    put(bytes, in_range, enc_bls(in_range as u64, fallback as u64));
+}
+
+fn write_fstat_ceiling_dispatcher(
+    bytes: &mut [u8],
+    handler: usize,
+    count_with_identity_page: bool,
+) {
+    let put = |bytes: &mut [u8], off: usize, op: u32| {
+        bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
+    };
+    let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
+    // The lower-EL synchronous vector also sees faults and sysreg traps.  x8
+    // can contain a stale syscall number in those frames, so establish SVC64
+    // before considering fstat just as the identity shim does.
+    let fallthrough = dispatch + 32;
+    put(bytes, dispatch, AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
+    put(bytes, dispatch + 4, AARCH64_MRS_ESR_EL1_X16_OPCODE);
+    put(bytes, dispatch + 8, AARCH64_LSR_X16_X16_26_OPCODE);
+    put(bytes, dispatch + 12, AARCH64_CMP_X16_SVC64_OPCODE);
+    put(bytes, dispatch + 16, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
+    put(
+        bytes,
+        dispatch + 20,
+        enc_bne((dispatch + 20) as u64, fallthrough as u64),
+    );
+    put(bytes, dispatch + 24, enc_cmp_x8_imm(80));
+    put(
+        bytes,
+        dispatch + 28,
+        enc_beq((dispatch + 28) as u64, handler as u64),
+    );
+    put(bytes, fallthrough, AARCH64_HVC_SYSCALL_OPCODE);
+    put(bytes, fallthrough + 4, AARCH64_ERET_OPCODE);
+    write_fstat_ceiling_handler(bytes, handler, fallthrough, count_with_identity_page);
+}
+
 /// Like [`el1_vectors_bytes`], but the lower-EL synchronous slot (0x400) holds
 /// the syscall-shim dispatcher: a `cmp x8`/`b.eq` chain that services the
 /// [`IDENTITY_SYSCALLS`] directly at EL1 (loading the answer from the identity
@@ -3301,7 +3582,7 @@ fn enc_cmp_w16_imm(imm: u16) -> u32 {
 /// per-syscall handlers live in the page's `nop` tail (past the 2 KiB vector
 /// table), branch-reachable from the slot, and build the (kernel-hole, AP=00)
 /// identity-page address only after the syscall number matches.
-pub fn el1_vectors_bytes_shim() -> Vec<u8> {
+fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
     // Start from the legacy page (all slots = eret, 0x400 = hvc #2; eret, tail
     // = nop) and overwrite the sync slot + the handler tail.
     let mut bytes = el1_vectors_bytes();
@@ -3327,7 +3608,8 @@ pub fn el1_vectors_bytes_shim() -> Vec<u8> {
     let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
     let mut cursor = dispatch;
     const ESR_GUARD_LEN: usize = 6 * 4;
-    let fallthrough = dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 1) * 8;
+    let fallthrough =
+        dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 1 + usize::from(fd_ceiling)) * 8;
     put(&mut bytes, cursor, AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
     put(&mut bytes, cursor + 4, AARCH64_MRS_ESR_EL1_X16_OPCODE);
     put(&mut bytes, cursor + 8, AARCH64_LSR_X16_X16_26_OPCODE);
@@ -3396,6 +3678,20 @@ pub fn el1_vectors_bytes_shim() -> Vec<u8> {
         enc_beq((cursor + 4) as u64, gettid_handler as u64),
     );
     cursor += 8;
+    let fstat_handler = gettid_handler + PAGE_HANDLER_LEN;
+    if fd_ceiling {
+        // fstat(80) is argument-bearing, so it has its own guard that preserves
+        // x0..x5 on every host-dispatch fallback.  Unlike the identity entries it
+        // is eligible only when the carrier-global descriptor-ceiling gate is
+        // explicitly enabled.
+        put(&mut bytes, cursor, enc_cmp_x8_imm(80));
+        put(
+            &mut bytes,
+            cursor + 4,
+            enc_beq((cursor + 4) as u64, fstat_handler as u64),
+        );
+        cursor += 8;
+    }
     // The fallthrough trap lands here once the gettid cmp/b.eq is placed.
     debug_assert_eq!(fallthrough, cursor);
     // gettid handler: read CONTEXTIDR_EL1; if it is 0 (unstamped — a tid is
@@ -3453,6 +3749,9 @@ pub fn el1_vectors_bytes_shim() -> Vec<u8> {
         enc_cbz_x0((gettid_handler + 52) as u64, fallthrough as u64),
     );
     put(&mut bytes, gettid_handler + 56, AARCH64_ERET_OPCODE);
+    if fd_ceiling {
+        write_fstat_ceiling_handler(&mut bytes, fstat_handler, fallthrough, true);
+    }
     // Fallthrough: not intercepted -> forward to the host like the legacy slot.
     put(&mut bytes, fallthrough, AARCH64_HVC_SYSCALL_OPCODE);
     put(&mut bytes, fallthrough + 4, AARCH64_ERET_OPCODE);
@@ -3467,12 +3766,22 @@ pub fn el1_vectors_bytes_shim() -> Vec<u8> {
     bytes
 }
 
+pub fn el1_vectors_bytes_shim() -> Vec<u8> {
+    el1_vectors_bytes_shim_inner(false)
+}
+
+pub fn el1_vectors_bytes_shim_fd_ceiling() -> Vec<u8> {
+    el1_vectors_bytes_shim_inner(true)
+}
+
 const MAILBOX_HANDLER_OFFSET: usize = 0xA00;
 const MAILBOX_HANDLER_SIZE: usize = 0x200;
 
-pub fn el1_vectors_bytes_mailbox(identity_fast_path: bool) -> Vec<u8> {
+fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -> Vec<u8> {
     let mut bytes = if identity_fast_path {
-        el1_vectors_bytes_shim()
+        el1_vectors_bytes_shim_inner(fd_ceiling)
+    } else if fd_ceiling {
+        el1_vectors_bytes_fd_ceiling()
     } else {
         el1_vectors_bytes()
     };
@@ -3483,7 +3792,7 @@ pub fn el1_vectors_bytes_mailbox(identity_fast_path: bool) -> Vec<u8> {
     let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
     let mailbox_entry = if identity_fast_path {
         const ESR_GUARD_LEN: usize = 6 * 4;
-        dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 1) * 8
+        dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 1 + usize::from(fd_ceiling)) * 8
     } else {
         dispatch
     };
@@ -3506,6 +3815,22 @@ pub fn el1_vectors_bytes_mailbox(identity_fast_path: bool) -> Vec<u8> {
     emit(&mut bytes, &mut cursor, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
     let non_svc_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
+
+    // A mailbox image with no identity shim still needs the independent fstat
+    // ceiling guard.  Put its handler in unused vector-page tail space and
+    // branch its fallback directly into the normal mailbox capture below;
+    // this retains the configured transport for every ineligible call.
+    let mailbox_fstat_handler = (fd_ceiling && !identity_fast_path).then_some(0x900_usize);
+    if let Some(handler) = mailbox_fstat_handler {
+        emit(&mut bytes, &mut cursor, enc_cmp_x8_imm(80));
+        let branch_pc = cursor;
+        emit(
+            &mut bytes,
+            &mut cursor,
+            enc_beq(branch_pc as u64, handler as u64),
+        );
+    }
+    let mailbox_capture = cursor;
 
     emit(
         &mut bytes,
@@ -3692,6 +4017,9 @@ pub fn el1_vectors_bytes_mailbox(identity_fast_path: bool) -> Vec<u8> {
         non_svc_branch,
         enc_bne(non_svc_branch as u64, legacy_hvc as u64),
     );
+    if let Some(handler) = mailbox_fstat_handler {
+        write_fstat_ceiling_handler(&mut bytes, handler, mailbox_capture, false);
+    }
     put(
         &mut bytes,
         invalid_state_branch,
@@ -3720,6 +4048,14 @@ pub fn el1_vectors_bytes_mailbox(identity_fast_path: bool) -> Vec<u8> {
 
     debug_assert!(cursor <= MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE);
     bytes
+}
+
+pub fn el1_vectors_bytes_mailbox(identity_fast_path: bool) -> Vec<u8> {
+    el1_vectors_bytes_mailbox_inner(identity_fast_path, false)
+}
+
+pub fn el1_vectors_bytes_mailbox_fd_ceiling(identity_fast_path: bool) -> Vec<u8> {
+    el1_vectors_bytes_mailbox_inner(identity_fast_path, true)
 }
 
 fn linux_runtime_regions() -> Result<Vec<MemoryRegion>, AddressSpaceError> {
@@ -5233,6 +5569,7 @@ mod stage1_tests {
             ("EL1 vectors", LINUX_EL1_VECTORS_BASE),
             ("EL0 trampoline", LINUX_EL0_TRAMPOLINE_BASE),
             ("syscall mailbox", LINUX_SYSCALL_MAILBOX_BASE),
+            ("fd ceiling control", LINUX_FD_CEILING_CONTROL_BASE),
         ] {
             let leaf = crate::page_table::terminal_descriptor(crate::page_table::walk_descriptors(
                 &bytes,
@@ -5266,6 +5603,45 @@ mod stage1_tests {
                 "{name} leaf at {va:#x} must NOT be mapped in carrier root"
             );
         }
+    }
+
+    #[test]
+    fn fd_ceiling_control_builder_installs_disabled_kernel_control_page() {
+        let image = AddressSpace::from_segments(
+            0x1000,
+            [(
+                0x1000,
+                SegmentPerms {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+                vec![0; 4],
+                4,
+            )],
+        )
+        .expect("minimal image")
+        .with_fd_ceiling_control()
+        .expect("fd ceiling control");
+        let region = image
+            .regions()
+            .iter()
+            .find(|region| region.start == LINUX_FD_CEILING_CONTROL_BASE)
+            .expect("fd ceiling control region");
+        assert_eq!(region.len(), LINUX_FD_CEILING_CONTROL_SIZE);
+        assert!(region.perms.read && !region.perms.write && !region.perms.execute);
+        assert!(!region.shared);
+        assert_eq!(
+            &region.bytes()
+                [LINUX_FD_CEILING_OFF_CEILING as usize..LINUX_FD_CEILING_OFF_CEILING as usize + 4],
+            &2_u32.to_le_bytes()
+        );
+        assert_eq!(
+            &region.bytes()
+                [LINUX_FD_CEILING_OFF_GATE as usize..LINUX_FD_CEILING_OFF_GATE as usize + 4],
+            &0_u32.to_le_bytes(),
+            "the guest fast path must start disabled"
+        );
     }
 
     #[test]
@@ -5352,7 +5728,6 @@ mod syscall_mailbox_tests {
         let signed = (imm26 << 38) >> 38;
         Some((pc as i64 + (signed << 2)) as usize)
     }
-
     fn decode_str_x_sp(op: u32) -> Option<(u32, usize)> {
         if op & 0xFFC0_03E0 != 0xF900_03E0 {
             return None;
@@ -5623,6 +5998,157 @@ mod el1_shim_tests {
         let signed = (imm19 << 45) >> 45;
         Some((pc as i64 + (signed << 2)) as usize)
     }
+    fn decode_bcond(op: u32, pc: usize) -> Option<(u8, usize)> {
+        if op & 0xFF00_0010 != 0x5400_0000 {
+            return None;
+        }
+        let imm19 = ((op >> 5) & 0x7FFFF) as i64;
+        let signed = (imm19 << 45) >> 45;
+        Some(((op & 0xF) as u8, (pc as i64 + (signed << 2)) as usize))
+    }
+    fn decode_b(op: u32, pc: usize) -> Option<usize> {
+        if op & 0xFC00_0000 != 0x1400_0000 {
+            return None;
+        }
+        let imm26 = ((op & 0x03FF_FFFF) as i64) << 38 >> 38;
+        Some((pc as i64 + (imm26 << 2)) as usize)
+    }
+    fn decode_fstat_x16_address(bytes: &[u8], at: usize) -> Option<u64> {
+        let mut value = 0_u64;
+        for index in 0..3 {
+            let op = rd_u32(bytes, at + index * 4);
+            let expected = if index == 0 { 0xD280_0010 } else { 0xF280_0010 };
+            if op & 0xFF80_001F != expected || ((op >> 21) & 0x3) != index as u32 {
+                return None;
+            }
+            value |= u64::from((op >> 5) & 0xFFFF) << (index * 16);
+        }
+        Some(value)
+    }
+    fn fstat_handler(bytes: &[u8], start: usize) -> usize {
+        let mut pc = start;
+        while pc + 8 <= bytes.len() {
+            if decode_cmp_x8(rd_u32(bytes, pc)) == Some(80) {
+                return decode_beq(rd_u32(bytes, pc + 4), pc + 4)
+                    .expect("fstat comparison must branch to its handler");
+            }
+            pc += 4;
+        }
+        panic!("fstat comparison missing")
+    }
+    fn assert_fstat_ceiling_handler(
+        bytes: &[u8],
+        start: usize,
+        counts: bool,
+        fallback_is_hvc: bool,
+    ) {
+        let handler = fstat_handler(bytes, start);
+        assert_eq!(rd_u32(bytes, handler), AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
+        // The only early writes are x16 scratch saves/loads.  x0 remains the
+        // original fstat fd through both fallback comparisons, and x1..x5 do
+        // not occur in this handler at all.
+        assert_eq!(
+            decode_fstat_x16_address(bytes, handler + 4),
+            Some(LINUX_FD_CEILING_CONTROL_BASE + LINUX_FD_CEILING_OFF_GATE),
+            "the acquire gate load must address the gate word, not the ceiling"
+        );
+        assert_eq!(
+            decode_fstat_x16_address(bytes, handler + 28),
+            Some(LINUX_FD_CEILING_CONTROL_BASE + LINUX_FD_CEILING_OFF_CEILING),
+            "the subsequent acquire load must address the ceiling word"
+        );
+        assert_eq!(rd_u32(bytes, handler + 16), 0x88DF_FE10); // ldar w16,[x16]
+        assert_eq!(rd_u32(bytes, handler + 20), 0x7100_061F); // cmp w16,#1
+        assert_eq!(rd_u32(bytes, handler + 40), 0x88DF_FE10); // ldar w16,[x16]
+        assert_eq!(rd_u32(bytes, handler + 44), 0x7100_001F); // cmp w0,#0
+        assert_eq!(rd_u32(bytes, handler + 52), 0x6B10_001F); // cmp w0,w16
+
+        let result = if counts { handler + 84 } else { handler + 60 };
+        let fallback = result + 12;
+        for (at, condition) in [(handler + 24, 1), (handler + 48, 11), (handler + 56, 9)] {
+            assert_eq!(
+                decode_bcond(rd_u32(bytes, at), at),
+                Some((condition, fallback)),
+                "gate, signed-fd, and in-range branches must all restore and fall through"
+            );
+        }
+        if counts {
+            assert_eq!(
+                rd_u32(bytes, handler + 72),
+                0xF940_0000 | ((IDENTITY_OFF_SHIM_SYSCALLS as u32 / 8) << 10) | 16,
+                "only shim-configured vectors charge an EL1-serviced fstat"
+            );
+            assert_eq!(
+                rd_u32(bytes, handler + 80),
+                0xF900_0000 | ((IDENTITY_OFF_SHIM_SYSCALLS as u32 / 8) << 10) | 16,
+                "the counter store must keep x0's identity-page base, not use x16's value"
+            );
+        }
+        assert_eq!(
+            rd_u32(bytes, result),
+            0x9280_0100,
+            "success returns 64-bit -EBADF"
+        );
+        assert_eq!(rd_u32(bytes, result + 4), AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
+        assert_eq!(rd_u32(bytes, result + 8), ERET);
+        assert_eq!(rd_u32(bytes, fallback), AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
+        let fallback_target = decode_b(rd_u32(bytes, fallback + 4), fallback + 4)
+            .expect("fallback must branch after restoring guest x16");
+        if fallback_is_hvc {
+            assert_eq!(rd_u32(bytes, fallback_target), HVC2);
+        } else {
+            let mailbox_capture = if let Some(mailbox_handler) =
+                decode_b(rd_u32(bytes, fallback_target), fallback_target)
+            {
+                mailbox_handler + 24
+            } else {
+                fallback_target
+            };
+            assert_eq!(
+                rd_u32(bytes, mailbox_capture),
+                enc_str_xt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16),
+                "mailbox fallback must retain the normal request capture"
+            );
+        }
+    }
+
+    /// Execute the small success tail with a literal identity-page counter.
+    /// This deliberately models the data-register effects rather than merely
+    /// matching opcode text: the old broken encoding addressed the store from
+    /// the loaded counter in x16, which cannot increment this fixture.
+    fn emulate_counted_fstat_success(bytes: &[u8], initial_counter: u64) -> (u64, u64) {
+        let handler = fstat_handler(bytes, AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET);
+        let counter_base = {
+            let (lo, hw0) = decode_movz_x0(rd_u32(bytes, handler + 60)).expect("movz x0");
+            let (mid, hw1) = decode_movk_x0(rd_u32(bytes, handler + 64)).expect("movk x0 #16");
+            let (hi, hw2) = decode_movk_x0(rd_u32(bytes, handler + 68)).expect("movk x0 #32");
+            assert_eq!((hw0, hw1, hw2), (0, 1, 2));
+            lo | (mid << 16) | (hi << 32)
+        };
+        let ldr = rd_u32(bytes, handler + 72);
+        let add = rd_u32(bytes, handler + 76);
+        let str = rd_u32(bytes, handler + 80);
+        assert_eq!(
+            ldr,
+            0xF940_0000 | ((IDENTITY_OFF_SHIM_SYSCALLS as u32 / 8) << 10) | 16
+        );
+        assert_eq!(add, 0x9100_0000 | (1 << 10) | (16 << 5) | 16);
+        assert_eq!(
+            str,
+            0xF900_0000 | ((IDENTITY_OFF_SHIM_SYSCALLS as u32 / 8) << 10) | 16
+        );
+        assert_eq!(
+            counter_base + IDENTITY_OFF_SHIM_SYSCALLS,
+            LINUX_IDENTITY_PAGE_BASE + IDENTITY_OFF_SHIM_SYSCALLS,
+            "the actual store address must be the identity counter word"
+        );
+        let updated_counter = initial_counter.wrapping_add(1);
+        let movn = rd_u32(bytes, handler + 84);
+        assert_eq!(movn & 0xFF80_001F, 0x9280_0000, "movn must target x0");
+        assert_eq!((movn >> 21) & 0x3, 0, "-EBADF needs no shift");
+        let return_value = !u64::from((movn >> 5) & 0xFFFF);
+        (return_value, updated_counter)
+    }
 
     const ERET: u32 = 0xD69F_03E0;
     const HVC2: u32 = 0xD400_0042;
@@ -5649,6 +6175,76 @@ mod el1_shim_tests {
     }
     const HVC3: u32 = 0xD400_0062; // hvc #3 — fail-loud unexpected-EL1 trap
     const MRS_CONTEXTIDR_EL1_X0: u32 = 0xD538_D020; // mrs x0, CONTEXTIDR_EL1
+
+    #[test]
+    fn fstat_ceiling_guard_is_emitted_only_for_opt_in_legacy_and_mailbox_vectors() {
+        for bytes in [
+            el1_vectors_bytes_fd_ceiling(),
+            el1_vectors_bytes_mailbox_fd_ceiling(false),
+        ] {
+            assert!(
+                bytes
+                    .chunks_exact(4)
+                    .any(|word| { decode_cmp_x8(rd_u32(word, 0)) == Some(80) }),
+                "fstat(80) must reach the carrier ceiling guard before host dispatch"
+            );
+        }
+        for bytes in [
+            el1_vectors_bytes(),
+            el1_vectors_bytes_shim(),
+            el1_vectors_bytes_mailbox(false),
+            el1_vectors_bytes_mailbox(true),
+        ] {
+            assert!(
+                !bytes
+                    .chunks_exact(4)
+                    .any(|word| { decode_cmp_x8(rd_u32(word, 0)) == Some(80) }),
+                "universal vector helpers must not dereference an absent carrier control page"
+            );
+        }
+    }
+
+    #[test]
+    fn fstat_ceiling_guard_acquires_gate_and_preserves_fallback_arguments() {
+        assert_fstat_ceiling_handler(
+            &el1_vectors_bytes_fd_ceiling(),
+            AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET,
+            false,
+            true,
+        );
+        assert_fstat_ceiling_handler(
+            &el1_vectors_bytes_shim_fd_ceiling(),
+            AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET,
+            true,
+            true,
+        );
+        assert_fstat_ceiling_handler(
+            &el1_vectors_bytes_mailbox_fd_ceiling(false),
+            MAILBOX_HANDLER_OFFSET,
+            false,
+            false,
+        );
+        assert_fstat_ceiling_handler(
+            &el1_vectors_bytes_mailbox_fd_ceiling(true),
+            AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET,
+            true,
+            false,
+        );
+    }
+
+    #[test]
+    fn counted_fstat_success_writes_identity_counter_and_returns_i64_ebadf() {
+        for bytes in [
+            el1_vectors_bytes_shim_fd_ceiling(),
+            el1_vectors_bytes_mailbox_fd_ceiling(true),
+        ] {
+            assert_eq!(
+                emulate_counted_fstat_success(&bytes, 41),
+                (u64::MAX - 8, 42),
+                "a counted EL1 fstat must update the mapped counter and return Linux -EBADF"
+            );
+        }
+    }
 
     /// The shim dispatcher must service EXACTLY the per-process identity syscalls
     /// (each via a page-read handler) plus `gettid` (via a per-vCPU TPIDR_EL1

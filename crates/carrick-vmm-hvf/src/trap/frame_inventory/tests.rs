@@ -897,6 +897,10 @@ fn exec_reuses_carrier_control_stage2_without_allocating_task_leases() {
             crate::memory::LINUX_CARRIER_MAINT_ROOT_BASE,
             crate::memory::LINUX_CARRIER_MAINT_ROOT_SIZE,
         ),
+        (
+            crate::memory::LINUX_FD_CEILING_CONTROL_BASE,
+            crate::memory::LINUX_FD_CEILING_CONTROL_SIZE,
+        ),
     ] {
         input.mappings.push(exec_mapping_for_order(start, size));
     }
@@ -921,7 +925,7 @@ fn exec_reuses_carrier_control_stage2_without_allocating_task_leases() {
             .iter()
             .filter(|mapping| is_persistent_executor_carrier_guest_mapping(mapping))
             .count(),
-        5
+        6
     );
 }
 

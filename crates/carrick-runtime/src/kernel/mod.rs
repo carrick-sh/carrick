@@ -12,6 +12,7 @@ pub(crate) mod cpu_limit;
 pub mod crash_capture;
 pub mod debug;
 pub mod exec;
+pub mod fd_ceiling;
 pub mod frame_inventory;
 pub mod guest_execution;
 pub mod ids;
@@ -68,6 +69,7 @@ pub use debug::{
     abort as kernel_debug_abort, fetch as kernel_debug_fetch,
 };
 pub use exec::{ExecError, ExecPrepareError, PreparedExec};
+pub use fd_ceiling::FdCeilingAuthority;
 pub use frame_inventory::{
     FrameInventoryAuthority, FrameInventoryError, FrameInventoryReserveError,
     FrameInventorySnapshot, FrameRow, MappingRow,

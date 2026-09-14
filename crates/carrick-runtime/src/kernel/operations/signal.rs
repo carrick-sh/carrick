@@ -248,6 +248,7 @@ impl Kernel {
             }
             Arc::clone(&record.task)
         };
+        self.fd_ceiling().disable();
         if !tracee.claim_ptrace_tracer(tracer) {
             return false;
         }

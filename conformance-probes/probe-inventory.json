@@ -594,6 +594,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "fdceiling": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "fifoopenmatrix": {
     "class": "conformance",
     "excluded": false,

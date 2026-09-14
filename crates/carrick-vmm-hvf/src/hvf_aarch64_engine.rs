@@ -1144,6 +1144,15 @@ pub fn persistent_executor_factory_authority(
 }
 
 impl HvpatchPersistentExecutorFactoryAuthority {
+    /// Publisher for first-root activation. Factory extraction is the point at
+    /// which the fixed mappings acquire their carrier-wide Arc owner; callers
+    /// register this while the prepared task start gate is still closed.
+    pub fn fd_ceiling_publisher(
+        &self,
+    ) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
+        self.spec.fd_ceiling_publisher()
+    }
+
     pub fn create_executor_parts(&self) -> Result<(HvfAarch64Vmm, HvfAarch64Vcpu), TrapError> {
         let (state, vcpu, mailbox) = HvfVmState::from_persistent_executor_spec(&self.spec)?;
         Ok((HvfAarch64Vmm { state }, HvfAarch64Vcpu::new(vcpu, mailbox)))
@@ -1238,6 +1247,10 @@ impl GuestVmBackend for HvfAarch64Vmm {
 }
 
 impl Aarch64Vmm for HvfAarch64Vmm {
+    fn fd_ceiling_publisher(&self) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
+        self.state.fd_ceiling_publisher()
+    }
+
     fn foreign_mm_endpoint(&self) -> Option<carrick_hal::ForeignMmEndpoint> {
         Some(self.state.foreign_mm_endpoint())
     }

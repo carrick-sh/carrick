@@ -432,6 +432,7 @@ pub struct Kernel {
     ids: IdRegistry,
     object_ids: ObjectIdRegistry,
     frame_inventory: FrameInventoryAuthority,
+    fd_ceiling: Arc<super::FdCeilingAuthority>,
     hvpatch_child_token_issuer: Arc<carrick_hal::HvpatchChildTokenIssuer>,
     #[allow(dead_code)] // consumed by the HVPatch carrier-directory publication slice
     hvpatch_child_token_verifier: Arc<carrick_hal::HvpatchChildTokenVerifier>,
@@ -1221,6 +1222,7 @@ impl Kernel {
         let process_group_claim = ids.claim_process_group(process_group_id)?;
         let session_claim = ids.claim_session(session_id)?;
         let object_ids = ObjectIdRegistry::new();
+        let fd_ceiling = Arc::new(super::FdCeilingAuthority::new());
         let mm_id = object_ids.mm_id()?;
         let mm = match bootstrap.mm_backend {
             Some(backend) => Arc::new(Mm::with_backend(mm_id, backend)),
@@ -1231,7 +1233,10 @@ impl Kernel {
             Arc::new(Sighand::new(object_ids.sighand_id()?)),
         ));
         let resources = Arc::new(ThreadResources::new(
-            Arc::new(FileTable::new(object_ids.file_table_id()?)),
+            Arc::new(FileTable::with_fd_ceiling(
+                object_ids.file_table_id()?,
+                Arc::clone(&fd_ceiling),
+            )),
             Arc::new(FsContext::new(object_ids.fs_context_id()?)),
             Arc::new(Credentials::root(object_ids.credentials_id()?)),
         ));
@@ -1347,6 +1352,7 @@ impl Kernel {
             ids,
             object_ids,
             frame_inventory: FrameInventoryAuthority::new(),
+            fd_ceiling,
             hvpatch_child_token_issuer,
             hvpatch_child_token_verifier,
             observations: Mutex::new(observations),
@@ -1387,6 +1393,10 @@ impl Kernel {
 
     pub fn auditors(&self) -> Arc<crate::observe::auditor::AuditorChain> {
         self.auditors.load_full()
+    }
+
+    pub fn fd_ceiling(&self) -> Arc<super::FdCeilingAuthority> {
+        Arc::clone(&self.fd_ceiling)
     }
 
     pub fn set_auditors(&self, auditors: Arc<crate::observe::auditor::AuditorChain>) {
@@ -1509,7 +1519,10 @@ impl Kernel {
             Arc::new(Sighand::new(self.object_ids.sighand_id()?)),
         ));
         let resources = Arc::new(ThreadResources::new(
-            Arc::new(FileTable::new(self.object_ids.file_table_id()?)),
+            Arc::new(FileTable::with_fd_ceiling(
+                self.object_ids.file_table_id()?,
+                self.fd_ceiling(),
+            )),
             Arc::new(FsContext::new(self.object_ids.fs_context_id()?)),
             Arc::new(Credentials::root(self.object_ids.credentials_id()?)),
         ));
