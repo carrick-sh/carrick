@@ -4,29 +4,30 @@
 //!   1. `listen` on `0.0.0.0:0`, SO_ACCEPTCONN on listening and fresh sockets;
 //!   2. `blocking_connect`: address reflection (`getpeername`, `getsockname`),
 //!      loopback identity (127.0.0.1);
-//!   3. `nonblocking_connect`: immediate return / errno, poll(POLLOUT) readiness,
+//!   3. `already_connected`: sockaddr validation and EISCONN on both connected halves;
+//!   4. `nonblocking_connect`: immediate return / errno, poll(POLLOUT) readiness,
 //!      SO_ERROR readback, and listener accept;
-//!   4. `echo64k`: 64 KiB bidirectional stream transfer with deterministic
+//!   5. `echo64k`: 64 KiB bidirectional stream transfer with deterministic
 //!      payload pattern, FNV-1a checksum validation, and short-write detection;
-//!   5. `fionread`: `ioctl(FIONREAD)` pending byte count after write;
-//!   6. `shutdown_wr`: POLLRDHUP / POLLIN on half-close, EOF read, EPIPE on
+//!   6. `fionread`: `ioctl(FIONREAD)` pending byte count after write;
+//!   7. `shutdown_wr`: POLLRDHUP / POLLIN on half-close, EOF read, EPIPE on
 //!      write after SHUT_WR, full shutdown readback;
-//!   7. `listener_close_with_backlog`: unaccepted connection reset behavior
+//!   8. `listener_close_with_backlog`: unaccepted connection reset behavior
 //!      when listener closes with pending connections in backlog;
-//!   8. `tcp_nodelay`: TCP_NODELAY default and set round-trip;
-//!   9. `connect_refused`: connect to an unbound port;
-//!   10. `getsockopt_types`: SO_TYPE, SO_DOMAIN, SO_PROTOCOL on accepted socket;
-//!   11. `bound_client_v4_loopback`: IPv4 client binding loopback to port 0,
+//!   9. `tcp_nodelay`: TCP_NODELAY default and set round-trip;
+//!   10. `connect_refused`: connect to an unbound port;
+//!   11. `getsockopt_types`: SO_TYPE, SO_DOMAIN, SO_PROTOCOL on accepted socket;
+//!   12. `bound_client_v4_loopback`: IPv4 client binding loopback to port 0,
 //!       endpoint preservation through connect, accepted peer comparison, dup/close and competing binds;
-//!   12. `bound_client_v4_wildcard`: IPv4 client binding wildcard to port 0,
+//!   13. `bound_client_v4_wildcard`: IPv4 client binding wildcard to port 0,
 //!       endpoint preservation through connect, accepted peer comparison, dup/close and competing binds;
-//!   13. `bound_client_v6_loopback`: IPv6 client binding loopback to port 0,
+//!   14. `bound_client_v6_loopback`: IPv6 client binding loopback to port 0,
 //!       endpoint preservation through connect, accepted peer comparison, dup/close and competing binds;
-//!   14. `bound_client_v6_wildcard`: IPv6 client binding wildcard to port 0,
+//!   15. `bound_client_v6_wildcard`: IPv6 client binding wildcard to port 0,
 //!       endpoint preservation through connect, accepted peer comparison, dup/close and competing binds;
-//!   15. `failed_connect_rollback_v4`: failed connect rollback of bound local endpoint against non-listening target (IPv4);
-//!   16. `failed_connect_rollback_v6`: failed connect rollback of bound local endpoint against non-listening target (IPv6);
-//!   17. `bind_admission_matrix`: TCP SO_REUSEADDR/SO_REUSEPORT and IPv4/IPv6 bind conflicts.
+//!   16. `failed_connect_rollback_v4`: failed connect rollback of bound local endpoint against non-listening target (IPv4);
+//!   17. `failed_connect_rollback_v6`: failed connect rollback of bound local endpoint against non-listening target (IPv6);
+//!   18. `bind_admission_matrix`: TCP SO_REUSEADDR/SO_REUSEPORT and IPv4/IPv6 bind conflicts.
 //!
 //! Output is deterministic `key=value` lines only. Every wait is bounded by a
 //! `poll` with a 5 s cap so a lost wake is a false line, never a hang.
@@ -1225,7 +1226,45 @@ fn main() {
         );
 
         // ---------------------------------------------------------------------
-        // Case 3: nonblocking_connect
+        // Case 3: already_connected
+        // ---------------------------------------------------------------------
+        let reconnect_bad_ptr_rc = libc::connect(
+            client_fd,
+            1usize as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        );
+        let reconnect_bad_ptr_errno = if reconnect_bad_ptr_rc < 0 { errno() } else { 0 };
+        let reconnect_short_len_rc = libc::connect(
+            client_fd,
+            &bound_sin as *const _ as *const libc::sockaddr,
+            1,
+        );
+        let reconnect_short_len_errno = if reconnect_short_len_rc < 0 { errno() } else { 0 };
+        let reconnect_client_rc = libc::connect(
+            client_fd,
+            &bound_sin as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        );
+        let reconnect_client_errno = if reconnect_client_rc < 0 { errno() } else { 0 };
+        let reconnect_accepted_rc = libc::connect(
+            accepted_fd,
+            &client_sin as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        );
+        let reconnect_accepted_errno = if reconnect_accepted_rc < 0 { errno() } else { 0 };
+        report!(
+            reconnect_bad_ptr_rc = reconnect_bad_ptr_rc,
+            reconnect_bad_ptr_errno = reconnect_bad_ptr_errno,
+            reconnect_short_len_rc = reconnect_short_len_rc,
+            reconnect_short_len_errno = reconnect_short_len_errno,
+            reconnect_client_rc = reconnect_client_rc,
+            reconnect_client_errno = reconnect_client_errno,
+            reconnect_accepted_rc = reconnect_accepted_rc,
+            reconnect_accepted_errno = reconnect_accepted_errno,
+        );
+
+        // ---------------------------------------------------------------------
+        // Case 4: nonblocking_connect
         // ---------------------------------------------------------------------
         let nb_sock = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0);
         let mut nb_target: libc::sockaddr_in = std::mem::zeroed();

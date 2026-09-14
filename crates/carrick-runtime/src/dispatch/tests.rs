@@ -7825,7 +7825,8 @@ mod inzone_tcp {
     use super::*;
     use crate::compat::CompatReporter;
     use carrick_abi::{
-        LINUX_AF_INET, LINUX_ECONNRESET, LINUX_MSG_OOB, LINUX_POLLIN, LINUX_SOCK_STREAM,
+        LINUX_AF_INET, LINUX_AF_UNSPEC, LINUX_ECONNRESET, LINUX_EFAULT, LINUX_EINVAL,
+        LINUX_EISCONN, LINUX_ENOTSOCK, LINUX_MSG_OOB, LINUX_POLLIN, LINUX_SOCK_STREAM,
         LINUX_SOL_SOCKET, LINUX_SO_ERROR,
     };
 
@@ -7970,6 +7971,47 @@ mod inzone_tcp {
             "accepted description must be InMemorySocket"
         );
         drop(accepted_guard);
+
+        // A connected in-zone stream is still a socket. Linux validates the
+        // supplied sockaddr before reporting EISCONN, and both the connecting
+        // and accepted halves report EISCONN for a valid reconnect attempt.
+        assert_eq!(
+            g.call(SYS_CONNECT, [client_fd as u64, 1, 16, 0, 0, 0]),
+            DispatchOutcome::errno(LINUX_EFAULT)
+        );
+        assert_eq!(
+            g.call(
+                SYS_CONNECT,
+                [client_fd as u64, ADDR_SCRATCH, 1, 0, 0, 0]
+            ),
+            DispatchOutcome::errno(LINUX_EINVAL)
+        );
+        assert_eq!(
+            g.call(
+                SYS_CONNECT,
+                [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]
+            ),
+            DispatchOutcome::errno(LINUX_EISCONN)
+        );
+        assert_eq!(
+            g.call(
+                SYS_CONNECT,
+                [accepted_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]
+            ),
+            DispatchOutcome::errno(LINUX_EISCONN)
+        );
+        g.mem
+            .write_bytes(ADDR_SCRATCH, &(LINUX_AF_UNSPEC as u16).to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            g.call(
+                SYS_CONNECT,
+                [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]
+            ),
+            DispatchOutcome::errno(LINUX_ENOTSOCK),
+            "AF_UNSPEC on an in-memory stream remains outside the reconnect fix"
+        );
+        g.make_sockaddr_in(ADDR_SCRATCH, port, [127, 0, 0, 1]);
 
         // Data round trip
         g.mem.write_bytes(DATA_SCRATCH, b"hello in-zone").unwrap();
