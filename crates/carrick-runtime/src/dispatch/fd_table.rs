@@ -1469,6 +1469,47 @@ impl HostFdRef {
     }
 }
 
+pub(in crate::dispatch) struct HostSocketAuthority {
+    description: Arc<crate::kernel::FileDescription>,
+    host_fd: HostFdRef,
+    pub(in crate::dispatch) family: i32,
+    pub(in crate::dispatch) socket_type: i32,
+    pub(in crate::dispatch) guest_local: Option<crate::network::GuestSocketAddr>,
+    pub(in crate::dispatch) reuseaddr: bool,
+    pub(in crate::dispatch) reuseport: bool,
+    pub(in crate::dispatch) ipv6_v6only: bool,
+}
+
+impl HostSocketAuthority {
+    pub(in crate::dispatch) fn host_fd(&self) -> HostFd {
+        self.host_fd.view()
+    }
+
+    pub(in crate::dispatch) fn set_ipv6_v6only(&self, enabled: bool) -> Result<(), LinuxErrno> {
+        let mut open = self.description.write().ok_or(super::LINUX_EBADF)?;
+        let OpenDescription::HostSocket {
+            base,
+            family,
+            host_fd,
+            ..
+        } = &mut *open
+        else {
+            return Err(super::LINUX_EBADF);
+        };
+        if *family != self.family || host_fd.raw() != self.host_fd.raw() {
+            return Err(super::LINUX_EBADF);
+        }
+        base.set_ipv6_v6only(enabled);
+        Ok(())
+    }
+}
+
+pub(in crate::dispatch) enum InMemoryTcpAtMark {
+    NotInMemory,
+    WrongSocket,
+    AtMark(bool),
+}
+
 pub(crate) type OpenFile = crate::kernel::FileSlot;
 
 pub(super) fn kernel_file_description(
@@ -2361,6 +2402,51 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
 }
 
 impl crate::kernel::FileDescription {
+    pub(in crate::dispatch) fn host_socket_authority(
+        self: &Arc<Self>,
+    ) -> Option<HostSocketAuthority> {
+        let open = self.read()?;
+        let OpenDescription::HostSocket {
+            base,
+            host_fd,
+            family,
+            type_,
+            ..
+        } = &*open
+        else {
+            return None;
+        };
+        Some(HostSocketAuthority {
+            description: Arc::clone(self),
+            host_fd: host_fd.clone(),
+            family: *family,
+            socket_type: *type_,
+            guest_local: base.guest_local(),
+            reuseaddr: base.so_reuseaddr(),
+            reuseport: base.so_reuseport(),
+            ipv6_v6only: base.ipv6_v6only(),
+        })
+    }
+
+    pub(in crate::dispatch) fn in_memory_tcp_at_mark(&self) -> InMemoryTcpAtMark {
+        let Some(open) = self.read() else {
+            return InMemoryTcpAtMark::NotInMemory;
+        };
+        let OpenDescription::InMemorySocket { socket, .. } = &*open else {
+            return InMemoryTcpAtMark::NotInMemory;
+        };
+        if socket.socket_type != carrick_abi::LINUX_SOCK_STREAM
+            || !matches!(
+                socket.family,
+                carrick_abi::LINUX_AF_INET | carrick_abi::LINUX_AF_INET6
+            )
+            || socket.protocol != carrick_abi::LINUX_IPPROTO_TCP
+        {
+            return InMemoryTcpAtMark::WrongSocket;
+        }
+        InMemoryTcpAtMark::AtMark(socket.at_oob_mark())
+    }
+
     pub(in crate::dispatch) fn open_description(&self) -> Option<&RwLock<OpenDescription>> {
         self.concrete_backing::<RwLock<OpenDescription>>()
     }
@@ -3060,6 +3146,40 @@ mod tests {
             0,
             "the final resource release publishes TCP FIN"
         );
+    }
+
+    #[test]
+    fn host_socket_authority_rejects_replaced_backing_identity() {
+        fn host_socket(fd: i32) -> OpenDescription {
+            OpenDescription::HostSocket {
+                base: OpenDescriptionBase::new(0),
+                host_fd: HostFdRef::new(fd),
+                family: carrick_abi::LINUX_AF_INET6,
+                type_: carrick_abi::LINUX_SOCK_STREAM,
+                protocol: carrick_abi::LINUX_IPPROTO_TCP,
+                mcast_memberships: Vec::new(),
+                synthetic_recv: VecDeque::new(),
+            }
+        }
+
+        let first = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
+        let second = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
+        assert!(first >= 0 && second >= 0);
+        let backing = Arc::new(RwLock::new(host_socket(first)));
+        let description = kernel_file_description(Arc::clone(&backing), 0);
+        let authority = description
+            .host_socket_authority()
+            .expect("capture first host socket");
+
+        *backing.write() = host_socket(second);
+        assert_eq!(
+            authority.set_ipv6_v6only(true),
+            Err(crate::linux_abi::LINUX_EBADF)
+        );
+        assert!(matches!(
+            &*backing.read(),
+            OpenDescription::HostSocket { base, .. } if !base.ipv6_v6only()
+        ));
     }
 
     #[test]

@@ -668,6 +668,19 @@ impl<'a> NetView<'a> {
         }
     }
 
+    pub(in crate::dispatch) fn host_socket_authority(
+        &self,
+        fd: i32,
+    ) -> Result<crate::dispatch::fd_table::HostSocketAuthority, LinuxErrno> {
+        let Some(open_file) = self.open_file(fd) else {
+            return Err(LINUX_EBADF);
+        };
+        open_file
+            .description()
+            .host_socket_authority()
+            .ok_or(LINUX_ENOTSOCK)
+    }
+
     /// Read the per-description `connect_in_progress` flag for `fd` (false if the
     /// fd is missing or not a HostSocket). See `OpenDescriptionBase.connect_in_progress`.
     fn socket_connect_in_progress(&self, fd: i32) -> bool {
@@ -953,24 +966,6 @@ impl<'a> NetView<'a> {
             OpenDescription::Packet { socket, .. } => Some(socket.protocol as i32),
             _ => None,
         }
-    }
-
-    fn socket_reuseport(&self, fd: i32) -> bool {
-        self.open_file(fd).is_some_and(|of| {
-            matches!(of.description.read().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.so_reuseport())
-        })
-    }
-
-    fn socket_reuseaddr(&self, fd: i32) -> bool {
-        self.open_file(fd).is_some_and(|of| {
-            matches!(of.description.read().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.so_reuseaddr())
-        })
-    }
-
-    fn socket_ipv6_v6only(&self, fd: i32) -> bool {
-        self.open_file(fd).is_some_and(|of| {
-            matches!(of.description.read().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.ipv6_v6only())
-        })
     }
 
     pub(super) fn socket_port_protocol(&self, fd: i32) -> Option<PortProtocol> {
@@ -1714,15 +1709,23 @@ impl<'a> NetView<'a> {
                     _ => {}
                 }
             }
-            let (host_fd, family) = this.host_socket_lookup(fd)?;
-            let bind_protocol = this.socket_port_protocol(fd);
+            let Some(bind_description) = this.open_file(fd).map(|open_file| open_file.description()) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let Some(bind_authority) = bind_description.host_socket_authority() else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
+            };
+            let host_fd = bind_authority.host_fd();
+            let family = bind_authority.family;
+            let bind_protocol = match bind_authority.socket_type {
+                LINUX_SOCK_STREAM => Some(PortProtocol::Tcp),
+                LINUX_SOCK_DGRAM => Some(PortProtocol::Udp),
+                _ => None,
+            };
             // Keep the exact open-description authority alive across bind.
             // Re-looking up the numeric fd afterwards would accept a reused
             // slot; the captured description instead ties host bind and lease
             // publication to one lifetime.
-            let Some(bind_description) = this.open_file(fd).map(|open_file| open_file.description()) else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
             // AF_UNIX autobind: a bind with only the family (addrlen == 2, empty
             // path) asks the kernel to assign a unique abstract name. macOS has
             // no autobind, so generate the name + a host node and bind there; a
@@ -1814,15 +1817,15 @@ impl<'a> NetView<'a> {
             // A failed host bind drops this guard without publication.
             let inzone_pending = if (family == LINUX_AF_INET || family == LINUX_AF_INET6)
                 && let Some(requested) = host_sockaddr_to_socket_addr(&host_addr)
-                && this.socket_port_protocol(fd) == Some(PortProtocol::Tcp)
+                && bind_protocol == Some(PortProtocol::Tcp)
             {
                 let scope = match this.network.spec.namespace_id.as_ref() {
                     Some(id) => crate::network::inzone::InZoneScope::Namespace(id.clone()),
                     None => crate::network::inzone::InZoneScope::CarrierHost,
                 };
-                let reuseaddr = this.socket_reuseaddr(fd);
-                let reuseport = this.socket_reuseport(fd);
-                let ipv6_v6only = this.socket_ipv6_v6only(fd);
+                let reuseaddr = bind_authority.reuseaddr;
+                let reuseport = bind_authority.reuseport;
+                let ipv6_v6only = bind_authority.ipv6_v6only;
                 // Linux accepts the pre-bind IPV6_V6ONLY option but rejects a
                 // subsequent bind of an IPv4-mapped IPv6 address (EINVAL).
                 // Decide before reserving a lease or touching the host carrier.
@@ -2052,11 +2055,13 @@ impl<'a> NetView<'a> {
             // Carrick has to distribute — see `reuseport`. Keyed on the address
             // the HOST actually bound (read back, not the requested one, which
             // may carry port 0 or have been rewritten above).
-            if this.socket_reuseport(fd)
-                && let Some(socket_type) = this.socket_guest_type(fd)
+            if bind_authority.reuseport
                 && let Some(bound) = host_sockaddr_bytes(host_fd_raw)
             {
-                reuseport::join(reuseport::GroupKey::new(socket_type, bound), host_fd_raw);
+                reuseport::join(
+                    reuseport::GroupKey::new(bind_authority.socket_type, bound),
+                    host_fd_raw,
+                );
             }
             if let Some((guest_local, _)) = logical_inzone_bind
                 && let Some(protocol) = bind_protocol
@@ -3010,7 +3015,9 @@ impl<'a> NetView<'a> {
                     _ => {}
                 }
             }
-            let (host_fd, family) = this.host_socket_lookup(fd)?;
+            let host_authority = this.host_socket_authority(fd)?;
+            let host_fd = host_authority.host_fd();
+            let family = host_authority.family;
             // getsockname needs both output pointers; a NULL addr or addrlen →
             // EFAULT (getsockname01), checked after the fd validation so a
             // bad/non-socket fd still surfaces EBADF/ENOTSOCK first.
@@ -3025,10 +3032,7 @@ impl<'a> NetView<'a> {
             {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if let Some(open_file) = this.open_file(fd)
-                && let Some(open) = open_file.description.read()
-                && let OpenDescription::HostSocket { base, .. } = &*open
-                && let Some(guest_local) = base.guest_local()
+            if let Some(guest_local) = host_authority.guest_local
                 && let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_local.0)
             {
                 if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {

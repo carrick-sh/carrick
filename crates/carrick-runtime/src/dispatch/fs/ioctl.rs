@@ -1431,53 +1431,51 @@ impl<'a> FsView<'a> {
                 LINUX_SIOCATMARK => {
                     // In-zone TCP has an urgent cursor of its own; consulting
                     // host_socket_lookup would misclassify it as ENOTTY.
-                    if let Some(open_file) = this.open_file(fd.0)
-                        && let Some(open) = open_file.description.read()
-                        && let OpenDescription::InMemorySocket { socket, .. } = &*open
-                    {
-                        if socket.socket_type != LINUX_SOCK_STREAM
-                            || !matches!(
-                                socket.family,
-                                carrick_abi::LINUX_AF_INET | carrick_abi::LINUX_AF_INET6
-                            )
-                            || socket.protocol != carrick_abi::LINUX_IPPROTO_TCP
-                        {
+                    let at_mark = this.open_file(fd.0).map(|open_file| {
+                        open_file.description().in_memory_tcp_at_mark()
+                    });
+                    match at_mark {
+                        Some(crate::dispatch::fd_table::InMemoryTcpAtMark::WrongSocket) => {
                             DispatchOutcome::errno(LINUX_ENOTTY)
-                        } else if arg == 0 {
-                            DispatchOutcome::errno(LINUX_EFAULT)
-                        } else {
-                            write_packed(
-                                &mut *cx.memory,
-                                arg,
-                                &(socket.at_oob_mark() as i32).to_le_bytes(),
-                            )
                         }
-                    } else {
-                        match this.host_socket_lookup(fd.0) {
-                    Ok(_) => {
-                        // SIOCATMARK reports whether the next read sits at the
-                        // out-of-band mark. It is a STREAM-only op: Linux returns
-                        // ENOTTY on a datagram socket (sockioctl01 "ATMARK on UDP"
-                        // resets the expected errno to ENOTTY). A NULL arg faults
-                        // (sockioctl01 "invalid option buffer"). carrick keeps no
-                        // OOB queue, so a valid stream socket reports atmark = 0
-                        // (man sockatmark: 0 ⇒ not at the mark), which is the true
-                        // state for any socket with no urgent data pending.
-                        if this.socket_guest_type(fd.0) != Some(LINUX_SOCK_STREAM) {
-                            DispatchOutcome::errno(LINUX_ENOTTY)
-                        } else if arg == 0 {
-                            DispatchOutcome::errno(LINUX_EFAULT)
-                        } else {
-                            write_packed(&mut *cx.memory, arg, &0i32.to_le_bytes())
+                        Some(crate::dispatch::fd_table::InMemoryTcpAtMark::AtMark(at_mark)) => {
+                            if arg == 0 {
+                                DispatchOutcome::errno(LINUX_EFAULT)
+                            } else {
+                                write_packed(
+                                    &mut *cx.memory,
+                                    arg,
+                                    &(at_mark as i32).to_le_bytes(),
+                                )
+                            }
+                        }
+                        Some(crate::dispatch::fd_table::InMemoryTcpAtMark::NotInMemory) | None => {
+                            match this.host_socket_lookup(fd.0) {
+                                Ok(_) => {
+                                    // SIOCATMARK reports whether the next read sits at the
+                                    // out-of-band mark. It is a STREAM-only op: Linux returns
+                                    // ENOTTY on a datagram socket (sockioctl01 "ATMARK on UDP"
+                                    // resets the expected errno to ENOTTY). A NULL arg faults
+                                    // (sockioctl01 "invalid option buffer"). carrick keeps no
+                                    // OOB queue, so a valid stream socket reports atmark = 0
+                                    // (man sockatmark: 0 ⇒ not at the mark), which is the true
+                                    // state for any socket with no urgent data pending.
+                                    if this.socket_guest_type(fd.0) != Some(LINUX_SOCK_STREAM) {
+                                        DispatchOutcome::errno(LINUX_ENOTTY)
+                                    } else if arg == 0 {
+                                        DispatchOutcome::errno(LINUX_EFAULT)
+                                    } else {
+                                        write_packed(&mut *cx.memory, arg, &0i32.to_le_bytes())
+                                    }
+                                }
+                                // A non-socket fd (e.g. a FIFO): Linux's vfs_ioctl returns
+                                // ENOTTY for SIOCATMARK, not ENOTSOCK (sockioctl01 "not a
+                                // socket" resets the expected errno to ENOTTY).
+                                Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
+                            }
                         }
                     }
-                    // A non-socket fd (e.g. a FIFO): Linux's vfs_ioctl returns
-                    // ENOTTY for SIOCATMARK, not ENOTSOCK (sockioctl01 "not a
-                    // socket" resets the expected errno to ENOTTY).
-                    Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
-                        }
-                    }
-                }
+                },
                 LINUX_SIOCGIFCONF => match this.host_socket_lookup(fd.0) {
                     Ok(_) => {
                         // struct ifconf: ifc_len (off 0, i32), ifc_buf (off 8, ptr).
