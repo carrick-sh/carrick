@@ -2222,6 +2222,12 @@ impl HvpatchVerifiedChildKernelBinding {
 }
 
 pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
+    /// Optional backend-owned sink for the carrier-global descriptor ceiling.
+    /// Unsupported execution lanes leave the optimization disabled.
+    fn fd_ceiling_publisher(&self) -> Option<Arc<dyn crate::FdCeilingPublisher>> {
+        None
+    }
+
     /// Exact carrier endpoint for retaining foreign-MM access state. Only the
     /// HVPatch root bootstrap consumes this; syscall handlers never receive it.
     fn foreign_mm_endpoint(&self) -> Option<crate::ForeignMmEndpoint> {

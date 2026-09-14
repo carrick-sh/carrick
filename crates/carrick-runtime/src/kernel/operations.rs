@@ -573,6 +573,7 @@ impl PreparedFork {
         let old_files = self.child_resources.files();
         let files = Arc::new(FileTable::for_external_exec(
             self.reservation.kernel.object_ids().file_table_id()?,
+            self.reservation.kernel.fd_ceiling(),
         ));
         let resources = Arc::new(self.child_resources.with_files(files));
         self.leader.replace_resources(Arc::clone(&resources));

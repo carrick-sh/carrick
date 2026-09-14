@@ -359,6 +359,10 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     type SiblingBuilder: Send;
     type ProcessBuilder: Send;
 
+    fn fd_ceiling_publisher(&self) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
+        None
+    }
+
     fn foreign_mm_endpoint(&self) -> Option<carrick_hal::ForeignMmEndpoint> {
         None
     }

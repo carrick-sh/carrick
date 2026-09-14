@@ -2803,6 +2803,10 @@ fn seed_sibling_snapshot(
 }
 
 impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
+    fn fd_ceiling_publisher(&self) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
+        self.vm.fd_ceiling_publisher()
+    }
+
     fn foreign_mm_endpoint(&self) -> Option<carrick_hal::ForeignMmEndpoint> {
         self.vm.foreign_mm_endpoint()
     }

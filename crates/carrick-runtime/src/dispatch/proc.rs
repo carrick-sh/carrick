@@ -1662,9 +1662,11 @@ impl<'a> ProcView<'a> {
             // are not differentiated in v1.
             match operation as u32 {
                 crate::seccomp::SECCOMP_SET_MODE_FILTER => {
+                    cx.kernel.kernel().fd_ceiling().disable();
                     Ok(this.install_seccomp_filter(cx.kernel.task(), &mut *cx.memory, args.0))
                 }
                 crate::seccomp::SECCOMP_SET_MODE_STRICT => {
+                    cx.kernel.kernel().fd_ceiling().disable();
                     Ok(this.install_seccomp_strict(&mut *cx.memory))
                 }
                 _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
@@ -1943,9 +1945,13 @@ impl<'a> ProcView<'a> {
                 // mode; arg3 is the `struct sock_fprog *` for FILTER mode.
                 LINUX_PR_SET_SECCOMP => match arg2 {
                     LINUX_SECCOMP_MODE_FILTER => {
+                        cx.kernel.kernel().fd_ceiling().disable();
                         this.install_seccomp_filter(cx.kernel.task(), memory, arg3)
                     }
-                    LINUX_SECCOMP_MODE_STRICT => this.install_seccomp_strict(memory),
+                    LINUX_SECCOMP_MODE_STRICT => {
+                        cx.kernel.kernel().fd_ceiling().disable();
+                        this.install_seccomp_strict(memory)
+                    },
                     _ => DispatchOutcome::errno(LINUX_EINVAL),
                 },
                 // PR_GET_SECCOMP: 2 if a filter is installed, else 0 (Linux
@@ -2774,6 +2780,8 @@ impl<'a> ProcView<'a> {
         }
 
         fn ptrace(this, cx, request: u64, pid: Pid, addr: GuestPtr, data: u64) {
+            // Stop carrier fast returns before any tracing relationship changes.
+            cx.kernel.kernel().fd_ceiling().disable();
             let transport =
                 select_ptrace_transport(this.page_geometry(), this.hvpatch_process().is_some());
             if transport == PtraceTransport::VirtualHvpatch {
@@ -6255,6 +6263,49 @@ mod kernel_process_dispatch_tests {
             .capture_one_task_context()
             .expect("bound HVPatch root context");
         (lane, dispatcher, process, root, lease)
+    }
+
+    #[derive(Debug, Default)]
+    struct CeilingPolicyProbe(std::sync::atomic::AtomicBool);
+
+    impl carrick_hal::FdCeilingPublisher for CeilingPolicyProbe {
+        fn raise(&self, _maximum: u32) {}
+        fn disable(&self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn seccomp_entry_points_close_fd_ceiling_even_without_identity_mapping() {
+        for (number, args) in [
+            (277, [0, 0, 0, 0, 0, 0]),
+            (277, [1, 0, INFO_ADDR, 0, 0, 0]),
+            (167, [LINUX_PR_SET_SECCOMP, 1, 0, 0, 0, 0]),
+            (167, [LINUX_PR_SET_SECCOMP, 2, INFO_ADDR, 0, 0, 0]),
+        ] {
+            let (_lane, mut dispatcher, _process, root, _lease) = bound_dispatcher(61_090);
+            dispatcher.proc.lock().no_new_privs = true;
+            let probe = Arc::new(CeilingPolicyProbe::default());
+            root.kernel().fd_ceiling().register(probe.clone());
+            let mut memory = LinearMemory::new(INFO_ADDR, vec![0; 0x100]);
+            memory.write_bytes(INFO_ADDR, &1u16.to_le_bytes()).unwrap();
+            memory
+                .write_bytes(INFO_ADDR + 8, &(INFO_ADDR + 16).to_le_bytes())
+                .unwrap();
+            let mut filter = [0u8; 8];
+            filter[..2].copy_from_slice(&6u16.to_le_bytes());
+            filter[4..].copy_from_slice(&crate::seccomp::SECCOMP_RET_ALLOW.to_le_bytes());
+            memory.write_bytes(INFO_ADDR + 16, &filter).unwrap();
+            assert_eq!(
+                dispatch(&mut dispatcher, &root, &mut memory, number, args),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            assert!(dispatcher.seccomp.is_active());
+            assert!(
+                probe.0.load(std::sync::atomic::Ordering::Acquire),
+                "seccomp syscall {number} left the carrier FD fast path enabled"
+            );
+        }
     }
 
     fn refreshed(context: &KernelContext) -> KernelContext {

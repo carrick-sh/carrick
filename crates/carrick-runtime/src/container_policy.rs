@@ -154,6 +154,8 @@ const SYS_KCMP: u64 = 272;
 /// default model never denies these; the guard keeps a future table honest
 /// without costing the common case its fast path.
 pub(crate) const IDENTITY_FAST_PATH_SYSCALLS: &[u64] = &[172, 173, 174, 175, 176, 177, 178];
+/// Argument-bearing calls that may be answered by the carrier ceiling guard.
+const FD_CEILING_FAST_PATH_SYSCALLS: &[u64] = &[80];
 
 /// A launch-time syscall-deny table (canonical syscall number -> errno),
 /// consulted at the dispatch-entry seam before any handler. See the module
@@ -316,7 +318,9 @@ impl crate::observe::SyscallObserver for ContainerPolicy {
     }
 
     fn wants_fast_path_visibility(&self) -> crate::observe::FastPathVisibility {
-        if self.denies_any(IDENTITY_FAST_PATH_SYSCALLS) {
+        if self.denies_any(IDENTITY_FAST_PATH_SYSCALLS)
+            || self.denies_any(FD_CEILING_FAST_PATH_SYSCALLS)
+        {
             crate::observe::FastPathVisibility::Required
         } else {
             crate::observe::FastPathVisibility::Blind
@@ -362,6 +366,17 @@ mod tests {
                 "syscall {nr} must NOT be policy-denied"
             );
         }
+    }
+
+    #[test]
+    fn denying_fstat_requires_fast_path_visibility() {
+        use crate::observe::SyscallObserver;
+        let policy = ContainerPolicy::from_entries(vec![(80, LINUX_EPERM)]);
+        assert_eq!(
+            policy.wants_fast_path_visibility(),
+            crate::observe::FastPathVisibility::Required,
+            "fstat denial must remain observable above the descriptor ceiling"
+        );
     }
 
     #[test]

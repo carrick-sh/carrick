@@ -1781,6 +1781,14 @@ impl HvfVmState {
         carrick_hal::ForeignMmEndpoint::for_carrier(self.carrier_foreign_mm_transport.clone())
     }
 
+    pub(crate) fn fd_ceiling_publisher(
+        &self,
+    ) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
+        self.carrier_mappings
+            .as_ref()
+            .and_then(PersistentCarrierMappings::fd_ceiling_publisher)
+    }
+
     pub(crate) fn bind_frame_cow(
         &mut self,
         authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
@@ -2054,6 +2062,15 @@ pub(crate) struct PersistentExecutorSpec {
     mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
     syscall_transport: HvfSyscallTransport,
     carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PersistentExecutorSpec {
+    pub(crate) fn fd_ceiling_publisher(
+        &self,
+    ) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
+        self.carrier_mappings.fd_ceiling_publisher()
+    }
 }
 
 // SAFETY: PersistentCarrierMappings owns immutable VM-global MAP_SHARED

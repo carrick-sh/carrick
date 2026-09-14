@@ -267,7 +267,7 @@ impl ThreadMappingDesc {
 }
 
 /// A root booting inside a live carrier must carry the SAME control image the
-/// carrier installed: identical geometry for all five fixed mappings, and
+/// carrier installed: identical geometry for all six fixed mappings, and
 /// identical bytes for the three code pages (EL0 trampoline, EL1 vectors, EL1
 /// maintenance). The mailbox arena and the carrier maintenance root are live
 /// data, so only their geometry is compared. Divergence is a build/config
@@ -337,9 +337,9 @@ pub(crate) fn audit_plan_against_installed_carrier(
             }
         }
     }
-    if seen != 5 {
+    if seen != 6 {
         return Err(TrapError::Hypervisor(format!(
-            "root image carries {seen} carrier control mappings, expected 5"
+            "root image carries {seen} carrier control mappings, expected 6"
         )));
     }
     Ok(())
@@ -372,6 +372,7 @@ pub(crate) fn is_persistent_executor_carrier_address(address: u64) -> bool {
             | carrick_mem::memory::LINUX_EL1_MAINT_BASE
             | carrick_mem::memory::LINUX_SYSCALL_MAILBOX_BASE
             | carrick_mem::memory::LINUX_CARRIER_MAINT_ROOT_BASE
+            | carrick_mem::memory::LINUX_FD_CEILING_CONTROL_BASE
     )
 }
 
@@ -386,7 +387,7 @@ pub(crate) fn persistent_executor_carrier_mappings<'a>(
         .collect()
 }
 
-/// Owning carrier-wide lifetime for the five fixed HVPatch control mappings.
+/// Owning carrier-wide lifetime for the six fixed HVPatch control mappings.
 /// Logical MM/task cleanup never sees these rows. The last factory/worker Arc
 /// drops only after every worker vCPU has been joined and destroyed.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -394,6 +395,8 @@ pub(crate) struct PersistentCarrierMappings {
     pub(crate) mappings: TaskMappingIndex,
     pub(crate) custody: std::sync::Arc<CarrierVmCustody>,
     pub(crate) vm_destroyed_after_custody_commit: std::sync::atomic::AtomicBool,
+    pub(super) fd_ceiling_publisher:
+        parking_lot::Mutex<Option<std::sync::Weak<dyn carrick_hal::FdCeilingPublisher>>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -416,11 +419,12 @@ impl PersistentCarrierMappings {
             mappings: carrier,
             custody,
             vm_destroyed_after_custody_commit: std::sync::atomic::AtomicBool::new(false),
+            fd_ceiling_publisher: parking_lot::Mutex::new(None),
         };
         authority.audit()?;
-        if authority.mappings.len() != 5 {
+        if authority.mappings.len() != 6 {
             return Err(TrapError::Hypervisor(format!(
-                "persistent executor carrier owns {} mappings, expected 5",
+                "persistent executor carrier owns {} mappings, expected 6",
                 authority.mappings.len()
             )));
         }
@@ -468,6 +472,111 @@ impl PersistentCarrierMappings {
     pub(crate) fn audit(&self) -> Result<(), TrapError> {
         let descriptors = persistent_executor_carrier_mappings(&self.mappings);
         audit_persistent_executor_carrier_mappings(&descriptors)
+    }
+
+    pub(crate) fn fd_ceiling_publisher(
+        self: &std::sync::Arc<Self>,
+    ) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
+        let mut cached = self.fd_ceiling_publisher.lock();
+        if let Some(publisher) = cached.as_ref().and_then(std::sync::Weak::upgrade) {
+            return Some(publisher);
+        }
+        let publisher =
+            std::sync::Arc::new(CarrierFdCeilingPublisher::new(std::sync::Arc::clone(self))?)
+                as std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>;
+        *cached = Some(std::sync::Arc::downgrade(&publisher));
+        Some(publisher)
+    }
+}
+
+pub(super) fn publish_fd_ceiling_words(
+    ceiling: &std::sync::atomic::AtomicU32,
+    gate: &std::sync::atomic::AtomicU32,
+    maximum: u32,
+) {
+    ceiling.fetch_max(maximum, std::sync::atomic::Ordering::Release);
+    let _ = gate.compare_exchange(
+        carrick_mem::memory::FD_CEILING_GATE_UNINITIALIZED,
+        carrick_mem::memory::FD_CEILING_GATE_ENABLED,
+        std::sync::atomic::Ordering::Release,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub(super) fn disable_fd_ceiling_word(gate: &std::sync::atomic::AtomicU32) {
+    gate.store(
+        carrick_mem::memory::FD_CEILING_GATE_PERMANENTLY_DISABLED,
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+struct CarrierFdCeilingPublisher {
+    _carrier: std::sync::Arc<PersistentCarrierMappings>,
+    ceiling: std::ptr::NonNull<std::sync::atomic::AtomicU32>,
+    gate: std::ptr::NonNull<std::sync::atomic::AtomicU32>,
+}
+
+impl CarrierFdCeilingPublisher {
+    fn new(carrier: std::sync::Arc<PersistentCarrierMappings>) -> Option<Self> {
+        let ceiling = carrier
+            .host_pointer(
+                carrick_mem::memory::LINUX_FD_CEILING_CONTROL_BASE
+                    + carrick_mem::memory::LINUX_FD_CEILING_OFF_CEILING,
+                std::mem::size_of::<std::sync::atomic::AtomicU32>(),
+            )?
+            .cast();
+        let gate = carrier
+            .host_pointer(
+                carrick_mem::memory::LINUX_FD_CEILING_CONTROL_BASE
+                    + carrick_mem::memory::LINUX_FD_CEILING_OFF_GATE,
+                std::mem::size_of::<std::sync::atomic::AtomicU32>(),
+            )?
+            .cast();
+        let publisher = Self {
+            _carrier: carrier,
+            ceiling,
+            gate,
+        };
+        if std::env::var_os("CARRICK_FD_CEILING").as_deref() == Some(std::ffi::OsStr::new("0")) {
+            carrick_hal::FdCeilingPublisher::disable(&publisher);
+        }
+        Some(publisher)
+    }
+
+    fn ceiling(&self) -> &std::sync::atomic::AtomicU32 {
+        // SAFETY: `_carrier` owns the complete stable mapping and both offsets
+        // are naturally aligned within that page for its entire lifetime.
+        unsafe { self.ceiling.as_ref() }
+    }
+
+    fn gate(&self) -> &std::sync::atomic::AtomicU32 {
+        // SAFETY: same owned-mapping proof as `ceiling`.
+        unsafe { self.gate.as_ref() }
+    }
+}
+
+impl std::fmt::Debug for CarrierFdCeilingPublisher {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CarrierFdCeilingPublisher")
+            .field("ceiling", &self.ceiling)
+            .field("gate", &self.gate)
+            .finish_non_exhaustive()
+    }
+}
+
+// SAFETY: the raw pointers name naturally aligned atomics within `_carrier`'s
+// stable MAP_SHARED backing. The Arc owns that backing across every callback.
+unsafe impl Send for CarrierFdCeilingPublisher {}
+unsafe impl Sync for CarrierFdCeilingPublisher {}
+
+impl carrick_hal::FdCeilingPublisher for CarrierFdCeilingPublisher {
+    fn raise(&self, maximum: u32) {
+        publish_fd_ceiling_words(self.ceiling(), self.gate(), maximum);
+    }
+
+    fn disable(&self) {
+        disable_fd_ceiling_word(self.gate());
     }
 }
 
@@ -569,6 +678,11 @@ pub(crate) fn audit_persistent_executor_carrier_mappings(
             carrick_mem::memory::LINUX_CARRIER_MAINT_ROOT_BASE,
             carrick_mem::memory::LINUX_CARRIER_MAINT_ROOT_SIZE,
         ),
+        (
+            "fd ceiling control",
+            carrick_mem::memory::LINUX_FD_CEILING_CONTROL_BASE,
+            carrick_mem::memory::LINUX_FD_CEILING_CONTROL_SIZE,
+        ),
     ] {
         let size = usize::try_from(size).map_err(|_| {
             TrapError::Hypervisor(format!("persistent executor {name} extent is too large"))
@@ -577,6 +691,22 @@ pub(crate) fn audit_persistent_executor_carrier_mappings(
             return Err(TrapError::Hypervisor(format!(
                 "persistent executor carrier {name} mapping is absent"
             )));
+        }
+        if name == "fd ceiling control" {
+            let mapping = mappings
+                .iter()
+                .find(|mapping| mapping.start == start && mapping.end == start + size as u64)
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "persistent executor carrier fd ceiling geometry is invalid".to_owned(),
+                    )
+                })?;
+            if mapping.perms != applevisor::memory::MemPerms::Read || mapping.guest_writable {
+                return Err(TrapError::Hypervisor(
+                    "persistent executor carrier fd ceiling mapping must be guest read-only"
+                        .to_owned(),
+                ));
+            }
         }
     }
     Ok(())

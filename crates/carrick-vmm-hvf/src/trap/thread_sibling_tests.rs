@@ -586,6 +586,10 @@ fn neutral_persistent_worker_resolves_slot_zero_only_from_carrier_mappings() {
     let carrier_region = |start: u64, size: u64, host: usize| {
         let mut region = mapped_region(start, start + size, start);
         region.host_addr = host as *mut u8;
+        if start == crate::memory::LINUX_FD_CEILING_CONTROL_BASE {
+            region.perms = applevisor::memory::MemPerms::Read;
+            region.guest_writable = false;
+        }
         region
     };
     let mappings = vec![
@@ -614,6 +618,11 @@ fn neutral_persistent_worker_resolves_slot_zero_only_from_carrier_mappings() {
             crate::memory::LINUX_CARRIER_MAINT_ROOT_SIZE,
             0x1500_0000,
         ),
+        carrier_region(
+            crate::memory::LINUX_FD_CEILING_CONTROL_BASE,
+            crate::memory::LINUX_FD_CEILING_CONTROL_SIZE,
+            0x1600_0000,
+        ),
         mapped_region(0x0040_0000, 0x0040_4000, 0x0040_0000),
         mapped_region(
             crate::memory::LINUX_PAGE_TABLES_BASE,
@@ -621,10 +630,10 @@ fn neutral_persistent_worker_resolves_slot_zero_only_from_carrier_mappings() {
             crate::memory::LINUX_PAGE_TABLES_BASE,
         ),
     ];
-    let carrier = persistent_executor_carrier_mappings(&mappings);
+    let mut carrier = persistent_executor_carrier_mappings(&mappings);
     assert_eq!(
         carrier.len(),
-        5,
+        6,
         "task image and stage-1 root stay task-owned"
     );
 
@@ -648,6 +657,41 @@ fn neutral_persistent_worker_resolves_slot_zero_only_from_carrier_mappings() {
     )
     .expect("slot zero resolves from executor-local carrier metadata");
     assert_eq!(pointer.as_ptr() as usize, 0x1400_0000);
+
+    audit_persistent_executor_carrier_mappings(&carrier)
+        .expect("complete carrier mapping projection audits");
+    let control = carrier
+        .iter_mut()
+        .find(|mapping| mapping.start == crate::memory::LINUX_FD_CEILING_CONTROL_BASE)
+        .expect("fd ceiling control descriptor");
+    control.perms = applevisor::memory::MemPerms::ReadWrite;
+    control.guest_writable = true;
+    assert!(
+        audit_persistent_executor_carrier_mappings(&carrier).is_err(),
+        "writable guest projection must fail closed"
+    );
+}
+
+#[test]
+fn fd_ceiling_publication_activates_once_and_disable_is_permanent() {
+    let ceiling = std::sync::atomic::AtomicU32::new(2);
+    let gate = std::sync::atomic::AtomicU32::new(crate::memory::FD_CEILING_GATE_UNINITIALIZED);
+
+    publish_fd_ceiling_words(&ceiling, &gate, 41);
+    assert_eq!(ceiling.load(std::sync::atomic::Ordering::Acquire), 41);
+    assert_eq!(
+        gate.load(std::sync::atomic::Ordering::Acquire),
+        crate::memory::FD_CEILING_GATE_ENABLED
+    );
+
+    disable_fd_ceiling_word(&gate);
+    publish_fd_ceiling_words(&ceiling, &gate, 99);
+    assert_eq!(ceiling.load(std::sync::atomic::Ordering::Acquire), 99);
+    assert_eq!(
+        gate.load(std::sync::atomic::Ordering::Acquire),
+        crate::memory::FD_CEILING_GATE_PERMANENTLY_DISABLED,
+        "a later authority registration must never re-enable the carrier"
+    );
 }
 
 #[test]
@@ -676,6 +720,10 @@ fn persistent_carrier_authority_outlives_terminal_task_cleanup_and_drops_stage2_
             crate::memory::LINUX_CARRIER_MAINT_ROOT_BASE,
             crate::memory::LINUX_CARRIER_MAINT_ROOT_SIZE,
         ),
+        (
+            crate::memory::LINUX_FD_CEILING_CONTROL_BASE,
+            crate::memory::LINUX_FD_CEILING_CONTROL_SIZE,
+        ),
     ] {
         let size = usize::try_from(size).unwrap();
         let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -691,6 +739,10 @@ fn persistent_carrier_authority_outlives_terminal_task_cleanup_and_drops_stage2_
         region.host_addr = host_addr;
         region.host_mapping = Some(host);
         region.stage2_lease = Some(lease);
+        if start == crate::memory::LINUX_FD_CEILING_CONTROL_BASE {
+            region.perms = applevisor::memory::MemPerms::Read;
+            region.guest_writable = false;
+        }
         task_mappings.insert(region);
         drop_observations.push((host_addr as usize, observed));
     }
@@ -716,6 +768,19 @@ fn persistent_carrier_authority_outlives_terminal_task_cleanup_and_drops_stage2_
     let worker = std::sync::Arc::new(authority);
     let factory = std::sync::Arc::clone(&worker);
     drop(task_mappings);
+
+    let first_publisher = worker
+        .fd_ceiling_publisher()
+        .expect("carrier control page has a publisher");
+    let repeated_publisher = factory
+        .fd_ceiling_publisher()
+        .expect("factory reuses carrier publisher");
+    assert!(
+        std::sync::Arc::ptr_eq(&first_publisher, &repeated_publisher),
+        "every root in one carrier must register the same publisher identity"
+    );
+    drop(first_publisher);
+    drop(repeated_publisher);
 
     let mailbox = worker
         .host_pointer(
@@ -753,6 +818,7 @@ fn persistent_carrier_mapping_drop_after_exact_custody_destroy_skips_live_unmap(
         mappings: TaskMappingIndex::from_region(mapping),
         custody: std::sync::Arc::clone(&custody),
         vm_destroyed_after_custody_commit: std::sync::atomic::AtomicBool::new(false),
+        fd_ceiling_publisher: parking_lot::Mutex::new(None),
     };
 
     destroy_vm_with_custody_using(&custody, "terminal carrier mapping fixture", || 0, || {})

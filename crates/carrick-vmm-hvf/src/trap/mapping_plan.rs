@@ -396,7 +396,7 @@ impl HvfVmState {
         // root boots INSIDE it. Its image is placed the way `execve_rebuild`
         // places a replacement image (global-frame stage-2 leases + rebased
         // stage-1 tables), so two live roots never collide on identity IPAs,
-        // and the five carrier control mappings are shared, not re-mapped.
+        // and the six carrier control mappings are shared, not re-mapped.
         //
         // The boot gate is held across the first root's `hv_vm_create`, so two
         // roots racing here cannot both create (HV_BUSY for the loser); a root

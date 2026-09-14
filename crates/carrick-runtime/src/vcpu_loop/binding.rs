@@ -5002,7 +5002,7 @@ where
         let thread = Arc::clone(context.thread());
 
         // Initial-runner park has stopped/destroyed its vCPU. Only now may the
-        // factory take the four owning carrier mappings: every failure below
+        // factory take the owning carrier mappings: every failure below
         // can drop them without unmapping stage-2 under a live bootstrap vCPU.
         let authority = match (&mut engine as &mut dyn std::any::Any).downcast_mut::<HvfEngine>() {
             Some(engine) => {
@@ -5023,6 +5023,15 @@ where
                 )));
             }
         };
+
+        // No guest has entered: its start gate remains held. The extracted
+        // factory now owns the shared control backing, so register existing
+        // file slots and restrictive policy before workers can run this root.
+        super::fd_ceiling::register(
+            &kernel.dispatcher,
+            &context,
+            authority.fd_ceiling_publisher(),
+        );
 
         let boxed: Box<dyn std::any::Any> = Box::new(engine);
         let hvf_engine = match boxed.downcast::<HvfEngine>() {

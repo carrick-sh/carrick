@@ -2713,9 +2713,17 @@
       "classification": "test_only",
       "rationale": "Test-only fixture or lock alias_registry_tests::thread_mapping_desc_from_region_and_fork_inheritance_with_offset::TEST_LOCK in crates/carrick-vmm-hvf/src/trap/memory_protection/tests.rs scoped strictly to test harness execution."
     },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
+  {
+    "kind": "env_var_os",
+    "file": "crates/carrick-vmm-hvf/src/trap/persistent_executor.rs",
+    "symbol": "new::CARRICK_FD_CEILING",
+    "fingerprint": "6625ba015b01422c31fb2adeea78d36bf8fa5f6bd5a04b7314d3fa6fe401e9f2",
+    "classification": "config_debug",
+    "rationale": "CARRICK_FD_CEILING=0 is a diagnostic same-binary ABBA control read while constructing the carrier-owned publisher. It can only permanently disable the carrier fstat fast path; it cannot enable a policy-disabled gate, lower the monotonic ceiling, select container identity, or change guest-visible syscall semantics."
+  },
+  {
+    "kind": "thread_local",
+    "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
       "symbol": "STAGE2_AUDIT_STATE",
       "fingerprint": "f4a8dd5e57f884559783cd3de35e10deac5ea59dfd6c204ad6ecdf6f75b88658",
       "classification": "test_only",
