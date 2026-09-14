@@ -2348,9 +2348,10 @@ fn create_raw_fd_applies_the_guest_mode_on_the_held_fd() {
     assert_eq!(b.metadata("/d/t").unwrap().size, 3);
 }
 
-/// Pin this process's descriptor table shut for the guard's lifetime:
-/// every fd below the soft limit is in use, so the next host `open`,
-/// `dup` or `openat` fails `EMFILE`. Restores the limit on drop.
+/// Pin this process's descriptor table shut for the guard's lifetime: a zero
+/// soft limit leaves existing descriptors valid but makes every new host
+/// `open`, `dup` or `openat` fail `EMFILE`, even if another task closes a
+/// lower descriptor. Restores the limit on drop.
 /// Requires the serial `just test` lane (a process-wide limit).
 struct DescriptorTableShut {
     saved: libc::rlimit,
@@ -2363,14 +2364,8 @@ impl DescriptorTableShut {
             unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
             0
         );
-        // `dup` hands out the LOWEST free number, so after closing it
-        // again every fd below `probe` is in use and a soft limit of
-        // `probe` leaves the table with no allocatable slot.
-        let probe = unsafe { libc::dup(0) };
-        assert!(probe >= 0);
-        unsafe { libc::close(probe) };
         let shut = libc::rlimit {
-            rlim_cur: probe as libc::rlim_t,
+            rlim_cur: 0,
             rlim_max: saved.rlim_max,
         };
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &shut) }, 0);
@@ -2450,6 +2445,24 @@ fn host_descriptor_exhaustion_is_refused_not_unavailable() {
             .served()
             .is_none()
     );
+}
+
+#[test]
+fn host_descriptor_exhaustion_stays_shut_after_lower_fd_released() {
+    let _serial = FS_RLIMIT_TEST_LOCK.lock();
+    // Releasing a pre-existing descriptor after guard admission must not make a
+    // new descriptor allocation possible while the guard is active.
+    let released = unsafe { libc::dup(0) };
+    assert!(released >= 0);
+    let _shut = DescriptorTableShut::new();
+    assert_eq!(unsafe { libc::close(released) }, 0);
+    let reopened = unsafe { libc::dup(0) };
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    if reopened >= 0 {
+        unsafe { libc::close(reopened) };
+    }
+    assert_eq!(reopened, -1, "guard admitted a released lower descriptor");
+    assert_eq!(errno, Some(libc::EMFILE));
 }
 
 /// `lookup_kind_and_metadata` on a plain file or directory is served by
