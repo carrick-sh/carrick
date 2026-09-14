@@ -81,6 +81,8 @@ use crate::args::DebugCommand;
 #[cfg(feature = "platform-macos")]
 use crate::debug::run_debug;
 #[cfg(target_os = "macos")]
+use crate::hvpatch_carrier_cpu_low_rate_profile::HvpatchCarrierCpuLowRateSummary;
+#[cfg(target_os = "macos")]
 use crate::hvpatch_core_profile::HvpatchCoreSummary;
 #[cfg(target_os = "macos")]
 use crate::hvpatch_exec_runtime_profile::HvpatchExecRuntimeSummary;
@@ -174,6 +176,31 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             } else {
                 bail!("unknown profile stream in {}", input.display());
             }
+        }
+        Commands::HvpatchCarrierCpuLowRateValidate {
+            input,
+            principal_drops,
+            aggregation_drops,
+            dynamic_drops,
+            dynamic_rinse_drops,
+            dynamic_dirty_drops,
+            other_drops,
+            interrupted,
+        } => {
+            let capture_status = crate::trace_profile::ProfileCaptureStatus {
+                principal_drops,
+                aggregation_drops,
+                dynamic_drops,
+                dynamic_rinse_drops,
+                dynamic_dirty_drops,
+                other_drops,
+                interrupted,
+            };
+            let summary = crate::hvpatch_carrier_cpu_low_rate_profile::HvpatchCarrierCpuLowRateSummary::from_path(
+                &input,
+                capture_status,
+            )?;
+            println!("HVPCARRIERLOW_VALID samples={}", summary.sample_population);
         }
         Commands::InspectElf { path } => {
             let metadata = inspect_elf(&path)
@@ -925,6 +952,13 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 {
                     bail!("--trace-out and --summary-jsonl must name different files");
                 }
+                if profile == Some(crate::trace_profile::TraceProfileKind::HvpatchCarrierCpuLowRate)
+                    && trace_out.is_none()
+                {
+                    bail!(
+                        "hvpatch-carrier-cpu-low-rate requires --trace-out so its complete raw stack population is retained"
+                    );
+                }
                 let me = std::env::current_exe()
                     .context("failed to resolve current carrick binary path")?;
                 if unsafe { libc::geteuid() } != 0 {
@@ -1003,7 +1037,21 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 let output_path = trace_out
                     .as_deref()
                     .or_else(|| internal_trace.as_ref().map(tempfile::NamedTempFile::path));
-                let script_src = script_template;
+                let script_src = match profile {
+                    Some(crate::trace_profile::TraceProfileKind::HvpatchCarrierCpuLowRate) => {
+                        let template = script_template.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "HVPatch carrier low-rate profile has no bundled D program"
+                            )
+                        })?;
+                        Some(
+                            crate::hvpatch_carrier_cpu_low_rate_profile::render_profile_script(
+                                template,
+                            )?,
+                        )
+                    }
+                    _ => script_template,
+                };
                 // Applied AFTER the launch-qualification rendering on purpose:
                 // the authority names the immutable bundled TEMPLATE's digest,
                 // so the bound must not be inside the hashed text. The program
@@ -1127,6 +1175,19 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                             eprintln!(
                                 "HVPatch frame-COW raw receipt captured; strict structural validation is required"
                             );
+                        } else if requested_profile
+                            == crate::trace_profile::TraceProfileKind::HvpatchCarrierCpuLowRate
+                        {
+                            if summary_jsonl.is_some() {
+                                bail!(
+                                    "the HVPatch carrier CPU low-rate profile has no JSON ledger schema; use its strict raw stream and CLI summary"
+                                );
+                            }
+                            let summary = HvpatchCarrierCpuLowRateSummary::from_path(
+                                raw_path,
+                                capture_status,
+                            )?;
+                            eprintln!("{}", summary.render_human());
                         } else if requested_profile
                             == crate::trace_profile::TraceProfileKind::HvpatchExecRuntimeStages
                         {

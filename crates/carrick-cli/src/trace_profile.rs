@@ -237,6 +237,7 @@ impl V2ProfileAuthority {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum TraceProfileKind {
+    HvpatchCarrierCpuLowRate,
     HvpatchFrameCow,
     HvpatchExecRuntimeStages,
     HvpatchCoreLifecycle,
@@ -248,6 +249,7 @@ pub(crate) enum TraceProfileKind {
 impl TraceProfileKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::HvpatchCarrierCpuLowRate => "hvpatch-carrier-cpu-low-rate",
             Self::HvpatchFrameCow => "hvpatch-frame-cow",
             Self::HvpatchExecRuntimeStages => "hvpatch-exec-runtime-stages",
             Self::HvpatchCoreLifecycle => "hvpatch-core-lifecycle",
@@ -265,7 +267,8 @@ impl TraceProfileKind {
     pub(crate) const fn capture_bound_placeholder(self) -> Option<&'static str> {
         match self {
             Self::NativeAmplification => Some(AMP1_BOUND_PLACEHOLDER),
-            Self::HvpatchFrameCow
+            Self::HvpatchCarrierCpuLowRate
+            | Self::HvpatchFrameCow
             | Self::HvpatchExecRuntimeStages
             | Self::HvpatchCoreLifecycle
             | Self::HvpatchIdentityHostSafety
@@ -276,6 +279,9 @@ impl TraceProfileKind {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     pub(crate) fn bundled_script(self) -> &'static str {
         match self {
+            Self::HvpatchCarrierCpuLowRate => {
+                carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_CARRIER_CPU_LOW_RATE_D
+            }
             Self::HvpatchFrameCow => carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_FRAME_COW_D,
             Self::HvpatchExecRuntimeStages => {
                 carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_EXEC_RUNTIME_STAGES_D
@@ -298,6 +304,7 @@ impl TraceProfileKind {
     #[allow(dead_code)]
     fn parse_protocol(value: &str) -> Result<Self> {
         match value {
+            "hvpatch-carrier-cpu-low-rate" => Ok(Self::HvpatchCarrierCpuLowRate),
             "hvpatch-frame-cow" => Ok(Self::HvpatchFrameCow),
             "hvpatch-exec-runtime-stages" => Ok(Self::HvpatchExecRuntimeStages),
             "hvpatch-core-lifecycle" => Ok(Self::HvpatchCoreLifecycle),
@@ -470,6 +477,10 @@ mod tests {
     #[test]
     fn trace_profile_kind_strings_and_runtime_profile() {
         for (kind, expected) in [
+            (
+                TraceProfileKind::HvpatchCarrierCpuLowRate,
+                "hvpatch-carrier-cpu-low-rate",
+            ),
             (TraceProfileKind::HvpatchFrameCow, "hvpatch-frame-cow"),
             (
                 TraceProfileKind::HvpatchExecRuntimeStages,

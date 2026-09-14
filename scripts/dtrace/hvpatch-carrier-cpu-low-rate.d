@@ -57,6 +57,8 @@
 
 dtrace:::BEGIN
 {
+    /* Replaced by the Rust profile launcher with the immutable template hash. */
+    printf("HVPCARRIERLOW|header|program_sha256=/* CARRICK_HVPCARRIERLOW_PROGRAM_SHA256 */\n");
     started = timestamp;
     root_exited = 0;
     bounded = 0;
