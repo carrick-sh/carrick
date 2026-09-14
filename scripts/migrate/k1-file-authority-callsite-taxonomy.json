@@ -2928,7 +2928,7 @@
       ],
       "text": "&& let Some(open) = open_file.description.read()",
       "scope_kind": "production_callsite",
-      "enclosing_function": "getpeername",
+      "enclosing_function": "getsockname",
       "migration_family": "inspect_misc"
     },
     {
@@ -2939,7 +2939,7 @@
       ],
       "text": "&& let Some(open) = open_file.description.read()",
       "scope_kind": "production_callsite",
-      "enclosing_function": "shutdown",
+      "enclosing_function": "getpeername",
       "migration_family": "inspect_misc"
     },
     {
@@ -2950,7 +2950,7 @@
       ],
       "text": "&& let Some(open) = open_file.description.read()",
       "scope_kind": "production_callsite",
-      "enclosing_function": "getsockname",
+      "enclosing_function": "shutdown",
       "migration_family": "inspect_misc"
     },
     {
