@@ -66,6 +66,27 @@ pub enum BackendError {
     /// errno by [`host_open_refusal`]. Authoritative: the dispatcher returns
     /// it as-is instead of the generic `EINVAL`/`EIO` it lowers `Io` to.
     Host(LinuxErrno),
+    /// A namespace admission or namespace operation failed with this exact
+    /// guest errno.
+    Namespace(LinuxErrno),
+}
+
+/// Result of asking the writable backend to rename one namespace entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayRenameOutcome {
+    /// The source is not owned by this backend; the layered VFS must copy it up.
+    NotOwned,
+    /// The source dentry moved to the destination dentry.
+    Renamed,
+    /// Both dentries name the same inode. Linux treats this as successful
+    /// without changing either name.
+    SameObject,
+}
+
+impl OverlayRenameOutcome {
+    pub const fn source_was_owned(self) -> bool {
+        !matches!(self, Self::NotOwned)
+    }
 }
 
 /// Outcome of a backend handing the dispatcher a host fd for a guest open
@@ -445,7 +466,7 @@ pub(crate) struct ArchiveTransactionGuard<'a> {
     _guard: RwLockWriteGuard<'a, ()>,
 }
 
-enum MutationGuard<'a> {
+pub(crate) enum MutationGuard<'a> {
     Shared { _guard: RwLockReadGuard<'a, ()> },
     ArchiveOwner,
 }
@@ -465,7 +486,7 @@ impl ArchiveMutationGate {
         }
     }
 
-    fn mutation(&self) -> MutationGuard<'_> {
+    pub(crate) fn mutation(&self) -> MutationGuard<'_> {
         let gate_id = self.id();
         if EXCLUSIVE_ARCHIVE_GATES.with(|held| held.borrow().contains(&gate_id)) {
             MutationGuard::ArchiveOwner
@@ -822,11 +843,13 @@ pub trait FsBackend: Send + Sync {
         Err(BackendError::Unsupported)
     }
 
-    /// Rename an entry the backend owns. Returns `Ok(true)` iff the
-    /// source was present in the backend; `Ok(false)` means the
-    /// caller has to materialise the rootfs-backed source into the
-    /// backend first.
-    fn rename_overlay_entry(&self, from: &str, to: &str) -> Result<bool, BackendError>;
+    /// Rename an entry the backend owns, preserving Linux's distinct
+    /// same-object success outcome for the layered namespace authority.
+    fn rename_overlay_entry(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<OverlayRenameOutcome, BackendError>;
 
     /// Rename an entry using already-held parent directory fds and leaf names
     /// resolved by Carrick's dentry layer, avoiding whole-path walks.
@@ -838,7 +861,7 @@ pub trait FsBackend: Send + Sync {
         dst_parent_fd: Option<&std::os::fd::OwnedFd>,
         dst_leaf_c: Option<&std::ffi::CStr>,
         dst_rel: &NormalizedRelPath,
-    ) -> Result<bool, BackendError> {
+    ) -> Result<OverlayRenameOutcome, BackendError> {
         let _ = (src_parent_fd, src_leaf_c, dst_parent_fd, dst_leaf_c);
         self.rename_overlay_entry(
             src_rel.as_path().to_str().ok_or(BackendError::Invalid)?,

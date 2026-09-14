@@ -135,8 +135,10 @@ impl ArchiveFsAuthority {
             .archive_mutation_gate()
             .ok_or(ArchiveFsError::UnsupportedEntry)?
             .archive_transaction();
-        validate_archive_plan(self, destination, &plan)?;
-        apply_archive_plan(self, destination, plan)
+        self.root.with_archive_namespace_transaction(|_permit| {
+            validate_archive_plan(self, destination, &plan)?;
+            apply_archive_plan(self, destination, plan)
+        })
     }
 
     pub(crate) fn export_tar(&self, source: &str) -> Result<Vec<u8>, ArchiveFsError> {
@@ -643,13 +645,16 @@ fn apply_archive_plan(
         })();
 
     if let Err(apply_error) = apply_result {
-        if let Err(rollback_error) = rollback_archive_paths(backend, snapshots) {
+        if let Err(rollback_error) = rollback_archive_paths(backend, &snapshots) {
+            invalidate_archive_paths(&authority.root.dentry_cache, &snapshots);
             return Err(ArchiveFsError::Io(format!(
                 "archive apply failed ({apply_error}); rollback failed ({rollback_error})"
             )));
         }
+        publish_rolled_back_archive_paths(&authority.root.dentry_cache, &snapshots);
         return Err(apply_error);
     }
+    publish_applied_archive_paths(&authority.root.dentry_cache, &mutation_paths, destination)?;
     Ok(())
 }
 
@@ -720,13 +725,14 @@ fn snapshot_archive_paths(
 
 fn rollback_archive_paths(
     backend: &dyn crate::fs_backend::FsBackend,
-    mut snapshots: Vec<ArchivePathSnapshot>,
+    snapshots: &[ArchivePathSnapshot],
 ) -> Result<(), ArchiveFsError> {
+    let mut snapshots = snapshots.iter().collect::<Vec<_>>();
     snapshots
         .sort_by_key(|snapshot| std::cmp::Reverse(Path::new(&snapshot.full).components().count()));
     let mut first_error = None;
     for snapshot in snapshots {
-        let restored = restore_archive_path(backend, &snapshot.full, snapshot.previous);
+        let restored = restore_archive_path(backend, &snapshot.full, &snapshot.previous);
         if first_error.is_none() {
             first_error = restored.err();
         }
@@ -737,7 +743,7 @@ fn rollback_archive_paths(
 fn restore_archive_path(
     backend: &dyn crate::fs_backend::FsBackend,
     full: &str,
-    previous: PreviousArchiveEntry,
+    previous: &PreviousArchiveEntry,
 ) -> Result<(), ArchiveFsError> {
     let backend_error = |error| ArchiveFsError::Io(format!("rollback {full}: {error:?}"));
     match previous {
@@ -750,21 +756,72 @@ fn restore_archive_path(
         }
         PreviousArchiveEntry::File { contents, metadata } => {
             backend
-                .set_file_contents(full, contents)
+                .set_file_contents(full, contents.clone())
                 .map_err(backend_error)?;
-            restore_archive_metadata(backend, full, &metadata)?;
+            restore_archive_metadata(backend, full, metadata)?;
         }
         PreviousArchiveEntry::Directory { metadata } => {
             backend.make_dir(full).map_err(backend_error)?;
-            restore_archive_metadata(backend, full, &metadata)?;
+            restore_archive_metadata(backend, full, metadata)?;
         }
         PreviousArchiveEntry::Symlink { target, metadata } => {
             backend.remove_entry_checked(full).map_err(backend_error)?;
-            backend.symlink(&target, full).map_err(backend_error)?;
-            restore_archive_metadata(backend, full, &metadata)?;
+            backend.symlink(target, full).map_err(backend_error)?;
+            restore_archive_metadata(backend, full, metadata)?;
         }
     }
     Ok(())
+}
+
+/// Publish archive effects only after the whole archive plan has become durable.
+/// Direct backend writes deliberately keep the dentry cache untouched while a
+/// later entry can still fail and force rollback.
+fn publish_applied_archive_paths(
+    cache: &crate::vfs::DentryCache,
+    paths: &[PathBuf],
+    destination: &str,
+) -> Result<(), ArchiveFsError> {
+    for relative in paths {
+        let full = destination_path(destination, relative)?;
+        cache.entry_created(&full, None);
+    }
+    Ok(())
+}
+
+/// Restore cache visibility to the final post-rollback state, never to the
+/// transient state that existed while the archive plan was being applied.
+fn publish_rolled_back_archive_paths(
+    cache: &crate::vfs::DentryCache,
+    snapshots: &[ArchivePathSnapshot],
+) {
+    for snapshot in snapshots {
+        match &snapshot.previous {
+            // An absent upper entry can reveal either an immutable lower entry
+            // or nothing. `entry_removed` would install a negative dentry and
+            // incorrectly hide that lower entry, so make the next layered
+            // lookup derive its final state instead.
+            PreviousArchiveEntry::AbsentUpper => {
+                cache.inode_changed(&snapshot.full, None);
+            }
+            PreviousArchiveEntry::Tombstone => {
+                cache.entry_removed(&snapshot.full, None);
+            }
+            PreviousArchiveEntry::File { .. }
+            | PreviousArchiveEntry::Directory { .. }
+            | PreviousArchiveEntry::Symlink { .. } => {
+                cache.entry_created(&snapshot.full, None);
+            }
+        }
+    }
+}
+
+/// A failed rollback has no single known final namespace state. Drop every
+/// affected cache entry so a later lookup rederives the layered view rather
+/// than publishing a plausible but stale archive result.
+fn invalidate_archive_paths(cache: &crate::vfs::DentryCache, snapshots: &[ArchivePathSnapshot]) {
+    for snapshot in snapshots {
+        cache.inode_changed(&snapshot.full, None);
+    }
 }
 
 fn restore_archive_metadata(
@@ -1137,6 +1194,11 @@ mod tests {
             .expect("original file");
         let mut dispatcher = SyscallDispatcher::new();
         let _ = dispatcher.set_fs_backend(Box::new(backend));
+        let before = dispatcher
+            .fs
+            .rootfs_vfs
+            .dentry_stat("/dest/first", false)
+            .expect("cache original entry before archive");
 
         assert!(
             dispatcher
@@ -1153,6 +1215,12 @@ mod tests {
             Some(&b"original"[..]),
             "a failed PUT must restore every earlier mutation",
         );
+        let after = dispatcher
+            .fs
+            .rootfs_vfs
+            .dentry_stat("/dest/first", false)
+            .expect("cache must describe the rolled-back entry");
+        assert_eq!(after.ino, before.ino);
     }
 
     #[test]

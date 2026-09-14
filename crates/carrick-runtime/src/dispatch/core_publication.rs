@@ -392,111 +392,160 @@ impl SyscallDispatcher {
                 publication
             }
             (None, None) => {
-                let backend = &self.fs.rootfs_vfs.overlay;
-                self.cleanup_core_artifact(&temp_path)?;
-                if failpoint == Some("before-create") {
-                    return Err(CorePublicationError::Failpoint("before-create"));
-                }
-                if failpoint == Some("unwritable-path") {
-                    return Err(CorePublicationError::Failpoint("unwritable-path"));
-                }
-                backend
-                    .create_file(&temp_path)
-                    .map_err(|error| CorePublicationError::Backend {
-                        operation: "create",
-                        path: temp_path.clone(),
-                        error,
-                    })?;
-                let bytes_len = usize::try_from(payload.emitted_bytes()).unwrap_or(usize::MAX);
-                let publication = (|| {
-                    if failpoint == Some("short-write") {
-                        return Err(CorePublicationError::Failpoint("short-write"));
-                    }
-                    let logical_size = usize::try_from(payload.logical_size).map_err(|_| {
-                        CorePublicationError::Backend {
-                            operation: "write",
-                            path: temp_path.clone(),
-                            error: crate::fs_backend::BackendError::Invalid,
-                        }
-                    })?;
-                    let initial_size = logical_size.max(payload.header.len());
-                    backend
-                        .write_file_range(&temp_path, 0, &payload.header, initial_size)
-                        .map_err(|error| CorePublicationError::Backend {
-                            operation: "write",
-                            path: temp_path.clone(),
-                            error,
-                        })?;
-                    for ext in &payload.extents {
-                        let offset = usize::try_from(ext.offset).map_err(|_| {
-                            CorePublicationError::Backend {
-                                operation: "write",
-                                path: temp_path.clone(),
-                                error: crate::fs_backend::BackendError::Invalid,
+                let publication = self.fs.rootfs_vfs.with_paths_topology_admission(
+                    &[temp_path.as_str(), final_path.as_str()],
+                    |_permit| {
+                        (|| -> Result<CorePublication, CorePublicationError> {
+                            let backend = &self.fs.rootfs_vfs.overlay;
+                            self.cleanup_core_overlay_artifact(&temp_path)?;
+                            if failpoint == Some("before-create") {
+                                return Err(CorePublicationError::Failpoint("before-create"));
                             }
-                        })?;
-                        backend
-                            .write_file_range(&temp_path, offset, &ext.bytes, logical_size)
-                            .map_err(|error| CorePublicationError::Backend {
-                                operation: "write",
-                                path: temp_path.clone(),
-                                error,
+                            if failpoint == Some("unwritable-path") {
+                                return Err(CorePublicationError::Failpoint("unwritable-path"));
+                            }
+                            backend.create_file(&temp_path).map_err(|error| {
+                                CorePublicationError::Backend {
+                                    operation: "create",
+                                    path: temp_path.clone(),
+                                    error,
+                                }
                             })?;
-                    }
-                    if failpoint == Some("fsync") {
-                        return Err(CorePublicationError::Failpoint("fsync"));
-                    }
-                    if let Some(fd) =
-                        backend.reopen_for_durability(&temp_path).map_err(|error| {
-                            CorePublicationError::Backend {
-                                operation: "reopen-for-fsync",
-                                path: temp_path.clone(),
-                                error,
+                            self.fs
+                                .rootfs_vfs
+                                .dentry_cache
+                                .entry_created(&temp_path, None);
+                            let bytes_len =
+                                usize::try_from(payload.emitted_bytes()).unwrap_or(usize::MAX);
+                            let publication = (|| {
+                                if failpoint == Some("short-write") {
+                                    return Err(CorePublicationError::Failpoint("short-write"));
+                                }
+                                let logical_size =
+                                    usize::try_from(payload.logical_size).map_err(|_| {
+                                        CorePublicationError::Backend {
+                                            operation: "write",
+                                            path: temp_path.clone(),
+                                            error: crate::fs_backend::BackendError::Invalid,
+                                        }
+                                    })?;
+                                let initial_size = logical_size.max(payload.header.len());
+                                backend
+                                    .write_file_range(&temp_path, 0, &payload.header, initial_size)
+                                    .map_err(|error| CorePublicationError::Backend {
+                                        operation: "write",
+                                        path: temp_path.clone(),
+                                        error,
+                                    })?;
+                                for ext in &payload.extents {
+                                    let offset = usize::try_from(ext.offset).map_err(|_| {
+                                        CorePublicationError::Backend {
+                                            operation: "write",
+                                            path: temp_path.clone(),
+                                            error: crate::fs_backend::BackendError::Invalid,
+                                        }
+                                    })?;
+                                    backend
+                                        .write_file_range(
+                                            &temp_path,
+                                            offset,
+                                            &ext.bytes,
+                                            logical_size,
+                                        )
+                                        .map_err(|error| CorePublicationError::Backend {
+                                            operation: "write",
+                                            path: temp_path.clone(),
+                                            error,
+                                        })?;
+                                }
+                                self.fs
+                                    .rootfs_vfs
+                                    .dentry_cache
+                                    .inode_changed(&temp_path, None);
+                                if failpoint == Some("fsync") {
+                                    return Err(CorePublicationError::Failpoint("fsync"));
+                                }
+                                if let Some(fd) = backend
+                                    .reopen_for_durability(&temp_path)
+                                    .map_err(|error| CorePublicationError::Backend {
+                                        operation: "reopen-for-fsync",
+                                        path: temp_path.clone(),
+                                        error,
+                                    })?
+                                {
+                                    // SAFETY: transfers ownership of fd to scoped_fd so it is closed on scope exit.
+                                    let scoped_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                                    let result = unsafe { libc::fsync(scoped_fd.as_raw_fd()) };
+                                    if result < 0 {
+                                        let errno = std::io::Error::last_os_error()
+                                            .raw_os_error()
+                                            .unwrap_or(0);
+                                        return Err(CorePublicationError::Fsync {
+                                            path: temp_path.clone(),
+                                            errno,
+                                        });
+                                    }
+                                    drop(scoped_fd);
+                                }
+                                if failpoint == Some("rename") {
+                                    return Err(CorePublicationError::Failpoint("rename"));
+                                }
+                                let renamed = backend
+                                    .rename_overlay_entry(&temp_path, &final_path)
+                                    .map_err(|error| CorePublicationError::Backend {
+                                        operation: "rename",
+                                        path: final_path.clone(),
+                                        error,
+                                    })?;
+                                match renamed {
+                                    crate::fs_backend::OverlayRenameOutcome::Renamed => {
+                                        self.fs.rootfs_vfs.dentry_cache.entry_moved(
+                                            &temp_path,
+                                            &final_path,
+                                            None,
+                                        );
+                                    }
+                                    crate::fs_backend::OverlayRenameOutcome::SameObject => {
+                                        // `renameat` validated the host operation but left
+                                        // both hard-link names intact. Remove only our
+                                        // temporary link; the final name already denotes the
+                                        // exact same payload.
+                                        self.cleanup_core_overlay_artifact(&temp_path)?;
+                                    }
+                                    crate::fs_backend::OverlayRenameOutcome::NotOwned => {
+                                        return Err(CorePublicationError::RenameMissing {
+                                            from: temp_path.clone(),
+                                            to: final_path.clone(),
+                                        });
+                                    }
+                                }
+                                if failpoint == Some("post-publication") {
+                                    self.cleanup_core_overlay_artifact(&final_path)?;
+                                    return Err(CorePublicationError::Failpoint(
+                                        "post-publication",
+                                    ));
+                                }
+                                Ok(CorePublication {
+                                    path: final_path.clone(),
+                                    bytes: bytes_len,
+                                    generation,
+                                })
+                            })();
+                            if publication.is_err() {
+                                self.cleanup_core_overlay_artifact(&temp_path)?;
                             }
-                        })?
-                    {
-                        // SAFETY: transfers ownership of fd to scoped_fd so it is closed on scope exit.
-                        let scoped_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-                        let result = unsafe { libc::fsync(scoped_fd.as_raw_fd()) };
-                        if result < 0 {
-                            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                            return Err(CorePublicationError::Fsync {
-                                path: temp_path.clone(),
-                                errno,
-                            });
-                        }
-                        drop(scoped_fd);
-                    }
-                    if failpoint == Some("rename") {
-                        return Err(CorePublicationError::Failpoint("rename"));
-                    }
-                    let renamed = backend
-                        .rename_overlay_entry(&temp_path, &final_path)
-                        .map_err(|error| CorePublicationError::Backend {
-                            operation: "rename",
-                            path: final_path.clone(),
-                            error,
-                        })?;
-                    if !renamed {
-                        return Err(CorePublicationError::RenameMissing {
-                            from: temp_path.clone(),
-                            to: final_path.clone(),
-                        });
-                    }
-                    if failpoint == Some("post-publication") {
-                        self.cleanup_core_artifact(&final_path)?;
-                        return Err(CorePublicationError::Failpoint("post-publication"));
-                    }
-                    Ok(CorePublication {
-                        path: final_path.clone(),
-                        bytes: bytes_len,
-                        generation,
-                    })
-                })();
-                if publication.is_err() {
-                    self.cleanup_core_artifact(&temp_path)?;
+                            publication
+                        })()
+                    },
+                );
+                match publication {
+                    Ok(publication) => publication,
+                    Err(errno) => Err(CorePublicationError::Backend {
+                        operation: "namespace-admission",
+                        path: final_path,
+                        error: crate::fs_backend::BackendError::Namespace(errno),
+                    }),
                 }
-                publication
             }
             _ => Err(CorePublicationError::Backend {
                 operation: "rename",
@@ -560,28 +609,52 @@ impl SyscallDispatcher {
                 }
             }
         } else {
-            let backend = &self.fs.rootfs_vfs.overlay;
-            let is_regular_file = backend
-                .metadata(path)
-                .map(|m| m.kind == crate::rootfs::RootFsEntryKind::File)
-                .unwrap_or(false);
-            match backend.remove_entry_checked(path) {
-                Ok(_) => Ok(()),
-                Err(remove_error) => {
-                    let artifact_invalidated = if is_regular_file {
-                        backend.set_file_contents(path, Vec::new()).is_ok()
-                    } else {
-                        false
-                    };
-                    if artifact_invalidated && backend.remove_entry_checked(path).is_ok() {
-                        return Ok(());
-                    }
-                    Err(CorePublicationError::Cleanup {
-                        path: path.to_owned(),
-                        remove_error,
-                        artifact_invalidated,
-                    })
+            let admitted = self
+                .fs
+                .rootfs_vfs
+                .with_paths_topology_admission(&[path], |_permit| {
+                    self.cleanup_core_overlay_artifact(path)
+                });
+            match admitted {
+                Ok(result) => result,
+                Err(errno) => Err(CorePublicationError::Backend {
+                    operation: "namespace-admission",
+                    path: path.to_owned(),
+                    error: crate::fs_backend::BackendError::Namespace(errno),
+                }),
+            }
+        }
+    }
+
+    /// Root-overlay cleanup runs under the caller's namespace admission. The
+    /// public cleanup entrypoint acquires that admission when it is not already
+    /// part of core publication.
+    fn cleanup_core_overlay_artifact(&self, path: &str) -> Result<(), CorePublicationError> {
+        let backend = &self.fs.rootfs_vfs.overlay;
+        let is_regular_file = backend
+            .metadata(path)
+            .map(|m| m.kind == crate::rootfs::RootFsEntryKind::File)
+            .unwrap_or(false);
+        match backend.remove_entry_checked(path) {
+            Ok(_) => {
+                self.fs.rootfs_vfs.dentry_cache.entry_removed(path, None);
+                Ok(())
+            }
+            Err(remove_error) => {
+                let artifact_invalidated = if is_regular_file {
+                    backend.set_file_contents(path, Vec::new()).is_ok()
+                } else {
+                    false
+                };
+                if artifact_invalidated && backend.remove_entry_checked(path).is_ok() {
+                    self.fs.rootfs_vfs.dentry_cache.entry_removed(path, None);
+                    return Ok(());
                 }
+                Err(CorePublicationError::Cleanup {
+                    path: path.to_owned(),
+                    remove_error,
+                    artifact_invalidated,
+                })
             }
         }
     }
@@ -707,7 +780,8 @@ mod tests {
             &self,
             from: &str,
             to: &str,
-        ) -> Result<bool, crate::fs_backend::BackendError> {
+        ) -> Result<crate::fs_backend::OverlayRenameOutcome, crate::fs_backend::BackendError>
+        {
             self.inner.rename_overlay_entry(from, to)
         }
 
@@ -740,6 +814,26 @@ mod tests {
             rlimit_core: 4096,
             dumpable: true,
         }
+    }
+
+    /// Core publication receives its cwd from a live task, so its parent must
+    /// already be a guest directory. Keep root-overlay fixtures faithful to
+    /// that contract rather than bypassing namespace admission for tests.
+    fn dispatcher_with_core_parent() -> SyscallDispatcher {
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .make_dir("/tmp")
+            .expect("tmp parent");
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .make_dir("/tmp/coretest")
+            .expect("core cwd");
+        dispatcher
     }
 
     #[test]
@@ -1097,7 +1191,7 @@ mod tests {
 
     #[test]
     fn atomic_core_publication_has_one_success_edge() {
-        let dispatcher = SyscallDispatcher::new();
+        let dispatcher = dispatcher_with_core_parent();
         let snapshot = snapshot();
         let publication = dispatcher
             .publish_core_atomic_with_failpoint(&snapshot, 7, b"complete".to_vec(), None)
@@ -1123,6 +1217,22 @@ mod tests {
     }
 
     #[test]
+    fn core_publication_rejects_a_snapshot_cwd_without_a_directory_parent() {
+        let dispatcher = SyscallDispatcher::new();
+        let error = dispatcher
+            .publish_core_atomic_with_failpoint(&snapshot(), 8, b"missing-parent".to_vec(), None)
+            .expect_err("a core cwd must name an existing guest directory");
+        assert!(matches!(
+            error,
+            CorePublicationError::Backend {
+                operation: "namespace-admission",
+                error: crate::fs_backend::BackendError::Namespace(errno),
+                ..
+            } if errno == crate::linux_abi::LINUX_ENOENT
+        ));
+    }
+
+    #[test]
     fn every_publication_failpoint_leaves_no_final_or_temporary_file() {
         for failpoint in [
             "before-create",
@@ -1132,7 +1242,7 @@ mod tests {
             "rename",
             "post-publication",
         ] {
-            let dispatcher = SyscallDispatcher::new();
+            let dispatcher = dispatcher_with_core_parent();
             let snapshot = snapshot();
             dispatcher
                 .publish_core_atomic_with_failpoint(
@@ -1165,7 +1275,7 @@ mod tests {
 
     #[test]
     fn published_core_remains_rollback_owned_until_wait_commit() {
-        let dispatcher = SyscallDispatcher::new();
+        let dispatcher = dispatcher_with_core_parent();
         let snapshot = snapshot();
         let publication = dispatcher
             .publish_core_atomic_with_failpoint(&snapshot, 11, b"rollback".to_vec(), None)
@@ -1198,6 +1308,18 @@ mod tests {
             .fs
             .rootfs_vfs_mut()
             .set_overlay(Box::new(FinalCleanupErrorBackend::new()));
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .make_dir("/tmp")
+            .expect("tmp parent");
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .make_dir("/tmp/coretest")
+            .expect("core cwd");
         let error = dispatcher
             .publish_core_atomic_with_failpoint(
                 &snapshot(),
@@ -1226,6 +1348,18 @@ mod tests {
             .fs
             .rootfs_vfs_mut()
             .set_overlay(Box::new(FinalCleanupErrorBackend::new()));
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .make_dir("/tmp")
+            .expect("tmp parent");
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .make_dir("/tmp/coretest")
+            .expect("core cwd");
         let publication = dispatcher
             .publish_core_atomic_with_failpoint(
                 &snapshot(),

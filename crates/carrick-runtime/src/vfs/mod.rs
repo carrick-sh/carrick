@@ -89,6 +89,7 @@ pub mod dev;
 pub mod devpts;
 pub mod etc_services;
 pub mod mount;
+pub(crate) mod namespace_mutation;
 pub mod proc;
 pub mod resolvconf;
 pub mod rootfs;

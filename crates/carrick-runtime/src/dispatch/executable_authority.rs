@@ -904,7 +904,12 @@ mod tests {
         let source = dispatcher.acquire_exec_source(&context, "/image").unwrap();
         let original_id = source.object_id();
 
-        assert!(backend.rename_overlay_entry("/image", "/renamed").unwrap());
+        assert!(
+            backend
+                .rename_overlay_entry("/image", "/renamed")
+                .unwrap()
+                .source_was_owned()
+        );
         backend
             .set_file_contents("/renamed", b"updated".to_vec())
             .unwrap();

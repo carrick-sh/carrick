@@ -5056,7 +5056,11 @@ impl FsBackend for HostFsBackend {
         Ok(deleted)
     }
 
-    fn rename_overlay_entry(&self, from: &str, to: &str) -> Result<bool, BackendError> {
+    fn rename_overlay_entry(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<crate::fs_backend::OverlayRenameOutcome, BackendError> {
         let src = normalize(from).ok_or(BackendError::Invalid)?;
         let dst = normalize(to).ok_or(BackendError::Invalid)?;
         let src_rel = NormalizedRelPath::from_normalized_relative(src);
@@ -5072,7 +5076,8 @@ impl FsBackend for HostFsBackend {
         dst_parent_fd: Option<&std::os::fd::OwnedFd>,
         dst_leaf_c: Option<&std::ffi::CStr>,
         dst_rel: &NormalizedRelPath,
-    ) -> Result<bool, BackendError> {
+    ) -> Result<crate::fs_backend::OverlayRenameOutcome, BackendError> {
+        use crate::fs_backend::OverlayRenameOutcome;
         use std::os::fd::AsRawFd;
         let _mutation = self.archive_mutation_gate.mutation();
 
@@ -5082,7 +5087,7 @@ impl FsBackend for HostFsBackend {
         } else {
             src_fallback = match self.namei_leaf(src_rel.as_path()) {
                 Some(pair) => pair,
-                None => return Ok(false),
+                None => return Ok(OverlayRenameOutcome::NotOwned),
             };
             (src_fallback.0.as_raw_fd(), src_fallback.1.as_c_str())
         };
@@ -5102,14 +5107,46 @@ impl FsBackend for HostFsBackend {
             (dst_fallback_fd.as_raw_fd(), dst_fallback_name.as_c_str())
         };
 
+        let mut src_stat: libc::stat = unsafe { std::mem::zeroed() };
+        let src_rc = unsafe {
+            host_fstatat!(
+                src_pfd,
+                src_name_c.as_ptr(),
+                &mut src_stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if src_rc != 0 {
+            let raw = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            return if raw == libc::ENOENT {
+                Ok(OverlayRenameOutcome::NotOwned)
+            } else {
+                Err(BackendError::Namespace(crate::host_to_linux_errno(raw)))
+            };
+        }
+        let mut dst_stat: libc::stat = unsafe { std::mem::zeroed() };
+        let same_object = unsafe {
+            host_fstatat!(
+                dst_pfd,
+                dst_name_c.as_ptr(),
+                &mut dst_stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            ) == 0
+                && src_stat.st_dev == dst_stat.st_dev
+                && src_stat.st_ino == dst_stat.st_ino
+        };
         let rc =
             unsafe { libc::renameat(src_pfd, src_name_c.as_ptr(), dst_pfd, dst_name_c.as_ptr()) };
         if rc != 0 {
-            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            if err == libc::ENOENT {
-                return Ok(false);
-            }
-            return Err(BackendError::Io);
+            let raw = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            return Err(BackendError::Namespace(crate::host_to_linux_errno(raw)));
+        }
+        if same_object {
+            return Ok(OverlayRenameOutcome::SameObject);
         }
         self.propagate_marker_dir(src_pfd, dst_pfd, dst_rel.as_path());
 
@@ -5155,7 +5192,7 @@ impl FsBackend for HostFsBackend {
         self.evict_dir_cache_subtree(dst_rel.as_path());
         self.evict_stat_cache_subtree(src_rel.as_path());
         self.evict_stat_cache_subtree(dst_rel.as_path());
-        Ok(true)
+        Ok(OverlayRenameOutcome::Renamed)
     }
 
     fn exchange_overlay_entries(&self, a: &str, b: &str) -> Result<bool, BackendError> {

@@ -60,7 +60,7 @@ fn scenario_rename_overlay_file<B: FsBackend>(b: &mut B) {
     b.create_file("/tmp/src").unwrap();
     b.set_file_contents("/tmp/src", b"hello".to_vec()).unwrap();
     let moved = b.rename_overlay_entry("/tmp/src", "/tmp/dst").unwrap();
-    assert!(moved);
+    assert!(moved.source_was_owned());
     assert_eq!(b.file_contents("/tmp/dst").as_deref(), Some(&b"hello"[..]));
     // Source no longer readable: MemoryBackend tombstones it, the
     // disk-authoritative HostFsBackend really renamed it away.
@@ -1320,7 +1320,11 @@ fn rename_stops_the_old_directory_path_from_resolving() {
     assert!(b.stat_cache_lookup("/pkg/a").is_some());
     assert!(b.dir_fd_for(Path::new("pkg")).is_ok());
 
-    assert!(b.rename_overlay_entry("/pkg", "/moved").unwrap());
+    assert!(
+        b.rename_overlay_entry("/pkg", "/moved")
+            .unwrap()
+            .source_was_owned()
+    );
 
     assert!(
         b.dir_fd_for(Path::new("pkg")).is_err(),
@@ -1664,9 +1668,37 @@ fn authority_attached_handles_observe_directory_rename() {
         .set_file_contents("/old/file", b"data".to_vec())
         .unwrap();
     assert_eq!(first.file_contents("/old/file").unwrap(), b"data");
-    assert!(second.rename_overlay_entry("/old", "/new").unwrap());
+    assert!(
+        second
+            .rename_overlay_entry("/old", "/new")
+            .unwrap()
+            .source_was_owned()
+    );
     assert!(first.file_contents("/old/file").is_none());
     assert_eq!(first.file_contents("/new/file").unwrap(), b"data");
+}
+
+#[test]
+fn host_rename_distinguishes_unowned_source_from_operation_error() {
+    let scratch = tempfile::tempdir().unwrap();
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
+    backend.make_dir("/dir").unwrap();
+    assert_eq!(
+        backend.rename_overlay_entry("/missing", "/new").unwrap(),
+        OverlayRenameOutcome::NotOwned
+    );
+
+    backend
+        .set_file_contents("/file", b"data".to_vec())
+        .unwrap();
+    assert_eq!(
+        backend.rename_overlay_entry("/file", "/dir"),
+        Err(BackendError::Namespace(crate::linux_abi::LINUX_EISDIR))
+    );
+    assert_eq!(
+        backend.file_contents("/file").as_deref(),
+        Some(b"data".as_slice())
+    );
 }
 
 #[test]
@@ -2867,7 +2899,12 @@ fn moved_marker_node_keeps_the_destination_directory_interference_tracked() {
     assert!(!backend.dir_has_overlay_interference("/b"));
     assert!(!backend.dir_has_overlay_interference("/c"));
 
-    assert!(backend.rename_overlay_entry("/a/sock", "/b/sock").unwrap());
+    assert!(
+        backend
+            .rename_overlay_entry("/a/sock", "/b/sock")
+            .unwrap()
+            .source_was_owned()
+    );
     assert!(
         backend.dir_has_overlay_interference("/b"),
         "rename must stamp the destination directory"
