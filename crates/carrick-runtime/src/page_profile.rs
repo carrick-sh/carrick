@@ -120,6 +120,7 @@ mod tests {
                 stdio: carrick_spec::StdioMode::Inherit,
                 uid: carrick_abi::NsUid::ROOT,
                 gid: carrick_abi::NsGid::ROOT,
+                initial_identity: carrick_spec::InitialIdentity::Resolved,
                 pid: carrick_spec::PidMode::Private,
             },
             mounts: carrick_spec::MountSpec {

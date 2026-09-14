@@ -76,9 +76,9 @@ use std::collections::HashMap;
 pub use carrick_image::{ImageStore, ResolvedImage};
 pub use carrick_runtime::runtime::RunResult;
 pub use carrick_spec::{
-    BridgeId, FsBackendKind, ImageConfig, Mount, MountSpec, NetworkAttachmentSpec, NetworkMode,
-    NetworkNamespaceId, NetworkNamespaceSpec, NetworkSpec, PidMode, Platform, PortMapping,
-    ProcessSpec, ResourceSpec, RunSpec, SeccompPolicy, SecuritySpec, StdioMode,
+    BridgeId, FsBackendKind, ImageConfig, InitialIdentity, Mount, MountSpec, NetworkAttachmentSpec,
+    NetworkMode, NetworkNamespaceId, NetworkNamespaceSpec, NetworkSpec, PidMode, Platform,
+    PortMapping, ProcessSpec, ResourceSpec, RunSpec, SeccompPolicy, SecuritySpec, StdioMode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -425,14 +425,25 @@ pub fn resolve_run_spec(req: RunRequest, image: ResolvedImage) -> Result<Resolve
     }
     .or_else(|| Some(Utf8PathBuf::from("/")));
 
-    // 4. Resolve user (`--user` overrides image USER). Numeric `uid[:gid]`
-    // bypasses the file lookup. A user/group NAME is resolved against the
-    // image rootfs (/etc/passwd and /etc/group via RootFs layers). An unresolvable
-    // name is a hard error naming the user/group.
+    // 4. Resolve numeric user (`--user` overrides image USER) here. Retain a
+    // named user/group for the runtime to resolve against the one root it has
+    // already prepared, avoiding a second RootFs materialization solely for
+    // identity lookup.
     let warnings = Vec::new();
-    let (uid, gid) = match req.user.as_deref().or(image.config.user.as_deref()) {
-        None | Some("") => (carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT),
-        Some(s) => resolve_user(s, &image.layers)?,
+    let (uid, gid, initial_identity) = match req.user.as_deref().or(image.config.user.as_deref()) {
+        None | Some("") => (
+            carrick_abi::NsUid::ROOT,
+            carrick_abi::NsGid::ROOT,
+            InitialIdentity::Resolved,
+        ),
+        Some(s) => match parse_numeric_user(s) {
+            Some((uid, gid)) => (uid, gid, InitialIdentity::Resolved),
+            None => (
+                carrick_abi::NsUid::ROOT,
+                carrick_abi::NsGid::ROOT,
+                InitialIdentity::Named(s.to_owned()),
+            ),
+        },
     };
 
     // 5. Select fs backend: caller's `--fs`, else the shared default
@@ -540,6 +551,7 @@ pub fn resolve_run_spec(req: RunRequest, image: ResolvedImage) -> Result<Resolve
             stdio: req.stdio,
             uid,
             gid,
+            initial_identity,
             pid: req.pid,
         },
         mounts: MountSpec {
@@ -605,100 +617,6 @@ fn parse_numeric_user(spec: &str) -> Option<(carrick_abi::NsUid, carrick_abi::Ns
         None => 0,
     };
     Some((carrick_abi::NsUid::new(uid), carrick_abi::NsGid::new(gid)))
-}
-
-fn lookup_user_in_passwd(
-    passwd_content: &str,
-    username: &str,
-) -> Option<(carrick_abi::NsUid, carrick_abi::NsGid)> {
-    for line in passwd_content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut fields = line.split(':');
-        let name = fields.next()?;
-        let _pwd = fields.next()?;
-        let uid_str = fields.next()?;
-        let gid_str = fields.next()?;
-        if name == username {
-            let uid: u32 = uid_str.parse().ok()?;
-            let gid: u32 = gid_str.parse().ok()?;
-            return Some((carrick_abi::NsUid::new(uid), carrick_abi::NsGid::new(gid)));
-        }
-    }
-    None
-}
-
-fn lookup_group_in_group(group_content: &str, groupname: &str) -> Option<carrick_abi::NsGid> {
-    for line in group_content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut fields = line.split(':');
-        let name = fields.next()?;
-        let _pwd = fields.next()?;
-        let gid_str = fields.next()?;
-        if name == groupname {
-            let gid: u32 = gid_str.parse().ok()?;
-            return Some(carrick_abi::NsGid::new(gid));
-        }
-    }
-    None
-}
-
-/// Resolve a user spec (`--user` or image `User`) against rootfs layers.
-/// Numeric `uid[:gid]` bypasses the file lookup. A user/group name is
-/// resolved against `/etc/passwd` and `/etc/group` in the image rootfs.
-/// An unknown name returns a hard error naming the user/group.
-fn resolve_user(
-    spec: &str,
-    layers: &[camino::Utf8PathBuf],
-) -> Result<(carrick_abi::NsUid, carrick_abi::NsGid), String> {
-    if let Some((u, g)) = parse_numeric_user(spec) {
-        return Ok((u, g));
-    }
-
-    let (user_part, group_part) = match spec.split_once(':') {
-        Some((u, g)) => (u, Some(g)),
-        None => (spec, None),
-    };
-
-    if user_part.is_empty() {
-        return Err(format!("invalid user spec: {spec:?}"));
-    }
-
-    let rootfs = carrick_runtime::rootfs::RootFs::from_layer_paths(layers)
-        .map_err(|e| format!("failed to load rootfs to resolve user '{spec}': {e}"))?;
-
-    let (uid, default_gid) = if let Ok(numeric_uid) = user_part.parse::<u32>() {
-        (carrick_abi::NsUid::new(numeric_uid), None)
-    } else {
-        let passwd_content = rootfs
-            .read_to_string("/etc/passwd")
-            .map_err(|e| format!("unknown user: {user_part} (failed to read /etc/passwd: {e})"))?;
-        let (u, g) = lookup_user_in_passwd(&passwd_content, user_part)
-            .ok_or_else(|| format!("unknown user: {user_part}"))?;
-        (u, Some(g))
-    };
-
-    let gid = match group_part {
-        Some(g) => {
-            if let Ok(numeric_gid) = g.parse::<u32>() {
-                carrick_abi::NsGid::new(numeric_gid)
-            } else {
-                let group_content = rootfs
-                    .read_to_string("/etc/group")
-                    .map_err(|e| format!("unknown group: {g} (failed to read /etc/group: {e})"))?;
-                lookup_group_in_group(&group_content, g)
-                    .ok_or_else(|| format!("unknown group: {g}"))?
-            }
-        }
-        None => default_gid.unwrap_or(carrick_abi::NsGid::ROOT),
-    };
-
-    Ok((uid, gid))
 }
 
 pub struct Engine {
@@ -909,6 +827,7 @@ mod tests {
                 stdio: StdioMode::Inherit,
                 uid: carrick_abi::NsUid::new(1000),
                 gid: carrick_abi::NsGid::new(2000),
+                initial_identity: InitialIdentity::Resolved,
                 pid: PidMode::Private,
             },
             mounts: MountSpec {
@@ -1449,106 +1368,18 @@ mod tests {
     }
 
     #[test]
-    fn named_user_resolves_against_rootfs_passwd() {
-        let dir = tempfile::tempdir().unwrap();
-        let layer_path = dir.path().join("layer.tar.gz");
-        let passwd = b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/bin/false\nalice:x:1001:1001:Alice:/home/alice:/bin/sh\n";
-        let group = b"root:x:0:\nnobody:x:65534:\ndevelopers:x:1002:alice\n";
-        let tar_gz = carrick_test_support::gzip_tar([
-            ("etc/passwd", passwd.as_slice()),
-            ("etc/group", group.as_slice()),
-        ]);
-        std::fs::write(&layer_path, tar_gz).unwrap();
-        let image = ResolvedImage {
-            layers: vec![Utf8PathBuf::from_path_buf(layer_path).unwrap()],
-            config: ImageConfig {
-                entrypoint: None,
-                cmd: Some(vec!["/bin/ls".to_string()]),
-                env: vec![],
-                working_dir: None,
-                user: None,
-                exposed_ports: None,
-                labels: None,
-                stop_signal: None,
-            },
-        };
+    fn named_user_is_deferred_to_prepared_image_root() {
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let spec = spec_of(base_req(Some("alice:developers")), image)
+            .expect("named identity is carried to runtime preparation");
 
-        // root -> (0, 0)
-        let spec = spec_of(base_req(Some("root")), image.clone()).expect("root resolve");
+        assert_eq!(
+            spec.process.initial_identity,
+            InitialIdentity::Named("alice:developers".to_owned())
+        );
         assert_eq!(
             (spec.process.uid, spec.process.gid),
             (carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT)
-        );
-
-        // nobody -> (65534, 65534)
-        let spec = spec_of(base_req(Some("nobody")), image.clone()).expect("nobody resolve");
-        assert_eq!(
-            (spec.process.uid, spec.process.gid),
-            (
-                carrick_abi::NsUid::new(65534),
-                carrick_abi::NsGid::new(65534)
-            )
-        );
-
-        // alice:developers -> (1001, 1002)
-        let spec =
-            spec_of(base_req(Some("alice:developers")), image.clone()).expect("alice:dev resolve");
-        assert_eq!(
-            (spec.process.uid, spec.process.gid),
-            (carrick_abi::NsUid::new(1001), carrick_abi::NsGid::new(1002))
-        );
-
-        // numeric uid with named group: 1001:developers -> (1001, 1002)
-        let spec = spec_of(base_req(Some("1001:developers")), image.clone())
-            .expect("numeric:group resolve");
-        assert_eq!(
-            (spec.process.uid, spec.process.gid),
-            (carrick_abi::NsUid::new(1001), carrick_abi::NsGid::new(1002))
-        );
-
-        // named user with numeric gid: alice:2000 -> (1001, 2000)
-        let spec =
-            spec_of(base_req(Some("alice:2000")), image.clone()).expect("user:numeric resolve");
-        assert_eq!(
-            (spec.process.uid, spec.process.gid),
-            (carrick_abi::NsUid::new(1001), carrick_abi::NsGid::new(2000))
-        );
-
-        // unknown user must fail hard
-        let err =
-            spec_of(base_req(Some("nosuchuser")), image.clone()).expect_err("nosuchuser must fail");
-        assert!(
-            err.contains("nosuchuser"),
-            "error must name the missing user: {err}"
-        );
-
-        // unknown group must fail hard
-        let err =
-            spec_of(base_req(Some("alice:nosuchgroup")), image).expect_err("nosuchgroup must fail");
-        assert!(
-            err.contains("nosuchgroup"),
-            "error must name the missing group: {err}"
-        );
-
-        // image with empty layer list fails when named user is requested
-        let empty_layer_img = ResolvedImage {
-            layers: vec![],
-            config: ImageConfig {
-                entrypoint: None,
-                cmd: Some(vec!["/bin/ls".to_string()]),
-                env: vec![],
-                working_dir: None,
-                user: None,
-                exposed_ports: None,
-                labels: None,
-                stop_signal: None,
-            },
-        };
-        let err =
-            spec_of(base_req(Some("nobody")), empty_layer_img).expect_err("empty layers must fail");
-        assert!(
-            err.contains("nobody"),
-            "error must name the user when layers empty: {err}"
         );
     }
 

@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use camino::Utf8PathBuf;
-use carrick_spec::{FsBackendKind, PidMode, Platform, RunSpec, StdioMode};
+use carrick_spec::{FsBackendKind, InitialIdentity, PidMode, Platform, RunSpec, StdioMode};
 
 pub use crate::dispatch::StdioSink;
 use crate::dispatch::SyscallDispatcher;
@@ -36,7 +36,7 @@ use crate::execute::{
     is_entrypoint_not_executable, is_entrypoint_not_found, prepare_host_root,
     record_detached_scratch, rosetta_license_notice, seed_guest_baseline,
 };
-use crate::fs_backend::HostFsBackend;
+use crate::fs_backend::{FsBackend, HostFsBackend};
 use crate::interactive_supervisor::InteractiveSession;
 use crate::kernel::container::LaunchContext;
 use crate::network::RuntimeNetwork;
@@ -263,14 +263,134 @@ fn configure_identity_and_policy(
     dispatcher: &mut SyscallDispatcher,
     spec: &RunSpec,
     container: &crate::kernel::Container,
+    credentials: (carrick_abi::NsUid, carrick_abi::NsGid),
 ) {
     if let Some(cwd) = &spec.process.cwd {
         dispatcher.set_cwd(cwd.as_str());
     }
-    dispatcher.set_credentials(spec.process.uid, spec.process.gid);
+    dispatcher.set_credentials(credentials.0, credentials.1);
     // Launch-time container syscall policy (the Docker default-seccomp model,
     // or unconfined) — before boot, inherited by the whole guest process tree.
     dispatcher.apply_launch_privileges(spec.security.seccomp_policy, container);
+}
+
+/// Resolve a retained named identity against the root that will become visible
+/// to the initial guest. Numeric specs have already been resolved by the
+/// engine, but numeric user/name group mixtures arrive here as `Named`.
+fn resolve_initial_identity(
+    identity: &InitialIdentity,
+    resolved: (carrick_abi::NsUid, carrick_abi::NsGid),
+    read_file: impl Fn(&str) -> Result<String, String>,
+) -> Result<(carrick_abi::NsUid, carrick_abi::NsGid), RuntimeError> {
+    let InitialIdentity::Named(spec) = identity else {
+        return Ok(resolved);
+    };
+    let (user_part, group_part) = match spec.split_once(':') {
+        Some((user, group)) => (user, Some(group)),
+        None => (spec.as_str(), None),
+    };
+    if user_part.is_empty() {
+        return Err(RuntimeError::Configuration(format!(
+            "invalid user spec: {spec:?}"
+        )));
+    }
+    let (uid, default_gid) = match user_part.parse::<u32>() {
+        Ok(uid) => (carrick_abi::NsUid::new(uid), None),
+        Err(_) => {
+            let passwd = read_file("/etc/passwd").map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "unknown user: {user_part} (failed to read /etc/passwd: {error})"
+                ))
+            })?;
+            lookup_user_in_passwd(&passwd, user_part)
+                .map(|(uid, gid)| (uid, Some(gid)))
+                .ok_or_else(|| RuntimeError::Configuration(format!("unknown user: {user_part}")))?
+        }
+    };
+    let gid = match group_part {
+        Some(group) => match group.parse::<u32>() {
+            Ok(gid) => carrick_abi::NsGid::new(gid),
+            Err(_) => {
+                let groups = read_file("/etc/group").map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "unknown group: {group} (failed to read /etc/group: {error})"
+                    ))
+                })?;
+                lookup_group_in_group(&groups, group)
+                    .ok_or_else(|| RuntimeError::Configuration(format!("unknown group: {group}")))?
+            }
+        },
+        None => default_gid.unwrap_or(carrick_abi::NsGid::ROOT),
+    };
+    Ok((uid, gid))
+}
+
+fn resolve_initial_identity_from_rootfs(
+    identity: &InitialIdentity,
+    uid: carrick_abi::NsUid,
+    gid: carrick_abi::NsGid,
+    rootfs: &crate::rootfs::RootFs,
+) -> Result<(carrick_abi::NsUid, carrick_abi::NsGid), RuntimeError> {
+    resolve_initial_identity(identity, (uid, gid), |path| {
+        rootfs
+            .read_to_string(path)
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn resolve_initial_identity_from_host(
+    identity: &InitialIdentity,
+    uid: carrick_abi::NsUid,
+    gid: carrick_abi::NsGid,
+    host: &HostFsBackend,
+) -> Result<(carrick_abi::NsUid, carrick_abi::NsGid), RuntimeError> {
+    resolve_initial_identity(identity, (uid, gid), |path| {
+        let bytes = host
+            .file_contents(path)
+            .ok_or_else(|| "not found".to_owned())?;
+        String::from_utf8(bytes).map_err(|error| error.to_string())
+    })
+}
+
+fn lookup_user_in_passwd(
+    passwd_content: &str,
+    username: &str,
+) -> Option<(carrick_abi::NsUid, carrick_abi::NsGid)> {
+    for line in passwd_content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        let _password = fields.next()?;
+        let uid = fields.next()?;
+        let gid = fields.next()?;
+        if name == username {
+            return Some((
+                carrick_abi::NsUid::new(uid.parse().ok()?),
+                carrick_abi::NsGid::new(gid.parse().ok()?),
+            ));
+        }
+    }
+    None
+}
+
+fn lookup_group_in_group(group_content: &str, groupname: &str) -> Option<carrick_abi::NsGid> {
+    for line in group_content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        let _password = fields.next()?;
+        let gid = fields.next()?;
+        if name == groupname {
+            return Some(carrick_abi::NsGid::new(gid.parse().ok()?));
+        }
+    }
+    None
 }
 
 fn install_spec_mounts(dispatcher: &mut SyscallDispatcher, spec: &RunSpec) {
@@ -344,6 +464,41 @@ fn prepare_host_backend(
     .map_err(|error| {
         RuntimeError::FsBackend(anyhow::anyhow!("failed to prepare OCI rootfs: {error}"))
     })?;
+    // Resolve against the image-only root before baseline files and user mounts
+    // become visible. An attached exec overlay is mutable by design, so retain
+    // the image-only view there rather than allowing it to alter initial USER.
+    let credentials = if exec_overlay.is_some()
+        && matches!(&spec.process.initial_identity, InitialIdentity::Named(_))
+    {
+        let image_root =
+            crate::rootfs::RootFs::from_layer_paths(layer_paths(spec)).map_err(|e| {
+                RuntimeError::FsBackend(anyhow::anyhow!(
+                    "failed to compose image rootfs to resolve user: {e}"
+                ))
+            })?;
+        resolve_initial_identity_from_rootfs(
+            &spec.process.initial_identity,
+            spec.process.uid,
+            spec.process.gid,
+            &image_root,
+        )?
+    } else {
+        match &root_layout {
+            HostRootLayout::CachedLower(rootfs) => resolve_initial_identity_from_rootfs(
+                &spec.process.initial_identity,
+                spec.process.uid,
+                spec.process.gid,
+                rootfs,
+            )?,
+            HostRootLayout::Materialized => resolve_initial_identity_from_host(
+                &spec.process.initial_identity,
+                spec.process.uid,
+                spec.process.gid,
+                &host,
+            )?,
+        }
+    };
+
     // The overlay exists and holds a prepared root: NOW it is safe to tell the
     // registry where it is.
     if let Some((id, scratch)) = &managed_scratch {
@@ -364,7 +519,7 @@ fn prepare_host_backend(
     // absent from the container ENOENTs instead of escaping to the host.
     dispatcher.sandbox_exec_to_container();
     dispatcher.set_executable_path(spec.process.executable.clone());
-    configure_identity_and_policy(&mut dispatcher, spec, container);
+    configure_identity_and_policy(&mut dispatcher, spec, container, credentials);
 
     let hosts_entries = plan
         .network
@@ -400,8 +555,14 @@ fn prepare_memory_backend(
         dispatcher.set_host_resolver_snapshot(snapshot);
     }
     let guest_hostname = container.uts_ns().nodename();
+    let credentials = resolve_initial_identity_from_rootfs(
+        &spec.process.initial_identity,
+        spec.process.uid,
+        spec.process.gid,
+        &rootfs,
+    )?;
     configure_page_geometry(&mut dispatcher, plan);
-    configure_identity_and_policy(&mut dispatcher, spec, container);
+    configure_identity_and_policy(&mut dispatcher, spec, container, credentials);
     crate::execute::install_fs_backend(&mut dispatcher, FsBackendKind::Memory, &guest_hostname)
         .map_err(|e| {
             RuntimeError::FsBackend(anyhow::anyhow!("failed to install fs backend: {e}"))
@@ -776,6 +937,115 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn named_initial_identity_reads_the_already_prepared_rootfs() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let layer = scratch.path().join("identity-layer.tar.gz");
+        std::fs::write(
+            &layer,
+            carrick_test_support::gzip_tar_with_links(
+                [
+                    (
+                        "usr/share/image-passwd",
+                        b"broken:x:not-a-uid:not-a-gid::/broken:/bin/false\nalice:x:1001:1001::/home/alice:/bin/sh\n".as_slice(),
+                    ),
+                    (
+                        "usr/share/image-group",
+                        b"broken:x:not-a-gid:\ndevelopers:x:1002:alice\n".as_slice(),
+                    ),
+                ],
+                [
+                    ("etc/passwd", "/usr/share/image-passwd"),
+                    ("etc/group", "/usr/share/image-group"),
+                ],
+            ),
+        )
+        .expect("write layer");
+        let rootfs = crate::rootfs::RootFs::from_layer_paths([&layer]).expect("prepared rootfs");
+
+        let credentials = resolve_initial_identity_from_rootfs(
+            &carrick_spec::InitialIdentity::Named("alice:developers".to_owned()),
+            carrick_abi::NsUid::ROOT,
+            carrick_abi::NsGid::ROOT,
+            &rootfs,
+        )
+        .expect("resolve from prepared rootfs");
+
+        assert_eq!(
+            credentials,
+            (carrick_abi::NsUid::new(1001), carrick_abi::NsGid::new(1002))
+        );
+        assert_eq!(
+            resolve_initial_identity_from_rootfs(
+                &carrick_spec::InitialIdentity::Named("1001:developers".to_owned()),
+                carrick_abi::NsUid::ROOT,
+                carrick_abi::NsGid::ROOT,
+                &rootfs,
+            )
+            .expect("numeric user with named group"),
+            (carrick_abi::NsUid::new(1001), carrick_abi::NsGid::new(1002))
+        );
+        assert_eq!(
+            resolve_initial_identity_from_rootfs(
+                &carrick_spec::InitialIdentity::Named("alice:2000".to_owned()),
+                carrick_abi::NsUid::ROOT,
+                carrick_abi::NsGid::ROOT,
+                &rootfs,
+            )
+            .expect("named user with numeric group"),
+            (carrick_abi::NsUid::new(1001), carrick_abi::NsGid::new(2000))
+        );
+
+        let error = resolve_initial_identity_from_rootfs(
+            &carrick_spec::InitialIdentity::Named("missing".to_owned()),
+            carrick_abi::NsUid::ROOT,
+            carrick_abi::NsGid::ROOT,
+            &rootfs,
+        )
+        .expect_err("missing image-only user must remain a hard error");
+        assert!(error.to_string().contains("unknown user: missing"));
+
+        let error = resolve_initial_identity_from_rootfs(
+            &carrick_spec::InitialIdentity::Named("alice:missing".to_owned()),
+            carrick_abi::NsUid::ROOT,
+            carrick_abi::NsGid::ROOT,
+            &rootfs,
+        )
+        .expect_err("missing image-only group must remain a hard error");
+        assert!(error.to_string().contains("unknown group: missing"));
+    }
+
+    #[test]
+    fn named_initial_identity_reads_the_materialized_host_root() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let layer = scratch.path().join("identity-layer.tar.gz");
+        std::fs::write(
+            &layer,
+            carrick_test_support::gzip_tar([
+                (
+                    "etc/passwd",
+                    b"alice:x:1001:1001::/home/alice:/bin/sh\n".as_slice(),
+                ),
+                ("etc/group", b"developers:x:1002:alice\n".as_slice()),
+            ]),
+        )
+        .expect("write layer");
+        let mut host = HostFsBackend::new().expect("host root");
+        host.extract_layers(&[layer])
+            .expect("materialize image root");
+
+        assert_eq!(
+            resolve_initial_identity_from_host(
+                &InitialIdentity::Named("alice:developers".to_owned()),
+                carrick_abi::NsUid::ROOT,
+                carrick_abi::NsGid::ROOT,
+                &host,
+            )
+            .expect("resolve from materialized host root"),
+            (carrick_abi::NsUid::new(1001), carrick_abi::NsGid::new(1002))
+        );
+    }
+
     fn hvpatch_run_spec() -> RunSpec {
         RunSpec {
             process: carrick_spec::ProcessSpec {
@@ -787,6 +1057,7 @@ mod tests {
                 stdio: StdioMode::Inherit,
                 uid: carrick_abi::NsUid::ROOT,
                 gid: carrick_abi::NsGid::ROOT,
+                initial_identity: InitialIdentity::Resolved,
                 pid: PidMode::Host,
             },
             mounts: carrick_spec::MountSpec {
