@@ -22,7 +22,7 @@ pub struct RegrtestParser;
 /// regressions whose oracle ids were merely `absent` under the old parse. Bump
 /// this whenever the recognised id set or outcome mapping changes; the key
 /// change forces a deliberate `--refresh-oracle` instead of a false verdict.
-pub const PARSER_FINGERPRINT: &str = "regrtest-v2-timed-multiline";
+pub const PARSER_FINGERPRINT: &str = "regrtest-v3-doctest-wrapper";
 
 const LINE: &str = r"^(?:\d+(?:\.\d+)?s )?(\S+) \(([\w.]+)\)(?: \[\d+\])? \.\.\.(?: (.*))?$";
 const HEADER_LINE: &str = r"^(?:\d+(?:\.\d+)?s )?(\S+) \(([\w.]+)\)(?: \[\d+\])?$";
@@ -103,6 +103,23 @@ fn classify(rest: &str) -> Outcome {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DoctestSummary {
+    Pending,
+    Passed,
+    Failed,
+}
+
+fn doctest_completion_summary(line: &str) -> Option<DoctestSummary> {
+    if line == "Test passed." {
+        Some(DoctestSummary::Passed)
+    } else if line.starts_with("***Test Failed***") {
+        Some(DoctestSummary::Failed)
+    } else {
+        None
+    }
+}
+
 impl RegrtestParser {
     pub(crate) fn parse_closure(&self, raw: &Raw) -> SuiteResult {
         let text = super::strip_carrick_banners(&raw.combined());
@@ -129,9 +146,46 @@ impl RegrtestParser {
             };
 
         let mut pending_header: Option<(String, String)> = None;
+        let mut pending_doctest: Option<(String, String, DoctestSummary)> = None;
 
         for line in text.lines() {
             let trimmed = line.trim_end();
+            if let Some((_, _, summary)) = pending_doctest.as_mut() {
+                if let Some(completion) = doctest_completion_summary(trimmed) {
+                    if *summary != DoctestSummary::Failed {
+                        *summary = completion;
+                    }
+                    continue;
+                }
+                if *summary != DoctestSummary::Pending {
+                    let mut outcome = classify(trimmed);
+                    if outcome != Outcome::Other {
+                        if *summary == DoctestSummary::Failed {
+                            outcome = Outcome::Fail;
+                        }
+                        let (id, ordinal, _) = pending_doctest
+                            .take()
+                            .expect("pending doctest must still be present");
+                        push_assertion(&mut collector, &id, &ordinal, outcome);
+                        continue;
+                    }
+                }
+                let boundary = result_re.is_match(trimmed)
+                    || (*summary != DoctestSummary::Pending
+                        && (line_re.is_match(trimmed) || header_re.is_match(trimmed)));
+                if !boundary {
+                    continue;
+                }
+                let (id, ordinal, summary) = pending_doctest
+                    .take()
+                    .expect("pending doctest must still be present");
+                let outcome = if summary == DoctestSummary::Failed {
+                    Outcome::Fail
+                } else {
+                    Outcome::Other
+                };
+                push_assertion(&mut collector, &id, &ordinal, outcome);
+            }
             if let Some(caps) = line_re.captures(trimmed) {
                 if let Some((pid, pord)) = pending_header.take() {
                     push_assertion(&mut collector, &pid, &pord, Outcome::Other);
@@ -143,6 +197,11 @@ impl RegrtestParser {
                     .get(3)
                     .map_or(String::new(), |value| format!("[{}]", value.as_str()));
                 let rest = caps.get(4).map_or("", |m| m.as_str());
+                if rest.trim() == "Trying:" {
+                    pending_doctest =
+                        Some((id.as_str().to_string(), ordinal, DoctestSummary::Pending));
+                    continue;
+                }
                 let outcome = classify(rest);
                 push_assertion(&mut collector, id.as_str(), &ordinal, outcome);
             } else if let Some(caps) = header_re.captures(trimmed) {
@@ -168,6 +227,14 @@ impl RegrtestParser {
         }
         if let Some((pid, pord)) = pending_header.take() {
             push_assertion(&mut collector, &pid, &pord, Outcome::Other);
+        }
+        if let Some((id, ordinal, summary)) = pending_doctest.take() {
+            let outcome = if summary == DoctestSummary::Failed {
+                Outcome::Fail
+            } else {
+                Outcome::Other
+            };
+            push_assertion(&mut collector, &id, &ordinal, outcome);
         }
 
         let ids = collector.into_ids();
@@ -205,9 +272,46 @@ impl VerdictParser for RegrtestParser {
 
         let mut ids: BTreeMap<String, Outcome> = BTreeMap::new();
         let mut pending_header: Option<String> = None;
+        let mut pending_doctest: Option<(String, DoctestSummary)> = None;
 
         for line in text.lines() {
             let trimmed = line.trim_end();
+            if let Some((_, summary)) = pending_doctest.as_mut() {
+                if let Some(completion) = doctest_completion_summary(trimmed) {
+                    if *summary != DoctestSummary::Failed {
+                        *summary = completion;
+                    }
+                    continue;
+                }
+                if *summary != DoctestSummary::Pending {
+                    let mut outcome = classify(trimmed);
+                    if outcome != Outcome::Other {
+                        if *summary == DoctestSummary::Failed {
+                            outcome = Outcome::Fail;
+                        }
+                        let (id, _) = pending_doctest
+                            .take()
+                            .expect("pending doctest must still be present");
+                        ids.entry(id).or_insert(outcome);
+                        continue;
+                    }
+                }
+                let boundary = result_re.is_match(trimmed)
+                    || (*summary != DoctestSummary::Pending
+                        && (line_re.is_match(trimmed) || header_re.is_match(trimmed)));
+                if !boundary {
+                    continue;
+                }
+                let (id, summary) = pending_doctest
+                    .take()
+                    .expect("pending doctest must still be present");
+                let outcome = if summary == DoctestSummary::Failed {
+                    Outcome::Fail
+                } else {
+                    Outcome::Other
+                };
+                ids.entry(id).or_insert(outcome);
+            }
             if let Some(caps) = line_re.captures(trimmed) {
                 if let Some(pid) = pending_header.take() {
                     ids.entry(pid).or_insert(Outcome::Other);
@@ -216,6 +320,10 @@ impl VerdictParser for RegrtestParser {
                     continue;
                 };
                 let rest = caps.get(3).map_or("", |m| m.as_str());
+                if rest.trim() == "Trying:" {
+                    pending_doctest = Some((id.as_str().to_string(), DoctestSummary::Pending));
+                    continue;
+                }
                 // first-occurrence wins (cpython-parity's setdefault)
                 ids.entry(id.as_str().to_string())
                     .or_insert_with(|| classify(rest));
@@ -238,6 +346,14 @@ impl VerdictParser for RegrtestParser {
         }
         if let Some(pid) = pending_header.take() {
             ids.entry(pid).or_insert(Outcome::Other);
+        }
+        if let Some((id, summary)) = pending_doctest.take() {
+            let outcome = if summary == DoctestSummary::Failed {
+                Outcome::Fail
+            } else {
+                Outcome::Other
+            };
+            ids.entry(id).or_insert(outcome);
         }
 
         let result = match result_re.captures(&text).and_then(|c| c.get(1)) {
@@ -645,6 +761,118 @@ Result: SUCCESS";
         assert_eq!(r.totals.skipped, 1);
         assert_eq!(r.totals.failed, 0);
         assert_eq!(r.totals.n, 3);
+    }
+
+    #[test]
+    fn closure_parses_verbose_doctest_wrapper_terminal_status() {
+        let out = "\
+testDoctestFile (test.test_zipimport.ZipImportTest.testDoctestFile) ... Trying:
+    log.append(True)
+Expecting nothing
+ok
+test_fake (doctest.output.MustNotBecomeAnAssertion) ... ok
+1 items passed all tests:
+   1 tests in xyz.txt
+1 tests in 1 items.
+1 passed and 0 failed.
+Test passed.
+ok
+testAfter (test.test_zipimport.ZipImportTest.testAfter) ... ok
+
+Result: SUCCESS";
+        let result = RegrtestParser.parse_closure(&raw(out));
+        assert_eq!(
+            result
+                .ids
+                .get("py:test.test_zipimport.ZipImportTest.testDoctestFile#1"),
+            Some(&Outcome::Ok)
+        );
+        assert_eq!(result.totals.passed, 2);
+        assert!(
+            !result
+                .ids
+                .contains_key("py:doctest.output.MustNotBecomeAnAssertion#1")
+        );
+    }
+
+    #[test]
+    fn closure_preserves_verbose_doctest_wrapper_failure() {
+        let out = "\
+testDoctestFile (test.test_zipimport.ZipImportTest.testDoctestFile) ... Trying:
+    fail()
+Expecting nothing
+**********************************************************************
+Failed example:
+    fail()
+Exception raised:
+    RuntimeError: nested failure
+**********************************************************************
+1 items had failures:
+   1 of 1 in xyz.txt
+***Test Failed*** 1 failures.
+ok
+
+Result: FAILURE";
+        let result = RegrtestParser.parse_closure(&raw(out));
+        assert_eq!(
+            result
+                .ids
+                .get("py:test.test_zipimport.ZipImportTest.testDoctestFile#1"),
+            Some(&Outcome::Fail)
+        );
+        assert_eq!(result.totals.failed, 1);
+    }
+
+    #[test]
+    fn verbose_doctest_failure_summary_is_monotonic() {
+        let out = "\
+testContradicted (m.C.testContradicted) ... Trying:
+***Test Failed*** 1 failures.
+Test passed.
+ok
+testSkipped (m.C.testSkipped) ... Trying:
+***Test Failed*** 1 failures.
+skipped 'malformed outer status'
+
+Result: FAILURE";
+        let closure = RegrtestParser.parse_closure(&raw(out));
+        assert_eq!(
+            closure.ids.get("py:m.C.testContradicted#1"),
+            Some(&Outcome::Fail)
+        );
+        assert_eq!(
+            closure.ids.get("py:m.C.testSkipped#1"),
+            Some(&Outcome::Fail)
+        );
+        assert_eq!(closure.totals.failed, 2);
+        assert_eq!(closure.totals.skipped, 0);
+
+        let regression = RegrtestParser.parse(&raw(out));
+        assert_eq!(
+            regression.ids.get("m.C.testContradicted"),
+            Some(&Outcome::Fail)
+        );
+        assert_eq!(regression.ids.get("m.C.testSkipped"), Some(&Outcome::Fail));
+        assert_eq!(regression.totals.failed, 2);
+        assert_eq!(regression.totals.skipped, 0);
+    }
+
+    #[test]
+    fn closure_keeps_truncated_verbose_doctest_wrapper_incomplete() {
+        let out = "\
+testDoctestFile (test.test_zipimport.ZipImportTest.testDoctestFile) ... Trying:
+    log.append(True)
+Expecting nothing
+ok
+1 items passed all tests:\n";
+        let result = RegrtestParser.parse_closure(&raw(out));
+        assert_eq!(
+            result
+                .ids
+                .get("py:test.test_zipimport.ZipImportTest.testDoctestFile#1"),
+            Some(&Outcome::Other)
+        );
+        assert_eq!(result.result, SuiteOutcome::None);
     }
 
     #[test]
