@@ -588,10 +588,9 @@ impl SyscallDispatcher {
         if let Some(fd) =
             crate::dispatch::fs::proc_synthetic::proc_self_fd_number(path, visible_self)
         {
-            let source = self.open_file(fd).and_then(|file| {
-                let description = file.description.read()?;
-                description.retained_exec_source().cloned()
-            });
+            let source = self
+                .open_file(fd)
+                .and_then(|file| file.description.retained_exec_source());
             if let Some(source) = source {
                 return Ok(source);
             }

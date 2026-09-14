@@ -452,7 +452,7 @@ impl<'a> FsView<'a> {
 
                 if proc_self_magic_link(&resolved, visible_self) == Some("exe")
                     && !open_flags.contains(LinuxOpenFlags::NOFOLLOW)
-                    && let Some(current) = self.proc.lock().current_executable.clone()
+                    && let Some(current) = self.cross.current_executable()
                 {
                     let outcome = self.install_proc_executable_source(&resolved, current, flags);
                     return Ok(PathLookup {

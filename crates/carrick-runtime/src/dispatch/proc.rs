@@ -900,6 +900,28 @@ impl ProcState {
 }
 
 impl<'a> ProcView<'a> {
+    /// Lend the current image identity and environment while holding the proc
+    /// state lock. Callers must return an owned snapshot from `snapshot`.
+    fn with_current_exec_snapshot<T>(
+        &self,
+        snapshot: impl FnOnce(Option<&super::executable_authority::CurrentExecutable>, &[Vec<u8>]) -> T,
+    ) -> T {
+        let proc = self.proc.lock();
+        snapshot(proc.current_executable.as_ref(), &proc.env)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn current_executable(
+        &self,
+    ) -> Option<super::executable_authority::CurrentExecutable> {
+        self.with_current_exec_snapshot(|current, _| current.cloned())
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn current_exec_env(&self) -> Vec<Vec<u8>> {
+        self.with_current_exec_snapshot(|_, env| env.to_vec())
+    }
+
     #[inline]
     pub(in crate::dispatch) fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
         self.cross.cred_snapshot()

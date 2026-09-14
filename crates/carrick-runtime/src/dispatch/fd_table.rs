@@ -2562,6 +2562,23 @@ impl crate::kernel::FileDescription {
         InMemoryTcpAtMark::AtMark(socket.at_oob_mark())
     }
 
+    /// Snapshot the exact executable source retained by a `/proc/*/exe` open
+    /// description. The backing guard is acquired only at its owning
+    /// description boundary.
+    pub(in crate::dispatch) fn retained_exec_source(
+        &self,
+    ) -> Option<crate::dispatch::executable_authority::ExecSource> {
+        self.read()?.retained_exec_source().cloned()
+    }
+
+    /// Snapshot the exact executable, including its live dentry display, from
+    /// a `/proc/*/exe` open description.
+    pub(in crate::dispatch) fn retained_current_executable(
+        &self,
+    ) -> Option<crate::dispatch::executable_authority::CurrentExecutable> {
+        self.read()?.retained_executable().cloned()
+    }
+
     pub(in crate::dispatch) fn open_description(&self) -> Option<&RwLock<OpenDescription>> {
         self.concrete_backing::<RwLock<OpenDescription>>()
     }
