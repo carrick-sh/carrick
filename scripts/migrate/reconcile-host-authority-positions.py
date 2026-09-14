@@ -16,10 +16,10 @@ themselves to a site. Classifications, evidence and rationale prose are never
 touched.
 
 It refuses to guess. If a (catalog_id, operation, file) group has a different
-row COUNT than the recompiled tree, the group is left alone and reported: a
-changed count means a host-authority call was genuinely added or removed, which
-is a REVIEW decision, not a position update. Only a group that vanished entirely
-is dropped, and it is named in the output so the removal is visible.
+row COUNT than the recompiled tree, or appears only in the candidate,
+reconciliation refuses: a changed count or new group needs REVIEW, not a
+position update. Only a group that vanished entirely is dropped, and it is named
+in the output so the removal is visible.
 
 Usage:
     python3 scripts/migrate/check-host-authority-transitions.py --refresh-candidate /tmp/cand.json
@@ -150,6 +150,23 @@ def reconcile_host_authority_positions(
     reviewed = collections.defaultdict(list)
     for row in inventory:
         reviewed[key(row)].append(row)
+
+    # A position-only reconciliation cannot manufacture a human review for a
+    # call group that the current inventory has never seen. Refuse before any
+    # rebinding or artifact write. The --rehome path keeps its function-aware
+    # matching below.
+    if not rehome:
+        candidate_only = sorted(set(fresh) - set(reviewed))
+        if candidate_only:
+            messages = [
+                f"  {group[0]} {group[1]} {group[2]}: {len(fresh[group])} candidate row(s)"
+                for group in candidate_only
+            ]
+            raise RefusedError(
+                "REFUSING to reconcile: candidate-only host-authority group(s) "
+                "need review before inventory/capture update:\n"
+                + "\n".join(messages)
+            )
 
     moved = 0
     rebound = 0

@@ -249,6 +249,60 @@ class RehomeInventoriesTests(unittest.TestCase):
 
     # --- Host Authority Tests ---
 
+    def test_host_authority_candidate_only_group_needs_review_before_writes(self):
+        """A new group must not replace either reviewed artifact."""
+        rel_file = "crates/carrick-runtime/src/new_profile.rs"
+        candidate = {
+            "capture_receipt": {
+                "kind": "macos_hvf",
+                "rows": [{"capture": "new-row"}],
+            },
+            "rows": [
+                {
+                    "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
+                    "operation": "std::fs::read_to_string",
+                    "source": {
+                        "file": rel_file,
+                        "line": 7,
+                        "column": 5,
+                        "column_start": 5,
+                        "column_end": 27,
+                        "line_start": 7,
+                        "line_end": 7,
+                        "byte_start": 90,
+                        "byte_end": 112,
+                    },
+                    "expansion": None,
+                    "profiles": ["macos-runtime-default"],
+                }
+            ],
+        }
+        candidate_path = self.root / "candidate.json"
+        candidate_path.write_text(json.dumps(candidate, indent=2) + "\n")
+        inventory_path = self.migrate_dir / "host-authority-transition-inventory.json"
+        capture_path = self.migrate_dir / "host-authority-macos-capture.json"
+        inventory_path.write_text(json.dumps([], indent=2) + "\n")
+        capture_path.write_text(
+            json.dumps(
+                {"kind": "macos_hvf", "rows": [{"capture": "old-row"}]},
+                indent=2,
+            )
+            + "\n"
+        )
+        inventory_before = inventory_path.read_bytes()
+        capture_before = capture_path.read_bytes()
+
+        with self.assertRaisesRegex(RefusedError, "candidate-only.*need review"):
+            RECONCILE.reconcile_host_authority(
+                candidate_path=candidate_path,
+                inventory_path=inventory_path,
+                capture_path=capture_path,
+                root=self.root,
+            )
+
+        self.assertEqual(inventory_path.read_bytes(), inventory_before)
+        self.assertEqual(capture_path.read_bytes(), capture_before)
+
     def test_host_authority_moved_verbatim_rehomes(self):
         """Host authority row moved verbatim re-homes when enclosing function matches."""
         target_file = self.hvf_src / "target_ha.rs"
@@ -313,18 +367,15 @@ class RehomeInventoriesTests(unittest.TestCase):
         }
         inv_path.write_text(json.dumps([row], indent=2) + "\n")
 
-        # Without rehome, group is dropped or refused
-        rebound = RECONCILE.reconcile_host_authority(
-            candidate_path=cand_path,
-            inventory_path=inv_path,
-            capture_path=cap_path,
-            rehome=False,
-            root=self.root,
-        )
-        self.assertEqual(rebound, 0)
-        # Should not have rebound to rel_b when rehome=False
-        inv_check = json.loads(inv_path.read_text())
-        self.assertFalse(any(r["source"]["file"] == rel_b for r in inv_check))
+        # A candidate-only group needs review when rehome is not requested.
+        with self.assertRaisesRegex(RefusedError, "candidate-only.*need review"):
+            RECONCILE.reconcile_host_authority(
+                candidate_path=cand_path,
+                inventory_path=inv_path,
+                capture_path=cap_path,
+                rehome=False,
+                root=self.root,
+            )
 
         # Reset inventory for rehome=True
         inv_path.write_text(json.dumps([row], indent=2) + "\n")
