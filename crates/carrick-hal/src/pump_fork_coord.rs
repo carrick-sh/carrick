@@ -24,6 +24,7 @@ pub trait HostSignalPump: Send + Sync + Default {
 
     /// Start the async pump (idempotent) against this registry + futex.
     fn start(&self, registry: &Arc<dyn VcpuRegistry>, futex: &Arc<dyn PlatformFutex>);
+    fn notify_kernel_wake(&self) {}
 }
 
 /// The one [`SignalPumpControl`] implementation for every backend.
@@ -52,6 +53,17 @@ impl<P: HostSignalPump> SignalPumpControl for SignalPumpController<P> {
     fn start_signal_pump(&self, registry: &Arc<dyn VcpuRegistry>, futex: &Arc<dyn PlatformFutex>) {
         self.pump.ensure_handler();
         self.pump.start(registry, futex);
+    }
+
+    fn publish_kernel_wake(
+        &self,
+        registry: &Arc<dyn VcpuRegistry>,
+        futex: &Arc<dyn PlatformFutex>,
+    ) {
+        registry.publish_kernel_wake_debt();
+        self.pump.ensure_handler();
+        self.pump.start(registry, futex);
+        self.pump.notify_kernel_wake();
     }
 }
 

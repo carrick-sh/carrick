@@ -237,7 +237,9 @@ pub enum MailboxProtocolError {
     StaleGeneration { expected: u64, actual: u64 },
     UnexpectedState { expected: MailboxState, actual: u32 },
     UnknownTrapKind(u32),
+    UnknownResponseAction(u32),
     NonIncreasingSequence { last: u64, actual: u64 },
+    ResponseSequenceMismatch { expected: u64, actual: u64 },
 }
 
 pub fn validate_request_metadata(

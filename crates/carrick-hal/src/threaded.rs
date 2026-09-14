@@ -234,6 +234,15 @@ pub trait VcpuRegistry: Send + Sync {
     fn any_other_in_guest(&self, except: ThreadId) -> bool;
     /// Whether this exact registered vCPU is entering or executing guest code.
     fn is_in_guest(&self, tid: ThreadId) -> bool;
+    fn publish_kernel_wake_debt(&self) {}
+    fn retry_kernel_wake_debt(&self) -> KernelWakeRetryPoll {
+        KernelWakeRetryPoll::default()
+    }
+    fn kernel_wake_debt_for(&self, _tid: ThreadId) -> Option<KernelWakeDebt> {
+        None
+    }
+    fn acknowledge_kernel_wake_debt(&self, _tid: ThreadId, _debt: KernelWakeDebt) {}
+    fn retire_kernel_wake_debt(&self, _tid: ThreadId) {}
     /// Bounded timeout diagnostics only: registered vCPU identities and their
     /// current in-guest handshake state, read from the SAME entries
     /// [`VcpuRegistry::any_other_in_guest`] reads, so a timeout dump cannot
@@ -242,6 +251,18 @@ pub trait VcpuRegistry: Send + Sync {
     fn debug_registered_vcpus(&self) -> Vec<(ThreadId, bool)> {
         Vec::new()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelWakeDebt {
+    pub enrollment: u64,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KernelWakeRetryPoll {
+    pub owed: bool,
+    pub kicked: bool,
 }
 
 /// Diagnostic result for the live sibling-vCPU lease set.
@@ -328,6 +349,9 @@ struct VcpuRegistryState {
     listeners: BTreeMap<u64, VcpuLeaseListener>,
     next_listener: u64,
     next_freeze_generation: u64,
+    next_enrollment: u64,
+    next_kernel_wake_generation: u64,
+    kernel_wake_debts: HashMap<ThreadId, u64>,
 }
 
 impl Default for VcpuRegistryState {
@@ -338,6 +362,9 @@ impl Default for VcpuRegistryState {
             listeners: BTreeMap::new(),
             next_listener: 1,
             next_freeze_generation: 1,
+            next_enrollment: 1,
+            next_kernel_wake_generation: 1,
+            kernel_wake_debts: HashMap::new(),
         }
     }
 }
@@ -353,6 +380,8 @@ pub struct GenericVcpuRegistry {
 struct VcpuRegistration {
     kick: Box<dyn VcpuKickDyn>,
     in_guest: Arc<AtomicBool>,
+    enrollment: u64,
+    kernel_wake_generation: Option<u64>,
 }
 
 impl VcpuRegistration {
@@ -563,6 +592,11 @@ impl VcpuRegistry for GenericVcpuRegistry {
                     },
                 };
             }
+            let inherited_kernel_wake = state.kernel_wake_debts.get(&tid).copied();
+            let enrollment = state.next_enrollment;
+            state.next_enrollment = state.next_enrollment.checked_add(1).unwrap_or_else(|| {
+                carrick_fatal!("hal::kernel_wake", "vCPU enrollment generation exhausted")
+            });
             let inserted = state
                 .vcpus
                 .insert(
@@ -570,6 +604,8 @@ impl VcpuRegistry for GenericVcpuRegistry {
                     VcpuRegistration {
                         kick: handle,
                         in_guest: in_guest.share(),
+                        enrollment,
+                        kernel_wake_generation: inherited_kernel_wake,
                     },
                 )
                 .is_none();
@@ -655,6 +691,69 @@ impl VcpuRegistry for GenericVcpuRegistry {
             .vcpus
             .get(&tid)
             .is_some_and(VcpuRegistration::is_in_guest)
+    }
+
+    fn publish_kernel_wake_debt(&self) {
+        let mut state = self.lock();
+        let generation = state.next_kernel_wake_generation;
+        state.next_kernel_wake_generation = state
+            .next_kernel_wake_generation
+            .checked_add(1)
+            .unwrap_or_else(|| carrick_fatal!("hal::kernel_wake", "wake generation exhausted"));
+        for entry in state.vcpus.values_mut() {
+            entry.kernel_wake_generation = Some(generation);
+        }
+        let tids: Vec<_> = state.vcpus.keys().copied().collect();
+        for tid in tids {
+            state.kernel_wake_debts.insert(tid, generation);
+        }
+    }
+
+    fn retry_kernel_wake_debt(&self) -> KernelWakeRetryPoll {
+        let state = self.lock();
+        let mut poll = KernelWakeRetryPoll::default();
+        for entry in state.vcpus.values() {
+            if entry.kernel_wake_generation.is_some() && entry.is_in_guest() {
+                poll.owed = true;
+                entry.kick.kick();
+                poll.kicked = true;
+            }
+        }
+        poll
+    }
+
+    fn kernel_wake_debt_for(&self, tid: ThreadId) -> Option<KernelWakeDebt> {
+        let state = self.lock();
+        let entry = state.vcpus.get(&tid)?;
+        entry
+            .kernel_wake_generation
+            .map(|generation| KernelWakeDebt {
+                enrollment: entry.enrollment,
+                generation,
+            })
+    }
+
+    fn acknowledge_kernel_wake_debt(&self, tid: ThreadId, debt: KernelWakeDebt) {
+        let mut state = self.lock();
+        let Some(entry) = state.vcpus.get_mut(&tid) else {
+            return;
+        };
+        if entry.enrollment == debt.enrollment
+            && entry.kernel_wake_generation == Some(debt.generation)
+        {
+            entry.kernel_wake_generation = None;
+            if state.kernel_wake_debts.get(&tid) == Some(&debt.generation) {
+                state.kernel_wake_debts.remove(&tid);
+            }
+        }
+    }
+
+    fn retire_kernel_wake_debt(&self, tid: ThreadId) {
+        let mut state = self.lock();
+        state.kernel_wake_debts.remove(&tid);
+        if let Some(entry) = state.vcpus.get_mut(&tid) {
+            entry.kernel_wake_generation = None;
+        }
     }
 
     fn debug_registered_vcpus(&self) -> Vec<(ThreadId, bool)> {
@@ -1034,6 +1133,98 @@ mod generic_registry_tests {
             vec![(blocker, true), (coordinator, false)],
             "the timeout diagnostic must read the same authority as the predicate"
         );
+    }
+
+    #[test]
+    fn kernel_wake_debt_survives_exact_tid_rebind_only() {
+        let r = GenericVcpuRegistry::new();
+        let a = t(1);
+        let b = t(2);
+        let a_flag = InGuestFlag::for_guest_thread();
+        let b_flag = InGuestFlag::for_guest_thread();
+        register_for_test(&r, a, noop(), &a_flag);
+        r.publish_kernel_wake_debt();
+        let old = r.kernel_wake_debt_for(a).expect("A owes the publication");
+
+        r.unregister(a);
+        register_for_test(&r, b, noop(), &b_flag);
+        assert_eq!(
+            r.kernel_wake_debt_for(b),
+            None,
+            "unrelated B must not inherit A's debt"
+        );
+        register_for_test(&r, a, noop(), &a_flag);
+        let rebound = r
+            .kernel_wake_debt_for(a)
+            .expect("A's temporary lease gap preserves debt");
+        assert_ne!(rebound.enrollment, old.enrollment);
+        assert_eq!(rebound.generation, old.generation);
+
+        r.acknowledge_kernel_wake_debt(a, old);
+        assert_eq!(
+            r.kernel_wake_debt_for(a),
+            Some(rebound),
+            "stale enrollment cannot acknowledge rebound A"
+        );
+        r.acknowledge_kernel_wake_debt(a, rebound);
+        assert_eq!(r.kernel_wake_debt_for(a), None);
+    }
+
+    #[test]
+    fn retiring_a_thread_discards_its_dormant_kernel_wake_debt() {
+        let r = GenericVcpuRegistry::new();
+        let a = t(1);
+        let flag = InGuestFlag::for_guest_thread();
+        register_for_test(&r, a, noop(), &flag);
+        r.publish_kernel_wake_debt();
+        r.unregister(a);
+        r.retire_kernel_wake_debt(a);
+        register_for_test(&r, a, noop(), &flag);
+        assert_eq!(r.kernel_wake_debt_for(a), None);
+    }
+
+    #[test]
+    fn kernel_wake_retry_kicks_only_live_debt_in_guest() {
+        let r = GenericVcpuRegistry::new();
+        let tid = t(1);
+        let kicks = Arc::new(AtomicU64::new(0));
+        let flag = InGuestFlag::for_guest_thread();
+        register_for_test(&r, tid, Box::new(CountingHandle(Arc::clone(&kicks))), &flag);
+        r.publish_kernel_wake_debt();
+        assert_eq!(r.retry_kernel_wake_debt(), KernelWakeRetryPoll::default());
+        flag.enter_guest();
+        assert_eq!(
+            r.retry_kernel_wake_debt(),
+            KernelWakeRetryPoll {
+                owed: true,
+                kicked: true
+            }
+        );
+        assert_eq!(kicks.load(Ordering::SeqCst), 1);
+        flag.leave_guest();
+        assert_eq!(r.retry_kernel_wake_debt(), KernelWakeRetryPoll::default());
+        assert!(
+            r.kernel_wake_debt_for(tid).is_some(),
+            "host residency disarms polling without acknowledging debt"
+        );
+    }
+
+    #[test]
+    fn sibling_ack_cannot_clear_an_in_guest_participants_debt() {
+        let r = GenericVcpuRegistry::new();
+        let a = t(1);
+        let b = t(2);
+        let a_flag = InGuestFlag::for_guest_thread();
+        let b_flag = InGuestFlag::for_guest_thread();
+        register_for_test(&r, a, noop(), &a_flag);
+        register_for_test(&r, b, noop(), &b_flag);
+        r.publish_kernel_wake_debt();
+        let a_debt = r.kernel_wake_debt_for(a).unwrap();
+        let b_debt = r.kernel_wake_debt_for(b).unwrap();
+        a_flag.enter_guest();
+        r.acknowledge_kernel_wake_debt(b, b_debt);
+        assert_eq!(r.kernel_wake_debt_for(a), Some(a_debt));
+        assert!(r.retry_kernel_wake_debt().owed);
     }
 }
 
@@ -2668,4 +2859,12 @@ pub trait SignalPumpControl: Send + Sync {
     /// Start the process-directed signal pump (idempotent) against the given
     /// registry + futex, if one is not already running.
     fn start_signal_pump(&self, registry: &Arc<dyn VcpuRegistry>, futex: &Arc<dyn PlatformFutex>);
+    fn publish_kernel_wake(
+        &self,
+        registry: &Arc<dyn VcpuRegistry>,
+        futex: &Arc<dyn PlatformFutex>,
+    ) {
+        registry.publish_kernel_wake_debt();
+        self.start_signal_pump(registry, futex);
+    }
 }
