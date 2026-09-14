@@ -1864,6 +1864,12 @@ impl FileTable {
         &self.epoll_wake_registry
     }
 
+    /// Capture a registry-only capability for an asynchronous readiness wake.
+    /// It intentionally does not retain this file table or any descriptor.
+    pub(crate) fn epoll_wake_handle(&self) -> crate::dispatch::EpollWakeHandle {
+        crate::dispatch::EpollWakeHandle::from_registry(&self.epoll_wake_registry)
+    }
+
     pub(crate) fn functional_refs_active(&self) -> bool {
         self.functional_refs_active.load(Ordering::Acquire)
     }
@@ -2409,6 +2415,37 @@ mod tests {
         assert_eq!(epoll.live_epoll_interest_count(), Ok(1));
         drop(regular);
         assert_eq!(epoll.live_epoll_interest_count(), Ok(0));
+    }
+
+    #[test]
+    fn epoll_wake_handle_wakes_after_its_file_table_drops() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table ID")));
+        let wake = table.epoll_wake_handle();
+        let table_weak = Arc::downgrade(&table);
+
+        let mut mux = crate::event_mux::make_event_multiplexer().expect("event multiplexer");
+        mux.register_user(0).expect("register user wake");
+        let epoll = crate::dispatch::EpollKqueue::new(mux, Arc::clone(table.epoll_wake_registry()));
+
+        drop(table);
+        assert!(
+            table_weak.upgrade().is_none(),
+            "wake handle must not retain FileTable"
+        );
+
+        wake.notify();
+        let mut pollfd = libc::pollfd {
+            fd: epoll.poll_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut pollfd, 1, 0) },
+            1,
+            "registry-only wake handle must wake the registered epoll instance"
+        );
+        assert_ne!(pollfd.revents & libc::POLLIN, 0);
     }
 
     #[test]

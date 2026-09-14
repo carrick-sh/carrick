@@ -651,8 +651,8 @@ mod pty_registry;
 mod creds;
 mod epoll_shim;
 pub(crate) use epoll_shim::{
-    EpollWakeRegistry, new_epoll_wake_registry, notify_inmem_epoll, register_epoll_kqueue,
-    unregister_epoll_kqueue,
+    EpollWakeHandle, EpollWakeRegistry, new_epoll_wake_registry, notify_inmem_epoll,
+    register_epoll_kqueue, unregister_epoll_kqueue,
 };
 pub(crate) mod fd_table;
 mod fifo_beacon;
