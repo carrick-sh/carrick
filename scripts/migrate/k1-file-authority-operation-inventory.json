@@ -3,7 +3,7 @@
   "scope": "production Rust sources under crates/carrick-runtime/src",
   "counts": {
     "table_guard": 141,
-    "description_guard": 206,
+    "description_guard": 207,
     "description_backing": 17,
     "epoll": 385,
     "stream": 176,
@@ -12,7 +12,7 @@
   },
   "production_counts": {
     "table_guard": 66,
-    "description_guard": 182,
+    "description_guard": 183,
     "description_backing": 6,
     "epoll": 159,
     "stream": 121,
@@ -9234,7 +9234,16 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2590,
+      "line": 2525,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
+      "line": 2622,
       "categories": [
         "description_guard"
       ],
@@ -9243,7 +9252,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2624,
+      "line": 2656,
       "categories": [
         "description_guard"
       ],
@@ -9252,7 +9261,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 3164,
+      "line": 3196,
       "categories": [
         "description_guard"
       ],
@@ -9261,7 +9270,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 3173,
+      "line": 3205,
       "categories": [
         "description_guard"
       ],
@@ -9270,7 +9279,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 3263,
+      "line": 3295,
       "categories": [
         "description_guard"
       ],
@@ -9279,7 +9288,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 3368,
+      "line": 3400,
       "categories": [
         "description_guard"
       ],
@@ -11784,7 +11793,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/tests.rs",
-      "line": 8602,
+      "line": 8644,
       "categories": [
         "stream"
       ],
@@ -11793,7 +11802,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/tests.rs",
-      "line": 8611,
+      "line": 8653,
       "categories": [
         "stream"
       ],
