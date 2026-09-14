@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "counts": {
-    "inspect_misc": 144,
+    "inspect_misc": 145,
     "create_install": 71,
     "slot_description_mutation": 21,
     "read_attempt": 12,
@@ -2834,7 +2834,18 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2590,
+      "line": 2525,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "connect",
+      "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
+      "line": 2622,
       "categories": [
         "description_guard"
       ],
@@ -2845,7 +2856,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2624,
+      "line": 2656,
       "categories": [
         "description_guard"
       ],
@@ -2856,7 +2867,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 3164,
+      "line": 3196,
       "categories": [
         "description_guard"
       ],
@@ -2867,7 +2878,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 3173,
+      "line": 3205,
       "categories": [
         "description_guard"
       ],
@@ -2878,7 +2889,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 3263,
+      "line": 3295,
       "categories": [
         "description_guard"
       ],
@@ -2889,7 +2900,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 3368,
+      "line": 3400,
       "categories": [
         "description_guard"
       ],
