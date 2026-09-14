@@ -15,7 +15,18 @@
 //!      when listener closes with pending connections in backlog;
 //!   8. `tcp_nodelay`: TCP_NODELAY default and set round-trip;
 //!   9. `connect_refused`: connect to an unbound port;
-//!   10. `getsockopt_types`: SO_TYPE, SO_DOMAIN, SO_PROTOCOL on accepted socket.
+//!   10. `getsockopt_types`: SO_TYPE, SO_DOMAIN, SO_PROTOCOL on accepted socket;
+//!   11. `bound_client_v4_loopback`: IPv4 client binding loopback to port 0,
+//!       endpoint preservation through connect, accepted peer comparison, dup/close and competing binds;
+//!   12. `bound_client_v4_wildcard`: IPv4 client binding wildcard to port 0,
+//!       endpoint preservation through connect, accepted peer comparison, dup/close and competing binds;
+//!   13. `bound_client_v6_loopback`: IPv6 client binding loopback to port 0,
+//!       endpoint preservation through connect, accepted peer comparison, dup/close and competing binds;
+//!   14. `bound_client_v6_wildcard`: IPv6 client binding wildcard to port 0,
+//!       endpoint preservation through connect, accepted peer comparison, dup/close and competing binds;
+//!   15. `failed_connect_rollback_v4`: failed connect rollback of bound local endpoint against non-listening target (IPv4);
+//!   16. `failed_connect_rollback_v6`: failed connect rollback of bound local endpoint against non-listening target (IPv6);
+//!   17. `bind_admission_matrix`: TCP SO_REUSEADDR/SO_REUSEPORT and IPv4/IPv6 bind conflicts.
 //!
 //! Output is deterministic `key=value` lines only. Every wait is bounded by a
 //! `poll` with a 5 s cap so a lost wake is a false line, never a hang.
@@ -40,6 +51,986 @@ fn set_nonblock(fd: i32) {
         if fl >= 0 {
             libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SockFamily {
+    V4,
+    V6,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindKind {
+    Loopback,
+    Wildcard,
+}
+
+struct EndpointHelper;
+
+impl EndpointHelper {
+    fn loopback_storage_v4(port_be: u16) -> (libc::sockaddr_storage, libc::socklen_t) {
+        unsafe {
+            let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+            let sin = &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in);
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+            sin.sin_port = port_be;
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+    }
+
+    fn wildcard_storage_v4(port_be: u16) -> (libc::sockaddr_storage, libc::socklen_t) {
+        unsafe {
+            let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+            let sin = &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in);
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_addr.s_addr = libc::INADDR_ANY.to_be();
+            sin.sin_port = port_be;
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+    }
+
+    fn loopback_storage_v6(port_be: u16) -> (libc::sockaddr_storage, libc::socklen_t) {
+        unsafe {
+            let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+            let sin6 = &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6);
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_addr = libc::in6_addr {
+                s6_addr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            };
+            sin6.sin6_port = port_be;
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    }
+
+    fn wildcard_storage_v6(port_be: u16) -> (libc::sockaddr_storage, libc::socklen_t) {
+        unsafe {
+            let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+            let sin6 = &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6);
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_addr = libc::in6_addr { s6_addr: [0u8; 16] };
+            sin6.sin6_port = port_be;
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    }
+
+    fn mapped_loopback_storage_v6(port_be: u16) -> (libc::sockaddr_storage, libc::socklen_t) {
+        unsafe {
+            let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+            let sin6 = &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6);
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_addr = libc::in6_addr {
+                s6_addr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1],
+            };
+            sin6.sin6_port = port_be;
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    }
+
+    fn get_port_be(storage: &libc::sockaddr_storage) -> u16 {
+        unsafe {
+            let family = storage.ss_family as i32;
+            if family == libc::AF_INET {
+                let sin = &*(storage as *const _ as *const libc::sockaddr_in);
+                sin.sin_port
+            } else if family == libc::AF_INET6 {
+                let sin6 = &*(storage as *const _ as *const libc::sockaddr_in6);
+                sin6.sin6_port
+            } else {
+                0
+            }
+        }
+    }
+
+    fn set_port_be(storage: &mut libc::sockaddr_storage, port_be: u16) {
+        unsafe {
+            let family = storage.ss_family as i32;
+            if family == libc::AF_INET {
+                let sin = &mut *(storage as *mut _ as *mut libc::sockaddr_in);
+                sin.sin_port = port_be;
+            } else if family == libc::AF_INET6 {
+                let sin6 = &mut *(storage as *mut _ as *mut libc::sockaddr_in6);
+                sin6.sin6_port = port_be;
+            }
+        }
+    }
+
+    fn is_loopback(storage: &libc::sockaddr_storage) -> bool {
+        unsafe {
+            let family = storage.ss_family as i32;
+            if family == libc::AF_INET {
+                let sin = &*(storage as *const _ as *const libc::sockaddr_in);
+                sin.sin_addr.s_addr == u32::from_ne_bytes([127, 0, 0, 1])
+            } else if family == libc::AF_INET6 {
+                let sin6 = &*(storage as *const _ as *const libc::sockaddr_in6);
+                sin6.sin6_addr.s6_addr == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+            } else {
+                false
+            }
+        }
+    }
+
+    fn is_wildcard(storage: &libc::sockaddr_storage) -> bool {
+        unsafe {
+            let family = storage.ss_family as i32;
+            if family == libc::AF_INET {
+                let sin = &*(storage as *const _ as *const libc::sockaddr_in);
+                sin.sin_addr.s_addr == 0
+            } else if family == libc::AF_INET6 {
+                let sin6 = &*(storage as *const _ as *const libc::sockaddr_in6);
+                sin6.sin6_addr.s6_addr == [0u8; 16]
+            } else {
+                false
+            }
+        }
+    }
+
+    fn addrs_equal(a: &libc::sockaddr_storage, b: &libc::sockaddr_storage) -> bool {
+        unsafe {
+            let af = a.ss_family as i32;
+            let bf = b.ss_family as i32;
+            if af != bf {
+                return false;
+            }
+            if af == libc::AF_INET {
+                let sin_a = &*(a as *const _ as *const libc::sockaddr_in);
+                let sin_b = &*(b as *const _ as *const libc::sockaddr_in);
+                sin_a.sin_addr.s_addr == sin_b.sin_addr.s_addr
+            } else if af == libc::AF_INET6 {
+                let sin6_a = &*(a as *const _ as *const libc::sockaddr_in6);
+                let sin6_b = &*(b as *const _ as *const libc::sockaddr_in6);
+                sin6_a.sin6_addr.s6_addr == sin6_b.sin6_addr.s6_addr
+            } else {
+                false
+            }
+        }
+    }
+
+    fn getsockname(fd: i32) -> (i32, i32, libc::sockaddr_storage, libc::socklen_t) {
+        unsafe {
+            let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+            let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            let rc = libc::getsockname(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len);
+            let err = if rc == 0 { 0 } else { errno() };
+            (rc, err, storage, len)
+        }
+    }
+
+    fn getpeername(fd: i32) -> (i32, i32, libc::sockaddr_storage, libc::socklen_t) {
+        unsafe {
+            let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+            let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            let rc = libc::getpeername(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len);
+            let err = if rc == 0 { 0 } else { errno() };
+            (rc, err, storage, len)
+        }
+    }
+
+    fn try_competing_bind(storage: &libc::sockaddr_storage, len: libc::socklen_t) -> (i32, i32) {
+        unsafe {
+            let family = storage.ss_family as i32;
+            let fd = libc::socket(family, libc::SOCK_STREAM, 0);
+            if fd < 0 {
+                return (-1, errno());
+            }
+            let rc = libc::bind(fd, storage as *const _ as *const libc::sockaddr, len);
+            let err = if rc == 0 { 0 } else { errno() };
+            libc::close(fd);
+            (rc, err)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConnectPhaseResult {
+    initial_rc: i32,
+    initial_errno: i32,
+    poll_rc: i32,
+    poll_errno: i32,
+    so_error_rc: i32,
+    so_error: i32,
+    completed: bool,
+}
+
+unsafe fn perform_nonblocking_connect(
+    c_fd: i32,
+    addr: *const libc::sockaddr,
+    addrlen: libc::socklen_t,
+) -> ConnectPhaseResult {
+    if c_fd < 0 {
+        return ConnectPhaseResult {
+            initial_rc: -1,
+            initial_errno: libc::EBADF,
+            poll_rc: 0,
+            poll_errno: 0,
+            so_error_rc: -1,
+            so_error: 0,
+            completed: false,
+        };
+    }
+    let rc = libc::connect(c_fd, addr, addrlen);
+    let initial_err = if rc == 0 { 0 } else { errno() };
+    if rc == 0 {
+        return ConnectPhaseResult {
+            initial_rc: 0,
+            initial_errno: 0,
+            poll_rc: 0,
+            poll_errno: 0,
+            so_error_rc: 0,
+            so_error: 0,
+            completed: true,
+        };
+    }
+    if initial_err != libc::EINPROGRESS {
+        return ConnectPhaseResult {
+            initial_rc: rc,
+            initial_errno: initial_err,
+            poll_rc: 0,
+            poll_errno: 0,
+            so_error_rc: 0,
+            so_error: 0,
+            completed: false,
+        };
+    }
+    let mut pfd = libc::pollfd {
+        fd: c_fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let prc = libc::poll(&mut pfd, 1, 5000);
+    let poll_err = if prc < 0 { errno() } else { 0 };
+    if prc <= 0 {
+        return ConnectPhaseResult {
+            initial_rc: rc,
+            initial_errno: initial_err,
+            poll_rc: prc,
+            poll_errno: poll_err,
+            so_error_rc: -1,
+            so_error: 0,
+            completed: false,
+        };
+    }
+    let mut so_err: libc::c_int = 0;
+    let mut optlen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let gso_rc = libc::getsockopt(
+        c_fd,
+        libc::SOL_SOCKET,
+        libc::SO_ERROR,
+        &mut so_err as *mut _ as *mut libc::c_void,
+        &mut optlen,
+    );
+    let gso_err = if gso_rc == 0 { 0 } else { errno() };
+    let completed = gso_rc == 0 && so_err == 0;
+    ConnectPhaseResult {
+        initial_rc: rc,
+        initial_errno: initial_err,
+        poll_rc: prc,
+        poll_errno: poll_err,
+        so_error_rc: gso_rc,
+        so_error: if gso_rc == 0 { so_err } else { gso_err },
+        completed,
+    }
+}
+
+unsafe fn perform_nonblocking_accept(listener_fd: i32) -> i32 {
+    let mut pfd = libc::pollfd {
+        fd: listener_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if libc::poll(&mut pfd, 1, 5000) <= 0 || (pfd.revents & libc::POLLIN) == 0 {
+        return -1;
+    }
+    let acc_fd = libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut());
+    if acc_fd >= 0 {
+        set_nonblock(acc_fd);
+    }
+    acc_fd
+}
+
+unsafe fn test_stream_transfer(fd1: i32, fd2: i32) -> bool {
+    let b1 = [b'X'];
+    let mut pfd = libc::pollfd {
+        fd: fd1,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    if libc::poll(&mut pfd, 1, 5000) <= 0 || (pfd.revents & libc::POLLOUT) == 0 {
+        return false;
+    }
+    if libc::write(fd1, b1.as_ptr().cast(), 1) != 1 {
+        return false;
+    }
+
+    let mut pfd2 = libc::pollfd {
+        fd: fd2,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if libc::poll(&mut pfd2, 1, 5000) <= 0 || (pfd2.revents & libc::POLLIN) == 0 {
+        return false;
+    }
+    let mut buf = [0u8; 1];
+    if libc::read(fd2, buf.as_mut_ptr().cast(), 1) != 1 || buf[0] != b'X' {
+        return false;
+    }
+
+    let b2 = [b'Y'];
+    let mut pfd2_out = libc::pollfd {
+        fd: fd2,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    if libc::poll(&mut pfd2_out, 1, 5000) <= 0 || (pfd2_out.revents & libc::POLLOUT) == 0 {
+        return false;
+    }
+    if libc::write(fd2, b2.as_ptr().cast(), 1) != 1 {
+        return false;
+    }
+
+    let mut pfd1_in = libc::pollfd {
+        fd: fd1,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if libc::poll(&mut pfd1_in, 1, 5000) <= 0 || (pfd1_in.revents & libc::POLLIN) == 0 {
+        return false;
+    }
+    let mut buf2 = [0u8; 1];
+    if libc::read(fd1, buf2.as_mut_ptr().cast(), 1) != 1 || buf2[0] != b'Y' {
+        return false;
+    }
+
+    true
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BoundClientCaseResult {
+    listen_ok: bool,
+    client_bind_ret: i32,
+    client_bind_errno: i32,
+    client_pre_gsn_ret: i32,
+    client_pre_gsn_errno: i32,
+    client_pre_port_nonzero: bool,
+    client_pre_addr_ok: bool,
+    connect: ConnectPhaseResult,
+    connect_ok: bool,
+    client_post_port_preserved: bool,
+    client_post_addr_loopback: bool,
+    client_peer_port_eq_listen: bool,
+    client_peer_addr_loopback: bool,
+    accepted_peer_port_eq_client_pre: bool,
+    accepted_peer_port_eq_client_post: bool,
+    accepted_peer_addr_loopback: bool,
+    compete_before_close_ret: i32,
+    compete_before_close_errno: i32,
+    dup_post_close_port_preserved: bool,
+    dup_post_close_addr_loopback: bool,
+    dup_peer_port_eq_listen: bool,
+    dup_stream_ok: bool,
+    compete_after_orig_close_ret: i32,
+    compete_after_orig_close_errno: i32,
+    compete_after_dup_close_ret: i32,
+    compete_after_dup_close_errno: i32,
+}
+
+unsafe fn run_bound_client_case(family: SockFamily, bind_kind: BindKind) -> BoundClientCaseResult {
+    // 1. Listener
+    let (l_storage, l_len) = match family {
+        SockFamily::V4 => EndpointHelper::loopback_storage_v4(0),
+        SockFamily::V6 => EndpointHelper::loopback_storage_v6(0),
+    };
+    let af = match family {
+        SockFamily::V4 => libc::AF_INET,
+        SockFamily::V6 => libc::AF_INET6,
+    };
+    let listener = libc::socket(af, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0);
+    let l_bind_rc = if listener >= 0 {
+        libc::bind(
+            listener,
+            &l_storage as *const _ as *const libc::sockaddr,
+            l_len,
+        )
+    } else {
+        -1
+    };
+    let listen_rc = if l_bind_rc == 0 {
+        libc::listen(listener, 8)
+    } else {
+        -1
+    };
+    let (l_gsn_rc, _, l_bound_storage, _) = if l_bind_rc == 0 && listen_rc == 0 {
+        EndpointHelper::getsockname(listener)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let listen_port_be = EndpointHelper::get_port_be(&l_bound_storage);
+    let listen_ok =
+        listener >= 0 && l_bind_rc == 0 && listen_rc == 0 && l_gsn_rc == 0 && listen_port_be != 0;
+
+    // 2. Client bind
+    let (c_bind_storage, c_bind_len) = match (family, bind_kind) {
+        (SockFamily::V4, BindKind::Loopback) => EndpointHelper::loopback_storage_v4(0),
+        (SockFamily::V4, BindKind::Wildcard) => EndpointHelper::wildcard_storage_v4(0),
+        (SockFamily::V6, BindKind::Loopback) => EndpointHelper::loopback_storage_v6(0),
+        (SockFamily::V6, BindKind::Wildcard) => EndpointHelper::wildcard_storage_v6(0),
+    };
+    let client = libc::socket(af, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0);
+    let c_bind_rc = if client >= 0 {
+        libc::bind(
+            client,
+            &c_bind_storage as *const _ as *const libc::sockaddr,
+            c_bind_len,
+        )
+    } else {
+        -1
+    };
+    let c_bind_errno = if c_bind_rc == 0 { 0 } else { errno() };
+
+    let (c_pre_gsn_rc, c_pre_gsn_errno, c_pre_storage, _) = if c_bind_rc == 0 {
+        EndpointHelper::getsockname(client)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let c_pre_port = EndpointHelper::get_port_be(&c_pre_storage);
+    let c_pre_port_nonzero = c_pre_gsn_rc == 0 && c_pre_port != 0;
+    let c_pre_addr_ok = match bind_kind {
+        BindKind::Loopback => c_pre_gsn_rc == 0 && EndpointHelper::is_loopback(&c_pre_storage),
+        BindKind::Wildcard => c_pre_gsn_rc == 0 && EndpointHelper::is_wildcard(&c_pre_storage),
+    };
+
+    let mut client_compete_storage = c_pre_storage;
+    EndpointHelper::set_port_be(&mut client_compete_storage, c_pre_port);
+    let client_compete_len = c_bind_len;
+
+    // 3. Connect & Accept
+    let (target_storage, target_len) = match family {
+        SockFamily::V4 => EndpointHelper::loopback_storage_v4(listen_port_be),
+        SockFamily::V6 => EndpointHelper::loopback_storage_v6(listen_port_be),
+    };
+    let connect_res = if listen_ok && c_bind_rc == 0 && c_pre_port_nonzero {
+        perform_nonblocking_connect(
+            client,
+            &target_storage as *const _ as *const libc::sockaddr,
+            target_len,
+        )
+    } else {
+        ConnectPhaseResult {
+            initial_rc: -1,
+            initial_errno: libc::EBADF,
+            poll_rc: 0,
+            poll_errno: 0,
+            so_error_rc: -1,
+            so_error: 0,
+            completed: false,
+        }
+    };
+    let acc_fd = if connect_res.completed {
+        perform_nonblocking_accept(listener)
+    } else {
+        -1
+    };
+    let connect_ok = connect_res.completed && acc_fd >= 0;
+
+    // 4. Post-connect queries
+    let (c_post_gsn_rc, _, c_post_storage, _) = if connect_ok {
+        EndpointHelper::getsockname(client)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let c_post_port = EndpointHelper::get_port_be(&c_post_storage);
+    let client_post_port_preserved =
+        connect_ok && c_post_gsn_rc == 0 && c_pre_port_nonzero && c_post_port == c_pre_port;
+    let client_post_addr_loopback =
+        connect_ok && c_post_gsn_rc == 0 && EndpointHelper::is_loopback(&c_post_storage);
+
+    let (c_gpn_rc, _, c_peer_storage, _) = if connect_ok {
+        EndpointHelper::getpeername(client)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let c_peer_port = EndpointHelper::get_port_be(&c_peer_storage);
+    let client_peer_port_eq_listen = connect_ok && c_gpn_rc == 0 && c_peer_port == listen_port_be;
+    let client_peer_addr_loopback =
+        connect_ok && c_gpn_rc == 0 && EndpointHelper::is_loopback(&c_peer_storage);
+
+    let (acc_gpn_rc, _, acc_peer_storage, _) = if acc_fd >= 0 {
+        EndpointHelper::getpeername(acc_fd)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let acc_peer_port = EndpointHelper::get_port_be(&acc_peer_storage);
+    let accepted_peer_port_eq_client_pre =
+        connect_ok && acc_gpn_rc == 0 && c_pre_port_nonzero && acc_peer_port == c_pre_port;
+    let accepted_peer_port_eq_client_post =
+        connect_ok && acc_gpn_rc == 0 && c_post_gsn_rc == 0 && acc_peer_port == c_post_port;
+    let accepted_peer_addr_loopback =
+        connect_ok && acc_gpn_rc == 0 && EndpointHelper::is_loopback(&acc_peer_storage);
+
+    // 5. Competing bind before closing original
+    let (compete_before_close_ret, compete_before_close_errno) = if c_pre_port_nonzero {
+        EndpointHelper::try_competing_bind(&client_compete_storage, client_compete_len)
+    } else {
+        (-1, -1)
+    };
+
+    // 6. Dup client socket & close original
+    let dup_fd = if client >= 0 { libc::dup(client) } else { -1 };
+    if client >= 0 {
+        libc::close(client);
+    }
+    let (dup_gsn_rc, _, dup_storage, _) = if dup_fd >= 0 {
+        EndpointHelper::getsockname(dup_fd)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let dup_port = EndpointHelper::get_port_be(&dup_storage);
+    let dup_post_close_port_preserved = connect_ok
+        && dup_fd >= 0
+        && dup_gsn_rc == 0
+        && c_pre_port_nonzero
+        && dup_port == c_pre_port;
+    let dup_post_close_addr_loopback =
+        connect_ok && dup_fd >= 0 && dup_gsn_rc == 0 && EndpointHelper::is_loopback(&dup_storage);
+
+    let (dup_gpn_rc, _, dup_peer_storage, _) = if dup_fd >= 0 {
+        EndpointHelper::getpeername(dup_fd)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let dup_peer_port = EndpointHelper::get_port_be(&dup_peer_storage);
+    let dup_peer_port_eq_listen =
+        connect_ok && dup_fd >= 0 && dup_gpn_rc == 0 && dup_peer_port == listen_port_be;
+
+    let dup_stream_ok = if connect_ok && dup_fd >= 0 && acc_fd >= 0 {
+        test_stream_transfer(dup_fd, acc_fd)
+    } else {
+        false
+    };
+
+    // 7. Competing bind after original close (dup alive)
+    let (compete_after_orig_close_ret, compete_after_orig_close_errno) = if c_pre_port_nonzero {
+        EndpointHelper::try_competing_bind(&client_compete_storage, client_compete_len)
+    } else {
+        (-1, -1)
+    };
+
+    // 8. Close dup_fd
+    if dup_fd >= 0 {
+        libc::close(dup_fd);
+    }
+
+    // 9. Competing bind after dup close (peer acc_fd remains open)
+    let (compete_after_dup_close_ret, compete_after_dup_close_errno) = if c_pre_port_nonzero {
+        EndpointHelper::try_competing_bind(&client_compete_storage, client_compete_len)
+    } else {
+        (-1, -1)
+    };
+
+    // 10. Cleanup
+    if acc_fd >= 0 {
+        libc::close(acc_fd);
+    }
+    if listener >= 0 {
+        libc::close(listener);
+    }
+
+    BoundClientCaseResult {
+        listen_ok,
+        client_bind_ret: c_bind_rc,
+        client_bind_errno: c_bind_errno,
+        client_pre_gsn_ret: c_pre_gsn_rc,
+        client_pre_gsn_errno: c_pre_gsn_errno,
+        client_pre_port_nonzero: c_pre_port_nonzero,
+        client_pre_addr_ok: c_pre_addr_ok,
+        connect: connect_res,
+        connect_ok,
+        client_post_port_preserved,
+        client_post_addr_loopback,
+        client_peer_port_eq_listen,
+        client_peer_addr_loopback,
+        accepted_peer_port_eq_client_pre,
+        accepted_peer_port_eq_client_post,
+        accepted_peer_addr_loopback,
+        compete_before_close_ret,
+        compete_before_close_errno,
+        dup_post_close_port_preserved,
+        dup_post_close_addr_loopback,
+        dup_peer_port_eq_listen,
+        dup_stream_ok,
+        compete_after_orig_close_ret,
+        compete_after_orig_close_errno,
+        compete_after_dup_close_ret,
+        compete_after_dup_close_errno,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FailedConnectResult {
+    bind_ret: i32,
+    bind_errno: i32,
+    pre_gsn_ret: i32,
+    pre_gsn_errno: i32,
+    pre_port_nonzero: bool,
+    pre_addr_ok: bool,
+    connect: ConnectPhaseResult,
+    post_gsn_ret: i32,
+    post_gsn_errno: i32,
+    post_port_preserved: bool,
+    post_addr_ok: bool,
+    post_gpn_ret: i32,
+    post_gpn_errno: i32,
+}
+
+unsafe fn run_failed_connect_case(
+    family: SockFamily,
+    bind_kind: BindKind,
+    target_storage: &libc::sockaddr_storage,
+    target_len: libc::socklen_t,
+) -> FailedConnectResult {
+    let af = match family {
+        SockFamily::V4 => libc::AF_INET,
+        SockFamily::V6 => libc::AF_INET6,
+    };
+    let (c_bind_storage, c_bind_len) = match (family, bind_kind) {
+        (SockFamily::V4, BindKind::Loopback) => EndpointHelper::loopback_storage_v4(0),
+        (SockFamily::V4, BindKind::Wildcard) => EndpointHelper::wildcard_storage_v4(0),
+        (SockFamily::V6, BindKind::Loopback) => EndpointHelper::loopback_storage_v6(0),
+        (SockFamily::V6, BindKind::Wildcard) => EndpointHelper::wildcard_storage_v6(0),
+    };
+    let fd = libc::socket(af, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0);
+    let bind_ret = if fd >= 0 {
+        libc::bind(
+            fd,
+            &c_bind_storage as *const _ as *const libc::sockaddr,
+            c_bind_len,
+        )
+    } else {
+        -1
+    };
+    let bind_errno = if bind_ret == 0 { 0 } else { errno() };
+
+    let (pre_gsn_ret, pre_gsn_errno, pre_storage, _) = if bind_ret == 0 {
+        EndpointHelper::getsockname(fd)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let pre_port = EndpointHelper::get_port_be(&pre_storage);
+    let pre_port_nonzero = pre_gsn_ret == 0 && pre_port != 0;
+    let pre_addr_ok = match bind_kind {
+        BindKind::Loopback => pre_gsn_ret == 0 && EndpointHelper::is_loopback(&pre_storage),
+        BindKind::Wildcard => pre_gsn_ret == 0 && EndpointHelper::is_wildcard(&pre_storage),
+    };
+
+    let connect_res = if bind_ret == 0 && pre_port_nonzero {
+        perform_nonblocking_connect(
+            fd,
+            target_storage as *const _ as *const libc::sockaddr,
+            target_len,
+        )
+    } else {
+        ConnectPhaseResult {
+            initial_rc: -1,
+            initial_errno: libc::EBADF,
+            poll_rc: 0,
+            poll_errno: 0,
+            so_error_rc: -1,
+            so_error: 0,
+            completed: false,
+        }
+    };
+
+    let (post_gsn_ret, post_gsn_errno, post_storage, _) = if fd >= 0 {
+        EndpointHelper::getsockname(fd)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let post_port = EndpointHelper::get_port_be(&post_storage);
+    let post_port_preserved = bind_ret == 0
+        && pre_gsn_ret == 0
+        && pre_port_nonzero
+        && post_gsn_ret == 0
+        && post_port == pre_port;
+    let post_addr_ok = bind_ret == 0
+        && pre_gsn_ret == 0
+        && post_gsn_ret == 0
+        && EndpointHelper::addrs_equal(&pre_storage, &post_storage);
+
+    let (post_gpn_ret, post_gpn_errno, _, _) = if fd >= 0 {
+        EndpointHelper::getpeername(fd)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+
+    if fd >= 0 {
+        libc::close(fd);
+    }
+
+    FailedConnectResult {
+        bind_ret,
+        bind_errno,
+        pre_gsn_ret,
+        pre_gsn_errno,
+        pre_port_nonzero,
+        pre_addr_ok,
+        connect: connect_res,
+        post_gsn_ret,
+        post_gsn_errno,
+        post_port_preserved,
+        post_addr_ok,
+        post_gpn_ret,
+        post_gpn_errno,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BindAdmissionResult {
+    setup_ok: bool,
+    v6only_setopt_ret: i32,
+    v6only_setopt_errno: i32,
+    first_bind_ret: i32,
+    first_bind_errno: i32,
+    first_port_nonzero: bool,
+    second_bind_ret: i32,
+    second_bind_errno: i32,
+    first_listen_attempted: bool,
+    first_listen_ret: i32,
+    first_listen_errno: i32,
+    second_listen_attempted: bool,
+    second_listen_ret: i32,
+    second_listen_errno: i32,
+    cleanup_ok: bool,
+}
+
+unsafe fn set_socket_option(fd: i32, level: i32, optname: i32, value: i32) -> (i32, i32) {
+    if fd < 0 {
+        return (-1, libc::EBADF);
+    }
+    let rc = libc::setsockopt(
+        fd,
+        level,
+        optname,
+        &value as *const _ as *const libc::c_void,
+        std::mem::size_of_val(&value) as libc::socklen_t,
+    );
+    (rc, if rc == 0 { 0 } else { errno() })
+}
+
+unsafe fn run_v4_bind_admission_case(
+    first_reuseaddr: bool,
+    first_reuseport: bool,
+    second_reuseaddr: bool,
+    second_reuseport: bool,
+) -> BindAdmissionResult {
+    let first = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+    let second = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+    let first_addr_opt = set_socket_option(
+        first,
+        libc::SOL_SOCKET,
+        libc::SO_REUSEADDR,
+        first_reuseaddr as i32,
+    );
+    let first_port_opt = set_socket_option(
+        first,
+        libc::SOL_SOCKET,
+        libc::SO_REUSEPORT,
+        first_reuseport as i32,
+    );
+    let second_addr_opt = set_socket_option(
+        second,
+        libc::SOL_SOCKET,
+        libc::SO_REUSEADDR,
+        second_reuseaddr as i32,
+    );
+    let second_port_opt = set_socket_option(
+        second,
+        libc::SOL_SOCKET,
+        libc::SO_REUSEPORT,
+        second_reuseport as i32,
+    );
+    let (first_addr, first_len) = EndpointHelper::loopback_storage_v4(0);
+    let first_bind_ret = if first >= 0 {
+        libc::bind(
+            first,
+            &first_addr as *const _ as *const libc::sockaddr,
+            first_len,
+        )
+    } else {
+        -1
+    };
+    let first_bind_errno = if first_bind_ret == 0 { 0 } else { errno() };
+    let (_, _, first_bound, _) = if first_bind_ret == 0 {
+        EndpointHelper::getsockname(first)
+    } else {
+        (-1, libc::EBADF, std::mem::zeroed(), 0)
+    };
+    let first_port = EndpointHelper::get_port_be(&first_bound);
+    let first_port_nonzero = first_bind_ret == 0 && first_port != 0;
+    let mut second_addr = first_bound;
+    EndpointHelper::set_port_be(&mut second_addr, first_port);
+    let second_bind_ret = if second >= 0 && first_port_nonzero {
+        libc::bind(
+            second,
+            &second_addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    } else {
+        -1
+    };
+    let second_bind_errno = if second_bind_ret == 0 {
+        0
+    } else if first_port_nonzero {
+        errno()
+    } else {
+        libc::EBADF
+    };
+    let first_listen_attempted = first_bind_ret == 0;
+    let first_listen_ret = if first_listen_attempted {
+        libc::listen(first, 1)
+    } else {
+        -1
+    };
+    let first_listen_errno = if !first_listen_attempted || first_listen_ret == 0 {
+        0
+    } else {
+        errno()
+    };
+    let second_listen_attempted = second_bind_ret == 0;
+    let second_listen_ret = if second_listen_attempted {
+        libc::listen(second, 1)
+    } else {
+        -1
+    };
+    let second_listen_errno = if !second_listen_attempted || second_listen_ret == 0 {
+        0
+    } else {
+        errno()
+    };
+    let cleanup_ok =
+        (first < 0 || libc::close(first) == 0) && (second < 0 || libc::close(second) == 0);
+    BindAdmissionResult {
+        setup_ok: first >= 0
+            && second >= 0
+            && first_addr_opt.0 == 0
+            && first_port_opt.0 == 0
+            && second_addr_opt.0 == 0
+            && second_port_opt.0 == 0,
+        v6only_setopt_ret: 0,
+        v6only_setopt_errno: 0,
+        first_bind_ret,
+        first_bind_errno,
+        first_port_nonzero,
+        second_bind_ret,
+        second_bind_errno,
+        first_listen_attempted,
+        first_listen_ret,
+        first_listen_errno,
+        second_listen_attempted,
+        second_listen_ret,
+        second_listen_errno,
+        cleanup_ok,
+    }
+}
+
+unsafe fn run_v6_to_v4_bind_admission_case(v6only: bool, mapped: bool) -> BindAdmissionResult {
+    let first = libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0);
+    let second = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+    let v6only_opt = set_socket_option(first, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, v6only as i32);
+    let (first_addr, first_len) = if mapped {
+        EndpointHelper::mapped_loopback_storage_v6(0)
+    } else {
+        EndpointHelper::wildcard_storage_v6(0)
+    };
+    let first_bind_ret = if first >= 0 {
+        libc::bind(
+            first,
+            &first_addr as *const _ as *const libc::sockaddr,
+            first_len,
+        )
+    } else {
+        -1
+    };
+    let first_bind_errno = if first_bind_ret == 0 { 0 } else { errno() };
+    let (_, _, first_bound, _) = if first_bind_ret == 0 {
+        EndpointHelper::getsockname(first)
+    } else {
+        (-1, libc::EBADF, std::mem::zeroed(), 0)
+    };
+    let first_port = EndpointHelper::get_port_be(&first_bound);
+    let first_port_nonzero = first_bind_ret == 0 && first_port != 0;
+    let (second_addr, second_len) = EndpointHelper::loopback_storage_v4(first_port);
+    let second_bind_ret = if second >= 0 && first_port_nonzero {
+        libc::bind(
+            second,
+            &second_addr as *const _ as *const libc::sockaddr,
+            second_len,
+        )
+    } else {
+        -1
+    };
+    let second_bind_errno = if second_bind_ret == 0 {
+        0
+    } else if first_port_nonzero {
+        errno()
+    } else {
+        libc::EBADF
+    };
+    let first_listen_attempted = first_bind_ret == 0;
+    let first_listen_ret = if first_listen_attempted {
+        libc::listen(first, 1)
+    } else {
+        -1
+    };
+    let first_listen_errno = if !first_listen_attempted || first_listen_ret == 0 {
+        0
+    } else {
+        errno()
+    };
+    let second_listen_attempted = second_bind_ret == 0;
+    let second_listen_ret = if second_listen_attempted {
+        libc::listen(second, 1)
+    } else {
+        -1
+    };
+    let second_listen_errno = if !second_listen_attempted || second_listen_ret == 0 {
+        0
+    } else {
+        errno()
+    };
+    let cleanup_ok =
+        (first < 0 || libc::close(first) == 0) && (second < 0 || libc::close(second) == 0);
+    BindAdmissionResult {
+        setup_ok: first >= 0 && second >= 0 && v6only_opt.0 == 0,
+        v6only_setopt_ret: v6only_opt.0,
+        v6only_setopt_errno: v6only_opt.1,
+        first_bind_ret,
+        first_bind_errno,
+        first_port_nonzero,
+        second_bind_ret,
+        second_bind_errno,
+        first_listen_attempted,
+        first_listen_ret,
+        first_listen_errno,
+        second_listen_attempted,
+        second_listen_ret,
+        second_listen_errno,
+        cleanup_ok,
     }
 }
 
@@ -322,11 +1313,7 @@ fn main() {
                     break;
                 }
                 let want = ECHO_TOTAL - sent;
-                let n = libc::write(
-                    client_fd,
-                    pattern_c[sent..].as_ptr().cast(),
-                    want,
-                );
+                let n = libc::write(client_fd, pattern_c[sent..].as_ptr().cast(), want);
                 if n > 0 {
                     let n = n as usize;
                     if n < want {
@@ -357,11 +1344,7 @@ fn main() {
                 break;
             }
             let want = ECHO_TOTAL - recvd;
-            let n = libc::read(
-                accepted_fd,
-                server_buf[recvd..].as_mut_ptr().cast(),
-                want,
-            );
+            let n = libc::read(accepted_fd, server_buf[recvd..].as_mut_ptr().cast(), want);
             if n > 0 {
                 recvd += n as usize;
             } else if n < 0 {
@@ -594,11 +1577,7 @@ fn main() {
         let _ = libc::listen(l7, 8);
         let mut bound7: libc::sockaddr_in = std::mem::zeroed();
         let mut slen7 = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        let _ = libc::getsockname(
-            l7,
-            &mut bound7 as *mut _ as *mut libc::sockaddr,
-            &mut slen7,
-        );
+        let _ = libc::getsockname(l7, &mut bound7 as *mut _ as *mut libc::sockaddr, &mut slen7);
         let port7_be = bound7.sin_port;
 
         let c7 = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
@@ -782,5 +1761,458 @@ fn main() {
         if listener >= 0 {
             libc::close(listener);
         }
+
+        // ---------------------------------------------------------------------
+        // Case 11: bound_client_v4_loopback
+        // ---------------------------------------------------------------------
+        let res_v4_loopback = run_bound_client_case(SockFamily::V4, BindKind::Loopback);
+        report!(
+            v4_loopback_listen_ok = res_v4_loopback.listen_ok,
+            v4_loopback_client_bind_ret = res_v4_loopback.client_bind_ret,
+            v4_loopback_client_bind_errno = res_v4_loopback.client_bind_errno,
+            v4_loopback_client_pre_gsn_ret = res_v4_loopback.client_pre_gsn_ret,
+            v4_loopback_client_pre_gsn_errno = res_v4_loopback.client_pre_gsn_errno,
+            v4_loopback_client_pre_port_nonzero = res_v4_loopback.client_pre_port_nonzero,
+            v4_loopback_client_pre_addr_loopback = res_v4_loopback.client_pre_addr_ok,
+            v4_loopback_connect_initial_ret = res_v4_loopback.connect.initial_rc,
+            v4_loopback_connect_initial_errno = res_v4_loopback.connect.initial_errno,
+            v4_loopback_connect_poll_ret = res_v4_loopback.connect.poll_rc,
+            v4_loopback_connect_poll_errno = res_v4_loopback.connect.poll_errno,
+            v4_loopback_connect_so_error_ret = res_v4_loopback.connect.so_error_rc,
+            v4_loopback_connect_so_error = res_v4_loopback.connect.so_error,
+            v4_loopback_connect_ok = res_v4_loopback.connect_ok,
+            v4_loopback_client_post_port_preserved = res_v4_loopback.client_post_port_preserved,
+            v4_loopback_client_post_addr_loopback = res_v4_loopback.client_post_addr_loopback,
+            v4_loopback_client_peer_port_eq_listen = res_v4_loopback.client_peer_port_eq_listen,
+            v4_loopback_client_peer_addr_loopback = res_v4_loopback.client_peer_addr_loopback,
+            v4_loopback_accepted_peer_port_eq_client_pre =
+                res_v4_loopback.accepted_peer_port_eq_client_pre,
+            v4_loopback_accepted_peer_port_eq_client_post =
+                res_v4_loopback.accepted_peer_port_eq_client_post,
+            v4_loopback_accepted_peer_addr_loopback = res_v4_loopback.accepted_peer_addr_loopback,
+            v4_loopback_compete_before_close_ret = res_v4_loopback.compete_before_close_ret,
+            v4_loopback_compete_before_close_errno = res_v4_loopback.compete_before_close_errno,
+            v4_loopback_dup_post_close_port_preserved =
+                res_v4_loopback.dup_post_close_port_preserved,
+            v4_loopback_dup_post_close_addr_loopback = res_v4_loopback.dup_post_close_addr_loopback,
+            v4_loopback_dup_peer_port_eq_listen = res_v4_loopback.dup_peer_port_eq_listen,
+            v4_loopback_dup_stream_ok = res_v4_loopback.dup_stream_ok,
+            v4_loopback_compete_after_orig_close_ret = res_v4_loopback.compete_after_orig_close_ret,
+            v4_loopback_compete_after_orig_close_errno =
+                res_v4_loopback.compete_after_orig_close_errno,
+            v4_loopback_compete_after_dup_close_ret = res_v4_loopback.compete_after_dup_close_ret,
+            v4_loopback_compete_after_dup_close_errno =
+                res_v4_loopback.compete_after_dup_close_errno,
+        );
+
+        // ---------------------------------------------------------------------
+        // Case 12: bound_client_v4_wildcard
+        // ---------------------------------------------------------------------
+        let res_v4_wildcard = run_bound_client_case(SockFamily::V4, BindKind::Wildcard);
+        report!(
+            v4_wildcard_listen_ok = res_v4_wildcard.listen_ok,
+            v4_wildcard_client_bind_ret = res_v4_wildcard.client_bind_ret,
+            v4_wildcard_client_bind_errno = res_v4_wildcard.client_bind_errno,
+            v4_wildcard_client_pre_gsn_ret = res_v4_wildcard.client_pre_gsn_ret,
+            v4_wildcard_client_pre_gsn_errno = res_v4_wildcard.client_pre_gsn_errno,
+            v4_wildcard_client_pre_port_nonzero = res_v4_wildcard.client_pre_port_nonzero,
+            v4_wildcard_client_pre_addr_any = res_v4_wildcard.client_pre_addr_ok,
+            v4_wildcard_connect_initial_ret = res_v4_wildcard.connect.initial_rc,
+            v4_wildcard_connect_initial_errno = res_v4_wildcard.connect.initial_errno,
+            v4_wildcard_connect_poll_ret = res_v4_wildcard.connect.poll_rc,
+            v4_wildcard_connect_poll_errno = res_v4_wildcard.connect.poll_errno,
+            v4_wildcard_connect_so_error_ret = res_v4_wildcard.connect.so_error_rc,
+            v4_wildcard_connect_so_error = res_v4_wildcard.connect.so_error,
+            v4_wildcard_connect_ok = res_v4_wildcard.connect_ok,
+            v4_wildcard_client_post_port_preserved = res_v4_wildcard.client_post_port_preserved,
+            v4_wildcard_client_post_addr_loopback = res_v4_wildcard.client_post_addr_loopback,
+            v4_wildcard_client_peer_port_eq_listen = res_v4_wildcard.client_peer_port_eq_listen,
+            v4_wildcard_client_peer_addr_loopback = res_v4_wildcard.client_peer_addr_loopback,
+            v4_wildcard_accepted_peer_port_eq_client_pre =
+                res_v4_wildcard.accepted_peer_port_eq_client_pre,
+            v4_wildcard_accepted_peer_port_eq_client_post =
+                res_v4_wildcard.accepted_peer_port_eq_client_post,
+            v4_wildcard_accepted_peer_addr_loopback = res_v4_wildcard.accepted_peer_addr_loopback,
+            v4_wildcard_compete_before_close_ret = res_v4_wildcard.compete_before_close_ret,
+            v4_wildcard_compete_before_close_errno = res_v4_wildcard.compete_before_close_errno,
+            v4_wildcard_dup_post_close_port_preserved =
+                res_v4_wildcard.dup_post_close_port_preserved,
+            v4_wildcard_dup_post_close_addr_loopback = res_v4_wildcard.dup_post_close_addr_loopback,
+            v4_wildcard_dup_peer_port_eq_listen = res_v4_wildcard.dup_peer_port_eq_listen,
+            v4_wildcard_dup_stream_ok = res_v4_wildcard.dup_stream_ok,
+            v4_wildcard_compete_after_orig_close_ret = res_v4_wildcard.compete_after_orig_close_ret,
+            v4_wildcard_compete_after_orig_close_errno =
+                res_v4_wildcard.compete_after_orig_close_errno,
+            v4_wildcard_compete_after_dup_close_ret = res_v4_wildcard.compete_after_dup_close_ret,
+            v4_wildcard_compete_after_dup_close_errno =
+                res_v4_wildcard.compete_after_dup_close_errno,
+        );
+
+        // ---------------------------------------------------------------------
+        // Case 13: bound_client_v6_loopback
+        // ---------------------------------------------------------------------
+        let res_v6_loopback = run_bound_client_case(SockFamily::V6, BindKind::Loopback);
+        report!(
+            v6_loopback_listen_ok = res_v6_loopback.listen_ok,
+            v6_loopback_client_bind_ret = res_v6_loopback.client_bind_ret,
+            v6_loopback_client_bind_errno = res_v6_loopback.client_bind_errno,
+            v6_loopback_client_pre_gsn_ret = res_v6_loopback.client_pre_gsn_ret,
+            v6_loopback_client_pre_gsn_errno = res_v6_loopback.client_pre_gsn_errno,
+            v6_loopback_client_pre_port_nonzero = res_v6_loopback.client_pre_port_nonzero,
+            v6_loopback_client_pre_addr_loopback = res_v6_loopback.client_pre_addr_ok,
+            v6_loopback_connect_initial_ret = res_v6_loopback.connect.initial_rc,
+            v6_loopback_connect_initial_errno = res_v6_loopback.connect.initial_errno,
+            v6_loopback_connect_poll_ret = res_v6_loopback.connect.poll_rc,
+            v6_loopback_connect_poll_errno = res_v6_loopback.connect.poll_errno,
+            v6_loopback_connect_so_error_ret = res_v6_loopback.connect.so_error_rc,
+            v6_loopback_connect_so_error = res_v6_loopback.connect.so_error,
+            v6_loopback_connect_ok = res_v6_loopback.connect_ok,
+            v6_loopback_client_post_port_preserved = res_v6_loopback.client_post_port_preserved,
+            v6_loopback_client_post_addr_loopback = res_v6_loopback.client_post_addr_loopback,
+            v6_loopback_client_peer_port_eq_listen = res_v6_loopback.client_peer_port_eq_listen,
+            v6_loopback_client_peer_addr_loopback = res_v6_loopback.client_peer_addr_loopback,
+            v6_loopback_accepted_peer_port_eq_client_pre =
+                res_v6_loopback.accepted_peer_port_eq_client_pre,
+            v6_loopback_accepted_peer_port_eq_client_post =
+                res_v6_loopback.accepted_peer_port_eq_client_post,
+            v6_loopback_accepted_peer_addr_loopback = res_v6_loopback.accepted_peer_addr_loopback,
+            v6_loopback_compete_before_close_ret = res_v6_loopback.compete_before_close_ret,
+            v6_loopback_compete_before_close_errno = res_v6_loopback.compete_before_close_errno,
+            v6_loopback_dup_post_close_port_preserved =
+                res_v6_loopback.dup_post_close_port_preserved,
+            v6_loopback_dup_post_close_addr_loopback = res_v6_loopback.dup_post_close_addr_loopback,
+            v6_loopback_dup_peer_port_eq_listen = res_v6_loopback.dup_peer_port_eq_listen,
+            v6_loopback_dup_stream_ok = res_v6_loopback.dup_stream_ok,
+            v6_loopback_compete_after_orig_close_ret = res_v6_loopback.compete_after_orig_close_ret,
+            v6_loopback_compete_after_orig_close_errno =
+                res_v6_loopback.compete_after_orig_close_errno,
+            v6_loopback_compete_after_dup_close_ret = res_v6_loopback.compete_after_dup_close_ret,
+            v6_loopback_compete_after_dup_close_errno =
+                res_v6_loopback.compete_after_dup_close_errno,
+        );
+
+        // ---------------------------------------------------------------------
+        // Case 14: bound_client_v6_wildcard
+        // ---------------------------------------------------------------------
+        let res_v6_wildcard = run_bound_client_case(SockFamily::V6, BindKind::Wildcard);
+        report!(
+            v6_wildcard_listen_ok = res_v6_wildcard.listen_ok,
+            v6_wildcard_client_bind_ret = res_v6_wildcard.client_bind_ret,
+            v6_wildcard_client_bind_errno = res_v6_wildcard.client_bind_errno,
+            v6_wildcard_client_pre_gsn_ret = res_v6_wildcard.client_pre_gsn_ret,
+            v6_wildcard_client_pre_gsn_errno = res_v6_wildcard.client_pre_gsn_errno,
+            v6_wildcard_client_pre_port_nonzero = res_v6_wildcard.client_pre_port_nonzero,
+            v6_wildcard_client_pre_addr_any = res_v6_wildcard.client_pre_addr_ok,
+            v6_wildcard_connect_initial_ret = res_v6_wildcard.connect.initial_rc,
+            v6_wildcard_connect_initial_errno = res_v6_wildcard.connect.initial_errno,
+            v6_wildcard_connect_poll_ret = res_v6_wildcard.connect.poll_rc,
+            v6_wildcard_connect_poll_errno = res_v6_wildcard.connect.poll_errno,
+            v6_wildcard_connect_so_error_ret = res_v6_wildcard.connect.so_error_rc,
+            v6_wildcard_connect_so_error = res_v6_wildcard.connect.so_error,
+            v6_wildcard_connect_ok = res_v6_wildcard.connect_ok,
+            v6_wildcard_client_post_port_preserved = res_v6_wildcard.client_post_port_preserved,
+            v6_wildcard_client_post_addr_loopback = res_v6_wildcard.client_post_addr_loopback,
+            v6_wildcard_client_peer_port_eq_listen = res_v6_wildcard.client_peer_port_eq_listen,
+            v6_wildcard_client_peer_addr_loopback = res_v6_wildcard.client_peer_addr_loopback,
+            v6_wildcard_accepted_peer_port_eq_client_pre =
+                res_v6_wildcard.accepted_peer_port_eq_client_pre,
+            v6_wildcard_accepted_peer_port_eq_client_post =
+                res_v6_wildcard.accepted_peer_port_eq_client_post,
+            v6_wildcard_accepted_peer_addr_loopback = res_v6_wildcard.accepted_peer_addr_loopback,
+            v6_wildcard_compete_before_close_ret = res_v6_wildcard.compete_before_close_ret,
+            v6_wildcard_compete_before_close_errno = res_v6_wildcard.compete_before_close_errno,
+            v6_wildcard_dup_post_close_port_preserved =
+                res_v6_wildcard.dup_post_close_port_preserved,
+            v6_wildcard_dup_post_close_addr_loopback = res_v6_wildcard.dup_post_close_addr_loopback,
+            v6_wildcard_dup_peer_port_eq_listen = res_v6_wildcard.dup_peer_port_eq_listen,
+            v6_wildcard_dup_stream_ok = res_v6_wildcard.dup_stream_ok,
+            v6_wildcard_compete_after_orig_close_ret = res_v6_wildcard.compete_after_orig_close_ret,
+            v6_wildcard_compete_after_orig_close_errno =
+                res_v6_wildcard.compete_after_orig_close_errno,
+            v6_wildcard_compete_after_dup_close_ret = res_v6_wildcard.compete_after_dup_close_ret,
+            v6_wildcard_compete_after_dup_close_errno =
+                res_v6_wildcard.compete_after_dup_close_errno,
+        );
+
+        // ---------------------------------------------------------------------
+        // Case 15: failed_connect_rollback_v4
+        // ---------------------------------------------------------------------
+        // Bind non-listening target on loopback with port 0 and KEEP alive.
+        let target_v4 = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        let (d_sin15, d_len15) = EndpointHelper::loopback_storage_v4(0);
+        let _ = if target_v4 >= 0 {
+            libc::bind(
+                target_v4,
+                &d_sin15 as *const _ as *const libc::sockaddr,
+                d_len15,
+            )
+        } else {
+            -1
+        };
+        let (_, _, d_bound15, _) = EndpointHelper::getsockname(target_v4);
+        let unused_v4_port_be = EndpointHelper::get_port_be(&d_bound15);
+        let (target_unused_v4, target_unused_v4_len) =
+            EndpointHelper::loopback_storage_v4(unused_v4_port_be);
+
+        let res_v4_loopback = run_failed_connect_case(
+            SockFamily::V4,
+            BindKind::Loopback,
+            &target_unused_v4,
+            target_unused_v4_len,
+        );
+        let res_v4_wildcard = run_failed_connect_case(
+            SockFamily::V4,
+            BindKind::Wildcard,
+            &target_unused_v4,
+            target_unused_v4_len,
+        );
+
+        if target_v4 >= 0 {
+            libc::close(target_v4);
+        }
+
+        report!(
+            v4_failed_loopback_client_bind_ret = res_v4_loopback.bind_ret,
+            v4_failed_loopback_client_bind_errno = res_v4_loopback.bind_errno,
+            v4_failed_loopback_client_pre_gsn_ret = res_v4_loopback.pre_gsn_ret,
+            v4_failed_loopback_client_pre_gsn_errno = res_v4_loopback.pre_gsn_errno,
+            v4_failed_loopback_client_pre_port_nonzero = res_v4_loopback.pre_port_nonzero,
+            v4_failed_loopback_client_pre_addr_loopback = res_v4_loopback.pre_addr_ok,
+            v4_failed_loopback_connect_initial_ret = res_v4_loopback.connect.initial_rc,
+            v4_failed_loopback_connect_initial_errno = res_v4_loopback.connect.initial_errno,
+            v4_failed_loopback_connect_poll_ret = res_v4_loopback.connect.poll_rc,
+            v4_failed_loopback_connect_poll_errno = res_v4_loopback.connect.poll_errno,
+            v4_failed_loopback_connect_so_error_ret = res_v4_loopback.connect.so_error_rc,
+            v4_failed_loopback_connect_so_error = res_v4_loopback.connect.so_error,
+            v4_failed_loopback_post_sockname_ret = res_v4_loopback.post_gsn_ret,
+            v4_failed_loopback_post_sockname_errno = res_v4_loopback.post_gsn_errno,
+            v4_failed_loopback_post_port_preserved = res_v4_loopback.post_port_preserved,
+            v4_failed_loopback_post_addr_loopback = res_v4_loopback.post_addr_ok,
+            v4_failed_loopback_post_peername_ret = res_v4_loopback.post_gpn_ret,
+            v4_failed_loopback_post_peername_errno = res_v4_loopback.post_gpn_errno,
+            v4_failed_wildcard_client_bind_ret = res_v4_wildcard.bind_ret,
+            v4_failed_wildcard_client_bind_errno = res_v4_wildcard.bind_errno,
+            v4_failed_wildcard_client_pre_gsn_ret = res_v4_wildcard.pre_gsn_ret,
+            v4_failed_wildcard_client_pre_gsn_errno = res_v4_wildcard.pre_gsn_errno,
+            v4_failed_wildcard_client_pre_port_nonzero = res_v4_wildcard.pre_port_nonzero,
+            v4_failed_wildcard_client_pre_addr_any = res_v4_wildcard.pre_addr_ok,
+            v4_failed_wildcard_connect_initial_ret = res_v4_wildcard.connect.initial_rc,
+            v4_failed_wildcard_connect_initial_errno = res_v4_wildcard.connect.initial_errno,
+            v4_failed_wildcard_connect_poll_ret = res_v4_wildcard.connect.poll_rc,
+            v4_failed_wildcard_connect_poll_errno = res_v4_wildcard.connect.poll_errno,
+            v4_failed_wildcard_connect_so_error_ret = res_v4_wildcard.connect.so_error_rc,
+            v4_failed_wildcard_connect_so_error = res_v4_wildcard.connect.so_error,
+            v4_failed_wildcard_post_sockname_ret = res_v4_wildcard.post_gsn_ret,
+            v4_failed_wildcard_post_sockname_errno = res_v4_wildcard.post_gsn_errno,
+            v4_failed_wildcard_post_port_preserved = res_v4_wildcard.post_port_preserved,
+            v4_failed_wildcard_post_addr_any = res_v4_wildcard.post_addr_ok,
+            v4_failed_wildcard_post_peername_ret = res_v4_wildcard.post_gpn_ret,
+            v4_failed_wildcard_post_peername_errno = res_v4_wildcard.post_gpn_errno,
+        );
+
+        // ---------------------------------------------------------------------
+        // Case 16: failed_connect_rollback_v6
+        // ---------------------------------------------------------------------
+        // Bind non-listening target on loopback with port 0 and KEEP alive.
+        let target_v6 = libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0);
+        let (d_sin16, d_len16) = EndpointHelper::loopback_storage_v6(0);
+        let _ = if target_v6 >= 0 {
+            libc::bind(
+                target_v6,
+                &d_sin16 as *const _ as *const libc::sockaddr,
+                d_len16,
+            )
+        } else {
+            -1
+        };
+        let (_, _, d_bound16, _) = EndpointHelper::getsockname(target_v6);
+        let unused_v6_port_be = EndpointHelper::get_port_be(&d_bound16);
+        let (target_unused_v6, target_unused_v6_len) =
+            EndpointHelper::loopback_storage_v6(unused_v6_port_be);
+
+        let res_v6_loopback = run_failed_connect_case(
+            SockFamily::V6,
+            BindKind::Loopback,
+            &target_unused_v6,
+            target_unused_v6_len,
+        );
+        let res_v6_wildcard = run_failed_connect_case(
+            SockFamily::V6,
+            BindKind::Wildcard,
+            &target_unused_v6,
+            target_unused_v6_len,
+        );
+
+        if target_v6 >= 0 {
+            libc::close(target_v6);
+        }
+
+        report!(
+            v6_failed_loopback_client_bind_ret = res_v6_loopback.bind_ret,
+            v6_failed_loopback_client_bind_errno = res_v6_loopback.bind_errno,
+            v6_failed_loopback_client_pre_gsn_ret = res_v6_loopback.pre_gsn_ret,
+            v6_failed_loopback_client_pre_gsn_errno = res_v6_loopback.pre_gsn_errno,
+            v6_failed_loopback_client_pre_port_nonzero = res_v6_loopback.pre_port_nonzero,
+            v6_failed_loopback_client_pre_addr_loopback = res_v6_loopback.pre_addr_ok,
+            v6_failed_loopback_connect_initial_ret = res_v6_loopback.connect.initial_rc,
+            v6_failed_loopback_connect_initial_errno = res_v6_loopback.connect.initial_errno,
+            v6_failed_loopback_connect_poll_ret = res_v6_loopback.connect.poll_rc,
+            v6_failed_loopback_connect_poll_errno = res_v6_loopback.connect.poll_errno,
+            v6_failed_loopback_connect_so_error_ret = res_v6_loopback.connect.so_error_rc,
+            v6_failed_loopback_connect_so_error = res_v6_loopback.connect.so_error,
+            v6_failed_loopback_post_sockname_ret = res_v6_loopback.post_gsn_ret,
+            v6_failed_loopback_post_sockname_errno = res_v6_loopback.post_gsn_errno,
+            v6_failed_loopback_post_port_preserved = res_v6_loopback.post_port_preserved,
+            v6_failed_loopback_post_addr_loopback = res_v6_loopback.post_addr_ok,
+            v6_failed_loopback_post_peername_ret = res_v6_loopback.post_gpn_ret,
+            v6_failed_loopback_post_peername_errno = res_v6_loopback.post_gpn_errno,
+            v6_failed_wildcard_client_bind_ret = res_v6_wildcard.bind_ret,
+            v6_failed_wildcard_client_bind_errno = res_v6_wildcard.bind_errno,
+            v6_failed_wildcard_client_pre_gsn_ret = res_v6_wildcard.pre_gsn_ret,
+            v6_failed_wildcard_client_pre_gsn_errno = res_v6_wildcard.pre_gsn_errno,
+            v6_failed_wildcard_client_pre_port_nonzero = res_v6_wildcard.pre_port_nonzero,
+            v6_failed_wildcard_client_pre_addr_any = res_v6_wildcard.pre_addr_ok,
+            v6_failed_wildcard_connect_initial_ret = res_v6_wildcard.connect.initial_rc,
+            v6_failed_wildcard_connect_initial_errno = res_v6_wildcard.connect.initial_errno,
+            v6_failed_wildcard_connect_poll_ret = res_v6_wildcard.connect.poll_rc,
+            v6_failed_wildcard_connect_poll_errno = res_v6_wildcard.connect.poll_errno,
+            v6_failed_wildcard_connect_so_error_ret = res_v6_wildcard.connect.so_error_rc,
+            v6_failed_wildcard_connect_so_error = res_v6_wildcard.connect.so_error,
+            v6_failed_wildcard_post_sockname_ret = res_v6_wildcard.post_gsn_ret,
+            v6_failed_wildcard_post_sockname_errno = res_v6_wildcard.post_gsn_errno,
+            v6_failed_wildcard_post_port_preserved = res_v6_wildcard.post_port_preserved,
+            v6_failed_wildcard_post_addr_any = res_v6_wildcard.post_addr_ok,
+            v6_failed_wildcard_post_peername_ret = res_v6_wildcard.post_gpn_ret,
+            v6_failed_wildcard_post_peername_errno = res_v6_wildcard.post_gpn_errno,
+        );
+
+        // ---------------------------------------------------------------------
+        // Case 17: bind_admission_matrix
+        // ---------------------------------------------------------------------
+        let reuseaddr_pair = run_v4_bind_admission_case(true, false, true, false);
+        let reuseport_pair = run_v4_bind_admission_case(false, true, false, true);
+        let reuseaddr_then_reuseport = run_v4_bind_admission_case(true, false, false, true);
+        let reuseport_then_reuseaddr = run_v4_bind_admission_case(false, true, true, false);
+        let dual_stack = run_v6_to_v4_bind_admission_case(false, false);
+        let v6only = run_v6_to_v4_bind_admission_case(true, false);
+        let mapped = run_v6_to_v4_bind_admission_case(false, true);
+        // Linux accepts the pre-bind setsockopt but rejects this mapped-v6 bind
+        // with EINVAL; keep both operations separate in the output.
+        let mapped_v6only = run_v6_to_v4_bind_admission_case(true, true);
+        report!(
+            reuseaddr_pair_setup_ok = reuseaddr_pair.setup_ok,
+            reuseaddr_pair_first_bind_ret = reuseaddr_pair.first_bind_ret,
+            reuseaddr_pair_first_bind_errno = reuseaddr_pair.first_bind_errno,
+            reuseaddr_pair_first_port_nonzero = reuseaddr_pair.first_port_nonzero,
+            reuseaddr_pair_second_bind_ret = reuseaddr_pair.second_bind_ret,
+            reuseaddr_pair_second_bind_errno = reuseaddr_pair.second_bind_errno,
+            reuseaddr_pair_first_listen_attempted = reuseaddr_pair.first_listen_attempted,
+            reuseaddr_pair_first_listen_ret = reuseaddr_pair.first_listen_ret,
+            reuseaddr_pair_first_listen_errno = reuseaddr_pair.first_listen_errno,
+            reuseaddr_pair_second_listen_attempted = reuseaddr_pair.second_listen_attempted,
+            reuseaddr_pair_second_listen_ret = reuseaddr_pair.second_listen_ret,
+            reuseaddr_pair_second_listen_errno = reuseaddr_pair.second_listen_errno,
+            reuseaddr_pair_cleanup_ok = reuseaddr_pair.cleanup_ok,
+            reuseport_pair_setup_ok = reuseport_pair.setup_ok,
+            reuseport_pair_first_bind_ret = reuseport_pair.first_bind_ret,
+            reuseport_pair_first_bind_errno = reuseport_pair.first_bind_errno,
+            reuseport_pair_first_port_nonzero = reuseport_pair.first_port_nonzero,
+            reuseport_pair_second_bind_ret = reuseport_pair.second_bind_ret,
+            reuseport_pair_second_bind_errno = reuseport_pair.second_bind_errno,
+            reuseport_pair_first_listen_attempted = reuseport_pair.first_listen_attempted,
+            reuseport_pair_first_listen_ret = reuseport_pair.first_listen_ret,
+            reuseport_pair_first_listen_errno = reuseport_pair.first_listen_errno,
+            reuseport_pair_second_listen_attempted = reuseport_pair.second_listen_attempted,
+            reuseport_pair_second_listen_ret = reuseport_pair.second_listen_ret,
+            reuseport_pair_second_listen_errno = reuseport_pair.second_listen_errno,
+            reuseport_pair_cleanup_ok = reuseport_pair.cleanup_ok,
+            reuseaddr_then_reuseport_setup_ok = reuseaddr_then_reuseport.setup_ok,
+            reuseaddr_then_reuseport_first_bind_ret = reuseaddr_then_reuseport.first_bind_ret,
+            reuseaddr_then_reuseport_first_bind_errno = reuseaddr_then_reuseport.first_bind_errno,
+            reuseaddr_then_reuseport_first_port_nonzero =
+                reuseaddr_then_reuseport.first_port_nonzero,
+            reuseaddr_then_reuseport_second_bind_ret = reuseaddr_then_reuseport.second_bind_ret,
+            reuseaddr_then_reuseport_second_bind_errno = reuseaddr_then_reuseport.second_bind_errno,
+            reuseaddr_then_reuseport_first_listen_attempted =
+                reuseaddr_then_reuseport.first_listen_attempted,
+            reuseaddr_then_reuseport_first_listen_ret = reuseaddr_then_reuseport.first_listen_ret,
+            reuseaddr_then_reuseport_first_listen_errno =
+                reuseaddr_then_reuseport.first_listen_errno,
+            reuseaddr_then_reuseport_second_listen_attempted =
+                reuseaddr_then_reuseport.second_listen_attempted,
+            reuseaddr_then_reuseport_second_listen_ret = reuseaddr_then_reuseport.second_listen_ret,
+            reuseaddr_then_reuseport_second_listen_errno =
+                reuseaddr_then_reuseport.second_listen_errno,
+            reuseaddr_then_reuseport_cleanup_ok = reuseaddr_then_reuseport.cleanup_ok,
+            reuseport_then_reuseaddr_setup_ok = reuseport_then_reuseaddr.setup_ok,
+            reuseport_then_reuseaddr_first_bind_ret = reuseport_then_reuseaddr.first_bind_ret,
+            reuseport_then_reuseaddr_first_bind_errno = reuseport_then_reuseaddr.first_bind_errno,
+            reuseport_then_reuseaddr_first_port_nonzero =
+                reuseport_then_reuseaddr.first_port_nonzero,
+            reuseport_then_reuseaddr_second_bind_ret = reuseport_then_reuseaddr.second_bind_ret,
+            reuseport_then_reuseaddr_second_bind_errno = reuseport_then_reuseaddr.second_bind_errno,
+            reuseport_then_reuseaddr_first_listen_attempted =
+                reuseport_then_reuseaddr.first_listen_attempted,
+            reuseport_then_reuseaddr_first_listen_ret = reuseport_then_reuseaddr.first_listen_ret,
+            reuseport_then_reuseaddr_first_listen_errno =
+                reuseport_then_reuseaddr.first_listen_errno,
+            reuseport_then_reuseaddr_second_listen_attempted =
+                reuseport_then_reuseaddr.second_listen_attempted,
+            reuseport_then_reuseaddr_second_listen_ret = reuseport_then_reuseaddr.second_listen_ret,
+            reuseport_then_reuseaddr_second_listen_errno =
+                reuseport_then_reuseaddr.second_listen_errno,
+            reuseport_then_reuseaddr_cleanup_ok = reuseport_then_reuseaddr.cleanup_ok,
+            dual_stack_setup_ok = dual_stack.setup_ok,
+            dual_stack_v6only_setopt_ret = dual_stack.v6only_setopt_ret,
+            dual_stack_v6only_setopt_errno = dual_stack.v6only_setopt_errno,
+            dual_stack_first_bind_ret = dual_stack.first_bind_ret,
+            dual_stack_first_bind_errno = dual_stack.first_bind_errno,
+            dual_stack_first_port_nonzero = dual_stack.first_port_nonzero,
+            dual_stack_v4_second_bind_ret = dual_stack.second_bind_ret,
+            dual_stack_v4_second_bind_errno = dual_stack.second_bind_errno,
+            dual_stack_first_listen_attempted = dual_stack.first_listen_attempted,
+            dual_stack_first_listen_ret = dual_stack.first_listen_ret,
+            dual_stack_first_listen_errno = dual_stack.first_listen_errno,
+            dual_stack_v4_second_listen_attempted = dual_stack.second_listen_attempted,
+            dual_stack_v4_second_listen_ret = dual_stack.second_listen_ret,
+            dual_stack_v4_second_listen_errno = dual_stack.second_listen_errno,
+            dual_stack_cleanup_ok = dual_stack.cleanup_ok,
+            v6only_setup_ok = v6only.setup_ok,
+            v6only_setopt_ret = v6only.v6only_setopt_ret,
+            v6only_setopt_errno = v6only.v6only_setopt_errno,
+            v6only_first_bind_ret = v6only.first_bind_ret,
+            v6only_first_bind_errno = v6only.first_bind_errno,
+            v6only_first_port_nonzero = v6only.first_port_nonzero,
+            v6only_v4_second_bind_ret = v6only.second_bind_ret,
+            v6only_v4_second_bind_errno = v6only.second_bind_errno,
+            v6only_first_listen_attempted = v6only.first_listen_attempted,
+            v6only_first_listen_ret = v6only.first_listen_ret,
+            v6only_first_listen_errno = v6only.first_listen_errno,
+            v6only_v4_second_listen_attempted = v6only.second_listen_attempted,
+            v6only_v4_second_listen_ret = v6only.second_listen_ret,
+            v6only_v4_second_listen_errno = v6only.second_listen_errno,
+            v6only_cleanup_ok = v6only.cleanup_ok,
+            mapped_v6_setup_ok = mapped.setup_ok,
+            mapped_v6_first_bind_ret = mapped.first_bind_ret,
+            mapped_v6_first_bind_errno = mapped.first_bind_errno,
+            mapped_v6_first_port_nonzero = mapped.first_port_nonzero,
+            mapped_v6_v4_second_bind_ret = mapped.second_bind_ret,
+            mapped_v6_v4_second_bind_errno = mapped.second_bind_errno,
+            mapped_v6_first_listen_attempted = mapped.first_listen_attempted,
+            mapped_v6_first_listen_ret = mapped.first_listen_ret,
+            mapped_v6_first_listen_errno = mapped.first_listen_errno,
+            mapped_v6_v4_second_listen_attempted = mapped.second_listen_attempted,
+            mapped_v6_v4_second_listen_ret = mapped.second_listen_ret,
+            mapped_v6_v4_second_listen_errno = mapped.second_listen_errno,
+            mapped_v6_cleanup_ok = mapped.cleanup_ok,
+            mapped_v6_v6only_setopt_ret = mapped_v6only.v6only_setopt_ret,
+            mapped_v6_v6only_setopt_errno = mapped_v6only.v6only_setopt_errno,
+            mapped_v6_v6only_bind_ret = mapped_v6only.first_bind_ret,
+            mapped_v6_v6only_bind_errno = mapped_v6only.first_bind_errno,
+            mapped_v6_v6only_listen_attempted = mapped_v6only.first_listen_attempted,
+            mapped_v6_v6only_listen_ret = mapped_v6only.first_listen_ret,
+            mapped_v6_v6only_listen_errno = mapped_v6only.first_listen_errno,
+            mapped_v6_v6only_cleanup_ok = mapped_v6only.cleanup_ok,
+        );
     }
 }

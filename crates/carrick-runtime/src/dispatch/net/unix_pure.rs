@@ -24,6 +24,7 @@ use crate::linux_abi::{
     LINUX_SOCK_SEQPACKET, LINUX_SOCK_STREAM, LinuxErrno,
 };
 use crate::network::interposer::{ConnectionRecordState, MockService};
+use carrick_abi::{LINUX_AF_INET, LINUX_AF_INET6, LINUX_IPPROTO_TCP};
 
 pub const LINUX_SHUT_RD: i32 = 0;
 pub const LINUX_SHUT_WR: i32 = 1;
@@ -60,6 +61,13 @@ pub(crate) struct UnixDatagram {
     pub rights: Vec<Arc<OpenFile>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TcpPeerTerminal {
+    Open,
+    Fin,
+    Reset,
+}
+
 pub(crate) struct PureSocketState {
     pub bound_addr: Option<Vec<u8>>,
     pub local_sockaddr: Option<SocketAddr>,
@@ -75,6 +83,9 @@ pub(crate) struct PureSocketState {
     pub peer_creds: Option<LinuxUcred>,
     pub shutdown_read: bool,
     pub shutdown_write: bool,
+    tcp_pair: bool,
+    tcp_peer_terminal: TcpPeerTerminal,
+    tcp_send_terminal: bool,
     pub so_passcred: bool,
     pub so_error: Option<i32>,
     pub so_rcvtimeo: Option<Duration>,
@@ -89,12 +100,17 @@ pub(crate) struct PureSocketState {
     pub tcp_keepintvl: i32,
     pub tcp_keepcnt: i32,
     pub so_linger: (i32, i32),
+    /// Offset in `stream_buf` of the current TCP urgent mark, relative to the
+    /// unread cursor.  The mark remains at zero after MSG_OOB consumption so
+    /// SIOCATMARK can report it until a normal read crosses it.
+    pub oob_mark: Option<usize>,
     pub oob_data: Option<u8>,
     pub so_oobinline: bool,
     pub mock_service: Option<Arc<dyn MockService>>,
     pub mock_peer_closed: bool,
     pub connection_record: Option<Arc<Mutex<ConnectionRecordState>>>,
     pub request_buf: Vec<u8>,
+    pub inzone_cleanup: Option<Arc<dyn crate::dispatch::fd_table::InZoneCleanup>>,
 }
 
 pub struct PureSocketInner {
@@ -154,6 +170,9 @@ impl PureSocketInner {
                 peer_creds: None,
                 shutdown_read: false,
                 shutdown_write: false,
+                tcp_pair: false,
+                tcp_peer_terminal: TcpPeerTerminal::Open,
+                tcp_send_terminal: false,
                 so_passcred: false,
                 so_error: None,
                 so_rcvtimeo: None,
@@ -168,12 +187,14 @@ impl PureSocketInner {
                 tcp_keepintvl: 75,
                 tcp_keepcnt: 9,
                 so_linger: (0, 0),
+                oob_mark: None,
                 oob_data: None,
                 so_oobinline: false,
                 mock_service: None,
                 mock_peer_closed: false,
                 connection_record: None,
                 request_buf: Vec::new(),
+                inzone_cleanup: None,
             }),
             changed: Condvar::new(),
             wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
@@ -208,6 +229,9 @@ impl PureSocketInner {
                 peer_creds: None,
                 shutdown_read: false,
                 shutdown_write: false,
+                tcp_pair: false,
+                tcp_peer_terminal: TcpPeerTerminal::Open,
+                tcp_send_terminal: false,
                 so_passcred: false,
                 so_error: None,
                 so_rcvtimeo: None,
@@ -222,12 +246,14 @@ impl PureSocketInner {
                 tcp_keepintvl: 75,
                 tcp_keepcnt: 9,
                 so_linger: (0, 0),
+                oob_mark: None,
                 oob_data: None,
                 so_oobinline: false,
                 mock_service: Some(mock),
                 mock_peer_closed: false,
                 connection_record: record,
                 request_buf: Vec::new(),
+                inzone_cleanup: None,
             }),
             changed: Condvar::new(),
             wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
@@ -256,6 +282,10 @@ impl PureSocketInner {
         {
             let mut s1 = first.state.lock();
             let mut s2 = second.state.lock();
+            let tcp_pair =
+                protocol == LINUX_IPPROTO_TCP && matches!(family, LINUX_AF_INET | LINUX_AF_INET6);
+            s1.tcp_pair = tcp_pair;
+            s2.tcp_pair = tcp_pair;
             s1.peer = Some(Arc::downgrade(&second));
             s1.peer_creds = Some(creds2);
             s2.peer = Some(Arc::downgrade(&first));
@@ -308,7 +338,13 @@ impl PureSocketInner {
     }
 
     pub(crate) fn set_so_error(&self, err: i32) {
-        self.state.lock().so_error = Some(err);
+        let mut state = self.state.lock();
+        state.so_error = Some(err);
+        if state.tcp_pair && err == carrick_abi::LINUX_ECONNRESET.get() {
+            state.tcp_peer_terminal = TcpPeerTerminal::Reset;
+            state.tcp_send_terminal = true;
+        }
+        drop(state);
         self.notify_waiters();
     }
 
@@ -589,6 +625,9 @@ impl PureSocketInner {
         if state.shutdown_write {
             return Err(LINUX_EPIPE);
         }
+        if state.tcp_pair && state.tcp_send_terminal {
+            return Err(LINUX_EPIPE);
+        }
 
         let send_cap = state.so_sndbuf;
 
@@ -643,14 +682,58 @@ impl PureSocketInner {
                 return Err(LINUX_ENOTCONN);
             };
             let Some(peer) = peer_weak.upgrade() else {
+                if state.tcp_pair
+                    && state.tcp_peer_terminal == TcpPeerTerminal::Fin
+                    && data.is_empty()
+                {
+                    return Ok(0);
+                }
+                if state.tcp_pair
+                    && state.tcp_peer_terminal == TcpPeerTerminal::Fin
+                    && !data.is_empty()
+                {
+                    let admitted = data.len().min(send_cap);
+                    if admitted == 0 {
+                        return Err(LINUX_EAGAIN);
+                    }
+                    state.tcp_send_terminal = true;
+                    state.so_error = Some(LINUX_EPIPE.get());
+                    return Ok(admitted);
+                }
                 return Err(LINUX_EPIPE);
             };
             peer
         };
         drop(state);
 
-        let mut peer_state = peer_arc.state.lock();
+        let (mut state, mut peer_state) = self.lock_with_peer(&peer_arc);
+        if let Some(err) = state.so_error.take() {
+            return Err(LinuxErrno::new(err));
+        }
+        if state.shutdown_write || state.tcp_send_terminal {
+            return Err(LINUX_EPIPE);
+        }
         if peer_state.shutdown_read {
+            if state.tcp_pair && data.is_empty() {
+                return Ok(0);
+            }
+            if state.tcp_pair && !data.is_empty() {
+                let admitted = data.len().min(send_cap);
+                if admitted == 0 {
+                    return Err(LINUX_EAGAIN);
+                }
+                state.tcp_send_terminal = true;
+                state.so_error = Some(LINUX_EPIPE.get());
+                peer_state.so_error = Some(carrick_abi::LINUX_ECONNRESET.get());
+                peer_state.tcp_peer_terminal = TcpPeerTerminal::Reset;
+                peer_state.stream_buf.clear();
+                peer_state.stream_rights.clear();
+                drop(peer_state);
+                drop(state);
+                peer_arc.notify_waiters();
+                self.notify_waiters();
+                return Ok(admitted);
+            }
             return Err(LINUX_EPIPE);
         }
 
@@ -693,22 +776,80 @@ impl PureSocketInner {
             None => (self.state.lock(), None),
         };
         if state.shutdown_read {
+            if state.tcp_pair
+                && let Some(err) = state.so_error.take()
+            {
+                return Err(LinuxErrno::new(err));
+            }
+            return Ok((0, Vec::new()));
+        }
+        if buf.is_empty() {
             return Ok((0, Vec::new()));
         }
 
-        if state.stream_buf.is_empty() {
+        // A normal MSG_PEEK at the urgent mark must not cross it.  Without
+        // SO_OOBINLINE it exposes the suffix after the separately-readable
+        // urgent byte; with SO_OOBINLINE that byte is virtual stream data and
+        // therefore prefixes the suffix.  Neither form consumes the mark.
+        if peek && state.oob_mark == Some(0) {
+            if state.so_oobinline
+                && let Some(byte) = state.oob_data
+            {
+                buf[0] = byte;
+                let suffix_len = state.stream_buf.len().min(buf.len().saturating_sub(1));
+                for (index, slot) in buf.iter_mut().skip(1).take(suffix_len).enumerate() {
+                    *slot = state.stream_buf[index];
+                }
+                return Ok((suffix_len + 1, Vec::new()));
+            }
+
+            let suffix_len = state.stream_buf.len().min(buf.len());
+            for (index, slot) in buf.iter_mut().take(suffix_len).enumerate() {
+                *slot = state.stream_buf[index];
+            }
+            return Ok((suffix_len, Vec::new()));
+        }
+
+        // TCP urgent data has a cursor separate from its optional out-of-band
+        // byte.  A normal read that *starts* at the mark crosses it: with
+        // SO_OOBINLINE it first returns the urgent byte; otherwise it discards
+        // that byte and makes MSG_OOB subsequently fail.  A prior MSG_OOB read
+        // leaves the zero-width mark here for SIOCATMARK, with `oob_data=None`.
+        let mut inline_byte = None;
+        if state.oob_mark == Some(0) && !peek {
+            if state.so_oobinline {
+                inline_byte = state.oob_data.take();
+            } else {
+                state.oob_data = None;
+            }
+            state.oob_mark = None;
+        }
+
+        if state.stream_buf.is_empty() && inline_byte.is_none() {
             // Linux reports a pending socket error (a reset while the
             // connection sat in a closed listener's queue) from the first
             // `recv` that finds no data, before EOF; the error is consumed by
             // that report, exactly like `SO_ERROR`, so the next call sees EOF.
-            if let Some(err) = state.so_error.take() {
-                return Err(LinuxErrno::new(err));
+            if let Some(err) = state.so_error {
+                // A write after a received TCP FIN queues EPIPE for SO_ERROR
+                // (or the next send), while reads continue to report EOF.
+                if !(state.tcp_pair
+                    && state.tcp_peer_terminal == TcpPeerTerminal::Fin
+                    && err == LINUX_EPIPE.get())
+                {
+                    state.so_error = None;
+                    return Err(LinuxErrno::new(err));
+                }
             }
             if state.mock_service.is_some() {
                 if state.mock_peer_closed {
                     return Ok((0, Vec::new()));
                 }
                 return Err(LINUX_EAGAIN);
+            }
+
+            if state.tcp_pair && state.tcp_peer_terminal != TcpPeerTerminal::Open {
+                return Ok((0, Vec::new()));
             }
 
             let is_peer_alive = peer_state.as_ref().is_some_and(|p| !p.shutdown_write);
@@ -719,7 +860,9 @@ impl PureSocketInner {
         }
         drop(peer_state);
 
-        let to_read = buf.len().min(state.stream_buf.len());
+        let mark_limit = state.oob_mark.unwrap_or(state.stream_buf.len());
+        let stream_capacity = buf.len().saturating_sub(usize::from(inline_byte.is_some()));
+        let to_read = stream_capacity.min(state.stream_buf.len()).min(mark_limit);
         if peek {
             for (i, slot) in buf.iter_mut().take(to_read).enumerate() {
                 *slot = state.stream_buf[i];
@@ -727,8 +870,19 @@ impl PureSocketInner {
             return Ok((to_read, Vec::new()));
         }
 
-        for slot in buf.iter_mut().take(to_read) {
+        let mut written = 0;
+        if let Some(byte) = inline_byte {
+            if !buf.is_empty() {
+                buf[0] = byte;
+                written = 1;
+            }
+        }
+        for slot in buf.iter_mut().skip(written).take(to_read) {
             *slot = state.stream_buf.pop_front().unwrap_or(0);
+            written += 1;
+        }
+        if let Some(mark) = &mut state.oob_mark {
+            *mark = mark.saturating_sub(to_read);
         }
 
         let mut rights = Vec::new();
@@ -742,7 +896,7 @@ impl PureSocketInner {
             peer.notify_waiters();
         }
 
-        Ok((to_read, rights))
+        Ok((written, rights))
     }
 
     pub(crate) fn send_dgram(
@@ -814,6 +968,9 @@ impl PureSocketInner {
 
     pub(crate) fn shutdown(&self, how: i32) -> Result<(), LinuxErrno> {
         let mut state = self.state.lock();
+        let peer = state.peer.as_ref().and_then(Weak::upgrade);
+        let tcp_pair = state.tcp_pair;
+        let publishes_fin = matches!(how, LINUX_SHUT_WR | LINUX_SHUT_RDWR);
         match how {
             LINUX_SHUT_RD => state.shutdown_read = true,
             LINUX_SHUT_WR => state.shutdown_write = true,
@@ -823,8 +980,17 @@ impl PureSocketInner {
             }
             _ => return Err(LINUX_EINVAL),
         }
+        drop(state);
 
-        if let Some(peer) = state.peer.as_ref().and_then(|p| p.upgrade()) {
+        if tcp_pair && publishes_fin {
+            if let Some(peer) = &peer {
+                let mut peer_state = peer.state.lock();
+                if peer_state.tcp_peer_terminal == TcpPeerTerminal::Open {
+                    peer_state.tcp_peer_terminal = TcpPeerTerminal::Fin;
+                }
+            }
+        }
+        if let Some(peer) = peer {
             peer.notify_waiters();
         }
         self.notify_waiters();
@@ -838,6 +1004,10 @@ impl PureSocketInner {
     pub(crate) fn set_so_oobinline(&self, inline: bool) {
         let mut state = self.state.lock();
         state.so_oobinline = inline;
+    }
+
+    pub(crate) fn at_oob_mark(&self) -> bool {
+        self.state.lock().oob_mark == Some(0)
     }
 
     pub(crate) fn send_oob(&self, data: &[u8]) -> Result<usize, LinuxErrno> {
@@ -870,28 +1040,27 @@ impl PureSocketInner {
 
         let urgent_byte = data[data.len() - 1];
         let stream_part = &data[..data.len() - 1];
-
-        if peer_state.so_oobinline {
-            let available = send_cap.saturating_sub(peer_state.stream_buf.len());
-            if available == 0 && !data.is_empty() {
-                return Err(LINUX_EAGAIN);
-            }
-            let to_write = data.len().min(available);
-            peer_state.stream_buf.extend(&data[..to_write]);
-            drop(peer_state);
-            peer_arc.notify_waiters();
-            Ok(to_write)
-        } else {
-            if !stream_part.is_empty() {
-                let available = send_cap.saturating_sub(peer_state.stream_buf.len());
-                let to_write = stream_part.len().min(available);
-                peer_state.stream_buf.extend(&stream_part[..to_write]);
-            }
-            peer_state.oob_data = Some(urgent_byte);
-            drop(peer_state);
-            peer_arc.notify_waiters();
-            Ok(data.len())
+        // Linux has one active urgent indication.  A later MSG_OOB makes the
+        // previous urgent byte ordinary stream data at its old mark, then
+        // installs the new mark after its ordinary prefix.
+        let materialized_old = usize::from(peer_state.oob_data.is_some());
+        let needed = stream_part.len().saturating_add(materialized_old);
+        let available = send_cap.saturating_sub(peer_state.stream_buf.len());
+        if available < needed {
+            return Err(LINUX_EAGAIN);
         }
+        if let (Some(mark), Some(old_byte)) =
+            (peer_state.oob_mark.take(), peer_state.oob_data.take())
+        {
+            let insertion = mark.min(peer_state.stream_buf.len());
+            peer_state.stream_buf.insert(insertion, old_byte);
+        }
+        peer_state.stream_buf.extend(stream_part);
+        peer_state.oob_mark = Some(peer_state.stream_buf.len());
+        peer_state.oob_data = Some(urgent_byte);
+        drop(peer_state);
+        peer_arc.notify_waiters();
+        Ok(data.len())
     }
 
     pub(crate) fn recv_oob(&self, buf: &mut [u8], peek: bool) -> Result<usize, LinuxErrno> {
@@ -909,7 +1078,15 @@ impl PureSocketInner {
         }) else {
             return Err(LINUX_EINVAL);
         };
+        // Preserve the historical zero-length behavior (the selected urgent
+        // indication is consumed for a non-PEEK call) while avoiding a guest
+        // reachable empty-slice panic.  The probe records Linux's exact rule.
         if buf.is_empty() {
+            let consumed = !peek;
+            drop(state);
+            if consumed {
+                self.notify_waiters();
+            }
             return Ok(0);
         }
         buf[0] = byte;
@@ -942,6 +1119,7 @@ impl PureSocketInner {
 
         if self.socket_type == LINUX_SOCK_STREAM || self.socket_type == LINUX_SOCK_SEQPACKET {
             let has_mock = state.mock_service.is_some();
+            let tcp_terminal = state.tcp_pair && state.tcp_peer_terminal != TcpPeerTerminal::Open;
             let (peer_shut_wr, peer_shut_rd, peer_dropped) = if has_mock {
                 (state.mock_peer_closed, state.mock_peer_closed, false)
             } else if state.peer.is_none() {
@@ -951,16 +1129,23 @@ impl PureSocketInner {
             } else {
                 (true, true, true)
             };
+            let peer_shut_wr = peer_shut_wr || tcp_terminal;
 
-            if !state.stream_buf.is_empty() || state.shutdown_read || peer_shut_wr {
+            if !state.stream_buf.is_empty()
+                || (state.so_oobinline && state.oob_data.is_some())
+                || state.shutdown_read
+                || peer_shut_wr
+            {
                 mask |= LINUX_EPOLLIN;
             }
-            if !state.shutdown_write && !peer_shut_rd {
-                if has_mock {
+            if !state.shutdown_write && !state.tcp_send_terminal {
+                if state.tcp_pair && state.tcp_peer_terminal == TcpPeerTerminal::Fin {
+                    mask |= LINUX_EPOLLOUT;
+                } else if !peer_shut_rd && has_mock {
                     if state.request_buf.len() < state.so_sndbuf {
                         mask |= LINUX_EPOLLOUT;
                     }
-                } else if let Some(p) = peer_state.as_ref() {
+                } else if !peer_shut_rd && let Some(p) = peer_state.as_ref() {
                     if p.stream_buf.len() < state.so_sndbuf {
                         mask |= LINUX_EPOLLOUT;
                     }
@@ -969,7 +1154,9 @@ impl PureSocketInner {
             if peer_shut_wr {
                 mask |= LINUX_EPOLLRDHUP;
             }
-            if peer_dropped || (peer_shut_wr && peer_shut_rd) {
+            let tcp_hup = state.tcp_pair && state.tcp_peer_terminal == TcpPeerTerminal::Reset;
+            let generic_hup = !state.tcp_pair && (peer_dropped || (peer_shut_wr && peer_shut_rd));
+            if tcp_hup || generic_hup {
                 mask |= LINUX_EPOLLHUP;
             }
             if state.oob_data.is_some() {
@@ -1000,14 +1187,33 @@ impl PureSocketInner {
 impl Drop for PureSocketInner {
     fn drop(&mut self) {
         let mut state = self.state.lock();
+        let peer = state.peer.as_ref().and_then(Weak::upgrade);
+        let tcp_pair = state.tcp_pair;
+        let unread_receive = !state.stream_buf.is_empty() || !state.stream_rights.is_empty();
+        let abortive_tcp =
+            tcp_pair && ((state.so_linger.0 != 0 && state.so_linger.1 == 0) || unread_receive);
         state.shutdown_read = true;
         state.shutdown_write = true;
         state.mock_peer_closed = true;
+        state.stream_buf.clear();
+        state.stream_rights.clear();
         if let Some(rec_ref) = &state.connection_record {
             let mut rec = rec_ref.lock();
             rec.completed = true;
         }
-        if let Some(peer) = state.peer.as_ref().and_then(|p| p.upgrade()) {
+        drop(state);
+
+        if let Some(peer) = peer {
+            if tcp_pair {
+                let mut peer_state = peer.state.lock();
+                if abortive_tcp {
+                    peer_state.tcp_peer_terminal = TcpPeerTerminal::Reset;
+                    peer_state.tcp_send_terminal = true;
+                    peer_state.so_error = Some(carrick_abi::LINUX_ECONNRESET.get());
+                } else if peer_state.tcp_peer_terminal == TcpPeerTerminal::Open {
+                    peer_state.tcp_peer_terminal = TcpPeerTerminal::Fin;
+                }
+            }
             peer.notify_waiters();
         }
     }
@@ -1275,6 +1481,127 @@ mod tests {
         );
     }
 
+    fn tcp_pair() -> (Arc<PureSocketInner>, Arc<PureSocketInner>) {
+        PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        )
+    }
+
+    #[test]
+    fn tcp_final_close_preserves_data_fin_and_write_error_transition() {
+        let (client, server) = tcp_pair();
+        assert_eq!(server.send_stream(b"data", Vec::new()), Ok(4));
+        drop(server);
+
+        let mut buf = [0; 8];
+        assert_eq!(
+            client.poll_mask() & LINUX_EPOLLOUT,
+            LINUX_EPOLLOUT,
+            "TCP FIN before poll preserves writable connect completion"
+        );
+        assert_eq!(client.recv_stream(&mut buf, 0).unwrap().0, 4);
+        assert_eq!(client.recv_stream(&mut buf, 0).unwrap().0, 0);
+        assert_eq!(client.send_stream(b"x", Vec::new()), Ok(1));
+        assert_eq!(client.recv_stream(&mut buf, 0).unwrap().0, 0);
+        assert_eq!(client.take_so_error(), Some(LINUX_EPIPE.get()));
+        assert_eq!(client.send_stream(b"y", Vec::new()), Err(LINUX_EPIPE));
+    }
+
+    #[test]
+    fn tcp_shutdown_rdwr_keeps_peer_alive_for_reset_transition() {
+        let (client, server) = tcp_pair();
+        server.shutdown(LINUX_SHUT_RDWR).unwrap();
+
+        let mut buf = [0; 8];
+        let mask = client.poll_mask();
+        assert_eq!(mask & LINUX_EPOLLIN, LINUX_EPOLLIN);
+        assert_eq!(mask & LINUX_EPOLLOUT, LINUX_EPOLLOUT);
+        assert_eq!(mask & LINUX_EPOLLRDHUP, LINUX_EPOLLRDHUP);
+        assert_eq!(mask & LINUX_EPOLLHUP, 0, "TCP FIN is not connection HUP");
+        assert_eq!(client.recv_stream(&mut buf, 0).unwrap().0, 0);
+        assert_eq!(client.send_stream(b"x", Vec::new()), Ok(1));
+        assert_eq!(
+            server.recv_stream(&mut buf, 0).unwrap_err(),
+            carrick_abi::LINUX_ECONNRESET
+        );
+        assert_eq!(client.take_so_error(), Some(LINUX_EPIPE.get()));
+        assert_eq!(client.send_stream(b"y", Vec::new()), Err(LINUX_EPIPE));
+    }
+
+    #[test]
+    fn tcp_abortive_final_close_preserves_delivered_data_then_reports_reset() {
+        let (client, server) = tcp_pair();
+        assert_eq!(server.send_stream(b"discard", Vec::new()), Ok(7));
+        server.set_so_linger((1, 0));
+        drop(server);
+
+        let mut buf = [0; 8];
+        assert_eq!(client.recv_stream(&mut buf, 0).unwrap().0, 7);
+        assert_eq!(&buf[..7], b"discard");
+        assert_eq!(
+            client.recv_stream(&mut buf, 0).unwrap_err(),
+            carrick_abi::LINUX_ECONNRESET
+        );
+        assert_eq!(client.recv_stream(&mut buf, 0).unwrap().0, 0);
+        assert_eq!(client.send_stream(b"x", Vec::new()), Err(LINUX_EPIPE));
+    }
+
+    #[test]
+    fn tcp_final_close_with_unread_receive_data_reports_reset() {
+        let (client, server) = tcp_pair();
+        assert_eq!(client.send_stream(b"unread", Vec::new()), Ok(6));
+        drop(server);
+
+        let mut buf = [0; 8];
+        assert_eq!(
+            client.recv_stream(&mut buf, 0).unwrap_err(),
+            carrick_abi::LINUX_ECONNRESET
+        );
+        assert_eq!(client.recv_stream(&mut buf, 0).unwrap().0, 0);
+        assert_eq!(client.send_stream(b"x", Vec::new()), Err(LINUX_EPIPE));
+    }
+
+    #[test]
+    fn tcp_abortive_close_error_can_be_consumed_by_send_first() {
+        let (client, server) = tcp_pair();
+        server.set_so_linger((1, 0));
+        drop(server);
+
+        assert_eq!(
+            client.send_stream(b"x", Vec::new()),
+            Err(carrick_abi::LINUX_ECONNRESET)
+        );
+        assert_eq!(client.send_stream(b"y", Vec::new()), Err(LINUX_EPIPE));
+        let mut buf = [0; 1];
+        assert_eq!(client.recv_stream(&mut buf, 0).unwrap().0, 0);
+    }
+
+    #[test]
+    fn tcp_empty_send_after_fin_does_not_consume_the_admitted_write() {
+        let (client, server) = tcp_pair();
+        drop(server);
+
+        assert_eq!(client.send_stream(&[], Vec::new()), Ok(0));
+        assert_eq!(client.take_so_error(), None);
+        assert_eq!(client.send_stream(b"x", Vec::new()), Ok(1));
+        assert_eq!(client.take_so_error(), Some(LINUX_EPIPE.get()));
+    }
+
+    #[test]
+    fn unix_stream_final_close_keeps_existing_epipe_semantics() {
+        let (client, server) = PureSocketInner::pair(
+            LINUX_SOCK_STREAM,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+        drop(server);
+        assert_eq!(client.send_stream(b"x", Vec::new()), Err(LINUX_EPIPE));
+    }
+
     /// Two guest threads polling the two halves of one connection at once
     /// (a Go server and its client in the same process, each in
     /// `epoll_wait`) must never deadlock: readiness on one half needs the
@@ -1398,5 +1725,114 @@ mod tests {
 
         // Subsequent recv without new OOB is EINVAL
         assert_eq!(s2.recv_oob(&mut buf, false), Err(LINUX_EINVAL));
+    }
+
+    #[test]
+    fn inet_stream_oob_mark_caps_then_normal_read_crosses_it() {
+        let (sender, receiver) = tcp_pair();
+        sender.send_oob(b"hello").unwrap();
+        sender.send_stream(b"world", Vec::new()).unwrap();
+
+        let mut buf = [0u8; 8];
+        assert_eq!(receiver.recv_stream(&mut buf, 0).unwrap().0, 4);
+        assert_eq!(&buf[..4], b"hell");
+        assert!(receiver.at_oob_mark());
+        assert_eq!(receiver.poll_mask() & LINUX_EPOLLPRI, LINUX_EPOLLPRI);
+
+        // A normal read at the mark crosses it, making separate MSG_OOB
+        // unavailable and exposing only the ordinary suffix.
+        assert_eq!(receiver.recv_stream(&mut buf, 0).unwrap().0, 5);
+        assert_eq!(&buf[..5], b"world");
+        assert!(!receiver.at_oob_mark());
+        assert_eq!(receiver.recv_oob(&mut buf, false), Err(LINUX_EINVAL));
+        assert_eq!(receiver.poll_mask() & LINUX_EPOLLPRI, 0);
+    }
+
+    #[test]
+    fn inet_stream_repeated_oob_supersedes_and_materializes_old_byte() {
+        let (sender, receiver) = tcp_pair();
+        sender.send_oob(b"one!").unwrap();
+        sender.send_oob(b"two?").unwrap();
+        sender.send_stream(b"tail", Vec::new()).unwrap();
+
+        let mut buf = [0u8; 16];
+        assert_eq!(receiver.recv_stream(&mut buf, 0).unwrap().0, 7);
+        assert_eq!(&buf[..7], b"one!two");
+        assert!(receiver.at_oob_mark());
+        assert_eq!(receiver.recv_oob(&mut buf, false), Ok(1));
+        assert_eq!(buf[0], b'?');
+        assert_eq!(receiver.poll_mask() & LINUX_EPOLLPRI, 0);
+        assert_eq!(receiver.recv_stream(&mut buf, 0).unwrap().0, 4);
+        assert_eq!(&buf[..4], b"tail");
+    }
+
+    #[test]
+    fn inet_stream_oob_peek_and_inline_toggle_preserve_the_mark() {
+        let (sender, receiver) = tcp_pair();
+        sender.send_oob(b"hello").unwrap();
+        sender.send_stream(b"world", Vec::new()).unwrap();
+
+        let mut buf = [0u8; 8];
+        assert_eq!(receiver.recv_stream_flags(&mut buf, 0, true).unwrap().0, 4);
+        assert_eq!(&buf[..4], b"hell");
+        assert!(!receiver.at_oob_mark());
+        assert_eq!(receiver.recv_stream(&mut buf, 0).unwrap().0, 4);
+        assert!(receiver.at_oob_mark());
+        assert_eq!(receiver.recv_stream_flags(&mut buf, 0, true).unwrap().0, 5);
+        assert_eq!(&buf[..5], b"world");
+        assert!(receiver.at_oob_mark());
+        assert_eq!(receiver.poll_mask() & LINUX_EPOLLPRI, LINUX_EPOLLPRI);
+        assert_eq!(receiver.recv_oob(&mut buf, true), Ok(1));
+        assert_eq!(buf[0], b'o');
+        assert_eq!(receiver.poll_mask() & LINUX_EPOLLPRI, LINUX_EPOLLPRI);
+
+        // OOBINLINE is evaluated when consuming pending urgent data, not when
+        // it was sent.  MSG_OOB becomes EINVAL but the priority indication
+        // survives until the normal read consumes the inline byte.
+        receiver.set_so_oobinline(true);
+        assert_eq!(receiver.recv_oob(&mut buf, false), Err(LINUX_EINVAL));
+        assert_eq!(receiver.poll_mask() & LINUX_EPOLLPRI, LINUX_EPOLLPRI);
+        assert_eq!(receiver.recv_stream(&mut buf, 0).unwrap().0, 6);
+        assert_eq!(&buf[..6], b"oworld");
+        assert_eq!(receiver.poll_mask() & LINUX_EPOLLPRI, 0);
+    }
+
+    #[test]
+    fn inet_stream_inline_oob_peek_at_mark_is_non_mutating() {
+        let (sender, receiver) = tcp_pair();
+        sender.send_oob(b"hello").unwrap();
+        sender.send_stream(b"world", Vec::new()).unwrap();
+
+        let mut buf = [0u8; 8];
+        assert_eq!(receiver.recv_stream(&mut buf, 0).unwrap().0, 4);
+        receiver.set_so_oobinline(true);
+        assert_eq!(receiver.recv_stream_flags(&mut buf, 0, true).unwrap().0, 6);
+        assert_eq!(&buf[..6], b"oworld");
+        assert!(receiver.at_oob_mark());
+        assert_eq!(receiver.poll_mask() & LINUX_EPOLLPRI, LINUX_EPOLLPRI);
+        assert_eq!(receiver.recv_stream(&mut buf, 0).unwrap().0, 6);
+        assert_eq!(&buf[..6], b"oworld");
+
+        let (sender, receiver) = tcp_pair();
+        sender.send_oob(b"!").unwrap();
+        receiver.set_so_oobinline(true);
+        assert_eq!(receiver.poll_mask() & LINUX_EPOLLIN, LINUX_EPOLLIN);
+
+        // Zero-length normal reads observe no bytes and must not cross a fresh mark.
+        let (sender, receiver) = tcp_pair();
+        sender.send_oob(b"!").unwrap();
+        let mut empty = [];
+        assert_eq!(receiver.recv_stream(&mut empty, 0).unwrap().0, 0);
+        assert!(receiver.at_oob_mark());
+
+        // A zero-length MSG_OOB PEEK retains readiness; its consuming form
+        // clears the urgent indication and wakes observers just like a
+        // non-empty consuming receive.
+        let (sender, receiver) = tcp_pair();
+        sender.send_oob(b"!").unwrap();
+        assert_eq!(receiver.recv_oob(&mut empty, true), Ok(0));
+        assert_eq!(receiver.poll_mask() & LINUX_EPOLLPRI, LINUX_EPOLLPRI);
+        assert_eq!(receiver.recv_oob(&mut empty, false), Ok(0));
+        assert_eq!(receiver.poll_mask() & LINUX_EPOLLPRI, 0);
     }
 }

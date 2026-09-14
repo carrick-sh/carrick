@@ -498,6 +498,16 @@ impl<'a> NetView<'a> {
                     }
                 }
             }
+            if level == LINUX_SOL_IPV6
+                && optname == crate::linux_abi::LINUX_IPV6_V6ONLY
+                && optlen >= 4
+                && let Ok(b) = memory.read_bytes(optval_addr, 4)
+                && let Some(open_file) = this.open_file(fd)
+                && let Some(mut open) = open_file.description.write()
+                && let OpenDescription::HostSocket { base, .. } = &mut *open
+            {
+                base.set_ipv6_v6only(i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) != 0);
+            }
             // IP_RECVERR / IPV6_RECVERR: the guest is opting into Linux's UDP
             // ERROR QUEUE. Darwin has neither the option nor the queue, so
             // accept it here and model the queue ourselves — see
