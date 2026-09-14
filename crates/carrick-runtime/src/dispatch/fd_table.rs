@@ -54,7 +54,7 @@ use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::linux_abi::{
     LINUX_EFBIG, LINUX_EINVAL, LINUX_EOVERFLOW, LINUX_S_IFCHR, LINUX_S_IFIFO, LINUX_S_IFMT,
-    LINUX_S_IFREG, LINUX_S_IFSOCK, LinuxEpollEvent,
+    LINUX_S_IFREG, LINUX_S_IFSOCK, LinuxEpollEvent, LinuxEpollEvents,
 };
 use crate::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
 
@@ -111,6 +111,16 @@ pub(super) struct EpollInterest {
     ///   accepted — its first accept, which the ET contract requires, resets
     ///   the baseline.
     pub(super) last_read_avail: u64,
+    /// Last in-zone listener enqueue generation sampled for this registration.
+    /// It is distinct from `last_read_avail`: a guest-to-guest connection
+    /// arrives through EVFILT_USER, while host listener arrivals carry kqueue
+    /// queue depth.  Equal depths across those sources still describe a new ET
+    /// edge.
+    pub(super) last_inzone_arrival_generation: Option<u64>,
+    /// Last host listener accept-queue depth delivered from a real kqueue
+    /// record. Kept separate from the in-zone enqueue generation: a fallback
+    /// sample after EVFILT_USER has no host queue-depth authority.
+    pub(super) last_host_listener_count: Option<u64>,
     /// Edge-triggered write side was attempted and returned EAGAIN after an
     /// earlier EPOLLOUT delivery. Keep the host write filter armed while still
     /// suppressing immediate sampled OUT redelivery; the next host write event
@@ -134,6 +144,15 @@ pub(super) struct EpollInterest {
     /// rejected instead of mis-delivered. (epoll_et_pipe_eof_not_lost.)
     pub(super) reg_gen: u32,
     pub(super) _callback_enrollment: Option<Arc<crate::kernel::WaitCallbackEnrollment>>,
+}
+
+/// The listener-local facts that belong to one readiness observation.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ListenerReadinessSample {
+    pub(super) ready: LinuxEpollEvents,
+    /// Host poll readiness only; excludes the in-zone queue contribution.
+    pub(super) host_ready: LinuxEpollEvents,
+    pub(super) inzone: Option<crate::network::inzone::ListenerReadinessSnapshot>,
 }
 
 #[derive(Debug)]
@@ -1901,6 +1920,63 @@ impl super::SyscallDispatcher {
 
 pub(super) type OpenDescriptionRef = Arc<RwLock<OpenDescription>>;
 
+pub(super) fn listening_socket_readiness_sample(
+    description: &OpenDescription,
+    interest: LinuxEpollEvents,
+) -> Option<ListenerReadinessSample> {
+    let OpenDescription::HostSocket { host_fd, base, .. } = description else {
+        return None;
+    };
+    if !base.listening() {
+        return None;
+    }
+    if base.pending_socket_error().is_some() {
+        let mut ready = LinuxEpollEvents::ERR;
+        if interest.contains(LinuxEpollEvents::OUT) {
+            ready |= LinuxEpollEvents::OUT;
+        }
+        return Some(ListenerReadinessSample {
+            ready: ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP),
+            host_ready: LinuxEpollEvents::ERR,
+            inzone: None,
+        });
+    }
+    let inzone = base
+        .inzone_listener()
+        .map(|listener| listener.readiness_snapshot());
+    let mut ready = LinuxEpollEvents::empty();
+    let mut host_ready = LinuxEpollEvents::empty();
+    if inzone.is_some_and(|snapshot| snapshot.pending > 0)
+        && interest.contains(LinuxEpollEvents::IN)
+    {
+        ready |= LinuxEpollEvents::IN;
+    }
+    let mut pfd = libc::pollfd {
+        fd: host_fd.raw(),
+        events: 0,
+        revents: 0,
+    };
+    if interest.contains(LinuxEpollEvents::IN) {
+        pfd.events |= libc::POLLIN;
+    }
+    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if rc > 0 {
+        if pfd.revents & libc::POLLIN != 0 {
+            ready |= LinuxEpollEvents::IN;
+            host_ready |= LinuxEpollEvents::IN;
+        }
+        if pfd.revents & libc::POLLERR != 0 {
+            ready |= LinuxEpollEvents::ERR;
+            host_ready |= LinuxEpollEvents::ERR;
+        }
+    }
+    Some(ListenerReadinessSample {
+        ready: ready & (interest | LinuxEpollEvents::ERR),
+        host_ready,
+        inzone,
+    })
+}
+
 impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
     fn is_epoll(&self) -> bool {
         matches!(
@@ -2288,31 +2364,8 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 let is_stream_like = *type_ == carrick_abi::LINUX_SOCK_STREAM
                     || *type_ == carrick_abi::LINUX_SOCK_SEQPACKET;
                 if is_stream_like {
-                    if base.listening() {
-                        let inzone_has_pending =
-                            base.inzone_listener().is_some_and(|l| l.pending() > 0);
-                        let mut ready = LinuxEpollEvents::empty();
-                        if inzone_has_pending && interest.contains(LinuxEpollEvents::IN) {
-                            ready |= LinuxEpollEvents::IN;
-                        }
-                        let mut pfd = libc::pollfd {
-                            fd: host_fd.raw(),
-                            events: 0,
-                            revents: 0,
-                        };
-                        if interest.contains(LinuxEpollEvents::IN) {
-                            pfd.events |= libc::POLLIN;
-                        }
-                        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-                        if rc > 0 {
-                            if pfd.revents & libc::POLLIN != 0 {
-                                ready |= LinuxEpollEvents::IN;
-                            }
-                            if pfd.revents & libc::POLLERR != 0 {
-                                ready |= LinuxEpollEvents::ERR;
-                            }
-                        }
-                        return ready & (interest | LinuxEpollEvents::ERR);
+                    if let Some(sample) = listening_socket_readiness_sample(&open, interest) {
+                        return sample.ready;
                     }
                     let is_connected = base.connected()
                         || super::net::host_stream_socket_is_connected(host_fd.raw());

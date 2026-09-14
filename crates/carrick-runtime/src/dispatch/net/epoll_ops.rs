@@ -435,6 +435,19 @@ impl<'a> NetView<'a> {
             .saturating_add(synthetic_bytes)
     }
 
+    fn listening_socket_readiness_sample_for_poll(
+        &self,
+        fd: i32,
+        requested: u32,
+    ) -> Option<crate::dispatch::fd_table::ListenerReadinessSample> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read()?;
+        crate::dispatch::fd_table::listening_socket_readiness_sample(
+            &open,
+            carrick_abi::LinuxEpollEvents::from_bits_retain(requested),
+        )
+    }
+
     /// Consumption-based EPOLLET re-arm for the Linux lane's sampled epoll
     /// emulation: after the guest performs a read-family syscall on fd X,
     /// clear the read-side bits of `last_ready` for X in every epoll interest
@@ -962,7 +975,18 @@ impl<'a> NetView<'a> {
             // guest_fd -> (accumulated epoll events, epoll_data); read+write filters
             // for the same fd merge into one returned event.
             let mut acc: HashMap<i32, (u32, u64)> = HashMap::new();
-            type ReadyUpdate = (i32, u32, u64, u32, Option<u64>, bool, bool, bool);
+            type ReadyUpdate = (
+                i32,
+                u32,
+                u64,
+                u32,
+                Option<u64>,
+                Option<u64>,
+                Option<u64>,
+                bool,
+                bool,
+                bool,
+            );
             let mut ready_updates: Vec<ReadyUpdate> = Vec::new();
             let mut host_ready_sampled = std::collections::HashSet::<i32>::new();
             const READ_READY_BITS: u32 =
@@ -1021,8 +1045,20 @@ impl<'a> NetView<'a> {
                             };
                             // Per-guest-fd epoll interest snapshot: (host_fd,
                             // events, epoll data, reg_gen, io_gen, last_ready,
-                            // last_read_avail, write_backpressured).
-                            type GfdInterest = (i32, u32, u64, u32, u64, u32, u64, bool);
+                            // last_read_avail, last in-zone arrival generation,
+                            // write_backpressured).
+                            type GfdInterest = (
+                                i32,
+                                u32,
+                                u64,
+                                u32,
+                                u64,
+                                u32,
+                                u64,
+                                Option<u64>,
+                                Option<u64>,
+                                bool,
+                            );
                             let mut info: HashMap<i32, GfdInterest> = HashMap::new();
                             let mut rev: HashMap<i32, Vec<i32>> = HashMap::new();
                             if let OpenDescription::Epoll { interest, .. } = &*open {
@@ -1038,6 +1074,8 @@ impl<'a> NetView<'a> {
                                                 slot.io_gen,
                                                 slot.last_ready,
                                                 slot.last_read_avail,
+                                                slot.last_inzone_arrival_generation,
+                                                slot.last_host_listener_count,
                                                 slot.write_backpressured,
                                             ),
                                         );
@@ -1075,7 +1113,7 @@ impl<'a> NetView<'a> {
                                 edge_readiness_count.min(i32::MAX as u64) as i32,
                             );
                             match gfd_info.get(&guest_fd) {
-                                Some(&(hfd, _, _, reg_gen, _, _, _, _))
+                                Some(&(hfd, _, _, reg_gen, _, _, _, _, _, _))
                                     if reg_gen == generation =>
                                 {
                                     if let Some(siblings) = host_to_gfds.get(&hfd) {
@@ -1118,11 +1156,18 @@ impl<'a> NetView<'a> {
                                 io_gen,
                                 last_ready,
                                 last_read_avail,
+                                last_inzone_arrival_generation,
+                                last_host_listener_count,
                                 write_backpressured,
                             )) = gfd_info.get(&gfd)
                             {
                                 host_ready_sampled.insert(gfd);
-                                let mut raw = this.epoll_ready_events(gfd, requested);
+                                let listener_sample =
+                                    this.listening_socket_readiness_sample_for_poll(gfd, requested);
+                                let mut raw = listener_sample.as_ref().map_or_else(
+                                    || this.epoll_ready_events(gfd, requested),
+                                    |sample| sample.ready.bits(),
+                                );
                                 let terminal_edge = edge_bits
                                     & (LINUX_EPOLLRDHUP | LINUX_EPOLLHUP | LINUX_EPOLLERR);
                                 raw |= terminal_edge;
@@ -1139,6 +1184,21 @@ impl<'a> NetView<'a> {
                                 } else {
                                     edge_readiness_count
                                 };
+                                let inzone_arrival_generation =
+                                    listener_sample.as_ref().and_then(|sample| {
+                                        sample.inzone.and_then(|snapshot| {
+                                            (snapshot.pending > 0)
+                                                .then_some(snapshot.arrival_generation)
+                                        })
+                                    });
+                                let host_listener_count =
+                                    listener_sample.as_ref().and_then(|sample| {
+                                        (sample.inzone.is_some()
+                                            && sample
+                                                .host_ready
+                                                .contains(carrick_abi::LinuxEpollEvents::IN))
+                                        .then_some(edge_readiness_count)
+                                    });
                                 let clear_write_backpressure =
                                     write_backpressured && raw & LINUX_EPOLLOUT != 0;
                                 // Growth over the recorded baseline delivers a
@@ -1154,8 +1214,12 @@ impl<'a> NetView<'a> {
                                 // its accept-queue depth is non-monotone.
                                 let read_growth = if requested & LINUX_EPOLLET != 0
                                     && raw & READ_READY_BITS != 0
-                                    && observed_read_avail > last_read_avail
-                                {
+                                    && if inzone_arrival_generation.is_some() {
+                                        inzone_arrival_generation != last_inzone_arrival_generation
+                                            || host_listener_count > last_host_listener_count
+                                    } else {
+                                        observed_read_avail > last_read_avail
+                                    } {
                                     raw & READ_READY_BITS
                                 } else {
                                     0
@@ -1183,6 +1247,8 @@ impl<'a> NetView<'a> {
                                     io_gen,
                                     raw,
                                     read_avail_update,
+                                    inzone_arrival_generation,
+                                    host_listener_count,
                                     clear_write_backpressure,
                                     true,
                                     masked_ready,
@@ -1252,18 +1318,37 @@ impl<'a> NetView<'a> {
                 }
                 host_ready_sampled.insert(*fd);
                 let requested = interest.event.events;
-                let raw_ready = this.epoll_ready_events(*fd, requested);
+                let listener_sample =
+                    this.listening_socket_readiness_sample_for_poll(*fd, requested);
+                let raw_ready = listener_sample.as_ref().map_or_else(
+                    || this.epoll_ready_events(*fd, requested),
+                    |sample| sample.ready.bits(),
+                );
                 let read_avail = if raw_ready & READ_READY_BITS != 0 {
                     this.host_read_avail_for_poll(*fd)
                 } else {
                     0
                 };
+                let inzone_arrival_generation = listener_sample.as_ref().and_then(|sample| {
+                    sample.inzone.and_then(|snapshot| {
+                        (snapshot.pending > 0).then_some(snapshot.arrival_generation)
+                    })
+                });
+                let host_listener_count = listener_sample.as_ref().and_then(|sample| {
+                    sample
+                        .host_ready
+                        .contains(carrick_abi::LinuxEpollEvents::IN)
+                        .then_some(interest.last_host_listener_count.unwrap_or(0).max(1))
+                });
                 let clear_write_backpressure =
                     interest.write_backpressured && raw_ready & LINUX_EPOLLOUT != 0;
                 let read_growth = if requested & LINUX_EPOLLET != 0
                     && raw_ready & READ_READY_BITS != 0
-                    && read_avail > interest.last_read_avail
-                {
+                    && if inzone_arrival_generation.is_some() {
+                        inzone_arrival_generation != interest.last_inzone_arrival_generation
+                    } else {
+                        read_avail > interest.last_read_avail
+                    } {
                     raw_ready & READ_READY_BITS
                 } else {
                     0
@@ -1325,6 +1410,8 @@ impl<'a> NetView<'a> {
                     interest.io_gen,
                     raw_ready,
                     read_avail_update,
+                    inzone_arrival_generation,
+                    host_listener_count,
                     clear_write_backpressure,
                     false,
                     masked_ready,
@@ -1381,16 +1468,29 @@ impl<'a> NetView<'a> {
                     continue;
                 }
                 let requested = interest.event.events;
-                let raw_ready = this.epoll_ready_events(*fd, requested);
+                let listener_sample =
+                    this.listening_socket_readiness_sample_for_poll(*fd, requested);
+                let raw_ready = listener_sample.as_ref().map_or_else(
+                    || this.epoll_ready_events(*fd, requested),
+                    |sample| sample.ready.bits(),
+                );
                 let read_avail = if raw_ready & READ_READY_BITS != 0 {
                     this.host_read_avail_for_poll(*fd)
                 } else {
                     0
                 };
+                let inzone_arrival_generation = listener_sample.as_ref().and_then(|sample| {
+                    sample.inzone.and_then(|snapshot| {
+                        (snapshot.pending > 0).then_some(snapshot.arrival_generation)
+                    })
+                });
                 let read_growth = if requested & LINUX_EPOLLET != 0
                     && raw_ready & READ_READY_BITS != 0
-                    && read_avail > interest.last_read_avail
-                {
+                    && if inzone_arrival_generation.is_some() {
+                        inzone_arrival_generation != interest.last_inzone_arrival_generation
+                    } else {
+                        read_avail > interest.last_read_avail
+                    } {
                     raw_ready & READ_READY_BITS
                 } else {
                     0
@@ -1411,6 +1511,8 @@ impl<'a> NetView<'a> {
                     interest.io_gen,
                     raw_ready,
                     read_avail_update,
+                    inzone_arrival_generation,
+                    None,
                     false,
                     false,
                     false,
@@ -1480,6 +1582,8 @@ impl<'a> NetView<'a> {
                             io_gen,
                             raw,
                             read_avail,
+                            inzone_arrival_generation,
+                            host_listener_count,
                             clear_write_backpressure,
                             edge_drained,
                             masked_ready,
@@ -1500,6 +1604,10 @@ impl<'a> NetView<'a> {
                                 slot.last_ready = raw;
                                 if let Some(read_avail) = read_avail {
                                     slot.last_read_avail = read_avail;
+                                }
+                                slot.last_inzone_arrival_generation = inzone_arrival_generation;
+                                if host_listener_count.is_some() {
+                                    slot.last_host_listener_count = host_listener_count;
                                 }
                                 if clear_write_backpressure {
                                     slot.write_backpressured = false;
@@ -3147,6 +3255,8 @@ impl<'a> NetView<'a> {
                             event,
                             last_ready: 0,
                             last_read_avail: 0,
+                            last_inzone_arrival_generation: None,
+                            last_host_listener_count: None,
                             write_backpressured: false,
                             io_gen: 0,
                             reg_gen,
@@ -3204,9 +3314,11 @@ impl<'a> NetView<'a> {
                         target: slot.target.clone(),
                         host_poll_source,
                         event,
-                        last_ready: 0,
-                        last_read_avail: 0,
-                        write_backpressured: false,
+                            last_ready: 0,
+                            last_read_avail: 0,
+                            last_inzone_arrival_generation: None,
+                            last_host_listener_count: None,
+                            write_backpressured: false,
                         io_gen: 0,
                         reg_gen,
                         _callback_enrollment: slot._callback_enrollment.clone(),

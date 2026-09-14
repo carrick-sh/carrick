@@ -1534,6 +1534,149 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         assert_eq!(data, listener as u64);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn epoll_et_host_then_inzone_arrival_tracks_separate_latches() {
+        check_mixed_listener_arrivals(false);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn epoll_et_inzone_then_host_arrival_tracks_separate_latches() {
+        check_mixed_listener_arrivals(true);
+    }
+
+    /// Each order starts with a fresh listener, so the second source cannot
+    /// inherit a baseline from an earlier arrival of the same source.
+    #[cfg(target_os = "macos")]
+    fn check_mixed_listener_arrivals(inzone_first: bool) {
+        use carrick_abi::{LINUX_SO_ERROR, LINUX_SOL_SOCKET};
+
+        let mut h = Harness::new();
+        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;
+        let listener = returned(h.call(
+            198,
+            [
+                LINUX_AF_INET as u64,
+                LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
+                0,
+                0,
+                0,
+                0,
+            ],
+        )) as i32;
+        let bind_addr = h.reserve(16);
+        let mut sockaddr = [0u8; 16];
+        sockaddr[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+        sockaddr[2..4].copy_from_slice(&0u16.to_be_bytes());
+        sockaddr[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        h.memory.write_bytes(bind_addr, &sockaddr).unwrap();
+        assert_eq!(returned(h.call(200, [listener as u64, bind_addr, 16, 0, 0, 0])), 0);
+        assert_eq!(returned(h.call(201, [listener as u64, 128, 0, 0, 0, 0])), 0);
+
+        let name_addr = h.reserve(16);
+        let name_len_addr = h.reserve(4);
+        h.memory.write_bytes(name_len_addr, &(16u32).to_ne_bytes()).unwrap();
+        assert_eq!(returned(h.call(204, [listener as u64, name_addr, name_len_addr, 0, 0, 0])), 0);
+        let bound = h.memory.read_bytes(name_addr, 16).unwrap();
+        let port = u16::from_be_bytes([bound[2], bound[3]]);
+
+        let event_addr = h.reserve(16);
+        let mut event = [0u8; 16];
+        event[0..4].copy_from_slice(&(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes());
+        event[8..16].copy_from_slice(&(listener as u64).to_le_bytes());
+        h.memory.write_bytes(event_addr, &event).unwrap();
+        assert_eq!(returned(h.call(21, [epfd, LINUX_EPOLL_CTL_ADD, listener as u64, event_addr, 0, 0])), 0);
+
+        let connect_guest = |h: &mut Harness| {
+            let client = returned(h.call(
+                198,
+                [
+                    LINUX_AF_INET as u64,
+                    LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )) as i32;
+            let client_addr = h.reserve(16);
+            let mut target = [0u8; 16];
+            target[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+            target[2..4].copy_from_slice(&port.to_be_bytes());
+            target[4..8].copy_from_slice(&[127, 0, 0, 1]);
+            h.memory.write_bytes(client_addr, &target).unwrap();
+            assert_eq!(errno(h.call(203, [client as u64, client_addr, 16, 0, 0, 0])), 115);
+
+            let poll_addr = h.reserve(8);
+            let timeout_addr = h.reserve(16);
+            let mut pollfd = [0u8; 8];
+            pollfd[0..4].copy_from_slice(&client.to_le_bytes());
+            pollfd[4..6].copy_from_slice(&LINUX_POLLOUT.to_le_bytes());
+            h.memory.write_bytes(poll_addr, &pollfd).unwrap();
+            let mut timeout = [0u8; 16];
+            timeout[0..8].copy_from_slice(&1i64.to_le_bytes());
+            h.memory.write_bytes(timeout_addr, &timeout).unwrap();
+            match h.call(73, [poll_addr, 1, timeout_addr, 0, 0, 0]) {
+                DispatchOutcome::Returned { value } => assert_eq!(value, 1),
+                DispatchOutcome::WaitOnFds { fds, .. } => {
+                    let (host_fd, events) = fds.first().expect("connect wait fd");
+                    let mut pfd = libc::pollfd { fd: host_fd, events, revents: 0 };
+                    assert_eq!(unsafe { libc::poll(&mut pfd, 1, 1000) }, 1, "connect completion");
+                    assert_eq!(returned(h.call(73, [poll_addr, 1, timeout_addr, 0, 0, 0])), 1);
+                }
+                other => panic!("ppoll guest nonblocking connect: {other:?}"),
+            }
+            let revents = i16::from_le_bytes(h.memory.read_bytes(poll_addr + 6, 2).unwrap().try_into().unwrap());
+            assert_ne!(revents & LINUX_POLLOUT, 0);
+            let error_addr = h.reserve(4);
+            let error_len_addr = h.reserve(4);
+            h.memory.write_bytes(error_len_addr, &4u32.to_le_bytes()).unwrap();
+            assert_eq!(returned(h.call(209, [client as u64, LINUX_SOL_SOCKET as u64, LINUX_SO_ERROR as u64, error_addr, error_len_addr, 0])), 0);
+            assert_eq!(i32::from_le_bytes(h.memory.read_bytes(error_addr, 4).unwrap().try_into().unwrap()), 0);
+            client
+        };
+
+        let out_addr = h.reserve(16);
+        let host_addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let connect_host = || {
+            std::net::TcpStream::connect_timeout(&host_addr, Duration::from_secs(1))
+                .expect("host TCP connection completes")
+        };
+        // Keep host clients alive with RAII, including during assertion unwind.
+        let mut host_clients = Vec::new();
+        if inzone_first {
+            connect_guest(&mut h);
+        } else {
+            host_clients.push(connect_host());
+        }
+        assert_eq!(epoll_wait_ready(&mut h, epfd, out_addr), 1);
+        assert_eq!(
+            returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0])),
+            0,
+            "first unread arrival must not be delivered twice"
+        );
+
+        if inzone_first {
+            host_clients.push(connect_host());
+        } else {
+            connect_guest(&mut h);
+        }
+        assert_eq!(
+            epoll_wait_ready(&mut h, epfd, out_addr),
+            1,
+            "arrival from the other source must produce a fresh edge"
+        );
+        let event = h.memory.read_bytes(out_addr, 16).unwrap();
+        assert_ne!(u32::from_le_bytes(event[0..4].try_into().unwrap()) & LINUX_EPOLLIN, 0);
+        assert_eq!(u64::from_le_bytes(event[8..16].try_into().unwrap()), listener as u64);
+        assert_eq!(
+            returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0])),
+            0,
+            "second unread arrival must not be delivered twice"
+        );
+    }
+
     // A listener's ET readiness is "a connection ARRIVED since you last
     // drained", NOT "the accept queue got deeper": its readiness COUNT (the
     // kqueue `EVFILT_READ` `data` = pending accept-queue depth, which is the
