@@ -846,6 +846,19 @@ impl Default for Platform {
     }
 }
 
+/// Whether initial credentials were fully resolved at spec construction or must
+/// be resolved against the image root prepared by the runtime.
+///
+/// Older serialized specs have no field and therefore retain their resolved
+/// uid/gid behavior through the default.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitialIdentity {
+    #[default]
+    Resolved,
+    Named(String),
+}
+
 /// The fully-resolved launch request: everything `carrick-runtime` needs to
 /// start one Linux process, with every CLI-vs-image precedence decision already
 /// made.
@@ -886,6 +899,11 @@ pub struct ProcessSpec {
     /// with no group, docker uses gid 0.
     #[serde(default)]
     pub gid: carrick_abi::NsGid,
+    /// A named `--user` / image `USER` expression retained for resolution
+    /// against the prepared image root. Defaults to [`InitialIdentity::Resolved`]
+    /// for persisted specs from earlier builds.
+    #[serde(default)]
+    pub initial_identity: InitialIdentity,
     /// PID namespace mode (`docker run --pid`). `Private` (default) gives the
     /// container its own pid ns (init == pid 1); `Host` shares the host pid ns.
     #[serde(default)]
@@ -1063,6 +1081,9 @@ mod tests {
         assert!(spec.network.namespace.published_ports.is_empty());
         // No `stdio` key: the serde default is the streaming CLI mode.
         assert_eq!(spec.process.stdio, StdioMode::Inherit);
+        // Specs persisted before named initial identity was introduced retain
+        // their resolved uid/gid authority.
+        assert_eq!(spec.process.initial_identity, InitialIdentity::Resolved);
         // A container spec without the field is docker-shaped: the launch-time
         // default seccomp model applies.
         assert_eq!(

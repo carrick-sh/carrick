@@ -69,6 +69,7 @@ fn main() {
                     stdio: carrick_spec::StdioMode::Captured,
                     uid: carrick_abi::NsUid::ROOT,
                     gid: carrick_abi::NsGid::ROOT,
+                    initial_identity: carrick_spec::InitialIdentity::Resolved,
                     pid: carrick_spec::PidMode::default(),
                 },
                 mounts: carrick_spec::MountSpec {
