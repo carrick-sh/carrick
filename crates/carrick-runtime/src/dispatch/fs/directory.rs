@@ -616,10 +616,9 @@ impl<'a> FsView<'a> {
                 t
             } else if let Some(t) = proc_self_fd_number(&path, visible_self).and_then(|n| {
                 this.open_file(n).and_then(|f| {
-                    f.description.read().and_then(|g| {
-                        g.retained_executable()
-                            .map(crate::dispatch::executable_authority::CurrentExecutable::display_path)
-                    })
+                    f.description
+                        .retained_current_executable()
+                        .map(|current| current.display_path())
                 })
             }) {
                 t

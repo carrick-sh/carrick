@@ -735,11 +735,11 @@ impl SyscallDispatcher {
     pub(crate) fn current_executable(
         &self,
     ) -> Option<super::executable_authority::CurrentExecutable> {
-        self.proc.lock().current_executable.clone()
+        self.proc_view().current_executable()
     }
 
     pub(crate) fn current_exec_env(&self) -> Vec<Vec<u8>> {
-        self.proc.lock().env.clone()
+        self.proc_view().current_exec_env()
     }
 }
 
@@ -845,6 +845,9 @@ pub(in crate::dispatch) trait FsCrossSubsystem: Send + Sync {
     fn captured_mm(&self) -> Arc<crate::kernel::Mm>;
     fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials>;
     fn cwd(&self) -> String;
+    fn current_executable(&self) -> Option<super::executable_authority::CurrentExecutable> {
+        None
+    }
     fn mem_snapshot(&self) -> super::mem::MemState;
     fn identity_pid(&self) -> u32;
     /// Live `/proc/sysvipc/{shm,sem,msg}` tables (header plus one row per
@@ -993,6 +996,9 @@ impl FsCrossSubsystem for SyscallDispatcher {
     }
     fn cwd(&self) -> String {
         self.cwd()
+    }
+    fn current_executable(&self) -> Option<super::executable_authority::CurrentExecutable> {
+        self.current_executable()
     }
     fn mem_snapshot(&self) -> super::mem::MemState {
         self.mem_snapshot()
