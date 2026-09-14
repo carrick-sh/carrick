@@ -6406,6 +6406,32 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "user-selected HVPatch carrier low-rate profile receipt"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_to_string",
+    "profiles": [
+      "macos-cli-default"
+    ],
+    "rationale": "At crates/carrick-cli/src/hvpatch_carrier_cpu_low_rate_profile.rs:42 in `from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch carrier low-rate profile receipt.",
+    "review_id": "HA-000653",
+    "source": {
+      "byte_end": 1627,
+      "byte_start": 1609,
+      "column": 19,
+      "column_end": 37,
+      "column_start": 19,
+      "file": "crates/carrick-cli/src/hvpatch_carrier_cpu_low_rate_profile.rs",
+      "line": 42,
+      "line_end": 42,
+      "line_start": 42
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "user-selected HVPatch core profile receipt"
     },
     "expansion": null,
