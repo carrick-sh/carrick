@@ -2,9 +2,9 @@
   "schema": 1,
   "scope": "production_callsite taxonomy entries only",
   "ceiling": {
-    "create_install": 63,
+    "create_install": 62,
     "epoll_wait": 17,
-    "inspect_misc": 123,
+    "inspect_misc": 122,
     "lifecycle": 6,
     "mapping_ring": 5,
     "read_attempt": 9,
