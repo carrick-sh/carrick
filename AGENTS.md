@@ -466,6 +466,16 @@ Research the closest analogue first: FreeBSD's linuxulator, gVisor, NetBSD
 compat, WSL1. GPL sources stay off-limits — clean-room only, ABIs from
 man-pages, specs and the differential oracle.
 
+**A successful host rename is not necessarily a move.** Renaming two hardlinks
+to the same inode succeeds without removing either name. Keep that outcome
+distinct through the backend, layered rootfs and dispatcher: publishing a move
+or a whiteout after a no-op hides or deletes a valid source. Namespace admission
+must span identity checks, the host operation and cache/event publication; stat
+snapshots before and after the operation do not replace that transaction. Keep
+archive admission before namespace admission, and include archive rollback and
+core-file publication in the same namespace authority. Test both physical names
+and cached lookup, including a lower layer and `RENAME_NOREPLACE`.
+
 ### The compat zone is ours; the host is for what crosses the boundary
 
 Carrick has its own kernel. **Functionality that never leaves the Linux compat

@@ -196,7 +196,11 @@ impl FsBackend for CountingMemoryBackend {
         self.inner.deleted_child_names(dir)
     }
 
-    fn rename_overlay_entry(&self, from: &str, to: &str) -> Result<bool, BackendError> {
+    fn rename_overlay_entry(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<carrick_runtime::fs_backend::OverlayRenameOutcome, BackendError> {
         self.inner.rename_overlay_entry(from, to)
     }
 

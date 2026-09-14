@@ -569,7 +569,12 @@ impl FsBackend for MemoryBackend {
         Ok(deleted)
     }
 
-    fn rename_overlay_entry(&self, from: &str, to: &str) -> Result<bool, BackendError> {
+    fn rename_overlay_entry(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<crate::fs_backend::OverlayRenameOutcome, BackendError> {
+        use crate::fs_backend::OverlayRenameOutcome;
         let _mutation = self.archive_mutation_gate.mutation();
         let src = normalize(from).ok_or(BackendError::Invalid)?;
         let dst = normalize(to).ok_or(BackendError::Invalid)?;
@@ -580,7 +585,7 @@ impl FsBackend for MemoryBackend {
             inner.deletions.insert(src);
             self.generation
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return Ok(true);
+            return Ok(OverlayRenameOutcome::Renamed);
         }
         if inner.dirs.remove(&src) {
             inner.deletions.remove(&dst);
@@ -588,9 +593,9 @@ impl FsBackend for MemoryBackend {
             inner.deletions.insert(src);
             self.generation
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return Ok(true);
+            return Ok(OverlayRenameOutcome::Renamed);
         }
-        Ok(false)
+        Ok(OverlayRenameOutcome::NotOwned)
     }
 
     fn exchange_overlay_entries(&self, a: &str, b: &str) -> Result<bool, BackendError> {
@@ -693,7 +698,12 @@ mod retained_object_tests {
         let object = entry.object.expect("memory entry exposes live object");
         let id = object.object_id();
 
-        assert!(backend.rename_overlay_entry("/image", "/renamed").unwrap());
+        assert!(
+            backend
+                .rename_overlay_entry("/image", "/renamed")
+                .unwrap()
+                .source_was_owned()
+        );
         backend.write_file_range("/renamed", 0, b"new", 3).unwrap();
         assert_eq!(object.object_id(), id);
         assert_eq!(bytes(&object), b"new");

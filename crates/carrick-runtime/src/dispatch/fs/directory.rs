@@ -264,16 +264,6 @@ impl<'a> FsView<'a> {
         {
             return Ok(DispatchOutcome::errno(LINUX_EROFS));
         }
-        let moved_executable = self.executable_object_id_at(&resolved_old);
-        let replaced_executable = self.executable_object_id_at(&resolved_new);
-        let same_executable_object =
-            moved_executable.is_some() && moved_executable == replaced_executable;
-        let moved_directory = self
-            .layered_metadata(&resolved_old)
-            .is_ok_and(|metadata| metadata.kind == RootFsEntryKind::Directory);
-        let replaced_directory = self
-            .layered_metadata(&resolved_new)
-            .is_ok_and(|metadata| metadata.kind == RootFsEntryKind::Directory);
         // RENAME_EXCHANGE: atomically swap two EXISTING entries. Both must
         // exist (a missing side → ENOENT, renameat201 case 3); the swap lands
         // in the writable overlay backend, which preserves each entry's
@@ -290,21 +280,45 @@ impl<'a> FsView<'a> {
             if !old_exists || !new_exists {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
-            // Capture dir-ness before the swap for inotify IN_ISDIR.
-            let (old_is_dir, new_is_dir) = if self.fs.inotify_registry.is_empty() {
-                (false, false)
-            } else {
-                (
-                    self.inotify_path_kind(&resolved_old).unwrap_or(false),
-                    self.inotify_path_kind(&resolved_new).unwrap_or(false),
-                )
-            };
-            return match self
-                .fs
-                .rootfs_vfs
-                .exchange_with_flags(&resolved_old, &resolved_new)
-            {
-                Ok(()) => {
+            return match self.fs.rootfs_vfs.exchange_with_flags_and_publish(
+                &resolved_old,
+                &resolved_new,
+                || {
+                    let moved_executable = self.executable_object_id_at(&resolved_old);
+                    let replaced_executable = self.executable_object_id_at(&resolved_new);
+                    let same_executable_object =
+                        moved_executable.is_some() && moved_executable == replaced_executable;
+                    let moved_directory = self
+                        .layered_metadata(&resolved_old)
+                        .is_ok_and(|metadata| metadata.kind == RootFsEntryKind::Directory);
+                    let replaced_directory = self
+                        .layered_metadata(&resolved_new)
+                        .is_ok_and(|metadata| metadata.kind == RootFsEntryKind::Directory);
+                    let kinds = if self.fs.inotify_registry.is_empty() {
+                        (false, false)
+                    } else {
+                        (
+                            self.inotify_path_kind(&resolved_old).unwrap_or(false),
+                            self.inotify_path_kind(&resolved_new).unwrap_or(false),
+                        )
+                    };
+                    (
+                        moved_executable,
+                        replaced_executable,
+                        same_executable_object,
+                        moved_directory,
+                        replaced_directory,
+                        kinds,
+                    )
+                },
+                |(
+                    moved_executable,
+                    replaced_executable,
+                    same_executable_object,
+                    moved_directory,
+                    replaced_directory,
+                    (old_is_dir, new_is_dir),
+                )| {
                     if !same_executable_object && (moved_directory || replaced_directory) {
                         self.notify_executable_directory_exchange(&resolved_old, &resolved_new);
                     }
@@ -328,7 +342,9 @@ impl<'a> FsView<'a> {
                         target_tid,
                     );
                     Ok(DispatchOutcome::Returned { value: 0 })
-                }
+                },
+            ) {
+                Ok(outcome) => outcome,
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             };
         }
@@ -353,6 +369,16 @@ impl<'a> FsView<'a> {
                 if no_replace && mnew.vfs.lookup(&mnew.full_path).is_ok() {
                     return Ok(DispatchOutcome::errno(LINUX_EEXIST));
                 }
+                // Mounted VFS renames use that mount's own namespace
+                // authority. RootFs snapshots are captured only after its
+                // separate admission below.
+                let moved_executable = self.executable_object_id_at(&resolved_old);
+                let replaced_executable = self.executable_object_id_at(&resolved_new);
+                let same_executable_object =
+                    moved_executable.is_some() && moved_executable == replaced_executable;
+                let moved_directory = self
+                    .layered_metadata(&resolved_old)
+                    .is_ok_and(|metadata| metadata.kind == RootFsEntryKind::Directory);
                 return match mnew.vfs.rename(&mold.full_path, &mnew.full_path) {
                     Ok(()) => {
                         if !same_executable_object && moved_directory {
@@ -374,69 +400,84 @@ impl<'a> FsView<'a> {
             }
             (None, None) => {}
         }
-        // Capture the source kind before the move (for IN_ISDIR) only when
-        // something is watching.
-        let dnotify_rename_watched = !self.fs.dnotify_registry.lock().is_empty();
-        let moved_is_dir = if self.fs.inotify_registry.is_empty() && !dnotify_rename_watched {
-            false
-        } else {
-            self.inotify_path_kind(&resolved_old).unwrap_or(false)
-        };
-        match self
-            .fs
-            .rootfs_vfs
-            .rename_with_flags(&resolved_old, &resolved_new, no_replace)
-        {
-            Ok(()) => {
-                if !same_executable_object && moved_directory {
-                    self.notify_executable_directory_rename(&resolved_old, &resolved_new);
-                }
-                if !same_executable_object && let Some(object_id) = moved_executable {
-                    self.notify_executable_rename(object_id, &resolved_old, &resolved_new);
-                }
-                if !same_executable_object && let Some(object_id) = replaced_executable {
-                    self.notify_executable_unlink(object_id, &resolved_new);
-                }
-                if !self.fs.inotify_registry.is_empty() {
-                    // IN_MOVED_FROM (old name) + IN_MOVED_TO (new name), cookie-
-                    // tied, to watches on the respective parent directories.
-                    self.inotify_move(&resolved_old, &resolved_new, moved_is_dir);
-                    // A watch ON the moved object follows it and also sees
-                    // IN_MOVE_SELF (inotify02's directory self-rename). Emitted on
-                    // the OLD path key, where the watch still lives, BEFORE the
-                    // registry migrates the key to the new path.
-                    self.inotify_self(&resolved_old, carrick_abi::LINUX_IN_MOVE_SELF);
-                    self.fs
-                        .inotify_registry
-                        .rename_path(&resolved_old, &resolved_new);
-                }
-                if moved_is_dir {
-                    self.dnotify_child_for_tid(
-                        context,
-                        &resolved_old,
-                        LinuxDnotifyMask::RENAME,
-                        target_tid,
-                    );
-                }
-                // A process whose cwd IS the renamed directory (or sits under it)
-                // must follow the move: Linux's cwd is an inode, but carrick tracks
-                // it as a path string, so rewrite the prefix. Without this a later
-                // relative path resolves against the stale cwd and returns ENOENT
-                // (inotify02 renames its own cwd, then unlinks a child by relative
-                // name). Same-process only; a cross-process ancestor rename does not
-                // update another process's cwd string (its inode would, on Linux).
-                let cwd = self.cwd();
-                if cwd == resolved_old {
-                    self.set_cwd(&resolved_new);
-                } else if cwd.starts_with(&resolved_old)
-                    && cwd.as_bytes().get(resolved_old.len()) == Some(&b'/')
+        match self.fs.rootfs_vfs.rename_with_flags_and_publish(
+            &resolved_old,
+            &resolved_new,
+            no_replace,
+            || {
+                let moved_executable = self.executable_object_id_at(&resolved_old);
+                let replaced_executable = self.executable_object_id_at(&resolved_new);
+                let same_executable_object =
+                    moved_executable.is_some() && moved_executable == replaced_executable;
+                let moved_directory = self
+                    .layered_metadata(&resolved_old)
+                    .is_ok_and(|metadata| metadata.kind == RootFsEntryKind::Directory);
+                let dnotify_rename_watched = !self.fs.dnotify_registry.lock().is_empty();
+                let moved_is_dir = if self.fs.inotify_registry.is_empty() && !dnotify_rename_watched
                 {
-                    let rest = &cwd[resolved_old.len() + 1..];
-                    self.set_cwd(&format!("{resolved_new}/{rest}"));
+                    false
+                } else {
+                    self.inotify_path_kind(&resolved_old).unwrap_or(false)
+                };
+                (
+                    moved_executable,
+                    replaced_executable,
+                    same_executable_object,
+                    moved_directory,
+                    moved_is_dir,
+                )
+            },
+            |(
+                moved_executable,
+                replaced_executable,
+                same_executable_object,
+                moved_directory,
+                moved_is_dir,
+            ),
+             outcome| match outcome {
+                crate::vfs::rootfs::RenameOutcome::SameObject => {
+                    Ok(DispatchOutcome::Returned { value: 0 })
                 }
-                self.rename_open_paths(&resolved_old, &resolved_new);
-                Ok(DispatchOutcome::Returned { value: 0 })
-            }
+                crate::vfs::rootfs::RenameOutcome::Renamed => {
+                    if !same_executable_object && moved_directory {
+                        self.notify_executable_directory_rename(&resolved_old, &resolved_new);
+                    }
+                    if !same_executable_object && let Some(object_id) = moved_executable {
+                        self.notify_executable_rename(object_id, &resolved_old, &resolved_new);
+                    }
+                    if !same_executable_object && let Some(object_id) = replaced_executable {
+                        self.notify_executable_unlink(object_id, &resolved_new);
+                    }
+                    if !self.fs.inotify_registry.is_empty() {
+                        self.inotify_move(&resolved_old, &resolved_new, moved_is_dir);
+                        self.inotify_self(&resolved_old, carrick_abi::LINUX_IN_MOVE_SELF);
+                        self.fs
+                            .inotify_registry
+                            .rename_path(&resolved_old, &resolved_new);
+                    }
+                    if moved_is_dir {
+                        self.dnotify_child_for_tid(
+                            context,
+                            &resolved_old,
+                            LinuxDnotifyMask::RENAME,
+                            target_tid,
+                        );
+                    }
+                    let cwd = self.cwd();
+                    if cwd == resolved_old {
+                        self.set_cwd(&resolved_new);
+                    } else if cwd.starts_with(&resolved_old)
+                        && cwd.as_bytes().get(resolved_old.len()) == Some(&b'/')
+                    {
+                        let rest = &cwd[resolved_old.len() + 1..];
+                        self.set_cwd(&format!("{resolved_new}/{rest}"));
+                    }
+                    self.rename_open_paths(&resolved_old, &resolved_new);
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                }
+            },
+        ) {
+            Ok(outcome) => outcome,
             Err(errno) => Ok(DispatchOutcome::errno(errno)),
         }
     }
@@ -922,14 +963,10 @@ impl<'a> FsView<'a> {
             // a parent with S_ISGID inherits the parent's GID *and* gets
             // S_ISGID itself (so a shared-group subtree propagates).
             // Otherwise the new dir's group is the creator's egid.
-            let mut inherited_gid = false;
-            let parent_res = this.fs.rootfs_vfs.resolved_parent(&resolved);
-            let parent_info = match parent_res {
-                Ok(p) => p,
-                Err(e) => return Ok(DispatchOutcome::errno(e)),
-            };
-
             const S_ISGID: u32 = 0o2000;
+            match this.fs.rootfs_vfs.with_mkdir_transaction(&resolved, |permit| {
+            let mut inherited_gid = false;
+            let parent_info = permit.parent(&resolved).ok_or(LINUX_EINVAL)?;
             if let Some(ref pfd) = parent_info.parent_fd {
                 use std::os::fd::AsRawFd;
                 let mut st: libc::stat = unsafe { core::mem::zeroed() };
@@ -958,13 +995,9 @@ impl<'a> FsView<'a> {
                 }
             }
             // Layered existence + parent-exists checks live inside
-            // RootFsVfs::mkdir_under_parent; the dispatcher only handles
+            // RootFsVfs::mkdir_admitted; the dispatcher only handles
             // synthetic path shadowing.
-            match this
-                .fs
-                .rootfs_vfs
-                .mkdir_under_parent(&parent_info, &resolved, create_mode)
-            {
+            match this.fs.rootfs_vfs.mkdir_admitted(permit, &resolved, create_mode) {
                 Ok(()) => {
                     // Only invoke set_mode if the mode requires xattr storage
                     // (e.g. owner permissions lack read/write/execute).
@@ -985,6 +1018,10 @@ impl<'a> FsView<'a> {
                     this.dnotify_child(cx.kernel, &resolved, LinuxDnotifyMask::CREATE);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
+                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            }
+            }) {
+                Ok(outcome) => outcome,
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
         }
