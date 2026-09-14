@@ -209,11 +209,16 @@ impl std::fmt::Debug for BlockingWrite {
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct BlockingRecordLock {
     #[serde(skip_serializing)]
-    pub(in crate::dispatch) logical: super::fs::LogicalRecordLockWait,
+    pub(in crate::dispatch) logical: super::fs::LogicalLockWait,
 }
 
 impl BlockingRecordLock {
+    #[cfg(test)]
     pub(crate) fn logical(wait: super::fs::LogicalRecordLockWait) -> Self {
+        Self::logical_lock(super::fs::LogicalLockWait::Record { wait, _lease: None })
+    }
+
+    pub(in crate::dispatch) fn logical_lock(wait: super::fs::LogicalLockWait) -> Self {
         Self { logical: wait }
     }
 }
@@ -686,10 +691,24 @@ pub enum DispatchOutcome {
     /// The runtime owns this staged continuation, waits for POLLOUT with the
     /// dispatcher lock released, and completes with the Linux-visible result.
     BlockingWrite(BlockingWrite),
-    /// A blocking record-lock `fcntl(F_SETLKW/F_OFD_SETLKW)`. The dispatcher
-    /// parsed and validated the guest `struct flock`, but the host call may
-    /// sleep until a sibling thread releases a conflicting lock. Execute it in
-    /// the run loop after dispatcher state locks have been released.
+    /// A timerfd read waiting on a Carrick-owned timer.  Unlike a generic fd
+    /// wait, this owns the exact description and must complete that operation
+    /// even if its numeric fd was subsequently reused.
+    BlockingTimerFdRead(#[serde(skip)] crate::dispatch::format_time::BlockingTimerFdRead),
+    /// A parsed SysV semaphore operation parked outside the dispatcher.  It
+    /// retains the exact semaphore-set generation and operation array, so an
+    /// `IPC_RMID`/id-reuse race cannot retarget completion.
+    BlockingSemop(#[serde(skip)] crate::dispatch::sysv::BlockingSemop),
+    /// Retained poll/select operation.  Its completion samples the admission
+    /// snapshot and either writes final output or re-parks itself.
+    BlockingFdWait {
+        #[serde(skip)]
+        wait: crate::dispatch::fd_wait::BlockingFdWait,
+        sig_mask: WaitSigMask,
+    },
+    /// A pending record-lock or flock operation. The dispatcher retains its
+    /// parsed request and exact ownership; the continuation reactor attempts
+    /// acquisition without occupying a guest executor while a conflict remains.
     BlockingRecordLock(BlockingRecordLock),
     /// A blocking `waitid(P_PID, pid, …)` whose target child hasn't changed
     /// state yet. The runtime parks the vCPU thread on the child's exit via the

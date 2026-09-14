@@ -21,8 +21,9 @@
 //!
 //! What this does NOT implement (yet):
 //!   - SHM_REMAP.
-//!   - Complete SysV semaphore parity; this module still forwards semaphores to
-//!     host SysV semaphores with Carrick-owned guest metadata layered above.
+//!   - Complete SysV semaphore parity.  Semaphore values and blocking waits
+//!     are logical Carrick state; `SEM_UNDO` and several permission/accounting
+//!     details remain intentionally unimplemented.
 
 pub(crate) use super::dispatcher::IpcView;
 use super::*;
@@ -71,9 +72,9 @@ const LIN_MSG_QBYTES: usize = 88;
 const LINUX_MSQID_DS_SIZE: usize = 120;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 /// Linux aarch64 `struct ipc64_perm` (UAPI, `include/uapi/asm-generic/ipcbuf.h`).
@@ -371,7 +372,7 @@ impl ShmSegment {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct SemSet {
     key: i32,
     scan_index: SemScanIndex,
@@ -382,7 +383,9 @@ struct SemSet {
     cuid: NsUid,
     cgid: NsGid,
     ctime: u64,
-    otime: u64,
+    /// Shared because a parked operation must update the exact set it admitted
+    /// against, even after its numeric semid has been removed or recycled.
+    otime: Arc<AtomicU64>,
     values: Arc<Mutex<Vec<u16>>>,
     /// Linux `sempid` per semaphore.
     logical_last_operators: Arc<Mutex<Vec<Option<i32>>>>,
@@ -390,6 +393,43 @@ struct SemSet {
     logical_wait_counts: SemWaitCounters,
     changed: Arc<parking_lot::Condvar>,
     removed: Arc<std::sync::atomic::AtomicBool>,
+    change_generation: Arc<AtomicU64>,
+    change_listeners: Arc<Mutex<SemopChangeListeners>>,
+    next_change_listener: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for SemSet {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SemSet")
+            .field("key", &self.key)
+            .field("nsems", &self.nsems)
+            .field("removed", &self.removed.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Result of atomically subscribing a parked semop to the generation scanned
+/// when it decided to block.  `Ready` closes the producer-before-enrollment
+/// gap without a polling sleep.
+pub(crate) enum SemopChangeEnrollment {
+    Ready,
+    Subscribed(SemopChangeSubscription),
+}
+
+type SemopChangeListeners = BTreeMap<u64, Arc<dyn Fn() + Send + Sync>>;
+
+pub(crate) struct SemopChangeSubscription {
+    listeners: std::sync::Weak<Mutex<SemopChangeListeners>>,
+    id: u64,
+}
+
+impl Drop for SemopChangeSubscription {
+    fn drop(&mut self) {
+        if let Some(listeners) = self.listeners.upgrade() {
+            listeners.lock().remove(&self.id);
+        }
+    }
 }
 
 /// Linux sembuf ABI.
@@ -585,6 +625,43 @@ impl SemScanIndex {
 }
 
 impl SemSet {
+    fn change_generation(&self) -> u64 {
+        self.change_generation.load(Ordering::Acquire)
+    }
+
+    fn subscribe_change(
+        &self,
+        expected_generation: u64,
+        callback: Arc<dyn Fn() + Send + Sync>,
+    ) -> SemopChangeEnrollment {
+        let mut listeners = self.change_listeners.lock();
+        if self.change_generation() != expected_generation {
+            return SemopChangeEnrollment::Ready;
+        }
+        let id = self.next_change_listener.fetch_add(1, Ordering::Relaxed);
+        listeners.insert(id, callback);
+        SemopChangeEnrollment::Subscribed(SemopChangeSubscription {
+            listeners: Arc::downgrade(&self.change_listeners),
+            id,
+        })
+    }
+
+    /// Publish only after the semaphore mutation lock is released.  Callbacks
+    /// may synchronously enqueue a continuation, so invoking them under values
+    /// or namespace state would re-enter this object in the wrong lock order.
+    fn publish_change(&self) {
+        self.change_generation.fetch_add(1, Ordering::AcqRel);
+        let callbacks = self
+            .change_listeners
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for callback in callbacks {
+            callback();
+        }
+    }
+
     fn can_admin(&self, creds: &crate::kernel::Credentials) -> bool {
         creds.euid.is_root() || creds.euid == self.uid || creds.euid == self.cuid
     }
@@ -2426,7 +2503,7 @@ impl<'a> IpcView<'a> {
                 meta.gid,
                 meta.cuid,
                 meta.cgid,
-                meta.otime,
+                meta.otime.load(Ordering::Acquire),
                 meta.ctime,
             ));
         }
@@ -3119,12 +3196,9 @@ impl<'a> IpcView<'a> {
             }
         }
 
-        /// semget(key, nsems, semflg): allocate/look up a SysV semaphore set.
-        /// Forwarded to the host (macOS has SysV semaphores); IPC_CREAT/IPC_EXCL
-        /// share their values with Linux, and carrick guest processes are
-        /// separate host processes, so the host kernel gives cross-process
-        /// semaphore coherence for free. Carrick returns a Linux-shaped guest
-        /// semid and keeps the host semid private at the libc boundary.
+        /// semget(key, nsems, semflg): allocate/look up a logical SysV
+        /// semaphore set.  The namespace is Carrick-owned so it remains
+        /// coherent across HVPatch logical processes without host SysV state.
         fn semget(this, cx, key: u64, nsems: u64, semflg: u64) {
             let _ = cx;
             // Linux caps nsems at SEMMSL (default 32000): nsems > SEMMSL → EINVAL
@@ -3195,7 +3269,7 @@ impl<'a> IpcView<'a> {
                         cuid: creds.euid,
                         cgid: creds.egid,
                         ctime: now,
-                        otime: 0,
+                        otime: Arc::new(AtomicU64::new(0)),
                         values: Arc::new(Mutex::new(vec![0u16; nsems_usize])),
                         logical_last_operators: Arc::new(Mutex::new(vec![None; nsems_usize])),
                         logical_wait_counts: Arc::new(Mutex::new(vec![
@@ -3204,6 +3278,9 @@ impl<'a> IpcView<'a> {
                         ])),
                         changed: Arc::new(parking_lot::Condvar::new()),
                         removed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        change_generation: Arc::new(AtomicU64::new(0)),
+                        change_listeners: Arc::new(Mutex::new(BTreeMap::new())),
+                        next_change_listener: Arc::new(AtomicU64::new(1)),
                     },
                 );
                 if key != LINUX_IPC_PRIVATE {
@@ -4002,11 +4079,237 @@ impl Drop for SysvSemBlockStateGuard {
     }
 }
 
-struct SemopWaitCtx<'a> {
-    task_pid: Option<i32>,
-    wait_counts: &'a SemWaitCounters,
-    interrupted: &'a dyn Fn() -> bool,
-    completed: &'a dyn Fn(&[LinuxSembuf]),
+/// Exact, parsed semaphore operation retained after the dispatcher releases
+/// its locks.  In particular it contains no semid or namespace lookup key:
+/// an `IPC_RMID` followed by id reuse can only resolve to `EIDRM`, never apply
+/// an old operation to the replacement set.
+#[derive(Clone)]
+pub struct BlockingSemop {
+    sem_set: Box<SemSet>,
+    sops: Vec<LinuxSembuf>,
+    deadline: Option<std::time::Instant>,
+    logical_operator: Option<i32>,
+    block_state: Arc<Mutex<Option<SysvSemBlockStateGuard>>>,
+    block_context: (
+        crate::kernel::ContainerId,
+        Option<i32>,
+        crate::thread::ThreadId,
+    ),
+    operation: Arc<()>,
+    /// Generation sampled while `values` established the operation could not
+    /// proceed.  The wait service subscribes to this snapshot, never a later
+    /// capture-time read, closing wake-before-enroll.
+    observed_generation: Option<u64>,
+}
+
+impl std::fmt::Debug for BlockingSemop {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlockingSemop")
+            .field("operations", &self.sops.len())
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for BlockingSemop {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.operation, &other.operation)
+    }
+}
+
+impl Eq for BlockingSemop {}
+
+pub(crate) enum BlockingSemopStep {
+    Done(DispatchOutcome),
+    Wait(BlockingSemop),
+}
+
+impl BlockingSemop {
+    fn new(
+        sem_set: SemSet,
+        sops: Vec<LinuxSembuf>,
+        deadline: Option<std::time::Instant>,
+        logical_operator: Option<i32>,
+        block_context: (
+            crate::kernel::ContainerId,
+            Option<i32>,
+            crate::thread::ThreadId,
+        ),
+    ) -> Self {
+        Self {
+            sem_set: Box::new(sem_set),
+            sops,
+            deadline,
+            logical_operator,
+            block_state: Arc::new(Mutex::new(None)),
+            block_context,
+            operation: Arc::new(()),
+            observed_generation: None,
+        }
+    }
+
+    pub(crate) fn deadline(&self) -> Option<std::time::Instant> {
+        self.deadline
+    }
+
+    pub(crate) fn observed_generation(&self) -> u64 {
+        self.observed_generation
+            .unwrap_or_else(|| self.sem_set.change_generation())
+    }
+
+    pub(crate) fn subscribe_change(
+        &self,
+        expected_generation: u64,
+        callback: Arc<dyn Fn() + Send + Sync>,
+    ) -> SemopChangeEnrollment {
+        self.sem_set.subscribe_change(expected_generation, callback)
+    }
+
+    fn finish(&self) {
+        self.block_state.lock().take();
+    }
+
+    fn ensure_block_state(&self) {
+        let mut state = self.block_state.lock();
+        if state.is_none() {
+            let (container, task_pid, tid) = self.block_context;
+            *state = Some(SysvSemBlockStateGuard::for_semop(
+                container,
+                task_pid,
+                tid,
+                &self.sem_set.logical_wait_counts,
+                &self.sops,
+            ));
+        }
+    }
+
+    fn try_complete(mut self) -> BlockingSemopStep {
+        let mut values = self.sem_set.values.lock();
+        // IPC_RMID takes this same lock before publishing `removed`, so an
+        // admitted operation either commits before removal or observes EIDRM;
+        // it cannot mutate a tombstoned/recycled numeric id.
+        if self.sem_set.removed.load(Ordering::Acquire) {
+            drop(values);
+            self.finish();
+            return BlockingSemopStep::Done(DispatchOutcome::errno(carrick_abi::LINUX_EIDRM));
+        }
+        let mut simulated = values.clone();
+        for operation in &self.sops {
+            let current = simulated[usize::from(operation.sem_num)];
+            if operation.sem_op > 0 {
+                let next = i32::from(current) + i32::from(operation.sem_op);
+                if next > 32767 {
+                    drop(values);
+                    self.finish();
+                    return BlockingSemopStep::Done(DispatchOutcome::errno(
+                        crate::linux_abi::LINUX_ERANGE,
+                    ));
+                }
+                simulated[usize::from(operation.sem_num)] = next as u16;
+            } else if operation.sem_op < 0 {
+                if current < operation.sem_op.unsigned_abs() {
+                    self.observed_generation = Some(self.sem_set.change_generation());
+                    drop(values);
+                    if SemOpFlags::from_bits_retain(operation.sem_flg as u16)
+                        .contains(SemOpFlags::NOWAIT)
+                    {
+                        self.finish();
+                        return BlockingSemopStep::Done(DispatchOutcome::errno(LINUX_EAGAIN));
+                    }
+                    if self
+                        .deadline
+                        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                    {
+                        self.finish();
+                        return BlockingSemopStep::Done(DispatchOutcome::errno(LINUX_EAGAIN));
+                    }
+                    self.ensure_block_state();
+                    return BlockingSemopStep::Wait(self);
+                }
+                simulated[usize::from(operation.sem_num)] =
+                    current - operation.sem_op.unsigned_abs();
+            } else if current != 0 {
+                self.observed_generation = Some(self.sem_set.change_generation());
+                drop(values);
+                if SemOpFlags::from_bits_retain(operation.sem_flg as u16)
+                    .contains(SemOpFlags::NOWAIT)
+                {
+                    self.finish();
+                    return BlockingSemopStep::Done(DispatchOutcome::errno(LINUX_EAGAIN));
+                }
+                if self
+                    .deadline
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                {
+                    self.finish();
+                    return BlockingSemopStep::Done(DispatchOutcome::errno(LINUX_EAGAIN));
+                }
+                self.ensure_block_state();
+                return BlockingSemopStep::Wait(self);
+            }
+        }
+        *values = simulated;
+        if let Some(pid) = self.logical_operator {
+            self.sem_set.record_logical_semop(pid, &self.sops);
+        }
+        self.sem_set.otime.store(unix_now_secs(), Ordering::Release);
+        // The values lock linearizes both the array update and its sempid/
+        // sem_otime metadata.  Publish wake callbacks only after releasing it.
+        drop(values);
+        self.sem_set.changed.notify_all();
+        self.sem_set.publish_change();
+        self.finish();
+        BlockingSemopStep::Done(DispatchOutcome::Returned { value: 0 })
+    }
+
+    pub(crate) fn complete(self) -> BlockingSemopStep {
+        self.try_complete()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn blocking_semop_for_continuation_test() -> BlockingSemop {
+    let set = SemSet {
+        key: LINUX_IPC_PRIVATE,
+        scan_index: SemScanIndex(0),
+        nsems: 1,
+        mode: ShmPermMode::requested(0o600),
+        uid: NsUid::ROOT,
+        gid: NsGid::ROOT,
+        cuid: NsUid::ROOT,
+        cgid: NsGid::ROOT,
+        ctime: 0,
+        otime: Arc::new(AtomicU64::new(0)),
+        values: Arc::new(Mutex::new(vec![0])),
+        logical_last_operators: Arc::new(Mutex::new(vec![None])),
+        logical_wait_counts: Arc::new(Mutex::new(vec![SemWaitCounts::default()])),
+        changed: Arc::new(parking_lot::Condvar::new()),
+        removed: Arc::new(AtomicBool::new(false)),
+        change_generation: Arc::new(AtomicU64::new(0)),
+        change_listeners: Arc::new(Mutex::new(BTreeMap::new())),
+        next_change_listener: Arc::new(AtomicU64::new(1)),
+    };
+    let mut wait = BlockingSemop::new(
+        set,
+        vec![LinuxSembuf {
+            sem_num: 0,
+            sem_op: -1,
+            sem_flg: 0,
+        }],
+        None,
+        None,
+        (
+            crate::kernel::ContainerId::allocate(),
+            None,
+            crate::thread::ThreadId::synthetic_for_tests(91_001),
+        ),
+    );
+    // The helper must model a genuinely admitted wait, including its guard,
+    // rather than a manually fabricated enum variant.
+    wait.ensure_block_state();
+    wait.observed_generation = Some(wait.sem_set.change_generation());
+    wait
 }
 
 fn sysv_semop<M: CurrentMmMemory>(
@@ -4015,14 +4318,9 @@ fn sysv_semop<M: CurrentMmMemory>(
     sops_addr: u64,
     nsops: usize,
     timeout: Option<LinuxTimespec>,
-    wait: SemopWaitCtx<'_>,
+    task_pid: Option<i32>,
+    logical_operator: Option<i32>,
 ) -> Result<DispatchOutcome, DispatchError> {
-    let SemopWaitCtx {
-        task_pid,
-        wait_counts,
-        interrupted,
-        completed,
-    } = wait;
     if nsops == 0 {
         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
     }
@@ -4048,86 +4346,22 @@ fn sysv_semop<M: CurrentMmMemory>(
             sem_flg,
         });
     }
-    let may_block = sops.iter().any(|s| {
-        s.sem_op <= 0
-            && !SemOpFlags::from_bits_retain(s.sem_flg as u16).contains(SemOpFlags::NOWAIT)
-    });
-
     let deadline = timeout.map(|ts| {
         let total_ns = (ts.tv_sec.max(0) as u128) * 1_000_000_000 + ts.tv_nsec.max(0) as u128;
         std::time::Instant::now()
             + std::time::Duration::from_nanos(total_ns.min(u64::MAX as u128) as u64)
     });
 
-    let mut block_state: Option<SysvSemBlockStateGuard> = None;
-    loop {
-        if sem_set.removed.load(std::sync::atomic::Ordering::Acquire) {
-            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIDRM));
-        }
-        if interrupted() {
-            return Ok(DispatchOutcome::errno(LINUX_EINTR));
-        }
-        {
-            let mut vals = sem_set.values.lock();
-            let mut can_apply = true;
-            let mut would_block_nowait = false;
-            let mut sim_vals = vals.clone();
-            for sop in &sops {
-                let idx = usize::from(sop.sem_num);
-                let cur = sim_vals[idx];
-                let is_nowait =
-                    SemOpFlags::from_bits_retain(sop.sem_flg as u16).contains(SemOpFlags::NOWAIT);
-                if sop.sem_op > 0 {
-                    if (cur as i32 + sop.sem_op as i32) > 32767 {
-                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ERANGE));
-                    }
-                    sim_vals[idx] = cur + sop.sem_op as u16;
-                } else if sop.sem_op < 0 {
-                    let req = (-sop.sem_op) as u16;
-                    if cur < req {
-                        can_apply = false;
-                        if is_nowait {
-                            would_block_nowait = true;
-                        }
-                        break;
-                    }
-                    sim_vals[idx] = cur - req;
-                } else {
-                    if cur != 0 {
-                        can_apply = false;
-                        if is_nowait {
-                            would_block_nowait = true;
-                        }
-                        break;
-                    }
-                }
-            }
-            if can_apply {
-                *vals = sim_vals;
-                drop(vals);
-                completed(&sops);
-                sem_set.changed.notify_all();
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            if would_block_nowait || !may_block {
-                return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
-            }
-            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
-            }
-            if block_state.is_none() {
-                block_state = Some(SysvSemBlockStateGuard::for_semop(
-                    cx.kernel.container().id(),
-                    task_pid,
-                    cx.tid(),
-                    wait_counts,
-                    &sops,
-                ));
-            }
-            sem_set
-                .changed
-                .wait_for(&mut vals, std::time::Duration::from_millis(10));
-        }
+    let immediate = BlockingSemop::new(
+        sem_set.clone(),
+        sops.clone(),
+        deadline,
+        logical_operator,
+        (cx.kernel.container().id(), task_pid, cx.tid()),
+    );
+    match immediate.complete() {
+        BlockingSemopStep::Done(outcome) => Ok(outcome),
+        BlockingSemopStep::Wait(wait) => Ok(DispatchOutcome::BlockingSemop(wait)),
     }
 }
 
@@ -4144,10 +4378,10 @@ impl<'a> IpcView<'a> {
             Ok(guest_semid) => guest_semid,
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
-        let (sem_set, wait_counts) = match self.sysv.with_state(|state| {
+        let sem_set = match self.sysv.with_state(|state| {
             let meta = state.semaphores.get(&guest_semid).ok_or(LINUX_EINVAL);
             match meta {
-                Ok(meta) => Ok((meta.clone(), Arc::clone(&meta.logical_wait_counts))),
+                Ok(meta) => Ok(meta.clone()),
                 Err(errno) => Err(errno),
             }
         }) {
@@ -4161,40 +4395,14 @@ impl<'a> IpcView<'a> {
         let logical_operator = self
             .hvpatch_process()
             .map(|_| crate::dispatch::signal::ns_visible_sender_pid(cx.kernel));
-        let tid = cx.tid();
-        let interrupted = || {
-            crate::host_signal::has_unblocked_pending_for(
-                tid.raw(),
-                carrick_abi::SigBlockMask::NONE,
-            ) || self.has_deliverable_dispatch_pending_for_wait(
-                cx.kernel,
-                tid,
-                carrick_abi::WaitSigMask::NONE,
-            )
-        };
-        let completed = |sops: &[LinuxSembuf]| {
-            let now = unix_now_secs();
-            if let Some(pid) = logical_operator {
-                self.sysv.with_state_mut(|state| {
-                    if let Some(meta) = state.semaphores.get_mut(&guest_semid) {
-                        meta.record_logical_semop(pid, sops);
-                        meta.otime = now;
-                    }
-                });
-            }
-        };
         sysv_semop(
             cx,
             &sem_set,
             sops_addr,
             nsops,
             timeout,
-            SemopWaitCtx {
-                task_pid: sysv_run_state_task_pid(cx.kernel),
-                wait_counts: &wait_counts,
-                interrupted: &interrupted,
-                completed: &completed,
-            },
+            sysv_run_state_task_pid(cx.kernel),
+            logical_operator,
         )
     }
 
@@ -4237,28 +4445,33 @@ impl<'a> IpcView<'a> {
 
         match cmd {
             LINUX_IPC_RMID => {
-                let (res, changed) = self.sysv.with_state_mut(|state| {
+                let (res, changed_set) = self.sysv.with_state_mut(|state| {
                     let Some(meta) = state.semaphores.get_mut(&guest_semid) else {
                         return (Err(LINUX_EINVAL), None);
                     };
                     if !meta.can_admin(creds) {
                         return (Err(LINUX_EPERM), None);
                     }
-                    meta.removed
-                        .store(true, std::sync::atomic::Ordering::Release);
+                    // Serialize removal against a captured semop's value
+                    // commit.  The parked continuation holds this same lock
+                    // while it observes `removed` and commits its full array.
+                    let values = meta.values.lock();
+                    meta.removed.store(true, Ordering::Release);
+                    drop(values);
                     let key = meta.key;
-                    let changed = Arc::clone(&meta.changed);
+                    let changed_set = meta.clone();
                     state.semaphores.remove(&guest_semid);
                     if key != LINUX_IPC_PRIVATE {
                         state.sem_keys.remove(&key);
                     }
-                    (Ok(()), Some(changed))
+                    (Ok(()), Some(changed_set))
                 });
                 if let Err(errno) = res {
                     return Ok(DispatchOutcome::errno(errno));
                 }
-                if let Some(changed) = changed {
-                    changed.notify_all();
+                if let Some(changed_set) = changed_set {
+                    changed_set.changed.notify_all();
+                    changed_set.publish_change();
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
@@ -4306,7 +4519,7 @@ impl<'a> IpcView<'a> {
                             seq: meta.scan_index.0 as u16,
                             ..Default::default()
                         },
-                        sem_otime: meta.otime,
+                        sem_otime: meta.otime.load(Ordering::Acquire),
                         sem_ctime: meta.ctime,
                         sem_nsems: meta.nsems as u64,
                         __unused3: 0,
@@ -4353,7 +4566,7 @@ impl<'a> IpcView<'a> {
                 if !(0..=32767).contains(&val) {
                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ERANGE));
                 }
-                let (res, changed) = self.sysv.with_state_mut(|state| {
+                let (res, changed_set) = self.sysv.with_state_mut(|state| {
                     let Some(meta) = state.semaphores.get_mut(&guest_semid) else {
                         return (Err(LINUX_EINVAL), None);
                     };
@@ -4366,14 +4579,15 @@ impl<'a> IpcView<'a> {
                     meta.values.lock()[idx] = val as u16;
                     meta.record_logical_setval(caller_pid, semnum);
                     meta.ctime = now;
-                    let changed = Arc::clone(&meta.changed);
-                    (Ok(()), Some(changed))
+                    let changed_set = meta.clone();
+                    (Ok(()), Some(changed_set))
                 });
                 if let Err(errno) = res {
                     return Ok(DispatchOutcome::errno(errno));
                 }
-                if let Some(changed) = changed {
-                    changed.notify_all();
+                if let Some(changed_set) = changed_set {
+                    changed_set.changed.notify_all();
+                    changed_set.publish_change();
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
@@ -4521,7 +4735,7 @@ impl<'a> IpcView<'a> {
                 if let Some(hook) = SETALL_INTERLEAVING_HOOK.lock().as_ref() {
                     hook(witness.guest_semid);
                 }
-                let (res, changed) = self.sysv.with_state_mut(|state| {
+                let (res, changed_set) = self.sysv.with_state_mut(|state| {
                     let Some(meta) = state.semaphores.get_mut(&witness.guest_semid) else {
                         return (Err(LINUX_EINVAL), None);
                     };
@@ -4540,14 +4754,15 @@ impl<'a> IpcView<'a> {
                     *meta.values.lock() = vals;
                     meta.record_logical_setall(caller_pid);
                     meta.ctime = now;
-                    let changed = Arc::clone(&meta.changed);
-                    (Ok(()), Some(changed))
+                    let changed_set = meta.clone();
+                    (Ok(()), Some(changed_set))
                 });
                 if let Err(errno) = res {
                     return Ok(DispatchOutcome::errno(errno));
                 }
-                if let Some(changed) = changed {
-                    changed.notify_all();
+                if let Some(changed_set) = changed_set {
+                    changed_set.changed.notify_all();
+                    changed_set.publish_change();
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
@@ -4633,7 +4848,7 @@ impl<'a> IpcView<'a> {
                     seq: meta.scan_index.0 as u16,
                     ..Default::default()
                 },
-                sem_otime: meta.otime,
+                sem_otime: meta.otime.load(Ordering::Acquire),
                 sem_ctime: meta.ctime,
                 sem_nsems: meta.nsems as u64,
                 __unused3: 0,
@@ -4994,12 +5209,15 @@ mod ipc_set_tests {
             cuid: NsUid::ROOT,
             cgid: NsGid::ROOT,
             ctime: 0,
-            otime: 0,
+            otime: Arc::new(AtomicU64::new(0)),
             values: Arc::new(Mutex::new(vec![0u16; 3])),
             logical_last_operators: Arc::new(Mutex::new(vec![None; 3])),
             logical_wait_counts: Arc::new(Mutex::new(vec![SemWaitCounts::default(); 3])),
             changed: Arc::new(parking_lot::Condvar::new()),
             removed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            change_generation: Arc::new(AtomicU64::new(0)),
+            change_listeners: Arc::new(Mutex::new(BTreeMap::new())),
+            next_change_listener: Arc::new(AtomicU64::new(1)),
         };
         let child = parent.clone();
         child.record_logical_semop(
@@ -5110,12 +5328,15 @@ mod ipc_set_tests {
                 cuid: NsUid::ROOT,
                 cgid: NsGid::ROOT,
                 ctime: 0,
-                otime: 0,
+                otime: Arc::new(AtomicU64::new(0)),
                 values: Arc::new(Mutex::new(vec![0u16; nsems])),
                 logical_last_operators: Arc::new(Mutex::new(vec![None; nsems])),
                 logical_wait_counts: Arc::new(Mutex::new(vec![SemWaitCounts::default(); nsems])),
                 changed: Arc::new(parking_lot::Condvar::new()),
                 removed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                change_generation: Arc::new(AtomicU64::new(0)),
+                change_listeners: Arc::new(Mutex::new(BTreeMap::new())),
+                next_change_listener: Arc::new(AtomicU64::new(1)),
             };
             Self { set }
         }
@@ -5127,6 +5348,7 @@ mod ipc_set_tests {
         fn post(&self, semnum: u16) {
             self.set.values.lock()[semnum as usize] += 1;
             self.set.changed.notify_all();
+            self.set.publish_change();
         }
     }
 
@@ -5187,7 +5409,7 @@ mod ipc_set_tests {
         fixture: &InMemSemFixture,
         sops: &[LinuxSembuf],
         timeout: Option<LinuxTimespec>,
-        counts: &SemWaitCounters,
+        _counts: &SemWaitCounters,
         watch: (i32, SemWaitKind),
         on_wait: impl Fn(usize, u32) -> bool,
     ) -> DispatchOutcome {
@@ -5209,29 +5431,40 @@ mod ipc_set_tests {
             execution_lease: None,
             mm_executor: None,
         };
-        let (watch_semnum, watch_kind) = watch;
-        let consultations = std::cell::Cell::new(0usize);
-        let interrupted = || -> bool {
-            let index = usize::try_from(watch_semnum).expect("watch semnum");
-            let observed = counts.lock().get(index).map_or(0, |c| c.get(watch_kind));
-            let calls = consultations.get() + 1;
-            consultations.set(calls);
-            on_wait(calls, observed)
-        };
-        sysv_semop(
+        let outcome = sysv_semop(
             &mut cx,
             &fixture.set,
             SEMOP_TEST_SOPS_ADDR,
             sops.len(),
             timeout,
-            SemopWaitCtx {
-                task_pid: None,
-                wait_counts: counts,
-                interrupted: &interrupted,
-                completed: &|_| {},
-            },
+            None,
+            None,
         )
-        .expect("semop probe dispatch")
+        .expect("semop probe dispatch");
+        let DispatchOutcome::BlockingSemop(mut semop) = outcome else {
+            return outcome;
+        };
+        // Compatibility harness for the old synchronous unit cases. Production
+        // never drives this loop: the retained continuation owns the operation.
+        for calls in 1..=64 {
+            let (watch_semnum, watch_kind) = watch;
+            let observed = fixture
+                .set
+                .logical_wait_count(watch_semnum, watch_kind)
+                .unwrap_or(0);
+            if on_wait(calls, observed) {
+                drop(semop);
+                return DispatchOutcome::errno(LINUX_EINTR);
+            }
+            match semop.complete() {
+                BlockingSemopStep::Done(outcome) => return outcome,
+                BlockingSemopStep::Wait(next) => {
+                    semop = next;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+        panic!("compatibility driver exhausted while retained semop remained parked")
     }
 
     fn decrement_sop(sem_num: u16, sem_flg: i16) -> LinuxSembuf {
@@ -5240,6 +5473,133 @@ mod ipc_set_tests {
             sem_op: -1,
             sem_flg,
         }
+    }
+
+    fn begin_semop_for_continuation_test(
+        fixture: &InMemSemFixture,
+        sops: &[LinuxSembuf],
+        timeout: Option<LinuxTimespec>,
+    ) -> DispatchOutcome {
+        let dispatcher = SyscallDispatcher::new();
+        let kernel = dispatcher
+            .capture_one_task_context()
+            .expect("kernel context");
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(SEMOP_TEST_SOPS_ADDR, vec![0; 0x1000]);
+        memory
+            .write_bytes(SEMOP_TEST_SOPS_ADDR, &sembuf_bytes(sops))
+            .expect("stage sembuf array");
+        let mut cx = SyscallCtx {
+            kernel: &kernel,
+            request: SyscallRequest::new(193, SyscallArgs::from([0; 6])),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+            execution_lease: None,
+            mm_executor: None,
+        };
+        sysv_semop(
+            &mut cx,
+            &fixture.set,
+            SEMOP_TEST_SOPS_ADDR,
+            sops.len(),
+            timeout,
+            None,
+            None,
+        )
+        .expect("semop dispatch")
+    }
+
+    #[test]
+    fn retained_semop_keeps_array_atomic_and_completes_exact_set() {
+        let fixture = InMemSemFixture::new(2);
+        fixture.post(0);
+        let outcome = begin_semop_for_continuation_test(
+            &fixture,
+            &[decrement_sop(0, 0), decrement_sop(1, 0)],
+            None,
+        );
+        let DispatchOutcome::BlockingSemop(semop) = outcome else {
+            panic!("unsatisfied array must park as retained semop: {outcome:?}");
+        };
+        assert_eq!(fixture.value(0), 1, "first operation must not commit early");
+        assert_eq!(fixture.value(1), 0);
+        fixture.post(1);
+        assert!(matches!(
+            semop.complete(),
+            BlockingSemopStep::Done(DispatchOutcome::Returned { value: 0 })
+        ));
+        assert_eq!((fixture.value(0), fixture.value(1)), (0, 0));
+    }
+
+    #[test]
+    fn immediate_semop_never_registers_a_blocked_waiter() {
+        let fixture = InMemSemFixture::new(1);
+        fixture.post(0);
+        let outcome = begin_semop_for_continuation_test(&fixture, &[decrement_sop(0, 0)], None);
+        assert!(matches!(outcome, DispatchOutcome::Returned { value: 0 }));
+        assert_eq!(
+            fixture.set.logical_wait_count(0, SemWaitKind::Increase),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn retained_semop_generation_closes_wake_before_enroll_and_drop_unwinds_counts() {
+        let fixture = InMemSemFixture::new(1);
+        let outcome = begin_semop_for_continuation_test(&fixture, &[decrement_sop(0, 0)], None);
+        let DispatchOutcome::BlockingSemop(semop) = outcome else {
+            panic!("empty semaphore must park: {outcome:?}");
+        };
+        assert_eq!(
+            fixture.set.logical_wait_count(0, SemWaitKind::Increase),
+            Some(1),
+            "park admission publishes GETNCNT"
+        );
+        let observed = semop.observed_generation();
+        fixture.post(0);
+        assert!(matches!(
+            semop.subscribe_change(observed, Arc::new(|| {})),
+            SemopChangeEnrollment::Ready
+        ));
+        drop(semop);
+        assert_eq!(
+            fixture.set.logical_wait_count(0, SemWaitKind::Increase),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn retained_semop_tombstone_cannot_retarget_and_keeps_deadline() {
+        let fixture = InMemSemFixture::new(1);
+        let outcome = begin_semop_for_continuation_test(
+            &fixture,
+            &[decrement_sop(0, 0)],
+            Some(LinuxTimespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            }),
+        );
+        let DispatchOutcome::BlockingSemop(semop) = outcome else {
+            panic!("empty semaphore must park: {outcome:?}");
+        };
+        let deadline = semop.deadline();
+        let BlockingSemopStep::Wait(semop) = semop.complete() else {
+            panic!("unarmed set must remain parked before the deadline");
+        };
+        assert_eq!(
+            semop.deadline(),
+            deadline,
+            "repark must keep admission deadline"
+        );
+        let values = fixture.set.values.lock();
+        fixture.set.removed.store(true, Ordering::Release);
+        drop(values);
+        fixture.set.publish_change();
+        assert!(matches!(
+            semop.complete(),
+            BlockingSemopStep::Done(DispatchOutcome::Errno { errno }) if errno == carrick_abi::LINUX_EIDRM
+        ));
     }
 
     fn wait_zero_sop(sem_num: u16, sem_flg: i16) -> LinuxSembuf {
@@ -5416,12 +5776,15 @@ mod ipc_set_tests {
             cuid: NsUid::ROOT,
             cgid: NsGid::ROOT,
             ctime: 0,
-            otime: 0,
+            otime: Arc::new(AtomicU64::new(0)),
             values: Arc::new(Mutex::new(vec![0u16; 3])),
             logical_last_operators: Arc::new(Mutex::new(vec![None; 3])),
             logical_wait_counts: Arc::new(Mutex::new(vec![SemWaitCounts::default(); 3])),
             changed: Arc::new(parking_lot::Condvar::new()),
             removed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            change_generation: Arc::new(AtomicU64::new(0)),
+            change_listeners: Arc::new(Mutex::new(BTreeMap::new())),
+            next_change_listener: Arc::new(AtomicU64::new(1)),
         };
         let child = parent.clone();
 

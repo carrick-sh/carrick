@@ -11,6 +11,7 @@ use super::pipe::{PipeWriteNotification, PipeWriteOperation};
 use super::*;
 use crate::dispatch::fd_table::{DirListing, HostFdRef, HostWriteKind, is_anon_overlay_path};
 use crate::dispatch::{HostPipeWriteTarget, WaitFdAuthority, write_host_pipe_owned};
+use crate::kernel::FileSlotNumber;
 use crate::linux_abi::{
     LINUX_EAGAIN, LINUX_EBADF, LINUX_EFAULT, LINUX_EFBIG, LINUX_EINTR, LINUX_EINVAL, LINUX_ENXIO,
     LINUX_EOVERFLOW, LINUX_EPIPE, LINUX_ESPIPE, LINUX_O_ACCMODE, LINUX_O_WRONLY,
@@ -643,7 +644,12 @@ impl<'a> FsView<'a> {
                     WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
                 ));
             }
-            let Some(open_file) = this.open_file(fd.0) else {
+            let Ok(number) = FileSlotNumber::for_open_fd(fd.0) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let files = this.captured_file_table();
+            let Some((open_file, slot_authority)) = files.capture_open_slot_authority(number)
+            else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             let Some(mut open) = open_file.description.write() else {
@@ -801,7 +807,25 @@ impl<'a> FsView<'a> {
                     let nonblocking =
                         open_file.description.common().status_flags() & LINUX_TFD_NONBLOCK != 0;
                     drop(open);
-                    return Ok(read_timerfd(memory, address, length, &state, nonblocking));
+                    // Authenticate the slot captured before classification and
+                    // retain its exact description while the table read guard
+                    // prevents a close/reuse from racing this admission.
+                    let Some(lease) = files.retain_slot_lease(slot_authority) else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    return Ok(match super::super::begin_timerfd_read(
+                        memory,
+                        address,
+                        length,
+                        state,
+                        lease,
+                        nonblocking,
+                    ) {
+                        super::super::TimerFdReadStep::Done(outcome) => outcome,
+                        super::super::TimerFdReadStep::Wait(read) => {
+                            DispatchOutcome::BlockingTimerFdRead(read)
+                        }
+                    });
                 }
                 OpenDescription::Inotify { state, .. } => {
                     let state = Arc::clone(state);

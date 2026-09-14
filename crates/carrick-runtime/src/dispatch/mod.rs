@@ -688,7 +688,11 @@ mod syslog;
 mod sysv;
 #[cfg(doctest)]
 pub mod sysv;
+pub use sysv::BlockingSemop;
 pub use sysv::SysvWaitState;
+#[cfg(test)]
+pub(crate) use sysv::blocking_semop_for_continuation_test;
+pub(crate) use sysv::{BlockingSemopStep, SemopChangeEnrollment, SemopChangeSubscription};
 #[macro_use]
 mod time;
 pub use time::{
@@ -765,6 +769,7 @@ pub(crate) use routing::{
 pub use seccomp_observer::check_syscall_flags;
 pub mod format_stat;
 pub(in crate::dispatch) use format_stat::*;
+pub(crate) mod fd_wait;
 pub mod format_time;
 pub(crate) use format_time::*;
 pub mod rootfs_helpers;

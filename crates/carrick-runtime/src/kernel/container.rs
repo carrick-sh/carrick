@@ -17,7 +17,7 @@
 //! `NsProxy`, never through a static.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use camino::Utf8PathBuf;
@@ -371,10 +371,102 @@ struct DeterministicWaiters {
     waiters: std::collections::BTreeMap<u64, DeterministicWaiter>,
 }
 
-#[derive(Debug, Clone)]
+type DeterministicWakeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
+
+#[derive(Clone)]
 struct DeterministicWaiter {
     due_monotonic: Option<Duration>,
     pair: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    callback: Option<DeterministicWakeCallback>,
+}
+
+impl std::fmt::Debug for DeterministicWaiter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeterministicWaiter")
+            .field("due_monotonic", &self.due_monotonic)
+            .field("has_callback", &self.callback.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) type ClockChangeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
+
+#[derive(Default)]
+struct ClockChangeState {
+    generation: u64,
+    next_listener: u64,
+    listeners: std::collections::BTreeMap<u64, ClockChangeCallback>,
+}
+
+impl std::fmt::Debug for ClockChangeState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClockChangeState")
+            .field("generation", &self.generation)
+            .field("listeners", &self.listeners.len())
+            .finish()
+    }
+}
+
+/// A versioned subscription to one [`ClockDomain`] change publication.
+///
+/// Dropping it removes the callback from later publications.  A callback
+/// already cloned by an in-flight publication remains possible; consumers use
+/// their continuation token to make that late delivery harmless.
+#[derive(Debug)]
+pub(crate) struct ClockChangeSubscription {
+    id: u64,
+    state: Weak<Mutex<ClockChangeState>>,
+}
+
+impl Drop for ClockChangeSubscription {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.upgrade() {
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .listeners
+                .remove(&self.id);
+        }
+    }
+}
+
+/// The result of atomically checking a clock-change generation and enrolling.
+pub(crate) enum ClockChangeEnrollment {
+    Ready(u64),
+    Subscribed(ClockChangeSubscription),
+}
+
+impl std::fmt::Debug for ClockChangeEnrollment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready(generation) => formatter.debug_tuple("Ready").field(generation).finish(),
+            Self::Subscribed(_) => formatter.write_str("Subscribed(ClockChangeSubscription)"),
+        }
+    }
+}
+
+/// A deterministic scheduler enrollment owned by a parked continuation.
+///
+/// Drop removes its exact waiter, so closing/rearming/cancelling a timer cannot
+/// leave an obsolete deadline eligible for virtual-time auto-advance.
+#[derive(Debug)]
+pub(crate) struct DeterministicWaiterSubscription {
+    id: u64,
+    clock: Weak<ClockDomain>,
+}
+
+impl Drop for DeterministicWaiterSubscription {
+    fn drop(&mut self) {
+        if let Some(clock) = self.clock.upgrade() {
+            clock.remove_waiter(self.id);
+            // Removing an untimed continuation can make the remaining parked
+            // timers all timed.  Reconsider immediately so cancellation does
+            // not leave deterministic time stopped until an unrelated event.
+            clock.maybe_auto_advance();
+        }
+    }
 }
 
 /// The vvar `VVAR_OFF_REALTIME_OFF_NS` word for a domain: the vDSO computes
@@ -436,7 +528,15 @@ pub struct ClockDomain {
     epoch: AtomicU64,
     start_host_instant: Instant,
     virtual_monotonic_ns: AtomicU64,
-    waiters: Mutex<DeterministicWaiters>,
+    /// Publishes virtual-clock progress and guest-controlled realtime steps to
+    /// timerfd continuations without a host-time polling loop.
+    clock_wait_queue: Arc<crate::kernel::WaitQueue>,
+    /// Serializes a clock snapshot with every change publication.  A timer
+    /// continuation takes this lock while deriving its deadline and generation;
+    /// a concurrent step therefore either precedes that snapshot or produces a
+    /// generation mismatch at subscription, never an invisible edge.
+    clock_changes: Arc<Mutex<ClockChangeState>>,
+    waiters: Arc<Mutex<DeterministicWaiters>>,
     adjtimex: Mutex<AdjtimexState>,
 }
 
@@ -459,7 +559,13 @@ impl ClockDomain {
             epoch: AtomicU64::new(0),
             start_host_instant: Instant::now(),
             virtual_monotonic_ns: AtomicU64::new(0),
-            waiters: Mutex::new(DeterministicWaiters::default()),
+            clock_wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
+            clock_changes: Arc::new(Mutex::new(ClockChangeState {
+                generation: 0,
+                next_listener: 1,
+                listeners: std::collections::BTreeMap::new(),
+            })),
+            waiters: Arc::new(Mutex::new(DeterministicWaiters::default())),
             adjtimex: Mutex::new(AdjtimexState::default()),
         }
     }
@@ -530,13 +636,83 @@ impl ClockDomain {
         self.epoch.load(Ordering::Acquire)
     }
 
+    pub fn wait_queue(&self) -> Arc<crate::kernel::WaitQueue> {
+        Arc::clone(&self.clock_wait_queue)
+    }
+
+    /// Run `snapshot` while excluding a clock mutation and return the exact
+    /// generation that describes the values it observed.
+    ///
+    /// Timerfd uses this to bind its derived deadline to an enrollment
+    /// generation.  Taking a generation after deriving a deadline is not
+    /// enough: a realtime step could otherwise land between those operations
+    /// and make the old deadline look current forever.
+    pub(crate) fn with_clock_change_snapshot<T>(&self, snapshot: impl FnOnce() -> T) -> (u64, T) {
+        let state = self
+            .clock_changes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let value = snapshot();
+        (state.generation, value)
+    }
+
+    /// Atomically compare a snapshot generation and install a callback for the
+    /// next clock change.  `Ready` means the caller must re-drive its operation
+    /// instead of parking on a stale deadline.
+    pub(crate) fn subscribe_clock_change(
+        &self,
+        expected_generation: u64,
+        callback: ClockChangeCallback,
+    ) -> ClockChangeEnrollment {
+        let mut state = self
+            .clock_changes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.generation != expected_generation {
+            return ClockChangeEnrollment::Ready(state.generation);
+        }
+        let id = state.next_listener;
+        state.next_listener = state.next_listener.wrapping_add(1);
+        if id == 0 {
+            return ClockChangeEnrollment::Ready(state.generation);
+        }
+        state.listeners.insert(id, callback);
+        ClockChangeEnrollment::Subscribed(ClockChangeSubscription {
+            id,
+            state: Arc::downgrade(&self.clock_changes),
+        })
+    }
+
+    fn begin_clock_change(&self, change: impl FnOnce()) -> Vec<ClockChangeCallback> {
+        let mut state = self
+            .clock_changes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        change();
+        state.generation = state.generation.wrapping_add(1);
+        state.listeners.values().cloned().collect()
+    }
+
+    fn finish_clock_change(&self, callbacks: Vec<ClockChangeCallback>) {
+        // Neither the version-listener mutex nor a deterministic-waiter mutex
+        // is held here.  A callback may cancel its continuation, drop this
+        // subscription, or install another timer without lock inversion.
+        self.clock_wait_queue.wake_all();
+        for callback in callbacks {
+            callback();
+        }
+    }
+
     /// Attempt to set the guest realtime offset. Returns EPERM if embedder time control is active.
     pub fn try_set_realtime_offset_ns(&self, delta_ns: i64) -> Result<(), carrick_abi::LinuxErrno> {
         if self.is_controlled() {
             return Err(carrick_abi::LINUX_EPERM);
         }
-        self.realtime_offset_ns.store(delta_ns, Ordering::SeqCst);
-        self.epoch.fetch_add(1, Ordering::Release);
+        let callbacks = self.begin_clock_change(|| {
+            self.realtime_offset_ns.store(delta_ns, Ordering::SeqCst);
+            self.epoch.fetch_add(1, Ordering::Release);
+        });
+        self.finish_clock_change(callbacks);
         Ok(())
     }
 
@@ -550,20 +726,23 @@ impl ClockDomain {
         if self.is_controlled() {
             return Err(carrick_abi::LINUX_EPERM);
         }
-        let mut curr = self.realtime_offset_ns.load(Ordering::SeqCst);
-        loop {
-            let next = curr.saturating_add(step_ns);
-            match self.realtime_offset_ns.compare_exchange_weak(
-                curr,
-                next,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => break,
-                Err(actual) => curr = actual,
+        let callbacks = self.begin_clock_change(|| {
+            let mut curr = self.realtime_offset_ns.load(Ordering::SeqCst);
+            loop {
+                let next = curr.saturating_add(step_ns);
+                match self.realtime_offset_ns.compare_exchange_weak(
+                    curr,
+                    next,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => curr = actual,
+                }
             }
-        }
-        self.epoch.fetch_add(1, Ordering::Release);
+            self.epoch.fetch_add(1, Ordering::Release);
+        });
+        self.finish_clock_change(callbacks);
         Ok(())
     }
 
@@ -686,11 +865,18 @@ impl ClockDomain {
         if !self.is_deterministic() {
             return Err(TimeError::UnsupportedMode(format!("{:?}", self.control)));
         }
-        let old_ns = self
-            .virtual_monotonic_ns
-            .fetch_add(delta.as_nanos() as u64, Ordering::SeqCst);
+        let mut old_ns = 0;
+        let callbacks = self.begin_clock_change(|| {
+            old_ns = self
+                .virtual_monotonic_ns
+                .fetch_add(delta.as_nanos() as u64, Ordering::SeqCst);
+        });
         let new_now = Duration::from_nanos(old_ns.saturating_add(delta.as_nanos() as u64));
-        self.wake_due_waiters_locked(new_now);
+        let timer_callbacks = self.wake_due_waiters(new_now);
+        self.finish_clock_change(callbacks);
+        for callback in timer_callbacks {
+            callback();
+        }
         Ok(())
     }
 
@@ -717,9 +903,48 @@ impl ClockDomain {
             DeterministicWaiter {
                 due_monotonic,
                 pair: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+                callback: None,
             },
         );
         id
+    }
+
+    /// Enroll a timer continuation in the deterministic scheduler.
+    ///
+    /// The returned guard owns precisely this due time.  It is deliberately
+    /// separate from the synchronous `wait_virtual` id API: continuation
+    /// cancellation must remove the waiter without blocking an executor.
+    pub(crate) fn enroll_deterministic_waiter(
+        self: &Arc<Self>,
+        due_monotonic: Option<Duration>,
+        callback: impl Fn() + Send + Sync + 'static,
+    ) -> Option<DeterministicWaiterSubscription> {
+        if !self.is_deterministic() {
+            return None;
+        }
+        let id = {
+            let mut state = self
+                .waiters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let id = state.next_id;
+            state.next_id += 1;
+            state.waiters.insert(
+                id,
+                DeterministicWaiter {
+                    due_monotonic,
+                    pair: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+                    callback: Some(Arc::new(callback)),
+                },
+            );
+            id
+        };
+        let subscription = DeterministicWaiterSubscription {
+            id,
+            clock: Arc::downgrade(self),
+        };
+        self.maybe_auto_advance();
+        Some(subscription)
     }
 
     /// Remove an enrolled waiter from the virtual scheduler.
@@ -731,21 +956,28 @@ impl ClockDomain {
         state.waiters.remove(&id);
     }
 
-    fn wake_due_waiters_locked(&self, current_time: Duration) {
+    fn wake_due_waiters(&self, current_time: Duration) -> Vec<DeterministicWakeCallback> {
         let state = self
             .waiters
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut callbacks = Vec::new();
         for waiter in state.waiters.values() {
             if let Some(due) = waiter.due_monotonic {
                 if due <= current_time {
                     let (lock, cvar) = &*waiter.pair;
                     let mut done = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    *done = true;
-                    cvar.notify_all();
+                    if !*done {
+                        *done = true;
+                        cvar.notify_all();
+                        if let Some(callback) = &waiter.callback {
+                            callbacks.push(Arc::clone(callback));
+                        }
+                    }
                 }
             }
         }
+        callbacks
     }
 
     /// In Deterministic mode, wait on the virtual clock until due time or host deadline.
@@ -817,66 +1049,73 @@ impl ClockDomain {
         if !self.is_deterministic() {
             return;
         }
-        let state = self
-            .waiters
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut min_due: Option<Duration> = None;
-        let mut all_timed = true;
-        let mut active_count = 0;
-        for waiter in state.waiters.values() {
-            let (lock, _) = &*waiter.pair;
-            let is_done = *lock.lock().unwrap_or_else(|p| p.into_inner());
-            if is_done {
-                continue;
-            }
-            active_count += 1;
-            match waiter.due_monotonic {
-                Some(due) => {
-                    min_due = match min_due {
-                        None => Some(due),
-                        Some(m) => Some(m.min(due)),
-                    };
+        let (clock_callbacks, timer_callbacks) = {
+            // The version lock comes before the scheduler lock everywhere in
+            // this method.  A timer plan holds timer.inner then takes this
+            // lock, while clock mutation never takes timer.inner, so a plan
+            // sees either side of the virtual-time update as one snapshot.
+            let mut changes = self
+                .clock_changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = self
+                .waiters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut min_due: Option<Duration> = None;
+            let mut all_timed = true;
+            let mut active_count = 0;
+            for waiter in state.waiters.values() {
+                let (lock, _) = &*waiter.pair;
+                if *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+                    continue;
                 }
-                None => {
-                    all_timed = false;
+                active_count += 1;
+                match waiter.due_monotonic {
+                    Some(due) => min_due = Some(min_due.map_or(due, |earliest| earliest.min(due))),
+                    None => all_timed = false,
                 }
             }
-        }
-
-        if !all_timed || active_count == 0 {
-            return;
-        }
-
-        let current_ns = self.virtual_monotonic_ns.load(Ordering::SeqCst);
-        let current_dur = Duration::from_nanos(current_ns);
-
-        if let Some(earliest) = min_due {
-            if earliest > current_dur {
+            if !all_timed || active_count == 0 {
+                return;
+            }
+            let current = Duration::from_nanos(self.virtual_monotonic_ns.load(Ordering::SeqCst));
+            let Some(due) = min_due else {
+                return;
+            };
+            let target = current.max(due);
+            let advanced = target > current;
+            if advanced {
                 self.virtual_monotonic_ns
-                    .store(earliest.as_nanos() as u64, Ordering::SeqCst);
-                for waiter in state.waiters.values() {
-                    if let Some(due) = waiter.due_monotonic {
-                        if due <= earliest {
-                            let (lock, cvar) = &*waiter.pair;
-                            let mut done = lock.lock().unwrap_or_else(|p| p.into_inner());
-                            *done = true;
-                            cvar.notify_all();
-                        }
-                    }
-                }
-            } else {
-                for waiter in state.waiters.values() {
-                    if let Some(due) = waiter.due_monotonic {
-                        if due <= current_dur {
-                            let (lock, cvar) = &*waiter.pair;
-                            let mut done = lock.lock().unwrap_or_else(|p| p.into_inner());
-                            *done = true;
-                            cvar.notify_all();
+                    .store(target.as_nanos() as u64, Ordering::SeqCst);
+                changes.generation = changes.generation.wrapping_add(1);
+            }
+
+            let mut timer_callbacks = Vec::new();
+            for waiter in state.waiters.values() {
+                if waiter
+                    .due_monotonic
+                    .is_some_and(|waiter_due| waiter_due <= target)
+                {
+                    let (lock, cvar) = &*waiter.pair;
+                    let mut done = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if !*done {
+                        *done = true;
+                        cvar.notify_all();
+                        if let Some(callback) = &waiter.callback {
+                            timer_callbacks.push(Arc::clone(callback));
                         }
                     }
                 }
             }
+            let clock_callbacks = advanced.then(|| changes.listeners.values().cloned().collect());
+            (clock_callbacks, timer_callbacks)
+        };
+        if let Some(clock_callbacks) = clock_callbacks {
+            self.finish_clock_change(clock_callbacks);
+        }
+        for callback in timer_callbacks {
+            callback();
         }
     }
 
@@ -1461,7 +1700,11 @@ mod tests {
 
 #[cfg(test)]
 mod clock_domain_tests {
-    use super::{ClockDomain, SignedDuration, TimeError, vvar_realtime_word};
+    use super::{
+        ClockChangeEnrollment, ClockDomain, SignedDuration, TimeError, vvar_realtime_word,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn wall_now() -> Duration {
@@ -1614,6 +1857,93 @@ mod clock_domain_tests {
 
         clock.remove_waiter(w1);
         clock.remove_waiter(w2);
+    }
+
+    #[test]
+    fn clock_change_subscription_rejects_a_stale_snapshot() {
+        let clock = ClockDomain::system();
+        let (observed, ()) = clock.with_clock_change_snapshot(|| ());
+        clock
+            .try_step_realtime_offset_ns(Duration::from_secs(1).as_nanos() as i64)
+            .expect("system clock accepts a realtime step");
+
+        assert!(matches!(
+            clock.subscribe_clock_change(observed, Arc::new(|| panic!("stale callback installed"))),
+            ClockChangeEnrollment::Ready(current) if current != observed
+        ));
+    }
+
+    #[test]
+    fn clock_change_callback_can_reenter_and_drop_its_subscription() {
+        let clock = Arc::new(ClockDomain::system());
+        let (observed, ()) = clock.with_clock_change_snapshot(|| ());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let subscription = Arc::new(Mutex::new(None));
+        let callback_clock = Arc::clone(&clock);
+        let callback_calls = Arc::clone(&calls);
+        let callback_subscription = Arc::clone(&subscription);
+        let enrollment = clock.subscribe_clock_change(
+            observed,
+            Arc::new(move || {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                let _ = callback_clock.with_clock_change_snapshot(|| callback_clock.realtime_now());
+                callback_subscription
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+            }),
+        );
+        let ClockChangeEnrollment::Subscribed(enrollment) = enrollment else {
+            panic!("unchanged snapshot must subscribe");
+        };
+        *subscription
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(enrollment);
+
+        clock
+            .try_step_realtime_offset_ns(1)
+            .expect("system clock accepts a realtime step");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        clock
+            .try_step_realtime_offset_ns(1)
+            .expect("system clock accepts a second realtime step");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "dropped callback stays removed"
+        );
+    }
+
+    #[test]
+    fn deterministic_subscription_auto_advance_publishes_callback_and_drop_disarms() {
+        let clock = Arc::new(ClockDomain::deterministic(UNIX_EPOCH));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_clock = Arc::clone(&clock);
+        let callback_calls = Arc::clone(&calls);
+        let _subscription = clock
+            .enroll_deterministic_waiter(Some(Duration::from_millis(50)), move || {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                let _ =
+                    callback_clock.with_clock_change_snapshot(|| callback_clock.monotonic_now());
+            })
+            .expect("deterministic clock owns a scheduler enrollment");
+        assert_eq!(clock.monotonic_now(), Duration::from_millis(50));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let blocker = clock
+            .enroll_deterministic_waiter(None, || {})
+            .expect("deterministic clock owns an untimed scheduler enrollment");
+        let resumed_calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&resumed_calls);
+        let _timed = clock
+            .enroll_deterministic_waiter(Some(Duration::from_millis(100)), move || {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+            })
+            .expect("deterministic clock owns a scheduler enrollment");
+        assert_eq!(clock.monotonic_now(), Duration::from_millis(50));
+        drop(blocker);
+        assert_eq!(clock.monotonic_now(), Duration::from_millis(100));
+        assert_eq!(resumed_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

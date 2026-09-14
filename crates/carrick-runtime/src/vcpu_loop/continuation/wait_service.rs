@@ -73,6 +73,10 @@ pub(in crate::vcpu_loop) enum ProducerSubscription {
     Task(crate::kernel::objects::TaskWakeSubscription),
     Vfork(crate::kernel::core::VforkReleaseSubscription),
     FileSlot(crate::kernel::objects::FileSlotSubscription),
+    TimerFd(crate::dispatch::fd_table::TimerFdChangeSubscription),
+    Clock(crate::kernel::container::ClockChangeSubscription),
+    DeterministicTimer(std::sync::Arc<crate::kernel::container::DeterministicWaiterSubscription>),
+    Semop(crate::dispatch::SemopChangeSubscription),
     WaitQueue(crate::kernel::WaitCallbackEnrollment),
 }
 
@@ -83,6 +87,10 @@ impl std::fmt::Debug for ProducerSubscription {
             Self::Task(_) => formatter.write_str("TaskWakeSubscription"),
             Self::Vfork(_) => formatter.write_str("VforkReleaseSubscription"),
             Self::FileSlot(_) => formatter.write_str("FileSlotSubscription"),
+            Self::TimerFd(_) => formatter.write_str("TimerFdSubscription"),
+            Self::Clock(_) => formatter.write_str("ClockChangeSubscription"),
+            Self::DeterministicTimer(_) => formatter.write_str("DeterministicTimerSubscription"),
+            Self::Semop(_) => formatter.write_str("SemopChangeSubscription"),
             Self::WaitQueue(_) => formatter.write_str("WaitQueueSubscription"),
         }
     }
@@ -1201,6 +1209,140 @@ impl CarrierWaitService {
                             self.inner.publish_event(token, ContinuationEvent::Ready);
                         }
                     }
+                }
+            }
+        }
+        if let ReadinessProbe::Fds { timer_sources, .. } = &probe {
+            for source in timer_sources {
+                let plan = source.plan();
+                let callback_weak = weak.clone();
+                let callback = Arc::new(move |_| {
+                    if let Some(inner) = callback_weak.upgrade() {
+                        inner.publish_event(token, ContinuationEvent::Ready);
+                    }
+                });
+                match source.subscribe_change(plan.timer_generation, callback) {
+                    crate::dispatch::fd_table::TimerFdChangeEnrollment::Subscribed(
+                        subscription,
+                    ) => {
+                        self.inner.attach_subscription(
+                            token,
+                            ProducerSubscription::TimerFd(subscription),
+                        );
+                    }
+                    crate::dispatch::fd_table::TimerFdChangeEnrollment::Ready => {
+                        self.inner.publish_event(token, ContinuationEvent::Ready);
+                    }
+                }
+
+                let callback_weak = weak.clone();
+                let clock_callback = Arc::new(move || {
+                    if let Some(inner) = callback_weak.upgrade() {
+                        inner.publish_event(token, ContinuationEvent::Ready);
+                    }
+                });
+                match source
+                    .state_clock()
+                    .subscribe_clock_change(plan.clock_generation, clock_callback)
+                {
+                    crate::kernel::container::ClockChangeEnrollment::Subscribed(subscription) => {
+                        self.inner
+                            .attach_subscription(token, ProducerSubscription::Clock(subscription));
+                    }
+                    crate::kernel::container::ClockChangeEnrollment::Ready(_) => {
+                        self.inner.publish_event(token, ContinuationEvent::Ready);
+                    }
+                }
+
+                let callback_weak = weak.clone();
+                if let Some(subscription) =
+                    source
+                        .state_clock()
+                        .enroll_deterministic_waiter(plan.virtual_due, move || {
+                            if let Some(inner) = callback_weak.upgrade() {
+                                inner.publish_event(token, ContinuationEvent::Ready);
+                            }
+                        })
+                {
+                    self.inner.attach_subscription(
+                        token,
+                        ProducerSubscription::DeterministicTimer(Arc::new(subscription)),
+                    );
+                }
+            }
+        }
+        if let ReadinessProbe::TimerFdRead { read, plan, .. } = &probe {
+            let callback_weak = weak.clone();
+            let callback = Arc::new(move |_| {
+                if let Some(inner) = callback_weak.upgrade() {
+                    inner.publish_event(token, ContinuationEvent::Ready);
+                }
+            });
+            let enrollment = read
+                .lock()
+                .as_ref()
+                .map(|read| read.subscribe_change(plan.timer_generation, callback));
+            match enrollment {
+                Some(crate::dispatch::fd_table::TimerFdChangeEnrollment::Subscribed(
+                    subscription,
+                )) => {
+                    self.inner
+                        .attach_subscription(token, ProducerSubscription::TimerFd(subscription));
+                }
+                Some(crate::dispatch::fd_table::TimerFdChangeEnrollment::Ready) | None => {
+                    self.inner.publish_event(token, ContinuationEvent::Ready);
+                }
+            }
+            let callback_weak = weak.clone();
+            let clock_callback = Arc::new(move || {
+                if let Some(inner) = callback_weak.upgrade() {
+                    inner.publish_event(token, ContinuationEvent::Ready);
+                }
+            });
+            let clock_enrollment = read.lock().as_ref().map(|read| {
+                read.state_clock()
+                    .subscribe_clock_change(plan.clock_generation, clock_callback)
+            });
+            match clock_enrollment {
+                Some(crate::kernel::container::ClockChangeEnrollment::Subscribed(subscription)) => {
+                    self.inner
+                        .attach_subscription(token, ProducerSubscription::Clock(subscription));
+                }
+                Some(crate::kernel::container::ClockChangeEnrollment::Ready(_)) | None => {
+                    self.inner.publish_event(token, ContinuationEvent::Ready);
+                }
+            }
+            let callback_weak = weak.clone();
+            let deterministic_callback = move || {
+                if let Some(inner) = callback_weak.upgrade() {
+                    inner.publish_event(token, ContinuationEvent::Ready);
+                }
+            };
+            if let Some(read) = read.lock().as_mut() {
+                read.enroll_deterministic_waiter(plan.virtual_due, deterministic_callback);
+            }
+        }
+        if let ReadinessProbe::Semop {
+            semop, generation, ..
+        } = &probe
+        {
+            let callback_weak = weak.clone();
+            let callback = Arc::new(move || {
+                if let Some(inner) = callback_weak.upgrade() {
+                    inner.publish_event(token, ContinuationEvent::Ready);
+                }
+            });
+            let enrollment = semop
+                .lock()
+                .as_ref()
+                .map(|semop| semop.subscribe_change(*generation, callback));
+            match enrollment {
+                Some(crate::dispatch::SemopChangeEnrollment::Subscribed(subscription)) => {
+                    self.inner
+                        .attach_subscription(token, ProducerSubscription::Semop(subscription));
+                }
+                Some(crate::dispatch::SemopChangeEnrollment::Ready) | None => {
+                    self.inner.publish_event(token, ContinuationEvent::Ready);
                 }
             }
         }

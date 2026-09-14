@@ -223,6 +223,43 @@ pub(super) struct TimerFdState {
     /// the domain is captured here rather than looked up per evaluation.
     pub(super) clock: std::sync::Arc<crate::kernel::container::ClockDomain>,
     pub(super) wait_queue: Arc<crate::kernel::WaitQueue>,
+    change_generation: std::sync::atomic::AtomicU64,
+    change_listeners: Arc<Mutex<BTreeMap<u64, TimerFdChangeListener>>>,
+    next_change_listener: std::sync::atomic::AtomicU64,
+}
+
+type TimerFdChangeCallback = Arc<dyn Fn(u64) + Send + Sync + 'static>;
+
+struct TimerFdChangeListener {
+    expected_generation: u64,
+    callback: TimerFdChangeCallback,
+}
+
+impl std::fmt::Debug for TimerFdChangeListener {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TimerFdChangeListener")
+            .field("expected_generation", &self.expected_generation)
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) struct TimerFdChangeSubscription {
+    listeners: std::sync::Weak<Mutex<BTreeMap<u64, TimerFdChangeListener>>>,
+    id: u64,
+}
+
+impl Drop for TimerFdChangeSubscription {
+    fn drop(&mut self) {
+        if let Some(listeners) = self.listeners.upgrade() {
+            listeners.lock().remove(&self.id);
+        }
+    }
+}
+
+pub(crate) enum TimerFdChangeEnrollment {
+    Ready,
+    Subscribed(TimerFdChangeSubscription),
 }
 
 impl TimerFdState {
@@ -240,6 +277,65 @@ impl TimerFdState {
             changed: Condvar::new(),
             clock,
             wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
+            change_generation: std::sync::atomic::AtomicU64::new(1),
+            change_listeners: Arc::new(Mutex::new(BTreeMap::new())),
+            next_change_listener: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    pub(crate) fn change_generation(&self) -> u64 {
+        self.change_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn subscribe_change(
+        &self,
+        expected_generation: u64,
+        callback: TimerFdChangeCallback,
+    ) -> TimerFdChangeEnrollment {
+        let mut listeners = self.change_listeners.lock();
+        let current = self.change_generation();
+        if current != expected_generation {
+            return TimerFdChangeEnrollment::Ready;
+        }
+        let id = self
+            .next_change_listener
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if id == 0 || id == u64::MAX {
+            return TimerFdChangeEnrollment::Ready;
+        }
+        listeners.insert(
+            id,
+            TimerFdChangeListener {
+                expected_generation,
+                callback,
+            },
+        );
+        TimerFdChangeEnrollment::Subscribed(TimerFdChangeSubscription {
+            listeners: Arc::downgrade(&self.change_listeners),
+            id,
+        })
+    }
+
+    pub(crate) fn publish_change(&self) {
+        let generation = self
+            .change_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .wrapping_add(1);
+        let callbacks = {
+            let mut listeners = self.change_listeners.lock();
+            listeners
+                .values_mut()
+                .filter_map(|listener| {
+                    (listener.expected_generation != generation).then(|| {
+                        listener.expected_generation = generation;
+                        Arc::clone(&listener.callback)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        for callback in callbacks {
+            callback(generation);
         }
     }
 }
@@ -2381,19 +2477,6 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
 
     fn wait_queue(&self) -> Option<Arc<crate::kernel::WaitQueue>> {
         self.read().wait_queue()
-    }
-
-    fn timerfd_remaining_timeout(&self) -> Option<std::time::Duration> {
-        let open = self.read();
-        if let OpenDescription::TimerFd { state, .. } = &*open {
-            let timer = state.inner.lock();
-            if let Some(deadline) = timer.deadline {
-                let now = super::linux_clock_duration(&state.clock, timer.clock_id)
-                    .unwrap_or(std::time::Duration::ZERO);
-                return Some(deadline.saturating_sub(now));
-            }
-        }
-        None
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

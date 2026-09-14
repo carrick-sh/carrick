@@ -1,4 +1,4 @@
-f3c8f781a315de7c
+1d386139528c657f
 eventfd_read_value=5
 eventfd_reset=true
 epoll_ready_count=1
@@ -13,6 +13,14 @@ ppoll_empty_rc=0
 select_empty_rc=0
 pselect_ready_rc=1
 timerfd_fired=true
+timerfd_unfired_nonblock_errno=11
+timerfd_fault_ready=1
+timerfd_fault_revents=1
+timerfd_fault_read_rc=-1
+timerfd_fault_read_errno=14
+timerfd_after_fault_read_rc=-1
+timerfd_after_fault_read_errno=11
+timerfd_after_fault_expirations=0
 poll_invalid_nval=true
 pipe2_nb_flag=true
 pipe2_nb_empty_eagain=true
@@ -22,3 +30,10 @@ poll_multi_ready_count=3
 poll_multi_rd_in=true
 poll_multi_wr_out=true
 poll_multi_bad_nval=true
+timerfd_worker_startup=32
+timerfd_worker_arm_failures=0
+timerfd_worker_completion_count=32
+timerfd_worker_completion_successes=32
+timerfd_worker_read_successes=32
+timerfd_worker_expirations_one=32
+timerfd_worker_read_failures=0

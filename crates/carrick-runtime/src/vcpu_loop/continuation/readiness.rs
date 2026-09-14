@@ -17,6 +17,8 @@ use super::{
     ExecutionGeneration, FutexSource, FutexWait, MmId, OwnedFdRegistration, TaskKey, ThreadKey,
     VforkParentWait, WaitFdAuthority,
 };
+use crate::dispatch::BlockingSemop;
+use crate::dispatch::format_time::{BlockingTimerFdRead, TimerFdPollSource, TimerFdReadPlan};
 use crate::dispatch::{BlockingRecordLock, BlockingWrite, DispatchOutcome};
 use crate::kernel::{Kernel, Task};
 
@@ -343,7 +345,9 @@ pub(in crate::vcpu_loop) enum ReadinessProbe {
         registrations: Vec<OwnedFdRegistration>,
         file_table: Arc<crate::kernel::objects::FileTable>,
         fd_authority: WaitFdAuthority,
-        deadline: Option<Instant>,
+        caller_deadline: Option<Instant>,
+        timer_sources: Vec<TimerFdPollSource>,
+        timerfd_admission_stale: bool,
     },
     SharedWord {
         location: SharedFutexLocation,
@@ -356,6 +360,16 @@ pub(in crate::vcpu_loop) enum ReadinessProbe {
         poll_events: i16,
         write: Arc<Mutex<BlockingWrite>>,
         completion: Arc<Mutex<Option<DispatchOutcome>>>,
+    },
+    TimerFdRead {
+        read: Arc<Mutex<Option<BlockingTimerFdRead>>>,
+        deadline: Option<Instant>,
+        plan: TimerFdReadPlan,
+    },
+    Semop {
+        semop: Arc<Mutex<Option<BlockingSemop>>>,
+        deadline: Option<Instant>,
+        generation: u64,
     },
     RecordLock {
         lock: Arc<BlockingRecordLock>,
@@ -548,19 +562,52 @@ impl ReadinessProbe {
                 registrations,
                 file_table,
                 fd_authority,
+                caller_deadline,
+                timer_sources,
+                timerfd_admission_stale,
                 ..
             }
             | ContinuationDetail::Select {
                 registrations,
                 file_table,
                 fd_authority,
+                caller_deadline,
+                timer_sources,
+                timerfd_admission_stale,
                 ..
             } => Self::Fds {
                 registrations: registrations.clone(),
                 file_table: Arc::clone(file_table),
                 fd_authority: fd_authority.clone(),
-                deadline: state.deadline,
+                caller_deadline: *caller_deadline,
+                timer_sources: timer_sources.clone(),
+                timerfd_admission_stale: *timerfd_admission_stale,
             },
+            ContinuationDetail::FdWait(wait) => {
+                let wait = wait.lock();
+                if let Some(wait) = wait.as_ref() {
+                    Self::Fds {
+                        registrations: wait
+                            .registrations()
+                            .iter()
+                            .map(|registration| OwnedFdRegistration {
+                                fd: Arc::clone(&registration.fd),
+                                events: registration.events,
+                                generation: super::next_nonzero(&super::NEXT_RESOURCE_GENERATION),
+                            })
+                            .collect(),
+                        file_table: Arc::clone(&state.authority.file_table),
+                        fd_authority: wait.authority().clone(),
+                        caller_deadline: wait.caller_deadline(),
+                        timer_sources: wait.timer_sources(),
+                        timerfd_admission_stale: false,
+                    }
+                } else {
+                    Self::Passive {
+                        deadline: Some(Instant::now()),
+                    }
+                }
+            }
             ContinuationDetail::SharedFutex {
                 location,
                 generation,
@@ -588,6 +635,38 @@ impl ReadinessProbe {
                     poll_events,
                     write: Arc::clone(write),
                     completion: Arc::clone(&state.producer_completion),
+                }
+            }
+            ContinuationDetail::TimerFdRead(read) => {
+                let plan = read
+                    .lock()
+                    .as_ref()
+                    .map(BlockingTimerFdRead::plan)
+                    .unwrap_or(TimerFdReadPlan {
+                        host_timeout: None,
+                        virtual_due: None,
+                        ready: true,
+                        deadline: None,
+                        expirations: 0,
+                        timer_generation: 0,
+                        clock_generation: 0,
+                    });
+                Self::TimerFdRead {
+                    read: Arc::clone(read),
+                    deadline: state.deadline,
+                    plan,
+                }
+            }
+            ContinuationDetail::Semop(semop) => {
+                let generation = semop
+                    .lock()
+                    .as_ref()
+                    .map(BlockingSemop::observed_generation)
+                    .unwrap_or(u64::MAX);
+                Self::Semop {
+                    semop: Arc::clone(semop),
+                    deadline: state.deadline,
+                    generation,
                 }
             }
             // Enroll against the generation the CHILD SCAN observed, never
@@ -659,11 +738,25 @@ impl ReadinessProbe {
             }
             Self::Fds {
                 registrations,
-                deadline,
+                caller_deadline,
+                timer_sources,
+                timerfd_admission_stale,
                 ..
             } => {
-                if let Some(event) = deadline_event(*deadline) {
+                if *timerfd_admission_stale {
+                    return Some(ContinuationEvent::Ready);
+                }
+                if let Some(event) = deadline_event(*caller_deadline) {
                     return Some(event);
+                }
+                // A timerfd deadline is a readiness edge.  It must wake the
+                // retained poll/select operation to sample its sources, not
+                // manufacture the caller's timeout completion.
+                if timer_sources.iter().any(|source| {
+                    let plan = source.plan();
+                    plan.ready || plan.host_timeout.is_some_and(|duration| duration.is_zero())
+                }) {
+                    return Some(ContinuationEvent::Ready);
                 }
                 if registrations.is_empty() {
                     return None;
@@ -720,6 +813,12 @@ impl ReadinessProbe {
                     None
                 }
             }
+            Self::TimerFdRead { deadline, .. } => deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+                .then_some(ContinuationEvent::Timeout),
+            Self::Semop { deadline, .. } => deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+                .then_some(ContinuationEvent::Timeout),
             Self::RecordLock { lock, completion } => {
                 let outcome = match crate::dispatch::try_drive_blocking_record_lock(lock) {
                     crate::dispatch::BlockingRecordLockStep::Done(outcome) => Some(outcome),

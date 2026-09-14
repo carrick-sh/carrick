@@ -4,16 +4,111 @@
 //! `impl SyscallDispatcher` methods.
 
 use super::*;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+
+use crate::kernel::objects::{
+    FileDescriptionFdLease, FileDescriptionFinalizer, FileDescriptionFinalizerKey,
+};
 
 struct RecordLockRequest<'a, M> {
     kernel: &'a crate::kernel::KernelContext,
     memory: &'a mut M,
     tid: crate::thread::ThreadId,
     host_fd: i32,
+    lease: FileDescriptionFdLease,
     desc_ptr: usize,
     linux_cmd: u64,
     arg: u64,
+}
+
+/// Retain the exact slot selected by a locking syscall before inspecting its
+/// backing. A close/reuse therefore either wins before admission (`EBADF`) or
+/// leaves this operation holding the original description through completion.
+fn retain_lock_description(
+    this: &FsView<'_>,
+    fd: i32,
+) -> Result<FileDescriptionFdLease, LinuxErrno> {
+    let authority = this.captured_slot_authority(fd).ok_or(LINUX_EBADF)?;
+    this.captured_file_table()
+        .retain_slot_lease(authority)
+        .ok_or(LINUX_EBADF)
+}
+
+/// Return the host backing from an already retained exact description.
+fn retained_host_file_for_lock(
+    this: &FsView<'_>,
+    fd: i32,
+) -> Result<Option<(FileDescriptionFdLease, i32, usize)>, LinuxErrno> {
+    let Some(authority) = this.captured_slot_authority(fd) else {
+        // Classic fcntl locking preserves its validated no-op for inherited
+        // stdio, which has no FileTable slot and therefore cannot admit a
+        // slot lease.
+        return if is_stdio_fd(fd) {
+            Ok(None)
+        } else {
+            Err(LINUX_EBADF)
+        };
+    };
+    let Some(lease) = this.captured_file_table().retain_slot_lease(authority) else {
+        return Err(LINUX_EBADF);
+    };
+    let desc_ptr = Arc::as_ptr(lease.description()) as usize;
+    let Some(description) = lease.description().read() else {
+        return Err(LINUX_EBADF);
+    };
+    let host_fd = match &*description {
+        OpenDescription::HostFile { host_fd, .. } => Some(host_fd.raw()),
+        _ => None,
+    };
+    drop(description);
+    Ok(host_fd.map(|host_fd| (lease, host_fd, desc_ptr)))
+}
+
+/// Releases the description-owned lock classes when their exact open-file
+/// description loses its final functional reference. The weak table edge keeps
+/// descriptor retirement from owning filesystem state.
+#[derive(Debug)]
+struct LogicalLockRetirement {
+    locks: Weak<LogicalRecordLocks>,
+    file: LeaseFileId,
+    owner: usize,
+}
+
+impl FileDescriptionFinalizer for LogicalLockRetirement {
+    fn key(&self) -> FileDescriptionFinalizerKey {
+        // An open description's backing identity is immutable until terminal
+        // retirement, so `owner` names one file. Include the logical-table
+        // identity as well: a finalizer from another registry must not be
+        // silently deduplicated just because it refers to this description.
+        FileDescriptionFinalizerKey::typed::<Self>(self.locks.as_ptr() as usize, self.owner)
+    }
+
+    fn finalize(&self) {
+        if let Some(locks) = self.locks.upgrade() {
+            locks.release_ofd(&self.file, self.owner);
+        }
+    }
+}
+
+/// Register final OFD/flock retirement while `lease` keeps this exact
+/// description functionally live. The hook contains no description `Arc`, so
+/// terminal cleanup cannot form a description → table → description cycle.
+pub(crate) fn register_logical_lock_retirement(
+    lease: &FileDescriptionFdLease,
+    locks: &Arc<LogicalRecordLocks>,
+    file: LeaseFileId,
+) -> Result<usize, LinuxErrno> {
+    let description = lease.description();
+    let owner = Arc::as_ptr(description) as usize;
+    let retirement = Arc::new(LogicalLockRetirement {
+        locks: Arc::downgrade(locks),
+        file,
+        owner,
+    });
+    description
+        .register_terminal_finalizer(retirement)
+        .then_some(owner)
+        .ok_or(LINUX_EBADF)
 }
 
 /// Forward a classic POSIX record lock (F_SETLK/F_SETLKW/F_GETLK) on a
@@ -109,6 +204,18 @@ fn forward_record_lock<M: CurrentMmMemory>(
                 req.kernel, req.memory, req.arg, conflict, is_ofd,
             );
         }
+        let ofd_lease = if is_ofd {
+            if let Err(errno) = register_logical_lock_retirement(
+                &req.lease,
+                &this.fs.classic_record_locks,
+                request.file.clone(),
+            ) {
+                return DispatchOutcome::errno(errno);
+            }
+            Some(req.lease.clone())
+        } else {
+            None
+        };
         match this.fs.classic_record_locks.try_set(request.clone()) {
             Ok(()) => DispatchOutcome::Returned { value: 0 },
             Err(errno) if matches!(req.linux_cmd, LINUX_F_SETLK | LINUX_F_OFD_SETLK) => {
@@ -121,9 +228,12 @@ fn forward_record_lock<M: CurrentMmMemory>(
                     request,
                     req.tid,
                 );
-                DispatchOutcome::BlockingRecordLock(crate::dispatch::BlockingRecordLock::logical(
-                    wait,
-                ))
+                DispatchOutcome::BlockingRecordLock(
+                    crate::dispatch::BlockingRecordLock::logical_lock(LogicalLockWait::Record {
+                        wait,
+                        _lease: ofd_lease,
+                    }),
+                )
             }
         }
     }
@@ -788,6 +898,122 @@ impl std::fmt::Debug for LogicalRecordLockWait {
     }
 }
 
+/// A reactor-driven wait for either POSIX/OFD record locking or whole-file
+/// flock locking. Both use the same continuation family, but only record locks
+/// participate in the POSIX wait-for graph.
+#[derive(Clone)]
+pub(crate) enum LogicalLockWait {
+    Record {
+        wait: LogicalRecordLockWait,
+        _lease: Option<FileDescriptionFdLease>,
+    },
+    Flock(LogicalFlockWait),
+}
+
+impl LogicalLockWait {
+    pub(crate) fn acquire(&self) -> Result<(), LinuxErrno> {
+        match self {
+            Self::Record { wait, .. } => wait.acquire(),
+            Self::Flock(wait) => wait.acquire(),
+        }
+    }
+
+    pub(crate) fn try_acquire(&self) -> Result<(), LinuxErrno> {
+        match self {
+            Self::Record { wait, .. } => wait.try_acquire(),
+            Self::Flock(wait) => wait.try_acquire(),
+        }
+    }
+}
+
+/// A flock wait retains the exact open-file description through asynchronous
+/// admission. Its owner is that description's stable `Arc` identity, never a
+/// process identity or a guest fd number that may be reused while parked.
+#[derive(Clone)]
+pub(crate) struct LogicalFlockWait {
+    locks: Arc<LogicalRecordLocks>,
+    file: LeaseFileId,
+    owner: usize,
+    write: bool,
+    tid: crate::thread::ThreadId,
+    _lease: FileDescriptionFdLease,
+}
+
+impl LogicalFlockWait {
+    pub(crate) fn new(
+        locks: Arc<LogicalRecordLocks>,
+        file: LeaseFileId,
+        owner: usize,
+        write: bool,
+        tid: crate::thread::ThreadId,
+        lease: FileDescriptionFdLease,
+    ) -> Self {
+        Self {
+            locks,
+            file,
+            owner,
+            write,
+            tid,
+            _lease: lease,
+        }
+    }
+
+    fn acquire(&self) -> Result<(), LinuxErrno> {
+        self.locks
+            .wait_flock_interruptibly(&self.file, self.owner, self.write, self.tid)
+    }
+
+    pub(crate) fn try_acquire(&self) -> Result<(), LinuxErrno> {
+        self.locks
+            .try_flock(self.file.clone(), self.owner, self.write)
+    }
+}
+
+impl std::fmt::Debug for LogicalLockWait {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Record { wait, .. } => formatter.debug_tuple("Record").field(wait).finish(),
+            Self::Flock(wait) => formatter.debug_tuple("Flock").field(wait).finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for LogicalFlockWait {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LogicalFlockWait")
+            .field("file", &self.file)
+            .field("owner", &self.owner)
+            .field("write", &self.write)
+            .field("tid", &self.tid)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for LogicalLockWait {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Record { wait: left, .. }, Self::Record { wait: right, .. }) => left == right,
+            (Self::Flock(left), Self::Flock(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for LogicalLockWait {}
+
+impl PartialEq for LogicalFlockWait {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.locks, &other.locks)
+            && self.file == other.file
+            && self.owner == other.owner
+            && self.write == other.write
+            && self.tid == other.tid
+    }
+}
+
+impl Eq for LogicalFlockWait {}
+
 fn logical_record_lock_file(host_fd: i32) -> Result<LeaseFileId, LinuxErrno> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     unsafe { libc::fstat(host_fd, &mut stat) }.host_syscall_errno()?;
@@ -990,11 +1216,6 @@ impl<'a> FsView<'a> {
             self.fs
                 .classic_record_locks
                 .release_file_owner(&file, LogicalRecordLockOwner::from(owner));
-            let is_last_ref = Arc::strong_count(&open_file.description) <= 2;
-            if is_last_ref {
-                let desc_ptr = Arc::as_ptr(&open_file.description) as usize;
-                self.fs.classic_record_locks.release_ofd(&file, desc_ptr);
-            }
         }
     }
 
@@ -1522,14 +1743,8 @@ impl<'a> FsView<'a> {
                 // (in-memory/synthetic files, --fs memory) so apt's
                 // /var/lib/apt/lists/lock path keeps working.
                 LINUX_F_SETLK | LINUX_F_SETLKW => {
-                    if !this.fd_is_valid(fd.0) {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    }
-                    let desc_ptr = this
-                        .open_file(fd.0)
-                        .map_or(0, |of| Arc::as_ptr(&of.description) as usize);
-                    match this.host_file_fd_for_flush(fd.0) {
-                        Ok(Some(host_fd)) => {
+                    match retained_host_file_for_lock(this, fd.0) {
+                        Ok(Some((lease, host_fd, desc_ptr))) => {
                             let tid = cx.tid();
                             forward_record_lock(
                                 this,
@@ -1538,6 +1753,7 @@ impl<'a> FsView<'a> {
                                     memory: &mut *cx.memory,
                                     tid,
                                     host_fd,
+                                    lease,
                                     desc_ptr,
                                     linux_cmd: command,
                                     arg,
@@ -1555,14 +1771,8 @@ impl<'a> FsView<'a> {
                     }
                 }
                 LINUX_F_GETLK => {
-                    if !this.fd_is_valid(fd.0) {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    }
-                    let desc_ptr = this
-                        .open_file(fd.0)
-                        .map_or(0, |of| Arc::as_ptr(&of.description) as usize);
-                    match this.host_file_fd_for_flush(fd.0) {
-                        Ok(Some(host_fd)) => {
+                    match retained_host_file_for_lock(this, fd.0) {
+                        Ok(Some((lease, host_fd, desc_ptr))) => {
                             let tid = cx.tid();
                             forward_record_lock(
                                 this,
@@ -1571,6 +1781,7 @@ impl<'a> FsView<'a> {
                                     memory: &mut *cx.memory,
                                     tid,
                                     host_fd,
+                                    lease,
                                     desc_ptr,
                                     linux_cmd: command,
                                     arg,
@@ -1591,14 +1802,8 @@ impl<'a> FsView<'a> {
                 // OFD locks (F_OFD_*) are owned by the open file description, not
                 // the process.
                 LINUX_F_OFD_SETLK | LINUX_F_OFD_SETLKW | LINUX_F_OFD_GETLK => {
-                    if !this.fd_is_valid(fd.0) {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    }
-                    let desc_ptr = this
-                        .open_file(fd.0)
-                        .map_or(0, |of| Arc::as_ptr(&of.description) as usize);
-                    match this.host_file_fd_for_flush(fd.0) {
-                        Ok(Some(host_fd)) => {
+                    match retained_host_file_for_lock(this, fd.0) {
+                        Ok(Some((lease, host_fd, desc_ptr))) => {
                             let tid = cx.tid();
                             forward_record_lock(
                                 this,
@@ -1607,6 +1812,7 @@ impl<'a> FsView<'a> {
                                     memory: &mut *cx.memory,
                                     tid,
                                     host_fd,
+                                    lease,
                                     desc_ptr,
                                     linux_cmd: command,
                                     arg,
@@ -1841,8 +2047,9 @@ impl<'a> FsView<'a> {
 
         fn flock(this, cx, fd: Fd, operation: u64) {
             let fd: Fd = fd;
-            let Some(open_file) = this.open_file(fd.0) else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            let lease = match retain_lock_description(this, fd.0) {
+                Ok(lease) => lease,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
 
             let lock_operation = operation & !LINUX_LOCK_NB;
@@ -1854,7 +2061,7 @@ impl<'a> FsView<'a> {
             }
 
             let file = {
-                let Some(description) = open_file.description.read() else {
+                let Some(description) = lease.description().read() else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 Self::lease_file_identity(&description)
@@ -1863,15 +2070,22 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             };
 
-            let desc_ptr = Arc::as_ptr(&open_file.description) as usize;
-
             if lock_operation == LINUX_LOCK_UN {
+                let desc_ptr = Arc::as_ptr(lease.description()) as usize;
                 this.fs.classic_record_locks.unlock_flock(&file, desc_ptr);
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
 
             let write = lock_operation == LINUX_LOCK_EX;
             let nonblocking = operation & LINUX_LOCK_NB != 0;
+            let desc_ptr = match register_logical_lock_retirement(
+                &lease,
+                &this.fs.classic_record_locks,
+                file.clone(),
+            ) {
+                Ok(owner) => owner,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
 
             match this
                 .fs
@@ -1881,13 +2095,19 @@ impl<'a> FsView<'a> {
                 Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
                 Err(errno) if nonblocking => Ok(DispatchOutcome::errno(errno)),
                 Err(_) => {
-                    let tid = cx.tid();
-                    match this.fs.classic_record_locks.wait_flock_interruptibly(
-                        &file, desc_ptr, write, tid,
-                    ) {
-                        Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
-                        Err(errno) => Ok(DispatchOutcome::errno(errno)),
-                    }
+                    let wait = LogicalFlockWait::new(
+                        Arc::clone(&this.fs.classic_record_locks),
+                        file,
+                        desc_ptr,
+                        write,
+                        cx.tid(),
+                        lease,
+                    );
+                    Ok(DispatchOutcome::BlockingRecordLock(
+                        crate::dispatch::BlockingRecordLock::logical_lock(LogicalLockWait::Flock(
+                            wait,
+                        )),
+                    ))
                 }
             }
         }

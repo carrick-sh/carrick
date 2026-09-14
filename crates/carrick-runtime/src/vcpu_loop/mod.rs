@@ -1365,6 +1365,26 @@ where
                     outcome,
                 ))
             }
+            Completion::TimerFdRead(read) => match read.complete(engine) {
+                crate::dispatch::format_time::TimerFdReadStep::Done(outcome) => Some(outcome),
+                crate::dispatch::format_time::TimerFdReadStep::Wait(read) => {
+                    Some(DispatchOutcome::BlockingTimerFdRead(read))
+                }
+            },
+            Completion::Semop(semop) => match semop.complete() {
+                crate::dispatch::BlockingSemopStep::Done(outcome) => Some(outcome),
+                crate::dispatch::BlockingSemopStep::Wait(semop) => {
+                    Some(DispatchOutcome::BlockingSemop(semop))
+                }
+            },
+            Completion::FdWait { wait, sig_mask } => {
+                match wait.complete(engine, &kernel.dispatcher) {
+                    crate::dispatch::fd_wait::BlockingFdWaitStep::Done(outcome) => Some(outcome),
+                    crate::dispatch::fd_wait::BlockingFdWaitStep::Wait(wait) => {
+                        Some(DispatchOutcome::BlockingFdWait { wait, sig_mask })
+                    }
+                }
+            }
             Completion::InterruptedSleep { remaining } => {
                 Some(crate::dispatch::complete_interrupted_sleep(
                     engine,
