@@ -14,23 +14,53 @@
 
 use conformance_probes::report;
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 #[repr(align(16))]
 #[allow(dead_code)]
 struct JumpBuf([usize; 64]);
 
 static mut JUMP_BUF: JumpBuf = JumpBuf([0; 64]);
-static B_SPINNING: AtomicBool = AtomicBool::new(false);
 static B_OBSERVED_CHANGE: AtomicBool = AtomicBool::new(false);
 static B_STALE_FAULT: AtomicBool = AtomicBool::new(false);
 static B_ITERS_1: AtomicU64 = AtomicU64::new(0);
 static B_ITERS_2: AtomicU64 = AtomicU64::new(0);
 static PHASE: AtomicI32 = AtomicI32::new(0);
+static WORKER_STATE: AtomicU32 = AtomicU32::new(0);
 
-static mut TEST_PAGE: *mut u8 = core::ptr::null_mut();
+static TEST_PAGE: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 
 const MAX_ITERS: u64 = 100_000_000;
+const MAX_HANDSHAKE_SPINS: u64 = 100_000_000;
+const STATE_ARMED: u32 = 1;
+const STATE_ACTIVE: u32 = 2;
+const STATE_DONE: u32 = 3;
+
+const fn phase_state(phase: i32, state: u32) -> u32 {
+    (phase as u32) * 4 + state
+}
+
+fn wait_for_state(phase: i32, wanted: u32) -> bool {
+    for _ in 0..MAX_HANDSHAKE_SPINS {
+        let state = WORKER_STATE.load(Ordering::Acquire);
+        if state == phase_state(phase, wanted) {
+            return true;
+        }
+        if wanted != STATE_DONE && state == phase_state(phase, STATE_DONE) {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+fn report_handshake_failure() {
+    report!(
+        broadcast_mprotect_observed = false,
+        broadcast_munmap_observed = false,
+        no_stale_fault = false,
+    );
+}
 
 unsafe extern "C" {
     #[link_name = "__sigsetjmp"]
@@ -62,52 +92,70 @@ extern "C" fn worker_thread(_arg: *mut c_void) -> *mut c_void {
             core::hint::spin_loop();
         }
 
+        WORKER_STATE.store(phase_state(1, STATE_ARMED), Ordering::Release);
         if c_sigsetjmp(core::ptr::addr_of_mut!(JUMP_BUF).cast(), 1) == 0 {
-            B_SPINNING.store(true, Ordering::SeqCst);
             let mut iters: u64 = 0;
             while iters < MAX_ITERS {
                 B_ITERS_1.store(iters, Ordering::Relaxed);
-                let val = core::ptr::read_volatile(TEST_PAGE);
+                let page = TEST_PAGE.load(Ordering::Acquire);
+                if page.is_null() {
+                    break;
+                }
+                let val = core::ptr::read_volatile(page);
+                if iters == 0 {
+                    WORKER_STATE.store(phase_state(1, STATE_ACTIVE), Ordering::Release);
+                }
                 if val != 42 {
                     break;
                 }
                 iters = iters.saturating_add(1);
             }
         }
-        B_SPINNING.store(false, Ordering::SeqCst);
+        WORKER_STATE.store(phase_state(1, STATE_DONE), Ordering::Release);
 
         // Wait for Phase 2: munmap test
         while PHASE.load(Ordering::SeqCst) != 2 {
             core::hint::spin_loop();
         }
 
+        WORKER_STATE.store(phase_state(2, STATE_ARMED), Ordering::Release);
         if c_sigsetjmp(core::ptr::addr_of_mut!(JUMP_BUF).cast(), 1) == 0 {
-            B_SPINNING.store(true, Ordering::SeqCst);
             let mut iters: u64 = 0;
             while iters < MAX_ITERS {
                 B_ITERS_2.store(iters, Ordering::Relaxed);
-                let val = core::ptr::read_volatile(TEST_PAGE);
+                let page = TEST_PAGE.load(Ordering::Acquire);
+                if page.is_null() {
+                    break;
+                }
+                let val = core::ptr::read_volatile(page);
+                if iters == 0 {
+                    WORKER_STATE.store(phase_state(2, STATE_ACTIVE), Ordering::Release);
+                }
                 if val != 84 {
                     break;
                 }
                 iters = iters.saturating_add(1);
             }
         }
-        B_SPINNING.store(false, Ordering::SeqCst);
+        WORKER_STATE.store(phase_state(2, STATE_DONE), Ordering::Release);
 
         // Wait for Phase 3: stale translation check
         while PHASE.load(Ordering::SeqCst) != 3 {
             core::hint::spin_loop();
         }
 
+        WORKER_STATE.store(phase_state(3, STATE_ARMED), Ordering::Release);
         if c_sigsetjmp(core::ptr::addr_of_mut!(JUMP_BUF).cast(), 1) == 0 {
-            B_SPINNING.store(true, Ordering::SeqCst);
-            let val = core::ptr::read_volatile(TEST_PAGE);
-            if val != 123 {
-                B_STALE_FAULT.store(true, Ordering::SeqCst);
+            let page = TEST_PAGE.load(Ordering::Acquire);
+            if !page.is_null() {
+                let val = core::ptr::read_volatile(page);
+                WORKER_STATE.store(phase_state(3, STATE_ACTIVE), Ordering::Release);
+                if val != 123 {
+                    B_STALE_FAULT.store(true, Ordering::SeqCst);
+                }
             }
         }
-        B_SPINNING.store(false, Ordering::SeqCst);
+        WORKER_STATE.store(phase_state(3, STATE_DONE), Ordering::Release);
     }
     core::ptr::null_mut()
 }
@@ -136,21 +184,24 @@ fn main() {
             libc::_exit(2);
         }
         core::ptr::write_volatile(page1.cast::<u8>(), 42);
-        TEST_PAGE = page1.cast();
+        TEST_PAGE.store(page1.cast(), Ordering::Release);
 
         let mut thread: libc::pthread_t = std::mem::zeroed();
-        if libc::pthread_create(&mut thread, core::ptr::null(), worker_thread, core::ptr::null_mut()) != 0 {
+        if libc::pthread_create(
+            &mut thread,
+            core::ptr::null(),
+            worker_thread,
+            core::ptr::null_mut(),
+        ) != 0
+        {
             libc::_exit(3);
         }
 
         // Signal Phase 1
         PHASE.store(1, Ordering::SeqCst);
-        while !B_SPINNING.load(Ordering::SeqCst) {
-            core::hint::spin_loop();
-        }
-        // Busy spin briefly so Thread B is actively reading the page
-        for _ in 0..50_000 {
-            core::hint::spin_loop();
+        if !wait_for_state(1, STATE_ACTIVE) {
+            report_handshake_failure();
+            return;
         }
 
         // Thread A mprotects page to PROT_NONE
@@ -158,11 +209,10 @@ fn main() {
             libc::_exit(4);
         }
 
-        // Wait for Thread B to exit its spin loop (via SIGSEGV jump)
-        let mut spin_wait = 0;
-        while B_SPINNING.load(Ordering::SeqCst) && spin_wait < 100_000_000 {
-            core::hint::spin_loop();
-            spin_wait += 1;
+        // Wait for Thread B to exit its read loop (normally via SIGSEGV jump).
+        if !wait_for_state(1, STATE_DONE) {
+            report_handshake_failure();
+            return;
         }
         let mprotect_observed = B_OBSERVED_CHANGE.load(Ordering::SeqCst);
         libc::munmap(page1, 4096);
@@ -181,14 +231,12 @@ fn main() {
             libc::_exit(5);
         }
         core::ptr::write_volatile(page2.cast::<u8>(), 84);
-        TEST_PAGE = page2.cast();
+        TEST_PAGE.store(page2.cast(), Ordering::Release);
 
         PHASE.store(2, Ordering::SeqCst);
-        while !B_SPINNING.load(Ordering::SeqCst) {
-            core::hint::spin_loop();
-        }
-        for _ in 0..50_000 {
-            core::hint::spin_loop();
+        if !wait_for_state(2, STATE_ACTIVE) {
+            report_handshake_failure();
+            return;
         }
 
         // Thread A munmaps page2
@@ -196,10 +244,9 @@ fn main() {
             libc::_exit(6);
         }
 
-        let mut spin_wait2 = 0;
-        while B_SPINNING.load(Ordering::SeqCst) && spin_wait2 < 100_000_000 {
-            core::hint::spin_loop();
-            spin_wait2 += 1;
+        if !wait_for_state(2, STATE_DONE) {
+            report_handshake_failure();
+            return;
         }
         let munmap_observed = B_OBSERVED_CHANGE.load(Ordering::SeqCst);
 
@@ -219,14 +266,14 @@ fn main() {
             libc::_exit(8);
         }
         core::ptr::write_volatile(page3.cast::<u8>(), 123);
-        TEST_PAGE = page3.cast();
+        TEST_PAGE.store(page3.cast(), Ordering::Release);
 
         PHASE.store(3, Ordering::SeqCst);
-        while !B_SPINNING.load(Ordering::SeqCst) {
-            core::hint::spin_loop();
+        if !wait_for_state(3, STATE_DONE) {
+            report_handshake_failure();
+            return;
         }
 
-        libc::pthread_join(thread, core::ptr::null_mut());
         let stale_fault = B_STALE_FAULT.load(Ordering::SeqCst);
         libc::munmap(page3, 4096);
 
