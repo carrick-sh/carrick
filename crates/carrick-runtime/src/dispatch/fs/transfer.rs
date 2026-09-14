@@ -8,7 +8,7 @@ use carrick_abi::*;
 use carrick_guest_mem::CurrentMmMemory;
 
 use super::LinuxSpliceFlags;
-use super::pipe::{PipeDrain, take_pipe_bytes, wait_for_pipe_readable};
+use super::pipe::{PipeDrain, PipeWriteOperation, take_pipe_bytes, wait_for_pipe_readable};
 use super::*;
 use crate::dispatch::fd_table::{HostFdRef, HostWriteKind, is_anon_overlay_path};
 use crate::dispatch::{
@@ -715,12 +715,14 @@ impl<'a> FsView<'a> {
                         return write_pipe(
                             bytes,
                             &pipe,
-                            io_lease,
                             flags,
-                            tid,
-                            wait_authority,
-                            || false,
-                            None,
+                            PipeWriteOperation {
+                                writer_lease: io_lease,
+                                tid,
+                                authority: wait_authority,
+                                is_interrupted: || false,
+                                notification: None,
+                            },
                         );
                     }
                     OpenDescription::HostPipe {

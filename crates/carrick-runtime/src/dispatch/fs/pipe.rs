@@ -514,129 +514,90 @@ pub(crate) fn tee_in_memory_pipes(
     InMemoryTeeOutcome::Transferred(copy_len)
 }
 
-pub(crate) fn write_pipe(
+/// Exact operation authority admitted before the pipe state lock. A parked
+/// large write transfers this authority to its continuation; a non-parked
+/// write drops it when the syscall returns.
+pub(crate) struct PipeWriteOperation<I> {
+    pub(crate) writer_lease: crate::kernel::objects::FileDescriptionFdLease,
+    pub(crate) tid: crate::thread::ThreadId,
+    pub(crate) authority: super::WaitFdAuthority,
+    pub(crate) is_interrupted: I,
+    /// Present only for syscall paths that can publish a parked continuation.
+    /// Transfer helpers deliberately pass `None` and return their partial count.
+    pub(crate) notification: Option<PipeWriteNotification>,
+}
+
+/// Perform the one synchronous in-memory pipe write step. A write can either
+/// complete, return a partial count, wait before copying, or transfer its exact
+/// operation authority to a continuation; it never retries synchronously.
+pub(crate) fn write_pipe<I: Fn() -> bool>(
     bytes: &[u8],
     pipe: &PipeRef,
-    writer_lease: crate::kernel::objects::FileDescriptionFdLease,
     status_flags: u64,
-    tid: crate::thread::ThreadId,
-    authority: super::WaitFdAuthority,
-    is_interrupted: impl Fn() -> bool,
-    notification: Option<PipeWriteNotification>,
+    operation: PipeWriteOperation<I>,
 ) -> DispatchOutcome {
     let nonblocking = status_flags & LINUX_O_NONBLOCK != 0;
-    let length = bytes.len();
-    if length == 0 {
+    if bytes.is_empty() {
         return DispatchOutcome::Returned { value: 0 };
     }
 
-    let mut written = 0;
     let mut state = pipe.state.lock();
-
-    while written < length {
-        if state.readers == 0 {
-            if written > 0 {
-                break;
-            }
-            return DispatchOutcome::errno(LINUX_EPIPE);
-        }
-
-        // A pending signal is consulted only where this write would WAIT.
-        // Checking it before the copy made a write with room return EINTR
-        // with nothing written: `sigunblockpending` unblocks two signals,
-        // the first handler's pipe write ran with the second still pending
-        // and lost its byte. Linux never interrupts a write that can
-        // complete immediately.
-        let capacity = state.capacity;
-        let available = capacity.saturating_sub(state.buffer.len());
-
-        // Writes <= PIPE_BUF (4096) must be atomic: all or wait.
-        // Writes > PIPE_BUF with no room at all (available == 0) must also wait
-        // for readiness before writing anything, rather than spinning in the vCPU.
-        if written == 0 && (available == 0 || (length <= PIPE_BUF && available < length)) {
-            if nonblocking {
-                return DispatchOutcome::errno(LINUX_EAGAIN);
-            }
-            // Entering the sleep with a signal already pending is the one
-            // place a write with nothing written answers EINTR (the BSD
-            // `PCATCH`-on-entry rule).
-            if is_interrupted() {
-                return DispatchOutcome::errno(LINUX_EINTR);
-            }
-            let Some(host_fd) = pipe.write_poll_fd_locked(&state) else {
-                return DispatchOutcome::errno(LINUX_EMFILE);
-            };
-            // The readiness protocol is a LEVEL signal: while the pipe is
-            // guest-writable, one byte sits in the write-readiness
-            // notification pipe, so the host wait is POLLIN on its READ end.
-            // POLLOUT here polled a pipe read end for writability, which the
-            // host never reports — the park completed only via signals or
-            // timeouts, never via the reader draining the buffer.
-            return DispatchOutcome::WaitOnFds {
-                fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, authority),
-                timeout: None,
-                sig_mask: carrick_abi::WaitSigMask::NONE,
-                completion: FdWaitCompletion::Fd {
-                    on_timeout: LINUX_EAGAIN.guest_retval(),
-                },
-            };
-        }
-
-        if available > 0 {
-            let chunk = (length - written).min(available);
-            state.buffer.extend(&bytes[written..written + chunk]);
-            written += chunk;
-            pipe.update_readiness_locked(&state);
-            pipe.changed.notify_all();
-            if written == length || nonblocking {
-                break;
-            }
-        } else if nonblocking {
-            if written > 0 {
-                break;
-            }
-            return DispatchOutcome::errno(LINUX_EAGAIN);
-        }
-
-        // A > PIPE_BUF write which made progress must retain that exact
-        // endpoint and resume at `written` through the continuation reactor.
-        // Sleeping this executor in 20ms Condvar slices strands other runnable
-        // guest work behind the bounded vCPU pool.
-        if is_interrupted() {
-            break;
-        }
-        let Some(readiness_fd) = pipe.write_poll_fd_locked(&state) else {
-            break;
-        };
-        let Some(notification) = notification else {
-            break;
-        };
-        let endpoint = PipeWriteEndpointLease::retain(
-            writer_lease,
-            Arc::clone(pipe),
-            readiness_fd,
-            notification,
-        );
-        drop(state);
-        pipe.changed.notify_all();
-        endpoint.publish_progress(written);
-        return DispatchOutcome::BlockingWrite(crate::dispatch::BlockingWrite::in_memory_pipe(
-            endpoint,
-            bytes.to_vec(),
-            written,
-            tid,
-            true,
-        ));
+    if state.readers == 0 {
+        return DispatchOutcome::errno(LINUX_EPIPE);
     }
 
+    let available = state.capacity.saturating_sub(state.buffer.len());
+    // Writes <= PIPE_BUF are atomic. Larger writes with no room also wait
+    // before their first byte rather than occupying an executor in a retry loop.
+    if available == 0 || (bytes.len() <= PIPE_BUF && available < bytes.len()) {
+        if nonblocking {
+            return DispatchOutcome::errno(LINUX_EAGAIN);
+        }
+        if (operation.is_interrupted)() {
+            return DispatchOutcome::errno(LINUX_EINTR);
+        }
+        let Some(host_fd) = pipe.write_poll_fd_locked(&state) else {
+            return DispatchOutcome::errno(LINUX_EMFILE);
+        };
+        return DispatchOutcome::WaitOnFds {
+            fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, operation.authority),
+            timeout: None,
+            sig_mask: carrick_abi::WaitSigMask::NONE,
+            completion: FdWaitCompletion::Fd {
+                on_timeout: LINUX_EAGAIN.guest_retval(),
+            },
+        };
+    }
+
+    let written = bytes.len().min(available);
+    state.buffer.extend(&bytes[..written]);
     pipe.update_readiness_locked(&state);
     drop(state);
     pipe.changed.notify_all();
-    if written == 0 {
-        DispatchOutcome::errno(LINUX_EINTR)
-    } else {
-        DispatchOutcome::returned_len_or_errno(written)
+
+    if written == bytes.len() || nonblocking || (operation.is_interrupted)() {
+        return DispatchOutcome::returned_len_or_errno(written);
     }
+    let Some(readiness_fd) = pipe.write_poll_fd() else {
+        return DispatchOutcome::returned_len_or_errno(written);
+    };
+    let Some(notification) = operation.notification else {
+        return DispatchOutcome::returned_len_or_errno(written);
+    };
+    let endpoint = PipeWriteEndpointLease::retain(
+        operation.writer_lease,
+        Arc::clone(pipe),
+        readiness_fd,
+        notification,
+    );
+    endpoint.publish_progress(written);
+    DispatchOutcome::BlockingWrite(crate::dispatch::BlockingWrite::in_memory_pipe(
+        endpoint,
+        bytes.to_vec(),
+        written,
+        operation.tid,
+        true,
+    ))
 }
 
 impl<'a> FsView<'a> {
@@ -731,12 +692,14 @@ mod tests {
         let outcome = write_pipe(
             bytes,
             pipe,
-            lease,
             status_flags,
-            crate::thread::ThreadId::synthetic_for_tests(fd),
-            authority,
-            is_interrupted,
-            None,
+            PipeWriteOperation {
+                writer_lease: lease,
+                tid: crate::thread::ThreadId::synthetic_for_tests(fd),
+                authority,
+                is_interrupted,
+                notification: None,
+            },
         );
         description.release_fd_ref();
         outcome
@@ -967,12 +930,14 @@ mod tests {
         let mut blocked = match write_pipe(
             &payload,
             &pipe,
-            lease,
             0,
-            crate::thread::ThreadId::synthetic_for_tests(14),
-            WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
-            || false,
-            Some(PipeWriteNotification::for_tests()),
+            PipeWriteOperation {
+                writer_lease: lease,
+                tid: crate::thread::ThreadId::synthetic_for_tests(14),
+                authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+                is_interrupted: || false,
+                notification: Some(PipeWriteNotification::for_tests()),
+            },
         ) {
             DispatchOutcome::BlockingWrite(write) => write,
             other => panic!("expected parked partial write, got {other:?}"),
@@ -1027,12 +992,14 @@ mod tests {
         let mut blocked = match write_pipe(
             &current,
             &pipe,
-            lease,
             0,
-            crate::thread::ThreadId::synthetic_for_tests(16),
-            WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
-            || false,
-            Some(PipeWriteNotification::for_tests()),
+            PipeWriteOperation {
+                writer_lease: lease,
+                tid: crate::thread::ThreadId::synthetic_for_tests(16),
+                authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+                is_interrupted: || false,
+                notification: Some(PipeWriteNotification::for_tests()),
+            },
         ) {
             DispatchOutcome::BlockingWrite(write) => {
                 // A 32-byte valid next iovec followed by EFAULT has a 4KiB
@@ -1090,12 +1057,14 @@ mod tests {
         let mut blocked = match write_pipe(
             &current,
             &pipe,
-            lease,
             0,
-            crate::thread::ThreadId::synthetic_for_tests(15),
-            WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
-            || false,
-            Some(PipeWriteNotification::for_tests()),
+            PipeWriteOperation {
+                writer_lease: lease,
+                tid: crate::thread::ThreadId::synthetic_for_tests(15),
+                authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+                is_interrupted: || false,
+                notification: Some(PipeWriteNotification::for_tests()),
+            },
         ) {
             DispatchOutcome::BlockingWrite(write) => {
                 // Three bytes preceded this current iovec. A later fault

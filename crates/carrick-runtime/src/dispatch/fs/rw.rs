@@ -7,7 +7,7 @@ use std::sync::Arc;
 use carrick_abi::*;
 use carrick_guest_mem::CurrentMmMemory;
 
-use super::pipe::PipeWriteNotification;
+use super::pipe::{PipeWriteNotification, PipeWriteOperation};
 use super::*;
 use crate::dispatch::fd_table::{DirListing, HostFdRef, HostWriteKind, is_anon_overlay_path};
 use crate::dispatch::{HostPipeWriteTarget, WaitFdAuthority, write_host_pipe_owned};
@@ -2320,22 +2320,24 @@ impl<'a> FsView<'a> {
                             let outcome = write_pipe(
                                 &bytes,
                                 &pipe,
-                                io_lease,
                                 flags,
-                                tid,
-                                wait_authority,
-                                || {
-                                    this.has_deliverable_dispatch_pending_for_wait(
-                                        cx.kernel,
-                                        tid,
-                                        carrick_abi::WaitSigMask::NONE,
-                                    )
+                                PipeWriteOperation {
+                                    writer_lease: io_lease,
+                                    tid,
+                                    authority: wait_authority,
+                                    is_interrupted: || {
+                                        this.has_deliverable_dispatch_pending_for_wait(
+                                            cx.kernel,
+                                            tid,
+                                            carrick_abi::WaitSigMask::NONE,
+                                        )
+                                    },
+                                    notification: Some(PipeWriteNotification::new(
+                                        this.captured_file_table().epoll_wake_handle(),
+                                        Arc::clone(cx.kernel.kernel()),
+                                        fd,
+                                    )),
                                 },
-                                Some(PipeWriteNotification::new(
-                                    this.captured_file_table().epoll_wake_handle(),
-                                    Arc::clone(cx.kernel.kernel()),
-                                    fd,
-                                )),
                             );
                             if let DispatchOutcome::Returned { value } = outcome {
                                 if value > 0 {
@@ -3041,22 +3043,24 @@ impl<'a> FsView<'a> {
                                 outcome = write_pipe(
                                     &bytes,
                                     &pipe,
-                                    io_lease,
                                     flags,
-                                    tid,
-                                    wait_authority,
-                                    || {
-                                        this.has_deliverable_dispatch_pending_for_wait(
-                                            cx.kernel,
-                                            tid,
-                                            carrick_abi::WaitSigMask::NONE,
-                                        )
+                                    PipeWriteOperation {
+                                        writer_lease: io_lease,
+                                        tid,
+                                        authority: wait_authority,
+                                        is_interrupted: || {
+                                            this.has_deliverable_dispatch_pending_for_wait(
+                                                cx.kernel,
+                                                tid,
+                                                carrick_abi::WaitSigMask::NONE,
+                                            )
+                                        },
+                                        notification: Some(PipeWriteNotification::new(
+                                            this.captured_file_table().epoll_wake_handle(),
+                                            Arc::clone(cx.kernel.kernel()),
+                                            fd,
+                                        )),
                                     },
-                                    Some(PipeWriteNotification::new(
-                                        this.captured_file_table().epoll_wake_handle(),
-                                        Arc::clone(cx.kernel.kernel()),
-                                        fd,
-                                    )),
                                 );
                                 writeback = None;
                             }
