@@ -61,13 +61,13 @@ pub(crate) struct PipeWriteNotification {
 
 impl PipeWriteNotification {
     pub(crate) fn new(
-        epoll_registry: crate::dispatch::EpollWakeRegistry,
+        epoll_wake: crate::dispatch::EpollWakeHandle,
         kernel: Arc<crate::kernel::Kernel>,
         source_fd: i32,
     ) -> Self {
         Self {
             kind: PipeWriteNotificationKind::Live {
-                epoll_registry,
+                epoll_wake,
                 kernel,
                 source_fd,
             },
@@ -77,11 +77,11 @@ impl PipeWriteNotification {
     fn publish(&self, pipe: &PipeInner, bytes: usize) {
         match &self.kind {
             PipeWriteNotificationKind::Live {
-                epoll_registry,
+                epoll_wake,
                 kernel,
                 source_fd,
             } => {
-                crate::dispatch::epoll_shim::notify_inmem_epoll(epoll_registry);
+                epoll_wake.notify();
                 crate::dispatch::fs::locks::fasync_notify_pipe_write(
                     kernel,
                     pipe.pipe_id(),
@@ -104,7 +104,7 @@ impl PipeWriteNotification {
 
 enum PipeWriteNotificationKind {
     Live {
-        epoll_registry: crate::dispatch::EpollWakeRegistry,
+        epoll_wake: crate::dispatch::EpollWakeHandle,
         kernel: Arc<crate::kernel::Kernel>,
         source_fd: i32,
     },

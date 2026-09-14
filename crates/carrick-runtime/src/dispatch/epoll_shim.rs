@@ -6,6 +6,24 @@ use super::*;
 
 pub(crate) type EpollWakeRegistry = std::sync::Arc<Mutex<Vec<i32>>>;
 
+/// A retained capability to publish an in-memory readiness wake.
+///
+/// This owns only the registry shared by one file table, rather than keeping
+/// that table (or any file description) alive across an asynchronous
+/// continuation.
+#[derive(Clone, Debug)]
+pub(crate) struct EpollWakeHandle(EpollWakeRegistry);
+
+impl EpollWakeHandle {
+    pub(crate) fn from_registry(registry: &EpollWakeRegistry) -> Self {
+        Self(std::sync::Arc::clone(registry))
+    }
+
+    pub(crate) fn notify(&self) {
+        notify_inmem_epoll(&self.0);
+    }
+}
+
 /// Create an epoll wake registry owned by one dispatcher/process state.
 pub(crate) fn new_epoll_wake_registry() -> EpollWakeRegistry {
     std::sync::Arc::new(Mutex::new(Vec::new()))

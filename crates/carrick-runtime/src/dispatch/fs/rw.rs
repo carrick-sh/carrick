@@ -2332,7 +2332,7 @@ impl<'a> FsView<'a> {
                                     )
                                 },
                                 Some(PipeWriteNotification::new(
-                                    Arc::clone(this.captured_file_table().epoll_wake_registry()),
+                                    this.captured_file_table().epoll_wake_handle(),
                                     Arc::clone(cx.kernel.kernel()),
                                     fd,
                                 )),
@@ -3053,9 +3053,7 @@ impl<'a> FsView<'a> {
                                         )
                                     },
                                     Some(PipeWriteNotification::new(
-                                        Arc::clone(
-                                            this.captured_file_table().epoll_wake_registry(),
-                                        ),
+                                        this.captured_file_table().epoll_wake_handle(),
                                         Arc::clone(cx.kernel.kernel()),
                                         fd,
                                     )),
