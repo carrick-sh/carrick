@@ -1,4 +1,4 @@
-accb2fecd5b83aab
+0e994f70ea83d94f
 listen_ok=true
 so_acceptconn_listener=1
 so_acceptconn_unlistened=0
@@ -7,6 +7,14 @@ peer_eq_client_sockname=true
 accepted_sockname_ip_loopback=true
 accepted_sockname_port_eq_listen=true
 client_peername_ip_loopback=true
+reconnect_bad_ptr_rc=-1
+reconnect_bad_ptr_errno=14
+reconnect_short_len_rc=-1
+reconnect_short_len_errno=22
+reconnect_client_rc=-1
+reconnect_client_errno=106
+reconnect_accepted_rc=-1
+reconnect_accepted_errno=106
 nb_connect_ret=115
 nb_connect_pollout_revents=0x4
 nb_so_error=0

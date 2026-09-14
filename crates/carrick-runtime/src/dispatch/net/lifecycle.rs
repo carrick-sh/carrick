@@ -2515,6 +2515,38 @@ impl<'a> NetView<'a> {
             let fd = fd.0;
             let addr_addr = addr.0;
             let addrlen = addrlen as u32;
+            // A loopback TCP connect may replace the host-backed description
+            // with an in-zone pair. A later connect must still validate the
+            // supplied sockaddr before reporting that the stream is already
+            // connected; treating every non-HostSocket as ENOTSOCK loses both
+            // Linux's EFAULT/EINVAL precedence and EISCONN result.
+            if let Some(open_file) = this.open_file(fd) {
+                let in_memory_stream = {
+                    let Some(open) = open_file.description.read() else {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
+                    };
+                    match &*open {
+                        OpenDescription::InMemorySocket { socket, .. } => Some((
+                            socket.family,
+                            socket.socket_type == LINUX_SOCK_STREAM,
+                            socket.is_listening(),
+                            socket.peer_addr().is_some(),
+                        )),
+                        _ => None,
+                    }
+                };
+                if let Some((family, is_stream, is_listening, has_peer)) = in_memory_stream {
+                    let host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
+                    let compatible_inet_family = matches!(family, LINUX_AF_INET | LINUX_AF_INET6)
+                        && linux_to_host_af(family).is_ok_and(|host_family| {
+                            host_sockaddr_family(&host_addr) == host_family as u16
+                        });
+                    if compatible_inet_family && is_stream && !is_listening && has_peer {
+                        return Ok(DispatchOutcome::errno(LINUX_EISCONN));
+                    }
+                    return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
+                }
+            }
             let (host_fd, family) = this.host_socket_lookup(fd)?;
             let Some(connect_description) = this.open_file(fd).map(|open_file| open_file.description()) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
