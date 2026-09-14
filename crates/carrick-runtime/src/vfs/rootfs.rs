@@ -2031,6 +2031,13 @@ impl Vfs for RootFsVfs {
     }
 
     fn mkdir(&self, path: &str, mode: u32) -> Result<(), VfsError> {
+        let mut components = std::path::Path::new(path).components();
+        if matches!(components.next(), Some(std::path::Component::RootDir))
+            && components.next().is_none()
+        {
+            self.lookup(path)?;
+            return Err(LINUX_EEXIST);
+        }
         self.with_namespace_batch(&[path], true, |permit| {
             self.mkdir_admitted(permit, path, mode)
         })??;
@@ -2952,6 +2959,15 @@ mod tests {
         v.mkdir("/tmp", 0o755).unwrap();
         let md = v.lookup("/tmp").unwrap();
         assert_eq!(md.kind, EntryKind::Directory);
+    }
+
+    #[test]
+    fn mkdir_existing_root_returns_eexist_without_weakening_empty_path() {
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
+        assert_eq!(v.lookup("/").unwrap().kind, EntryKind::Directory);
+        assert_eq!(v.mkdir("/", 0o755), Err(LINUX_EEXIST));
+        assert_eq!(v.mkdir("///", 0o755), Err(LINUX_EEXIST));
+        assert_eq!(v.mkdir("", 0o755), Err(LINUX_ENOENT));
     }
 
     #[test]
