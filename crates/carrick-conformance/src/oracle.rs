@@ -49,6 +49,46 @@ struct OracleKey<'a> {
     parser_profile: Option<&'a str>,
 }
 
+/// Docker execution identity used for duration evidence. Parsing policy is
+/// intentionally absent: it can change whether output is an admissible oracle,
+/// but cannot change how long this declared container execution takes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct OracleExecutionKey {
+    docker_platform: String,
+    image: String,
+    cmd: Vec<String>,
+    docker_flags: Vec<String>,
+    entrypoint: Option<String>,
+    bind_mounts: Vec<String>,
+    env: Vec<String>,
+    workdir: Option<String>,
+}
+
+fn oracle_execution_key(
+    suite: &Suite,
+    platform: crate::lane::DockerPlatform,
+) -> OracleExecutionKey {
+    OracleExecutionKey {
+        docker_platform: platform.as_str().to_string(),
+        image: suite.image.clone(),
+        cmd: suite.cmd.clone(),
+        docker_flags: suite.docker_flags.clone(),
+        entrypoint: suite.entrypoint.as_ref().and_then(|e| e.for_docker()),
+        bind_mounts: suite.bind_mounts.clone(),
+        env: suite
+            .env
+            .iter()
+            .chain(suite.env_docker.iter())
+            .map(|kv| format!("{}={}", kv.key, kv.val))
+            .collect(),
+        workdir: suite.workdir.clone(),
+    }
+}
+
+fn execution_key_from_verdict_key(key: &str) -> Option<OracleExecutionKey> {
+    serde_json::from_str(key).ok()
+}
+
 fn parser_fingerprint(verdict: VerdictKind) -> Option<&'static str> {
     match verdict {
         VerdictKind::Regrtest => Some(crate::parsers::regrtest::PARSER_FINGERPRINT),
@@ -121,11 +161,21 @@ pub struct OracleRecord {
     pub elapsed_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OracleTimingRecord {
+    name: String,
+    execution_key: OracleExecutionKey,
+    elapsed_ms: u64,
+}
+
 /// A committed JSONL cache of docker oracle results, keyed by determinant.
 pub struct OracleCache {
     path: PathBuf,
     by_key: BTreeMap<String, OracleRecord>,
-    dirty: bool,
+    verdict_dirty: bool,
+    timing_path: PathBuf,
+    timing_by_key: BTreeMap<OracleExecutionKey, OracleTimingRecord>,
+    timing_dirty: bool,
 }
 
 impl OracleCache {
@@ -148,10 +198,44 @@ impl OracleCache {
                 path.display()
             );
         }
+        let mut timing_by_key = BTreeMap::new();
+        // Historical verdict records were admitted only after a completed
+        // Docker run, so their elapsed values are valid migration evidence.
+        for record in by_key.values() {
+            if let (Some(key), Some(elapsed_ms)) = (
+                execution_key_from_verdict_key(&record.key),
+                record.elapsed_ms,
+            ) {
+                upsert_timing(&mut timing_by_key, &record.name, key, elapsed_ms);
+            }
+        }
+        let mut timing_path = path.to_path_buf();
+        timing_path.set_extension("timings.jsonl");
+        let (sidecar, timing_skipped) = match std::fs::read_to_string(&timing_path) {
+            Ok(text) => parse_timing_records(&text),
+            Err(_) => (BTreeMap::new(), 0),
+        };
+        for record in sidecar.into_values() {
+            upsert_timing(
+                &mut timing_by_key,
+                &record.name,
+                record.execution_key,
+                record.elapsed_ms,
+            );
+        }
+        if timing_skipped > 0 {
+            eprintln!(
+                "oracle timing cache: skipped {timing_skipped} unparseable record(s) in {}",
+                timing_path.display()
+            );
+        }
         OracleCache {
             path: path.to_path_buf(),
             by_key,
-            dirty: false,
+            verdict_dirty: false,
+            timing_path,
+            timing_by_key,
+            timing_dirty: false,
         }
     }
 
@@ -225,6 +309,34 @@ impl OracleCache {
         record.elapsed_ms
     }
 
+    /// Elapsed Docker evidence used only to derive the Carrick deadline.
+    pub fn get_timeout_elapsed_ms(
+        &self,
+        suite: &Suite,
+        platform: crate::lane::DockerPlatform,
+    ) -> Option<u64> {
+        self.timing_by_key
+            .get(&oracle_execution_key(suite, platform))
+            .map(|record| record.elapsed_ms)
+    }
+
+    fn record_completed_timing(
+        &mut self,
+        suite: &Suite,
+        platform: crate::lane::DockerPlatform,
+        elapsed_ms: Option<u64>,
+    ) {
+        let Some(elapsed_ms) = elapsed_ms else {
+            return;
+        };
+        let key = oracle_execution_key(suite, platform);
+        let prior = self.timing_by_key.get(&key).map(|r| r.elapsed_ms);
+        upsert_timing(&mut self.timing_by_key, &suite.name, key, elapsed_ms);
+        if prior.is_none_or(|prior| elapsed_ms > prior) {
+            self.timing_dirty = true;
+        }
+    }
+
     /// Cache a freshly-run docker result. Refuses a non-comparable (crashed /
     /// empty) oracle so a broken run is retried next time, never frozen. Returns
     /// whether it was stored.
@@ -265,7 +377,7 @@ impl OracleCache {
                 elapsed_ms,
             },
         );
-        self.dirty = true;
+        self.verdict_dirty = true;
         true
     }
 
@@ -299,7 +411,11 @@ impl OracleCache {
         elapsed_ms: Option<u64>,
         timed_out: bool,
     ) -> bool {
-        !timed_out && self.insert_for_profile(suite, platform, profile, result, elapsed_ms)
+        if timed_out {
+            return false;
+        }
+        self.record_completed_timing(suite, platform, elapsed_ms);
+        self.insert_for_profile(suite, platform, profile, result, elapsed_ms)
     }
 
     /// Remove the current determinant record before a forced fresh oracle run.
@@ -317,34 +433,103 @@ impl OracleCache {
     ) -> bool {
         let removed = self
             .by_key
-            .remove(&oracle_key_for_profile(suite, platform, profile))
-            .is_some();
-        if removed {
-            self.dirty = true;
+            .remove(&oracle_key_for_profile(suite, platform, profile));
+        let Some(record) = removed else {
+            return false;
+        };
+        self.verdict_dirty = true;
+        // If this verdict row supplied migrated timing evidence, materialize
+        // the timing index before save removes that historical source.
+        if record.elapsed_ms.is_some()
+            && execution_key_from_verdict_key(&record.key)
+                .is_some_and(|key| self.timing_by_key.contains_key(&key))
+        {
+            self.timing_dirty = true;
         }
-        removed
+        true
     }
 
     /// Whether any insert or invalidation mutated the cache since load.
     pub fn dirty(&self) -> bool {
-        self.dirty
+        self.verdict_dirty || self.timing_dirty
     }
 
     /// Persist, sorted by (name, key), for stable reviewable diffs.
     pub fn save(&self) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+        if self.verdict_dirty {
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut recs: Vec<&OracleRecord> = self.by_key.values().collect();
+            recs.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
+            let mut s = String::new();
+            for r in recs {
+                s.push_str(&serde_json::to_string(r)?);
+                s.push('\n');
+            }
+            std::fs::write(&self.path, s)?;
         }
-        let mut recs: Vec<&OracleRecord> = self.by_key.values().collect();
-        recs.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
-        let mut s = String::new();
-        for r in recs {
-            s.push_str(&serde_json::to_string(r)?);
-            s.push('\n');
+        if self.timing_dirty {
+            if let Some(parent) = self.timing_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut recs: Vec<&OracleTimingRecord> = self.timing_by_key.values().collect();
+            recs.sort_by(|a, b| {
+                a.name
+                    .cmp(&b.name)
+                    .then_with(|| a.execution_key.cmp(&b.execution_key))
+            });
+            let mut s = String::new();
+            for r in recs {
+                s.push_str(&serde_json::to_string(r)?);
+                s.push('\n');
+            }
+            std::fs::write(&self.timing_path, s)?;
         }
-        std::fs::write(&self.path, s)?;
         Ok(())
     }
+}
+
+fn upsert_timing(
+    timings: &mut BTreeMap<OracleExecutionKey, OracleTimingRecord>,
+    name: &str,
+    key: OracleExecutionKey,
+    elapsed_ms: u64,
+) {
+    match timings.entry(key.clone()) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(OracleTimingRecord {
+                name: name.to_string(),
+                execution_key: key,
+                elapsed_ms,
+            });
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            if elapsed_ms > entry.get().elapsed_ms {
+                entry.get_mut().elapsed_ms = elapsed_ms;
+                entry.get_mut().name = name.to_string();
+            }
+        }
+    }
+}
+
+fn parse_timing_records(text: &str) -> (BTreeMap<OracleExecutionKey, OracleTimingRecord>, usize) {
+    let mut records = BTreeMap::new();
+    let mut skipped = 0;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        match serde_json::from_str::<OracleTimingRecord>(line) {
+            Ok(record) => {
+                upsert_timing(
+                    &mut records,
+                    &record.name,
+                    record.execution_key,
+                    record.elapsed_ms,
+                );
+            }
+            Err(_) => skipped += 1,
+        }
+    }
+    (records, skipped)
 }
 
 /// Only a comparable oracle (the docker side actually produced a verdict) may be
@@ -573,7 +758,7 @@ mod tests {
         s.verdict = VerdictKind::Regrtest;
         let key = oracle_key(&s, crate::lane::DockerPlatform::LinuxArm64);
         assert!(
-            key.contains(r#""verdict":"regrtest","parser":"regrtest-v2-timed-multiline""#),
+            key.contains(r#""verdict":"regrtest","parser":"regrtest-v3-doctest-wrapper""#),
             "a regrtest oracle row is only valid for the parser that produced it: {key}"
         );
         let mut shell = base_suite();
@@ -725,6 +910,176 @@ mod tests {
             "invalid historical closure rows must not retain usable timing evidence"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn timeout_timing_reuses_compatible_historical_profile_only() {
+        let path = std::env::temp_dir().join(format!(
+            "carrick-oracle-timeout-history-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let suite = base_suite();
+        let platform = crate::lane::DockerPlatform::LinuxArm64;
+        let record = OracleRecord {
+            name: suite.name.clone(),
+            key: oracle_key(&suite, platform),
+            result: result(&[("t", Outcome::Ok)], SuiteOutcome::Success),
+            elapsed_ms: Some(20_759),
+        };
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .expect("seed historical regression timing");
+
+        let cache = OracleCache::load(&path);
+        assert_eq!(cache.get_timeout_elapsed_ms(&suite, platform), Some(20_759));
+        for mutate in [
+            |s: &mut Suite| s.cmd.push("--different".into()),
+            |s: &mut Suite| s.image.push_str("-different"),
+            |s: &mut Suite| s.docker_flags.push("--privileged".into()),
+            |s: &mut Suite| {
+                s.env_docker.push(EnvKv {
+                    key: "DIFFERENT".into(),
+                    val: "1".into(),
+                })
+            },
+        ] {
+            let mut different = suite.clone();
+            mutate(&mut different);
+            assert_eq!(cache.get_timeout_elapsed_ms(&different, platform), None);
+        }
+        assert_eq!(
+            cache.get_timeout_elapsed_ms(&suite, crate::lane::DockerPlatform::LinuxAmd64),
+            None
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn completed_non_strict_refresh_persists_timing_without_verdict() {
+        let path = std::env::temp_dir().join(format!(
+            "carrick-oracle-timing-only-{}.jsonl",
+            std::process::id()
+        ));
+        let mut timing_path = path.clone();
+        timing_path.set_extension("timings.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&timing_path);
+        let suite = base_suite();
+        let platform = crate::lane::DockerPlatform::LinuxArm64;
+        let non_strict = result(&[("t", Outcome::Fail)], SuiteOutcome::Failure);
+
+        let mut cache = OracleCache::load(&path);
+        assert!(!cache.insert_fresh_for_profile(
+            &suite,
+            platform,
+            ParserProfile::ClosureV3,
+            non_strict,
+            Some(21_142),
+            false,
+        ));
+        assert!(
+            cache
+                .get_for_profile(&suite, platform, ParserProfile::ClosureV3)
+                .is_none(),
+            "timing evidence must never become a strict verdict"
+        );
+        assert_eq!(cache.get_timeout_elapsed_ms(&suite, platform), Some(21_142));
+        assert!(cache.dirty(), "timing-only evidence must be persisted");
+        cache.save().expect("save timing sidecar");
+        assert!(
+            !path.exists(),
+            "timing-only evidence must not rewrite or synthesize verdict JSONL"
+        );
+
+        let reloaded = OracleCache::load(&path);
+        assert!(
+            reloaded
+                .get_for_profile(&suite, platform, ParserProfile::ClosureV3)
+                .is_none()
+        );
+        assert_eq!(
+            reloaded.get_timeout_elapsed_ms(&suite, platform),
+            Some(21_142)
+        );
+        assert!(timing_path.exists());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&timing_path);
+    }
+
+    #[test]
+    fn timed_out_refresh_never_seeds_deadline_timing() {
+        let path = std::env::temp_dir().join(format!(
+            "carrick-oracle-timed-out-timing-{}.jsonl",
+            std::process::id()
+        ));
+        let suite = base_suite();
+        let platform = crate::lane::DockerPlatform::LinuxArm64;
+        let mut cache = OracleCache::load(&path);
+        assert!(!cache.insert_fresh_for_profile(
+            &suite,
+            platform,
+            ParserProfile::ClosureV3,
+            result(&[("t", Outcome::Ok)], SuiteOutcome::Success),
+            Some(60_000),
+            true,
+        ));
+        assert_eq!(cache.get_timeout_elapsed_ms(&suite, platform), None);
+        assert!(!cache.dirty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn invalidated_historical_timing_survives_shorter_non_strict_refresh() {
+        let path = std::env::temp_dir().join(format!(
+            "carrick-oracle-timing-migration-{}.jsonl",
+            std::process::id()
+        ));
+        let mut timing_path = path.clone();
+        timing_path.set_extension("timings.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&timing_path);
+        let suite = base_suite();
+        let platform = crate::lane::DockerPlatform::LinuxArm64;
+        let profile = ParserProfile::ClosureV3;
+        let record = OracleRecord {
+            name: suite.name.clone(),
+            key: oracle_key_for_profile(&suite, platform, profile),
+            result: result(&[("t", Outcome::Ok)], SuiteOutcome::Success),
+            elapsed_ms: Some(20_759),
+        };
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .expect("seed historical closure timing");
+
+        let mut cache = OracleCache::load(&path);
+        assert!(cache.invalidate_for_profile(&suite, platform, profile));
+        assert!(!cache.insert_fresh_for_profile(
+            &suite,
+            platform,
+            profile,
+            result(&[("t", Outcome::Fail)], SuiteOutcome::Failure),
+            Some(13_500),
+            false,
+        ));
+        cache.save().expect("persist migrated timing");
+
+        let reloaded = OracleCache::load(&path);
+        assert!(
+            reloaded
+                .get_for_profile(&suite, platform, profile)
+                .is_none()
+        );
+        assert_eq!(
+            reloaded.get_timeout_elapsed_ms(&suite, platform),
+            Some(20_759)
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&timing_path);
     }
 
     #[test]

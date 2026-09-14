@@ -564,16 +564,11 @@ fn run() -> anyhow::Result<ExitCode> {
     // Keep prior elapsed evidence even during `--refresh-oracle`: refreshing
     // invalidates verdict bytes, not the fact that an intentionally sleeping
     // Linux test needs longer than the ordinary five-second Carrick budget.
-    let prior_cached_elapsed = selected
+    let timeout_elapsed = selected
         .iter()
-        .map(|s| match oracle_profile {
-            oracle::ParserProfile::Regression => cache.get_elapsed_ms(s, docker_platform),
-            oracle::ParserProfile::ClosureV3 => {
-                cache.get_elapsed_ms_for_profile(s, docker_platform, oracle_profile)
-            }
-        })
+        .map(|s| cache.get_timeout_elapsed_ms(s, docker_platform))
         .collect::<Vec<_>>();
-    let (cached, cached_elapsed): (Vec<Option<parsers::SuiteResult>>, Vec<Option<u64>>) =
+    let (cached, cached_verdict_elapsed): (Vec<Option<parsers::SuiteResult>>, Vec<Option<u64>>) =
         if args.refresh_oracle {
             let invalidated = selected
                 .iter()
@@ -587,7 +582,7 @@ fn run() -> anyhow::Result<ExitCode> {
             if invalidated > 0 {
                 eprintln!("oracle cache: invalidated {invalidated} selected record(s) for refresh");
             }
-            (vec![None; n], prior_cached_elapsed)
+            (vec![None; n], vec![None; n])
         } else {
             selected
                 .iter()
@@ -664,7 +659,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 &lane,
                 args.carrick_fast_timeout_s,
                 args.carrick_timeout_cap_s,
-                cached_elapsed[i],
+                timeout_elapsed[i],
             );
             eprintln!("  [carrick] {}", s.name);
             // Stream this suite's report NOW if its oracle is cached (the common
@@ -675,7 +670,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     result: res.clone(),
                     run_id: "<cached>".to_string(),
                     argv: engine::docker_dry_run(s, "<cached>", docker_platform),
-                    elapsed_ms: cached_elapsed[i],
+                    elapsed_ms: cached_verdict_elapsed[i],
                     timed_out: false,
                 };
                 let cout = out.as_ref().ok();
@@ -818,7 +813,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 result: res.clone(),
                 run_id: "<cached>".to_string(),
                 argv: engine::docker_dry_run(s, "<cached>", docker_platform),
-                elapsed_ms: cached_elapsed[i],
+                elapsed_ms: cached_verdict_elapsed[i],
                 timed_out: false,
             },
             None => fresh.remove(&i).ok_or_else(|| {
