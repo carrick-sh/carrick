@@ -1,4 +1,4 @@
-f643788ba6cd5d8f
+f466e723a9ef8bcd
 semget_ok=true
 semget_errno=0
 sem_info_ok=true
@@ -29,3 +29,9 @@ semop_positive_overflow_erange=true
 semtimedop_positive_overflow_erange=true
 semctl_rmid_owner_ignores_mode=true
 proc_sysvipc_sem_present=true
+semop_worker_parent_release_rc=0
+semop_worker_parent_release_errno=0
+semop_worker_successes=32
+semop_worker_joined=32
+semop_worker_final_value=0
+semop_worker_remove_rc=0
