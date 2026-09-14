@@ -14121,18 +14121,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:4314 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:4370 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
     "review_id": "HA-000644",
     "source": {
-      "byte_end": 182655,
-      "byte_start": 182630,
+      "byte_end": 185253,
+      "byte_start": 185228,
       "column": 35,
       "column_end": 60,
       "column_start": 35,
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 4314,
-      "line_end": 4314,
-      "line_start": 4314
+      "line": 4370,
+      "line_end": 4370,
+      "line_start": 4370
     }
   },
   {
@@ -14259,18 +14259,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/vcpu_kick.rs:414 in `spawn_signal_pump_inner`, `std::thread::Builder::new` acts only on the current HVF VM vCPU registry and kick helper used by `spawn_signal_pump_inner`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/vcpu_kick.rs:424 in `spawn_signal_pump_inner`, `std::thread::Builder::new` acts only on the current HVF VM vCPU registry and kick helper used by `spawn_signal_pump_inner`; no guest identity selects its host target.",
     "review_id": "HA-000591",
     "source": {
-      "byte_end": 18374,
-      "byte_start": 18349,
+      "byte_end": 18822,
+      "byte_start": 18797,
       "column": 18,
       "column_end": 43,
       "column_start": 18,
       "file": "crates/carrick-vmm-hvf/src/vcpu_kick.rs",
-      "line": 414,
-      "line_end": 414,
-      "line_start": 414
+      "line": 424,
+      "line_end": 424,
+      "line_start": 424
     }
   },
   {
