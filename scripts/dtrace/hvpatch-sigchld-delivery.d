@@ -29,6 +29,11 @@
  * - signal-inject: i32 Linux signum, u64 saved PC, u64 new SP, u64 handler.
  * - vcpu-kick: u64 vCPU handle, i32 handle-valid flag, i32 raw
  *   hv_vcpus_exit return code.
+ * - kick-in_kernel: u64 saved guest PC, u32 exception level.  Exact spelling
+ *   verified from signed binary 43cef's DOF on 2026-09-14.  Rust
+ *   `kick__in_kernel` lowers the double underscore to a hyphen and preserves
+ *   the single underscore; the prior `kick-in-kernel` selector was invalid
+ *   and silently produced zero events.
  * AArch64 syscall numbers selected here are epoll_pwait=22, ppoll=73,
  * exit=93, exit_group=94, waitid=95, rt_sigaction=134, clone=220, wait4=260,
  * pidfd_open=434, and epoll_pwait2=441.
@@ -60,7 +65,7 @@ dtrace:::BEGIN
     bounded = 0;
 }
 
-carrick*:::kick-in-kernel
+carrick*:::kick-in_kernel
 /(pid == $target || progenyof($target))/
 {
     printf("HVPATCHSIGCHLD1|kick-in-kernel|timestamp=%llu|host_pid=%d|host_tid=%d|pc=0x%llx|el=%u\n",
