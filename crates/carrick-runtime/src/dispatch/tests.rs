@@ -8000,19 +8000,6 @@ mod inzone_tcp {
             ),
             DispatchOutcome::errno(LINUX_EISCONN)
         );
-        g.mem
-            .write_bytes(ADDR_SCRATCH, &(LINUX_AF_UNSPEC as u16).to_ne_bytes())
-            .unwrap();
-        assert_eq!(
-            g.call(
-                SYS_CONNECT,
-                [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]
-            ),
-            DispatchOutcome::errno(LINUX_ENOTSOCK),
-            "AF_UNSPEC on an in-memory stream remains outside the reconnect fix"
-        );
-        g.make_sockaddr_in(ADDR_SCRATCH, port, [127, 0, 0, 1]);
-
         // Data round trip
         g.mem.write_bytes(DATA_SCRATCH, b"hello in-zone").unwrap();
         assert_eq!(
@@ -8083,6 +8070,71 @@ mod inzone_tcp {
             let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
             assert_eq!(rc, 0, "host listener must have no connections on host queue");
         }
+        drop(listen_guard);
+
+        // AF_UNSPEC explicitly resets an in-zone TCP association while retaining
+        // the local endpoint and open-description identity for reconnect.
+        let description_before_disconnect = Arc::clone(&client_desc);
+        g.mem.write_bytes(DATA_SCRATCH, b"queued").unwrap();
+        assert_eq!(g.ok(SYS_WRITE, [client_fd as u64, DATA_SCRATCH, 6, 0, 0, 0]), 6);
+        g.mem
+            .write_bytes(ADDR_SCRATCH, &(LINUX_AF_UNSPEC as u16).to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            g.call(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert!(Arc::ptr_eq(
+            &description_before_disconnect,
+            &g.dispatcher.open_file(client_fd).unwrap().description()
+        ));
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.call(SYS_GETPEERNAME, [client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_ENOTCONN)
+        );
+        assert_eq!(g.ok(SYS_READ, [accepted_fd as u64, DATA_SCRATCH, 6, 0, 0, 0]), 6);
+        assert_eq!(&g.mem.read_bytes(DATA_SCRATCH, 6).unwrap(), b"queued");
+        assert_eq!(
+            g.call(SYS_READ, [accepted_fd as u64, DATA_SCRATCH, 1, 0, 0, 0]),
+            DispatchOutcome::errno(LINUX_ECONNRESET)
+        );
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(g.ok(SYS_GETSOCKNAME, [client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0]), 0);
+        assert_eq!(g.read_sockaddr_in(ADDR_SCRATCH).0, client_port);
+        g.make_sockaddr_in(ADDR_SCRATCH, 1, [127, 0, 0, 1]);
+        assert_eq!(
+            g.call(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            DispatchOutcome::errno(LINUX_ENOTSOCK)
+        );
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            g.call(
+                SYS_GETPEERNAME,
+                [client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0]
+            ),
+            DispatchOutcome::errno(carrick_abi::LINUX_ENOTCONN)
+        );
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKNAME,
+                [client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(g.read_sockaddr_in(ADDR_SCRATCH).0, client_port);
+        g.make_sockaddr_in(ADDR_SCRATCH, port, [127, 0, 0, 1]);
+        assert_eq!(g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]), 0);
+        let reaccepted_fd = g.ok(SYS_ACCEPT, [listen_fd as u64, 0, 0, 0, 0, 0]) as i32;
+        assert_eq!(g.ok(SYS_CLOSE, [accepted_fd as u64, 0, 0, 0, 0, 0]), 0);
+        g.mem.write_bytes(DATA_SCRATCH, b"r").unwrap();
+        assert_eq!(g.ok(SYS_WRITE, [client_fd as u64, DATA_SCRATCH, 1, 0, 0, 0]), 1);
+        assert_eq!(g.ok(SYS_READ, [reaccepted_fd as u64, DATA_SCRATCH + 1, 1, 0, 0, 0]), 1);
     }
 
     #[test]
