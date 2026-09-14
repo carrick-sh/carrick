@@ -706,15 +706,26 @@ where
             // from outside "the guest saw EINTR under SA_RESTART" is otherwise a
             // dead end — you cannot tell a missing syscall from the restartable
             // set apart from a retval that was never EINTR in the first place.
+            let restart_predicates = i32::from(at_syscall_boundary)
+                | (i32::from(retval_is_eintr) << 1)
+                | (i32::from(handler_wants_restart) << 2)
+                | (i32::from(syscall_restartable) << 3);
+            let syscall_nr = trap.last_syscall_nr().map_or(-1, |nr| nr as i64);
+            let syscall_retval = last_syscall_retval.unwrap_or(0);
             crate::probes::signal_restart_decision(
                 tid.raw(),
                 pending,
-                trap.last_syscall_nr().map_or(-1, |nr| nr as i64),
-                last_syscall_retval.unwrap_or(0),
-                i32::from(at_syscall_boundary)
-                    | (i32::from(retval_is_eintr) << 1)
-                    | (i32::from(handler_wants_restart) << 2)
-                    | (i32::from(syscall_restartable) << 3),
+                syscall_nr,
+                syscall_retval,
+                restart_predicates,
+            );
+            crate::event_ring::rec_signal_restart_decision(
+                tid.raw(),
+                pending,
+                syscall_nr,
+                syscall_retval,
+                restart_predicates,
+                interrupted_pc,
             );
             // Wire form for the sigframe build (see the synchronous-fault arm).
             let saved_sigmask = dispatcher
@@ -788,7 +799,10 @@ where
                 queued_siginfo,
                 restart_syscall,
             }) {
-                Ok(()) => Ok(Some(PendingSignalAction::ignored())),
+                Ok(()) => {
+                    crate::event_ring::rec_signal_inject(tid.raw(), pending, restart_syscall);
+                    Ok(Some(PendingSignalAction::ignored()))
+                }
                 // Linux force_sigsegv: the signal frame couldn't be written to the
                 // user stack. Terminate the whole thread-group by SIGSEGV (exit
                 // 139).

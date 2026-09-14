@@ -225,6 +225,21 @@ pub const SYSLOG_STATE: u8 = 57;
 /// Linux syslog(2) readiness notification and wait events. `a` is owner, `b` encodes
 /// event class and wake count, and `c` is the raw host poll descriptor.
 pub const SYSLOG_WAKE: u8 = 58;
+/// Caught-signal restart decision. `a` is guest TID, `b` is Linux signal,
+/// and `c` is the same four-bit predicate mask published by the USDT probe.
+pub const SIGNAL_RESTART: u8 = 59;
+/// Companion for `SIGNAL_RESTART`. `a:b` is the signed 64-bit syscall number
+/// and `c` is guest TID.
+pub const SIGNAL_SYSCALL: u8 = 60;
+/// Companion for `SIGNAL_RESTART`. `a:b` is the signed 64-bit syscall return
+/// value and `c` is guest TID.
+pub const SIGNAL_RETVAL: u8 = 61;
+/// Optional companion for `SIGNAL_RESTART`; `a:b` is the interrupted EL0 PC
+/// and `c` is guest TID. Absence means delivery was at a syscall boundary.
+pub const SIGNAL_PC: u8 = 62;
+/// Successful caught-signal frame injection. `a` is guest TID, `b` is Linux
+/// signal, and `c` is the final restart decision.
+pub const SIGNAL_INJECT: u8 = 63;
 
 const HVPWAIT_ID_MASK: u32 = 0x00ff_ffff;
 
@@ -596,7 +611,7 @@ pub enum RingReadError {
 }
 
 const fn known_kind(kind: u8) -> bool {
-    kind >= BIND && kind <= EPRETIRE
+    kind >= BIND && kind <= SIGNAL_INJECT
 }
 
 fn read_slot_after(
@@ -1021,13 +1036,16 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
                 7 => "select",
                 8 => "poll",
                 9 => "host-write",
-                10 => "record-lock",
-                11 => "proc-exit",
-                12 => "proc-state",
-                13 => "child",
-                14 => "signals",
-                15 => "sleep",
-                16 => "vfork-parent",
+                10 => "timerfd-read",
+                11 => "record-lock",
+                12 => "proc-exit",
+                13 => "proc-state",
+                14 => "child",
+                15 => "signals",
+                16 => "sleep",
+                17 => "vfork-parent",
+                18 => "fd-wait",
+                19 => "semop",
                 _ => "unknown",
             };
             format!("HVPBLOCK pid={a} tid={b} native_nr={number} family={family}")
@@ -1062,8 +1080,58 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
             (b as u32) >> 16,
             (b as u32) & 0xffff
         ),
+        SIGNAL_RESTART => format!(
+            "SIGNAL_RESTART tid={a} signal={b} predicates={:#x}",
+            c as u32
+        ),
+        SIGNAL_SYSCALL => format!(
+            "SIGNAL_SYSCALL tid={c} nr={}",
+            ((a as u32 as u64) | ((b as u32 as u64) << 32)) as i64
+        ),
+        SIGNAL_RETVAL => format!(
+            "SIGNAL_RETVAL tid={c} retval={}",
+            ((a as u32 as u64) | ((b as u32 as u64) << 32)) as i64
+        ),
+        SIGNAL_PC => format!(
+            "SIGNAL_PC tid={c} pc={:#018x}",
+            (a as u32 as u64) | ((b as u32 as u64) << 32)
+        ),
+        SIGNAL_INJECT => format!("SIGNAL_INJECT tid={a} signal={b} restart={}", c != 0),
         _ => String::new(),
     }
+}
+
+/// Record the sparse, fully-qualified caught-signal decision. Companion
+/// records immediately follow the decision; TID identifies the optional PC
+/// record if events from another executor interleave.
+pub fn rec_signal_restart_decision(
+    tid: i32,
+    signum: i32,
+    syscall_nr: i64,
+    retval: i64,
+    predicates: i32,
+    interrupted_pc: Option<u64>,
+) {
+    rec(SIGNAL_RESTART, tid, signum, predicates);
+    rec(
+        SIGNAL_SYSCALL,
+        syscall_nr as u64 as u32 as i32,
+        ((syscall_nr as u64) >> 32) as u32 as i32,
+        tid,
+    );
+    rec(
+        SIGNAL_RETVAL,
+        retval as u64 as u32 as i32,
+        ((retval as u64) >> 32) as u32 as i32,
+        tid,
+    );
+    if let Some(pc) = interrupted_pc {
+        rec(SIGNAL_PC, pc as u32 as i32, (pc >> 32) as u32 as i32, tid);
+    }
+}
+
+pub fn rec_signal_inject(tid: i32, signum: i32, restart: bool) {
+    rec(SIGNAL_INJECT, tid, signum, i32::from(restart));
 }
 
 pub fn rec_syslog(owner_id: u32, action: i32, len: i32, retval: i32) {
@@ -1631,6 +1699,70 @@ mod tests {
         assert_eq!(
             decode(SYSLOG_WAKE, 7, b_wake, 12),
             "SYSLOG_WAKE owner=7 type=1 wake_count=5 poll_fd=12"
+        );
+    }
+
+    #[test]
+    fn signal_restart_event_ring_preserves_full_width_values() {
+        assert_eq!(SIGNAL_RESTART, 59);
+        assert_eq!(SIGNAL_SYSCALL, 60);
+        assert_eq!(SIGNAL_RETVAL, 61);
+        assert_eq!(SIGNAL_PC, 62);
+        assert_eq!(SIGNAL_INJECT, 63);
+        assert_eq!(
+            decode(SIGNAL_RESTART, 41, 2, 0b1011),
+            "SIGNAL_RESTART tid=41 signal=2 predicates=0xb"
+        );
+        let syscall_nr = 115i64;
+        assert_eq!(
+            decode(
+                SIGNAL_SYSCALL,
+                syscall_nr as u64 as u32 as i32,
+                ((syscall_nr as u64) >> 32) as u32 as i32,
+                41,
+            ),
+            "SIGNAL_SYSCALL tid=41 nr=115"
+        );
+        let retval = -0x1234_5678_7654_321i64;
+        assert_eq!(
+            decode(
+                SIGNAL_RETVAL,
+                retval as u64 as u32 as i32,
+                ((retval as u64) >> 32) as u32 as i32,
+                41,
+            ),
+            format!("SIGNAL_RETVAL tid=41 retval={retval}")
+        );
+        assert_eq!(
+            decode(SIGNAL_PC, 0x7654_3210u32 as i32, 0x0000_ffff, 41),
+            "SIGNAL_PC tid=41 pc=0x0000ffff76543210"
+        );
+        // Another executor may publish between companions. Every companion
+        // carries its own TID, so a debugger does not infer ownership from
+        // physical adjacency in the ring.
+        assert_eq!(
+            decode(SIGNAL_RETVAL, 7, 0, 99),
+            "SIGNAL_RETVAL tid=99 retval=7"
+        );
+        assert_eq!(
+            decode(SIGNAL_INJECT, 41, 2, 1),
+            "SIGNAL_INJECT tid=41 signal=2 restart=true"
+        );
+        assert_eq!(
+            decode(HVPBLOCK, 98, 4, (16_i32 << 24) | 115),
+            "HVPBLOCK pid=98 tid=4 native_nr=115 family=sleep"
+        );
+        assert_eq!(
+            decode(HVPBLOCK, 98, 4, (10_i32 << 24) | 85),
+            "HVPBLOCK pid=98 tid=4 native_nr=85 family=timerfd-read"
+        );
+        assert_eq!(
+            decode(HVPBLOCK, 98, 4, (18_i32 << 24) | 23),
+            "HVPBLOCK pid=98 tid=4 native_nr=23 family=fd-wait"
+        );
+        assert_eq!(
+            decode(HVPBLOCK, 98, 4, (19_i32 << 24) | 65),
+            "HVPBLOCK pid=98 tid=4 native_nr=65 family=semop"
         );
     }
 }

@@ -464,17 +464,25 @@ def _format_hvpatch_blocked_continuation(pid: int, tid: int, packed: int) -> str
         7: "select",
         8: "poll",
         9: "host-write",
-        10: "record-lock",
-        11: "proc-exit",
-        12: "proc-state",
-        13: "child",
-        14: "signals",
-        15: "sleep",
-        16: "vfork-parent",
+        10: "timerfd-read",
+        11: "record-lock",
+        12: "proc-exit",
+        13: "proc-state",
+        14: "child",
+        15: "signals",
+        16: "sleep",
+        17: "vfork-parent",
+        18: "fd-wait",
+        19: "semop",
     }.get((packed >> 24) & 0xFF, "unknown")
     native_nr = packed & 0xFFFFFF
     syscall = "overflow" if native_nr == 0xFFFFFF else str(native_nr)
     return f"pid={pid} tid={tid} native_nr={syscall} family={family}"
+
+def _signed64(x: int) -> int:
+    x &= 0xFFFFFFFFFFFFFFFF
+    return x - (1 << 64) if x & 0x8000000000000000 else x
+
 
 # kind -> (name, formatter(a, b, c))
 _EVENTRING_KINDS = {
@@ -625,6 +633,20 @@ _EVENTRING_KINDS = {
             f"owner={a} type={(b & 0xffffffff) >> 16} wake_count={b & 0xffff} poll_fd={c}"
         ),
     ),
+    59: ("SIGNAL_RESTART", lambda a, b, c: f"tid={a} signal={b} predicates={c & 0xffffffff:#x}"),
+    60: (
+        "SIGNAL_SYSCALL",
+        lambda a, b, c: f"tid={c} nr={_signed64((a & 0xffffffff) | ((b & 0xffffffff) << 32))}",
+    ),
+    61: (
+        "SIGNAL_RETVAL",
+        lambda a, b, c: f"tid={c} retval={_signed64((a & 0xffffffff) | ((b & 0xffffffff) << 32))}",
+    ),
+    62: (
+        "SIGNAL_PC",
+        lambda a, b, c: f"tid={c} pc={((a & 0xffffffff) | ((b & 0xffffffff) << 32)):#018x}",
+    ),
+    63: ("SIGNAL_INJECT", lambda a, b, c: f"tid={a} signal={b} restart={bool(c)}"),
 }
 
 
