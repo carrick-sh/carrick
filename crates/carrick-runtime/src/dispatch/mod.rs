@@ -671,6 +671,7 @@ pub(crate) use mem::boot_private_file_backings;
 pub(crate) mod net;
 #[macro_use]
 mod perf;
+pub(crate) mod executable_authority;
 mod proc;
 #[cfg(test)]
 pub(crate) use proc::build_hvpatch_waitid_siginfo;
@@ -683,6 +684,10 @@ mod bpf;
 pub mod mm_mutation;
 mod mount_api;
 mod mqueue;
+pub use mqueue::BlockingMqueue;
+#[cfg(test)]
+pub(crate) use mqueue::blocking_mqueue_for_continuation_test;
+pub(crate) use mqueue::{BlockingMqueueStep, MqueueChangeEnrollment, MqueueChangeSubscription};
 mod syslog;
 #[cfg(not(doctest))]
 mod sysv;
@@ -1774,37 +1779,6 @@ impl SyscallDispatcher {
             .vfs_mounts
             .resolve(path)
             .and_then(|m| m.vfs.read_file(path).ok())
-    }
-
-    /// Return a run-local cache key for a real host-backed executable. The
-    /// inode identity and nanosecond mutation timestamps make writes, replaces,
-    /// and overlay shadows select a fresh entry; in-memory/bind targets bypass.
-    /// This lets the default materialized host root share prepared tool images
-    /// without assuming that its writable overlay is immutable.
-    pub(crate) fn hvpatch_exec_cache_key(
-        &self,
-        path: &str,
-        vdso: bool,
-        requires_syscall_traps: bool,
-        needs_at_base: bool,
-    ) -> Option<String> {
-        use std::os::unix::fs::MetadataExt as _;
-        let file = self.open_exec_host_file(path)?;
-        let metadata = file.metadata().ok()?;
-        Some(format!(
-            "{path}\0{}:{}:{}:{}:{}:{}:{}\0{}\0{}\0{}\0{}",
-            metadata.dev(),
-            metadata.ino(),
-            metadata.size(),
-            metadata.mtime(),
-            metadata.mtime_nsec(),
-            metadata.ctime(),
-            metadata.ctime_nsec(),
-            self.linux_page_size(),
-            u8::from(vdso),
-            u8::from(requires_syscall_traps),
-            u8::from(needs_at_base)
-        ))
     }
 
     /// Get or construct one stack-independent HvPatch exec image. The lock is

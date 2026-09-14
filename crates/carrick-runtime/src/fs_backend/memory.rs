@@ -12,79 +12,59 @@ use parking_lot::RwLock;
 use crate::fs_backend::path::{child_name, normalize};
 use crate::fs_backend::{
     ArchiveMutationGate, BackendError, FsBackend, HostFdOpen, OverlayEntry, OverlayEntryKind,
-    SharedFileContents, SharedFileEntry,
+    SharedFileContents, SharedFileEntry, SharedFileObject,
 };
 use crate::rootfs::{RootFsEntryKind, RootFsMetadata};
 
 /// In-memory FsBackend: directories and file contents live in maps,
 /// deletions are a tombstone set. Cheap, ephemeral, exactly what CI
 /// or `cargo test` wants.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum MemoryFile {
-    Dense(Arc<[u8]>),
-    RootFsBacked {
-        base: Arc<[u8]>,
-        dirty: BTreeMap<usize, Vec<u8>>,
-        len: usize,
-        mode: u32,
-    },
+type MemoryFile = Arc<SharedFileObject>;
+
+trait MemoryFileExt {
+    fn len(&self) -> usize;
+    fn mode(&self) -> u32;
+    fn to_vec(&self) -> Vec<u8>;
+    fn shared_contents(&self) -> SharedFileContents;
+    fn write_range(
+        &self,
+        offset: usize,
+        bytes: &[u8],
+        final_size: usize,
+    ) -> Result<(), BackendError>;
+    fn truncate_to_zero(&self);
 }
 
-impl MemoryFile {
+impl MemoryFileExt for MemoryFile {
     fn len(&self) -> usize {
-        match self {
-            Self::Dense(bytes) => bytes.len(),
-            Self::RootFsBacked { len, .. } => *len,
-        }
+        self.read().len
     }
 
     fn mode(&self) -> u32 {
-        match self {
-            Self::Dense(_) => 0o644,
-            Self::RootFsBacked { mode, .. } => *mode,
-        }
+        SharedFileObject::mode(self)
     }
 
     fn to_vec(&self) -> Vec<u8> {
-        match self {
-            Self::Dense(bytes) => bytes.as_ref().to_vec(),
-            Self::RootFsBacked {
-                base, dirty, len, ..
-            } => {
-                let mut out = vec![0; *len];
-                let copy_len = base.len().min(*len);
-                out[..copy_len].copy_from_slice(&base[..copy_len]);
-                for (&start, bytes) in dirty {
-                    if start >= *len {
-                        continue;
-                    }
-                    let write_len = bytes.len().min(*len - start);
-                    out[start..start + write_len].copy_from_slice(&bytes[..write_len]);
-                }
-                out
+        let state = self.read();
+        let mut out = vec![0; state.len];
+        let copy_len = state.base.len().min(state.len);
+        out[..copy_len].copy_from_slice(&state.base[..copy_len]);
+        for (&start, bytes) in &state.dirty {
+            if start >= state.len {
+                continue;
             }
+            let write_len = bytes.len().min(state.len - start);
+            out[start..start + write_len].copy_from_slice(&bytes[..write_len]);
         }
+        out
     }
 
     fn shared_contents(&self) -> SharedFileContents {
-        match self {
-            Self::Dense(base) => SharedFileContents {
-                base: Arc::clone(base),
-                dirty: BTreeMap::new(),
-                len: base.len(),
-            },
-            Self::RootFsBacked {
-                base, dirty, len, ..
-            } => SharedFileContents {
-                base: Arc::clone(base),
-                dirty: dirty.clone(),
-                len: *len,
-            },
-        }
+        self.snapshot()
     }
 
     fn write_range(
-        &mut self,
+        &self,
         offset: usize,
         bytes: &[u8],
         final_size: usize,
@@ -95,35 +75,18 @@ impl MemoryFile {
         if final_size < end {
             return Err(BackendError::Invalid);
         }
-        match self {
-            Self::Dense(base) => {
-                let base = Arc::clone(base);
-                let mut dirty = BTreeMap::new();
-                insert_dirty_range(&mut dirty, offset, bytes)?;
-                *self = Self::RootFsBacked {
-                    base,
-                    dirty,
-                    len: final_size,
-                    mode: 0o644,
-                };
-            }
-            Self::RootFsBacked { dirty, len, .. } => {
-                *len = final_size;
-                prune_dirty_ranges(dirty, final_size);
-                insert_dirty_range(dirty, offset, bytes)?;
-            }
-        }
+        let mut state = self.write();
+        state.len = final_size;
+        prune_dirty_ranges(&mut state.dirty, final_size);
+        insert_dirty_range(&mut state.dirty, offset, bytes)?;
         Ok(())
     }
 
-    fn truncate_to_zero(&mut self) {
-        let mode = self.mode();
-        *self = Self::RootFsBacked {
-            base: Arc::<[u8]>::from([]),
-            dirty: BTreeMap::new(),
-            len: 0,
-            mode,
-        };
+    fn truncate_to_zero(&self) {
+        let mut state = self.write();
+        state.base = Arc::<[u8]>::from([]);
+        state.dirty.clear();
+        state.len = 0;
     }
 }
 
@@ -337,6 +300,7 @@ impl FsBackend for MemoryBackend {
                     size: contents.len,
                 },
                 contents,
+                object: Some(Arc::clone(file)),
             });
         }
 
@@ -358,6 +322,7 @@ impl FsBackend for MemoryBackend {
                 size: contents.len,
             },
             contents,
+            object: Some(Arc::clone(file)),
         })
     }
 
@@ -384,7 +349,7 @@ impl FsBackend for MemoryBackend {
         inner
             .files
             .entry(normalized)
-            .or_insert_with(|| MemoryFile::Dense(Arc::<[u8]>::from([])));
+            .or_insert_with(|| SharedFileObject::new(Arc::<[u8]>::from([]), 0o644));
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -404,15 +369,9 @@ impl FsBackend for MemoryBackend {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
         inner.deletions.remove(&normalized);
-        inner.files.insert(
-            normalized,
-            MemoryFile::RootFsBacked {
-                len: contents.len(),
-                base: contents,
-                dirty: BTreeMap::new(),
-                mode: mode & 0o7777,
-            },
-        );
+        inner
+            .files
+            .insert(normalized, SharedFileObject::new(contents, mode));
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -451,17 +410,7 @@ impl FsBackend for MemoryBackend {
         // its creation mode under `--fs memory`, matching `--fs host` (which
         // chmods the real inode). The contents are preserved verbatim.
         if let Some(existing) = inner.files.get(&normalized) {
-            let bytes = existing.to_vec();
-            let len = bytes.len();
-            inner.files.insert(
-                normalized,
-                MemoryFile::RootFsBacked {
-                    base: Arc::from(bytes),
-                    dirty: BTreeMap::new(),
-                    len,
-                    mode,
-                },
-            );
+            existing.write().mode = mode;
             self.generation
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Ok(());
@@ -475,9 +424,17 @@ impl FsBackend for MemoryBackend {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
         inner.deletions.remove(&normalized);
-        inner
-            .files
-            .insert(normalized, MemoryFile::Dense(Arc::from(contents)));
+        if let Some(existing) = inner.files.get(&normalized) {
+            let mut state = existing.write();
+            state.len = contents.len();
+            state.base = Arc::from(contents);
+            state.dirty.clear();
+        } else {
+            inner.files.insert(
+                normalized,
+                SharedFileObject::new(Arc::from(contents), 0o644),
+            );
+        }
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -715,5 +672,96 @@ impl FsBackend for MemoryBackend {
 
     fn name(&self) -> &'static str {
         "memory"
+    }
+}
+
+#[cfg(test)]
+mod retained_object_tests {
+    use super::*;
+
+    fn bytes(object: &SharedFileObject) -> Vec<u8> {
+        object.read_all()
+    }
+
+    #[test]
+    fn retained_object_survives_rename_unlink_and_observes_mutation() {
+        let backend = MemoryBackend::new();
+        backend
+            .set_file_contents("/image", b"old".to_vec())
+            .unwrap();
+        let entry = backend.shared_file_entry("/image", false).unwrap();
+        let object = entry.object.expect("memory entry exposes live object");
+        let id = object.object_id();
+
+        assert!(backend.rename_overlay_entry("/image", "/renamed").unwrap());
+        backend.write_file_range("/renamed", 0, b"new", 3).unwrap();
+        assert_eq!(object.object_id(), id);
+        assert_eq!(bytes(&object), b"new");
+
+        assert!(backend.remove_entry("/renamed"));
+        assert!(backend.shared_file_entry("/renamed", false).is_none());
+        assert_eq!(bytes(&object), b"new", "retained inode outlives its name");
+    }
+
+    #[test]
+    fn overwrite_preserves_identity_but_recreate_allocates_a_new_object() {
+        let backend = MemoryBackend::new();
+        backend
+            .set_file_contents("/image", b"one".to_vec())
+            .unwrap();
+        let first = backend
+            .shared_file_entry("/image", false)
+            .unwrap()
+            .object
+            .unwrap();
+
+        backend
+            .set_file_contents("/image", b"two".to_vec())
+            .unwrap();
+        let overwritten = backend
+            .shared_file_entry("/image", false)
+            .unwrap()
+            .object
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &overwritten));
+        assert_eq!(bytes(&first), b"two");
+
+        assert!(backend.remove_entry("/image"));
+        backend
+            .set_file_contents("/image", b"three".to_vec())
+            .unwrap();
+        let recreated = backend
+            .shared_file_entry("/image", false)
+            .unwrap()
+            .object
+            .unwrap();
+        assert_ne!(first.object_id(), recreated.object_id());
+        assert_eq!(bytes(&first), b"two");
+        assert_eq!(bytes(&recreated), b"three");
+    }
+
+    #[test]
+    fn retained_object_reads_sparse_dirty_prefix_without_materializing_tail() {
+        let backend = MemoryBackend::new();
+        backend
+            .create_file_from_rootfs("/image", Arc::from(&b"abcdefgh"[..]), 0o755)
+            .unwrap();
+        backend.write_file_range("/image", 2, b"XY", 12).unwrap();
+        backend.write_file_range("/image", 10, b"Z", 12).unwrap();
+        let object = backend
+            .shared_file_entry("/image", false)
+            .unwrap()
+            .object
+            .unwrap();
+
+        assert_eq!(object.read_prefix(0), b"");
+        assert_eq!(object.read_prefix(3), b"abX");
+        assert_eq!(object.read_prefix(9), b"abXYefgh\0");
+        assert_eq!(object.read_prefix(usize::MAX), object.read_all());
+        assert_eq!(object.read_all(), b"abXYefgh\0\0Z\0");
+
+        backend.write_file_range("/image", 0, b"", 4).unwrap();
+        assert_eq!(object.read_prefix(256), b"abXY");
+        assert_eq!(object.read_all(), b"abXY");
     }
 }

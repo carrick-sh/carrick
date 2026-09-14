@@ -1377,6 +1377,14 @@ where
                     Some(DispatchOutcome::BlockingSemop(semop))
                 }
             },
+            Completion::Mqueue(mqueue) => {
+                match mqueue.complete(&kernel.dispatcher, context, engine) {
+                    crate::dispatch::BlockingMqueueStep::Done(outcome) => Some(outcome),
+                    crate::dispatch::BlockingMqueueStep::Wait(mqueue) => {
+                        Some(DispatchOutcome::BlockingMqueue(mqueue))
+                    }
+                }
+            }
             Completion::FdWait { wait, sig_mask } => {
                 match wait.complete(engine, &kernel.dispatcher) {
                     crate::dispatch::fd_wait::BlockingFdWaitStep::Done(outcome) => Some(outcome),

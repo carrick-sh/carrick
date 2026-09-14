@@ -363,54 +363,36 @@ impl<'a> FsView<'a> {
     /// left to image-load time. (execve03 / execveat02 / execve02.)
     // Called from `runtime/exec.rs` (the macOS/HVF execve path).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn check_exec_source(
+        &self,
+        _path: &str,
+        source: &crate::dispatch::executable_authority::ExecSource,
+    ) -> Result<(), LinuxErrno> {
+        let (uid, gid) = self.dac_identity();
+        source.exec_access_errno(uid, gid)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn check_exec_target(&self, path: &str) -> Result<(), LinuxErrno> {
-        // Existence via the SAME layered reader the loader uses, so a symlinked
-        // executable (busybox/coreutils) is followed identically here — but
-        // bounded to a single byte: this is an existence probe, and the full
-        // read walked the whole multi-MB tool binary once per exec. A bare
-        // RunElf boot may additionally read the literal host path.
         let host_fallback = self.exec_host_fs_fallback();
-        let exists = self.read_exec_file_head(path, 1).is_some()
-            || (host_fallback
-                && std::fs::metadata(path)
-                    .map(|m| m.is_file())
-                    .unwrap_or(false));
-        if exists {
+        if self.read_exec_file_head(path, 1).is_some()
+            || (host_fallback && std::fs::metadata(path).is_ok_and(|m| m.is_file()))
+        {
             return self.exec_access_errno(path).map_or(Ok(()), Err);
         }
-        // "Unreadable as a file" is NOT the same as "absent", and two of the
-        // cases that land here resolve perfectly well — `read_exec_file_head`
-        // simply cannot produce a file head for either:
-        //   * a DIRECTORY is EACCES on Linux. It exists and resolves; it is
-        //     just not an executable image. (Note this is EACCES even for a
-        //     mode-0755 directory, so it cannot come from the X_OK DAC check
-        //     above, where search permission would pass.)
-        //   * a symlink CYCLE is ELOOP, bounded at 40 links as Linux bounds it.
-        //     `resolve_at_path` has no cycle detection, so the self-referential
-        //     link resolved to "no such entry".
-        // Reporting ENOENT for either told the guest the path did not exist.
-        // Found by `conformance-probes/src/bin/execfailsurvive.rs`, which
-        // diffed carrick's 2/2 against Docker's 13/40.
         match self.canonicalize_following(path) {
-            Err(errno) if errno == crate::linux_abi::LINUX_ELOOP => {
-                return Err(crate::linux_abi::LINUX_ELOOP);
-            }
-            Ok(resolved) => {
+            Err(errno) if errno == crate::linux_abi::LINUX_ELOOP => Err(errno),
+            Ok(resolved)
                 if self
                     .layered_lstat(&resolved)
-                    .is_ok_and(|md| md.kind == RootFsEntryKind::Directory)
-                {
-                    return Err(crate::linux_abi::LINUX_EACCES);
-                }
+                    .is_ok_and(|md| md.kind == RootFsEntryKind::Directory) =>
+            {
+                Err(crate::linux_abi::LINUX_EACCES)
             }
-            Err(_) => {}
-        }
-        // Otherwise: resolve_at_path distinguishes ENOTDIR (a non-directory
-        // path component) and ENAMETOOLONG (an over-long path/component). A
-        // path that resolves but whose leaf is simply absent is ENOENT.
-        match self.resolve_at_path(LINUX_AT_FDCWD, path) {
-            Ok(_) => Err(LINUX_ENOENT),
-            Err(errno) => Err(errno),
+            _ => match self.resolve_at_path(LINUX_AT_FDCWD, path) {
+                Ok(_) => Err(LINUX_ENOENT),
+                Err(errno) => Err(errno),
+            },
         }
     }
 
@@ -552,6 +534,13 @@ impl<'a> FsView<'a> {
             OpenDescription::SyntheticFile { path, .. } => self
                 .synthetic_access(context, path, mode)
                 .unwrap_or(DispatchOutcome::errno(LINUX_ENOENT)),
+            OpenDescription::ProcExecutable { .. } => {
+                if mode & LINUX_W_OK != 0 {
+                    DispatchOutcome::errno(LINUX_EACCES)
+                } else {
+                    DispatchOutcome::Returned { value: 0 }
+                }
+            }
             OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }

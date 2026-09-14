@@ -104,6 +104,7 @@ impl<'a> FsView<'a> {
             return Ok(StatRecord::from_real(&path, &real).with_fs_identity(fs_id));
         }
         let record = match source {
+            OpenStatSource::Error(errno) => return Err(errno),
             OpenStatSource::Record(record) => record,
             OpenStatSource::HostStream {
                 host_fd,

@@ -16,11 +16,11 @@ SPEC.loader.exec_module(probe_inventory)
 
 
 class ProbeInventoryTest(unittest.TestCase):
-    def test_probe_inventory_partitions_all_461_sources(self):
+    def test_probe_inventory_partitions_all_537_sources(self):
         inventory = probe_inventory.load_inventory()
         sources = probe_inventory.source_names()
         self.assertEqual(set(inventory), sources)
-        self.assertEqual(len(inventory), 461)
+        self.assertEqual(len(inventory), 537)
         self.assertEqual(
             {name for name, row in inventory.items() if row["class"] == "performance"},
             {name for name in sources if name.startswith("perf_")},
@@ -30,7 +30,7 @@ class ProbeInventoryTest(unittest.TestCase):
             {"probeinit"},
         )
         self.assertEqual(
-            sum(row["class"] == "performance" for row in inventory.values()), 25
+            sum(row["class"] == "performance" for row in inventory.values()), 27
         )
         self.assertTrue(all(row["excluded"] is False for row in inventory.values()))
 

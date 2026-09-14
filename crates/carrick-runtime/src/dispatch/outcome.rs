@@ -699,6 +699,9 @@ pub enum DispatchOutcome {
     /// retains the exact semaphore-set generation and operation array, so an
     /// `IPC_RMID`/id-reuse race cannot retarget completion.
     BlockingSemop(#[serde(skip)] crate::dispatch::sysv::BlockingSemop),
+    /// A POSIX message-queue send or receive parked outside the dispatcher.
+    /// It retains the exact queue and captured operation across fd close/reuse.
+    BlockingMqueue(#[serde(skip)] crate::dispatch::mqueue::BlockingMqueue),
     /// Retained poll/select operation.  Its completion samples the admission
     /// snapshot and either writes final output or re-parks itself.
     BlockingFdWait {

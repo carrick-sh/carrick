@@ -236,15 +236,193 @@ pub struct RealStat {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedFileContents {
+    /// Stable identity of the backend file object. Rename preserves it;
+    /// unlink followed by recreation allocates a different identity.
+    pub object_id: u64,
     pub base: Arc<[u8]>,
     pub dirty: BTreeMap<usize, Vec<u8>>,
     pub len: usize,
+}
+
+/// Retained identity and mutable state of one in-memory regular-file inode.
+///
+/// Namespace maps own one `Arc` while the name exists. Higher layers can retain
+/// another instead of copying a snapshot, so rename only moves the namespace
+/// reference and unlink cannot destroy the inode until its last retained handle
+/// is dropped. Those layers opt into this through [`SharedFileEntry::object`].
+#[derive(Debug)]
+pub struct SharedFileObject {
+    object_id: u64,
+    state: RwLock<SharedFileObjectState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SharedFileObjectState {
+    pub(crate) base: Arc<[u8]>,
+    pub(crate) dirty: BTreeMap<usize, Vec<u8>>,
+    pub(crate) len: usize,
+    pub(crate) mode: u32,
+}
+
+impl SharedFileObject {
+    pub(crate) fn new(base: Arc<[u8]>, mode: u32) -> Arc<Self> {
+        Arc::new(Self {
+            object_id: fresh_file_object_id(),
+            state: RwLock::new(SharedFileObjectState {
+                len: base.len(),
+                base,
+                dirty: BTreeMap::new(),
+                mode: mode & 0o7777,
+            }),
+        })
+    }
+
+    pub fn object_id(&self) -> u64 {
+        self.object_id
+    }
+
+    pub fn snapshot(&self) -> SharedFileContents {
+        let state = self.state.read();
+        SharedFileContents {
+            object_id: self.object_id,
+            base: Arc::clone(&state.base),
+            dirty: state.dirty.clone(),
+            len: state.len,
+        }
+    }
+
+    pub fn mode(&self) -> u32 {
+        self.state.read().mode
+    }
+
+    pub fn len(&self) -> usize {
+        self.state.read().len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Read at most `max` leading bytes without cloning the sparse dirty map or
+    /// materializing bytes beyond the requested prefix.
+    pub fn read_prefix(&self, max: usize) -> Vec<u8> {
+        self.read_range(0, max)
+    }
+
+    /// Read a bounded range of the live inode, including sparse zeroes. Only
+    /// dirty extents intersecting this range are visited.
+    pub fn read_range(&self, offset: usize, max: usize) -> Vec<u8> {
+        let state = self.state.read();
+        render_shared_file(&state, offset, max)
+    }
+
+    /// Materialize the current logical file in one exactly-sized allocation.
+    pub fn read_all(&self) -> Vec<u8> {
+        let state = self.state.read();
+        render_shared_file(&state, 0, state.len)
+    }
+
+    pub(crate) fn read(&self) -> RwLockReadGuard<'_, SharedFileObjectState> {
+        self.state.read()
+    }
+
+    pub(crate) fn write(&self) -> RwLockWriteGuard<'_, SharedFileObjectState> {
+        self.state.write()
+    }
+}
+
+impl PartialEq for SharedFileObject {
+    fn eq(&self, other: &Self) -> bool {
+        self.object_id == other.object_id
+    }
+}
+
+impl Eq for SharedFileObject {}
+
+fn render_shared_file(state: &SharedFileObjectState, offset: usize, max: usize) -> Vec<u8> {
+    let output_len = state.len.saturating_sub(offset).min(max);
+    let mut output = vec![0; output_len];
+    if output_len == 0 {
+        return output;
+    }
+    let end = offset + output_len; // Bounded above by state.len.
+    let base_len = state.base.len().saturating_sub(offset).min(output_len);
+    if base_len != 0 {
+        output[..base_len].copy_from_slice(&state.base[offset..offset + base_len]);
+    }
+    // Dirty extents are disjoint. At most one earlier extent overlaps offset.
+    let predecessor = state.dirty.range(..offset).next_back();
+    for (&start, dirty) in predecessor
+        .into_iter()
+        .chain(state.dirty.range(offset..end))
+    {
+        let skip = offset.saturating_sub(start);
+        if skip >= dirty.len() {
+            continue;
+        }
+        let output_start = start.saturating_sub(offset);
+        let count = (dirty.len() - skip).min(output_len - output_start);
+        output[output_start..output_start + count].copy_from_slice(&dirty[skip..skip + count]);
+    }
+    output
+}
+
+#[cfg(test)]
+mod shared_file_range_tests {
+    use super::*;
+
+    #[test]
+    fn ranges_match_materialized_bytes_at_dirty_and_sparse_boundaries() {
+        let state = SharedFileObjectState {
+            base: Arc::from(&b"abcdefgh"[..]),
+            dirty: BTreeMap::from([(2, b"XYZ".to_vec()), (10, b"Q".to_vec())]),
+            len: 12,
+            mode: 0o755,
+        };
+        let expected = b"abXYZfgh\0\0Q\0";
+        for offset in 0..=14 {
+            for max in [0, 1, 3, 8, usize::MAX] {
+                let start = offset.min(expected.len());
+                let len = (expected.len() - start).min(max);
+                assert_eq!(
+                    render_shared_file(&state, offset, max),
+                    &expected[start..start + len],
+                    "offset={offset}, max={max}"
+                );
+            }
+        }
+        assert!(render_shared_file(&state, usize::MAX, usize::MAX).is_empty());
+    }
+
+    #[test]
+    fn tiny_range_at_large_sparse_offset_does_not_materialize_file() {
+        let tail = usize::MAX - 8;
+        let state = SharedFileObjectState {
+            base: Arc::from(&b"head"[..]),
+            dirty: BTreeMap::from([(tail, b"tail".to_vec())]),
+            len: usize::MAX,
+            mode: 0o755,
+        };
+        assert_eq!(render_shared_file(&state, tail + 1, 5), b"ail\0\0");
+        assert_eq!(
+            render_shared_file(&state, usize::MAX - 1, usize::MAX),
+            b"\0"
+        );
+    }
+}
+
+pub(crate) fn fresh_file_object_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedFileEntry {
     pub metadata: RootFsMetadata,
     pub contents: SharedFileContents,
+    /// Live retained inode authority when the backend has mutable in-memory
+    /// objects. Snapshot-only backends leave this absent.
+    pub object: Option<Arc<SharedFileObject>>,
 }
 
 thread_local! {

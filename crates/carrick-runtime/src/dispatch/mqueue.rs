@@ -12,7 +12,8 @@ use super::*;
 use crate::linux_abi::LinuxErrno;
 use carrick_abi::syscall::nr;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 syscall_table! {
     /// Per-module syscall routing for the POSIX message-queue subsystem.
@@ -214,10 +215,25 @@ pub struct MqueueState {
     pub notify: Option<MqueueNotify>,
 }
 
-#[derive(Debug)]
+type MqueueChangeListener = Arc<dyn Fn() + Send + Sync>;
+type MqueueChangeListenerRegistry = Mutex<HashMap<u64, MqueueChangeListener>>;
+
 pub struct MqueueInner {
     pub state: parking_lot::Mutex<MqueueState>,
     pub changed: parking_lot::Condvar,
+    change_generation: AtomicU64,
+    change_listeners: Arc<MqueueChangeListenerRegistry>,
+    next_change_listener: AtomicU64,
+    blocked_receivers: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for MqueueInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MqueueInner")
+            .field("state", &self.state)
+            .field("change_generation", &self.change_generation())
+            .finish_non_exhaustive()
+    }
 }
 
 impl MqueueInner {
@@ -232,6 +248,50 @@ impl MqueueInner {
                 notify: None,
             }),
             changed: parking_lot::Condvar::new(),
+            change_generation: AtomicU64::new(0),
+            change_listeners: Arc::new(Mutex::new(HashMap::new())),
+            next_change_listener: AtomicU64::new(1),
+            blocked_receivers: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn change_generation(&self) -> u64 {
+        self.change_generation.load(Ordering::Acquire)
+    }
+
+    fn subscribe_change(
+        &self,
+        expected: u64,
+        callback: Arc<dyn Fn() + Send + Sync>,
+    ) -> MqueueChangeEnrollment {
+        let id = self.next_change_listener.fetch_add(1, Ordering::Relaxed);
+        let mut listeners = self
+            .change_listeners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        listeners.insert(id, callback);
+        if self.change_generation() != expected {
+            listeners.remove(&id);
+            return MqueueChangeEnrollment::Ready;
+        }
+        MqueueChangeEnrollment::Subscribed(MqueueChangeSubscription {
+            listeners: Arc::downgrade(&self.change_listeners),
+            id,
+        })
+    }
+
+    fn publish_change(&self) {
+        self.change_generation.fetch_add(1, Ordering::AcqRel);
+        self.changed.notify_all();
+        let callbacks = self
+            .change_listeners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for callback in callbacks {
+            callback();
         }
     }
 
@@ -312,6 +372,108 @@ impl MqueueInner {
             state.notify.take()
         }
     }
+}
+
+pub(crate) enum MqueueChangeEnrollment {
+    Ready,
+    Subscribed(MqueueChangeSubscription),
+}
+
+pub(crate) struct MqueueChangeSubscription {
+    listeners: Weak<MqueueChangeListenerRegistry>,
+    id: u64,
+}
+
+impl Drop for MqueueChangeSubscription {
+    fn drop(&mut self) {
+        if let Some(listeners) = self.listeners.upgrade() {
+            listeners
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.id);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BlockingMqueueOperation {
+    Send { payload: Vec<u8>, priority: u32 },
+    Receive { buffer: u64, priority: Option<u64> },
+}
+
+#[derive(Clone)]
+pub struct BlockingMqueue {
+    queue: Arc<MqueueInner>,
+    clock: Arc<crate::kernel::container::ClockDomain>,
+    deadline: Option<(i64, i64)>,
+    operation: BlockingMqueueOperation,
+    observed_generation: u64,
+    tid: crate::thread::ThreadId,
+    _receive_waiter: Option<Arc<MqueueReceiveWaiter>>,
+    deterministic_waiter: Option<Arc<crate::kernel::container::DeterministicWaiterSubscription>>,
+}
+
+#[derive(Debug)]
+struct MqueueReceiveWaiter {
+    count: Arc<AtomicUsize>,
+    active: std::sync::atomic::AtomicBool,
+}
+
+impl MqueueReceiveWaiter {
+    fn new(count: Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self {
+            count,
+            active: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    fn settle(&self) {
+        if self.active.swap(false, Ordering::AcqRel) {
+            self.count.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for MqueueReceiveWaiter {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
+impl std::fmt::Debug for BlockingMqueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockingMqueue")
+            .field("deadline", &self.deadline)
+            .field("observed_generation", &self.observed_generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for BlockingMqueue {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.queue, &other.queue)
+            && Arc::ptr_eq(&self.clock, &other.clock)
+            && self.deadline == other.deadline
+            && self.operation == other.operation
+            && self.tid == other.tid
+    }
+}
+
+impl Eq for BlockingMqueue {}
+
+#[derive(Debug)]
+pub(crate) enum BlockingMqueueStep {
+    Done(DispatchOutcome),
+    Wait(BlockingMqueue),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MqueueWaitPlan {
+    pub(crate) deadline: Option<std::time::Instant>,
+    pub(crate) queue_generation: u64,
+    pub(crate) clock_generation: u64,
+    pub(crate) virtual_due: Option<std::time::Duration>,
 }
 
 #[derive(Default, Debug)]
@@ -729,48 +891,22 @@ impl<'a> IpcView<'a> {
 
             let nonblock = LinuxOpenFlags::from_bits_truncate(mq.description.common().status_flags())
                 .contains(LinuxOpenFlags::NONBLOCK);
-            let tid = cx.tid();
-            loop {
-                if mq_wait_interrupted(this, cx.kernel, tid) {
-                    return Ok(DispatchOutcome::errno(LINUX_EINTR));
-                }
-                {
-                    let mut state = mq.queue.state.lock();
-                    if state.messages.len() < state.max_msg {
-                        let was_empty = state.messages.is_empty();
-                        let notify = if was_empty { state.notify.take() } else { None };
-                        let seq = state.next_seq;
-                        state.next_seq = state.next_seq.wrapping_add(1);
-                        let pos = state
-                            .messages
-                            .iter()
-                            .position(|m| m.prio < prio as u32)
-                            .unwrap_or(state.messages.len());
-                        state.messages.insert(
-                            pos,
-                            MqueueMessage {
-                                prio: prio as u32,
-                                seq,
-                                payload,
-                            },
-                        );
-                        drop(state);
-                        mq.queue.changed.notify_all();
-                        if let Some(delivery) = notify {
-                            deliver_notify(this, cx.kernel, tid, delivery);
-                        }
-                        return Ok(DispatchOutcome::Returned { value: 0 });
-                    }
-                    if nonblock {
-                        return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
-                    }
-                    if deadline_expired(cx.kernel.task().container().clock(), deadline) {
-                        return Ok(DispatchOutcome::errno(LINUX_ETIMEDOUT));
-                    }
-                    mq.queue
-                        .changed
-                        .wait_for(&mut state, std::time::Duration::from_millis(10));
-                }
+            let wait = BlockingMqueue {
+                queue: mq.queue,
+                clock: Arc::clone(cx.kernel.task().container().clock()),
+                deadline,
+                operation: BlockingMqueueOperation::Send {
+                    payload,
+                    priority: prio as u32,
+                },
+                observed_generation: 0,
+                tid: cx.tid(),
+                _receive_waiter: None,
+                deterministic_waiter: None,
+            };
+            match wait.try_complete(this, cx.kernel, cx.memory, nonblock) {
+                BlockingMqueueStep::Done(outcome) => Ok(outcome),
+                BlockingMqueueStep::Wait(wait) => Ok(DispatchOutcome::BlockingMqueue(wait)),
             }
         }
 
@@ -796,44 +932,22 @@ impl<'a> IpcView<'a> {
 
             let nonblock = LinuxOpenFlags::from_bits_truncate(mq.description.common().status_flags())
                 .contains(LinuxOpenFlags::NONBLOCK);
-            let tid = cx.tid();
-            loop {
-                if mq_wait_interrupted(this, cx.kernel, tid) {
-                    return Ok(DispatchOutcome::errno(LINUX_EINTR));
-                }
-                {
-                    let mut state = mq.queue.state.lock();
-                    if !state.messages.is_empty() {
-                        let msg = state.messages.remove(0);
-                        drop(state);
-                        mq.queue.changed.notify_all();
-
-                        if prio_ptr.0 != 0
-                            && cx
-                                .memory
-                                .write_bytes(prio_ptr.0, &msg.prio.to_le_bytes())
-                                .is_err()
-                        {
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                        }
-                        let n = msg.payload.len();
-                        if !msg.payload.is_empty()
-                            && cx.memory.write_bytes(buf_ptr.0, &msg.payload).is_err()
-                        {
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                        }
-                        return Ok(DispatchOutcome::returned_len(n)?);
-                    }
-                    if nonblock {
-                        return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
-                    }
-                    if deadline_expired(cx.kernel.task().container().clock(), deadline) {
-                        return Ok(DispatchOutcome::errno(LINUX_ETIMEDOUT));
-                    }
-                    mq.queue
-                        .changed
-                        .wait_for(&mut state, std::time::Duration::from_millis(10));
-                }
+            let wait = BlockingMqueue {
+                queue: mq.queue,
+                clock: Arc::clone(cx.kernel.task().container().clock()),
+                deadline,
+                operation: BlockingMqueueOperation::Receive {
+                    buffer: buf_ptr.0,
+                    priority: (prio_ptr.0 != 0).then_some(prio_ptr.0),
+                },
+                observed_generation: 0,
+                tid: cx.tid(),
+                _receive_waiter: None,
+                deterministic_waiter: None,
+            };
+            match wait.try_complete(this, cx.kernel, cx.memory, nonblock) {
+                BlockingMqueueStep::Done(outcome) => Ok(outcome),
+                BlockingMqueueStep::Wait(wait) => Ok(DispatchOutcome::BlockingMqueue(wait)),
             }
         }
 
@@ -1239,6 +1353,207 @@ fn deadline_expired(
     };
     let now = clock.realtime_now();
     (now.as_secs() as i64, i64::from(now.subsec_nanos())) >= (sec, nsec)
+}
+
+impl BlockingMqueue {
+    pub(crate) fn plan(&self) -> MqueueWaitPlan {
+        let (clock_generation, (expired, deadline, virtual_due)) =
+            self.clock.with_clock_change_snapshot(|| {
+                let expired = deadline_expired(&self.clock, self.deadline);
+                let target = self
+                    .deadline
+                    .map(|(sec, nsec)| std::time::Duration::new(sec as u64, nsec as u32));
+                let now = self.clock.realtime_now();
+                let host_deadline =
+                    if expired || self.clock.is_deterministic() || self.clock.is_frozen() {
+                        None
+                    } else {
+                        target.and_then(|target| {
+                            (target > now)
+                                .then(|| {
+                                    std::time::Instant::now().checked_add(
+                                        self.clock.scale_timeout(target.saturating_sub(now)),
+                                    )
+                                })
+                                .flatten()
+                        })
+                    };
+                let virtual_due = self
+                    .clock
+                    .is_deterministic()
+                    .then(|| {
+                        target.map(|target| {
+                            self.clock
+                                .monotonic_now()
+                                .saturating_add(target.saturating_sub(now))
+                        })
+                    })
+                    .flatten();
+                (expired, host_deadline, virtual_due)
+            });
+        MqueueWaitPlan {
+            deadline: expired.then(std::time::Instant::now).or(deadline),
+            queue_generation: self.observed_generation,
+            clock_generation,
+            virtual_due,
+        }
+    }
+
+    pub(crate) fn enroll_deterministic_waiter(
+        &mut self,
+        due: Option<std::time::Duration>,
+        callback: impl Fn() + Send + Sync + 'static,
+    ) {
+        if self.deterministic_waiter.is_none() {
+            self.deterministic_waiter = self
+                .clock
+                .enroll_deterministic_waiter(due, callback)
+                .map(Arc::new);
+        }
+    }
+
+    pub(crate) fn subscribe_change(
+        &self,
+        expected: u64,
+        callback: Arc<dyn Fn() + Send + Sync>,
+    ) -> MqueueChangeEnrollment {
+        self.queue.subscribe_change(expected, callback)
+    }
+
+    pub(crate) fn clock(&self) -> &Arc<crate::kernel::container::ClockDomain> {
+        &self.clock
+    }
+
+    fn try_complete<M: CurrentMmMemory>(
+        mut self,
+        view: &IpcView<'_>,
+        kernel: &crate::kernel::KernelContext,
+        memory: &mut M,
+        nonblock: bool,
+    ) -> BlockingMqueueStep {
+        let mut state = self.queue.state.lock();
+        if mq_wait_interrupted(view, kernel, self.tid) {
+            if let Some(waiter) = self._receive_waiter.as_ref() {
+                waiter.settle();
+            }
+            drop(state);
+            return BlockingMqueueStep::Done(DispatchOutcome::errno(LINUX_EINTR));
+        }
+        let ready = match &self.operation {
+            BlockingMqueueOperation::Send { .. } => state.messages.len() < state.max_msg,
+            BlockingMqueueOperation::Receive { .. } => !state.messages.is_empty(),
+        };
+        if !ready {
+            self.observed_generation = self.queue.change_generation();
+            if nonblock {
+                drop(state);
+                return BlockingMqueueStep::Done(DispatchOutcome::errno(LINUX_EAGAIN));
+            }
+            if deadline_expired(&self.clock, self.deadline) {
+                if let Some(waiter) = self._receive_waiter.as_ref() {
+                    waiter.settle();
+                }
+                drop(state);
+                return BlockingMqueueStep::Done(DispatchOutcome::errno(LINUX_ETIMEDOUT));
+            }
+            if matches!(self.operation, BlockingMqueueOperation::Receive { .. })
+                && self._receive_waiter.is_none()
+            {
+                self._receive_waiter = Some(Arc::new(MqueueReceiveWaiter::new(Arc::clone(
+                    &self.queue.blocked_receivers,
+                ))));
+            }
+            drop(state);
+            return BlockingMqueueStep::Wait(self);
+        }
+
+        match self.operation {
+            BlockingMqueueOperation::Send { payload, priority } => {
+                let was_empty = state.messages.is_empty();
+                let notify = (was_empty
+                    && self.queue.blocked_receivers.load(Ordering::Acquire) == 0)
+                    .then(|| state.notify.take())
+                    .flatten();
+                let seq = state.next_seq;
+                state.next_seq = state.next_seq.wrapping_add(1);
+                let pos = state
+                    .messages
+                    .iter()
+                    .position(|message| message.prio < priority)
+                    .unwrap_or(state.messages.len());
+                state.messages.insert(
+                    pos,
+                    MqueueMessage {
+                        prio: priority,
+                        seq,
+                        payload,
+                    },
+                );
+                drop(state);
+                self.queue.publish_change();
+                if let Some(delivery) = notify {
+                    deliver_notify(view, kernel, self.tid, delivery);
+                }
+                BlockingMqueueStep::Done(DispatchOutcome::Returned { value: 0 })
+            }
+            BlockingMqueueOperation::Receive { buffer, priority } => {
+                if let Some(waiter) = self._receive_waiter.as_ref() {
+                    waiter.settle();
+                }
+                let message = state.messages.remove(0);
+                drop(state);
+                self.queue.publish_change();
+                if priority.is_some_and(|address| {
+                    memory
+                        .write_bytes(address, &message.prio.to_le_bytes())
+                        .is_err()
+                }) || (!message.payload.is_empty()
+                    && memory.write_bytes(buffer, &message.payload).is_err())
+                {
+                    return BlockingMqueueStep::Done(DispatchOutcome::errno(LINUX_EFAULT));
+                }
+                BlockingMqueueStep::Done(
+                    DispatchOutcome::returned_len(message.payload.len())
+                        .unwrap_or_else(|_| DispatchOutcome::errno(LINUX_EINVAL)),
+                )
+            }
+        }
+    }
+
+    pub(crate) fn complete<M: CurrentMmMemory>(
+        self,
+        dispatcher: &SyscallDispatcher,
+        kernel: &crate::kernel::KernelContext,
+        memory: &mut M,
+    ) -> BlockingMqueueStep {
+        self.try_complete(&dispatcher.ipc_view(), kernel, memory, false)
+    }
+
+    pub(crate) fn cancel(&self) {
+        let _state = self.queue.state.lock();
+        if let Some(waiter) = self._receive_waiter.as_ref() {
+            waiter.settle();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn blocking_mqueue_for_continuation_test(
+    tid: crate::thread::ThreadId,
+) -> BlockingMqueue {
+    BlockingMqueue {
+        queue: Arc::new(MqueueInner::new(1, 8, 0)),
+        clock: Arc::new(crate::kernel::container::ClockDomain::system()),
+        deadline: None,
+        operation: BlockingMqueueOperation::Receive {
+            buffer: 0x1000,
+            priority: None,
+        },
+        observed_generation: 0,
+        tid,
+        _receive_waiter: None,
+        deterministic_waiter: None,
+    }
 }
 
 #[cfg(test)]
@@ -2811,5 +3126,294 @@ mod tests {
             &clock,
             Some(((guest_now.as_secs() + 1_800) as i64, 0))
         ));
+    }
+
+    #[test]
+    fn blocking_mqueue_receive_subscribes_then_completes_captured_copyout() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_040);
+        dispatcher.bind_hvpatch_process(process);
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x9000]);
+        let mqd = open_test_queue(
+            &dispatcher,
+            &context,
+            &mut memory,
+            0x1000,
+            b"blocking_receive\0",
+        );
+        register_signal_notification(&dispatcher, &context, &mut memory, mqd, 10, 0x55, 0x1800);
+
+        let outcome = dispatch_call(
+            &dispatcher,
+            &context,
+            &mut memory,
+            183,
+            [mqd as u64, 0x3000, 8192, 0x4000, 0, 0],
+        );
+        let DispatchOutcome::BlockingMqueue(wait) = outcome else {
+            panic!("empty receive must become a continuation: {outcome:?}");
+        };
+        let stale_wait = wait.clone();
+        let queue = Arc::clone(&wait.queue);
+        let plan = wait.plan();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake_count = Arc::clone(&wakes);
+        let _subscription = match wait.subscribe_change(
+            plan.queue_generation,
+            Arc::new(move || {
+                wake_count.fetch_add(1, Ordering::SeqCst);
+            }),
+        ) {
+            MqueueChangeEnrollment::Subscribed(subscription) => subscription,
+            MqueueChangeEnrollment::Ready => panic!("unchanged queue must subscribe"),
+        };
+
+        memory.write_bytes(0x2000, b"payload").unwrap();
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &context,
+                &mut memory,
+                182,
+                [mqd as u64, 0x2000, 7, 23, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(
+            wait.queue.state.lock().notify.is_some(),
+            "a blocked receiver suppresses empty-to-nonempty notification"
+        );
+        assert!(matches!(
+            wait.complete(&dispatcher, &context, &mut memory),
+            BlockingMqueueStep::Done(DispatchOutcome::Returned { value: 7 })
+        ));
+        assert_eq!(memory.read_bytes(0x3000, 7).unwrap(), b"payload");
+        assert_eq!(
+            u32::from_le_bytes(memory.read_bytes(0x4000, 4).unwrap().try_into().unwrap()),
+            23
+        );
+        assert_eq!(
+            queue.blocked_receivers.load(Ordering::Acquire),
+            0,
+            "completion must settle receiver accounting despite a stale clone"
+        );
+        memory.write_bytes(0x2100, b"next").unwrap();
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &context,
+                &mut memory,
+                182,
+                [mqd as u64, 0x2100, 4, 1, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert!(
+            queue.state.lock().notify.is_none(),
+            "settled receiver must not let a stale clone suppress later notification"
+        );
+        drop(stale_wait);
+    }
+
+    #[test]
+    fn blocking_mqueue_send_completes_with_captured_payload_after_space_wake() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_043);
+        dispatcher.bind_hvpatch_process(process);
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x9000]);
+        let mqd = open_test_queue(
+            &dispatcher,
+            &context,
+            &mut memory,
+            0x1000,
+            b"blocking_send\0",
+        );
+        for index in 0..DEFAULT_MAXMSG {
+            memory.write_bytes(0x2000, &[index as u8]).unwrap();
+            assert_eq!(
+                dispatch_call(
+                    &dispatcher,
+                    &context,
+                    &mut memory,
+                    182,
+                    [mqd as u64, 0x2000, 1, 0, 0, 0],
+                ),
+                DispatchOutcome::Returned { value: 0 }
+            );
+        }
+        memory.write_bytes(0x2000, b"captured").unwrap();
+        let DispatchOutcome::BlockingMqueue(wait) = dispatch_call(
+            &dispatcher,
+            &context,
+            &mut memory,
+            182,
+            [mqd as u64, 0x2000, 8, 99, 0, 0],
+        ) else {
+            panic!("full queue send must block");
+        };
+        memory.write_bytes(0x2000, b"mutated!").unwrap();
+        assert!(matches!(
+            dispatch_call(
+                &dispatcher,
+                &context,
+                &mut memory,
+                183,
+                [mqd as u64, 0x3000, 8192, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 1 }
+        ));
+        assert!(matches!(
+            wait.complete(&dispatcher, &context, &mut memory),
+            BlockingMqueueStep::Done(DispatchOutcome::Returned { value: 0 })
+        ));
+        assert!(matches!(
+            dispatch_call(
+                &dispatcher,
+                &context,
+                &mut memory,
+                183,
+                [mqd as u64, 0x3000, 8192, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 8 }
+        ));
+        assert_eq!(memory.read_bytes(0x3000, 8).unwrap(), b"captured");
+    }
+
+    #[test]
+    fn blocking_mqueue_timeout_and_cancel_settle_receiver_with_stale_clone() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_041);
+        dispatcher.bind_hvpatch_process(process);
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x9000]);
+        let mqd = open_test_queue(
+            &dispatcher,
+            &context,
+            &mut memory,
+            0x1000,
+            b"blocking_settle\0",
+        );
+        let now = context.task().container().clock().realtime_now();
+        let deadline = LinuxTimespec {
+            tv_sec: now.as_secs() as i64 + 3600,
+            tv_nsec: i64::from(now.subsec_nanos()),
+        };
+        use zerocopy::IntoBytes as _;
+        memory.write_bytes(0x5000, deadline.as_bytes()).unwrap();
+        let DispatchOutcome::BlockingMqueue(wait) = dispatch_call(
+            &dispatcher,
+            &context,
+            &mut memory,
+            183,
+            [mqd as u64, 0x3000, 8192, 0, 0x5000, 0],
+        ) else {
+            panic!("future empty receive must block");
+        };
+        let stale = wait.clone();
+        let queue = Arc::clone(&wait.queue);
+        context
+            .task()
+            .container()
+            .clock()
+            .set_realtime_offset_ns(7200 * 1_000_000_000);
+        assert!(matches!(
+            wait.complete(&dispatcher, &context, &mut memory),
+            BlockingMqueueStep::Done(DispatchOutcome::Errno { errno })
+                if errno == LINUX_ETIMEDOUT
+        ));
+        assert_eq!(queue.blocked_receivers.load(Ordering::Acquire), 0);
+        stale.cancel();
+        assert_eq!(queue.blocked_receivers.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn blocking_mqueue_deterministic_deadline_enrolls_virtual_due() {
+        let epoch = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let clock = Arc::new(crate::kernel::container::ClockDomain::deterministic(epoch));
+        let mut wait = BlockingMqueue {
+            queue: Arc::new(MqueueInner::new(1, 8, 0)),
+            clock: Arc::clone(&clock),
+            deadline: Some((101, 0)),
+            operation: BlockingMqueueOperation::Receive {
+                buffer: 0x1000,
+                priority: None,
+            },
+            observed_generation: 0,
+            tid: crate::thread::ThreadId::synthetic_for_tests(83_042),
+            _receive_waiter: None,
+            deterministic_waiter: None,
+        };
+        let plan = wait.plan();
+        assert_eq!(plan.virtual_due, Some(std::time::Duration::from_secs(1)));
+        let fired = Arc::new(AtomicUsize::new(0));
+        let callback_fired = Arc::clone(&fired);
+        wait.enroll_deterministic_waiter(plan.virtual_due, move || {
+            callback_fired.fetch_add(1, Ordering::SeqCst);
+        });
+        clock.maybe_auto_advance();
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert!(deadline_expired(&clock, wait.deadline));
+    }
+
+    #[test]
+    fn blocking_mqueue_replans_absolute_deadline_after_realtime_steps() {
+        let clock = Arc::new(crate::kernel::container::ClockDomain::system());
+        let now = clock.realtime_now();
+        let target = now.saturating_add(std::time::Duration::from_secs(60));
+        let wait = BlockingMqueue {
+            queue: Arc::new(MqueueInner::new(1, 8, 0)),
+            clock: Arc::clone(&clock),
+            deadline: Some((target.as_secs() as i64, i64::from(target.subsec_nanos()))),
+            operation: BlockingMqueueOperation::Receive {
+                buffer: 0x1000,
+                priority: None,
+            },
+            observed_generation: 0,
+            tid: crate::thread::ThreadId::synthetic_for_tests(83_044),
+            _receive_waiter: None,
+            deterministic_waiter: None,
+        };
+        let original = wait.plan();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let callback_count = Arc::clone(&callbacks);
+        let _forward = match clock.subscribe_clock_change(
+            original.clock_generation,
+            Arc::new(move || {
+                callback_count.fetch_add(1, Ordering::SeqCst);
+            }),
+        ) {
+            crate::kernel::container::ClockChangeEnrollment::Subscribed(subscription) => {
+                subscription
+            }
+            crate::kernel::container::ClockChangeEnrollment::Ready(_) => {
+                panic!("unchanged clock must subscribe")
+            }
+        };
+        clock.set_realtime_offset_ns(30 * 1_000_000_000);
+        let forward = wait.plan();
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        assert!(forward.deadline < original.deadline);
+
+        let callback_count = Arc::clone(&callbacks);
+        let _backward = match clock.subscribe_clock_change(
+            forward.clock_generation,
+            Arc::new(move || {
+                callback_count.fetch_add(1, Ordering::SeqCst);
+            }),
+        ) {
+            crate::kernel::container::ClockChangeEnrollment::Subscribed(subscription) => {
+                subscription
+            }
+            crate::kernel::container::ClockChangeEnrollment::Ready(_) => {
+                panic!("replanned clock must subscribe")
+            }
+        };
+        clock.set_realtime_offset_ns(-30 * 1_000_000_000);
+        let backward = wait.plan();
+        assert_eq!(callbacks.load(Ordering::SeqCst), 3);
+        assert!(backward.deadline > original.deadline);
     }
 }

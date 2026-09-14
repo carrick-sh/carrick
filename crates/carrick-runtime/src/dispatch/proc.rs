@@ -609,6 +609,11 @@ pub(super) struct ProcState {
     /// Path of the currently-running executable, surfaced via
     /// `/proc/self/exe`, `/proc/self/cmdline`, `/proc/self/comm`, etc.
     pub executable_path: String,
+    /// Exact file object selected for the current image. A pathname alone is
+    /// insufficient: unlink, rename, and replacement must not retarget
+    /// `/proc/self/exe`. Cloning ProcState across fork shares the backing while
+    /// copying its namespace-facing display state.
+    pub current_executable: Option<super::executable_authority::CurrentExecutable>,
     /// Current guest argv, surfaced as NUL-separated bytes through
     /// `/proc/self/cmdline`.
     pub argv: Vec<String>,
@@ -783,6 +788,7 @@ impl ProcState {
     pub(super) fn new() -> Self {
         Self {
             executable_path: "/proc/self/exe".to_owned(),
+            current_executable: None,
             argv: vec!["/proc/self/exe".to_owned()],
             binfmt_interpreted: false,
             native_x86_64: false,
@@ -4473,7 +4479,11 @@ impl<'a> ProcView<'a> {
                 let fd = dirfd as i32;
                 let p = this.open_file(fd).and_then(|f| {
                     let d = f.description.read()?;
-                    d.open_path().map(|s| s.to_string())
+                    if d.retained_exec_source().is_some() {
+                        Some(format!("/proc/self/fd/{fd}"))
+                    } else {
+                        d.open_path().map(|s| s.to_string())
+                    }
                 });
                 match p {
                     Some(p) => p,

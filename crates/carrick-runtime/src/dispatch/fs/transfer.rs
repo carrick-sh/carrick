@@ -90,6 +90,7 @@ impl<'a> FsView<'a> {
         match &*open {
             OpenDescription::File { .. }
             | OpenDescription::SyntheticFile { .. }
+            | OpenDescription::ProcExecutable { .. }
             | OpenDescription::HostFile { .. }
             | OpenDescription::SyntheticDevice { .. }
             | OpenDescription::VirtualConsole { .. } => {
@@ -1543,6 +1544,9 @@ impl<'a> FsView<'a> {
                             offset: current, ..
                         }
                         | OpenDescription::SyntheticFile {
+                            offset: current, ..
+                        }
+                        | OpenDescription::ProcExecutable {
                             offset: current, ..
                         } => *current = offset,
                         // Same contract as `sendfile`: HostFile reads via `pread`

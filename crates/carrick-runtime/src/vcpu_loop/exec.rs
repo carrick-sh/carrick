@@ -334,6 +334,7 @@ pub(super) struct PreparedExecve {
     path: String,
     proc_argv: Vec<String>,
     proc_env: Vec<Vec<u8>>,
+    executable_source: crate::dispatch::executable_authority::ExecSource,
     command_line: String,
     inventory_failure_injection: Option<HvpatchExecInventoryFailureInjection>,
     hvpatch_mm_reservation: Option<crate::hvpatch::ExecMmReservation>,
@@ -1311,8 +1312,15 @@ where
         let command_line = proc_argv.join(" ");
         let proc_env = env.clone();
         let requires_syscall_traps = kernel.dispatcher.requires_syscall_traps();
-        let image = match kernel.dispatcher.with_kernel_resources(kernel_context, || {
-            load_execve_image(&kernel.dispatcher, &path, argv, env, requires_syscall_traps)
+        let loaded = match kernel.dispatcher.with_kernel_resources(kernel_context, || {
+            load_execve_image(
+                &kernel.dispatcher,
+                kernel_context,
+                &path,
+                argv,
+                env,
+                requires_syscall_traps,
+            )
         }) {
             Ok(image) => image,
             Err(errno) => {
@@ -1321,6 +1329,10 @@ where
                     .map(ExecvePreparation::Complete);
             }
         };
+        let crate::runtime::exec::LoadedExecImage {
+            image,
+            source: executable_source,
+        } = loaded;
         let inventory_failure_injection = kernel
             .hvpatch_process
             .as_ref()
@@ -1388,6 +1400,7 @@ where
             path,
             proc_argv,
             proc_env,
+            executable_source,
             command_line,
             inventory_failure_injection,
             hvpatch_mm_reservation,
@@ -1415,6 +1428,7 @@ where
             path,
             proc_argv,
             proc_env,
+            executable_source,
             command_line: cmdline,
             inventory_failure_injection,
             mut hvpatch_mm_reservation,
@@ -1695,9 +1709,12 @@ where
         if should_update_host_process_title(kernel.hvpatch_process.is_some()) {
             crate::dispatch::set_host_process_name(cmdline.as_bytes());
         }
-        kernel
-            .dispatcher
-            .set_executable_identity(path.clone(), proc_argv, proc_env);
+        kernel.dispatcher.set_executable_identity_with_source(
+            path.clone(),
+            proc_argv,
+            proc_env,
+            executable_source,
+        );
         kernel
             .dispatcher
             .reset_signal_handlers_on_execve(exec_kernel_context);
@@ -5173,7 +5190,7 @@ pub(crate) mod tests {
                 .expect("second exec delayed owner");
             case.job.phase = HvpatchProductionPhase::ExecSiblingDrain {
                 context: first_successor.retain_exact(),
-                owner,
+                owner: Box::new(owner),
             };
             case.engine = second_engine;
 
@@ -5854,7 +5871,7 @@ pub(crate) mod tests {
             .expect("test sibling drain must transfer authenticated ownership");
         let phase = HvpatchProductionPhase::ExecSiblingDrain {
             context: context.retain_exact(),
-            owner,
+            owner: Box::new(owner),
         };
         let scheduler = kernel
             .hvpatch_runtime

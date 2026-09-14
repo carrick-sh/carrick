@@ -851,6 +851,23 @@ impl<'a> MemView<'a> {
                 }
                 shared_file_bus_offset(contents.len() as u64, offset, length_u64, page_size)
             }
+            OpenDescription::ProcExecutable { executable, .. } => {
+                let source = executable.source();
+                let file_len = source.len().map_err(|error| {
+                    error
+                        .raw_os_error()
+                        .map(crate::host_to_linux_errno)
+                        .unwrap_or(linux_errno::EIO)
+                })?;
+                let contents = source.read_range(offset_usize, length).map_err(|error| {
+                    error
+                        .raw_os_error()
+                        .map(crate::host_to_linux_errno)
+                        .unwrap_or(linux_errno::EIO)
+                })?;
+                bytes[..contents.len()].copy_from_slice(&contents);
+                shared_file_bus_offset(file_len as u64, offset, length_u64, page_size)
+            }
             OpenDescription::InMemoryFile { contents, .. } => {
                 let data = contents.read();
                 let read_bytes = data.read_range(offset_usize, length);

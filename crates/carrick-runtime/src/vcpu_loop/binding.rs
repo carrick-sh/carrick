@@ -231,7 +231,7 @@ pub(super) enum HvpatchProductionPhase {
     },
     ExecSiblingDrain {
         context: crate::kernel::KernelContext,
-        owner: exec::PreparedExecveDrain,
+        owner: Box<exec::PreparedExecveDrain>,
     },
     TerminalProcessDrain {
         terminal: PersistentTerminal,
@@ -621,7 +621,10 @@ where
                     };
                     self.finish_exec_suffix(engine, control, finished)
                 } else {
-                    self.phase = HvpatchProductionPhase::ExecSiblingDrain { context, owner };
+                    self.phase = HvpatchProductionPhase::ExecSiblingDrain {
+                        context,
+                        owner: Box::new(owner),
+                    };
                     Ok(self.suspend(
                         HvpatchLoopSuspension::ExecSiblingDrain,
                         executor::ExecutorExit::Blocked(
@@ -2853,7 +2856,10 @@ where
                             };
                             return self.finish_exec_suffix(engine, control, finished);
                         }
-                        self.phase = HvpatchProductionPhase::ExecSiblingDrain { context, owner };
+                        self.phase = HvpatchProductionPhase::ExecSiblingDrain {
+                            context,
+                            owner: Box::new(owner),
+                        };
                         self.suspend(
                             HvpatchLoopSuspension::ExecSiblingDrain,
                             executor::ExecutorExit::Blocked(
@@ -3680,7 +3686,7 @@ where
                     &self.kernel,
                     engine,
                     &self.completion,
-                    owner,
+                    *owner,
                 ) {
                     Ok(finished) => finished,
                     Err(failure) => {
@@ -4129,7 +4135,7 @@ where
         let phase = std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident);
         match phase {
             HvpatchProductionPhase::ExecSiblingDrain { context, owner } => {
-                let (terminal_context, handoff) = owner.into_terminal_authority();
+                let (terminal_context, handoff) = (*owner).into_terminal_authority();
                 drop(context);
                 Some(PendingExecTerminal {
                     context: terminal_context,

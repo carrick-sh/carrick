@@ -204,6 +204,9 @@ impl<'a> MemView<'a> {
                             OpenDescription::File { path, .. }
                             | OpenDescription::SyntheticFile { path, .. }
                             | OpenDescription::InMemoryFile { path, .. } => path.clone(),
+                            OpenDescription::ProcExecutable { executable, .. } => {
+                                executable.display_path()
+                            }
                             OpenDescription::HostFile { metadata, .. } => {
                                 metadata.path.to_string_lossy().into_owned()
                             }
@@ -1663,6 +1666,32 @@ impl<'a> MemView<'a> {
                                 page_size,
                             )
                         {
+                            bus_fault_offset = Some(bus_offset);
+                        }
+                        if offset_usize < contents.len() {
+                            let available = &contents[offset_usize..];
+                            let copy_len = available.len().min(length_usize);
+                            bytes[..copy_len].copy_from_slice(&available[..copy_len]);
+                        }
+                    }
+                    OpenDescription::ProcExecutable { executable, .. } => {
+                        let contents = match executable.source().read_all() {
+                            Ok(contents) => contents,
+                            Err(_) => {
+                                return Ok(request.refused(
+                                    MmapRefusal::Internal(
+                                        "executable read failed during mmap populate",
+                                    ),
+                                    linux_errno::EIO,
+                                ));
+                            }
+                        };
+                        if let Some(bus_offset) = shared_file_bus_offset(
+                            contents.len() as u64,
+                            offset,
+                            length,
+                            page_size,
+                        ) {
                             bus_fault_offset = Some(bus_offset);
                         }
                         if offset_usize < contents.len() {

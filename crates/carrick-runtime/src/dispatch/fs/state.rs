@@ -139,6 +139,12 @@ pub(in crate::dispatch) struct FsState {
     /// into the overlay/rootfs state through ~50 call sites today.
     pub rootfs_vfs: std::sync::Arc<crate::vfs::RootFsVfs>,
 
+    /// Live executable dentries keyed by exact backend object identity. Shared
+    /// by forked dispatchers so a rename/unlink by one task updates every
+    /// `/proc/<pid>/exe` holder of that object.
+    pub(in crate::dispatch) executable_authorities:
+        std::sync::Arc<super::super::executable_authority::ExecutableAuthorityRegistry>,
+
     /// Shared pseudo-terminal table, also cloned into the /dev (ptmx) and
     /// /dev/pts mounts. The ioctl (TIOCSPTLCK) and close (free-on-master-
     /// close) paths reach it through the dispatcher.
@@ -544,6 +550,9 @@ impl FsState {
                 m
             }),
             rootfs_vfs: std::sync::Arc::new(crate::vfs::RootFsVfs::new()),
+            executable_authorities: std::sync::Arc::new(
+                super::super::executable_authority::ExecutableAuthorityRegistry::default(),
+            ),
             pty_table,
             inotify_registry: crate::inotify::InotifyRegistry::default(),
             fanotify_registry: crate::fanotify::FanotifyRegistry::default(),
@@ -558,6 +567,7 @@ impl FsState {
         Self {
             vfs_mounts: std::sync::Arc::clone(&self.vfs_mounts),
             rootfs_vfs: std::sync::Arc::clone(&self.rootfs_vfs),
+            executable_authorities: std::sync::Arc::clone(&self.executable_authorities),
             pty_table: std::sync::Arc::clone(&self.pty_table),
             inotify_registry: self.inotify_registry.clone(),
             // Arc clone: the SAME table, not a copy. See the field docs.

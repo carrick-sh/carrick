@@ -1134,6 +1134,7 @@ impl<'a> FsView<'a> {
                 // only under multithreading, surfacing as 58 ERRORs in test_csv.
                 | OpenDescription::File { .. }
                 | OpenDescription::SyntheticFile { .. }
+                | OpenDescription::ProcExecutable { .. }
                 | OpenDescription::SyntheticDevice { .. }
         )
     }
@@ -1821,6 +1822,9 @@ impl<'a> FsView<'a> {
                     OpenDescription::SyntheticFile { .. } => {
                         return Ok(DispatchOutcome::errno(LINUX_EROFS));
                     }
+                    OpenDescription::ProcExecutable { .. } => {
+                        return Ok(DispatchOutcome::errno(LINUX_EROFS));
+                    }
                     OpenDescription::InMemoryFile {
                         path,
                         contents,
@@ -1993,6 +1997,9 @@ impl<'a> FsView<'a> {
                     OpenDescription::SyntheticFile { .. } => {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
+                    OpenDescription::ProcExecutable { .. } => {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    }
                     OpenDescription::Directory { .. } => {
                         return Ok(DispatchOutcome::errno(LINUX_EISDIR));
                     }
@@ -2151,6 +2158,14 @@ impl<'a> FsView<'a> {
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     },
                     OpenDescription::SyntheticFile { contents, .. } => contents.len() as u64,
+                    OpenDescription::ProcExecutable { executable, .. } => {
+                        match executable.source().read_all() {
+                            Ok(contents) => contents.len() as u64,
+                            Err(_) => {
+                                return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
+                            }
+                        }
+                    }
                     // cachestat needs a page-cache-backed fd (regular file /
                     // shmem); anything else has no cache → EBADF.
                     _ => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
@@ -2569,6 +2584,15 @@ impl SyscallDispatcher {
     #[inline]
     pub(crate) fn stamp_new_node_owner(&self, path: &str, node_mode: u32) {
         self.fs_view().stamp_new_node_owner(path, node_mode);
+    }
+
+    #[inline]
+    pub(crate) fn check_exec_source(
+        &self,
+        path: &str,
+        source: &crate::dispatch::executable_authority::ExecSource,
+    ) -> Result<(), LinuxErrno> {
+        self.fs_view().check_exec_source(path, source)
     }
 
     #[inline]

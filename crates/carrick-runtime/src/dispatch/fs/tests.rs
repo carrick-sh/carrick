@@ -5,6 +5,149 @@ use crate::dispatch::ThreadCtx;
 use crate::dispatch::dispatcher::FsCrossSubsystem;
 use std::sync::Arc;
 
+#[test]
+fn proc_exe_open_fd_tracks_dentry_and_reads_retained_live_object() {
+    let backend = crate::fs_backend::MemoryBackend::new();
+    backend
+        .set_file_contents("/image", b"old-image".to_vec())
+        .unwrap();
+    backend.set_mode("/image", 0o755).unwrap();
+    backend
+        .set_file_contents("/other", b"other".to_vec())
+        .unwrap();
+    backend.set_mode("/other", 0o755).unwrap();
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend.clone()));
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let source = dispatcher.acquire_exec_source(&context, "/image").unwrap();
+    dispatcher.set_executable_identity_with_source(
+        "/image",
+        vec!["image".into()],
+        Vec::new(),
+        source,
+    );
+
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x2000]);
+    memory.write_bytes(0x4000, b"/proc/self/exe\0").unwrap();
+    let fd = match dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_O_RDONLY, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value,
+        other => panic!("open /proc/self/exe failed: {other:?}"),
+    };
+
+    let fd_link = format!("/proc/self/fd/{fd}\0");
+    memory.write_bytes(0x4100, fd_link.as_bytes()).unwrap();
+    let readlink = |dispatcher: &mut SyscallDispatcher, memory: &mut LinearMemory| {
+        let outcome = dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    78,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4100, 0x4200, 128, 0, 0]),
+                ),
+                memory,
+                &reporter,
+            )
+            .unwrap();
+        let DispatchOutcome::Returned { value } = outcome else {
+            panic!("readlink failed: {outcome:?}");
+        };
+        memory.read_bytes(0x4200, value as usize).unwrap()
+    };
+    assert_eq!(readlink(&mut dispatcher, &mut memory), b"/image");
+
+    memory.write_bytes(0x4300, b"/image\0").unwrap();
+    memory.write_bytes(0x4400, b"/renamed\0").unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    38,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4300, LINUX_AT_FDCWD, 0x4400, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(readlink(&mut dispatcher, &mut memory), b"/renamed");
+
+    let other = dispatcher.acquire_exec_source(&context, "/other").unwrap();
+    dispatcher.set_executable_identity_with_source(
+        "/other",
+        vec!["other".into()],
+        Vec::new(),
+        other,
+    );
+    let writer = match dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([LINUX_AT_FDCWD, 0x4400, LINUX_O_WRONLY, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value,
+        other => panic!("open renamed executable for mutation failed: {other:?}"),
+    };
+    memory.write_bytes(0x4600, b"updated-image").unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(64, SyscallArgs::from([writer as u64, 0x4600, 13, 0, 0, 0]),),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 13 }
+    );
+    let read = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4500, 64, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(read, DispatchOutcome::Returned { value: 13 });
+    assert_eq!(memory.read_bytes(0x4500, 13).unwrap(), b"updated-image");
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(35, SyscallArgs::from([LINUX_AT_FDCWD, 0x4400, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        readlink(&mut dispatcher, &mut memory),
+        b"/renamed (deleted)"
+    );
+}
+
 fn two_namespaced_roots_for_async_owner() -> (
     Arc<crate::kernel::Kernel>,
     crate::kernel::KernelContext,

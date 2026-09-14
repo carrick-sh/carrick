@@ -1214,6 +1214,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "mqueueworkerprogress": {
+    "class": "conformance",
+    "runner": "generic",
+    "excluded": false
+  },
   "mremapfixedshared": {
     "class": "conformance",
     "excluded": false,
@@ -1728,6 +1733,11 @@
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
+  },
+  "procexeidentity": {
+    "class": "conformance",
+    "runner": "generic",
+    "excluded": false
   },
   "procid": {
     "class": "conformance",
