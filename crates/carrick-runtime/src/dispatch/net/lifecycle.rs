@@ -1866,6 +1866,7 @@ impl<'a> NetView<'a> {
             } else {
                 None
             };
+            let mut materialized_bind: Option<(std::net::SocketAddr, PortProtocol)> = None;
             if family == LINUX_AF_INET
                 && let Some(protocol) = bind_protocol
                 && let Some(requested) = host_sockaddr_to_socket_addr(&host_addr)
@@ -1878,6 +1879,9 @@ impl<'a> NetView<'a> {
                     Ok(BindTarget::Host(host)) => {
                         if let Some(mapped) = socket_addr_to_host_sockaddr(host.0) {
                             host_addr = mapped;
+                            if logical_inzone_bind.is_none() {
+                                materialized_bind = Some((requested, protocol));
+                            }
                         }
                     }
                     Ok(BindTarget::Unchanged) => {}
@@ -2016,6 +2020,12 @@ impl<'a> NetView<'a> {
                     )
                 };
                 bind_result = retry.host_syscall_errno();
+                if bind_result.is_ok()
+                    && logical_inzone_bind.is_none()
+                    && materialized_bind.is_none()
+                {
+                    materialized_bind = Some((requested, protocol));
+                }
             }
             if let Err(errno) = bind_result {
                 return Ok(DispatchOutcome::errno(errno));
@@ -2052,6 +2062,23 @@ impl<'a> NetView<'a> {
                 && let Some(protocol) = bind_protocol
                 && let Some(host_local) = host_socket_addr(host_fd_raw, family, false)
             {
+                let _ = this.network.provider.record_socket_addresses(
+                    this.network.spec.namespace_id.as_ref(),
+                    crate::network::SocketKey::for_host_fd(host_fd_raw),
+                    Some(GuestSocketAddr(guest_local)),
+                    Some(HostSocketAddr(host_local)),
+                    None,
+                    protocol,
+                );
+            }
+            if let Some((guest_local, protocol)) = materialized_bind
+                && let Some(host_local) = host_socket_addr(host_fd_raw, family, false)
+            {
+                let guest_local = if guest_local.port() == 0 {
+                    std::net::SocketAddr::new(guest_local.ip(), host_local.port())
+                } else {
+                    guest_local
+                };
                 let _ = this.network.provider.record_socket_addresses(
                     this.network.spec.namespace_id.as_ref(),
                     crate::network::SocketKey::for_host_fd(host_fd_raw),
