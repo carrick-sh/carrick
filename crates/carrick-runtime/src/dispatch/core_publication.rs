@@ -150,8 +150,9 @@ impl SyscallDispatcher {
         let cwd = context.resources().fs_context().cwd();
         drop(mem);
         drop(proc);
-        let rlimit_core = self
-            .effective_resource_limit(crate::linux_abi::LINUX_RLIMIT_CORE)
+        let rlimit_core = context
+            .task()
+            .rlimit(carrick_abi::LinuxResource::Core)
             .rlim_cur;
         Ok(CoreProcessSnapshot {
             identity: crate::core_dump::ProcessIdentity {
@@ -676,6 +677,41 @@ mod tests {
     use crate::dispatch::blocks_512;
 
     use super::*;
+
+    #[test]
+    fn core_snapshot_reads_rlimit_from_supplied_task_outside_dispatch_scope() {
+        let (_process, supplied) = crate::hvpatch::process_context_for_tests(41_202);
+        supplied
+            .task()
+            .replace_rlimit(carrick_abi::LinuxResource::Core, |current| {
+                Ok::<_, ()>(carrick_abi::LinuxRlimit::new(0, current.rlim_max))
+            })
+            .expect("lower supplied task core limit");
+
+        let (_other_process, other) = crate::hvpatch::process_context_for_tests(41_203);
+        other
+            .task()
+            .replace_rlimit(carrick_abi::LinuxResource::Core, |current| {
+                Ok::<_, ()>(carrick_abi::LinuxRlimit::new(123, current.rlim_max))
+            })
+            .expect("set conflicting dispatch-scope core limit");
+
+        let dispatcher = SyscallDispatcher::new();
+        let outside = dispatcher
+            .core_process_snapshot(&supplied)
+            .expect("snapshot outside dispatch scope");
+        assert_eq!(outside.rlimit_core, 0, "supplied task owns the limit");
+
+        let conflicting = crate::dispatch::resources::with_captured_resources(&other, || {
+            dispatcher
+                .core_process_snapshot(&supplied)
+                .expect("snapshot with conflicting dispatch scope")
+        });
+        assert_eq!(
+            conflicting.rlimit_core, 0,
+            "an unrelated active dispatch scope must not override the supplied task"
+        );
+    }
 
     #[test]
     fn hvpatch_root_binding_rekeys_prepared_dispatch_mm_to_committed_kernel_mm() {
