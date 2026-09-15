@@ -442,15 +442,36 @@ fn fd_authority_diagnostic(authority: &WaitFdAuthority) -> String {
         WaitFdAuthority::Empty => "slots=empty".to_owned(),
         WaitFdAuthority::Missing => "slots=missing".to_owned(),
         WaitFdAuthority::Logical {
-            strict,
+            registrations,
+            unclassified,
             watched,
-            interest,
         } => {
-            format!(
-                "slots=[{}] watched=[{}] interest={interest:#x}",
-                render(strict),
-                render(watched)
-            )
+            let registered = registrations
+                .iter()
+                .map(|registration| {
+                    let slot = registration.slot();
+                    format!(
+                        "{}@{}:{}",
+                        slot.number().raw(),
+                        slot.description().raw(),
+                        match registration.source() {
+                            crate::dispatch::wait_source::WaitSource::Host { .. } => "host",
+                            crate::dispatch::wait_source::WaitSource::Description { .. } =>
+                                "description",
+                            crate::dispatch::wait_source::WaitSource::Dual { .. } => "dual",
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let unclassified = render(
+                &unclassified
+                    .iter()
+                    .map(|slot| slot.slot())
+                    .collect::<Vec<_>>(),
+            );
+            let watched = render(&watched.iter().map(|slot| slot.slot()).collect::<Vec<_>>());
+            format!("slots=[{registered}] unclassified=[{unclassified}] watched=[{watched}]")
         }
         WaitFdAuthority::Internal(_) => "slots=internal".to_owned(),
     }
@@ -996,15 +1017,9 @@ impl BlockedContinuation {
         let file_table = Arc::clone(&authority.file_table);
         let exact_slot_authorities = |fds: &WaitFds| match fds.authority() {
             WaitFdAuthority::Empty if fds.is_empty() => Ok(WaitFdAuthority::Empty),
-            WaitFdAuthority::Logical {
-                strict,
-                watched,
-                interest,
-            } if !strict.is_empty() => Ok(WaitFdAuthority::Logical {
-                strict: strict.clone(),
-                watched: watched.clone(),
-                interest: *interest,
-            }),
+            authority @ WaitFdAuthority::Logical { .. } if authority.has_strict_slots() => {
+                Ok(authority.clone())
+            }
             WaitFdAuthority::Internal(authority) => Ok(WaitFdAuthority::Internal(*authority)),
             WaitFdAuthority::Empty | WaitFdAuthority::Missing | WaitFdAuthority::Logical { .. } => {
                 Err(ContinuationBuildError::FdPinFailed)
@@ -1870,21 +1885,24 @@ impl BlockedContinuation {
                 fd_authority,
                 ..
             } => match fd_authority {
-                WaitFdAuthority::Logical { strict, .. } => strict
-                    .iter()
-                    .all(|authority| file_table.validate_slot_authority(*authority)),
+                WaitFdAuthority::Logical { .. } => fd_authority
+                    .strict_slots()
+                    .into_iter()
+                    .all(|authority| file_table.validate_slot_authority(authority)),
                 WaitFdAuthority::Empty | WaitFdAuthority::Internal(_) => true,
                 WaitFdAuthority::Missing => false,
             },
             ContinuationDetail::FdWait(wait) => wait.lock().as_ref().is_some_and(|wait| match wait
                 .authority()
             {
-                WaitFdAuthority::Logical { strict, .. } => strict.iter().all(|authority| {
-                    self.state()
-                        .authority
-                        .file_table
-                        .validate_slot_authority(*authority)
-                }),
+                authority @ WaitFdAuthority::Logical { .. } => {
+                    authority.strict_slots().into_iter().all(|slot| {
+                        self.state()
+                            .authority
+                            .file_table
+                            .validate_slot_authority(slot)
+                    })
+                }
                 WaitFdAuthority::Empty | WaitFdAuthority::Internal(_) => true,
                 WaitFdAuthority::Missing => false,
             }),
