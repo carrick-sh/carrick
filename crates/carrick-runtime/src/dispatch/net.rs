@@ -2842,6 +2842,14 @@ impl<'a> NetView<'a> {
             let mut revents: Vec<i16> = vec![0; owners.len()];
             let all_host: Option<Vec<HostPollTarget>> = host_map.iter().copied().collect();
 
+            let is_select_ready = |req_mask: i16, rev: i16| -> bool {
+                ((req_mask & 0x01) != 0
+                    && (rev & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0)
+                    || ((req_mask & 0x02) != 0
+                        && (rev & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP)) != 0)
+                    || ((req_mask & 0x04) != 0 && (rev & (libc::POLLPRI | libc::POLLERR)) != 0)
+            };
+
             if owners.is_empty() {
                 if timeout_ms == 0 && sigmask_addr == 0 {
                     return Ok(DispatchOutcome::Returned { value: 0 });
@@ -2893,7 +2901,27 @@ impl<'a> NetView<'a> {
                 if let Err(errno) = n.host_syscall_errno() {
                     return Ok(DispatchOutcome::errno(errno));
                 }
-                if n == 0 && timeout_ms != 0 {
+                let mut any = false;
+                for (i, (slot, p)) in revents.iter_mut().zip(pollfds.iter()).enumerate() {
+                    // A readiness pipe only says "something changed"; the
+                    // guest-visible events come from the description itself.
+                    let rev = if host_fds[i].readiness_pipe {
+                        if p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                            this.poll_ready_events(owners[i].0, events_list[i])
+                        } else {
+                            0
+                        }
+                    } else if host_fds[i].sample_description {
+                        this.poll_ready_events(owners[i].0, events_list[i])
+                    } else {
+                        p.revents
+                    };
+                    *slot = rev;
+                    if is_select_ready(owners[i].1, rev) {
+                        any = true;
+                    }
+                }
+                if !any && timeout_ms != 0 {
                     // Nothing ready yet, caller wants to block. Leave the guest
                     // fd-sets UNTOUCHED (select's bitmaps are input==output): a
                     // Ready re-dispatch must re-read the original input, and an
@@ -2932,28 +2960,13 @@ impl<'a> NetView<'a> {
                         completion: FdWaitCompletion::Select { clear_on_timeout },
                     });
                 }
-                for (i, (slot, p)) in revents.iter_mut().zip(pollfds.iter()).enumerate() {
-                    // A readiness pipe only says "something changed"; the
-                    // guest-visible events come from the description itself.
-                    *slot = if host_fds[i].readiness_pipe {
-                        if p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-                            this.poll_ready_events(owners[i].0, events_list[i])
-                        } else {
-                            0
-                        }
-                    } else if host_fds[i].sample_description {
-                        this.poll_ready_events(owners[i].0, events_list[i])
-                    } else {
-                        p.revents
-                    };
-                }
             } else {
                 // Mixed / synthetic fds: evaluate current readiness without holding the wait loop synchronously.
                 let mut any = false;
-                for (i, (fd, _)) in owners.iter().enumerate() {
+                for (i, (fd, req_mask)) in owners.iter().enumerate() {
                     let rev = this.poll_ready_events(*fd, events_list[i]);
                     revents[i] = rev;
-                    if rev != 0 {
+                    if is_select_ready(*req_mask, rev) {
                         any = true;
                     }
                 }

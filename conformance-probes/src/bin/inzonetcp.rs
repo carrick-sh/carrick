@@ -33,7 +33,12 @@
 //!       address reflection, echo transfer, IPV6_V6ONLY rejection, and [::1] bind refusal;
 //!   20. `remote_shutdown_receives_trailing_data`: server writes N bytes then shutdown(SHUT_WR)
 //!       (and second variant: close), client with unsent trailing data reads in chunks until EOF,
-//!       reporting bytes, recv rc/errno, poll revents, SO_ERROR, and trailing writes.
+//!       reporting bytes, recv rc/errno, poll revents, SO_ERROR, and trailing writes;
+//!   21. `pselect_epoll_handshake`: helper thread calls pselect on [listener, ctrl]
+//!       with 5s bound, wakes on connect, accepts, receives 1507 bytes, and sends
+//!       multi-segment response (1000 then 507 bytes); non-blocking client connects,
+//!       sends 1507 bytes, and drives epoll_wait on EPOLLIN (both level-triggered
+//!       and edge-triggered EPOLLET variants) reading in rounds with a 5s cap.
 //!
 //! Output is deterministic `key=value` lines only. Every wait is bounded by a
 //! `poll` with a 5 s cap so a lost wake is a false line, never a hang.
@@ -1730,6 +1735,305 @@ unsafe fn run_remote_shutdown_trailing_data_case(
     }
 }
 
+struct PselectEpollHandshakeResult {
+    server_select_rc: i32,
+    server_select_errno: i32,
+    server_accept_ok: bool,
+    server_recv_bytes: i64,
+    server_sent_bytes: i64,
+    client_connect_poll_rc: i32,
+    client_connect_poll_errno: i32,
+    client_connect_so_error: i32,
+    client_sent_bytes: i64,
+    round1_epoll_rc: i32,
+    round1_epoll_revents: String,
+    round1_bytes_read: i64,
+    round1_completed: bool,
+    round2_epoll_rc: i32,
+    round2_epoll_revents: String,
+    round2_bytes_read: i64,
+    round2_completed: bool,
+    completed: bool,
+}
+
+unsafe fn run_pselect_epoll_handshake_case(
+    edge_triggered: bool,
+) -> PselectEpollHandshakeResult {
+    let (l_storage, l_len) = EndpointHelper::loopback_storage_v4(0);
+    let listener = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+    set_nonblock(listener);
+    let l_bind_rc = if listener >= 0 {
+        libc::bind(
+            listener,
+            &l_storage as *const _ as *const libc::sockaddr,
+            l_len,
+        )
+    } else {
+        -1
+    };
+    let listen_rc = if l_bind_rc == 0 {
+        libc::listen(listener, 16)
+    } else {
+        -1
+    };
+    let (_, _, l_bound, _) = if listen_rc == 0 {
+        EndpointHelper::getsockname(listener)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let listen_port_be = EndpointHelper::get_port_be(&l_bound);
+
+    let mut ctrl_fds = [-1i32; 2];
+    let _ = libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, ctrl_fds.as_mut_ptr());
+    let ctrl_sock = ctrl_fds[0];
+
+    let server_thread = std::thread::spawn(move || {
+        let mut rfds: libc::fd_set = std::mem::zeroed();
+        libc::FD_ZERO(&mut rfds);
+        if listener >= 0 {
+            libc::FD_SET(listener, &mut rfds);
+        }
+        if ctrl_sock >= 0 {
+            libc::FD_SET(ctrl_sock, &mut rfds);
+        }
+        let nfds = std::cmp::max(listener, ctrl_sock) + 1;
+        let ts = libc::timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        let sel_rc = libc::pselect(
+            nfds,
+            &mut rfds,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &ts,
+            std::ptr::null(),
+        );
+        let sel_err = if sel_rc < 0 { errno() } else { 0 };
+
+        let mut accept_ok = false;
+        let mut s_recv_bytes = 0i64;
+        let mut s_sent_bytes = 0i64;
+
+        if sel_rc > 0 && listener >= 0 && libc::FD_ISSET(listener, &rfds) {
+            let accepted = libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut());
+            if accepted >= 0 {
+                accept_ok = true;
+                set_nonblock(accepted);
+
+                let mut client_msg = [0u8; 1507];
+                let mut total_in = 0usize;
+                while total_in < 1507 {
+                    let prc = poll_readable(accepted);
+                    if prc <= 0 {
+                        break;
+                    }
+                    let n = libc::recv(
+                        accepted,
+                        client_msg[total_in..].as_mut_ptr().cast(),
+                        1507 - total_in,
+                        0,
+                    );
+                    if n <= 0 {
+                        break;
+                    }
+                    total_in += n as usize;
+                }
+                s_recv_bytes = total_in as i64;
+
+                if total_in == 1507 {
+                    let seg1 = [0x41u8; 1000];
+                    let n1 = libc::send(accepted, seg1.as_ptr().cast(), 1000, libc::MSG_NOSIGNAL);
+                    if n1 == 1000 {
+                        s_sent_bytes += 1000;
+                        let prc = poll_readable(accepted);
+                        if prc > 0 {
+                            let mut ack = 0u8;
+                            let ar = libc::recv(accepted, &mut ack as *mut u8 as *mut _, 1, 0);
+                            if ar == 1 {
+                                let seg2 = [0x42u8; 507];
+                                let n2 = libc::send(
+                                    accepted,
+                                    seg2.as_ptr().cast(),
+                                    507,
+                                    libc::MSG_NOSIGNAL,
+                                );
+                                if n2 == 507 {
+                                    s_sent_bytes += 507;
+                                }
+                            }
+                        }
+                    }
+                }
+                libc::close(accepted);
+            }
+        }
+        if listener >= 0 {
+            libc::close(listener);
+        }
+        if ctrl_sock >= 0 {
+            libc::close(ctrl_sock);
+        }
+        (sel_rc, sel_err, accept_ok, s_recv_bytes, s_sent_bytes)
+    });
+
+    let client = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+    if client >= 0 {
+        set_nonblock(client);
+    }
+    let (target, target_len) = EndpointHelper::loopback_storage_v4(listen_port_be);
+    let connect_rc = if client >= 0 && listen_port_be != 0 {
+        libc::connect(
+            client,
+            &target as *const _ as *const libc::sockaddr,
+            target_len,
+        )
+    } else {
+        -1
+    };
+    let _ = if connect_rc < 0 { errno() } else { 0 };
+
+    let epfd = libc::epoll_create1(0);
+    let mut ev_connect = libc::epoll_event {
+        events: libc::EPOLLOUT as u32,
+        u64: 1,
+    };
+    if epfd >= 0 && client >= 0 {
+        libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, client, &mut ev_connect);
+    }
+    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];
+    let client_connect_poll_rc = if epfd >= 0 {
+        libc::epoll_wait(epfd, events.as_mut_ptr(), 1, 5000)
+    } else {
+        -1
+    };
+    let client_connect_poll_errno = if client_connect_poll_rc < 0 { errno() } else { 0 };
+
+    let mut client_connect_so_error = 0i32;
+    let mut so_err_len = std::mem::size_of::<i32>() as libc::socklen_t;
+    if client >= 0 {
+        libc::getsockopt(
+            client,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut client_connect_so_error as *mut _ as *mut libc::c_void,
+            &mut so_err_len,
+        );
+    }
+
+    let mut client_sent_bytes = 0i64;
+    if client >= 0
+        && client_connect_poll_rc > 0
+        && (events[0].events & libc::EPOLLOUT as u32 != 0)
+        && client_connect_so_error == 0
+    {
+        let msg = [0x33u8; 1507];
+        let sn = libc::send(client, msg.as_ptr().cast(), 1507, libc::MSG_NOSIGNAL);
+        if sn > 0 {
+            client_sent_bytes = sn as i64;
+        }
+    }
+
+    let in_events = libc::EPOLLIN as u32
+        | if edge_triggered {
+            libc::EPOLLET as u32
+        } else {
+            0
+        };
+    let mut in_ev = libc::epoll_event {
+        events: in_events,
+        u64: 1,
+    };
+    if epfd >= 0 && client >= 0 {
+        libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, client, &mut in_ev);
+    }
+
+    // Round 1
+    events[0] = libc::epoll_event { events: 0, u64: 0 };
+    let round1_epoll_rc = if epfd >= 0 {
+        libc::epoll_wait(epfd, events.as_mut_ptr(), 1, 5000)
+    } else {
+        -1
+    };
+    let round1_epoll_revents = if round1_epoll_rc > 0 {
+        format!("0x{:x}", events[0].events)
+    } else {
+        "0x0".to_string()
+    };
+    let mut round1_bytes_read = 0i64;
+    let mut total_read = 0i64;
+    if round1_epoll_rc > 0 && (events[0].events & libc::EPOLLIN as u32 != 0) && client >= 0 {
+        let mut buf = [0u8; 1000];
+        let rn = libc::recv(client, buf.as_mut_ptr().cast(), 1000, 0);
+        if rn > 0 {
+            round1_bytes_read = rn as i64;
+            total_read += round1_bytes_read;
+            let ack = b'K';
+            libc::send(client, &ack as *const u8 as *const _, 1, libc::MSG_NOSIGNAL);
+        }
+    }
+    let round1_completed = total_read == 1507;
+
+    // Round 2
+    events[0] = libc::epoll_event { events: 0, u64: 0 };
+    let r2_timeout = if round1_epoll_rc > 0 { 5000 } else { 0 };
+    let round2_epoll_rc = if epfd >= 0 {
+        libc::epoll_wait(epfd, events.as_mut_ptr(), 1, r2_timeout)
+    } else {
+        -1
+    };
+    let round2_epoll_revents = if round2_epoll_rc > 0 {
+        format!("0x{:x}", events[0].events)
+    } else {
+        "0x0".to_string()
+    };
+    let mut round2_bytes_read = 0i64;
+    if round2_epoll_rc > 0 && (events[0].events & libc::EPOLLIN as u32 != 0) && client >= 0 {
+        let mut buf = [0u8; 1000];
+        let rn = libc::recv(client, buf.as_mut_ptr().cast(), 1000, 0);
+        if rn > 0 {
+            round2_bytes_read = rn as i64;
+            total_read += round2_bytes_read;
+        }
+    }
+    let round2_completed = total_read == 1507;
+    let completed = total_read == 1507;
+
+    let (server_select_rc, server_select_errno, server_accept_ok, server_recv_bytes, server_sent_bytes) =
+        server_thread.join().unwrap_or((-1, 0, false, 0, 0));
+
+    if client >= 0 {
+        libc::close(client);
+    }
+    if epfd >= 0 {
+        libc::close(epfd);
+    }
+    if ctrl_fds[1] >= 0 {
+        libc::close(ctrl_fds[1]);
+    }
+
+    PselectEpollHandshakeResult {
+        server_select_rc,
+        server_select_errno,
+        server_accept_ok,
+        server_recv_bytes,
+        server_sent_bytes,
+        client_connect_poll_rc,
+        client_connect_poll_errno,
+        client_connect_so_error,
+        client_sent_bytes,
+        round1_epoll_rc,
+        round1_epoll_revents,
+        round1_bytes_read,
+        round1_completed,
+        round2_epoll_rc,
+        round2_epoll_revents,
+        round2_bytes_read,
+        round2_completed,
+        completed,
+    }
+}
+
 fn main() {
     unsafe {
         conformance_probes::install_ign(libc::SIGPIPE);
@@ -3037,6 +3341,50 @@ fn main() {
             close_client_so_error = res_close.client_so_error,
             close_client_post_eof_write_ret = res_close.client_post_eof_write_ret,
             close_client_post_eof_write_errno = res_close.client_post_eof_write_errno,
+        );
+
+        // ---------------------------------------------------------------------
+        // Case 20: pselect_epoll_handshake
+        // ---------------------------------------------------------------------
+        let res_hs_lt = run_pselect_epoll_handshake_case(false);
+        let res_hs_et = run_pselect_epoll_handshake_case(true);
+        report!(
+            hs_lt_server_select_rc = res_hs_lt.server_select_rc,
+            hs_lt_server_select_errno = res_hs_lt.server_select_errno,
+            hs_lt_server_accept_ok = res_hs_lt.server_accept_ok,
+            hs_lt_server_recv_bytes = res_hs_lt.server_recv_bytes,
+            hs_lt_server_sent_bytes = res_hs_lt.server_sent_bytes,
+            hs_lt_client_connect_poll_rc = res_hs_lt.client_connect_poll_rc,
+            hs_lt_client_connect_poll_errno = res_hs_lt.client_connect_poll_errno,
+            hs_lt_client_connect_so_error = res_hs_lt.client_connect_so_error,
+            hs_lt_client_sent_bytes = res_hs_lt.client_sent_bytes,
+            hs_lt_round1_epoll_rc = res_hs_lt.round1_epoll_rc,
+            hs_lt_round1_epoll_revents = res_hs_lt.round1_epoll_revents,
+            hs_lt_round1_bytes_read = res_hs_lt.round1_bytes_read,
+            hs_lt_round1_completed = res_hs_lt.round1_completed,
+            hs_lt_round2_epoll_rc = res_hs_lt.round2_epoll_rc,
+            hs_lt_round2_epoll_revents = res_hs_lt.round2_epoll_revents,
+            hs_lt_round2_bytes_read = res_hs_lt.round2_bytes_read,
+            hs_lt_round2_completed = res_hs_lt.round2_completed,
+            hs_lt_completed = res_hs_lt.completed,
+            hs_et_server_select_rc = res_hs_et.server_select_rc,
+            hs_et_server_select_errno = res_hs_et.server_select_errno,
+            hs_et_server_accept_ok = res_hs_et.server_accept_ok,
+            hs_et_server_recv_bytes = res_hs_et.server_recv_bytes,
+            hs_et_server_sent_bytes = res_hs_et.server_sent_bytes,
+            hs_et_client_connect_poll_rc = res_hs_et.client_connect_poll_rc,
+            hs_et_client_connect_poll_errno = res_hs_et.client_connect_poll_errno,
+            hs_et_client_connect_so_error = res_hs_et.client_connect_so_error,
+            hs_et_client_sent_bytes = res_hs_et.client_sent_bytes,
+            hs_et_round1_epoll_rc = res_hs_et.round1_epoll_rc,
+            hs_et_round1_epoll_revents = res_hs_et.round1_epoll_revents,
+            hs_et_round1_bytes_read = res_hs_et.round1_bytes_read,
+            hs_et_round1_completed = res_hs_et.round1_completed,
+            hs_et_round2_epoll_rc = res_hs_et.round2_epoll_rc,
+            hs_et_round2_epoll_revents = res_hs_et.round2_epoll_revents,
+            hs_et_round2_bytes_read = res_hs_et.round2_bytes_read,
+            hs_et_round2_completed = res_hs_et.round2_completed,
+            hs_et_completed = res_hs_et.completed,
         );
     }
 }

@@ -8720,4 +8720,78 @@ mod inzone_tcp {
         let read_back = g.mem.read_bytes(recv_scratch, 12).unwrap();
         assert_eq!(read_back, b"spliced-data");
     }
+
+    #[test]
+    fn pselect6_inzone_listener_with_pending_connection_returns_ready_instead_of_parking() {
+        const SYS_PSELECT6: u64 = 72;
+        let mut g = InZoneGuest::new();
+        let listen_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        g.make_sockaddr_in(ADDR_SCRATCH, 0, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
+            0
+        );
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKNAME,
+                [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+            ),
+            0
+        );
+        let (port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+
+        // Before connect, pselect6 with a timeout must park on WaitOnFds.
+        let readfds_addr = MEM_BASE + 0x540;
+        let mut fdset = [0u8; 128];
+        fdset[(listen_fd / 8) as usize] |= 1 << (listen_fd % 8);
+        g.mem.write_bytes(readfds_addr, &fdset).unwrap();
+
+        let timeout_addr = MEM_BASE + 0x500;
+        let timespec: [u64; 2] = [5, 0]; // 5 seconds
+        g.mem
+            .write_bytes(timeout_addr, zerocopy::IntoBytes::as_bytes(&timespec))
+            .unwrap();
+
+        let empty_outcome = g.call(
+            SYS_PSELECT6,
+            [listen_fd as u64 + 1, readfds_addr, 0, 0, timeout_addr, 0],
+        );
+        match empty_outcome {
+            DispatchOutcome::WaitOnFds { .. } => {}
+            other => panic!("expected WaitOnFds for empty in-zone listener, got {other:?}"),
+        }
+
+        // Connect from in-zone client.
+        let client_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        g.make_sockaddr_in(ADDR_SCRATCH, port, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+
+        // After connect, pselect6 must sample sample_description and return 1 immediately
+        // rather than re-parking into WaitOnFds due to host libc::poll returning 0.
+        g.mem.write_bytes(readfds_addr, &fdset).unwrap();
+        let ready_outcome = g.call(
+            SYS_PSELECT6,
+            [listen_fd as u64 + 1, readfds_addr, 0, 0, timeout_addr, 0],
+        );
+        match ready_outcome {
+            DispatchOutcome::Returned { value: 1 } => {}
+            other => panic!("expected Returned {{ value: 1 }} for in-zone listener with pending connect, got {other:?}"),
+        }
+        let out_fdset = g.mem.read_bytes(readfds_addr, 128).unwrap();
+        assert_eq!(out_fdset[(listen_fd / 8) as usize] & (1 << (listen_fd % 8)), 1 << (listen_fd % 8));
+    }
 }
