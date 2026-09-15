@@ -1224,22 +1224,31 @@ impl PureSocketInner {
                 mask |= LINUX_EPOLLIN;
             }
             if !state.shutdown_write && !state.tcp_send_terminal {
-                if state.tcp_pair && state.tcp_peer_terminal == TcpPeerTerminal::Fin {
+                if let Some(p) = peer_state.as_ref() {
+                    if (!peer_shut_rd && p.stream_buf.len() < state.so_sndbuf)
+                        || (state.tcp_pair && peer_shut_rd)
+                    {
+                        mask |= LINUX_EPOLLOUT;
+                    }
+                } else if has_mock {
+                    if !peer_shut_rd && state.request_buf.len() < state.so_sndbuf {
+                        mask |= LINUX_EPOLLOUT;
+                    }
+                } else if state.tcp_pair
+                    && state.tcp_peer_terminal == TcpPeerTerminal::Fin
+                    && peer_dropped
+                {
                     mask |= LINUX_EPOLLOUT;
-                } else if !peer_shut_rd && has_mock {
-                    if state.request_buf.len() < state.so_sndbuf {
-                        mask |= LINUX_EPOLLOUT;
-                    }
-                } else if !peer_shut_rd && let Some(p) = peer_state.as_ref() {
-                    if p.stream_buf.len() < state.so_sndbuf {
-                        mask |= LINUX_EPOLLOUT;
-                    }
                 }
             }
             if peer_shut_wr {
                 mask |= LINUX_EPOLLRDHUP;
             }
-            let tcp_hup = state.tcp_pair && state.tcp_peer_terminal == TcpPeerTerminal::Reset;
+            let tcp_hup = state.tcp_pair
+                && (state.tcp_peer_terminal == TcpPeerTerminal::Reset
+                    || (state.stream_buf.is_empty()
+                        && (state.tcp_send_terminal
+                            || (state.shutdown_write && (peer_dropped || peer_shut_wr)))));
             let generic_hup = !state.tcp_pair && (peer_dropped || (peer_shut_wr && peer_shut_rd));
             if tcp_hup || generic_hup {
                 mask |= LINUX_EPOLLHUP;
@@ -1525,6 +1534,86 @@ mod tests {
             read_eof, 0,
             "subsequent read after draining buffer must return 0 (EOF)"
         );
+    }
+
+    #[test]
+    fn inet_stream_peer_close_poll_mask_preserves_data_then_reports_hup_after_drain_and_send() {
+        let (s1, s2) = PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+        let sent = s1.send_stream(b"trailing-data", Vec::new()).unwrap();
+        assert_eq!(sent, 13);
+        drop(s1);
+
+        // Remote closed while receiver still has unread data: receiver must see
+        // EPOLLIN | EPOLLRDHUP, permitted write (EPOLLOUT), and NO EPOLLHUP yet.
+        let mask_pre = s2.poll_mask();
+        assert_eq!(
+            mask_pre & LINUX_EPOLLIN,
+            LINUX_EPOLLIN,
+            "buffered data is readable"
+        );
+        assert_eq!(
+            mask_pre & LINUX_EPOLLRDHUP,
+            LINUX_EPOLLRDHUP,
+            "peer is closed"
+        );
+        assert_eq!(
+            mask_pre & LINUX_EPOLLHUP,
+            0,
+            "unread data suppresses EPOLLHUP"
+        );
+        assert_eq!(
+            mask_pre & LINUX_EPOLLOUT,
+            LINUX_EPOLLOUT,
+            "single write permitted before terminal"
+        );
+
+        // Client writes trailing data: admitted once, entering send terminal with pending EPIPE.
+        let sent_tail = s2.send_stream(b"more", Vec::new()).unwrap();
+        assert_eq!(sent_tail, 4);
+
+        // Before draining receive buffer, EPOLLHUP is still suppressed.
+        let mask_mid = s2.poll_mask();
+        assert_eq!(
+            mask_mid & LINUX_EPOLLHUP,
+            0,
+            "unread data still suppresses EPOLLHUP"
+        );
+        assert_eq!(
+            mask_mid & LINUX_EPOLLOUT,
+            0,
+            "send terminal clears EPOLLOUT"
+        );
+        assert_eq!(
+            mask_mid & LINUX_EPOLLERR,
+            LINUX_EPOLLERR,
+            "pending EPIPE reports ERR"
+        );
+
+        // Drain the receive buffer to EOF.
+        let mut buf = [0u8; 32];
+        let (read, _) = s2.recv_stream(&mut buf, 0).unwrap();
+        assert_eq!(read, 13);
+        assert_eq!(&buf[..read], b"trailing-data");
+
+        let (read_eof, _) = s2.recv_stream(&mut buf, 0).unwrap();
+        assert_eq!(read_eof, 0);
+
+        // After drain, receiver reports EPOLLHUP along with IN, RDHUP, ERR.
+        let mask_post = s2.poll_mask();
+        assert_eq!(
+            mask_post & LINUX_EPOLLHUP,
+            LINUX_EPOLLHUP,
+            "drained terminal connection reports HUP"
+        );
+        assert_eq!(mask_post & LINUX_EPOLLIN, LINUX_EPOLLIN);
+        assert_eq!(mask_post & LINUX_EPOLLRDHUP, LINUX_EPOLLRDHUP);
+        assert_eq!(mask_post & LINUX_EPOLLERR, LINUX_EPOLLERR);
     }
 
     #[test]

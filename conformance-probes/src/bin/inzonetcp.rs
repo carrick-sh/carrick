@@ -30,7 +30,10 @@
 //!   18. `bind_admission_matrix`: TCP SO_REUSEADDR/SO_REUSEPORT and IPv4/IPv6 bind conflicts;
 //!   19. `v4mapped_client_to_v4_listener`: IPv4 listener on 127.0.0.1:0 and, separately, on 0.0.0.0:0,
 //!       AF_INET6 client bound to [::]:0 connecting to ::ffff:127.0.0.1:PORT,
-//!       address reflection, echo transfer, IPV6_V6ONLY rejection, and [::1] bind refusal.
+//!       address reflection, echo transfer, IPV6_V6ONLY rejection, and [::1] bind refusal;
+//!   20. `remote_shutdown_receives_trailing_data`: server writes N bytes then shutdown(SHUT_WR)
+//!       (and second variant: close), client with unsent trailing data reads in chunks until EOF,
+//!       reporting bytes, recv rc/errno, poll revents, SO_ERROR, and trailing writes.
 //!
 //! Output is deterministic `key=value` lines only. Every wait is bounded by a
 //! `poll` with a 5 s cap so a lost wake is a false line, never a hang.
@@ -1451,6 +1454,282 @@ unsafe fn run_v4mapped_v6_loopback_client_case() -> V6LoopbackClientCaseResult {
     }
 }
 
+struct RemoteShutdownTrailingDataResult {
+    listener_poll_rc: i32,
+    listener_poll_errno: i32,
+    listener_accept_ok: bool,
+    server_write_bytes: i64,
+    server_write_errno: i32,
+    server_term_ret: i32,
+    server_term_errno: i32,
+    client_pre_drain_poll_revents: String,
+    client_trailing_write_bytes: i64,
+    client_trailing_write_errno: i32,
+    server_trailing_recv_bytes: i64,
+    server_trailing_recv_errno: i32,
+    client_bytes_read: i64,
+    client_reads_count: i64,
+    client_final_recv_ret: i64,
+    client_final_recv_errno: i32,
+    client_post_eof_poll_revents: String,
+    client_so_error: i32,
+    client_post_eof_write_ret: i64,
+    client_post_eof_write_errno: i32,
+}
+
+unsafe fn run_remote_shutdown_trailing_data_case(
+    variant_close: bool,
+) -> RemoteShutdownTrailingDataResult {
+    let (l_storage, l_len) = EndpointHelper::loopback_storage_v4(0);
+    let listener = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+    let l_bind_rc = if listener >= 0 {
+        libc::bind(
+            listener,
+            &l_storage as *const _ as *const libc::sockaddr,
+            l_len,
+        )
+    } else {
+        -1
+    };
+    let listen_rc = if l_bind_rc == 0 {
+        libc::listen(listener, 4)
+    } else {
+        -1
+    };
+    let (_, _, l_bound, _) = if listen_rc == 0 {
+        EndpointHelper::getsockname(listener)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let listen_port_be = EndpointHelper::get_port_be(&l_bound);
+
+    let client = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+    let (target, target_len) = EndpointHelper::loopback_storage_v4(listen_port_be);
+    let _connect_rc = if client >= 0 && listen_port_be != 0 {
+        libc::connect(
+            client,
+            &target as *const _ as *const libc::sockaddr,
+            target_len,
+        )
+    } else {
+        -1
+    };
+
+    let listener_poll_rc = if listener >= 0 {
+        poll_readable(listener)
+    } else {
+        -1
+    };
+    let listener_poll_errno = if listener_poll_rc < 0 { errno() } else { 0 };
+
+    let accepted = if listener >= 0 && listener_poll_rc > 0 {
+        libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut())
+    } else {
+        -1
+    };
+    let listener_accept_ok = accepted >= 0;
+
+    if client >= 0 {
+        set_nonblock(client);
+    }
+    if accepted >= 0 {
+        set_nonblock(accepted);
+    }
+
+    let send_data = [0x5au8; 8192];
+    let server_write_rc = if accepted >= 0 {
+        libc::send(
+            accepted,
+            send_data.as_ptr().cast(),
+            send_data.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    } else {
+        -1
+    };
+    let (server_write_bytes, server_write_errno) = if server_write_rc >= 0 {
+        (server_write_rc as i64, 0)
+    } else {
+        (server_write_rc as i64, errno())
+    };
+
+    let (server_term_ret, server_term_errno) = if variant_close {
+        let rc = if accepted >= 0 {
+            libc::close(accepted)
+        } else {
+            -1
+        };
+        (rc, if rc < 0 { errno() } else { 0 })
+    } else {
+        let rc = if accepted >= 0 {
+            libc::shutdown(accepted, libc::SHUT_WR)
+        } else {
+            -1
+        };
+        (rc, if rc < 0 { errno() } else { 0 })
+    };
+
+    let mut pfd_pre = libc::pollfd {
+        fd: client,
+        events: libc::POLLIN | POLLRDHUP | libc::POLLHUP | libc::POLLERR,
+        revents: 0,
+    };
+    let _ = libc::poll(&mut pfd_pre, 1, 5000);
+    let client_pre_drain_poll_revents = format!("0x{:x}", pfd_pre.revents);
+
+    let trailing_data = [0xa5u8; 4096];
+    let tw_rc = if client >= 0 {
+        libc::send(
+            client,
+            trailing_data.as_ptr().cast(),
+            trailing_data.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    } else {
+        -1
+    };
+    let (client_trailing_write_bytes, client_trailing_write_errno) = if tw_rc >= 0 {
+        (tw_rc as i64, 0)
+    } else {
+        (tw_rc as i64, errno())
+    };
+
+    let (server_trailing_recv_bytes, server_trailing_recv_errno) =
+        if !variant_close && accepted >= 0 {
+            let mut s_buf = [0u8; 4096];
+            let mut s_pfd = libc::pollfd {
+                fd: accepted,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let _ = libc::poll(&mut s_pfd, 1, 5000);
+            let sr_rc = libc::recv(accepted, s_buf.as_mut_ptr().cast(), s_buf.len(), 0);
+            if sr_rc >= 0 {
+                (sr_rc as i64, 0)
+            } else {
+                (sr_rc as i64, errno())
+            }
+        } else {
+            (0, 0)
+        };
+
+    let mut chunk_buf = [0u8; 512];
+    let mut client_bytes_read = 0i64;
+    let mut client_reads_count = 0i64;
+    let mut client_final_recv_ret = -1i64;
+    let mut client_final_recv_errno = 0i32;
+    if client >= 0 {
+        loop {
+            let rc = libc::recv(client, chunk_buf.as_mut_ptr().cast(), chunk_buf.len(), 0);
+            if rc > 0 {
+                client_bytes_read += rc as i64;
+                client_reads_count += 1;
+                libc::usleep(100);
+            } else if rc == 0 {
+                client_final_recv_ret = 0;
+                client_final_recv_errno = 0;
+                break;
+            } else {
+                let e = errno();
+                if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                    let mut p = libc::pollfd {
+                        fd: client,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let prc = libc::poll(&mut p, 1, 5000);
+                    if prc <= 0 {
+                        client_final_recv_ret = -1;
+                        client_final_recv_errno = if prc < 0 {
+                            errno()
+                        } else {
+                            libc::ETIMEDOUT
+                        };
+                        break;
+                    }
+                    continue;
+                }
+                client_final_recv_ret = rc as i64;
+                client_final_recv_errno = e;
+                break;
+            }
+        }
+    }
+
+    let mut pfd_post = libc::pollfd {
+        fd: client,
+        events: libc::POLLIN | POLLRDHUP | libc::POLLHUP | libc::POLLERR,
+        revents: 0,
+    };
+    let _ = libc::poll(&mut pfd_post, 1, 5000);
+    let client_post_eof_poll_revents = format!("0x{:x}", pfd_post.revents);
+
+    let mut so_err: libc::c_int = 0;
+    let mut optlen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let gso_rc = if client >= 0 {
+        libc::getsockopt(
+            client,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut so_err as *mut _ as *mut libc::c_void,
+            &mut optlen,
+        )
+    } else {
+        -1
+    };
+    let client_so_error = if gso_rc == 0 { so_err } else { errno() };
+
+    let post_eof_buf = [1u8];
+    let pw_rc = if client >= 0 {
+        libc::send(
+            client,
+            post_eof_buf.as_ptr().cast(),
+            post_eof_buf.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    } else {
+        -1
+    };
+    let (client_post_eof_write_ret, client_post_eof_write_errno) = if pw_rc >= 0 {
+        (pw_rc as i64, 0)
+    } else {
+        (pw_rc as i64, errno())
+    };
+
+    if client >= 0 {
+        libc::close(client);
+    }
+    if !variant_close && accepted >= 0 {
+        libc::close(accepted);
+    }
+    if listener >= 0 {
+        libc::close(listener);
+    }
+
+    RemoteShutdownTrailingDataResult {
+        listener_poll_rc,
+        listener_poll_errno,
+        listener_accept_ok,
+        server_write_bytes,
+        server_write_errno,
+        server_term_ret,
+        server_term_errno,
+        client_pre_drain_poll_revents,
+        client_trailing_write_bytes,
+        client_trailing_write_errno,
+        server_trailing_recv_bytes,
+        server_trailing_recv_errno,
+        client_bytes_read,
+        client_reads_count,
+        client_final_recv_ret,
+        client_final_recv_errno,
+        client_post_eof_poll_revents,
+        client_so_error,
+        client_post_eof_write_ret,
+        client_post_eof_write_errno,
+    }
+}
+
 fn main() {
     unsafe {
         conformance_probes::install_ign(libc::SIGPIPE);
@@ -2713,5 +2992,52 @@ fn main() {
             v4mapped_v6_loopback_client_sockname_family = res_v6_loopback.client_sockname_family,
             v4mapped_v6_loopback_client_sockname_addr = res_v6_loopback.client_sockname_addr,
         );
+
+        // ---------------------------------------------------------------------
+        // Case 19: remote_shutdown_receives_trailing_data
+        // ---------------------------------------------------------------------
+        let res_shut_wr = run_remote_shutdown_trailing_data_case(false);
+        let res_close = run_remote_shutdown_trailing_data_case(true);
+        report!(
+            shut_wr_listener_poll_rc = res_shut_wr.listener_poll_rc,
+            shut_wr_listener_poll_errno = res_shut_wr.listener_poll_errno,
+            shut_wr_listener_accept_ok = res_shut_wr.listener_accept_ok,
+            shut_wr_server_write_bytes = res_shut_wr.server_write_bytes,
+            shut_wr_server_write_errno = res_shut_wr.server_write_errno,
+            shut_wr_server_shutdown_ret = res_shut_wr.server_term_ret,
+            shut_wr_server_shutdown_errno = res_shut_wr.server_term_errno,
+            shut_wr_client_pre_drain_poll_revents = res_shut_wr.client_pre_drain_poll_revents,
+            shut_wr_client_trailing_write_bytes = res_shut_wr.client_trailing_write_bytes,
+            shut_wr_client_trailing_write_errno = res_shut_wr.client_trailing_write_errno,
+            shut_wr_server_trailing_recv_bytes = res_shut_wr.server_trailing_recv_bytes,
+            shut_wr_server_trailing_recv_errno = res_shut_wr.server_trailing_recv_errno,
+            shut_wr_client_bytes_read = res_shut_wr.client_bytes_read,
+            shut_wr_client_reads_count = res_shut_wr.client_reads_count,
+            shut_wr_client_final_recv_ret = res_shut_wr.client_final_recv_ret,
+            shut_wr_client_final_recv_errno = res_shut_wr.client_final_recv_errno,
+            shut_wr_client_post_eof_poll_revents = res_shut_wr.client_post_eof_poll_revents,
+            shut_wr_client_so_error = res_shut_wr.client_so_error,
+            shut_wr_client_post_eof_write_ret = res_shut_wr.client_post_eof_write_ret,
+            shut_wr_client_post_eof_write_errno = res_shut_wr.client_post_eof_write_errno,
+            close_listener_poll_rc = res_close.listener_poll_rc,
+            close_listener_poll_errno = res_close.listener_poll_errno,
+            close_listener_accept_ok = res_close.listener_accept_ok,
+            close_server_write_bytes = res_close.server_write_bytes,
+            close_server_write_errno = res_close.server_write_errno,
+            close_server_close_ret = res_close.server_term_ret,
+            close_server_close_errno = res_close.server_term_errno,
+            close_client_pre_drain_poll_revents = res_close.client_pre_drain_poll_revents,
+            close_client_trailing_write_bytes = res_close.client_trailing_write_bytes,
+            close_client_trailing_write_errno = res_close.client_trailing_write_errno,
+            close_client_bytes_read = res_close.client_bytes_read,
+            close_client_reads_count = res_close.client_reads_count,
+            close_client_final_recv_ret = res_close.client_final_recv_ret,
+            close_client_final_recv_errno = res_close.client_final_recv_errno,
+            close_client_post_eof_poll_revents = res_close.client_post_eof_poll_revents,
+            close_client_so_error = res_close.client_so_error,
+            close_client_post_eof_write_ret = res_close.client_post_eof_write_ret,
+            close_client_post_eof_write_errno = res_close.client_post_eof_write_errno,
+        );
     }
 }
+
