@@ -87,6 +87,11 @@ pub struct SuiteReport {
     /// parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline: Option<crate::engine::CarrickDeadline>,
+    /// Phase 1b evidence for a row whose phase-1 measurement was an artefact of
+    /// how it was measured. `Option` (and skipped when absent) so committed
+    /// baselines and prior results files still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<SerialConfirmation>,
     /// diverging ids that are NOT excused (the regression set, or first-obs NEW set).
     pub new_diffs: Vec<String>,
     /// diverging ids excused by known_gaps or an unchanged baseline pair.
@@ -97,6 +102,42 @@ pub struct SuiteReport {
     pub docker_argv: Vec<String>,
     /// id -> [carrick, docker] outcome (the baseline payload for excuser 2).
     pub pairs: BTreeMap<String, [Outcome; 2]>,
+}
+
+/// Why a row was re-measured serially in Phase 1b.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmReason {
+    /// Cut off at the operator's diagnostic budget, below the declaration.
+    BudgetKill,
+    /// Got little CPU on an oversubscribed box: the measurement was invalid.
+    Starved,
+}
+
+/// What Phase 1b observed for one row: the load-run kill it was resolving, and
+/// the serial re-measurement that replaced it (or why there was none).
+///
+/// `perf.carrick_ms` on the report carries the SERIAL number — the only one
+/// from a controlled single-variable run and therefore the only citable one.
+/// The load run's timing survives here, labelled as a kill observation, never
+/// as a ratio.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SerialConfirmation {
+    pub reason: ConfirmReason,
+    /// Wall time the phase-1 run reached before it was cut off.
+    pub load_ms: u64,
+    /// The deadline that cut it off, in milliseconds.
+    pub load_budget_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_timeout_kind: Option<crate::engine::TimeoutKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_ms: Option<u64>,
+    pub serial_timed_out: bool,
+    /// Set when no serial re-run happened: `"budget pool exhausted"` or
+    /// `"disabled"`. Such a row keeps its phase-1 verdict and still blocks
+    /// bless — silent truncation is forbidden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
 }
 
 /// Per-suite baseline pairs loaded from a prior `baseline.jsonl`.
