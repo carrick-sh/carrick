@@ -304,6 +304,7 @@ pub(crate) mod seccomp;
 pub mod syslog;
 pub(crate) mod vdso_policy;
 pub mod vfs;
+pub mod wedge_capture;
 pub use prepare::{
     ExecutionPlan, PreparedRun, Runtime, RuntimeExtensions, StdioSink, prepare_on, resolve_plan,
 };

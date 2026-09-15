@@ -3,14 +3,6 @@
   "rows": [
     {
       "kind": "static",
-      "file": "crates/carrick-embed/src/lib.rs",
-      "symbol": "CARRIER_TEST_LOCK",
-      "fingerprint": "86037a327730c39a17444d150fb83c62b8a9461aef204b955c50b6dc8161ed37",
-      "classification": "test_only",
-      "rationale": "The cfg(test) mutex serializes embed lifecycle tests that intentionally exercise the process-exclusive hardware-carrier owner gate."
-    },
-    {
-      "kind": "static",
       "file": "crates/carrick-kernel/src/arena.rs",
       "symbol": "ARENA_FILE_COUNTER",
       "fingerprint": "acc33a042ab56c6664a0163e2f758900ce24f0f25411c6d9911740f2dedb09c1",
@@ -234,28 +226,12 @@
       "rationale": "Carrier-wide host infrastructure static LAST_PUBLISHED in crates/carrick-runtime/src/cred_ipc.rs maintaining host process lifecycle or VM resources."
     },
     {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
-      "symbol": "window_ms::CARRICK_DEADLOCK_WATCHDOG_MS",
-      "fingerprint": "2fdbff72de644671485c53733abc818ae8e29060e65c623ee535a1055fd52bb1",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_DEADLOCK_WATCHDOG_MS read in window_ms::CARRICK_DEADLOCK_WATCHDOG_MS (crates/carrick-runtime/src/deadlock_watchdog.rs) configuring carrier behavior or debug logging."
-    },
-    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
       "symbol": "ARMED",
       "fingerprint": "a7f2aacf891c55c9b568a735116f39b26fa16f04ed7861de0fa6285dd17fc06f",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static ARMED in crates/carrick-runtime/src/deadlock_watchdog.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
-      "symbol": "CAPTURE_CLAIMED",
-      "fingerprint": "98cf8d0b4e116fead58135a50c8a921c98c18b5cf591aa7db1bdf79989f063fe",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static CAPTURE_CLAIMED in crates/carrick-runtime/src/deadlock_watchdog.rs maintaining host process lifecycle or VM resources."
     },
     {
       "kind": "static",
@@ -272,14 +248,6 @@
       "fingerprint": "08dd817359cb554aff1e9c2465a3e192ad75c1f35a8a8cf35f3f54bde6a9d321",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static counter::COUNTER in crates/carrick-runtime/src/deadlock_watchdog.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
-      "symbol": "window_ms::CELL",
-      "fingerprint": "aa877e87e881070ff0133ff7c12178fa3a321a1486db1b61313ea73e66e8205b",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static window_ms::CELL in crates/carrick-runtime/src/deadlock_watchdog.rs maintaining host process lifecycle or VM resources."
     },
     {
       "kind": "env_var",
@@ -2713,17 +2681,17 @@
       "classification": "test_only",
       "rationale": "Test-only fixture or lock alias_registry_tests::thread_mapping_desc_from_region_and_fork_inheritance_with_offset::TEST_LOCK in crates/carrick-vmm-hvf/src/trap/memory_protection/tests.rs scoped strictly to test harness execution."
     },
-  {
-    "kind": "env_var_os",
-    "file": "crates/carrick-vmm-hvf/src/trap/persistent_executor.rs",
-    "symbol": "new::CARRICK_FD_CEILING",
-    "fingerprint": "6625ba015b01422c31fb2adeea78d36bf8fa5f6bd5a04b7314d3fa6fe401e9f2",
-    "classification": "config_debug",
-    "rationale": "CARRICK_FD_CEILING=0 is a diagnostic same-binary ABBA control read while constructing the carrier-owned publisher. It can only permanently disable the carrier fstat fast path; it cannot enable a policy-disabled gate, lower the monotonic ceiling, select container identity, or change guest-visible syscall semantics."
-  },
-  {
-    "kind": "thread_local",
-    "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap/persistent_executor.rs",
+      "symbol": "new::CARRICK_FD_CEILING",
+      "fingerprint": "6625ba015b01422c31fb2adeea78d36bf8fa5f6bd5a04b7314d3fa6fe401e9f2",
+      "classification": "config_debug",
+      "rationale": "CARRICK_FD_CEILING=0 is a diagnostic same-binary ABBA control read while constructing the carrier-owned publisher. It can only permanently disable the carrier fstat fast path; it cannot enable a policy-disabled gate, lower the monotonic ceiling, select container identity, or change guest-visible syscall semantics."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
       "symbol": "STAGE2_AUDIT_STATE",
       "fingerprint": "f4a8dd5e57f884559783cd3de35e10deac5ea59dfd6c204ad6ecdf6f75b88658",
       "classification": "test_only",
@@ -2792,6 +2760,22 @@
       "fingerprint": "a9778af5ccd1c6630d44c1e80c649fc3ac982ad5cc21d72bb30a021510749473",
       "classification": "monotonic_allocator",
       "rationale": "Process-wide identity allocation for retained in-memory file objects. The counter contains no guest filesystem state or current-container authority; contents, metadata and namespace ownership remain in per-object and backend state. Distinct backends need distinct identities when their handles meet in an executable registry."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
+      "symbol": "arm::CARRICK_RUN_ID",
+      "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
+      "classification": "config_debug",
+      "rationale": "The run id is copied into a wedge capture's manifest so an artifact directory can be attributed to the run that produced it; it is diagnostic provenance only."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/wedge_capture.rs",
+      "symbol": "CAPTURE_CLAIMED",
+      "fingerprint": "98cf8d0b4e116fead58135a50c8a921c98c18b5cf591aa7db1bdf79989f063fe",
+      "classification": "carrier_infra",
+      "rationale": "One external capture per carrier lifetime, whichever rung reaches it first. A wedged carrier is a property of the process, and a second lldb attach on the same wedge would race the first for the same artifacts."
     }
   ]
 }
