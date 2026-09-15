@@ -638,6 +638,31 @@ impl<'a> NetView<'a> {
         None
     }
 
+    /// Return the wait registration entry `(host_fd, events)` for a guest pollfd.
+    ///
+    /// When the guest fd is backed by a host poll target (direct host fd or
+    /// readiness pipe), this yields `(target.host_fd, target.host_events)`.
+    /// When the guest fd is a carrick-owned description without a host fd
+    /// (such as an in-memory socket), this yields `(-1, requested_events)` so
+    /// `WaitFds` logical interest carries its events for wait-queue enrollment
+    /// probing. Negative guest fds and unknown descriptors yield `None`.
+    pub(super) fn wait_target_for_poll(
+        &self,
+        guest_fd: i32,
+        requested_events: i16,
+    ) -> Option<(i32, i16)> {
+        if guest_fd < 0 {
+            return None;
+        }
+        if let Some(target) = self.host_poll_target(guest_fd, requested_events) {
+            Some((target.host_fd, target.host_events))
+        } else if self.open_file(guest_fd).is_some() {
+            Some((-1, requested_events))
+        } else {
+            None
+        }
+    }
+
     /// Return the host fd backing a guest fd for ppoll's fast path.
     /// `Some(host_fd)` means we can hand this off to libc::poll.
     /// `None` means it's synthetic (epoll/eventfd/timerfd/in-memory pipe)
@@ -2978,11 +3003,8 @@ impl<'a> NetView<'a> {
                     };
                     let mut wait_targets = Vec::new();
                     for (i, (fd, _)) in owners.iter().enumerate() {
-                        if *fd < 0 {
-                            continue;
-                        }
-                        if let Some(target) = this.host_poll_target(*fd, events_list[i]) {
-                            wait_targets.push((target.host_fd, target.host_events));
+                        if let Some(target) = this.wait_target_for_poll(*fd, events_list[i]) {
+                            wait_targets.push(target);
                         }
                     }
                     let files = this.captured_file_table();
@@ -3387,11 +3409,8 @@ impl<'a> NetView<'a> {
             };
             let mut wait_targets = Vec::new();
             for pollfd in &fds {
-                if pollfd.fd < 0 {
-                    continue;
-                }
-                if let Some(target) = this.host_poll_target(pollfd.fd, pollfd.events) {
-                    wait_targets.push((target.host_fd, target.host_events));
+                if let Some(target) = this.wait_target_for_poll(pollfd.fd, pollfd.events) {
+                    wait_targets.push(target);
                 }
             }
             let files = this.captured_file_table();

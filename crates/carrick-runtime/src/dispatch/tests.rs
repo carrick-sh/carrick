@@ -8794,4 +8794,115 @@ mod inzone_tcp {
         let out_fdset = g.mem.read_bytes(readfds_addr, 128).unwrap();
         assert_eq!(out_fdset[(listen_fd / 8) as usize] & (1 << (listen_fd % 8)), 1 << (listen_fd % 8));
     }
+
+    fn inzone_connected_pair() -> (InZoneGuest, i32, i32) {
+        let mut g = InZoneGuest::new();
+        let listen_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        g.make_sockaddr_in(ADDR_SCRATCH, 0, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
+            0
+        );
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKNAME,
+                [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+            ),
+            0
+        );
+        let (port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+        let client_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        g.make_sockaddr_in(ADDR_SCRATCH, port, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        let accepted_fd = g.ok(
+            SYS_ACCEPT,
+            [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+        ) as i32;
+        (g, client_fd, accepted_fd)
+    }
+
+    #[test]
+    fn ppoll_on_inzone_accepted_stream_carries_logical_pollin_interest() {
+        const SYS_PPOLL: u64 = 73;
+        let (mut g, _client_fd, accepted_fd) = inzone_connected_pair();
+
+        let timeout_addr = MEM_BASE + 0x500;
+        let timespec: [u64; 2] = [5, 0]; // 5 seconds
+        g.mem
+            .write_bytes(timeout_addr, zerocopy::IntoBytes::as_bytes(&timespec))
+            .unwrap();
+
+        let pollfd_addr = MEM_BASE + 0x520;
+        let mut pfd = [0u8; 8];
+        pfd[0..4].copy_from_slice(&accepted_fd.to_ne_bytes());
+        pfd[4..6].copy_from_slice(&libc::POLLIN.to_ne_bytes());
+        g.mem.write_bytes(pollfd_addr, &pfd).unwrap();
+
+        let outcome = g.call(SYS_PPOLL, [pollfd_addr, 1, timeout_addr, 0, 0, 0]);
+        let authority = match &outcome {
+            DispatchOutcome::WaitOnFds { fds, .. } => fds.authority().clone(),
+            DispatchOutcome::BlockingFdWait { wait, .. } => wait.authority().clone(),
+            other => panic!("expected WaitOnFds or BlockingFdWait, got {other:?}"),
+        };
+        match authority {
+            WaitFdAuthority::Logical { interest, .. } => {
+                assert!(
+                    interest & libc::POLLIN != 0,
+                    "ppoll: expected interest & POLLIN != 0, got interest={interest:#x}"
+                );
+            }
+            other => panic!("ppoll: expected WaitFdAuthority::Logical, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pselect6_on_inzone_accepted_stream_carries_logical_pollin_interest() {
+        const SYS_PSELECT6: u64 = 72;
+        let (mut g, _client_fd, accepted_fd) = inzone_connected_pair();
+
+        let timeout_addr = MEM_BASE + 0x500;
+        let timespec: [u64; 2] = [5, 0]; // 5 seconds
+        g.mem
+            .write_bytes(timeout_addr, zerocopy::IntoBytes::as_bytes(&timespec))
+            .unwrap();
+
+        let readfds_addr = MEM_BASE + 0x540;
+        let mut fdset = [0u8; 128];
+        fdset[(accepted_fd / 8) as usize] |= 1 << (accepted_fd % 8);
+        g.mem.write_bytes(readfds_addr, &fdset).unwrap();
+
+        let outcome = g.call(
+            SYS_PSELECT6,
+            [accepted_fd as u64 + 1, readfds_addr, 0, 0, timeout_addr, 0],
+        );
+        let authority = match &outcome {
+            DispatchOutcome::WaitOnFds { fds, .. } => fds.authority().clone(),
+            DispatchOutcome::BlockingFdWait { wait, .. } => wait.authority().clone(),
+            other => panic!("expected WaitOnFds or BlockingFdWait, got {other:?}"),
+        };
+        match authority {
+            WaitFdAuthority::Logical { interest, .. } => {
+                assert!(
+                    interest & libc::POLLIN != 0,
+                    "pselect6: expected interest & POLLIN != 0, got interest={interest:#x}"
+                );
+            }
+            other => panic!("pselect6: expected WaitFdAuthority::Logical, got {other:?}"),
+        }
+    }
 }
