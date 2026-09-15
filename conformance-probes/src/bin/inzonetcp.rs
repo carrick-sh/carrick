@@ -30,7 +30,7 @@
 //!   18. `bind_admission_matrix`: TCP SO_REUSEADDR/SO_REUSEPORT and IPv4/IPv6 bind conflicts;
 //!   19. `v4mapped_client_to_v4_listener`: IPv4 listener on 127.0.0.1:0 and, separately, on 0.0.0.0:0,
 //!       AF_INET6 client bound to [::]:0 connecting to ::ffff:127.0.0.1:PORT,
-//!       address reflection, echo transfer, and IPV6_V6ONLY connect rejection.
+//!       address reflection, echo transfer, IPV6_V6ONLY rejection, and [::1] bind refusal.
 //!
 //! Output is deterministic `key=value` lines only. Every wait is bounded by a
 //! `poll` with a 5 s cap so a lost wake is a false line, never a hang.
@@ -1355,6 +1355,102 @@ unsafe fn run_v4mapped_v6only_listener_case() -> (i32, i32) {
     (connect_ret, connect_errno)
 }
 
+struct V6LoopbackClientCaseResult {
+    connect_ret: i32,
+    connect_errno: i32,
+    client_peer_family: i32,
+    client_peer_addr: String,
+    client_sockname_family: i32,
+    client_sockname_addr: String,
+}
+
+unsafe fn run_v4mapped_v6_loopback_client_case() -> V6LoopbackClientCaseResult {
+    let (l_storage, l_len) = EndpointHelper::loopback_storage_v4(0);
+    let listener = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+    let l_bind_rc = if listener >= 0 {
+        libc::bind(
+            listener,
+            &l_storage as *const _ as *const libc::sockaddr,
+            l_len,
+        )
+    } else {
+        -1
+    };
+    let listen_rc = if l_bind_rc == 0 {
+        libc::listen(listener, 4)
+    } else {
+        -1
+    };
+    let (_, _, l_bound, _) = if listen_rc == 0 {
+        EndpointHelper::getsockname(listener)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let listen_port_be = EndpointHelper::get_port_be(&l_bound);
+
+    let client = libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0);
+    let (c_bind, c_bind_len) = EndpointHelper::loopback_storage_v6(0);
+    let c_bind_rc = if client >= 0 {
+        libc::bind(
+            client,
+            &c_bind as *const _ as *const libc::sockaddr,
+            c_bind_len,
+        )
+    } else {
+        -1
+    };
+    let (target, target_len) = EndpointHelper::mapped_loopback_storage_v6(listen_port_be);
+    let (connect_ret, connect_errno) = if client >= 0 && c_bind_rc == 0 && listen_port_be != 0 {
+        let rc = libc::connect(
+            client,
+            &target as *const _ as *const libc::sockaddr,
+            target_len,
+        );
+        let err = if rc < 0 { errno() } else { 0 };
+        (rc, err)
+    } else {
+        (-1, libc::EBADF)
+    };
+
+    let (client_peer_family, client_peer_addr) = if client >= 0 && connect_ret == 0 {
+        let (rc, _, storage, _) = EndpointHelper::getpeername(client);
+        if rc == 0 {
+            EndpointHelper::format_family_and_addr(&storage)
+        } else {
+            (-1, "none".to_string())
+        }
+    } else {
+        (-1, "none".to_string())
+    };
+
+    let (client_sockname_family, client_sockname_addr) = if client >= 0 && connect_ret == 0 {
+        let (rc, _, storage, _) = EndpointHelper::getsockname(client);
+        if rc == 0 {
+            EndpointHelper::format_family_and_addr(&storage)
+        } else {
+            (-1, "none".to_string())
+        }
+    } else {
+        (-1, "none".to_string())
+    };
+
+    if client >= 0 {
+        libc::close(client);
+    }
+    if listener >= 0 {
+        libc::close(listener);
+    }
+
+    V6LoopbackClientCaseResult {
+        connect_ret,
+        connect_errno,
+        client_peer_family,
+        client_peer_addr,
+        client_sockname_family,
+        client_sockname_addr,
+    }
+}
+
 fn main() {
     unsafe {
         conformance_probes::install_ign(libc::SIGPIPE);
@@ -2588,6 +2684,7 @@ fn main() {
         let res_v4mapped_exact = run_v4mapped_case(BindKind::Loopback);
         let res_v4mapped_wildcard = run_v4mapped_case(BindKind::Wildcard);
         let (v4mapped_v6only_ret, v4mapped_v6only_errno) = run_v4mapped_v6only_listener_case();
+        let res_v6_loopback = run_v4mapped_v6_loopback_client_case();
         report!(
             v4mapped_exact_connect_ret = res_v4mapped_exact.connect_ret,
             v4mapped_exact_connect_errno = res_v4mapped_exact.connect_errno,
@@ -2609,6 +2706,12 @@ fn main() {
             v4mapped_wildcard_echo_ok = res_v4mapped_wildcard.echo_ok,
             v4mapped_v6only_connect_ret = v4mapped_v6only_ret,
             v4mapped_v6only_connect_errno = v4mapped_v6only_errno,
+            v4mapped_v6_loopback_client_connect_ret = res_v6_loopback.connect_ret,
+            v4mapped_v6_loopback_client_connect_errno = res_v6_loopback.connect_errno,
+            v4mapped_v6_loopback_client_peer_family = res_v6_loopback.client_peer_family,
+            v4mapped_v6_loopback_client_peer_addr = res_v6_loopback.client_peer_addr,
+            v4mapped_v6_loopback_client_sockname_family = res_v6_loopback.client_sockname_family,
+            v4mapped_v6_loopback_client_sockname_addr = res_v6_loopback.client_sockname_addr,
         );
     }
 }

@@ -1,4 +1,4 @@
-d33fbaeb25dee124
+a2b78a3025e512bb
 listen_ok=true
 so_acceptconn_listener=1
 so_acceptconn_unlistened=0
@@ -456,3 +456,9 @@ v4mapped_wildcard_client_sockname_addr=::ffff:127.0.0.1
 v4mapped_wildcard_echo_ok=true
 v4mapped_v6only_connect_ret=-1
 v4mapped_v6only_connect_errno=111
+v4mapped_v6_loopback_client_connect_ret=-1
+v4mapped_v6_loopback_client_connect_errno=101
+v4mapped_v6_loopback_client_peer_family=-1
+v4mapped_v6_loopback_client_peer_addr=none
+v4mapped_v6_loopback_client_sockname_family=-1
+v4mapped_v6_loopback_client_sockname_addr=none
