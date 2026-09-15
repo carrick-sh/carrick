@@ -111,10 +111,11 @@ pub(crate) struct PureSocketState {
     pub connection_record: Option<Arc<Mutex<ConnectionRecordState>>>,
     pub request_buf: Vec<u8>,
     pub inzone_cleanup: Option<Arc<dyn crate::dispatch::fd_table::InZoneCleanup>>,
+    pub can_rebind: bool,
 }
 
 pub struct PureSocketInner {
-    pub(crate) family: i32,
+    pub(crate) family: std::sync::atomic::AtomicI32,
     pub(crate) socket_type: i32,
     pub(crate) protocol: i32,
     pub(crate) state: Mutex<PureSocketState>,
@@ -125,7 +126,7 @@ pub struct PureSocketInner {
 impl std::fmt::Debug for PureSocketInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PureSocketInner")
-            .field("family", &self.family)
+            .field("family", &self.family())
             .field("socket_type", &self.socket_type)
             .field("protocol", &self.protocol)
             .finish()
@@ -136,6 +137,23 @@ pub(crate) type UnixSocketState = PureSocketState;
 pub(crate) type UnixSocketInner = PureSocketInner;
 
 impl PureSocketInner {
+    pub(crate) fn family(&self) -> i32 {
+        self.family.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_family(&self, family: i32) {
+        self.family
+            .store(family, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn can_rebind(&self) -> bool {
+        self.state.lock().can_rebind
+    }
+
+    pub(crate) fn set_can_rebind(&self, allowed: bool) {
+        self.state.lock().can_rebind = allowed;
+    }
+
     pub(crate) fn notify_waiters(&self) {
         self.changed.notify_all();
         self.wait_queue.wake_all();
@@ -152,7 +170,7 @@ impl PureSocketInner {
         creds: LinuxUcred,
     ) -> Arc<Self> {
         Arc::new(Self {
-            family,
+            family: std::sync::atomic::AtomicI32::new(family),
             socket_type,
             protocol,
             state: Mutex::new(PureSocketState {
@@ -161,6 +179,7 @@ impl PureSocketInner {
                 peer_sockaddr: None,
                 peer: None,
                 listening: false,
+                can_rebind: false,
                 backlog_limit: 0,
                 accept_queue: VecDeque::new(),
                 stream_buf: VecDeque::new(),
@@ -211,7 +230,7 @@ impl PureSocketInner {
         record: Option<Arc<Mutex<ConnectionRecordState>>>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            family,
+            family: std::sync::atomic::AtomicI32::new(family),
             socket_type,
             protocol,
             state: Mutex::new(PureSocketState {
@@ -220,6 +239,7 @@ impl PureSocketInner {
                 peer_sockaddr: peer_addr,
                 peer: None,
                 listening: false,
+                can_rebind: false,
                 backlog_limit: 0,
                 accept_queue: VecDeque::new(),
                 stream_buf: VecDeque::new(),
@@ -336,7 +356,7 @@ impl PureSocketInner {
     pub(crate) fn disconnect_tcp_reset(&self) -> Result<(), LinuxErrno> {
         if self.socket_type != LINUX_SOCK_STREAM
             || self.protocol != LINUX_IPPROTO_TCP
-            || !matches!(self.family, LINUX_AF_INET | LINUX_AF_INET6)
+            || !matches!(self.family(), LINUX_AF_INET | LINUX_AF_INET6)
         {
             return Err(LINUX_EINVAL);
         }
@@ -365,7 +385,9 @@ impl PureSocketInner {
         state.tcp_peer_terminal = TcpPeerTerminal::Open;
         state.tcp_send_terminal = false;
         state.so_error = None;
+        state.can_rebind = true;
         peer_state.peer = None;
+        peer_state.inzone_cleanup = None;
         peer_state.tcp_peer_terminal = TcpPeerTerminal::Reset;
         peer_state.tcp_send_terminal = true;
         peer_state.so_error = Some(carrick_abi::LINUX_ECONNRESET.get());
@@ -382,12 +404,12 @@ impl PureSocketInner {
     ) -> Result<Arc<PureSocketInner>, LinuxErrno> {
         if self.socket_type != LINUX_SOCK_STREAM
             || self.protocol != LINUX_IPPROTO_TCP
-            || !matches!(self.family, LINUX_AF_INET | LINUX_AF_INET6)
+            || !matches!(self.family(), LINUX_AF_INET | LINUX_AF_INET6)
         {
             return Err(LINUX_EINVAL);
         }
         Ok(Self::new_with_family(
-            self.family,
+            self.family(),
             self.socket_type,
             self.protocol,
             creds,
@@ -661,7 +683,7 @@ impl PureSocketInner {
         }
 
         let server_side = Self::new_with_family(
-            self.family,
+            self.family(),
             self.socket_type,
             self.protocol,
             target_state.creds,

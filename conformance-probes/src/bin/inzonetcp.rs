@@ -472,6 +472,137 @@ unsafe fn run_tcp_disconnect_case(family: SockFamily, disconnect_accepted: bool)
     if listener >= 0 { libc::close(listener); }
 }
 
+unsafe fn run_tcp_rebind_case(family: SockFamily, is_accepted: bool, is_listen: bool) {
+    let af = if family == SockFamily::V4 { libc::AF_INET } else { libc::AF_INET6 };
+    let (mut target_addr, addrlen) = if family == SockFamily::V4 {
+        EndpointHelper::loopback_storage_v4(0)
+    } else {
+        EndpointHelper::loopback_storage_v6(0)
+    };
+
+    let listener = libc::socket(af, libc::SOCK_STREAM, 0);
+    let bind_rc = libc::bind(listener, (&target_addr as *const libc::sockaddr_storage).cast(), addrlen);
+    let _listen_rc = if bind_rc == 0 { libc::listen(listener, 4) } else { -1 };
+    let (_, _, bound_addr, _) = EndpointHelper::getsockname(listener);
+    let listen_port = EndpointHelper::get_port_be(&bound_addr);
+    EndpointHelper::set_port_be(&mut target_addr, listen_port);
+
+    let client = libc::socket(af, libc::SOCK_STREAM, 0);
+    set_nonblock(client);
+    let _initial = perform_nonblocking_connect(client, (&target_addr as *const libc::sockaddr_storage).cast(), addrlen);
+    let accept_poll_rc = poll_readable(listener);
+    let accepted = if accept_poll_rc > 0 { libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut()) } else { -1 };
+    if accepted >= 0 { set_nonblock(accepted); }
+
+    let (target_fd, old_peer) = if is_accepted { (accepted, client) } else { (client, accepted) };
+    let alias = if target_fd >= 0 { libc::dup(target_fd) } else { -1 };
+    let (_, _, local_before, _) = EndpointHelper::getsockname(target_fd);
+
+    let mut unspec: libc::sockaddr_storage = std::mem::zeroed();
+    unspec.ss_family = libc::AF_UNSPEC as libc::sa_family_t;
+    let unspec_len = if family == SockFamily::V6 { 28 } else { 16 };
+    let disconnect_rc = libc::connect(target_fd, (&unspec as *const libc::sockaddr_storage).cast(), unspec_len);
+
+    let (wild_storage, wild_len) = if family == SockFamily::V4 {
+        EndpointHelper::wildcard_storage_v4(0)
+    } else {
+        EndpointHelper::wildcard_storage_v6(0)
+    };
+
+    let bind_rc = libc::bind(target_fd, (&wild_storage as *const libc::sockaddr_storage).cast(), wild_len);
+    let bind_errno = if bind_rc == 0 { 0 } else { errno() };
+
+    let mut port_retained = false;
+    let mut bound_wildcard = false;
+    let mut alias_local_matches = false;
+    let mut second_bind_errno = 0;
+    let mut new_transfer = false;
+
+    if bind_rc == 0 {
+        let (_, _, after_storage, _) = EndpointHelper::getsockname(target_fd);
+        let before_port = EndpointHelper::get_port_be(&local_before);
+        let after_port = EndpointHelper::get_port_be(&after_storage);
+        port_retained = before_port == after_port;
+        bound_wildcard = EndpointHelper::is_wildcard(&after_storage);
+        let (_, _, alias_storage, _) = EndpointHelper::getsockname(alias);
+        alias_local_matches = EndpointHelper::addrs_equal(&after_storage, &alias_storage)
+            && after_port == EndpointHelper::get_port_be(&alias_storage);
+
+        let second_bind_rc = libc::bind(target_fd, (&wild_storage as *const libc::sockaddr_storage).cast(), wild_len);
+        second_bind_errno = if second_bind_rc == 0 { 0 } else { errno() };
+
+        let (newclient, newserver) = if is_listen {
+            let l_rc = libc::listen(target_fd, 2);
+            if l_rc == 0 {
+                let (connect_target, connect_target_len) = if family == SockFamily::V4 {
+                    EndpointHelper::loopback_storage_v4(after_port)
+                } else {
+                    EndpointHelper::loopback_storage_v6(after_port)
+                };
+                let nc = libc::socket(af, libc::SOCK_STREAM, 0);
+                set_nonblock(nc);
+                let _ = perform_nonblocking_connect(nc, (&connect_target as *const libc::sockaddr_storage).cast(), connect_target_len);
+                let poll_acc = poll_readable(target_fd);
+                let ns = if poll_acc > 0 { libc::accept(target_fd, std::ptr::null_mut(), std::ptr::null_mut()) } else { -1 };
+                if ns >= 0 { set_nonblock(ns); }
+                (nc, ns)
+            } else {
+                (-1, -1)
+            }
+        } else {
+            let _ = perform_nonblocking_connect(target_fd, (&target_addr as *const libc::sockaddr_storage).cast(), addrlen);
+            let poll_acc = poll_readable(listener);
+            let ns = if poll_acc > 0 { libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut()) } else { -1 };
+            if ns >= 0 { set_nonblock(ns); }
+            (target_fd, ns)
+        };
+
+        if old_peer >= 0 {
+            libc::close(old_peer);
+        }
+
+        if newclient >= 0 && newserver >= 0 {
+            let send_rc = libc::send(newclient, b"x".as_ptr().cast(), 1, libc::MSG_DONTWAIT);
+            if send_rc == 1 {
+                let poll_r = poll_readable(newserver);
+                if poll_r > 0 {
+                    let mut b = 0u8;
+                    let recv_rc = libc::recv(newserver, (&mut b as *mut u8).cast(), 1, libc::MSG_DONTWAIT);
+                    new_transfer = recv_rc == 1 && b == b'x';
+                }
+            }
+        }
+
+        if newserver >= 0 {
+            libc::close(newserver);
+        }
+        if is_listen && newclient >= 0 {
+            libc::close(newclient);
+        }
+    } else {
+        if old_peer >= 0 {
+            libc::close(old_peer);
+        }
+    }
+
+    let side = if is_accepted { "accepted" } else { "client" };
+    let action = if is_listen { "listen" } else { "connect" };
+    let family_str = if family == SockFamily::V4 { "v4" } else { "v6" };
+    let name = format!("tcp_rebind_{family_str}_{side}_{action}");
+
+    println!("{name}_disconnect_rc={disconnect_rc}");
+    println!("{name}_bind_errno={bind_errno}");
+    println!("{name}_port_retained={port_retained}");
+    println!("{name}_bound_wildcard={bound_wildcard}");
+    println!("{name}_alias_local_matches={alias_local_matches}");
+    println!("{name}_second_bind_errno={second_bind_errno}");
+    println!("{name}_new_transfer={new_transfer}");
+
+    if alias >= 0 { libc::close(alias); }
+    if target_fd >= 0 { libc::close(target_fd); }
+    if listener >= 0 { libc::close(listener); }
+}
+
 unsafe fn perform_nonblocking_accept(listener_fd: i32) -> i32 {
     let mut pfd = libc::pollfd {
         fd: listener_fd,
@@ -3141,6 +3272,18 @@ fn main() {
         run_tcp_disconnect_case(SockFamily::V4, true);
         run_tcp_disconnect_case(SockFamily::V6, false);
         run_tcp_disconnect_case(SockFamily::V6, true);
+
+        // ---------------------------------------------------------------------
+        // Case 12: tcp_rebind (AF_UNSPEC disconnect followed by wildcard bind)
+        // ---------------------------------------------------------------------
+        run_tcp_rebind_case(SockFamily::V4, false, true);
+        run_tcp_rebind_case(SockFamily::V4, false, false);
+        run_tcp_rebind_case(SockFamily::V4, true, true);
+        run_tcp_rebind_case(SockFamily::V4, true, false);
+        run_tcp_rebind_case(SockFamily::V6, false, true);
+        run_tcp_rebind_case(SockFamily::V6, false, false);
+        run_tcp_rebind_case(SockFamily::V6, true, true);
+        run_tcp_rebind_case(SockFamily::V6, true, false);
 
         if client_fd >= 0 {
             libc::close(client_fd);

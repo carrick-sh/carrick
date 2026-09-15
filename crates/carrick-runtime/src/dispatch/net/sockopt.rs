@@ -186,11 +186,11 @@ fn setsockopt_in_memory(
             _ => DispatchOutcome::Returned { value: 0 },
         }
     } else if level == crate::linux_abi::LINUX_SOL_TCP {
-        if socket.family == crate::linux_abi::LINUX_AF_UNIX {
+        if socket.family() == crate::linux_abi::LINUX_AF_UNIX {
             return DispatchOutcome::errno(LINUX_ENOPROTOOPT);
         }
-        if socket.family != crate::linux_abi::LINUX_AF_INET
-            && socket.family != crate::linux_abi::LINUX_AF_INET6
+        if socket.family() != crate::linux_abi::LINUX_AF_INET
+            && socket.family() != crate::linux_abi::LINUX_AF_INET6
         {
             return DispatchOutcome::errno(LINUX_ENOPROTOOPT);
         }
@@ -241,7 +241,51 @@ fn setsockopt_in_memory(
             }
             _ => DispatchOutcome::Returned { value: 0 },
         }
-    } else if socket.family == crate::linux_abi::LINUX_AF_UNIX {
+    } else if level == crate::linux_abi::LINUX_SOL_IPV6 {
+        if socket.family() == crate::linux_abi::LINUX_AF_UNIX {
+            return DispatchOutcome::errno(LINUX_ENOPROTOOPT);
+        }
+        if optname == crate::linux_abi::LINUX_IPV6_ADDRFORM {
+            if optlen != 0 && optval_addr == 0 {
+                return DispatchOutcome::errno(LINUX_EFAULT);
+            }
+            if optlen < 4 {
+                return DispatchOutcome::errno(LINUX_EINVAL);
+            }
+            let Ok(bytes) = memory.read_bytes(optval_addr, 4) else {
+                return DispatchOutcome::errno(LINUX_EFAULT);
+            };
+            let requested = i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            if requested != LINUX_AF_INET {
+                return DispatchOutcome::errno(LINUX_EINVAL);
+            }
+            if socket.family() != LINUX_AF_INET6 {
+                return DispatchOutcome::errno(LINUX_ENOPROTOOPT);
+            }
+            socket.set_family(LINUX_AF_INET);
+            {
+                let mut state = socket.state.lock();
+                if let Some(std::net::SocketAddr::V6(v6)) = state.local_sockaddr {
+                    if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                        state.local_sockaddr = Some(std::net::SocketAddr::new(
+                            std::net::IpAddr::V4(v4),
+                            v6.port(),
+                        ));
+                    }
+                }
+                if let Some(std::net::SocketAddr::V6(v6)) = state.peer_sockaddr {
+                    if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                        state.peer_sockaddr = Some(std::net::SocketAddr::new(
+                            std::net::IpAddr::V4(v4),
+                            v6.port(),
+                        ));
+                    }
+                }
+            }
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    } else if socket.family() == crate::linux_abi::LINUX_AF_UNIX {
         DispatchOutcome::errno(LINUX_ENOPROTOOPT)
     } else {
         DispatchOutcome::Returned { value: 0 }
@@ -268,7 +312,7 @@ fn getsockopt_in_memory<M: CurrentMmMemory>(
                 memory,
                 optval_addr,
                 optlen_addr,
-                &socket.family.to_ne_bytes(),
+                &socket.family().to_ne_bytes(),
             ),
             crate::linux_abi::LINUX_SO_PROTOCOL => write_sockopt_value(
                 memory,
@@ -334,11 +378,11 @@ fn getsockopt_in_memory<M: CurrentMmMemory>(
             }
         }
     } else if level == crate::linux_abi::LINUX_SOL_TCP {
-        if socket.family == crate::linux_abi::LINUX_AF_UNIX {
+        if socket.family() == crate::linux_abi::LINUX_AF_UNIX {
             return Ok(DispatchOutcome::errno(LINUX_ENOPROTOOPT));
         }
-        if socket.family != crate::linux_abi::LINUX_AF_INET
-            && socket.family != crate::linux_abi::LINUX_AF_INET6
+        if socket.family() != crate::linux_abi::LINUX_AF_INET
+            && socket.family() != crate::linux_abi::LINUX_AF_INET6
         {
             return Ok(DispatchOutcome::errno(LINUX_ENOPROTOOPT));
         }
@@ -382,7 +426,7 @@ fn getsockopt_in_memory<M: CurrentMmMemory>(
                 write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
             }
         }
-    } else if socket.family == crate::linux_abi::LINUX_AF_UNIX {
+    } else if socket.family() == crate::linux_abi::LINUX_AF_UNIX {
         Ok(DispatchOutcome::errno(LINUX_ENOPROTOOPT))
     } else {
         let val: i32 = 0;
