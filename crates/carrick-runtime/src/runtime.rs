@@ -933,9 +933,12 @@ fn finish_and_run_image_owned(
     debug_state_path: Option<&PathBuf>,
     ownership: Option<(crate::carrier::CarrierRuntime, crate::carrier::CarrierLease)>,
 ) -> Result<RunResult, RuntimeError> {
-    // Arm the one carrier's deadlock watchdog. Logical fork children advance
-    // the same carrier-global counter; no host-child re-arm exists.
-    crate::deadlock_watchdog::arm();
+    // The carrier's deadlock watchdog is NOT armed here. Its window is a typed
+    // parameter now (`deadlock_watchdog::DeadlockWindow`), stated by the caller
+    // that owns the run's budget — `carrick-embed`'s carrier budget arms it for
+    // the signed test lane. This call site had no window to state: it read a
+    // deleted environment variable and was a no-op without it, which is how a
+    // spinning carrier ran for 29m45s with a watchdog "present".
     // Back the guest's default fd table with real host descriptors. Every
     // guest-visible file is a host fd, so the carrier's own `RLIMIT_NOFILE`
     // (macOS starts at 256) must cover the guest default plus headroom, or
@@ -3130,6 +3133,12 @@ mod tests {
             // production host-process creation, which is what this inventory
             // is shrinking toward zero.
             ("vcpu_loop/signal.rs", [2, 0, 0]),
+            // An explicit OPERATOR BOUNDARY, not guest execution: the one
+            // `sudo -n lldb` the wedge capture runs to describe a carrier that
+            // can no longer describe itself. It spawns no guest, carries no
+            // Linux task, and exists precisely because the in-process sink
+            // cannot be reached from a spinning executor.
+            ("wedge_capture.rs", [0, 0, 1]),
         ]);
         let patterns = [
             ["unsafe { libc::", "fork()"].concat(),

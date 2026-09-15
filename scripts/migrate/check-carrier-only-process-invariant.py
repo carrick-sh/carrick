@@ -117,6 +117,17 @@ REVIEWED_OPERATOR_LIMITS = {
     (PurePosixPath("crates/carrick-cli/src/trace_cli.rs"), "exec_trace_under_sudo", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/trace_profile.rs"), "git_dirty", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/trace_profile.rs"), "command_output", "process_command"): 1,
+    # The wedge capture's `sudo -n lldb`: the same operator tool the CLI's
+    # `run_lldb_attach` is allowed, moved to where a wedged carrier can reach
+    # it. It creates no guest process and carries no Linux task; it exists
+    # because a spinning executor cannot reach the in-process abort sink, and
+    # the alternative is the 29m45s spin that ended only when a human attached
+    # the same debugger by hand.
+    (
+        PurePosixPath("crates/carrick-runtime/src/wedge_capture.rs"),
+        "run",
+        "process_command",
+    ): 1,
 }
 REVIEWED_PROBE_LIMITS = {
     (PurePosixPath("crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs"), "live_fork", "fork"): 1,
