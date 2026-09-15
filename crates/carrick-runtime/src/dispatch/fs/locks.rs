@@ -1312,7 +1312,7 @@ impl<'a> FsView<'a> {
 }
 
 /// Publish a pipe readiness edge from retained operation identity. Unlike
-/// [`SyscallDispatcher::fasync_notify_after_write`], this never resolves a
+/// `fasync_notify_after_write`, this never resolves a
 /// numeric guest fd after the operation has parked.
 pub(in crate::dispatch) fn fasync_notify_pipe_write(
     kernel: &Arc<crate::kernel::Kernel>,
