@@ -713,6 +713,8 @@ pub use abi_args::{Fd, GuestLen, GuestPtr, HostFd, HostPid, NsPid, Pid, Signal};
 use fd_table::*;
 
 pub mod wait_authority;
+#[cfg(test)]
+pub(crate) mod wait_queue_fixture;
 pub use wait_authority::WaitFds;
 pub(crate) use wait_authority::{InternalWaitKind, WaitFdAuthority};
 
