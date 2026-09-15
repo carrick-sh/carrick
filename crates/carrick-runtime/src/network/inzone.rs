@@ -158,7 +158,7 @@ impl InZoneListener {
                     server_state.peer_sockaddr =
                         Some(SocketAddr::new(IpAddr::V4(v4), peer_v6.port()));
                 }
-                // When mapping is absent, leave sockaddr unchanged. On an IPv4 listener this
+                // Without an IPv4-mapped form, leave sockaddr unchanged. On an IPv4 listener this
                 // branch is unreachable by construction because in-zone loopback connects to an
                 // IPv4 listener must resolve through an IPv4 address or an IPv4-mapped IPv6 address.
             }
@@ -167,7 +167,7 @@ impl InZoneListener {
                     server_state.local_sockaddr =
                         Some(SocketAddr::new(IpAddr::V4(v4), local_v6.port()));
                 }
-                // When mapping is absent, leave sockaddr unchanged. Unreachable by construction
+                // Without an IPv4-mapped form, leave sockaddr unchanged. Unreachable by construction
                 // on an IPv4 listener.
             }
         }
