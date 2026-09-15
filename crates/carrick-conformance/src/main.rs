@@ -24,7 +24,8 @@ mod verdict;
 use crate::closure::{ClosurePolicy, validate_closure_reports, validate_closure_selection};
 use crate::manifest::{Ecosystem, Manifest, Suite, Tier, Weight};
 use crate::verdict::{
-    Baseline, PerfSummary, SideSummary, SuiteReport, Verdict, classify, classify_closure,
+    Baseline, CarrickRunFacts, PerfSummary, SideSummary, SuiteReport, Verdict, classify,
+    classify_closure,
 };
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -960,6 +961,16 @@ fn build_report(
             None,
         ),
     };
+    let deadline = cout.map(|o| o.deadline);
+    // Only meaningful on a TIMEOUT, and only when the host answered. A
+    // transcript still growing at the kill outranks the duty/load ladder:
+    // `[blocked]` must never be printed for a run that was demonstrably making
+    // progress.
+    let timeout_kind = cout.and_then(|o| {
+        o.timeout_evidence.map(|e| {
+            engine::classify_timeout_with_progress(&e, o.elapsed_ms, engine::PROGRESS_WINDOW_MS)
+        })
+    });
 
     let c_res = match policy {
         ClassificationPolicy::Closure => {
@@ -968,11 +979,14 @@ fn build_report(
         ClassificationPolicy::Baseline(_) => parsers::parse(verdict_kind(s), &c_raw),
     };
     let d_res = &docker.result;
+    let facts = || CarrickRunFacts {
+        timed_out: c_timed,
+        deadline,
+        result: &c_res,
+    };
     let cl = match policy {
-        ClassificationPolicy::Closure => {
-            classify_closure(s, &c_res, c_timed, d_res, docker.timed_out)
-        }
-        ClassificationPolicy::Baseline(baseline) => classify(s, &c_res, c_timed, d_res, baseline),
+        ClassificationPolicy::Closure => classify_closure(s, facts(), d_res, docker.timed_out),
+        ClassificationPolicy::Baseline(baseline) => classify(s, facts(), d_res, baseline),
     };
 
     SuiteReport {
@@ -990,15 +1004,8 @@ fn build_report(
             totals: d_res.totals.clone(),
         },
         perf: c_elapsed_ms.map(|elapsed_ms| perf_summary(elapsed_ms, docker.elapsed_ms)),
-        // Only meaningful on a TIMEOUT, and only when the host answered. A
-        // transcript still growing at the kill outranks the duty/load ladder:
-        // `[blocked]` must never be printed for a run that was demonstrably
-        // making progress.
-        timeout_kind: cout.and_then(|o| {
-            o.timeout_evidence.map(|e| {
-                engine::classify_timeout_with_progress(&e, o.elapsed_ms, engine::PROGRESS_WINDOW_MS)
-            })
-        }),
+        timeout_kind,
+        deadline,
         new_diffs: cl.new_diffs,
         known_diffs: cl.known_diffs,
         carrick_run_id: c_runid,
@@ -1285,7 +1292,12 @@ fn timeout_blocks_bless(kind: Option<crate::engine::TimeoutKind>) -> bool {
 
 fn bless_blocks(target: BlessTarget, verdict: Verdict) -> bool {
     match verdict {
-        Verdict::Incomplete | Verdict::Timeout | Verdict::CarrickCrash => true,
+        // A BUDGET_KILL has no measured result at all, so there is nothing to
+        // bless — and unlike a starved timeout it is not a measurement waiver:
+        // the operator's deadline cut it off, not a busy box.
+        Verdict::Incomplete | Verdict::Timeout | Verdict::BudgetKill | Verdict::CarrickCrash => {
+            true
+        }
         Verdict::OracleFail => matches!(target, BlessTarget::SharedBaseline),
         Verdict::Match | Verdict::Diff | Verdict::Regression | Verdict::New => false,
     }
@@ -2377,6 +2389,11 @@ mod tests {
             elapsed_ms: 1,
             run_id: "closure-parser-test".into(),
             argv: Vec::new(),
+            deadline: engine::CarrickDeadline {
+                declared_s: 30,
+                effective_s: 30,
+                origin: engine::DeadlineOrigin::Declared,
+            },
             timeout_evidence: None,
         };
         let raw = parsers::Raw {
@@ -2731,6 +2748,7 @@ mod tests {
             },
             perf: None,
             timeout_kind,
+            deadline: None,
             new_diffs: Vec::new(),
             known_diffs: Vec::new(),
             carrick_run_id: "conf-test-c00".to_string(),
@@ -2777,6 +2795,39 @@ mod tests {
         assert!(gate.carried.is_empty());
     }
 
+    /// A BUDGET_KILL has no measured result, so it can never enter the blessed
+    /// baseline — and it is NOT a measurement waiver like `Starved`: the box was
+    /// not at fault, the operator's diagnostic deadline was. It blocks until
+    /// Phase 1b confirms it serially, or until `--allow-hang` names it.
+    #[test]
+    fn budget_kill_blocks_bless_and_is_not_a_measurement_waiver() {
+        use crate::engine::TimeoutKind;
+        let target = BlessTarget::SharedBaseline;
+        let reports = [
+            gate_report(
+                "go-go_types",
+                Verdict::BudgetKill,
+                Some(TimeoutKind::Progressing),
+            ),
+            gate_report("ltp-fine", Verdict::Match, None),
+        ];
+
+        let gate = bless_gate(target, &reports, &[]);
+        assert_eq!(gate.blocking, vec!["go-go_types"]);
+        assert!(
+            gate.starved.is_empty(),
+            "a budget kill measured the operator's deadline, not a busy box"
+        );
+        assert!(gate.carried.is_empty());
+        assert!(bless_blocks(target, Verdict::BudgetKill));
+
+        // `--allow-hang` still carries it by name, withheld from the artifact.
+        let allow = vec!["go-go_types".to_string()];
+        let gate = bless_gate(target, &reports, &allow);
+        assert!(gate.blocking.is_empty());
+        assert_eq!(gate.carried, vec!["go-go_types"]);
+    }
+
     /// An allowlist entry that no longer hangs is reported as stale, so a fixed
     /// suite's waiver gets pruned instead of silently exempting it forever.
     #[test]
@@ -2817,6 +2868,7 @@ mod tests {
             },
             perf: Some(perf_summary(10_000, Some(1_000))),
             timeout_kind: None,
+            deadline: None,
             new_diffs: Vec::new(),
             known_diffs: Vec::new(),
             carrick_run_id: "conf-test-c00".to_string(),
