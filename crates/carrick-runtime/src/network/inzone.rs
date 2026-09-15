@@ -151,6 +151,34 @@ impl InZoneListener {
     }
 
     fn enqueue_reserved(&self, server_half: Arc<PureSocketInner>) {
+        if self.key.addr.0.is_ipv4() {
+            let mut server_state = server_half.state.lock();
+            if let Some(SocketAddr::V6(peer_v6)) = server_state.peer_sockaddr {
+                let v4 = peer_v6.ip().to_ipv4_mapped().unwrap_or(Ipv4Addr::LOCALHOST);
+                server_state.peer_sockaddr = Some(SocketAddr::new(IpAddr::V4(v4), peer_v6.port()));
+            }
+            if let Some(SocketAddr::V6(local_v6)) = server_state.local_sockaddr {
+                let v4 = local_v6
+                    .ip()
+                    .to_ipv4_mapped()
+                    .unwrap_or(Ipv4Addr::LOCALHOST);
+                server_state.local_sockaddr =
+                    Some(SocketAddr::new(IpAddr::V4(v4), local_v6.port()));
+            }
+            if let Some(client_weak) = &server_state.peer
+                && let Some(client_half) = client_weak.upgrade()
+            {
+                let mut client_state = client_half.state.lock();
+                if let Some(SocketAddr::V6(client_local_v6)) = client_state.local_sockaddr {
+                    if client_local_v6.ip().is_loopback() {
+                        client_state.local_sockaddr = Some(SocketAddr::new(
+                            IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+                            client_local_v6.port(),
+                        ));
+                    }
+                }
+            }
+        }
         let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
         self.admissions.fetch_sub(1, Ordering::SeqCst);
         queue.push_back(server_half);
@@ -731,8 +759,16 @@ impl InZoneRegistry {
         let target_ip = target.0.ip();
         let target_port = target.0.port();
 
+        let mapped_v4 = match target_ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+            _ => None,
+        };
+        let is_loopback = target_ip.is_loopback() || mapped_v4.is_some_and(|v4| v4.is_loopback());
+        let is_scope = self.is_scope_address(scope, &target_ip)
+            || mapped_v4.is_some_and(|v4| self.is_scope_address(scope, &IpAddr::V4(v4)));
+
         // Must be loopback or scope-local address
-        if !target_ip.is_loopback() && !self.is_scope_address(scope, &target_ip) {
+        if !is_loopback && !is_scope {
             return None;
         }
 
@@ -770,9 +806,24 @@ impl InZoneRegistry {
             }
         }
 
+        // Connect to an IPv4-mapped IPv6 address (::ffff:a.b.c.d:PORT) resolves
+        // to an exact IPv4 listener on that port.
+        if let Some(v4) = mapped_v4 {
+            let v4_key = InZoneListenerKey {
+                scope: scope.clone(),
+                addr: GuestSocketAddr(SocketAddr::new(IpAddr::V4(v4), target_port)),
+            };
+            if let Some(group) = listeners.get(&v4_key)
+                && let Some(best) = group.iter().min_by_key(|l| l.pending())
+            {
+                return Some(Arc::clone(best));
+            }
+        }
+
         // 2. Wildcard match (0.0.0.0 or ::)
-        let wildcard_keys = match target.0 {
-            SocketAddr::V4(_) => vec![
+        let is_v4_like = matches!(target.0, SocketAddr::V4(_)) || mapped_v4.is_some();
+        let wildcard_keys = if is_v4_like {
+            vec![
                 InZoneListenerKey {
                     scope: scope.clone(),
                     addr: GuestSocketAddr(SocketAddr::new(
@@ -787,14 +838,15 @@ impl InZoneRegistry {
                         target_port,
                     )),
                 },
-            ],
-            SocketAddr::V6(_) => vec![InZoneListenerKey {
+            ]
+        } else {
+            vec![InZoneListenerKey {
                 scope: scope.clone(),
                 addr: GuestSocketAddr(SocketAddr::new(
                     IpAddr::V6(Ipv6Addr::UNSPECIFIED),
                     target_port,
                 )),
-            }],
+            }]
         };
 
         for wkey in wildcard_keys {
@@ -805,7 +857,7 @@ impl InZoneRegistry {
                         // A v6-only wildcard has a separate IPv4 port space.
                         // It must not receive an IPv4 connect merely because
                         // the in-zone resolver also considers [::] wildcard.
-                        !matches!(target.0, SocketAddr::V4(_)) || !listener.ipv6_v6only()
+                        !is_v4_like || !listener.ipv6_v6only()
                     })
                     .min_by_key(|listener| listener.pending())
             {
@@ -1557,5 +1609,71 @@ mod tests {
             .is_none()
         );
         reg.release_port(mapped);
+    }
+
+    #[test]
+    fn v4mapped_target_resolves_to_exact_and_wildcard_v4_listeners() {
+        let reg = InZoneRegistry::default();
+        let scope = InZoneScope::CarrierHost;
+
+        // 1. Exact IPv4 listener
+        let exact_listener = reg.register(
+            InZoneListenerKey {
+                scope: scope.clone(),
+                addr: GuestSocketAddr("127.0.0.1:49479".parse().unwrap()),
+            },
+            8,
+            false,
+            false,
+        );
+        assert!(Arc::ptr_eq(
+            &reg.resolve(
+                &scope,
+                GuestSocketAddr("[::ffff:127.0.0.1]:49479".parse().unwrap())
+            )
+            .expect("v4-mapped target resolves to exact IPv4 listener"),
+            &exact_listener
+        ));
+        reg.unregister(&exact_listener);
+
+        // 2. Wildcard 0.0.0.0 listener
+        let wildcard_v4_listener = reg.register(
+            InZoneListenerKey {
+                scope: scope.clone(),
+                addr: GuestSocketAddr("0.0.0.0:49480".parse().unwrap()),
+            },
+            8,
+            false,
+            false,
+        );
+        assert!(Arc::ptr_eq(
+            &reg.resolve(
+                &scope,
+                GuestSocketAddr("[::ffff:127.0.0.1]:49480".parse().unwrap())
+            )
+            .expect("v4-mapped target resolves to 0.0.0.0 listener"),
+            &wildcard_v4_listener
+        ));
+        reg.unregister(&wildcard_v4_listener);
+
+        // 3. V6ONLY [::] listener does NOT match v4-mapped target
+        let v6only_listener = reg.register(
+            InZoneListenerKey {
+                scope: scope.clone(),
+                addr: GuestSocketAddr("[::]:49481".parse().unwrap()),
+            },
+            8,
+            false,
+            true,
+        );
+        assert!(
+            reg.resolve(
+                &scope,
+                GuestSocketAddr("[::ffff:127.0.0.1]:49481".parse().unwrap())
+            )
+            .is_none(),
+            "v4-mapped target must not resolve to a V6ONLY [::] listener"
+        );
+        reg.unregister(&v6only_listener);
     }
 }

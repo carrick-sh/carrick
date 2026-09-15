@@ -27,7 +27,10 @@
 //!       endpoint preservation through connect, accepted peer comparison, dup/close and competing binds;
 //!   16. `failed_connect_rollback_v4`: failed connect rollback of bound local endpoint against non-listening target (IPv4);
 //!   17. `failed_connect_rollback_v6`: failed connect rollback of bound local endpoint against non-listening target (IPv6);
-//!   18. `bind_admission_matrix`: TCP SO_REUSEADDR/SO_REUSEPORT and IPv4/IPv6 bind conflicts.
+//!   18. `bind_admission_matrix`: TCP SO_REUSEADDR/SO_REUSEPORT and IPv4/IPv6 bind conflicts;
+//!   19. `v4mapped_client_to_v4_listener`: IPv4 listener on 127.0.0.1:0 and, separately, on 0.0.0.0:0,
+//!       AF_INET6 client bound to [::]:0 connecting to ::ffff:127.0.0.1:PORT,
+//!       address reflection, echo transfer, and IPV6_V6ONLY connect rejection.
 //!
 //! Output is deterministic `key=value` lines only. Every wait is bounded by a
 //! `poll` with a 5 s cap so a lost wake is a false line, never a hang.
@@ -259,6 +262,23 @@ impl EndpointHelper {
             let err = if rc == 0 { 0 } else { errno() };
             libc::close(fd);
             (rc, err)
+        }
+    }
+
+    fn format_family_and_addr(storage: &libc::sockaddr_storage) -> (i32, String) {
+        unsafe {
+            let family = storage.ss_family as i32;
+            if family == libc::AF_INET {
+                let sin = &*(storage as *const _ as *const libc::sockaddr_in);
+                let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                (family, ip.to_string())
+            } else if family == libc::AF_INET6 {
+                let sin6 = &*(storage as *const _ as *const libc::sockaddr_in6);
+                let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+                (family, ip.to_string())
+            } else {
+                (family, "none".to_string())
+            }
         }
     }
 }
@@ -1122,6 +1142,217 @@ unsafe fn run_v6_to_v4_bind_admission_case(v6only: bool, mapped: bool) -> BindAd
         second_listen_errno,
         cleanup_ok,
     }
+}
+
+#[derive(Debug, Clone)]
+struct V4MappedCaseResult {
+    connect_ret: i32,
+    connect_errno: i32,
+    accepted_peer_family: i32,
+    accepted_peer_addr: String,
+    client_peer_family: i32,
+    client_peer_addr: String,
+    client_sockname_family: i32,
+    client_sockname_addr: String,
+    echo_ok: bool,
+}
+
+unsafe fn run_v4mapped_case(bind_kind: BindKind) -> V4MappedCaseResult {
+    let (l_storage, l_len) = match bind_kind {
+        BindKind::Loopback => EndpointHelper::loopback_storage_v4(0),
+        BindKind::Wildcard => EndpointHelper::wildcard_storage_v4(0),
+    };
+    let listener = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+    let l_bind_rc = if listener >= 0 {
+        libc::bind(
+            listener,
+            &l_storage as *const _ as *const libc::sockaddr,
+            l_len,
+        )
+    } else {
+        -1
+    };
+    let listen_rc = if l_bind_rc == 0 {
+        libc::listen(listener, 4)
+    } else {
+        -1
+    };
+    let (_, _, l_bound, _) = if listen_rc == 0 {
+        EndpointHelper::getsockname(listener)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let listen_port_be = EndpointHelper::get_port_be(&l_bound);
+
+    let client = libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0);
+    let (c_bind, c_bind_len) = EndpointHelper::wildcard_storage_v6(0);
+    let c_bind_rc = if client >= 0 {
+        libc::bind(
+            client,
+            &c_bind as *const _ as *const libc::sockaddr,
+            c_bind_len,
+        )
+    } else {
+        -1
+    };
+    let (target, target_len) = EndpointHelper::mapped_loopback_storage_v6(listen_port_be);
+    let (connect_ret, connect_errno) = if client >= 0 && c_bind_rc == 0 && listen_port_be != 0 {
+        let rc = libc::connect(
+            client,
+            &target as *const _ as *const libc::sockaddr,
+            target_len,
+        );
+        let err = if rc < 0 { errno() } else { 0 };
+        (rc, err)
+    } else {
+        (-1, libc::EBADF)
+    };
+
+    let accepted = if listener >= 0 {
+        let mut pfd_listen = libc::pollfd {
+            fd: listener,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let p_rc = libc::poll(&mut pfd_listen, 1, 5000);
+        if p_rc > 0 && (pfd_listen.revents & libc::POLLIN) != 0 {
+            libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut())
+        } else {
+            -1
+        }
+    } else {
+        -1
+    };
+
+    let (accepted_peer_family, accepted_peer_addr) = if accepted >= 0 {
+        let (rc, _, storage, _) = EndpointHelper::getpeername(accepted);
+        if rc == 0 {
+            EndpointHelper::format_family_and_addr(&storage)
+        } else {
+            (-1, "none".to_string())
+        }
+    } else {
+        (-1, "none".to_string())
+    };
+
+    let (client_peer_family, client_peer_addr) = if client >= 0 && connect_ret == 0 {
+        let (rc, _, storage, _) = EndpointHelper::getpeername(client);
+        if rc == 0 {
+            EndpointHelper::format_family_and_addr(&storage)
+        } else {
+            (-1, "none".to_string())
+        }
+    } else {
+        (-1, "none".to_string())
+    };
+
+    let (client_sockname_family, client_sockname_addr) = if client >= 0 {
+        let (rc, _, storage, _) = EndpointHelper::getsockname(client);
+        if rc == 0 {
+            EndpointHelper::format_family_and_addr(&storage)
+        } else {
+            (-1, "none".to_string())
+        }
+    } else {
+        (-1, "none".to_string())
+    };
+
+    let echo_ok = if connect_ret == 0 && accepted >= 0 {
+        test_stream_transfer(client, accepted)
+    } else {
+        false
+    };
+
+    if client >= 0 {
+        libc::close(client);
+    }
+    if accepted >= 0 {
+        libc::close(accepted);
+    }
+    if listener >= 0 {
+        libc::close(listener);
+    }
+
+    V4MappedCaseResult {
+        connect_ret,
+        connect_errno,
+        accepted_peer_family,
+        accepted_peer_addr,
+        client_peer_family,
+        client_peer_addr,
+        client_sockname_family,
+        client_sockname_addr,
+        echo_ok,
+    }
+}
+
+unsafe fn run_v4mapped_v6only_listener_case() -> (i32, i32) {
+    let listener = libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0);
+    let (l_storage, l_len) = EndpointHelper::wildcard_storage_v6(0);
+    let one: libc::c_int = 1;
+    let s_rc = if listener >= 0 {
+        libc::setsockopt(
+            listener,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    } else {
+        -1
+    };
+    let l_bind_rc = if s_rc == 0 {
+        libc::bind(
+            listener,
+            &l_storage as *const _ as *const libc::sockaddr,
+            l_len,
+        )
+    } else {
+        -1
+    };
+    let listen_rc = if l_bind_rc == 0 {
+        libc::listen(listener, 4)
+    } else {
+        -1
+    };
+    let (_, _, l_bound, _) = if listen_rc == 0 {
+        EndpointHelper::getsockname(listener)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let listen_port_be = EndpointHelper::get_port_be(&l_bound);
+
+    let client = libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0);
+    let (c_bind, c_bind_len) = EndpointHelper::wildcard_storage_v6(0);
+    let c_bind_rc = if client >= 0 {
+        libc::bind(
+            client,
+            &c_bind as *const _ as *const libc::sockaddr,
+            c_bind_len,
+        )
+    } else {
+        -1
+    };
+    let (target, target_len) = EndpointHelper::mapped_loopback_storage_v6(listen_port_be);
+    let (connect_ret, connect_errno) = if client >= 0 && c_bind_rc == 0 && listen_port_be != 0 {
+        let rc = libc::connect(
+            client,
+            &target as *const _ as *const libc::sockaddr,
+            target_len,
+        );
+        let err = if rc < 0 { errno() } else { 0 };
+        (rc, err)
+    } else {
+        (-1, libc::EBADF)
+    };
+
+    if client >= 0 {
+        libc::close(client);
+    }
+    if listener >= 0 {
+        libc::close(listener);
+    }
+    (connect_ret, connect_errno)
 }
 
 fn main() {
@@ -2349,6 +2580,35 @@ fn main() {
             mapped_v6_v6only_listen_ret = mapped_v6only.first_listen_ret,
             mapped_v6_v6only_listen_errno = mapped_v6only.first_listen_errno,
             mapped_v6_v6only_cleanup_ok = mapped_v6only.cleanup_ok,
+        );
+
+        // ---------------------------------------------------------------------
+        // Case 18: v4mapped_client_to_v4_listener
+        // ---------------------------------------------------------------------
+        let res_v4mapped_exact = run_v4mapped_case(BindKind::Loopback);
+        let res_v4mapped_wildcard = run_v4mapped_case(BindKind::Wildcard);
+        let (v4mapped_v6only_ret, v4mapped_v6only_errno) = run_v4mapped_v6only_listener_case();
+        report!(
+            v4mapped_exact_connect_ret = res_v4mapped_exact.connect_ret,
+            v4mapped_exact_connect_errno = res_v4mapped_exact.connect_errno,
+            v4mapped_exact_accepted_peer_family = res_v4mapped_exact.accepted_peer_family,
+            v4mapped_exact_accepted_peer_addr = res_v4mapped_exact.accepted_peer_addr,
+            v4mapped_exact_client_peer_family = res_v4mapped_exact.client_peer_family,
+            v4mapped_exact_client_peer_addr = res_v4mapped_exact.client_peer_addr,
+            v4mapped_exact_client_sockname_family = res_v4mapped_exact.client_sockname_family,
+            v4mapped_exact_client_sockname_addr = res_v4mapped_exact.client_sockname_addr,
+            v4mapped_exact_echo_ok = res_v4mapped_exact.echo_ok,
+            v4mapped_wildcard_connect_ret = res_v4mapped_wildcard.connect_ret,
+            v4mapped_wildcard_connect_errno = res_v4mapped_wildcard.connect_errno,
+            v4mapped_wildcard_accepted_peer_family = res_v4mapped_wildcard.accepted_peer_family,
+            v4mapped_wildcard_accepted_peer_addr = res_v4mapped_wildcard.accepted_peer_addr,
+            v4mapped_wildcard_client_peer_family = res_v4mapped_wildcard.client_peer_family,
+            v4mapped_wildcard_client_peer_addr = res_v4mapped_wildcard.client_peer_addr,
+            v4mapped_wildcard_client_sockname_family = res_v4mapped_wildcard.client_sockname_family,
+            v4mapped_wildcard_client_sockname_addr = res_v4mapped_wildcard.client_sockname_addr,
+            v4mapped_wildcard_echo_ok = res_v4mapped_wildcard.echo_ok,
+            v4mapped_v6only_connect_ret = v4mapped_v6only_ret,
+            v4mapped_v6only_connect_errno = v4mapped_v6only_errno,
         );
     }
 }
