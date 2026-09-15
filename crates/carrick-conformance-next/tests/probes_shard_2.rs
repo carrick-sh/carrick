@@ -318,7 +318,10 @@ fn generic_probe_shard_2() {
                 common::generic_probe_container(probe_name, &probe_path, &probeinit_path);
 
             eprintln!("RUN generic probe shard 2 {target_triple}:{probe_name}");
-            let outcome = common::with_empty_stdin_pipe(|| container.run(["/tmp/carrick-init"]));
+            let outcome = common::timed_probe_run(
+                &format!("generic probe shard 2 {target_triple}:{probe_name}"),
+                || common::with_empty_stdin_pipe(|| container.run(["/tmp/carrick-init"])),
+            );
             let result = common::run_named_or_fail(
                 &format!("generic probe shard 2 {target_triple}:{probe_name}"),
                 outcome,

@@ -9,6 +9,9 @@ use std::time::Duration;
 
 pub mod invariants;
 
+pub use crate::deadline::{
+    COLD_START_ALLOWANCE_MS, DEFAULT_CARRIER_BUDGET_MS, effective_carrier_budget,
+};
 pub use crate::testing::invariants::{
     EveryChildRuns, ExitBudget, ExitBudgetMatcher, FirstTouchNeverDelivered, InvariantKind,
     NoOrphanZombie, NoWakeOfReapedTask, ProcessGraphLiveness,
@@ -53,7 +56,11 @@ pub struct TestContainer {
     every_child_runs_timeout: Option<Duration>,
     /// `None` until a test body arms `ExitBudget` — see [`Self::exit_budget`].
     exit_budget: Option<(ExitBudgetMatcher, Duration)>,
-    deadline: Option<std::time::Duration>,
+    /// `None` means "the measured default", NOT "unbounded" — see
+    /// [`Self::carrier_budget`].
+    carrier_budget: Option<std::time::Duration>,
+    /// Names this container's wedge-capture artifact directory.
+    label: Option<String>,
 }
 
 impl std::fmt::Debug for TestContainer {
@@ -70,7 +77,8 @@ impl std::fmt::Debug for TestContainer {
             .field("pull", &self.pull)
             .field("observers_count", &self.observers.len())
             .field("interceptors_count", &self.interceptors.len())
-            .field("deadline", &self.deadline)
+            .field("carrier_budget", &self.carrier_budget)
+            .field("label", &self.label)
             .finish()
     }
 }
@@ -95,7 +103,8 @@ impl TestContainer {
             disabled_invariants: BTreeSet::new(),
             every_child_runs_timeout: None,
             exit_budget: None,
-            deadline: None,
+            carrier_budget: None,
+            label: None,
         }
     }
 
@@ -194,20 +203,44 @@ impl TestContainer {
         installed
     }
 
-    /// Bound every [`Self::run`] by wall clock, ending in a POST-MORTEM.
+    /// Replace the measured default wall-clock bound on every run of this
+    /// container. The bound is ARMED whether or not this is called.
     ///
     /// On expiry the kernel is aborted through the one fail-closed sink and
     /// the run returns [`EmbedError::KernelAborted`] carrying the kernel
     /// graph, its findings and the event ring — instead of a host `SIGKILL`
-    /// that leaves an exit code and nothing to read.
+    /// that leaves an exit code and nothing to read. When even that abort
+    /// cannot be consumed (a spinning executor never reaches a supervised
+    /// wait), the carrier is captured from outside and the run returns
+    /// [`EmbedError::ProbeWedged`] naming the artifacts.
     ///
-    /// This is a TEST budget, so it is a number a human chose and can be wrong
-    /// under load; the always-on `ProcessGraphLiveness` invariant is the
-    /// load-independent one. Use this as a backstop and read the post-mortem
-    /// before believing it.
-    pub fn deadline(mut self, budget: std::time::Duration) -> Self {
-        self.deadline = Some(budget);
+    /// This is a TEST budget, so it is a number measured from a green gate and
+    /// can still be wrong under load; the always-on `ProcessGraphLiveness`
+    /// invariant is the load-independent one. Use this as a backstop and read
+    /// the post-mortem before believing it. `CARRICK_PROBE_CARRIER_BUDGET_MS`
+    /// overrides it, and exactly `0` disables it for a bisection run.
+    pub fn carrier_budget(mut self, budget: std::time::Duration) -> Self {
+        self.carrier_budget = Some(budget);
         self
+    }
+
+    /// Name this container in a wedge capture's artifact directory
+    /// (`target/postmortem/<label>-<pid>/`).
+    ///
+    /// Without it a capture is attributable only by pid, which is exactly the
+    /// state the `forkstackstorm` spin was found in.
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// The budget this container's next run is bounded by, hatch and
+    /// cold-start allowance applied.
+    pub(crate) fn resolved_carrier_budget(
+        &self,
+        first_in_process: bool,
+    ) -> Option<std::time::Duration> {
+        crate::deadline::effective_carrier_budget(self.carrier_budget, first_in_process)
     }
 
     /// See [`ContainerBuilder::post_mortem_dir`]. Installed for the host
@@ -346,11 +379,31 @@ impl TestContainer {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let builder = self.builder(argv);
-        match self.deadline {
-            Some(budget) => crate::deadline::run_with_deadline(builder, budget),
+        self.execute(self.builder(argv))
+    }
+
+    /// The ONE place a built container is executed.
+    ///
+    /// Every run entry point lowers through here so the carrier budget cannot
+    /// apply to some of them: `run_with_audit` called `run_blocking` directly
+    /// and was unbounded however the container was configured, which left
+    /// every audit-based case with no bound at all.
+    fn execute(&self, builder: ContainerBuilder) -> Result<ContainerResult, EmbedError> {
+        let first_in_process = claim_first_container();
+        let plan = self.resolved_carrier_budget(first_in_process);
+        #[cfg(test)]
+        crate::deadline::record_run_plan(plan);
+        match plan {
+            Some(budget) => {
+                crate::deadline::run_with_carrier_budget(builder, budget, &self.capture_label())
+            }
             None => builder.run_blocking(),
         }
+    }
+
+    /// What a wedge capture of this container is filed under.
+    fn capture_label(&self) -> String {
+        self.label.clone().unwrap_or_else(|| self.image.clone())
     }
 
     /// Run `argv` with a fresh [`AuditObserver`] installed with fast-path visibility enabled.
@@ -367,9 +420,19 @@ impl TestContainer {
         let audit = Arc::new(AuditObserver::new().require_fast_path_visibility());
         let mut builder = self.builder(argv);
         builder = builder.observer(Arc::clone(&audit) as Arc<dyn SyscallObserver>);
-        let result = builder.run_blocking()?;
+        let result = self.execute(builder)?;
         Ok((result, audit))
     }
+}
+
+/// Has a container already run in this host process?
+///
+/// Only the FIRST one pays image resolution and a cold guest, so only it gets
+/// the cold-start allowance. Carrier-global because the cost is: the image
+/// store and the guest page cache are process-wide, not per container.
+fn claim_first_container() -> bool {
+    static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    !SEEN.swap(true, std::sync::atomic::Ordering::AcqRel)
 }
 
 /// `ContainerBuilder::from_image(image).command(cmd).run_blocking()`.
@@ -508,6 +571,89 @@ mod tests {
         assert_eq!(container.interceptors.len(), 2);
         assert!(Arc::ptr_eq(&container.interceptors[0], &first));
         assert!(Arc::ptr_eq(&container.interceptors[1], &second));
+    }
+
+    /// A carrier bound that ships OFF is abandoned, not shipped: no probe ever
+    /// called `deadline`, so a spinning carrier ran 29m45s inside
+    /// `just conformance-probes` until a human noticed it.
+    #[test]
+    fn carrier_budget_is_armed_by_default() {
+        let container = TestContainer::new("ubuntu:24.04");
+        assert_eq!(
+            container.carrier_budget, None,
+            "no test body named a budget here"
+        );
+        assert!(
+            container.resolved_carrier_budget(false).is_some(),
+            "an unconfigured container must still be bounded"
+        );
+    }
+
+    /// The hatch is EXACT: only `0` disables, and any other value replaces the
+    /// budget for a bisection run.
+    #[test]
+    fn zero_is_the_exact_hatch() {
+        let requested = Some(Duration::from_millis(5_000));
+        assert_eq!(
+            crate::deadline::resolve_carrier_budget(Some(0), requested, false),
+            None
+        );
+        assert_eq!(
+            crate::deadline::resolve_carrier_budget(Some(0), None, true),
+            None
+        );
+        assert_eq!(
+            crate::deadline::resolve_carrier_budget(Some(250), requested, false),
+            Some(Duration::from_millis(250)),
+            "an operator value replaces the container's own budget"
+        );
+        assert_eq!(
+            crate::deadline::resolve_carrier_budget(None, requested, false),
+            requested
+        );
+    }
+
+    /// The first container in a host process pays for image resolution and a
+    /// cold guest, which is why a default 10s `exit_budget` aborted the probe
+    /// lane's first case. The allowance is added by the layer that knows which
+    /// container is first, so no caller can forget it.
+    #[test]
+    fn the_first_container_in_a_process_carries_the_cold_start_allowance() {
+        let steady = crate::deadline::resolve_carrier_budget(None, None, false).expect("steady");
+        let cold = crate::deadline::resolve_carrier_budget(None, None, true).expect("cold");
+        assert!(
+            cold > steady,
+            "cold start {cold:?} must exceed the steady budget {steady:?}"
+        );
+        assert_eq!(
+            cold - steady,
+            Duration::from_millis(crate::deadline::COLD_START_ALLOWANCE_MS)
+        );
+    }
+
+    /// `run_with_audit` used to call `run_blocking` directly, so every
+    /// audit-based case was unbounded however the container was configured.
+    /// Both entry points now lower through one execution path.
+    #[test]
+    fn run_with_audit_is_bounded_too() {
+        let container = TestContainer::new("");
+        crate::deadline::forget_last_run_plan();
+        let _ = container.run(["/bin/true"]);
+        let direct = crate::deadline::last_run_plan().expect("run must record its plan");
+        crate::deadline::forget_last_run_plan();
+        let _ = container.run_with_audit(["/bin/true"]);
+        let audited = crate::deadline::last_run_plan().expect("run_with_audit must record a plan");
+        assert!(direct.is_some(), "run must be bounded");
+        // The second run in this process is never the first container, so its
+        // plan is exactly the steady budget — the same number `run` lowered to,
+        // modulo the cold-start allowance whichever ran first consumed.
+        assert_eq!(
+            audited,
+            Some(Duration::from_millis(
+                crate::deadline::DEFAULT_CARRIER_BUDGET_MS
+            )),
+            "run_with_audit must apply the same budget as run"
+        );
     }
 
     fn installed_kinds(container: &TestContainer) -> Vec<InvariantKind> {
