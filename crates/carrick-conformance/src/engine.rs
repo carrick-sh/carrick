@@ -27,6 +27,10 @@ pub struct RunOutput {
     pub elapsed_ms: u64,
     pub run_id: String,
     pub argv: Vec<String>,
+    /// The deadline this run was actually held to, and WHICH budget produced
+    /// it. Recorded by construction so the classifier never has to infer the
+    /// provenance from elapsed-vs-budget arithmetic.
+    pub deadline: CarrickDeadline,
     /// Evidence captured at the moment of a TIMEOUT, so the verdict can say
     /// WHY the deadline was missed instead of just that it was. `None` when the
     /// run did not time out (or the host could not answer).
@@ -662,6 +666,7 @@ fn run_one(
         elapsed_ms: elapsed_ms(start.elapsed()),
         run_id: run_id.to_string(),
         argv,
+        deadline: deadline_budget,
         timeout_evidence,
     })
 }

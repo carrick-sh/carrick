@@ -24,6 +24,11 @@ pub enum Verdict {
     New,
     CarrickCrash,
     Timeout,
+    /// Cut off at the operator's Carrick-only diagnostic budget, BELOW the
+    /// suite's own declaration. Non-gating (it proves nothing about
+    /// correctness) and bless-blocking (there is no measured result to bless);
+    /// Phase 1b re-runs it serially at the declared budget for its real verdict.
+    BudgetKill,
     OracleFail,
 }
 
@@ -37,6 +42,7 @@ impl Verdict {
             Verdict::New => "NEW",
             Verdict::CarrickCrash => "CARRICK_CRASH",
             Verdict::Timeout => "TIMEOUT",
+            Verdict::BudgetKill => "BUDGET_KILL",
             Verdict::OracleFail => "ORACLE_FAIL",
         }
     }
@@ -75,6 +81,12 @@ pub struct SuiteReport {
     /// [`crate::engine::classify_timeout`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_kind: Option<crate::engine::TimeoutKind>,
+    /// The deadline the carrick run was actually held to, and which budget
+    /// produced it. `Option` (and skipped when absent) so committed baselines
+    /// and prior `results.jsonl` files written before this field existed still
+    /// parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<crate::engine::CarrickDeadline>,
     /// diverging ids that are NOT excused (the regression set, or first-obs NEW set).
     pub new_diffs: Vec<String>,
     /// diverging ids excused by known_gaps or an unchanged baseline pair.
@@ -174,18 +186,41 @@ impl Classification {
     }
 }
 
+/// Everything the classifier needs to know about the carrick side of one
+/// suite. The bare `carrick_timed_out: bool` it replaces could not say WHICH
+/// deadline fired, so "missed its own declared budget" and "was cut off by the
+/// operator's diagnostic budget" were indistinguishable at the only place a
+/// verdict is decided.
+pub struct CarrickRunFacts<'a> {
+    pub timed_out: bool,
+    /// `None` only when carrick never ran (spawn failure).
+    pub deadline: Option<crate::engine::CarrickDeadline>,
+    pub result: &'a SuiteResult,
+}
+
+impl CarrickRunFacts<'_> {
+    /// A kill at a deadline BELOW the suite's declaration. Decided by
+    /// construction from the recorded provenance, never from elapsed-vs-budget
+    /// arithmetic.
+    fn is_budget_kill(&self) -> bool {
+        self.timed_out && self.deadline.is_some_and(|d| d.is_diagnostic())
+    }
+}
+
 /// Strict, baseline-free classification for a closure run. Any missing,
 /// unequal, failed, skipped, broken, crashed, timed-out, or empty observation
 /// is a gating [`Verdict::Incomplete`]; known gaps and prior results are never
 /// consulted.
 pub fn classify_closure(
     _suite: &Suite,
-    carrick: &SuiteResult,
-    carrick_timed_out: bool,
+    facts: CarrickRunFacts<'_>,
     docker: &SuiteResult,
     docker_timed_out: bool,
 ) -> Classification {
-    let carrick = &align_descriptor_residue(carrick, docker);
+    // Closure demands a complete, identical, nonempty all-pass observation, so
+    // a truncated carrick run cannot satisfy it whichever budget truncated it.
+    let carrick_timed_out = facts.timed_out;
+    let carrick = &align_descriptor_residue(facts.result, docker);
     // Closure is stronger than regression parity: both sides must contain a
     // non-empty all-pass observation. Native failures, broken assertions and
     // skips are missing oracle evidence, even when Carrick reproduces them.
@@ -276,11 +311,12 @@ fn known_gap_match(id: &str, known_gaps: &[String]) -> bool {
 
 pub fn classify(
     suite: &Suite,
-    carrick: &SuiteResult,
-    carrick_timed_out: bool,
+    facts: CarrickRunFacts<'_>,
     docker: &SuiteResult,
     baseline: &Baseline,
 ) -> Classification {
+    let carrick = facts.result;
+    let carrick_timed_out = facts.timed_out;
     // An empty-pairs baseline entry has no per-id comparisons, so later comparable
     // output should read as NEW rather than REGRESSION. It is still a baseline
     // entry for current crash/timeout classification, otherwise stale crash rows
@@ -305,7 +341,22 @@ pub fn classify(
         };
     }
 
-    // 2. carrick crash/timeout short-circuit (one root-cause verdict, no diff storm).
+    // 2. A kill at the operator's diagnostic budget is a perf observation by
+    // construction: the adaptive deadline IS the project's 2x-Docker bar, so
+    // the run was cut off, not stuck. It cannot gate (nothing about parity was
+    // measured) and cannot be blessed (there is no result). Phase 1b re-runs it
+    // serially at the declared budget for its real verdict.
+    if facts.is_budget_kill() {
+        return Classification {
+            verdict: Verdict::BudgetKill,
+            gating: false,
+            new_diffs: vec![],
+            known_diffs: vec![],
+            pairs: BTreeMap::new(),
+        };
+    }
+
+    // 3. carrick crash/timeout short-circuit (one root-cause verdict, no diff storm).
     if carrick_timed_out || carrick.result == SuiteOutcome::None {
         let v = if carrick_timed_out {
             Verdict::Timeout
@@ -329,7 +380,7 @@ pub fn classify(
         };
     }
 
-    // 3. Both sides produced comparable output -> per-id diff.
+    // 4. Both sides produced comparable output -> per-id diff.
     let mut ids: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     ids.extend(carrick.ids.keys().map(String::as_str));
     ids.extend(docker.ids.keys().map(String::as_str));
@@ -385,6 +436,7 @@ mod tests {
 
     mod closure_outcome_equality {
         use super::super::*;
+        use super::facts;
 
         fn result(ids: &[(&str, Outcome)], outcome: SuiteOutcome) -> SuiteResult {
             let map: BTreeMap<String, Outcome> =
@@ -418,7 +470,7 @@ mod tests {
                 &[("a#1", Outcome::Ok), ("b#1", Outcome::Conf)],
                 SuiteOutcome::Success,
             );
-            let got = classify_closure(&s(), &side, false, &side.clone(), false);
+            let got = classify_closure(&s(), facts(&side, false), &side.clone(), false);
             assert_eq!(got.verdict, Verdict::Incomplete);
         }
 
@@ -430,7 +482,7 @@ mod tests {
                 &[("a#1", Outcome::Ok), ("b#1", Outcome::Fail)],
                 SuiteOutcome::Failure,
             );
-            let got = classify_closure(&s(), &side, false, &side.clone(), false);
+            let got = classify_closure(&s(), facts(&side, false), &side.clone(), false);
             assert_eq!(got.verdict, Verdict::Incomplete);
         }
 
@@ -440,14 +492,14 @@ mod tests {
         fn matched_broken_totals_are_incomplete() {
             let mut side = result(&[("a#1", Outcome::Ok)], SuiteOutcome::Success);
             side.totals.broken = 1;
-            let got = classify_closure(&s(), &side, false, &side.clone(), false);
+            let got = classify_closure(&s(), facts(&side, false), &side.clone(), false);
             assert_eq!(got.verdict, Verdict::Incomplete);
         }
 
         #[test]
         fn matched_empty_assertion_inventory_is_incomplete() {
             let side = result(&[], SuiteOutcome::Success);
-            let got = classify_closure(&s(), &side, false, &side.clone(), false);
+            let got = classify_closure(&s(), facts(&side, false), &side.clone(), false);
             assert_eq!(got.verdict, Verdict::Incomplete);
         }
 
@@ -466,7 +518,7 @@ mod tests {
             ] {
                 let mut side = result(&[("a#1", Outcome::Ok)], SuiteOutcome::Success);
                 side.ids.insert("a#1".into(), outcome);
-                let got = classify_closure(&s(), &side, false, &side.clone(), false);
+                let got = classify_closure(&s(), facts(&side, false), &side.clone(), false);
                 assert_eq!(got.verdict, Verdict::Incomplete, "{outcome:?}");
             }
         }
@@ -476,7 +528,7 @@ mod tests {
         fn result_kind_divergence_is_incomplete() {
             let a = result(&[("a#1", Outcome::Ok)], SuiteOutcome::Success);
             let b = result(&[("a#1", Outcome::Ok)], SuiteOutcome::Failure);
-            let got = classify_closure(&s(), &a, false, &b, false);
+            let got = classify_closure(&s(), facts(&a, false), &b, false);
             assert_eq!(got.verdict, Verdict::Incomplete);
         }
 
@@ -489,7 +541,7 @@ mod tests {
                 SuiteOutcome::None,
             ] {
                 let side = result(&[("a#1", Outcome::Ok)], outcome);
-                let got = classify_closure(&s(), &side, false, &side.clone(), false);
+                let got = classify_closure(&s(), facts(&side, false), &side.clone(), false);
                 assert_eq!(got.verdict, Verdict::Incomplete, "{outcome:?}");
             }
         }
@@ -499,13 +551,14 @@ mod tests {
         fn one_sided_skip_stays_incomplete() {
             let a = result(&[("a#1", Outcome::Conf)], SuiteOutcome::Success);
             let b = result(&[("a#1", Outcome::Ok)], SuiteOutcome::Success);
-            let got = classify_closure(&s(), &a, false, &b, false);
+            let got = classify_closure(&s(), facts(&a, false), &b, false);
             assert_eq!(got.verdict, Verdict::Incomplete);
         }
     }
 
     mod residue_alignment {
         use super::super::*;
+        use super::facts;
 
         fn suite(ids: &[(&str, Outcome)]) -> SuiteResult {
             let map: BTreeMap<String, Outcome> =
@@ -556,7 +609,7 @@ mod tests {
                     Outcome::Ok,
                 ),
             ]);
-            let got = classify_closure(&s(), &carrick, false, &docker, false);
+            let got = classify_closure(&s(), facts(&carrick, false), &docker, false);
             assert_eq!(got.verdict, Verdict::Match, "{:?}", got.pairs);
         }
 
@@ -569,7 +622,7 @@ mod tests {
                 ("ltp:splice07.c:56:on_pipe#1", Outcome::Ok),
                 ("ltp:splice07.c:56:on_fanotify#1", Outcome::Ok),
             ]);
-            let got = classify_closure(&s(), &carrick, false, &docker, false);
+            let got = classify_closure(&s(), facts(&carrick, false), &docker, false);
             assert_eq!(got.verdict, Verdict::Incomplete);
             assert_eq!(
                 got.pairs["ltp:splice07.c:56:on_pipe#1"],
@@ -594,7 +647,7 @@ mod tests {
                 ("ltp:splice07.c:56:on_pipe#1", Outcome::Ok),
                 ("ltp:splice07.c:56:on_0xBBBB#1", Outcome::Ok),
             ]);
-            let got = classify_closure(&s(), &carrick, false, &docker, false);
+            let got = classify_closure(&s(), facts(&carrick, false), &docker, false);
             assert_eq!(
                 got.pairs["ltp:splice07.c:56:on_pipe#1"],
                 [Outcome::Fail, Outcome::Ok]
@@ -610,7 +663,7 @@ mod tests {
         fn non_ltp_ids_do_not_align() {
             let carrick = suite(&[("go:TestOne#1", Outcome::Ok)]);
             let docker = suite(&[("go:TestTwo#1", Outcome::Ok)]);
-            let got = classify_closure(&s(), &carrick, false, &docker, false);
+            let got = classify_closure(&s(), facts(&carrick, false), &docker, false);
             assert_eq!(got.verdict, Verdict::Incomplete);
             assert_eq!(got.pairs["go:TestOne#1"], [Outcome::Ok, Outcome::Absent]);
             assert_eq!(got.pairs["go:TestTwo#1"], [Outcome::Absent, Outcome::Ok]);
@@ -641,6 +694,17 @@ mod tests {
         }
     }
 
+    /// Test shorthand for the ordinary case: a carrick run held to the suite's
+    /// OWN declared budget, so a timeout there is a genuine hang rather than a
+    /// budget kill.
+    fn facts(result: &SuiteResult, timed_out: bool) -> CarrickRunFacts<'_> {
+        CarrickRunFacts {
+            timed_out,
+            deadline: Some(declared_deadline()),
+            result,
+        }
+    }
+
     fn res(pairs: &[(&str, Outcome)]) -> SuiteResult {
         let mut ids = BTreeMap::new();
         for (k, v) in pairs {
@@ -653,12 +717,101 @@ mod tests {
         }
     }
 
+    fn diagnostic_deadline() -> crate::engine::CarrickDeadline {
+        // The sep14 `go-go_types` shape: 14 s of adaptive budget against a
+        // 300 s declaration.
+        crate::engine::CarrickDeadline {
+            declared_s: 300,
+            effective_s: 14,
+            origin: crate::engine::DeadlineOrigin::AdaptiveOracle,
+        }
+    }
+
+    fn declared_deadline() -> crate::engine::CarrickDeadline {
+        crate::engine::CarrickDeadline {
+            declared_s: 300,
+            effective_s: 300,
+            origin: crate::engine::DeadlineOrigin::Declared,
+        }
+    }
+
+    fn baseline_with(name: &str, id: &str, pair: [Outcome; 2]) -> Baseline {
+        let mut by = HashMap::new();
+        let mut p = BTreeMap::new();
+        p.insert(id.to_string(), pair);
+        by.insert(name.to_string(), p);
+        Baseline { by_suite: by }
+    }
+
+    /// A kill at the operator's diagnostic budget is a perf observation BY
+    /// CONSTRUCTION — AGENTS.md: a row sitting exactly on its budget has a
+    /// meaningless ratio — so it can never be a hang verdict. It proves nothing
+    /// about correctness (non-gating) and has no measured result to bless.
+    #[test]
+    fn a_diagnostic_budget_kill_is_not_a_hang_verdict() {
+        let baseline = baseline_with("s", "a", [Outcome::Ok, Outcome::Ok]);
+        let carrick = res(&[]);
+        let got = classify(
+            &suite(&[]),
+            CarrickRunFacts {
+                timed_out: true,
+                deadline: Some(diagnostic_deadline()),
+                result: &carrick,
+            },
+            &res(&[("a", Outcome::Ok)]),
+            &baseline,
+        );
+        assert_eq!(got.verdict, Verdict::BudgetKill);
+        assert!(!got.gating, "a truncated run proves nothing about parity");
+        assert_eq!(Verdict::BudgetKill.as_str(), "BUDGET_KILL");
+    }
+
+    /// A kill at the suite's OWN declared budget is still a hang: the suite
+    /// cannot finish inside the deadline it declares. `Progressing` there means
+    /// "making progress but too slow to ever finish", which is a genuine defect
+    /// and explicitly not a measurement waiver.
+    #[test]
+    fn a_declared_budget_kill_stays_a_gating_timeout() {
+        let baseline = baseline_with("s", "a", [Outcome::Ok, Outcome::Ok]);
+        let carrick = res(&[]);
+        let got = classify(
+            &suite(&[]),
+            CarrickRunFacts {
+                timed_out: true,
+                deadline: Some(declared_deadline()),
+                result: &carrick,
+            },
+            &res(&[("a", Outcome::Ok)]),
+            &baseline,
+        );
+        assert_eq!(got.verdict, Verdict::Timeout);
+        assert!(got.gating, "a kill at the declared budget must gate");
+        assert!(
+            !crate::engine::TimeoutKind::Progressing.is_measurement_failure(),
+            "progressing past the DECLARED budget is a defect, never a waiver"
+        );
+
+        // With no baseline entry the existing first-observation rule still
+        // applies unchanged.
+        let got = classify(
+            &suite(&[]),
+            CarrickRunFacts {
+                timed_out: true,
+                deadline: Some(declared_deadline()),
+                result: &carrick,
+            },
+            &res(&[("a", Outcome::Ok)]),
+            &Baseline::default(),
+        );
+        assert_eq!(got.verdict, Verdict::New);
+        assert!(!got.gating);
+    }
+
     #[test]
     fn clean_match() {
         let c = classify(
             &suite(&[]),
-            &res(&[("a", Outcome::Ok), ("b", Outcome::Ok)]),
-            false,
+            facts(&res(&[("a", Outcome::Ok), ("b", Outcome::Ok)]), false),
             &res(&[("a", Outcome::Ok), ("b", Outcome::Ok)]),
             &Baseline::default(),
         );
@@ -670,8 +823,7 @@ mod tests {
     fn known_gap_excuses_diff() {
         let c = classify(
             &suite(&["b"]),
-            &res(&[("a", Outcome::Ok), ("b", Outcome::Fail)]),
-            false,
+            facts(&res(&[("a", Outcome::Ok), ("b", Outcome::Fail)]), false),
             &res(&[("a", Outcome::Ok), ("b", Outcome::Ok)]),
             &Baseline::default(),
         );
@@ -683,8 +835,7 @@ mod tests {
     fn first_obs_diff_is_new_not_regression() {
         let c = classify(
             &suite(&[]),
-            &res(&[("a", Outcome::Fail)]),
-            false,
+            facts(&res(&[("a", Outcome::Fail)]), false),
             &res(&[("a", Outcome::Ok)]),
             &Baseline::default(),
         );
@@ -704,8 +855,7 @@ mod tests {
         };
         let c = classify(
             &suite(&[]),
-            &res(&[("a", Outcome::Fail)]),
-            false,
+            facts(&res(&[("a", Outcome::Fail)]), false),
             &res(&[("a", Outcome::Ok)]),
             &baseline,
         );
@@ -725,8 +875,7 @@ mod tests {
         };
         let c = classify(
             &suite(&[]),
-            &res(&[("a", Outcome::Fail)]),
-            false,
+            facts(&res(&[("a", Outcome::Fail)]), false),
             &res(&[("a", Outcome::Ok)]),
             &baseline,
         );
@@ -755,8 +904,7 @@ mod tests {
         // unexcused diff, the verdict is DIFF (non-gating).
         let c = classify(
             &suite(&[]),
-            &res(&[("a", Outcome::Fail)]),
-            false,
+            facts(&res(&[("a", Outcome::Fail)]), false),
             &res(&[("a", Outcome::Ok)]),
             &combined,
         );
@@ -768,8 +916,7 @@ mod tests {
         // baseline -> gating REGRESSION.
         let c2 = classify(
             &suite(&[]),
-            &res(&[("a", Outcome::Fail), ("b", Outcome::Fail)]),
-            false,
+            facts(&res(&[("a", Outcome::Fail), ("b", Outcome::Fail)]), false),
             &res(&[("a", Outcome::Ok), ("b", Outcome::Ok)]),
             &combined,
         );
@@ -791,8 +938,7 @@ mod tests {
         let combined = shared.with_overlay(Baseline::from_jsonl(""));
         let c = classify(
             &suite(&[]),
-            &res(&[("a", Outcome::Fail)]),
-            false,
+            facts(&res(&[("a", Outcome::Fail)]), false),
             &res(&[("a", Outcome::Ok)]),
             &combined,
         );
@@ -814,7 +960,7 @@ mod tests {
             ("c", Outcome::Ok),
             ("d", Outcome::Ok),
         ]);
-        let c = classify_closure(&suite(&[]), &truncated, true, &oracle, false);
+        let c = classify_closure(&suite(&[]), facts(&truncated, true), &oracle, false);
         assert_eq!(c.verdict, Verdict::Incomplete, "a deadline is never a pass");
         assert!(c.gating);
         let absent = c.pairs.values().filter(|p| p[0] == Outcome::Absent).count();
@@ -834,8 +980,7 @@ mod tests {
         truncated.result = SuiteOutcome::Truncated;
         let c = classify_closure(
             &suite(&[]),
-            &truncated,
-            true,
+            facts(&truncated, true),
             &res(&[("a", Outcome::Ok)]),
             false,
         );
@@ -852,8 +997,7 @@ mod tests {
         let combined = Baseline::from_jsonl("").with_overlay(Baseline::from_jsonl(""));
         let c = classify(
             &suite(&[]),
-            &res(&[("a", Outcome::Ok)]),
-            false,
+            facts(&res(&[("a", Outcome::Ok)]), false),
             &oracle,
             &combined,
         );
@@ -876,8 +1020,7 @@ mod tests {
         };
         let c = classify(
             &suite(&[]),
-            &crashed,
-            false,
+            facts(&crashed, false),
             &res(&[("a", Outcome::Ok), ("b", Outcome::Ok)]),
             &baseline,
         );
@@ -897,8 +1040,7 @@ mod tests {
         };
         let c = classify(
             &suite(&[]),
-            &crashed,
-            false,
+            facts(&crashed, false),
             &res(&[("a", Outcome::Ok)]),
             &baseline,
         );
@@ -912,8 +1054,7 @@ mod tests {
         oracle_broke.result = SuiteOutcome::None;
         let c = classify(
             &suite(&[]),
-            &res(&[("a", Outcome::Ok)]),
-            false,
+            facts(&res(&[("a", Outcome::Ok)]), false),
             &oracle_broke,
             &Baseline::default(),
         );
@@ -930,7 +1071,7 @@ mod tests {
         let suite = suite(&["assertion#1"]);
         let carrick = res(&[("assertion#1", Outcome::Broken)]);
         let docker = res(&[("assertion#1", Outcome::Ok)]);
-        let got = classify_closure(&suite, &carrick, false, &docker, false);
+        let got = classify_closure(&suite, facts(&carrick, false), &docker, false);
         assert_eq!(got.verdict, Verdict::Incomplete);
         assert!(got.gating);
         assert!(got.known_diffs.is_empty(), "no excuse channel in closure");
@@ -953,7 +1094,7 @@ mod tests {
         ] {
             let carrick = res(&[("assertion#1", outcome)]);
             assert!(
-                classify_closure(&suite(&[]), &carrick, false, &docker, false).gating,
+                classify_closure(&suite(&[]), facts(&carrick, false), &docker, false).gating,
                 "{outcome:?} vs Ok must gate"
             );
         }
@@ -962,7 +1103,7 @@ mod tests {
     #[test]
     fn closure_rejects_parseable_docker_timeout() {
         let side = res(&[("assertion#1", Outcome::Ok)]);
-        let got = classify_closure(&suite(&[]), &side, false, &side, true);
+        let got = classify_closure(&suite(&[]), facts(&side, false), &side, true);
         assert_eq!(got.verdict, Verdict::Incomplete);
         assert!(got.gating);
     }
