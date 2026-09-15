@@ -602,11 +602,13 @@ mod tests {
             crate::deadline::resolve_carrier_budget(Some(0), None, true),
             None
         );
-        assert_eq!(
-            crate::deadline::resolve_carrier_budget(Some(250), requested, false),
-            Some(Duration::from_millis(250)),
-            "an operator value replaces the container's own budget"
-        );
+        for first_in_process in [false, true] {
+            assert_eq!(
+                crate::deadline::resolve_carrier_budget(Some(250), requested, first_in_process),
+                Some(Duration::from_millis(250)),
+                "an operator value replaces the container's own budget exactly"
+            );
+        }
         assert_eq!(
             crate::deadline::resolve_carrier_budget(None, requested, false),
             requested
