@@ -5624,15 +5624,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 78517,
-        "byte_start": 78497,
+        "byte_end": 81819,
+        "byte_start": 81799,
         "column": 33,
         "column_end": 53,
         "column_start": 33,
         "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-        "line": 1873,
-        "line_end": 1873,
-        "line_start": 1873
+        "line": 1960,
+        "line_end": 1960,
+        "line_start": 1960
       }
     },
     {
@@ -5644,15 +5644,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 87633,
-        "byte_start": 87613,
+        "byte_end": 90935,
+        "byte_start": 90915,
         "column": 33,
         "column_end": 53,
         "column_start": 33,
         "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-        "line": 2043,
-        "line_end": 2043,
-        "line_start": 2043
+        "line": 2130,
+        "line_end": 2130,
+        "line_start": 2130
       }
     },
     {
@@ -6745,15 +6745,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 78349,
-        "byte_start": 78324,
+        "byte_end": 81651,
+        "byte_start": 81626,
         "column": 33,
         "column_end": 58,
         "column_start": 33,
         "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-        "line": 1870,
-        "line_end": 1870,
-        "line_start": 1870
+        "line": 1957,
+        "line_end": 1957,
+        "line_start": 1957
       }
     },
     {
@@ -6765,15 +6765,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 87448,
-        "byte_start": 87423,
+        "byte_end": 90750,
+        "byte_start": 90725,
         "column": 37,
         "column_end": 62,
         "column_start": 37,
         "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-        "line": 2039,
-        "line_end": 2039,
-        "line_start": 2039
+        "line": 2126,
+        "line_end": 2126,
+        "line_start": 2126
       }
     },
     {
@@ -8945,15 +8945,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 75723,
-        "byte_start": 75707,
+        "byte_end": 79025,
+        "byte_start": 79009,
         "column": 29,
         "column_end": 45,
         "column_start": 29,
         "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-        "line": 1822,
-        "line_end": 1822,
-        "line_start": 1822
+        "line": 1909,
+        "line_end": 1909,
+        "line_start": 1909
       }
     },
     {
@@ -11585,9 +11585,9 @@
       }
     }
   ],
-  "rows_sha256": "2deca2efe9f868d989ac3bae68dc0d10182964f2b9dbe5cc559a1dba26d13f90",
+  "rows_sha256": "5a60eaf1900e798e645f4622aff47b5b1bde72dc7170badb35f39c09acf3e2ad",
   "schema": 1,
-  "source_head": "3e393e5106d6cce49885246fca02228dd836b5ba",
+  "source_head": "cc1c1d80ba9a2ef632d8dda2d39c9192b3741b87",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
