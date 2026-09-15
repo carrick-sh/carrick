@@ -7508,18 +7508,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net/lifecycle.rs:2172 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net/lifecycle.rs:2173 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000328",
     "source": {
-      "byte_end": 92121,
-      "byte_start": 92101,
+      "byte_end": 92324,
+      "byte_start": 92304,
       "column": 33,
       "column_end": 53,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2172,
-      "line_end": 2172,
-      "line_start": 2172
+      "line": 2173,
+      "line_end": 2173,
+      "line_start": 2173
     }
   },
   {
@@ -7535,18 +7535,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net/lifecycle.rs:2342 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net/lifecycle.rs:2343 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000329",
     "source": {
-      "byte_end": 101237,
-      "byte_start": 101217,
+      "byte_end": 101440,
+      "byte_start": 101420,
       "column": 33,
       "column_end": 53,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2342,
-      "line_end": 2342,
-      "line_start": 2342
+      "line": 2343,
+      "line_end": 2343,
+      "line_start": 2343
     }
   },
   {
@@ -9021,18 +9021,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net/lifecycle.rs:2169 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net/lifecycle.rs:2170 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000390",
     "source": {
-      "byte_end": 91953,
-      "byte_start": 91928,
+      "byte_end": 92156,
+      "byte_start": 92131,
       "column": 33,
       "column_end": 58,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2169,
-      "line_end": 2169,
-      "line_start": 2169
+      "line": 2170,
+      "line_end": 2170,
+      "line_start": 2170
     }
   },
   {
@@ -9048,18 +9048,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net/lifecycle.rs:2338 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net/lifecycle.rs:2339 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000391",
     "source": {
-      "byte_end": 101052,
-      "byte_start": 101027,
+      "byte_end": 101255,
+      "byte_start": 101230,
       "column": 37,
       "column_end": 62,
       "column_start": 37,
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2338,
-      "line_end": 2338,
-      "line_start": 2338
+      "line": 2339,
+      "line_end": 2339,
+      "line_start": 2339
     }
   },
   {
@@ -11987,8 +11987,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/net/lifecycle.rs:2035 in `bind`, the host result from `std::process::id` determines the guest-visible synthetic netlink bind PID used by `bind`.",
     "review_id": "HA-000504",
     "source": {
-      "byte_end": 84370,
-      "byte_start": 84354,
+      "byte_end": 84419,
+      "byte_start": 84403,
       "column": 29,
       "column_end": 45,
       "column_start": 29,
