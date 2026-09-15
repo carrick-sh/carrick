@@ -532,7 +532,7 @@ impl<'a> NetView<'a> {
     /// classification every wait-shaped syscall shares, so `ppoll` and
     /// `pselect6` cannot drift from each other or from the wait service.
     ///
-    /// The host target and the exact [`FileSlotAuthority`] land in ONE
+    /// The host target and the exact `FileSlotAuthority` land in ONE
     /// [`WaitRegistration`]. The retired pair (`host_poll_target` plus
     /// `wait_target_for_poll`) built two independent lists joined by a `-1`
     /// sentinel whose events folded into one scalar across the whole wait, so
