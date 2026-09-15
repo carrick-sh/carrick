@@ -99,9 +99,12 @@ pub(crate) fn resolve_carrier_budget(
     requested: Option<Duration>,
     first_in_process: bool,
 ) -> Option<Duration> {
+    // An operator who names a number gets EXACTLY that number: the hatch is
+    // for bisecting a wedge, and a bound silently grown by two minutes on the
+    // first container would not be the bound they asked for.
     let base = match override_ms {
         Some(0) => return None,
-        Some(ms) => Duration::from_millis(ms),
+        Some(ms) => return Some(Duration::from_millis(ms)),
         None => requested.unwrap_or(Duration::from_millis(DEFAULT_CARRIER_BUDGET_MS)),
     };
     Some(if first_in_process {
@@ -288,7 +291,8 @@ mod tests {
         );
         assert_eq!(
             resolve_carrier_budget(Some(250), None, true),
-            Some(Duration::from_millis(250 + COLD_START_ALLOWANCE_MS))
+            Some(Duration::from_millis(250)),
+            "the operator hatch is exact, cold start included"
         );
     }
 }
