@@ -243,7 +243,7 @@ fn setsockopt_in_memory(
         }
     } else if level == crate::linux_abi::LINUX_SOL_IPV6 {
         if socket.family() == crate::linux_abi::LINUX_AF_UNIX {
-            return DispatchOutcome::errno(LINUX_ENOPROTOOPT);
+            return DispatchOutcome::errno(carrick_abi::LINUX_EOPNOTSUPP);
         }
         if optname == crate::linux_abi::LINUX_IPV6_ADDRFORM {
             if optlen != 0 && optval_addr == 0 {
@@ -261,6 +261,21 @@ fn setsockopt_in_memory(
             }
             if socket.family() != LINUX_AF_INET6 {
                 return DispatchOutcome::errno(LINUX_ENOPROTOOPT);
+            }
+            let (is_connected, is_v4mapped) = {
+                let state = socket.state.lock();
+                let connected = state.peer.is_some() && state.peer_sockaddr.is_some();
+                let v4mapped = match state.peer_sockaddr {
+                    Some(std::net::SocketAddr::V6(v6)) => v6.ip().to_ipv4_mapped().is_some(),
+                    _ => false,
+                };
+                (connected, v4mapped)
+            };
+            if !is_connected {
+                return DispatchOutcome::errno(carrick_abi::LINUX_ENOTCONN);
+            }
+            if !is_v4mapped {
+                return DispatchOutcome::errno(carrick_abi::LINUX_EADDRNOTAVAIL);
             }
             socket.set_family(LINUX_AF_INET);
             {
@@ -646,6 +661,9 @@ impl<'a> NetView<'a> {
                 if requested != LINUX_AF_INET {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
+                if family == LINUX_AF_UNIX {
+                    return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EOPNOTSUPP));
+                }
                 if family != LINUX_AF_INET6 {
                     return Ok(DispatchOutcome::errno(LINUX_ENOPROTOOPT));
                 }
@@ -655,9 +673,12 @@ impl<'a> NetView<'a> {
                 let Some(mut open) = open_file.description.write() else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
                 };
-                let OpenDescription::HostSocket { family, .. } = &mut *open else {
+                let OpenDescription::HostSocket { base, family, .. } = &mut *open else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
                 };
+                if !base.connected() {
+                    return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOTCONN));
+                }
                 *family = LINUX_AF_INET;
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
@@ -1304,6 +1325,38 @@ mod ipv6_addrform_tests {
         memory
             .write_bytes(0x4000, &LINUX_AF_INET.to_ne_bytes())
             .unwrap();
+        // Unconnected socket rejects IPV6_ADDRFORM with ENOTCONN
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
+                    SyscallRequest::new(
+                        208,
+                        SyscallArgs::from([
+                            fd as u64,
+                            LINUX_SOL_IPV6 as u64,
+                            crate::linux_abi::LINUX_IPV6_ADDRFORM as u64,
+                            0x4000,
+                            4,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::errno(carrick_abi::LINUX_ENOTCONN)
+        );
+
+        if let Some(open_file) = dispatcher.open_file(fd) {
+            let desc = open_file.description();
+            if let Some(mut open) = desc.write() {
+                if let OpenDescription::HostSocket { base, .. } = &mut *open {
+                    base.set_connected(true);
+                }
+            }
+        }
+
         assert_eq!(
             dispatcher
                 .dispatch(

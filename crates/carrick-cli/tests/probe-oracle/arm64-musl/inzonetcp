@@ -1,4 +1,4 @@
-26c54e30705e54a1
+31cf5361bba5d500
 listen_ok=true
 so_acceptconn_listener=1
 so_acceptconn_unlistened=0
@@ -652,3 +652,20 @@ racing_connect_v6_server_local_port_eq_listener=true
 racing_connect_v6_server_peer_family=10
 racing_connect_v6_server_peer_addr=::1
 racing_connect_v6_server_peer_port_eq_client=true
+addrform_v4mapped_rc=0
+addrform_v4mapped_errno=0
+addrform_v4mapped_so_domain=2
+addrform_v4mapped_sockname_family=2
+addrform_v4mapped_sockname_addr=127.0.0.1
+addrform_v4mapped_peername_family=2
+addrform_v4mapped_peername_addr=127.0.0.1
+addrform_genuine_v6_peer_rc=-1
+addrform_genuine_v6_peer_errno=99
+addrform_unconnected_rc=-1
+addrform_unconnected_errno=107
+addrform_unix_rc=-1
+addrform_unix_errno=95
+addrform_optlen2_rc=-1
+addrform_optlen2_errno=22
+addrform_val_v6_rc=-1
+addrform_val_v6_errno=22

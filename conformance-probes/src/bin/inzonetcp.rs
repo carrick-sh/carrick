@@ -45,6 +45,8 @@
 //!   23. `nonblocking_connect_racing`: nonblocking loopback connect against a bound
 //!       non-listening target, listener start, pending connect retry, and subsequent
 //!       connection progression with address reflection and SO_ERROR readback.
+//!   24. `ipv6_addrform`: setsockopt(IPPROTO_IPV6, IPV6_ADDRFORM, AF_INET) on accepted
+//!       dual-stack stream socket and error conditions.
 //!
 //! Output is deterministic `key=value` lines only. Every wait is bounded by a
 //! `poll` with a 5 s cap so a lost wake is a false line, never a hang.
@@ -54,6 +56,7 @@ use conformance_probes::{errno, report};
 const POLLRDHUP: libc::c_short = 0x2000;
 const SO_DOMAIN: libc::c_int = 39;
 const SO_PROTOCOL: libc::c_int = 38;
+const IPV6_ADDRFORM: libc::c_int = 1;
 
 const ECHO_TOTAL: usize = 65536;
 
@@ -2509,6 +2512,303 @@ unsafe fn run_racing_connect_case(family: SockFamily) -> RacingConnectResult {
     }
 }
 
+struct Ipv6AddrformResult {
+    addrform_v4mapped_rc: i32,
+    addrform_v4mapped_errno: i32,
+    addrform_v4mapped_so_domain: i32,
+    addrform_v4mapped_sockname_family: i32,
+    addrform_v4mapped_sockname_addr: String,
+    addrform_v4mapped_peername_family: i32,
+    addrform_v4mapped_peername_addr: String,
+    addrform_genuine_v6_peer_rc: i32,
+    addrform_genuine_v6_peer_errno: i32,
+    addrform_unconnected_rc: i32,
+    addrform_unconnected_errno: i32,
+    addrform_unix_rc: i32,
+    addrform_unix_errno: i32,
+    addrform_optlen2_rc: i32,
+    addrform_optlen2_errno: i32,
+    addrform_val_v6_rc: i32,
+    addrform_val_v6_errno: i32,
+}
+
+unsafe fn run_ipv6_addrform_case() -> Ipv6AddrformResult {
+    // 1. Dual-stack listener: AF_INET6, IPV6_V6ONLY = 0, bound to in6addr_any (port 0)
+    let listener = libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0);
+    let zero: libc::c_int = 0;
+    if listener >= 0 {
+        libc::setsockopt(
+            listener,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &zero as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    let (l_storage, l_len) = EndpointHelper::wildcard_storage_v6(0);
+    let l_bind_rc = if listener >= 0 {
+        libc::bind(
+            listener,
+            &l_storage as *const _ as *const libc::sockaddr,
+            l_len,
+        )
+    } else {
+        -1
+    };
+    let listen_rc = if l_bind_rc == 0 {
+        libc::listen(listener, 4)
+    } else {
+        -1
+    };
+    let (_, _, l_bound, _) = if listen_rc == 0 {
+        EndpointHelper::getsockname(listener)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let listen_port_be = EndpointHelper::get_port_be(&l_bound);
+
+    // IPv4 client connecting to 127.0.0.1:listen_port_be
+    let client = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+    let (target, target_len) = EndpointHelper::loopback_storage_v4(listen_port_be);
+    let connect_rc = if client >= 0 && listen_port_be != 0 {
+        libc::connect(
+            client,
+            &target as *const _ as *const libc::sockaddr,
+            target_len,
+        )
+    } else {
+        -1
+    };
+
+    let accepted = if connect_rc == 0 && listener >= 0 {
+        perform_nonblocking_accept(listener)
+    } else {
+        -1
+    };
+
+    // Edge case (d): optlen 2 on accepted dual-stack socket with v4-mapped peer
+    let val_inet: libc::c_int = libc::AF_INET;
+    let (addrform_optlen2_rc, addrform_optlen2_errno) = if accepted >= 0 {
+        let rc = libc::setsockopt(
+            accepted,
+            libc::IPPROTO_IPV6,
+            IPV6_ADDRFORM,
+            &val_inet as *const _ as *const libc::c_void,
+            2,
+        );
+        let err = if rc == 0 { 0 } else { errno() };
+        (rc, err)
+    } else {
+        (-1, libc::EBADF)
+    };
+
+    // Edge case (e): value AF_INET6 on accepted dual-stack socket with v4-mapped peer
+    let val_v6: libc::c_int = libc::AF_INET6;
+    let (addrform_val_v6_rc, addrform_val_v6_errno) = if accepted >= 0 {
+        let rc = libc::setsockopt(
+            accepted,
+            libc::IPPROTO_IPV6,
+            IPV6_ADDRFORM,
+            &val_v6 as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let err = if rc == 0 { 0 } else { errno() };
+        (rc, err)
+    } else {
+        (-1, libc::EBADF)
+    };
+
+    // Main call: setsockopt(IPPROTO_IPV6, IPV6_ADDRFORM, AF_INET) on accepted dual-stack socket
+    let (addrform_v4mapped_rc, addrform_v4mapped_errno) = if accepted >= 0 {
+        let rc = libc::setsockopt(
+            accepted,
+            libc::IPPROTO_IPV6,
+            IPV6_ADDRFORM,
+            &val_inet as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let err = if rc == 0 { 0 } else { errno() };
+        (rc, err)
+    } else {
+        (-1, libc::EBADF)
+    };
+
+    let addrform_v4mapped_so_domain = if accepted >= 0 {
+        let mut so_domain: libc::c_int = 0;
+        let mut so_domain_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let sd_rc = libc::getsockopt(
+            accepted,
+            libc::SOL_SOCKET,
+            SO_DOMAIN,
+            &mut so_domain as *mut _ as *mut libc::c_void,
+            &mut so_domain_len,
+        );
+        if sd_rc == 0 {
+            so_domain
+        } else {
+            -1
+        }
+    } else {
+        -1
+    };
+
+    let (addrform_v4mapped_sockname_family, addrform_v4mapped_sockname_addr) = if accepted >= 0 {
+        let (rc, _, storage, _) = EndpointHelper::getsockname(accepted);
+        if rc == 0 {
+            EndpointHelper::format_family_and_addr(&storage)
+        } else {
+            (-1, "none".to_string())
+        }
+    } else {
+        (-1, "none".to_string())
+    };
+
+    let (addrform_v4mapped_peername_family, addrform_v4mapped_peername_addr) = if accepted >= 0 {
+        let (rc, _, storage, _) = EndpointHelper::getpeername(accepted);
+        if rc == 0 {
+            EndpointHelper::format_family_and_addr(&storage)
+        } else {
+            (-1, "none".to_string())
+        }
+    } else {
+        (-1, "none".to_string())
+    };
+
+    if accepted >= 0 {
+        libc::close(accepted);
+    }
+    if client >= 0 {
+        libc::close(client);
+    }
+    if listener >= 0 {
+        libc::close(listener);
+    }
+
+    // Edge case (a): genuine IPv6 peer
+    let v6_listener = libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0);
+    let (l6_storage, l6_len) = EndpointHelper::loopback_storage_v6(0);
+    let l6_bind_rc = if v6_listener >= 0 {
+        libc::bind(
+            v6_listener,
+            &l6_storage as *const _ as *const libc::sockaddr,
+            l6_len,
+        )
+    } else {
+        -1
+    };
+    let l6_listen_rc = if l6_bind_rc == 0 {
+        libc::listen(v6_listener, 4)
+    } else {
+        -1
+    };
+    let (_, _, l6_bound, _) = if l6_listen_rc == 0 {
+        EndpointHelper::getsockname(v6_listener)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let listen6_port_be = EndpointHelper::get_port_be(&l6_bound);
+
+    let v6_client = libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0);
+    let (target6, target6_len) = EndpointHelper::loopback_storage_v6(listen6_port_be);
+    let connect6_rc = if v6_client >= 0 && listen6_port_be != 0 {
+        libc::connect(
+            v6_client,
+            &target6 as *const _ as *const libc::sockaddr,
+            target6_len,
+        )
+    } else {
+        -1
+    };
+
+    let v6_accepted = if connect6_rc == 0 && v6_listener >= 0 {
+        perform_nonblocking_accept(v6_listener)
+    } else {
+        -1
+    };
+
+    let (addrform_genuine_v6_peer_rc, addrform_genuine_v6_peer_errno) = if v6_accepted >= 0 {
+        let rc = libc::setsockopt(
+            v6_accepted,
+            libc::IPPROTO_IPV6,
+            IPV6_ADDRFORM,
+            &val_inet as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let err = if rc == 0 { 0 } else { errno() };
+        (rc, err)
+    } else {
+        (-1, libc::EBADF)
+    };
+
+    if v6_accepted >= 0 {
+        libc::close(v6_accepted);
+    }
+    if v6_client >= 0 {
+        libc::close(v6_client);
+    }
+    if v6_listener >= 0 {
+        libc::close(v6_listener);
+    }
+
+    // Edge case (b): unconnected AF_INET6 socket
+    let unconnected = libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0);
+    let (addrform_unconnected_rc, addrform_unconnected_errno) = if unconnected >= 0 {
+        let rc = libc::setsockopt(
+            unconnected,
+            libc::IPPROTO_IPV6,
+            IPV6_ADDRFORM,
+            &val_inet as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let err = if rc == 0 { 0 } else { errno() };
+        (rc, err)
+    } else {
+        (-1, libc::EBADF)
+    };
+    if unconnected >= 0 {
+        libc::close(unconnected);
+    }
+
+    // Edge case (c): AF_UNIX socket
+    let unix_sock = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+    let (addrform_unix_rc, addrform_unix_errno) = if unix_sock >= 0 {
+        let rc = libc::setsockopt(
+            unix_sock,
+            libc::IPPROTO_IPV6,
+            IPV6_ADDRFORM,
+            &val_inet as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let err = if rc == 0 { 0 } else { errno() };
+        (rc, err)
+    } else {
+        (-1, libc::EBADF)
+    };
+    if unix_sock >= 0 {
+        libc::close(unix_sock);
+    }
+
+    Ipv6AddrformResult {
+        addrform_v4mapped_rc,
+        addrform_v4mapped_errno,
+        addrform_v4mapped_so_domain,
+        addrform_v4mapped_sockname_family,
+        addrform_v4mapped_sockname_addr,
+        addrform_v4mapped_peername_family,
+        addrform_v4mapped_peername_addr,
+        addrform_genuine_v6_peer_rc,
+        addrform_genuine_v6_peer_errno,
+        addrform_unconnected_rc,
+        addrform_unconnected_errno,
+        addrform_unix_rc,
+        addrform_unix_errno,
+        addrform_optlen2_rc,
+        addrform_optlen2_errno,
+        addrform_val_v6_rc,
+        addrform_val_v6_errno,
+    }
+}
+
 fn main() {
     unsafe {
         conformance_probes::install_ign(libc::SIGPIPE);
@@ -3948,6 +4248,30 @@ fn main() {
             racing_connect_v6_server_peer_family = res_racing_v6.server_peer_family,
             racing_connect_v6_server_peer_addr = res_racing_v6.server_peer_addr,
             racing_connect_v6_server_peer_port_eq_client = res_racing_v6.server_peer_port_eq_client,
+        );
+
+        // ---------------------------------------------------------------------
+        // Case 24: ipv6_addrform
+        // ---------------------------------------------------------------------
+        let res_addrform = run_ipv6_addrform_case();
+        report!(
+            addrform_v4mapped_rc = res_addrform.addrform_v4mapped_rc,
+            addrform_v4mapped_errno = res_addrform.addrform_v4mapped_errno,
+            addrform_v4mapped_so_domain = res_addrform.addrform_v4mapped_so_domain,
+            addrform_v4mapped_sockname_family = res_addrform.addrform_v4mapped_sockname_family,
+            addrform_v4mapped_sockname_addr = res_addrform.addrform_v4mapped_sockname_addr,
+            addrform_v4mapped_peername_family = res_addrform.addrform_v4mapped_peername_family,
+            addrform_v4mapped_peername_addr = res_addrform.addrform_v4mapped_peername_addr,
+            addrform_genuine_v6_peer_rc = res_addrform.addrform_genuine_v6_peer_rc,
+            addrform_genuine_v6_peer_errno = res_addrform.addrform_genuine_v6_peer_errno,
+            addrform_unconnected_rc = res_addrform.addrform_unconnected_rc,
+            addrform_unconnected_errno = res_addrform.addrform_unconnected_errno,
+            addrform_unix_rc = res_addrform.addrform_unix_rc,
+            addrform_unix_errno = res_addrform.addrform_unix_errno,
+            addrform_optlen2_rc = res_addrform.addrform_optlen2_rc,
+            addrform_optlen2_errno = res_addrform.addrform_optlen2_errno,
+            addrform_val_v6_rc = res_addrform.addrform_val_v6_rc,
+            addrform_val_v6_errno = res_addrform.addrform_val_v6_errno,
         );
     }
 }
