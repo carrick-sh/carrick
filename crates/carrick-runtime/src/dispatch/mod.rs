@@ -713,6 +713,7 @@ pub use abi_args::{Fd, GuestLen, GuestPtr, HostFd, HostPid, NsPid, Pid, Signal};
 use fd_table::*;
 
 pub mod wait_authority;
+pub(crate) mod wait_plan;
 #[cfg(test)]
 pub(crate) mod wait_queue_fixture;
 pub(crate) mod wait_source;
