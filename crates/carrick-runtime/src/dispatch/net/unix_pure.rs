@@ -111,7 +111,16 @@ pub(crate) struct PureSocketState {
     pub connection_record: Option<Arc<Mutex<ConnectionRecordState>>>,
     pub request_buf: Vec<u8>,
     pub inzone_cleanup: Option<Arc<dyn crate::dispatch::fd_table::InZoneCleanup>>,
-    pub can_rebind: bool,
+    pub phase: PureSocketPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PureSocketPhase {
+    Unbound,
+    Bound,
+    Connected,
+    DisconnectedRebindable,
+    Listening,
 }
 
 pub struct PureSocketInner {
@@ -146,12 +155,12 @@ impl PureSocketInner {
             .store(family, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub(crate) fn can_rebind(&self) -> bool {
-        self.state.lock().can_rebind
+    pub(crate) fn phase(&self) -> PureSocketPhase {
+        self.state.lock().phase
     }
 
-    pub(crate) fn set_can_rebind(&self, allowed: bool) {
-        self.state.lock().can_rebind = allowed;
+    pub(crate) fn set_phase(&self, phase: PureSocketPhase) {
+        self.state.lock().phase = phase;
     }
 
     pub(crate) fn notify_waiters(&self) {
@@ -179,7 +188,7 @@ impl PureSocketInner {
                 peer_sockaddr: None,
                 peer: None,
                 listening: false,
-                can_rebind: false,
+                phase: PureSocketPhase::Unbound,
                 backlog_limit: 0,
                 accept_queue: VecDeque::new(),
                 stream_buf: VecDeque::new(),
@@ -239,7 +248,7 @@ impl PureSocketInner {
                 peer_sockaddr: peer_addr,
                 peer: None,
                 listening: false,
-                can_rebind: false,
+                phase: PureSocketPhase::Connected,
                 backlog_limit: 0,
                 accept_queue: VecDeque::new(),
                 stream_buf: VecDeque::new(),
@@ -306,6 +315,8 @@ impl PureSocketInner {
                 protocol == LINUX_IPPROTO_TCP && matches!(family, LINUX_AF_INET | LINUX_AF_INET6);
             s1.tcp_pair = tcp_pair;
             s2.tcp_pair = tcp_pair;
+            s1.phase = PureSocketPhase::Connected;
+            s2.phase = PureSocketPhase::Connected;
             s1.peer = Some(Arc::downgrade(&second));
             s1.peer_creds = Some(creds2);
             s2.peer = Some(Arc::downgrade(&first));
@@ -385,7 +396,7 @@ impl PureSocketInner {
         state.tcp_peer_terminal = TcpPeerTerminal::Open;
         state.tcp_send_terminal = false;
         state.so_error = None;
-        state.can_rebind = true;
+        state.phase = PureSocketPhase::DisconnectedRebindable;
         peer_state.peer = None;
         peer_state.inzone_cleanup = None;
         peer_state.tcp_peer_terminal = TcpPeerTerminal::Reset;
@@ -429,6 +440,7 @@ impl PureSocketInner {
         state.peer = Some(Arc::downgrade(peer));
         state.peer_creds = Some(peer_state.creds);
         state.tcp_pair = true;
+        state.phase = PureSocketPhase::Connected;
         state.tcp_peer_terminal = TcpPeerTerminal::Open;
         state.tcp_send_terminal = false;
         state.shutdown_read = false;
@@ -437,6 +449,7 @@ impl PureSocketInner {
         peer_state.peer = Some(Arc::downgrade(self));
         peer_state.peer_creds = Some(state.creds);
         peer_state.tcp_pair = true;
+        peer_state.phase = PureSocketPhase::Connected;
         Ok(())
     }
 

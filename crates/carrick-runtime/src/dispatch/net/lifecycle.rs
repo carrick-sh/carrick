@@ -976,7 +976,7 @@ impl<'a> NetView<'a> {
             state.local_sockaddr = Some(local);
             state.peer_sockaddr = Some(target.0);
             state.inzone_cleanup = Some(Arc::clone(&cleanup));
-            state.can_rebind = false;
+            state.phase = crate::dispatch::net::unix_pure::PureSocketPhase::Connected;
         }
         base.set_connected(true);
         base.set_connect_in_progress(false);
@@ -2051,8 +2051,9 @@ impl<'a> NetView<'a> {
                         if base.listening() || socket.is_listening() || base.connected() || socket.peer_addr().is_some() {
                             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         }
-                        if !socket.can_rebind() {
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        match socket.phase() {
+                            crate::dispatch::net::unix_pure::PureSocketPhase::DisconnectedRebindable => {}
+                            _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
                         }
                         let host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
                         let Some(requested) = host_sockaddr_to_socket_addr(&host_addr) else {
@@ -2116,7 +2117,7 @@ impl<'a> NetView<'a> {
                             let mut state = socket.state.lock();
                             state.local_sockaddr = Some(guest_bound);
                             state.inzone_cleanup = Some(cleanup);
-                            state.can_rebind = false;
+                            state.phase = crate::dispatch::net::unix_pure::PureSocketPhase::Bound;
                         }
                         let _ = this.network.provider.record_socket_addresses(
                             this.network.spec.namespace_id.as_ref(),
@@ -2655,12 +2656,16 @@ impl<'a> NetView<'a> {
                         let mut state = socket.state.lock();
                         state.listening = true;
                         state.backlog_limit = backlog.max(0) as usize;
+                        state.phase = crate::dispatch::net::unix_pure::PureSocketPhase::Listening;
                         base.set_listening(true);
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
                     return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
                 }
-                if base.connected() || socket.peer_addr().is_some() {
+                if base.connected()
+                    || socket.phase() == crate::dispatch::net::unix_pure::PureSocketPhase::Connected
+                    || socket.peer_addr().is_some()
+                {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 let reuseport = base.so_reuseport();
@@ -2700,7 +2705,7 @@ impl<'a> NetView<'a> {
                         let mut state = socket.state.lock();
                         state.local_sockaddr = Some(guest_bound);
                         state.inzone_cleanup = Some(cleanup);
-                        state.can_rebind = false;
+                        state.phase = crate::dispatch::net::unix_pure::PureSocketPhase::Listening;
                     }
                     logical_local = Some(guest_bound_addr);
                 }
@@ -2716,7 +2721,7 @@ impl<'a> NetView<'a> {
                     let mut state = socket.state.lock();
                     state.listening = true;
                     state.backlog_limit = backlog.max(0) as usize;
-                    state.can_rebind = false;
+                    state.phase = crate::dispatch::net::unix_pure::PureSocketPhase::Listening;
                     base.set_listening(true);
                 } else {
                     let Some(reservation) = this
@@ -2740,7 +2745,7 @@ impl<'a> NetView<'a> {
                         let mut state = socket.state.lock();
                         state.listening = true;
                         state.backlog_limit = backlog.max(0) as usize;
-                        state.can_rebind = false;
+                        state.phase = crate::dispatch::net::unix_pure::PureSocketPhase::Listening;
                     }
                 }
                 return Ok(DispatchOutcome::Returned { value: 0 });
@@ -2928,17 +2933,18 @@ impl<'a> NetView<'a> {
                             socket.socket_type == LINUX_SOCK_STREAM,
                             socket.is_listening(),
                             socket.peer_addr().is_some(),
+                            socket.phase(),
                         )),
                         _ => None,
                     }
                 };
-                if let Some((family, is_stream, is_listening, has_peer)) = in_memory_stream {
+                if let Some((family, is_stream, is_listening, has_peer, phase)) = in_memory_stream {
                     let host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
                     if host_sockaddr_family(&host_addr) == libc::AF_UNSPEC as u16
                         && matches!(family, LINUX_AF_INET | LINUX_AF_INET6)
                         && is_stream
                         && !is_listening
-                        && has_peer
+                        && (phase == crate::dispatch::net::unix_pure::PureSocketPhase::Connected || has_peer)
                     {
                         let open_file = this.open_file(fd).ok_or(LINUX_EBADF)?;
                         let description = open_file.description();
@@ -2959,14 +2965,24 @@ impl<'a> NetView<'a> {
                         && linux_to_host_af(family).is_ok_and(|host_family| {
                             host_sockaddr_family(&host_addr) == host_family as u16
                         });
-                    if compatible_inet_family && is_stream && !is_listening && has_peer {
-                        return Ok(DispatchOutcome::errno(LINUX_EISCONN));
-                    }
-                    if compatible_inet_family && is_stream && !is_listening && !has_peer {
-                        let Some(requested) = host_sockaddr_to_socket_addr(&host_addr) else {
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                        };
-                        return Ok(this.reconnect_disconnected_inzone_stream(fd, requested)?);
+                    if compatible_inet_family && is_stream && !is_listening {
+                        match phase {
+                            crate::dispatch::net::unix_pure::PureSocketPhase::Connected => {
+                                return Ok(DispatchOutcome::errno(LINUX_EISCONN));
+                            }
+                            crate::dispatch::net::unix_pure::PureSocketPhase::DisconnectedRebindable
+                            | crate::dispatch::net::unix_pure::PureSocketPhase::Bound => {
+                                let Some(requested) = host_sockaddr_to_socket_addr(&host_addr) else {
+                                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                                };
+                                return Ok(this.reconnect_disconnected_inzone_stream(fd, requested)?);
+                            }
+                            _ => {
+                                if has_peer {
+                                    return Ok(DispatchOutcome::errno(LINUX_EISCONN));
+                                }
+                            }
+                        }
                     }
                     return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
                 }
