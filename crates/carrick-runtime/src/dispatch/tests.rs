@@ -8860,10 +8860,11 @@ mod inzone_tcp {
             other => panic!("expected WaitOnFds or BlockingFdWait, got {other:?}"),
         };
         match authority {
-            WaitFdAuthority::Logical { interest, .. } => {
+            authority @ WaitFdAuthority::Logical { .. } => {
+                let interest = authority.probed_interest_for_test();
                 assert!(
-                    interest & libc::POLLIN != 0,
-                    "ppoll: expected interest & POLLIN != 0, got interest={interest:#x}"
+                    interest.contains(carrick_abi::LinuxPollEvents::IN),
+                    "ppoll: expected a probed POLLIN interest, got {interest:?}"
                 );
             }
             other => panic!("ppoll: expected WaitFdAuthority::Logical, got {other:?}"),
@@ -8896,10 +8897,11 @@ mod inzone_tcp {
             other => panic!("expected WaitOnFds or BlockingFdWait, got {other:?}"),
         };
         match authority {
-            WaitFdAuthority::Logical { interest, .. } => {
+            authority @ WaitFdAuthority::Logical { .. } => {
+                let interest = authority.probed_interest_for_test();
                 assert!(
-                    interest & libc::POLLIN != 0,
-                    "pselect6: expected interest & POLLIN != 0, got interest={interest:#x}"
+                    interest.contains(carrick_abi::LinuxPollEvents::IN),
+                    "pselect6: expected a probed POLLIN interest, got {interest:?}"
                 );
             }
             other => panic!("pselect6: expected WaitFdAuthority::Logical, got {other:?}"),
@@ -8948,10 +8950,11 @@ mod inzone_tcp {
             other => panic!("expected WaitOnFds or BlockingFdWait, got {other:?}"),
         };
         match authority {
-            WaitFdAuthority::Logical { interest, .. } => {
+            authority @ WaitFdAuthority::Logical { .. } => {
+                let interest = authority.probed_interest_for_test();
                 assert!(
-                    interest & libc::POLLIN != 0,
-                    "ppoll: expected interest & POLLIN != 0, got interest={interest:#x}"
+                    interest.contains(carrick_abi::LinuxPollEvents::IN),
+                    "ppoll: expected a probed POLLIN interest, got {interest:?}"
                 );
             }
             other => panic!("ppoll: expected WaitFdAuthority::Logical, got {other:?}"),
@@ -8984,10 +8987,11 @@ mod inzone_tcp {
             other => panic!("expected WaitOnFds or BlockingFdWait, got {other:?}"),
         };
         match authority {
-            WaitFdAuthority::Logical { interest, .. } => {
+            authority @ WaitFdAuthority::Logical { .. } => {
+                let interest = authority.probed_interest_for_test();
                 assert!(
-                    interest & libc::POLLIN != 0,
-                    "pselect6: expected interest & POLLIN != 0, got interest={interest:#x}"
+                    interest.contains(carrick_abi::LinuxPollEvents::IN),
+                    "pselect6: expected a probed POLLIN interest, got {interest:?}"
                 );
             }
             other => panic!("pselect6: expected WaitFdAuthority::Logical, got {other:?}"),

@@ -6588,12 +6588,25 @@ mod wait_enrollment_gap {
     /// wait. The property below never changes.
     fn description_backed_wait(
         slot: crate::kernel::objects::FileSlotAuthority,
-        _interest: LinuxPollEvents,
+        interest: LinuxPollEvents,
     ) -> WaitFds {
-        // Today a wait carries slot authorities in one list and `(host_fd,
-        // events)` pairs in another; a description-decided fd has no host
-        // object, so it contributes only the slot and its interest is lost.
-        WaitFds::empty().with_slot_authorities(vec![slot])
+        // One typed registration: the guest fd, its exact slot, the events it
+        // asked for, and the source that decides its readiness. A description
+        // source contributes no reactor entry and carries its OWN interest, so
+        // the wait service probes it with exactly these events once the
+        // enrollment is live.
+        let interest = crate::dispatch::wait_source::WaitInterest::new(interest)
+            .expect("a description-backed wait always requests something");
+        WaitFds::from_registrations(
+            vec![crate::dispatch::wait_source::WaitRegistration::new(
+                crate::dispatch::Fd(slot.number().raw()),
+                slot,
+                interest.events(),
+                crate::dispatch::wait_source::WaitSource::Description { interest },
+            )],
+            Vec::new(),
+        )
+        .expect("typed description-backed wait")
     }
 
     struct GapRun {
