@@ -39,6 +39,9 @@
 //!       multi-segment response (1000 then 507 bytes); non-blocking client connects,
 //!       sends 1507 bytes, and drives epoll_wait on EPOLLIN (both level-triggered
 //!       and edge-triggered EPOLLET variants) reading in rounds with a 5s cap.
+//!   22. `listener_delayed_connect`: server thread calls ppoll (and separately pselect)
+//!       on listener with 5s bound, waking on delayed connect, reporting wait rc/revents/readable
+//!       and accept rc.
 //!
 //! Output is deterministic `key=value` lines only. Every wait is bounded by a
 //! `poll` with a 5 s cap so a lost wake is a false line, never a hang.
@@ -2034,6 +2037,119 @@ unsafe fn run_pselect_epoll_handshake_case(
     }
 }
 
+struct ListenerDelayedConnectResult {
+    wait_rc: i32,
+    revents: String,
+    readable: bool,
+    accept_rc: i32,
+}
+
+enum ListenerWaitVariant {
+    Ppoll,
+    Pselect,
+}
+
+unsafe fn run_listener_delayed_connect_case(
+    variant: ListenerWaitVariant,
+) -> ListenerDelayedConnectResult {
+    let (l_storage, l_len) = EndpointHelper::loopback_storage_v4(0);
+    let listener = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+    let l_bind_rc = if listener >= 0 {
+        libc::bind(
+            listener,
+            &l_storage as *const _ as *const libc::sockaddr,
+            l_len,
+        )
+    } else {
+        -1
+    };
+    let listen_rc = if l_bind_rc == 0 {
+        libc::listen(listener, 16)
+    } else {
+        -1
+    };
+    let (_, _, l_bound, _) = if listen_rc == 0 {
+        EndpointHelper::getsockname(listener)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let listen_port_be = EndpointHelper::get_port_be(&l_bound);
+
+    let server_thread = std::thread::spawn(move || {
+        let ts = libc::timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        let (wait_rc, revents, readable) = match variant {
+            ListenerWaitVariant::Ppoll => {
+                let mut pfd = libc::pollfd {
+                    fd: listener,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let rc = libc::ppoll(&mut pfd, 1, &ts, std::ptr::null());
+                (rc, format!("0x{:x}", pfd.revents), (pfd.revents & libc::POLLIN) != 0)
+            }
+            ListenerWaitVariant::Pselect => {
+                let mut rfds: libc::fd_set = std::mem::zeroed();
+                libc::FD_ZERO(&mut rfds);
+                if listener >= 0 {
+                    libc::FD_SET(listener, &mut rfds);
+                }
+                let rc = libc::pselect(
+                    listener + 1,
+                    &mut rfds,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &ts,
+                    std::ptr::null(),
+                );
+                let is_set = listener >= 0 && libc::FD_ISSET(listener, &rfds);
+                (rc, if is_set { "0x1".to_string() } else { "0x0".to_string() }, is_set)
+            }
+        };
+
+        let mut accept_rc = -1;
+        if wait_rc > 0 && readable {
+            let accepted = libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut());
+            if accepted >= 0 {
+                accept_rc = 0;
+                libc::close(accepted);
+            } else {
+                accept_rc = -errno();
+            }
+        }
+        if listener >= 0 {
+            libc::close(listener);
+        }
+        (wait_rc, revents, readable, accept_rc)
+    });
+
+    // Give server thread time to enter wait before connecting.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let client = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+    let (target, target_len) = EndpointHelper::loopback_storage_v4(listen_port_be);
+    let _ = libc::connect(
+        client,
+        &target as *const _ as *const libc::sockaddr,
+        target_len,
+    );
+
+    let (wait_rc, revents, readable, accept_rc) = server_thread.join().unwrap();
+
+    if client >= 0 {
+        libc::close(client);
+    }
+
+    ListenerDelayedConnectResult {
+        wait_rc,
+        revents,
+        readable,
+        accept_rc,
+    }
+}
+
 fn main() {
     unsafe {
         conformance_probes::install_ign(libc::SIGPIPE);
@@ -3385,6 +3501,20 @@ fn main() {
             hs_et_round2_bytes_read = res_hs_et.round2_bytes_read,
             hs_et_round2_completed = res_hs_et.round2_completed,
             hs_et_completed = res_hs_et.completed,
+        );
+
+        // ---------------------------------------------------------------------
+        // Case 21: listener_delayed_connect
+        // ---------------------------------------------------------------------
+        let res_delayed_ppoll = run_listener_delayed_connect_case(ListenerWaitVariant::Ppoll);
+        let res_delayed_pselect = run_listener_delayed_connect_case(ListenerWaitVariant::Pselect);
+        report!(
+            delayed_connect_ppoll_rc = res_delayed_ppoll.wait_rc,
+            delayed_connect_ppoll_revents = res_delayed_ppoll.revents,
+            delayed_connect_ppoll_accept_rc = res_delayed_ppoll.accept_rc,
+            delayed_connect_pselect_rc = res_delayed_pselect.wait_rc,
+            delayed_connect_pselect_readable = res_delayed_pselect.readable,
+            delayed_connect_pselect_accept_rc = res_delayed_pselect.accept_rc,
         );
     }
 }

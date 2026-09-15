@@ -311,6 +311,44 @@ pub(super) struct HostPollTarget {
     pub(super) sample_description: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct WaitPollTargets {
+    targets: [(i32, i16); 2],
+    len: u8,
+}
+
+impl WaitPollTargets {
+    pub(super) const fn empty() -> Self {
+        Self {
+            targets: [(0, 0); 2],
+            len: 0,
+        }
+    }
+
+    pub(super) const fn one(target: (i32, i16)) -> Self {
+        Self {
+            targets: [target, (0, 0)],
+            len: 1,
+        }
+    }
+
+    pub(super) const fn two(first: (i32, i16), second: (i32, i16)) -> Self {
+        Self {
+            targets: [first, second],
+            len: 2,
+        }
+    }
+}
+
+impl IntoIterator for WaitPollTargets {
+    type Item = (i32, i16);
+    type IntoIter = std::iter::Take<std::array::IntoIter<(i32, i16), 2>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.targets.into_iter().take(self.len as usize)
+    }
+}
+
 impl<'a> NetView<'a> {
     #[inline]
     pub(in crate::dispatch) fn captured_file_table(&self) -> Arc<crate::kernel::FileTable> {
@@ -638,28 +676,36 @@ impl<'a> NetView<'a> {
         None
     }
 
-    /// Return the wait registration entry `(host_fd, events)` for a guest pollfd.
+    /// Return the wait registration entries for a guest pollfd.
     ///
-    /// When the guest fd is backed by a host poll target (direct host fd or
-    /// readiness pipe), this yields `(target.host_fd, target.host_events)`.
+    /// When the guest fd is backed by a host poll target without description
+    /// sampling, this yields `(target.host_fd, target.host_events)`.
+    /// When the target requires description sampling (such as a listening
+    /// socket with an in-zone accept queue), this yields both
+    /// `(target.host_fd, target.host_events)` for host reactor wakeups and
+    /// `(-1, requested_events)` so `WaitFds` logical interest carries its
+    /// events for wait-queue enrollment probing.
     /// When the guest fd is a carrick-owned description without a host fd
-    /// (such as an in-memory socket), this yields `(-1, requested_events)` so
-    /// `WaitFds` logical interest carries its events for wait-queue enrollment
-    /// probing. Negative guest fds and unknown descriptors yield `None`.
+    /// (such as an in-memory socket), this yields `(-1, requested_events)`.
+    /// Negative guest fds and unknown descriptors yield empty targets.
     pub(super) fn wait_target_for_poll(
         &self,
         guest_fd: i32,
         requested_events: i16,
-    ) -> Option<(i32, i16)> {
+    ) -> WaitPollTargets {
         if guest_fd < 0 {
-            return None;
+            return WaitPollTargets::empty();
         }
         if let Some(target) = self.host_poll_target(guest_fd, requested_events) {
-            Some((target.host_fd, target.host_events))
+            if target.sample_description {
+                WaitPollTargets::two((target.host_fd, target.host_events), (-1, requested_events))
+            } else {
+                WaitPollTargets::one((target.host_fd, target.host_events))
+            }
         } else if self.open_file(guest_fd).is_some() {
-            Some((-1, requested_events))
+            WaitPollTargets::one((-1, requested_events))
         } else {
-            None
+            WaitPollTargets::empty()
         }
     }
 
@@ -2957,10 +3003,10 @@ impl<'a> NetView<'a> {
                     } else {
                         Some(std::time::Duration::from_millis(timeout_ms as u64))
                     };
-                    let wait_fds: Vec<(i32, i16)> = host_fds
-                        .iter()
-                        .map(|t| (t.host_fd, t.host_events))
-                        .collect();
+                    let mut wait_fds = Vec::new();
+                    for (i, (fd, _)) in owners.iter().enumerate() {
+                        wait_fds.extend(this.wait_target_for_poll(*fd, events_list[i]));
+                    }
                     let mut clear_on_timeout: Vec<(u64, usize)> = Vec::new();
                     if let Some(s) = &read_set {
                         clear_on_timeout.push((readfds_addr, s.len()));
@@ -3003,9 +3049,7 @@ impl<'a> NetView<'a> {
                     };
                     let mut wait_targets = Vec::new();
                     for (i, (fd, _)) in owners.iter().enumerate() {
-                        if let Some(target) = this.wait_target_for_poll(*fd, events_list[i]) {
-                            wait_targets.push(target);
-                        }
+                        wait_targets.extend(this.wait_target_for_poll(*fd, events_list[i]));
                     }
                     let files = this.captured_file_table();
                     let wait_fds = match WaitFds::raw(wait_targets)
@@ -3365,12 +3409,10 @@ impl<'a> NetView<'a> {
                 } else {
                     Some(std::time::Duration::from_millis(timeout_ms as u64))
                 };
-                let wait_fds: Vec<(i32, i16)> = sys_pollfds
-                    .iter()
-                    .zip(fds.iter())
-                    .filter(|(p, g)| p.fd >= 0 && g.fd >= 0)
-                    .map(|(p, _)| (p.fd, p.events))
-                    .collect();
+                let mut wait_fds = Vec::new();
+                for pollfd in &fds {
+                    wait_fds.extend(this.wait_target_for_poll(pollfd.fd, pollfd.events));
+                }
                 // poll/ppoll: a timeout means "no fds ready" → return 0.
                 let files = this.captured_file_table();
                 let wait_fds = match WaitFds::raw(wait_fds)
@@ -3409,9 +3451,7 @@ impl<'a> NetView<'a> {
             };
             let mut wait_targets = Vec::new();
             for pollfd in &fds {
-                if let Some(target) = this.wait_target_for_poll(pollfd.fd, pollfd.events) {
-                    wait_targets.push(target);
-                }
+                wait_targets.extend(this.wait_target_for_poll(pollfd.fd, pollfd.events));
             }
             let files = this.captured_file_table();
             let wait_fds = match WaitFds::raw(wait_targets)
