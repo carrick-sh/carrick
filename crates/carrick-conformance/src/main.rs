@@ -990,10 +990,14 @@ fn build_report(
             totals: d_res.totals.clone(),
         },
         perf: c_elapsed_ms.map(|elapsed_ms| perf_summary(elapsed_ms, docker.elapsed_ms)),
-        // Only meaningful on a TIMEOUT, and only when the host answered.
+        // Only meaningful on a TIMEOUT, and only when the host answered. A
+        // transcript still growing at the kill outranks the duty/load ladder:
+        // `[blocked]` must never be printed for a run that was demonstrably
+        // making progress.
         timeout_kind: cout.and_then(|o| {
-            o.timeout_evidence
-                .map(|e| engine::classify_timeout(e.cpu_ms, o.elapsed_ms, e.loadavg_1m, e.ncpu))
+            o.timeout_evidence.map(|e| {
+                engine::classify_timeout_with_progress(&e, o.elapsed_ms, engine::PROGRESS_WINDOW_MS)
+            })
         }),
         new_diffs: cl.new_diffs,
         known_diffs: cl.known_diffs,
