@@ -712,8 +712,12 @@ impl<'a> NetView<'a> {
     fn set_socket_pending_error(&self, fd: i32, errno: carrick_abi::LinuxErrno) {
         if let Some(open_file) = self.open_file(fd)
             && let Some(mut open) = open_file.description.write()
-            && let OpenDescription::HostSocket { base, .. } = &mut *open
         {
+            let base = match &mut *open {
+                OpenDescription::HostSocket { base, .. }
+                | OpenDescription::InMemorySocket { base, .. } => base,
+                _ => return,
+            };
             base.set_pending_socket_error(errno.get());
         }
     }
@@ -721,8 +725,10 @@ impl<'a> NetView<'a> {
     pub(super) fn take_socket_pending_error(&self, fd: i32) -> Option<carrick_abi::LinuxErrno> {
         let open_file = self.open_file(fd)?;
         let mut open = open_file.description.write()?;
-        let OpenDescription::HostSocket { base, .. } = &mut *open else {
-            return None;
+        let base = match &mut *open {
+            OpenDescription::HostSocket { base, .. }
+            | OpenDescription::InMemorySocket { base, .. } => base,
+            _ => return None,
         };
         base.take_pending_socket_error()
             .map(carrick_abi::LinuxErrno::new)
@@ -787,6 +793,19 @@ impl<'a> NetView<'a> {
         Ok(())
     }
 
+    fn check_inzone_connect_preconditions(
+        &self,
+        fd: i32,
+        listener_key: &crate::network::inzone::InZoneListenerKey,
+        target: GuestSocketAddr,
+        client_local: Option<std::net::SocketAddr>,
+    ) -> Result<bool, LinuxErrno> {
+        if let Some(err) = self.take_socket_pending_error(fd) {
+            return Err(err);
+        }
+        Self::check_inzone_client_compatibility(listener_key, target, client_local)
+    }
+
     fn check_inzone_client_compatibility(
         listener_key: &crate::network::inzone::InZoneListenerKey,
         target: GuestSocketAddr,
@@ -843,7 +862,7 @@ impl<'a> NetView<'a> {
                     .ok_or(carrick_abi::LINUX_EADDRNOTAVAIL)?,
             )
         };
-        let _ = Self::check_inzone_client_compatibility(listener.key(), target, Some(local))?;
+        let _ = self.check_inzone_connect_preconditions(fd, listener.key(), target, Some(local))?;
         let admission = listener
             .reserve_admission()
             .ok_or(carrick_abi::LINUX_ECONNREFUSED)?;
@@ -2855,7 +2874,8 @@ impl<'a> NetView<'a> {
                             None
                         });
 
-                        let is_v4_target = match Self::check_inzone_client_compatibility(
+                        let is_v4_target = match this.check_inzone_connect_preconditions(
+                            fd,
                             listener.key(),
                             target,
                             bound_addr,
@@ -3078,6 +3098,26 @@ impl<'a> NetView<'a> {
                             };
                             if live_fd.raw() != host_fd.get() {
                                 return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                            }
+                            if base.inzone_cleanup().is_none() {
+                                let scope = match this.network.spec.namespace_id.as_ref() {
+                                    Some(id) => crate::network::inzone::InZoneScope::Namespace(id.clone()),
+                                    None => crate::network::inzone::InZoneScope::CarrierHost,
+                                };
+                                let Some(lease) = this.network.provider.inzone().try_claim_bound_port(
+                                    &scope,
+                                    guest_local,
+                                    base.so_reuseaddr(),
+                                    base.so_reuseport(),
+                                    base.ipv6_v6only(),
+                                ) else {
+                                    return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EADDRNOTAVAIL));
+                                };
+                                let guard = Arc::new(InZonePortGuard {
+                                    network: Arc::clone(this.network),
+                                    lease,
+                                }) as Arc<dyn InZoneCleanup>;
+                                base.set_inzone_cleanup(Some(guard));
                             }
                             base.set_guest_local(Some(GuestSocketAddr(guest_local)));
                             drop(open);
