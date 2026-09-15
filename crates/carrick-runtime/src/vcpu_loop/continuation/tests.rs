@@ -6553,3 +6553,223 @@ fn controller_nested_epoll_5_levels_deep_real_service_wake() {
     );
     assert_eq!(data, 505);
 }
+
+/// The enrollment gap: the window between a wait-shaped syscall's own
+/// readiness check and the wait service's enrollment on the description's wait
+/// queue. A producer edge landing inside it fires `wake_all()` with nobody
+/// enrolled, so the wake is gone; only a readiness probe taken AFTER the
+/// enrollment is live can recover it.
+///
+/// This module is the acceptance property for the typed-wait-source migration.
+/// It is red while a guest fd's participation in a wait is two independently
+/// built lists joined by one `logical_interest` scalar, because a registration
+/// built from a slot alone carries no per-fd interest and the post-enrollment
+/// probe is skipped.
+mod wait_enrollment_gap {
+    use std::sync::Arc;
+
+    use carrick_abi::LinuxPollEvents;
+    use proptest::prelude::*;
+
+    use super::{
+        BlockedContinuation, CarrierWaitService, ContinuationBackend, ContinuationEvent,
+        DispatchOutcome, FdWaitCompletion, Scheduler, WaitFds, WaitSigMask, await_event_timeout,
+        bootstrap, capture, publish,
+    };
+    use crate::dispatch::fd_table::WaitQueueKind;
+    use crate::dispatch::wait_queue_fixture::{self, WaitQueueFixture};
+
+    /// Every wait here is bounded: a lost wake must be a failing assertion, not
+    /// a wedged suite.
+    const GAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The ONE line this module changes across the migration: how a guest fd
+    /// whose readiness a carrick-owned DESCRIPTION decides is spelled as a
+    /// wait. The property below never changes.
+    fn description_backed_wait(
+        slot: crate::kernel::objects::FileSlotAuthority,
+        _interest: LinuxPollEvents,
+    ) -> WaitFds {
+        // Today a wait carries slot authorities in one list and `(host_fd,
+        // events)` pairs in another; a description-decided fd has no host
+        // object, so it contributes only the slot and its interest is lost.
+        WaitFds::empty().with_slot_authorities(vec![slot])
+    }
+
+    struct GapRun {
+        _kernel: Arc<crate::kernel::Kernel>,
+        service: CarrierWaitService,
+        _continuation: BlockedContinuation,
+        token: super::ContinuationWakeToken,
+    }
+
+    /// Install `fixture`'s description at a guest fd, prove it is NOT ready for
+    /// the fixture's interest, build the wait the syscall would return, then
+    /// run `producer_in_gap` and enroll. `producer_in_gap == false` fires the
+    /// producer AFTER enrollment instead, which the wait-queue callback covers.
+    fn run_gap(
+        pid: i32,
+        fixture: &mut WaitQueueFixture,
+        producer_in_gap: bool,
+        extra_requested: LinuxPollEvents,
+    ) -> GapRun {
+        let requested = fixture.interest() | extra_requested;
+        let (kernel, context) = bootstrap(pid);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(scheduler);
+        let generation = publish(&context, 0x9000 + pid as u64);
+        let files = context.resources().files();
+        let number = crate::kernel::FileSlotNumber::for_open_fd(3).expect("guest fd 3");
+        files.install(number, Arc::clone(fixture.description()), false);
+        let slot = files
+            .capture_slot_authority(number)
+            .expect("installed slot authority");
+
+        assert!(
+            fixture
+                .description()
+                .readiness(requested.to_epoll(), &crate::kernel::NoReadinessContext)
+                .is_empty(),
+            "fixture must start NOT ready, or the gap is never entered"
+        );
+        assert!(
+            fixture.description().wait_queue().is_some(),
+            "a wait-queue-bearing kind must expose its queue"
+        );
+
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: description_backed_wait(slot, requested),
+                timeout: None,
+                sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("description-backed wait admission");
+
+        if producer_in_gap {
+            fixture.fire_producer();
+        }
+        let mut registration = service.prepare_registration(&continuation);
+        service.enroll(&mut registration).expect("enroll wait");
+        let token = registration.wake_token();
+        continuation
+            .attach_registration(registration)
+            .expect("attach registration");
+        if !producer_in_gap {
+            fixture.fire_producer();
+        }
+
+        GapRun {
+            _kernel: kernel,
+            service,
+            _continuation: continuation,
+            token,
+        }
+    }
+
+    fn assert_ready(run: &GapRun, what: &str) {
+        match await_event_timeout(&run.service, run.token, GAP_TIMEOUT) {
+            Some(Ok(ContinuationEvent::Ready)) => {}
+            other => panic!("{what}: expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_wait_queue_kind_survives_a_wake_in_the_enrollment_gap() {
+        // Report EVERY kind that loses the wake, not just the first: the gap
+        // is a property of the representation, so the failing set is the
+        // diagnosis.
+        let mut lost = Vec::new();
+        for (index, kind) in WaitQueueKind::ALL.iter().copied().enumerate() {
+            let mut fixture = wait_queue_fixture::fixture(kind);
+            let run = run_gap(
+                16_400 + index as i32,
+                &mut fixture,
+                true,
+                LinuxPollEvents::empty(),
+            );
+            if !matches!(
+                await_event_timeout(&run.service, run.token, GAP_TIMEOUT),
+                Some(Ok(ContinuationEvent::Ready))
+            ) {
+                lost.push(kind);
+            }
+        }
+        assert!(
+            lost.is_empty(),
+            "producer edge lost in the enrollment gap for {lost:?}"
+        );
+    }
+
+    /// The kind list cannot rot: every entry is constructible and classifies
+    /// back to itself, and the classifier has no wildcard arm, so a new
+    /// wait-queue-bearing description fails to compile until it is listed.
+    #[test]
+    fn wait_queue_kind_enumeration_is_exhaustive() {
+        let mut seen = Vec::new();
+        for kind in WaitQueueKind::ALL.iter().copied() {
+            let fixture = wait_queue_fixture::fixture(kind);
+            assert_eq!(
+                wait_queue_fixture::classify(fixture.description()),
+                Some(kind),
+                "fixture for {kind:?} must classify as {kind:?}"
+            );
+            assert!(
+                fixture.description().wait_queue().is_some(),
+                "{kind:?} must expose a wait queue"
+            );
+            assert!(!seen.contains(&kind), "{kind:?} listed twice");
+            seen.push(kind);
+        }
+        assert_eq!(
+            seen.len(),
+            10,
+            "every OpenDescription::wait_queue arm needs a WaitQueueKind"
+        );
+    }
+
+    /// An in-zone listener is reachable from BOTH sides: a host client
+    /// connecting to its Darwin listen socket, and a guest connect pairing in
+    /// memory. Neither producer may be lost in the gap.
+    #[test]
+    fn inzone_listener_wakes_from_host_kqueue_and_from_description_queue() {
+        let mut host = wait_queue_fixture::inzone_listener_host_socket_with_host_client();
+        let run = run_gap(16_500, &mut host, true, LinuxPollEvents::empty());
+        assert_ready(&run, "in-zone listener woken by a HOST client connect");
+
+        let mut inzone = wait_queue_fixture::fixture(WaitQueueKind::InZoneListenerHostSocket);
+        let run = run_gap(16_501, &mut inzone, true, LinuxPollEvents::empty());
+        assert_ready(&run, "in-zone listener woken by an in-zone connect");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        /// The property, generated: for any kind and either ordering of the
+        /// producer against the enrollment, the waiter is reported Ready.
+        #[test]
+        fn a_producer_edge_is_never_lost_whichever_side_of_enrollment_it_lands(
+            kind_index in 0usize..WaitQueueKind::ALL.len(),
+            producer_in_gap in any::<bool>(),
+            extra_interest in any::<bool>(),
+        ) {
+            let kind = WaitQueueKind::ALL[kind_index];
+            let mut fixture = wait_queue_fixture::fixture(kind);
+            // A guest may request MORE than the producer satisfies. `PRI` is
+            // satisfied by no fixture here, so the answer must not change.
+            let extra = if extra_interest {
+                LinuxPollEvents::PRI
+            } else {
+                LinuxPollEvents::empty()
+            };
+            let pid = 16_600 + (kind_index as i32) * 4 + i32::from(producer_in_gap);
+            let run = run_gap(pid, &mut fixture, producer_in_gap, extra);
+            match await_event_timeout(&run.service, run.token, GAP_TIMEOUT) {
+                Some(Ok(ContinuationEvent::Ready)) => {}
+                other => panic!("{kind:?} (producer_in_gap={producer_in_gap}): expected Ready, got {other:?}"),
+            }
+        }
+    }
+}
