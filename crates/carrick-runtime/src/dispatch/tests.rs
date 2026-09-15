@@ -8993,4 +8993,121 @@ mod inzone_tcp {
             other => panic!("pselect6: expected WaitFdAuthority::Logical, got {other:?}"),
         }
     }
+
+    #[test]
+    fn refused_nonblocking_inzone_connect_leaves_socket_reconnectable() {
+        const SYS_FCNTL: u64 = 25;
+        const F_SETFL: u64 = 4;
+        const SYS_PPOLL: u64 = 73;
+
+        let mut g = InZoneGuest::new();
+
+        // 1. Bound-not-listening in-zone target
+        let listen_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        g.make_sockaddr_in(ADDR_SCRATCH, 0, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKNAME,
+                [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+            ),
+            0
+        );
+        let (port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+        assert_ne!(port, 0);
+
+        // 2. Client socket set nonblocking
+        let client_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        assert_eq!(
+            g.ok(
+                SYS_FCNTL,
+                [client_fd as u64, F_SETFL, carrick_abi::LINUX_O_NONBLOCK, 0, 0, 0],
+            ),
+            0
+        );
+
+        // 3. Initial nonblocking connect against bound-not-listening target -> EINPROGRESS
+        g.make_sockaddr_in(ADDR_SCRATCH, port, [127, 0, 0, 1]);
+        assert_eq!(
+            g.call(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_EINPROGRESS)
+        );
+
+        // 4. Listener transitions to listen
+        assert_eq!(
+            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
+            0
+        );
+
+        // 5. Connect 2 reports consumed pending error -> ECONNREFUSED
+        assert_eq!(
+            g.call(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_ECONNREFUSED)
+        );
+
+        // 6. Connect 3 connects to now-listening target -> EINPROGRESS
+        assert_eq!(
+            g.call(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_EINPROGRESS)
+        );
+
+        // 7. Readiness POLLOUT
+        let pollfd_addr = DATA_SCRATCH;
+        let mut pollfd = Vec::with_capacity(8);
+        pollfd.extend_from_slice(&client_fd.to_ne_bytes());
+        pollfd.extend_from_slice(&carrick_abi::LINUX_POLLOUT.to_ne_bytes());
+        pollfd.extend_from_slice(&0i16.to_ne_bytes());
+        g.mem.write_bytes(pollfd_addr, &pollfd).unwrap();
+        let timeout_addr = DATA_SCRATCH + 0x40;
+        g.mem.write_bytes(timeout_addr, &[0u8; 16]).unwrap();
+        assert_eq!(
+            g.ok(SYS_PPOLL, [pollfd_addr, 1, timeout_addr, 0, 8, 0]),
+            1,
+            "client should report POLLOUT"
+        );
+        let out = g.mem.read_bytes(pollfd_addr, 8).unwrap();
+        let revents = i16::from_ne_bytes([out[6], out[7]]);
+        assert_eq!(revents & carrick_abi::LINUX_POLLOUT, carrick_abi::LINUX_POLLOUT);
+
+        // 8. SO_ERROR reads 0
+        let optval = ADDR_SCRATCH;
+        let optlen = ADDRLEN_SCRATCH;
+        g.mem.write_bytes(optlen, &4u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKOPT,
+                [
+                    client_fd as u64,
+                    LINUX_SOL_SOCKET as u64,
+                    LINUX_SO_ERROR as u64,
+                    optval,
+                    optlen,
+                    0,
+                ],
+            ),
+            0
+        );
+        let err_bytes = g.mem.read_bytes(optval, 4).unwrap();
+        let so_err = i32::from_ne_bytes([err_bytes[0], err_bytes[1], err_bytes[2], err_bytes[3]]);
+        assert_eq!(so_err, 0, "SO_ERROR after connect must be 0");
+
+        // 9. Accept succeeds
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        let accepted_fd = g.ok(
+            SYS_ACCEPT,
+            [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+        ) as i32;
+        assert!(accepted_fd >= 3, "accept must succeed");
+    }
 }

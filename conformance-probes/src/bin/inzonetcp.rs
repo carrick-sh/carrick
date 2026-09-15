@@ -42,6 +42,9 @@
 //!   22. `listener_delayed_connect`: server thread calls ppoll (and separately pselect)
 //!       on listener with 5s bound, waking on delayed connect, reporting wait rc/revents/readable
 //!       and accept rc.
+//!   23. `nonblocking_connect_racing`: nonblocking loopback connect against a bound
+//!       non-listening target, listener start, pending connect retry, and subsequent
+//!       connection progression with address reflection and SO_ERROR readback.
 //!
 //! Output is deterministic `key=value` lines only. Every wait is bounded by a
 //! `poll` with a 5 s cap so a lost wake is a false line, never a hang.
@@ -2150,6 +2153,231 @@ unsafe fn run_listener_delayed_connect_case(
     }
 }
 
+#[derive(Debug, Clone)]
+struct RacingConnectResult {
+    c1_rc: i32,
+    c1_errno: i32,
+    listen_rc: i32,
+    listen_errno: i32,
+    c2_rc: i32,
+    c2_errno: i32,
+    c3_rc: i32,
+    c3_errno: i32,
+    poll_rc: i32,
+    poll_errno: i32,
+    poll_revents: String,
+    so_error_rc: i32,
+    so_error: i32,
+    client_local_family: i32,
+    client_local_addr: String,
+    client_local_port_nonzero: bool,
+    client_peer_family: i32,
+    client_peer_addr: String,
+    client_peer_port_eq_listener: bool,
+    accept_rc: i32,
+    accept_errno: i32,
+    server_local_family: i32,
+    server_local_addr: String,
+    server_local_port_eq_listener: bool,
+    server_peer_family: i32,
+    server_peer_addr: String,
+    server_peer_port_eq_client: bool,
+}
+
+unsafe fn run_racing_connect_case(family: SockFamily) -> RacingConnectResult {
+    let af = match family {
+        SockFamily::V4 => libc::AF_INET,
+        SockFamily::V6 => libc::AF_INET6,
+    };
+    let (d_sin, d_len) = match family {
+        SockFamily::V4 => EndpointHelper::loopback_storage_v4(0),
+        SockFamily::V6 => EndpointHelper::loopback_storage_v6(0),
+    };
+    let listener = libc::socket(af, libc::SOCK_STREAM, 0);
+    let b_rc = if listener >= 0 {
+        libc::bind(listener, &d_sin as *const _ as *const libc::sockaddr, d_len)
+    } else {
+        -1
+    };
+    let (_, _, l_bound, _) = if b_rc == 0 {
+        EndpointHelper::getsockname(listener)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let l_port_be = EndpointHelper::get_port_be(&l_bound);
+    let (target, target_len) = match family {
+        SockFamily::V4 => EndpointHelper::loopback_storage_v4(l_port_be),
+        SockFamily::V6 => EndpointHelper::loopback_storage_v6(l_port_be),
+    };
+
+    let client = libc::socket(af, libc::SOCK_STREAM, 0);
+    set_nonblock(client);
+
+    // 1. Initial nonblocking connect to bound, non-listening endpoint
+    let c1_rc = if client >= 0 {
+        libc::connect(
+            client,
+            &target as *const _ as *const libc::sockaddr,
+            target_len,
+        )
+    } else {
+        -1
+    };
+    let c1_errno = if c1_rc < 0 { errno() } else { 0 };
+
+    // 2. Listener transitions to listen(1)
+    let listen_rc = if listener >= 0 {
+        set_nonblock(listener);
+        libc::listen(listener, 1)
+    } else {
+        -1
+    };
+    let listen_errno = if listen_rc < 0 { errno() } else { 0 };
+
+    // 3. Retry connect 1: on Linux, reports pending ECONNREFUSED from initial attempt
+    let c2_rc = if client >= 0 {
+        libc::connect(
+            client,
+            &target as *const _ as *const libc::sockaddr,
+            target_len,
+        )
+    } else {
+        -1
+    };
+    let c2_errno = if c2_rc < 0 { errno() } else { 0 };
+
+    // 4. Retry connect 2: proceeds to connect to now-listening endpoint
+    let c3_rc = if client >= 0 {
+        libc::connect(
+            client,
+            &target as *const _ as *const libc::sockaddr,
+            target_len,
+        )
+    } else {
+        -1
+    };
+    let c3_errno = if c3_rc < 0 { errno() } else { 0 };
+
+    // 5. Poll for completion with 5 s bound
+    let mut pfd = libc::pollfd {
+        fd: client,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let poll_rc = if client >= 0 {
+        libc::poll(&mut pfd, 1, 5000)
+    } else {
+        -1
+    };
+    let poll_errno = if poll_rc < 0 { errno() } else { 0 };
+    let poll_revents = format!("0x{:x}", pfd.revents);
+
+    // 6. SO_ERROR readback after POLLOUT
+    let mut so_err: libc::c_int = 0;
+    let mut optlen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let so_error_rc = if client >= 0 {
+        libc::getsockopt(
+            client,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut so_err as *mut _ as *mut libc::c_void,
+            &mut optlen,
+        )
+    } else {
+        -1
+    };
+    let so_error_errno = if so_error_rc == 0 { 0 } else { errno() };
+    let so_error = if so_error_rc == 0 { so_err } else { so_error_errno };
+
+    // 7. Client getsockname and getpeername
+    let (c_gsn_rc, _c_gsn_errno, c_local_storage, _) = if client >= 0 {
+        EndpointHelper::getsockname(client)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let (client_local_family, client_local_addr) = EndpointHelper::format_family_and_addr(&c_local_storage);
+    let client_local_port = EndpointHelper::get_port_be(&c_local_storage);
+
+    let (c_gpn_rc, _c_gpn_errno, c_peer_storage, _) = if client >= 0 {
+        EndpointHelper::getpeername(client)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let (client_peer_family, client_peer_addr) = EndpointHelper::format_family_and_addr(&c_peer_storage);
+    let client_peer_port = EndpointHelper::get_port_be(&c_peer_storage);
+
+    // 8. Accept on listener and inspect accepted socket
+    let mut acc_storage: libc::sockaddr_storage = std::mem::zeroed();
+    let mut acc_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let accepted = if listener >= 0 {
+        libc::accept(
+            listener,
+            &mut acc_storage as *mut _ as *mut libc::sockaddr,
+            &mut acc_len,
+        )
+    } else {
+        -1
+    };
+    let accept_rc = if accepted >= 0 { 0 } else { -1 };
+    let accept_errno = if accepted >= 0 { 0 } else { errno() };
+
+    let (s_gsn_rc, _s_gsn_errno, s_local_storage, _) = if accepted >= 0 {
+        EndpointHelper::getsockname(accepted)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let (server_local_family, server_local_addr) = EndpointHelper::format_family_and_addr(&s_local_storage);
+    let server_local_port = EndpointHelper::get_port_be(&s_local_storage);
+
+    let (s_gpn_rc, _s_gpn_errno, s_peer_storage, _) = if accepted >= 0 {
+        EndpointHelper::getpeername(accepted)
+    } else {
+        (-1, -1, std::mem::zeroed(), 0)
+    };
+    let (server_peer_family, server_peer_addr) = EndpointHelper::format_family_and_addr(&s_peer_storage);
+    let server_peer_port = EndpointHelper::get_port_be(&s_peer_storage);
+
+    if accepted >= 0 {
+        libc::close(accepted);
+    }
+    if client >= 0 {
+        libc::close(client);
+    }
+    if listener >= 0 {
+        libc::close(listener);
+    }
+
+    RacingConnectResult {
+        c1_rc,
+        c1_errno,
+        listen_rc,
+        listen_errno,
+        c2_rc,
+        c2_errno,
+        c3_rc,
+        c3_errno,
+        poll_rc,
+        poll_errno,
+        poll_revents,
+        so_error_rc,
+        so_error,
+        client_local_family,
+        client_local_addr,
+        client_local_port_nonzero: c_gsn_rc == 0 && client_local_port != 0,
+        client_peer_family,
+        client_peer_addr,
+        client_peer_port_eq_listener: c_gpn_rc == 0 && client_peer_port == l_port_be,
+        accept_rc,
+        accept_errno,
+        server_local_family,
+        server_local_addr,
+        server_local_port_eq_listener: s_gsn_rc == 0 && server_local_port == l_port_be,
+        server_peer_family,
+        server_peer_addr,
+        server_peer_port_eq_client: s_gpn_rc == 0 && server_peer_port == client_local_port,
+    }
+}
+
 fn main() {
     unsafe {
         conformance_probes::install_ign(libc::SIGPIPE);
@@ -3515,6 +3743,68 @@ fn main() {
             delayed_connect_pselect_rc = res_delayed_pselect.wait_rc,
             delayed_connect_pselect_readable = res_delayed_pselect.readable,
             delayed_connect_pselect_accept_rc = res_delayed_pselect.accept_rc,
+        );
+
+        // ---------------------------------------------------------------------
+        // Case 22: nonblocking_connect_racing
+        // ---------------------------------------------------------------------
+        let res_racing_v4 = run_racing_connect_case(SockFamily::V4);
+        let res_racing_v6 = run_racing_connect_case(SockFamily::V6);
+        report!(
+            racing_connect_v4_c1_rc = res_racing_v4.c1_rc,
+            racing_connect_v4_c1_errno = res_racing_v4.c1_errno,
+            racing_connect_v4_listen_rc = res_racing_v4.listen_rc,
+            racing_connect_v4_listen_errno = res_racing_v4.listen_errno,
+            racing_connect_v4_c2_rc = res_racing_v4.c2_rc,
+            racing_connect_v4_c2_errno = res_racing_v4.c2_errno,
+            racing_connect_v4_c3_rc = res_racing_v4.c3_rc,
+            racing_connect_v4_c3_errno = res_racing_v4.c3_errno,
+            racing_connect_v4_poll_rc = res_racing_v4.poll_rc,
+            racing_connect_v4_poll_errno = res_racing_v4.poll_errno,
+            racing_connect_v4_poll_revents = res_racing_v4.poll_revents,
+            racing_connect_v4_so_error_rc = res_racing_v4.so_error_rc,
+            racing_connect_v4_so_error = res_racing_v4.so_error,
+            racing_connect_v4_client_local_family = res_racing_v4.client_local_family,
+            racing_connect_v4_client_local_addr = res_racing_v4.client_local_addr,
+            racing_connect_v4_client_local_port_nonzero = res_racing_v4.client_local_port_nonzero,
+            racing_connect_v4_client_peer_family = res_racing_v4.client_peer_family,
+            racing_connect_v4_client_peer_addr = res_racing_v4.client_peer_addr,
+            racing_connect_v4_client_peer_port_eq_listener = res_racing_v4.client_peer_port_eq_listener,
+            racing_connect_v4_accept_rc = res_racing_v4.accept_rc,
+            racing_connect_v4_accept_errno = res_racing_v4.accept_errno,
+            racing_connect_v4_server_local_family = res_racing_v4.server_local_family,
+            racing_connect_v4_server_local_addr = res_racing_v4.server_local_addr,
+            racing_connect_v4_server_local_port_eq_listener = res_racing_v4.server_local_port_eq_listener,
+            racing_connect_v4_server_peer_family = res_racing_v4.server_peer_family,
+            racing_connect_v4_server_peer_addr = res_racing_v4.server_peer_addr,
+            racing_connect_v4_server_peer_port_eq_client = res_racing_v4.server_peer_port_eq_client,
+            racing_connect_v6_c1_rc = res_racing_v6.c1_rc,
+            racing_connect_v6_c1_errno = res_racing_v6.c1_errno,
+            racing_connect_v6_listen_rc = res_racing_v6.listen_rc,
+            racing_connect_v6_listen_errno = res_racing_v6.listen_errno,
+            racing_connect_v6_c2_rc = res_racing_v6.c2_rc,
+            racing_connect_v6_c2_errno = res_racing_v6.c2_errno,
+            racing_connect_v6_c3_rc = res_racing_v6.c3_rc,
+            racing_connect_v6_c3_errno = res_racing_v6.c3_errno,
+            racing_connect_v6_poll_rc = res_racing_v6.poll_rc,
+            racing_connect_v6_poll_errno = res_racing_v6.poll_errno,
+            racing_connect_v6_poll_revents = res_racing_v6.poll_revents,
+            racing_connect_v6_so_error_rc = res_racing_v6.so_error_rc,
+            racing_connect_v6_so_error = res_racing_v6.so_error,
+            racing_connect_v6_client_local_family = res_racing_v6.client_local_family,
+            racing_connect_v6_client_local_addr = res_racing_v6.client_local_addr,
+            racing_connect_v6_client_local_port_nonzero = res_racing_v6.client_local_port_nonzero,
+            racing_connect_v6_client_peer_family = res_racing_v6.client_peer_family,
+            racing_connect_v6_client_peer_addr = res_racing_v6.client_peer_addr,
+            racing_connect_v6_client_peer_port_eq_listener = res_racing_v6.client_peer_port_eq_listener,
+            racing_connect_v6_accept_rc = res_racing_v6.accept_rc,
+            racing_connect_v6_accept_errno = res_racing_v6.accept_errno,
+            racing_connect_v6_server_local_family = res_racing_v6.server_local_family,
+            racing_connect_v6_server_local_addr = res_racing_v6.server_local_addr,
+            racing_connect_v6_server_local_port_eq_listener = res_racing_v6.server_local_port_eq_listener,
+            racing_connect_v6_server_peer_family = res_racing_v6.server_peer_family,
+            racing_connect_v6_server_peer_addr = res_racing_v6.server_peer_addr,
+            racing_connect_v6_server_peer_port_eq_client = res_racing_v6.server_peer_port_eq_client,
         );
     }
 }
