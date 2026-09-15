@@ -62,14 +62,10 @@ impl HostWaitTarget {
         Self { fd, events }
     }
 
-    // Task 5's `WaitFds::from_registrations` lowering is the first non-test
-    // reader of the host half.
-    #[allow(dead_code)]
     pub(crate) const fn fd(self) -> HostFd {
         self.fd
     }
 
-    #[allow(dead_code)]
     pub(crate) const fn events(self) -> LinuxPollEvents {
         self.events
     }
@@ -82,9 +78,6 @@ impl HostWaitTarget {
 /// probe, and every construction site owes a test that proves the latch: the
 /// producer fires in the gap and the host descriptor ALONE reports the waiter
 /// ready. Absent that proof a site is `HostPeersOnly` and takes the probe.
-// Task 4's `wait_source_for` is the first site that classifies a park as dual;
-// until then only this module's tests name coverage.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HostProxyCoverage {
     /// An in-memory pipe or eventfd readiness pipe, or an epoll instance's
@@ -104,8 +97,7 @@ pub(crate) enum WaitSource {
     Host { host: HostWaitTarget },
     /// No host object: the description's wait queue is the only wake source.
     Description { interest: WaitInterest },
-    /// Both, with typed coverage. Task 4 is the first site that builds one.
-    #[allow(dead_code)]
+    /// Both, with typed coverage.
     Dual {
         host: HostWaitTarget,
         interest: WaitInterest,
@@ -132,7 +124,6 @@ impl WaitSource {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) const fn host(&self) -> Option<HostWaitTarget> {
         match self {
             Self::Host { host } | Self::Dual { host, .. } => Some(*host),

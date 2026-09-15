@@ -774,8 +774,14 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
 
     let net_source = include_str!("../../dispatch/net.rs");
     assert!(
-        net_source.matches("with_guest_slots(&files").count() >= 2,
-        "pselect/ppoll must capture every exact guest fd slot at dispatch"
+        net_source.matches("this.wait_source_for(").count() >= 2,
+        "pselect/ppoll must classify every guest fd at dispatch: the host half and \
+         the exact slot in ONE registration"
+    );
+    assert!(
+        !net_source.contains("fn host_poll_target")
+            && !net_source.contains("fn wait_target_for_poll"),
+        "the two independently built wait lists and their -1 sentinel are retired"
     );
     let io_uring_source = include_str!("../../dispatch/ioring.rs");
     assert!(io_uring_source.contains("with_guest_slots(&files, [ring_fd, sqe.fd])"));

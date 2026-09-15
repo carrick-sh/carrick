@@ -85,11 +85,15 @@
 //! helper routines and the AF_UNIX registry live in the `support` submodule.
 pub(crate) use super::dispatcher::NetView;
 use super::*;
+use crate::dispatch::wait_source::{
+    HostProxyCoverage, HostWaitTarget, WaitInterest, WaitRegistration, WaitSource,
+};
 use crate::linux_abi::{
     LINUX_ICMP_ECHO_REPLY, LINUX_ICMP_ECHO_REQUEST, LINUX_IPPROTO_ICMP, LINUX_IPPROTO_TCP,
     LINUX_MSG_NOSIGNAL, LINUX_POLLRDHUP,
 };
 use crate::network::{BindTarget, ConnectTarget, GuestSocketAddr, HostSocketAddr};
+use carrick_abi::LinuxPollEvents;
 use carrick_abi::syscall::nr;
 
 syscall_table! {
@@ -298,54 +302,32 @@ pub(in crate::dispatch) fn recverr_close(host_fd: i32) {
 use support::*;
 pub(super) use support::{drain_netlink_queue, host_fd_is_nonblocking, set_host_nonblocking};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct HostPollTarget {
-    pub(super) host_fd: i32,
-    pub(super) host_events: i16,
-    pub(super) readiness_pipe: bool,
-    /// The host fd is only a WAKE source: the guest-visible events come from
-    /// `poll_ready_events` on every probe, not from the host `poll(0)` bits.
-    /// A listening socket that also owns an in-zone accept queue is the case:
-    /// a connection paired in-zone never touches the host listen socket, so
-    /// the host answer alone would report the listener idle until timeout.
-    pub(super) sample_description: bool,
+/// Lower the per-request wait registrations a syscall classified into the
+/// `WaitFds` it parks on.
+///
+/// A request position with no registration (a negative pollfd, which `poll(2)`
+/// ignores) takes no part, and a wait that named no source at all is a pure
+/// timeout wait — which is what the separate slot capture produced when every
+/// entry it was handed was negative.
+fn wait_fds_for(registrations: &[Option<WaitRegistration>]) -> Result<WaitFds, LinuxErrno> {
+    let registrations: Vec<WaitRegistration> = registrations.iter().flatten().copied().collect();
+    if registrations.is_empty() {
+        return Ok(WaitFds::empty());
+    }
+    WaitFds::from_registrations(registrations, Vec::new())
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct WaitPollTargets {
-    targets: [(i32, i16); 2],
-    len: u8,
-}
+/// One request position's host half: the descriptor the reactor parks on and,
+/// for a dual source, how completely it covers the description.
+type HostHalf = (HostWaitTarget, Option<HostProxyCoverage>);
 
-impl WaitPollTargets {
-    pub(super) const fn empty() -> Self {
-        Self {
-            targets: [(0, 0); 2],
-            len: 0,
-        }
-    }
-
-    pub(super) const fn one(target: (i32, i16)) -> Self {
-        Self {
-            targets: [target, (0, 0)],
-            len: 1,
-        }
-    }
-
-    pub(super) const fn two(first: (i32, i16), second: (i32, i16)) -> Self {
-        Self {
-            targets: [first, second],
-            len: 2,
-        }
-    }
-}
-
-impl IntoIterator for WaitPollTargets {
-    type Item = (i32, i16);
-    type IntoIter = std::iter::Take<std::array::IntoIter<(i32, i16), 2>>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.targets.into_iter().take(self.len as usize)
+/// The host half of a registration, or `None` when the description alone
+/// decides the fd's readiness and the caller must take the per-fd loop.
+fn host_half(registration: Option<&WaitRegistration>) -> Option<HostHalf> {
+    match registration.map(|registration| registration.source()) {
+        Some(WaitSource::Host { host }) => Some((host, None)),
+        Some(WaitSource::Dual { host, coverage, .. }) => Some((host, Some(coverage))),
+        Some(WaitSource::Description { .. }) | None => None,
     }
 }
 
@@ -574,45 +556,102 @@ impl<'a> NetView<'a> {
         }
     }
 
-    /// Resolve one guest poll interest to the host fd and host event that
-    /// `libc::poll`/`WaitOnFds` must watch for it — the ONE classification
-    /// `ppoll` and `pselect6` share, so neither can drift from the other.
+    /// Where one guest fd's readiness comes from while it is parked — the ONE
+    /// classification every wait-shaped syscall shares, so `ppoll` and
+    /// `pselect6` cannot drift from each other or from the wait service.
     ///
-    /// `None` means the fd is synthetic (epoll/timerfd/…) or currently needs
-    /// the per-fd `poll_ready_events` loop (an eventfd asked for `POLLOUT`, a
-    /// pipe with staged splice bytes); the caller must take that loop for the
-    /// whole set. An in-memory pipe or eventfd is host-visible only through
-    /// its READINESS pipe, whose read end becomes readable when the guest fd
-    /// is ready for whatever the guest asked — so the host event is always
-    /// `POLLIN` there, and `readiness_pipe` tells the caller to translate a
-    /// host wake back through `poll_ready_events` instead of using the host
-    /// revents verbatim. Polling that read end for the guest's `POLLOUT`
-    /// never fires: select01 counted a writable pipe end as not ready, and a
-    /// blocking select on a full pipe slept its whole timeout.
-    pub(super) fn host_poll_target(&self, fd: i32, events: i16) -> Option<HostPollTarget> {
-        if ((events & LINUX_POLLOUT) != 0 && self.fd_is_eventfd(fd))
-            || ((events & LINUX_POLLIN) != 0 && self.staged_splice_pipe_bytes(fd) != 0)
-        {
-            return None;
+    /// The host target and the exact [`FileSlotAuthority`] land in ONE
+    /// [`WaitRegistration`]. The retired pair (`host_poll_target` plus
+    /// `wait_target_for_poll`) built two independent lists joined by a `-1`
+    /// sentinel whose events folded into one scalar across the whole wait, so
+    /// a description could be enrolled with a fabricated interest, or with
+    /// none at all.
+    ///
+    /// `Ok(None)` means the fd takes no part in the wait:
+    ///
+    /// * a NEGATIVE pollfd, which `poll(2)` ignores. The retired
+    ///   `fd < 0 => direct(fd)` arm passed the guest number through as a HOST
+    ///   descriptor; there is no arm here that can.
+    /// * a carrick-owned description the guest asked for NO events on. Nothing
+    ///   can make it guest-visibly ready, so there is no interest to probe
+    ///   with and the host readiness pipe (which only says "something
+    ///   changed") is not an answer either.
+    ///
+    /// `Err(EBADF)` is a guest fd whose slot cannot be captured: the wait
+    /// cannot be authorised against it, which is what the separate slot
+    /// capture reported before.
+    pub(in crate::dispatch) fn wait_source_for(
+        &self,
+        files: &crate::kernel::FileTable,
+        guest_fd: Fd,
+        requested: LinuxPollEvents,
+    ) -> Result<Option<WaitRegistration>, LinuxErrno> {
+        if guest_fd.0 < 0 {
+            return Ok(None);
         }
+        // Capture BEFORE classifying: every guest fd a wait names must be
+        // authorised, including one whose readiness source turns out to be
+        // nothing, or a closed fd would silently drop out of the wait instead
+        // of failing it.
+        let number =
+            crate::kernel::FileSlotNumber::for_open_fd(guest_fd.0).map_err(|_| LINUX_EBADF)?;
+        let slot = files
+            .capture_slot_or_stdio_authority(number)
+            .ok_or(LINUX_EBADF)?;
+        let Some(source) = self.wait_source_kind(guest_fd, requested) else {
+            return Ok(None);
+        };
+        Ok(Some(WaitRegistration::new(
+            guest_fd, slot, requested, source,
+        )))
+    }
+
+    /// The readiness source alone, without the slot capture: the ported
+    /// `host_poll_target` match.
+    ///
+    /// An in-memory pipe or eventfd is host-visible only through its READINESS
+    /// pipe, whose read end becomes readable when the guest fd is ready for
+    /// whatever the guest asked — so the host event is always `POLLIN` there,
+    /// and the description, not the host revents, is the guest's answer. That
+    /// pipe is level-triggered, which is what licenses
+    /// [`HostProxyCoverage::LatchedLevelTriggered`]. Polling the read end for
+    /// the guest's `POLLOUT` never fires: select01 counted a writable pipe end
+    /// as not ready, and a blocking select on a full pipe slept its whole
+    /// timeout.
+    fn wait_source_kind(&self, guest_fd: Fd, requested: LinuxPollEvents) -> Option<WaitSource> {
+        let fd = guest_fd.0;
+        let interest = WaitInterest::new(requested);
+        let described = || interest.map(|interest| WaitSource::Description { interest });
+        // A host descriptor that is only a WAKE source needs the description
+        // alongside it; with no interest there is no description half, and its
+        // revents are not the guest's answer, so the fd has no source at all.
+        let proxied = |host: HostWaitTarget, coverage: HostProxyCoverage| {
+            interest.map(|interest| WaitSource::Dual {
+                host,
+                interest,
+                coverage,
+            })
+        };
         let direct = |host_fd: i32| {
-            Some(HostPollTarget {
-                host_fd,
-                host_events: events,
-                readiness_pipe: false,
-                sample_description: false,
+            Some(WaitSource::Host {
+                host: HostWaitTarget::new(HostFd(host_fd), requested),
             })
         };
         let readiness = |host_fd: i32| {
-            Some(HostPollTarget {
-                host_fd,
-                host_events: libc::POLLIN,
-                readiness_pipe: true,
-                sample_description: false,
-            })
+            proxied(
+                HostWaitTarget::new(HostFd(host_fd), LinuxPollEvents::IN),
+                HostProxyCoverage::LatchedLevelTriggered,
+            )
         };
+        if (requested.contains(LinuxPollEvents::OUT) && self.fd_is_eventfd(fd))
+            || (requested.contains(LinuxPollEvents::IN) && self.staged_splice_pipe_bytes(fd) != 0)
+        {
+            return described();
+        }
         if let Some(open_file) = self.open_file(fd) {
-            let open = open_file.description.read()?;
+            let Some(open) = open_file.description.read() else {
+                return described();
+            };
             return match &*open {
                 OpenDescription::HostPipe { host_fd, .. }
                 | OpenDescription::HostFile { host_fd, .. } => direct(host_fd.raw()),
@@ -631,82 +670,55 @@ impl<'a> NetView<'a> {
                         && !lifecycle::host_stream_socket_is_connected(host_fd.raw());
                     if base.pending_socket_error().is_some()
                         || unconnected_stream
-                        || (base.listening() && (events & LINUX_POLLOUT != 0))
+                        || (base.listening() && requested.contains(LinuxPollEvents::OUT))
                     {
-                        None
+                        described()
                     } else {
                         let host_events = if base.listening() {
-                            events & !libc::POLLOUT
+                            requested - LinuxPollEvents::OUT
                         } else {
-                            events
+                            requested
                         };
-                        Some(HostPollTarget {
-                            host_fd: host_fd.raw(),
-                            host_events,
-                            readiness_pipe: false,
-                            sample_description: base.listening()
-                                && base.inzone_listener().is_some(),
-                        })
+                        let host = HostWaitTarget::new(HostFd(host_fd.raw()), host_events);
+                        if base.listening() && base.inzone_listener().is_some() {
+                            // A connection paired IN ZONE never touches the
+                            // Darwin listen socket, so the host half observes
+                            // host peers only and the description still needs
+                            // the post-enrollment probe.
+                            proxied(host, HostProxyCoverage::HostPeersOnly)
+                        } else {
+                            Some(WaitSource::Host { host })
+                        }
                     }
                 }
-                OpenDescription::PipeReader { pipe, .. } => {
-                    pipe.read_poll_fd().and_then(|fd| readiness(fd.raw()))
-                }
-                OpenDescription::PipeWriter { pipe, .. } => {
-                    pipe.write_poll_fd().and_then(|fd| readiness(fd.raw()))
-                }
-                OpenDescription::EventFd { state, .. } => {
-                    state.read_fd.as_ref().and_then(|fd| readiness(fd.raw()))
-                }
+                OpenDescription::PipeReader { pipe, .. } => match pipe.read_poll_fd() {
+                    Some(fd) => readiness(fd.raw()),
+                    None => described(),
+                },
+                OpenDescription::PipeWriter { pipe, .. } => match pipe.write_poll_fd() {
+                    Some(fd) => readiness(fd.raw()),
+                    None => described(),
+                },
+                OpenDescription::EventFd { state, .. } => match state.read_fd.as_ref() {
+                    Some(fd) => readiness(fd.raw()),
+                    None => described(),
+                },
                 OpenDescription::Epoll { kqueue, .. } => readiness(kqueue.poll_fd()),
                 OpenDescription::Pidfd { kqueue, .. } => direct(kqueue.poll_fd()),
                 OpenDescription::Inotify { state, .. } => direct(state.poll_fd()),
                 OpenDescription::Fanotify { group, .. } => match group.poll_fd() {
                     fd if fd >= 0 => direct(fd),
-                    _ => None,
+                    _ => described(),
                 },
-                _ => None,
+                _ => described(),
             };
         }
-        if is_stdio_fd(fd) || fd < 0 {
-            return direct(fd);
-        }
-        // Unknown fd: never pass the guest number through as a host fd (see
+        // stdio the guest never reopened IS its host descriptor. Any other
+        // unknown fd never passes the guest number through as a host fd (see
         // `host_fd_for_poll`).
-        None
-    }
-
-    /// Return the wait registration entries for a guest pollfd.
-    ///
-    /// When the guest fd is backed by a host poll target without description
-    /// sampling, this yields `(target.host_fd, target.host_events)`.
-    /// When the target requires description sampling (such as a listening
-    /// socket with an in-zone accept queue), this yields both
-    /// `(target.host_fd, target.host_events)` for host reactor wakeups and
-    /// `(-1, requested_events)` so `WaitFds` logical interest carries its
-    /// events for wait-queue enrollment probing.
-    /// When the guest fd is a carrick-owned description without a host fd
-    /// (such as an in-memory socket), this yields `(-1, requested_events)`.
-    /// Negative guest fds and unknown descriptors yield empty targets.
-    pub(super) fn wait_target_for_poll(
-        &self,
-        guest_fd: i32,
-        requested_events: i16,
-    ) -> WaitPollTargets {
-        if guest_fd < 0 {
-            return WaitPollTargets::empty();
-        }
-        if let Some(target) = self.host_poll_target(guest_fd, requested_events) {
-            if target.sample_description {
-                WaitPollTargets::two((target.host_fd, target.host_events), (-1, requested_events))
-            } else {
-                WaitPollTargets::one((target.host_fd, target.host_events))
-            }
-        } else if self.open_file(guest_fd).is_some() {
-            WaitPollTargets::one((-1, requested_events))
-        } else {
-            WaitPollTargets::empty()
-        }
+        is_stdio_fd(fd).then(|| WaitSource::Host {
+            host: HostWaitTarget::new(HostFd(fd), requested),
+        })
     }
 
     /// Return the host fd backing a guest fd for ppoll's fast path.
@@ -2870,9 +2882,10 @@ impl<'a> NetView<'a> {
             // The old code unwrap_or'd synthetic fds into the guest fd *number* and
             // polled that as a host fd — which blocks on carrick's own fds and
             // deadlocks. Each fd gets POLLIN/POLLOUT/POLLPRI per its set membership.
+            let files = this.captured_file_table();
             let mut owners: Vec<(i32, i16)> = Vec::new(); // (fd, requested_mask)
             let mut events_list: Vec<i16> = Vec::new();
-            let mut host_map: Vec<Option<HostPollTarget>> = Vec::new();
+            let mut registrations: Vec<Option<WaitRegistration>> = Vec::new();
             for fd in 0..nfds {
                 let r = read_set.as_ref().is_some_and(|s| fd_set_contains(s, fd));
                 let w = write_set.as_ref().is_some_and(|s| fd_set_contains(s, fd));
@@ -2904,14 +2917,28 @@ impl<'a> NetView<'a> {
                 if e {
                     req_mask |= 0x04;
                 }
+                let registration = match this.wait_source_for(
+                    &files,
+                    Fd(fd_i32),
+                    LinuxPollEvents::from_bits_retain(events),
+                ) {
+                    Ok(registration) => registration,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
                 owners.push((fd_i32, req_mask));
                 events_list.push(events);
-                host_map.push(this.host_poll_target(fd_i32, events));
+                registrations.push(registration);
             }
 
             // revents per entry, filled by whichever path runs.
             let mut revents: Vec<i16> = vec![0; owners.len()];
-            let all_host: Option<Vec<HostPollTarget>> = host_map.iter().copied().collect();
+            // select(2) never registers an fd with an empty mask, so every
+            // entry carries a source; the fast path needs every one of them to
+            // be host-backed.
+            let all_host: Option<Vec<HostHalf>> = registrations
+                .iter()
+                .map(|registration| host_half(registration.as_ref()))
+                .collect();
 
             let is_select_ready = |req_mask: i16, rev: i16| -> bool {
                 ((req_mask & 0x01) != 0
@@ -2948,12 +2975,12 @@ impl<'a> NetView<'a> {
                     sig_mask,
                     completion: FdWaitCompletion::Fd { on_timeout: 0 },
                 });
-            } else if let Some(host_fds) = all_host {
-                let mut pollfds: Vec<libc::pollfd> = host_fds
+            } else if let Some(host_halves) = all_host {
+                let mut pollfds: Vec<libc::pollfd> = host_halves
                     .iter()
-                    .map(|t| libc::pollfd {
-                        fd: t.host_fd,
-                        events: t.host_events,
+                    .map(|(host, _)| libc::pollfd {
+                        fd: host.fd().get(),
+                        events: host.events().bits(),
                         revents: 0,
                     })
                     .collect();
@@ -2976,16 +3003,20 @@ impl<'a> NetView<'a> {
                 for (i, (slot, p)) in revents.iter_mut().zip(pollfds.iter()).enumerate() {
                     // A readiness pipe only says "something changed"; the
                     // guest-visible events come from the description itself.
-                    let rev = if host_fds[i].readiness_pipe {
-                        if p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-                            this.poll_ready_events(owners[i].0, events_list[i])
-                        } else {
-                            0
+                    let rev = match host_halves[i].1 {
+                        Some(HostProxyCoverage::LatchedLevelTriggered) => {
+                            if p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                                this.poll_ready_events(owners[i].0, events_list[i])
+                            } else {
+                                0
+                            }
                         }
-                    } else if host_fds[i].sample_description {
-                        this.poll_ready_events(owners[i].0, events_list[i])
-                    } else {
-                        p.revents
+                        // A host descriptor that sees host peers only cannot
+                        // answer for an in-zone producer.
+                        Some(HostProxyCoverage::HostPeersOnly) => {
+                            this.poll_ready_events(owners[i].0, events_list[i])
+                        }
+                        None => p.revents,
                     };
                     *slot = rev;
                     if is_select_ready(owners[i].1, rev) {
@@ -3003,10 +3034,6 @@ impl<'a> NetView<'a> {
                     } else {
                         Some(std::time::Duration::from_millis(timeout_ms as u64))
                     };
-                    let mut wait_fds = Vec::new();
-                    for (i, (fd, _)) in owners.iter().enumerate() {
-                        wait_fds.extend(this.wait_target_for_poll(*fd, events_list[i]));
-                    }
                     let mut clear_on_timeout: Vec<(u64, usize)> = Vec::new();
                     if let Some(s) = &read_set {
                         clear_on_timeout.push((readfds_addr, s.len()));
@@ -3017,10 +3044,7 @@ impl<'a> NetView<'a> {
                     if let Some(s) = &except_set {
                         clear_on_timeout.push((exceptfds_addr, s.len()));
                     }
-                    let files = this.captured_file_table();
-                    let wait_fds = match WaitFds::raw(wait_fds)
-                        .with_guest_slots(&files, owners.iter().map(|(fd, _)| *fd))
-                    {
+                    let wait_fds = match wait_fds_for(&registrations) {
                         Ok(wait_fds) => wait_fds,
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
@@ -3047,14 +3071,7 @@ impl<'a> NetView<'a> {
                     } else {
                         Some(std::time::Duration::from_millis(timeout_ms as u64))
                     };
-                    let mut wait_targets = Vec::new();
-                    for (i, (fd, _)) in owners.iter().enumerate() {
-                        wait_targets.extend(this.wait_target_for_poll(*fd, events_list[i]));
-                    }
-                    let files = this.captured_file_table();
-                    let wait_fds = match WaitFds::raw(wait_targets)
-                        .with_guest_slots(&files, owners.iter().map(|(fd, _)| *fd))
-                    {
+                    let wait_fds = match wait_fds_for(&registrations) {
                         Ok(wait_fds) => wait_fds,
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
@@ -3311,30 +3328,48 @@ impl<'a> NetView<'a> {
                 fds.push(pollfd);
                 addresses.push(address);
             }
-            // Map guest fds → host fds where possible. Fast path requires
-            // every fd be host-backed (stdio bare, HostPipe, HostSocket) or
-            // reachable through a readiness pipe; see `host_poll_target`.
-            let host_fds: Option<Vec<(i32, i16, bool, bool)>> = fds
+            // Classify every fd ONCE: the registration carries both the host
+            // half the reactor parks on and the exact slot the wait is
+            // authorised against. The fast path requires every fd to be
+            // host-backed (stdio bare, HostPipe, HostSocket) or reachable
+            // through a readiness pipe; see `wait_source_for`.
+            let files = this.captured_file_table();
+            let mut registrations: Vec<Option<WaitRegistration>> = Vec::with_capacity(fds.len());
+            for pollfd in &fds {
+                match this.wait_source_for(
+                    &files,
+                    Fd(pollfd.fd),
+                    LinuxPollEvents::from_bits_retain(pollfd.events),
+                ) {
+                    Ok(registration) => registrations.push(registration),
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                }
+            }
+            // A negative pollfd carries no registration and still keeps the
+            // fast path: `libc::poll` ignores it and reports revents 0.
+            let host_halves: Option<Vec<Option<HostHalf>>> = fds
                 .iter()
-                .map(|p| {
-                    this.host_poll_target(p.fd, p.events).map(|t| {
-                        (
-                            t.host_fd,
-                            t.host_events,
-                            t.readiness_pipe,
-                            t.sample_description,
-                        )
-                    })
+                .zip(registrations.iter())
+                .map(|(pollfd, registration)| match registration {
+                    None if pollfd.fd < 0 => Some(None),
+                    registration => host_half(registration.as_ref()).map(Some),
                 })
                 .collect();
-            if let Some(host_fds) = host_fds {
+            if let Some(host_halves) = host_halves {
                 let mut sys_pollfds: Vec<libc::pollfd> = fds
                     .iter()
-                    .zip(host_fds.iter())
-                    .map(|(_, (hf, events, _, _))| libc::pollfd {
-                        fd: *hf,
-                        events: *events,
-                        revents: 0,
+                    .zip(host_halves.iter())
+                    .map(|(pollfd, half)| match half {
+                        Some((host, _)) => libc::pollfd {
+                            fd: host.fd().get(),
+                            events: host.events().bits(),
+                            revents: 0,
+                        },
+                        None => libc::pollfd {
+                            fd: pollfd.fd,
+                            events: pollfd.events,
+                            revents: 0,
+                        },
                     })
                     .collect();
                 // NON-BLOCKING probe (timeout 0): we must NEVER block here — this
@@ -3355,18 +3390,23 @@ impl<'a> NetView<'a> {
                 let mut ready = 0i64;
                 for (i, p) in sys_pollfds.iter().enumerate() {
                     let mut pollfd = fds[i];
-                    let (_, _, is_readiness_pipe, sample_description) = host_fds[i];
-                    if is_readiness_pipe {
-                        if p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-                            pollfd.revents = this.poll_ready_events(pollfd.fd, pollfd.events);
-                        } else {
-                            pollfd.revents = 0;
+                    pollfd.revents = match host_halves[i].and_then(|(_, coverage)| coverage) {
+                        // A readiness pipe only says "something changed"; the
+                        // guest-visible events come from the description.
+                        Some(HostProxyCoverage::LatchedLevelTriggered) => {
+                            if p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                                this.poll_ready_events(pollfd.fd, pollfd.events)
+                            } else {
+                                0
+                            }
                         }
-                    } else if sample_description {
-                        pollfd.revents = this.poll_ready_events(pollfd.fd, pollfd.events);
-                    } else {
-                        pollfd.revents = p.revents;
-                    }
+                        // A host descriptor that sees host peers only cannot
+                        // answer for an in-zone producer.
+                        Some(HostProxyCoverage::HostPeersOnly) => {
+                            this.poll_ready_events(pollfd.fd, pollfd.events)
+                        }
+                        None => p.revents,
+                    };
                     // Darwin poll(2) has no POLLRDHUP bit. Reconstruct Linux's
                     // socket half-close readiness from kqueue EV_EOF before
                     // returning the all-host fast-path result; the per-fd path
@@ -3409,15 +3449,8 @@ impl<'a> NetView<'a> {
                 } else {
                     Some(std::time::Duration::from_millis(timeout_ms as u64))
                 };
-                let mut wait_fds = Vec::new();
-                for pollfd in &fds {
-                    wait_fds.extend(this.wait_target_for_poll(pollfd.fd, pollfd.events));
-                }
                 // poll/ppoll: a timeout means "no fds ready" → return 0.
-                let files = this.captured_file_table();
-                let wait_fds = match WaitFds::raw(wait_fds)
-                    .with_guest_slots(&files, fds.iter().filter(|p| p.fd >= 0).map(|pollfd| pollfd.fd))
-                {
+                let wait_fds = match wait_fds_for(&registrations) {
                     Ok(wait_fds) => wait_fds,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 };
@@ -3449,14 +3482,7 @@ impl<'a> NetView<'a> {
             } else {
                 Some(std::time::Duration::from_millis(timeout_ms as u64))
             };
-            let mut wait_targets = Vec::new();
-            for pollfd in &fds {
-                wait_targets.extend(this.wait_target_for_poll(pollfd.fd, pollfd.events));
-            }
-            let files = this.captured_file_table();
-            let wait_fds = match WaitFds::raw(wait_targets)
-                .with_guest_slots(&files, fds.iter().filter(|p| p.fd >= 0).map(|pollfd| pollfd.fd))
-            {
+            let wait_fds = match wait_fds_for(&registrations) {
                 Ok(wait_fds) => wait_fds,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
@@ -3748,5 +3774,181 @@ pub(in crate::dispatch) fn wait_in_memory_slot(
         completion: FdWaitCompletion::Fd {
             on_timeout: LINUX_EAGAIN.guest_retval(),
         },
+    }
+}
+
+#[cfg(test)]
+mod wait_source_tests {
+    use super::*;
+    use crate::dispatch::fd_table::WaitQueueKind;
+    use crate::dispatch::wait_queue_fixture::{self, WaitQueueFixture};
+    use crate::dispatch::wait_source::{HostProxyCoverage, WaitInterest, WaitSource};
+
+    /// Install a fixture description at a guest fd and hold the fixture's host
+    /// guards alive for the classification.
+    fn installed(kind: WaitQueueKind) -> (SyscallDispatcher, WaitQueueFixture, i32) {
+        let dispatcher = SyscallDispatcher::new();
+        let fixture = wait_queue_fixture::fixture(kind);
+        let open_file = OpenFile::new(Arc::clone(fixture.description()), 0);
+        let fd = dispatcher
+            .install_fd_at_or_above(3, open_file)
+            .expect("install fixture fd");
+        (dispatcher, fixture, fd)
+    }
+
+    fn classify(
+        dispatcher: &SyscallDispatcher,
+        fd: i32,
+        requested: LinuxPollEvents,
+    ) -> Result<Option<WaitRegistration>, LinuxErrno> {
+        let view = dispatcher.net_view();
+        let files = view.captured_file_table();
+        view.wait_source_for(&files, Fd(fd), requested)
+    }
+
+    fn source(dispatcher: &SyscallDispatcher, fd: i32, requested: LinuxPollEvents) -> WaitSource {
+        classify(dispatcher, fd, requested)
+            .expect("classification must not fail")
+            .unwrap_or_else(|| panic!("guest fd {fd} must carry a wait registration"))
+            .source()
+    }
+
+    fn interest(events: LinuxPollEvents) -> WaitInterest {
+        WaitInterest::new(events).expect("non-empty interest")
+    }
+
+    /// An in-zone listener's Darwin listen socket never sees a connection
+    /// paired in zone, so the description must still be probed: the host half
+    /// covers HOST PEERS ONLY.
+    #[test]
+    fn inzone_listener_classifies_as_dual_host_peers_only() {
+        let (dispatcher, _fixture, fd) = installed(WaitQueueKind::InZoneListenerHostSocket);
+        match source(&dispatcher, fd, LinuxPollEvents::IN) {
+            WaitSource::Dual {
+                host,
+                interest: carried,
+                coverage,
+            } => {
+                assert!(
+                    host.fd().get() >= 0,
+                    "the Darwin listen socket is the host half"
+                );
+                assert_eq!(carried, interest(LinuxPollEvents::IN));
+                assert_eq!(coverage, HostProxyCoverage::HostPeersOnly);
+            }
+            other => panic!("expected a dual host-peers-only source, got {other:?}"),
+        }
+    }
+
+    /// A carrick-owned socket has no host object at all: the description's
+    /// wait queue is the only wake source and the probe is mandatory.
+    #[test]
+    fn in_memory_socket_classifies_as_description() {
+        let (dispatcher, _fixture, fd) = installed(WaitQueueKind::InMemorySocket);
+        let source = source(&dispatcher, fd, LinuxPollEvents::IN);
+        assert_eq!(
+            source,
+            WaitSource::Description {
+                interest: interest(LinuxPollEvents::IN)
+            }
+        );
+        assert!(source.probe_after_enrol());
+        assert_eq!(source.host(), None);
+    }
+
+    /// An in-memory pipe's readiness pipe is a LEVEL-TRIGGERED mirror of the
+    /// description, so it is a dual source whose latch exempts it from the
+    /// probe — and it still carries the interest the description needs.
+    #[test]
+    fn readiness_pipe_classifies_as_dual_latched() {
+        let (dispatcher, _fixture, fd) = installed(WaitQueueKind::PipeReader);
+        match source(&dispatcher, fd, LinuxPollEvents::IN) {
+            WaitSource::Dual {
+                host,
+                interest: carried,
+                coverage,
+            } => {
+                assert_eq!(
+                    host.events(),
+                    LinuxPollEvents::IN,
+                    "a readiness pipe's read end is polled for POLLIN whatever the guest asked"
+                );
+                assert_eq!(carried, interest(LinuxPollEvents::IN));
+                assert_eq!(coverage, HostProxyCoverage::LatchedLevelTriggered);
+            }
+            other => panic!("expected a latched dual source, got {other:?}"),
+        }
+    }
+
+    /// A real host socket decides its own readiness: no interest, no probe.
+    #[test]
+    fn host_socket_classifies_as_host() {
+        let dispatcher = SyscallDispatcher::new();
+        let mut pair = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) },
+            0,
+            "host socketpair"
+        );
+        // The peer stays open: `host_poll_target` refuses an unconnected
+        // stream socket, so a half-closed pair would classify as a
+        // description rather than as the host source under test.
+        let _peer = HostFdRef::new(pair[1]);
+        let open_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::HostSocket {
+                base: OpenDescriptionBase::new(0),
+                host_fd: HostFdRef::new(pair[0]),
+                family: LINUX_AF_UNIX,
+                type_: LINUX_SOCK_STREAM,
+                protocol: 0,
+                mcast_memberships: Vec::new(),
+                synthetic_recv: std::collections::VecDeque::new(),
+            })),
+            0,
+            0,
+        );
+        let fd = dispatcher
+            .install_fd_at_or_above(3, open_file)
+            .expect("install host socket fd");
+        let source = source(&dispatcher, fd, LinuxPollEvents::IN);
+        assert_eq!(
+            source,
+            WaitSource::Host {
+                host: crate::dispatch::wait_source::HostWaitTarget::new(
+                    HostFd(pair[0]),
+                    LinuxPollEvents::IN
+                )
+            }
+        );
+        assert_eq!(source.description_interest(), None);
+        assert!(!source.probe_after_enrol());
+    }
+
+    /// stdio the guest never reopened is a bare host descriptor.
+    #[test]
+    fn bare_stdio_classifies_as_host() {
+        let dispatcher = SyscallDispatcher::new();
+        match source(&dispatcher, 0, LinuxPollEvents::IN) {
+            WaitSource::Host { host } => {
+                assert_eq!(host.fd(), HostFd(0));
+                assert_eq!(host.events(), LinuxPollEvents::IN);
+            }
+            other => panic!("expected a bare-stdio host source, got {other:?}"),
+        }
+    }
+
+    /// `host_poll_target`'s `fd < 0 => direct(fd)` arm passed a NEGATIVE guest
+    /// number through as a host descriptor. A negative pollfd is ignored by
+    /// `poll(2)`: it contributes no slot, no host target and no registration.
+    #[test]
+    fn negative_guest_fd_yields_none_and_never_a_host_target() {
+        let dispatcher = SyscallDispatcher::new();
+        for fd in [-1, -7, i32::MIN] {
+            assert_eq!(
+                classify(&dispatcher, fd, LinuxPollEvents::IN),
+                Ok(None),
+                "guest fd {fd} must not classify at all"
+            );
+        }
     }
 }
