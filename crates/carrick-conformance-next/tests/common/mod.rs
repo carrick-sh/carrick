@@ -604,6 +604,14 @@ pub fn generic_probe_container(
     let policy = probe_launch_policy(probe_name);
     let mut container = TestContainer::new(SMOKE_IMAGE)
         .pull_policy(PullPolicy::Missing)
+        // The label names this probe's wedge-capture directory; the budget is
+        // the measured one for this probe. Both are per-probe because a
+        // capture attributable only by pid is what the `forkstackstorm` spin
+        // left behind.
+        .label(probe_name)
+        .carrier_budget(std::time::Duration::from_millis(
+            carrick_conformance_next::probe_steady_budget_ms(probe_name),
+        ))
         .mount_readonly(probe_path.display().to_string(), "/tmp/p")
         .mount_readonly(probeinit_path.display().to_string(), "/tmp/carrick-init");
 
@@ -834,6 +842,21 @@ pub fn with_empty_stdin_pipe<T>(run: impl FnOnce() -> T) -> T {
         drop(restore);
         outcome
     }
+}
+
+/// Run one probe container and print its wall-clock cost on a grep-able line.
+///
+/// A carrier budget is only defensible if it comes from a measured
+/// distribution: the gate log is the only place that distribution exists, and
+/// without an elapsed field per row the constant could only be guessed. The
+/// line is emitted for every probe, matching or not, so a green gate is itself
+/// the measurement.
+pub fn timed_probe_run<T>(label: &str, run: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let outcome = run();
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    eprintln!("PROBE ELAPSED {label} elapsed_ms={elapsed_ms}");
+    outcome
 }
 
 static GUEST_LOCK: Mutex<()> = Mutex::new(());
