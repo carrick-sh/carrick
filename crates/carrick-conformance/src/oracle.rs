@@ -384,24 +384,6 @@ impl OracleCache {
     /// Cache a fresh Docker result only when the process completed before its
     /// deadline. Buffered all-pass output from a timed-out process is not an
     /// oracle result and must never survive into a later cache-only checkpoint.
-    pub fn insert_fresh(
-        &mut self,
-        suite: &Suite,
-        platform: crate::lane::DockerPlatform,
-        result: SuiteResult,
-        elapsed_ms: Option<u64>,
-        timed_out: bool,
-    ) -> bool {
-        self.insert_fresh_for_profile(
-            suite,
-            platform,
-            ParserProfile::Regression,
-            result,
-            elapsed_ms,
-            timed_out,
-        )
-    }
-
     pub fn insert_fresh_for_profile(
         &mut self,
         suite: &Suite,
@@ -416,6 +398,48 @@ impl OracleCache {
         }
         self.record_completed_timing(suite, platform, elapsed_ms);
         self.insert_for_profile(suite, platform, profile, result, elapsed_ms)
+    }
+
+    /// Insert BOTH parser-profile rows from ONE completed Docker run.
+    ///
+    /// The oracle is the container's bytes; the profile only says which parser
+    /// read them. Parsing the same captured transcript under both `ParseMode`s
+    /// and storing both rows means a `--closure` gate no longer leaves a later
+    /// regression run with an uncached surface (and vice versa). Each row is
+    /// admitted only by its OWN cacheability rule, so a suite that fails strict
+    /// closure still yields a valid regression row. A timed-out Docker run
+    /// inserts neither. Returns `(regression stored, closure stored)`.
+    pub fn insert_fresh_both_profiles(
+        &mut self,
+        suite: &Suite,
+        platform: crate::lane::DockerPlatform,
+        regression: SuiteResult,
+        closure: SuiteResult,
+        elapsed_ms: Option<u64>,
+        timed_out: bool,
+    ) -> (bool, bool) {
+        // Both rows go through the single freshness primitive, so the
+        // timed-out and cacheability rules have exactly one implementation.
+        // The timing sidecar's key deliberately excludes parsing policy and its
+        // upsert keeps the maximum, so recording it from both calls is
+        // idempotent.
+        let stored_regression = self.insert_fresh_for_profile(
+            suite,
+            platform,
+            ParserProfile::Regression,
+            regression,
+            elapsed_ms,
+            timed_out,
+        );
+        let stored_closure = self.insert_fresh_for_profile(
+            suite,
+            platform,
+            ParserProfile::ClosureV3,
+            closure,
+            elapsed_ms,
+            timed_out,
+        );
+        (stored_regression, stored_closure)
     }
 
     /// Remove the current determinant record before a forced fresh oracle run.
@@ -534,7 +558,7 @@ fn parse_timing_records(text: &str) -> (BTreeMap<OracleExecutionKey, OracleTimin
 
 /// Only a comparable oracle (the docker side actually produced a verdict) may be
 /// cached; a crash/hang/empty must be retried. Fresh Docker deadlines are
-/// rejected separately by [`OracleCache::insert_fresh`].
+/// rejected separately by [`OracleCache::insert_fresh_for_profile`].
 fn is_cacheable(result: &SuiteResult) -> bool {
     matches!(result.result, SuiteOutcome::Success | SuiteOutcome::Failure)
 }
@@ -767,6 +791,106 @@ mod tests {
             !oracle_key(&shell, crate::lane::DockerPlatform::LinuxArm64).contains("\"parser\""),
             "non-regrtest keys keep their committed bytes"
         );
+    }
+
+    /// The cache is keyed by the suite declaration PLUS the parser that read it,
+    /// so a `--closure` run's rows do not satisfy a later regression run: the
+    /// Sep 14 full closure run left a filtered `--ecosystem cpython
+    /// --require-cached-oracle` run refusing up front with 438 uncached rows,
+    /// and commit `0745386ef` paid for that with a full fresh Docker pass.
+    ///
+    /// One container's bytes can answer BOTH parsers, so one Docker run fills
+    /// both rows. Each row is still admitted only by its own cacheability rule,
+    /// and no existing key's bytes change (regression omits the determinant).
+    #[test]
+    fn one_docker_run_populates_both_profile_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "carrick-oracle-dual-profile-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut cache = OracleCache::load(&path);
+        let suite = base_suite();
+        let platform = crate::lane::DockerPlatform::LinuxArm64;
+
+        // A strict all-pass transcript is cacheable under both parsers.
+        let all_pass = result(&[("py:m.C.test_a#1", Outcome::Ok)], SuiteOutcome::Success);
+        assert_eq!(
+            cache.insert_fresh_both_profiles(
+                &suite,
+                platform,
+                all_pass.clone(),
+                all_pass.clone(),
+                Some(1_234),
+                false,
+            ),
+            (true, true)
+        );
+        assert!(cache.get(&suite, platform).is_some());
+        assert!(
+            cache
+                .get_for_profile(&suite, platform, ParserProfile::ClosureV3)
+                .is_some()
+        );
+        // The regression row keeps the committed key bytes exactly.
+        assert_eq!(
+            oracle_key_for_profile(&suite, platform, ParserProfile::Regression),
+            oracle_key(&suite, platform)
+        );
+
+        // A result that fails `is_strict_closure_success` yields the regression
+        // row only: each profile's own cacheability rule is honoured
+        // independently.
+        let mut failing = base_suite();
+        failing.name = "failing".into();
+        failing.image = "localhost:5005/failing:1".into();
+        let mixed = result(
+            &[
+                ("py:m.C.test_a#1", Outcome::Ok),
+                ("py:m.C.test_b#1", Outcome::Fail),
+            ],
+            SuiteOutcome::Failure,
+        );
+        assert_eq!(
+            cache.insert_fresh_both_profiles(
+                &failing,
+                platform,
+                mixed.clone(),
+                mixed.clone(),
+                Some(2_345),
+                false,
+            ),
+            (true, false)
+        );
+        assert!(cache.get(&failing, platform).is_some());
+        assert!(
+            cache
+                .get_for_profile(&failing, platform, ParserProfile::ClosureV3)
+                .is_none()
+        );
+
+        // A timed-out Docker run inserts NEITHER row.
+        let mut timed = base_suite();
+        timed.name = "timed".into();
+        timed.image = "localhost:5005/timed:1".into();
+        assert_eq!(
+            cache.insert_fresh_both_profiles(
+                &timed,
+                platform,
+                all_pass.clone(),
+                all_pass,
+                Some(9_999),
+                true,
+            ),
+            (false, false)
+        );
+        assert!(cache.get(&timed, platform).is_none());
+        assert!(
+            cache
+                .get_for_profile(&timed, platform, ParserProfile::ClosureV3)
+                .is_none()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

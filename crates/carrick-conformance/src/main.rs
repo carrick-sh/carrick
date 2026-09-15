@@ -262,8 +262,13 @@ struct Args {
     )]
     carrick_serial_confirm_budget_s: u64,
     /// Parser profile for `--oracle-fill`: `closure` (the assertion-exact
-    /// profile the closure gate keys on) or `regression`. These are DIFFERENT
-    /// cache keys; filling the wrong one leaves the gate's row still missing.
+    /// profile the closure gate keys on) or `regression`.
+    ///
+    /// A fill now writes BOTH profile rows from the one container it runs, each
+    /// admitted by its own cacheability rule, so this flag no longer decides
+    /// which row exists — it selects which parse the REPORT uses, and which row
+    /// is invalidated up front and required to come back (the other is a bonus
+    /// its own rule may legitimately refuse).
     #[arg(long, default_value = "closure")]
     oracle_fill_profile: String,
 }
@@ -904,28 +909,32 @@ fn run() -> anyhow::Result<ExitCode> {
         let side = match out.and_then(|r| r.ok()) {
             Some(o) => {
                 let timed_out = o.timed_out;
-                let res = parsers::parse_for_mode(verdict_kind(s), &o.raw(), parser_mode);
-                match oracle_profile {
-                    oracle::ParserProfile::Regression => {
-                        cache.insert_fresh(
-                            s,
-                            docker_platform,
-                            res.clone(),
-                            Some(o.elapsed_ms),
-                            timed_out,
-                        );
-                    }
-                    oracle::ParserProfile::ClosureV3 => {
-                        cache.insert_fresh_for_profile(
-                            s,
-                            docker_platform,
-                            oracle_profile,
-                            res.clone(),
-                            Some(o.elapsed_ms),
-                            timed_out,
-                        );
-                    }
-                }
+                // One container's bytes answer BOTH parsers, so fill both rows
+                // from this run. `--closure` and a regression gate key on
+                // different determinants, and a closure-only cache left a
+                // filtered regression run refusing with 438 uncached rows.
+                let raw = o.raw();
+                let res = parsers::parse_for_mode(verdict_kind(s), &raw, parser_mode);
+                let other = parsers::parse_for_mode(
+                    verdict_kind(s),
+                    &raw,
+                    match parser_mode {
+                        parsers::ParseMode::Regression => parsers::ParseMode::Closure,
+                        parsers::ParseMode::Closure => parsers::ParseMode::Regression,
+                    },
+                );
+                let (regression, closure) = match oracle_profile {
+                    oracle::ParserProfile::Regression => (res.clone(), other),
+                    oracle::ParserProfile::ClosureV3 => (other, res.clone()),
+                };
+                cache.insert_fresh_both_profiles(
+                    s,
+                    docker_platform,
+                    regression,
+                    closure,
+                    Some(o.elapsed_ms),
+                    timed_out,
+                );
                 DockerSide {
                     result: res,
                     run_id: o.run_id,
@@ -1346,7 +1355,16 @@ fn oracle_fill(
             ));
             continue;
         }
-        let res = parsers::parse_for_mode(verdict_kind(suite), &out.raw(), parser_mode);
+        let raw = out.raw();
+        let res = parsers::parse_for_mode(verdict_kind(suite), &raw, parser_mode);
+        let other = parsers::parse_for_mode(
+            verdict_kind(suite),
+            &raw,
+            match parser_mode {
+                parsers::ParseMode::Regression => parsers::ParseMode::Closure,
+                parsers::ParseMode::Closure => parsers::ParseMode::Regression,
+            },
+        );
         eprintln!(
             "  [docker] {} -> {:?} n={} pass={} fail={} broken={} skip={} ({} ms)\n\
                         raw: {} / {}",
@@ -1361,14 +1379,25 @@ fn oracle_fill(
             out.stdout_path.display(),
             out.stderr_path.display(),
         );
-        if !cache.insert_fresh_for_profile(
+        let (regression, closure) = match profile {
+            oracle::ParserProfile::Regression => (res, other),
+            oracle::ParserProfile::ClosureV3 => (other, res),
+        };
+        let (stored_regression, stored_closure) = cache.insert_fresh_both_profiles(
             suite,
             docker_platform,
-            profile,
-            res,
+            regression,
+            closure,
             Some(out.elapsed_ms),
             out.timed_out,
-        ) {
+        );
+        // Only the NAMED profile is the repair being asked for; the other row
+        // is a bonus that its own cacheability rule may legitimately refuse.
+        let stored_named = match profile {
+            oracle::ParserProfile::Regression => stored_regression,
+            oracle::ParserProfile::ClosureV3 => stored_closure,
+        };
+        if !stored_named {
             failures.push(format!(
                 "{}: cache refused the fresh oracle — row left missing",
                 suite.name
