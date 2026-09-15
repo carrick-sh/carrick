@@ -85,6 +85,7 @@
 //! helper routines and the AF_UNIX registry live in the `support` submodule.
 pub(crate) use super::dispatcher::NetView;
 use super::*;
+use crate::dispatch::wait_plan::{ParkSampling, WaitAssembly, WaitRequestFd};
 use crate::dispatch::wait_source::{
     HostProxyCoverage, HostWaitTarget, WaitInterest, WaitRegistration, WaitSource,
 };
@@ -301,35 +302,6 @@ pub(in crate::dispatch) fn recverr_close(host_fd: i32) {
 
 use support::*;
 pub(super) use support::{drain_netlink_queue, host_fd_is_nonblocking, set_host_nonblocking};
-
-/// Lower the per-request wait registrations a syscall classified into the
-/// `WaitFds` it parks on.
-///
-/// A request position with no registration (a negative pollfd, which `poll(2)`
-/// ignores) takes no part, and a wait that named no source at all is a pure
-/// timeout wait — which is what the separate slot capture produced when every
-/// entry it was handed was negative.
-fn wait_fds_for(registrations: &[Option<WaitRegistration>]) -> Result<WaitFds, LinuxErrno> {
-    let registrations: Vec<WaitRegistration> = registrations.iter().flatten().copied().collect();
-    if registrations.is_empty() {
-        return Ok(WaitFds::empty());
-    }
-    WaitFds::from_registrations(registrations, Vec::new())
-}
-
-/// One request position's host half: the descriptor the reactor parks on and,
-/// for a dual source, how completely it covers the description.
-type HostHalf = (HostWaitTarget, Option<HostProxyCoverage>);
-
-/// The host half of a registration, or `None` when the description alone
-/// decides the fd's readiness and the caller must take the per-fd loop.
-fn host_half(registration: Option<&WaitRegistration>) -> Option<HostHalf> {
-    match registration.map(|registration| registration.source()) {
-        Some(WaitSource::Host { host }) => Some((host, None)),
-        Some(WaitSource::Dual { host, coverage, .. }) => Some((host, Some(coverage))),
-        Some(WaitSource::Description { .. }) | None => None,
-    }
-}
 
 impl<'a> NetView<'a> {
     #[inline]
@@ -2874,18 +2846,15 @@ impl<'a> NetView<'a> {
             let write_set = this.read_optional_fd_set(memory, writefds_addr, nfds)??;
             let except_set = this.read_optional_fd_set(memory, exceptfds_addr, nfds)??;
 
-            // Collect the union of the three sets into per-fd entries, and try to
-            // map each guest fd to a real host fd. Then route exactly like ppoll:
-            //   - all fds host-backed → one libc::poll (kernel blocks efficiently);
-            //   - any fd synthetic (eventfd/timerfd/epoll/in-memory pipe) → the
-            //     poll_ready_events readiness loop, which is correct for those.
-            // The old code unwrap_or'd synthetic fds into the guest fd *number* and
-            // polled that as a host fd — which blocks on carrick's own fds and
-            // deadlocks. Each fd gets POLLIN/POLLOUT/POLLPRI per its set membership.
+            // Collect the union of the three sets into per-fd entries, each with
+            // POLLIN/POLLOUT/POLLPRI per its set membership, and hand them to the
+            // ONE wait assembly `ppoll` also uses. Older code unwrap_or'd a
+            // synthetic fd into the guest fd *number* and polled that as a host
+            // fd — which blocks on carrick's own fds and deadlocks; a guest fd
+            // number reaches `libc::poll` nowhere in the typed path.
             let files = this.captured_file_table();
             let mut owners: Vec<(i32, i16)> = Vec::new(); // (fd, requested_mask)
-            let mut events_list: Vec<i16> = Vec::new();
-            let mut registrations: Vec<Option<WaitRegistration>> = Vec::new();
+            let mut request: Vec<WaitRequestFd> = Vec::new();
             for fd in 0..nfds {
                 let r = read_set.as_ref().is_some_and(|s| fd_set_contains(s, fd));
                 let w = write_set.as_ref().is_some_and(|s| fd_set_contains(s, fd));
@@ -2917,36 +2886,12 @@ impl<'a> NetView<'a> {
                 if e {
                     req_mask |= 0x04;
                 }
-                let registration = match this.wait_source_for(
-                    &files,
-                    Fd(fd_i32),
-                    LinuxPollEvents::from_bits_retain(events),
-                ) {
-                    Ok(registration) => registration,
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                };
                 owners.push((fd_i32, req_mask));
-                events_list.push(events);
-                registrations.push(registration);
+                request.push(WaitRequestFd {
+                    fd: Fd(fd_i32),
+                    requested: LinuxPollEvents::from_bits_retain(events),
+                });
             }
-
-            // revents per entry, filled by whichever path runs.
-            let mut revents: Vec<i16> = vec![0; owners.len()];
-            // select(2) never registers an fd with an empty mask, so every
-            // entry carries a source; the fast path needs every one of them to
-            // be host-backed.
-            let all_host: Option<Vec<HostHalf>> = registrations
-                .iter()
-                .map(|registration| host_half(registration.as_ref()))
-                .collect();
-
-            let is_select_ready = |req_mask: i16, rev: i16| -> bool {
-                ((req_mask & 0x01) != 0
-                    && (rev & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0)
-                    || ((req_mask & 0x02) != 0
-                        && (rev & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP)) != 0)
-                    || ((req_mask & 0x04) != 0 && (rev & (libc::POLLPRI | libc::POLLERR)) != 0)
-            };
 
             if owners.is_empty() {
                 if timeout_ms == 0 && sigmask_addr == 0 {
@@ -2975,55 +2920,20 @@ impl<'a> NetView<'a> {
                     sig_mask,
                     completion: FdWaitCompletion::Fd { on_timeout: 0 },
                 });
-            } else if let Some(host_halves) = all_host {
-                let mut pollfds: Vec<libc::pollfd> = host_halves
-                    .iter()
-                    .map(|(host, _)| libc::pollfd {
-                        fd: host.fd().get(),
-                        events: host.events().bits(),
-                        revents: 0,
-                    })
-                    .collect();
-                // NON-BLOCKING probe (timeout 0). A blocking libc::poll here
-                // would (a) tie up this vCPU thread without releasing it for
-                // siblings, and (b) never wake on a guest signal — carrick
-                // publishes pending signals via an atomic the dispatcher checks
-                // between dispatches, not a host signal that interrupts poll —
-                // so select could never return EINTR. Instead, if nothing is
-                // ready and the caller wants to wait, hand off to the runtime's
-                // signal-interruptible waiter via WaitOnFds (mirrors how
-                // ppoll uses WaitOnFds).
-                let n = unsafe {
-                    libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 0)
-                };
-                if let Err(errno) = n.host_syscall_errno() {
-                    return Ok(DispatchOutcome::errno(errno));
+            }
+
+            // ONE assembly: classify every fd, batch one non-blocking host
+            // poll, sample the descriptions the host cannot answer for, and —
+            // if nothing is ready — hand back the typed park. `select` never
+            // registers an fd with an empty mask and rejects an invalid fd
+            // with EBADF above, so "some revents" and "some SELECT-ready
+            // revents" name the same set here.
+            let revents: Vec<i16> = match this.assemble_wait(&files, &request, timeout_ms != 0, &[]) {
+                WaitAssembly::Errno(errno) => return Ok(DispatchOutcome::errno(errno)),
+                WaitAssembly::Ready { revents } | WaitAssembly::NotReady { revents } => {
+                    revents.iter().map(|revents| revents.bits()).collect()
                 }
-                let mut any = false;
-                for (i, (slot, p)) in revents.iter_mut().zip(pollfds.iter()).enumerate() {
-                    // A readiness pipe only says "something changed"; the
-                    // guest-visible events come from the description itself.
-                    let rev = match host_halves[i].1 {
-                        Some(HostProxyCoverage::LatchedLevelTriggered) => {
-                            if p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-                                this.poll_ready_events(owners[i].0, events_list[i])
-                            } else {
-                                0
-                            }
-                        }
-                        // A host descriptor that sees host peers only cannot
-                        // answer for an in-zone producer.
-                        Some(HostProxyCoverage::HostPeersOnly) => {
-                            this.poll_ready_events(owners[i].0, events_list[i])
-                        }
-                        None => p.revents,
-                    };
-                    *slot = rev;
-                    if is_select_ready(owners[i].1, rev) {
-                        any = true;
-                    }
-                }
-                if !any && timeout_ms != 0 {
+                WaitAssembly::Park { wait, sampling, .. } => {
                     // Nothing ready yet, caller wants to block. Leave the guest
                     // fd-sets UNTOUCHED (select's bitmaps are input==output): a
                     // Ready re-dispatch must re-read the original input, and an
@@ -3034,80 +2944,64 @@ impl<'a> NetView<'a> {
                     } else {
                         Some(std::time::Duration::from_millis(timeout_ms as u64))
                     };
-                    let mut clear_on_timeout: Vec<(u64, usize)> = Vec::new();
-                    if let Some(s) = &read_set {
-                        clear_on_timeout.push((readfds_addr, s.len()));
-                    }
-                    if let Some(s) = &write_set {
-                        clear_on_timeout.push((writefds_addr, s.len()));
-                    }
-                    if let Some(s) = &except_set {
-                        clear_on_timeout.push((exceptfds_addr, s.len()));
-                    }
-                    let wait_fds = match wait_fds_for(&registrations) {
-                        Ok(wait_fds) => wait_fds,
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                    };
-                    return Ok(DispatchOutcome::WaitOnFds {
-                        fds: wait_fds,
-                        timeout,
-                        sig_mask,
-                        completion: FdWaitCompletion::Select { clear_on_timeout },
-                    });
-                }
-            } else {
-                // Mixed / synthetic fds: evaluate current readiness without holding the wait loop synchronously.
-                let mut any = false;
-                for (i, (fd, req_mask)) in owners.iter().enumerate() {
-                    let rev = this.poll_ready_events(*fd, events_list[i]);
-                    revents[i] = rev;
-                    if is_select_ready(*req_mask, rev) {
-                        any = true;
-                    }
-                }
-                if !any && timeout_ms != 0 {
-                    let timeout = if timeout_ms < 0 {
-                        None
-                    } else {
-                        Some(std::time::Duration::from_millis(timeout_ms as u64))
-                    };
-                    let wait_fds = match wait_fds_for(&registrations) {
-                        Ok(wait_fds) => wait_fds,
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                    };
-                    let mut entries = Vec::with_capacity(owners.len());
-                    for (fd, requested) in &owners {
-                        let source = if files.is_bare_stdio_open(*fd) {
-                            crate::dispatch::fd_wait::RetainedFdSource::BareStdio
-                        } else {
-                            let authority = crate::kernel::FileSlotNumber::for_open_fd(*fd)
-                                .ok()
-                                .and_then(|number| files.capture_slot_authority(number));
-                            let Some(lease) = authority.and_then(|slot| files.retain_slot_lease(slot)) else {
-                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    match sampling {
+                        ParkSampling::HostDescriptors => {
+                            let mut clear_on_timeout: Vec<(u64, usize)> = Vec::new();
+                            if let Some(s) = &read_set {
+                                clear_on_timeout.push((readfds_addr, s.len()));
+                            }
+                            if let Some(s) = &write_set {
+                                clear_on_timeout.push((writefds_addr, s.len()));
+                            }
+                            if let Some(s) = &except_set {
+                                clear_on_timeout.push((exceptfds_addr, s.len()));
+                            }
+                            return Ok(DispatchOutcome::WaitOnFds {
+                                fds: wait,
+                                timeout,
+                                sig_mask,
+                                completion: FdWaitCompletion::Select { clear_on_timeout },
+                            });
+                        }
+                        // A carrick-owned description is invisible to the
+                        // reactor's pollfd array, so the park retains the exact
+                        // descriptions and re-evaluates them itself.
+                        ParkSampling::RetainedDescriptions => {
+                            let mut entries = Vec::with_capacity(owners.len());
+                            for (fd, requested) in &owners {
+                                let source = if files.is_bare_stdio_open(*fd) {
+                                    crate::dispatch::fd_wait::RetainedFdSource::BareStdio
+                                } else {
+                                    let authority = crate::kernel::FileSlotNumber::for_open_fd(*fd)
+                                        .ok()
+                                        .and_then(|number| files.capture_slot_authority(number));
+                                    let Some(lease) = authority.and_then(|slot| files.retain_slot_lease(slot)) else {
+                                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                                    };
+                                    crate::dispatch::fd_wait::RetainedFdSource::Leased(lease)
+                                };
+                                entries.push(crate::dispatch::fd_wait::RetainedSelectFd {
+                                    fd: *fd,
+                                    requested: *requested as u8,
+                                    source,
+                                });
+                            }
+                            let kind = crate::dispatch::fd_wait::BlockingFdWaitKind::Select {
+                                entries,
+                                read: read_set.map(|input| crate::dispatch::fd_wait::RetainedFdSet { address: readfds_addr, input }),
+                                write: write_set.map(|input| crate::dispatch::fd_wait::RetainedFdSet { address: writefds_addr, input }),
+                                except: except_set.map(|input| crate::dispatch::fd_wait::RetainedFdSet { address: exceptfds_addr, input }),
                             };
-                            crate::dispatch::fd_wait::RetainedFdSource::Leased(lease)
-                        };
-                        entries.push(crate::dispatch::fd_wait::RetainedSelectFd {
-                            fd: *fd,
-                            requested: *requested as u8,
-                            source,
-                        });
+                            let caller_deadline = timeout.map(|duration| std::time::Instant::now() + duration);
+                            let wait = match crate::dispatch::fd_wait::BlockingFdWait::new(kind, caller_deadline, wait) {
+                                Ok(wait) => wait,
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            };
+                            return Ok(DispatchOutcome::BlockingFdWait { wait, sig_mask });
+                        }
                     }
-                    let kind = crate::dispatch::fd_wait::BlockingFdWaitKind::Select {
-                        entries,
-                        read: read_set.map(|input| crate::dispatch::fd_wait::RetainedFdSet { address: readfds_addr, input }),
-                        write: write_set.map(|input| crate::dispatch::fd_wait::RetainedFdSet { address: writefds_addr, input }),
-                        except: except_set.map(|input| crate::dispatch::fd_wait::RetainedFdSet { address: exceptfds_addr, input }),
-                    };
-                    let caller_deadline = timeout.map(|duration| std::time::Instant::now() + duration);
-                    let wait = match crate::dispatch::fd_wait::BlockingFdWait::new(kind, caller_deadline, wait_fds) {
-                        Ok(wait) => wait,
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                    };
-                    return Ok(DispatchOutcome::BlockingFdWait { wait, sig_mask });
                 }
-            }
+            };
 
             // Adapter so the writeback below reads `p.revents` uniformly.
             let pollfds: Vec<libc::pollfd> = owners
@@ -3328,132 +3222,86 @@ impl<'a> NetView<'a> {
                 fds.push(pollfd);
                 addresses.push(address);
             }
-            // Classify every fd ONCE: the registration carries both the host
-            // half the reactor parks on and the exact slot the wait is
-            // authorised against. The fast path requires every fd to be
-            // host-backed (stdio bare, HostPipe, HostSocket) or reachable
-            // through a readiness pipe; see `wait_source_for`.
+            // ONE assembly: classify every fd, batch one non-blocking host
+            // poll, sample the descriptions the host cannot answer for, and —
+            // if nothing is ready — hand back the typed park. A NON-BLOCKING
+            // probe is mandatory here: this runs while holding the dispatcher
+            // lock, and blocking would starve every sibling thread (the GIL
+            // handoff, a server's workers), and would never wake on a guest
+            // signal, which carrick publishes via an atomic the dispatcher
+            // checks between dispatches rather than a host signal.
             let files = this.captured_file_table();
-            let mut registrations: Vec<Option<WaitRegistration>> = Vec::with_capacity(fds.len());
-            for pollfd in &fds {
-                match this.wait_source_for(
-                    &files,
-                    Fd(pollfd.fd),
-                    LinuxPollEvents::from_bits_retain(pollfd.events),
-                ) {
-                    Ok(registration) => registrations.push(registration),
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                }
-            }
-            // A negative pollfd carries no registration and still keeps the
-            // fast path: `libc::poll` ignores it and reports revents 0.
-            let host_halves: Option<Vec<Option<HostHalf>>> = fds
+            let request: Vec<WaitRequestFd> = fds
                 .iter()
-                .zip(registrations.iter())
-                .map(|(pollfd, registration)| match registration {
-                    None if pollfd.fd < 0 => Some(None),
-                    registration => host_half(registration.as_ref()).map(Some),
+                .map(|pollfd| WaitRequestFd {
+                    fd: Fd(pollfd.fd),
+                    requested: LinuxPollEvents::from_bits_retain(pollfd.events),
                 })
                 .collect();
-            if let Some(host_halves) = host_halves {
-                let mut sys_pollfds: Vec<libc::pollfd> = fds
-                    .iter()
-                    .zip(host_halves.iter())
-                    .map(|(pollfd, half)| match half {
-                        Some((host, _)) => libc::pollfd {
-                            fd: host.fd().get(),
-                            events: host.events().bits(),
-                            revents: 0,
-                        },
-                        None => libc::pollfd {
-                            fd: pollfd.fd,
-                            events: pollfd.events,
-                            revents: 0,
-                        },
-                    })
-                    .collect();
-                // NON-BLOCKING probe (timeout 0): we must NEVER block here — this
-                // runs while holding the dispatcher lock, and blocking would starve
-                // every sibling thread (the GIL handoff, a server's workers). If
-                // nothing is ready and the guest asked to wait, hand off to the
-                // runtime via WaitOnFds, which waits with the lock RELEASED.
-                let n = unsafe {
-                    libc::poll(
-                        sys_pollfds.as_mut_ptr(),
-                        sys_pollfds.len() as libc::nfds_t,
-                        0,
-                    )
+            let (revents, park) =
+                match this.assemble_wait(&files, &request, timeout_ms != 0, &[]) {
+                    WaitAssembly::Errno(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    WaitAssembly::Ready { revents } | WaitAssembly::NotReady { revents } => {
+                        (revents, None)
+                    }
+                    WaitAssembly::Park {
+                        revents,
+                        wait,
+                        sampling,
+                    } => (revents, Some((wait, sampling))),
                 };
-                if let Err(errno) = n.host_syscall_errno() {
-                    return Ok(DispatchOutcome::errno(errno));
+
+            let mut ready = 0i64;
+            for (index, pollfd) in fds.iter_mut().enumerate() {
+                pollfd.revents = revents[index].bits();
+                // Darwin poll(2) has no POLLRDHUP bit. Reconstruct Linux's
+                // socket half-close readiness from kqueue EV_EOF; the per-fd
+                // path does the same in poll_ready_events. (Task 8 moves these
+                // three normalizations into `assemble_wait` so `pselect6` and
+                // `epoll` share them.)
+                if pollfd.events & LINUX_POLLRDHUP != 0
+                    && this.socket_guest_type(pollfd.fd).is_some()
+                    && this
+                        .host_fd_for_poll(pollfd.fd)
+                        .is_some_and(|host| host_stream_socket_rdhup(host.get()))
+                {
+                    pollfd.revents |= LINUX_POLLIN | LINUX_POLLRDHUP;
                 }
-                let mut ready = 0i64;
-                for (i, p) in sys_pollfds.iter().enumerate() {
-                    let mut pollfd = fds[i];
-                    pollfd.revents = match host_halves[i].and_then(|(_, coverage)| coverage) {
-                        // A readiness pipe only says "something changed"; the
-                        // guest-visible events come from the description.
-                        Some(HostProxyCoverage::LatchedLevelTriggered) => {
-                            if p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-                                this.poll_ready_events(pollfd.fd, pollfd.events)
-                            } else {
-                                0
-                            }
-                        }
-                        // A host descriptor that sees host peers only cannot
-                        // answer for an in-zone producer.
-                        Some(HostProxyCoverage::HostPeersOnly) => {
-                            this.poll_ready_events(pollfd.fd, pollfd.events)
-                        }
-                        None => p.revents,
-                    };
-                    // Darwin poll(2) has no POLLRDHUP bit. Reconstruct Linux's
-                    // socket half-close readiness from kqueue EV_EOF before
-                    // returning the all-host fast-path result; the per-fd path
-                    // does the same in poll_ready_events.
-                    if pollfd.events & LINUX_POLLRDHUP != 0
-                        && this.socket_guest_type(pollfd.fd).is_some()
-                        && host_stream_socket_rdhup(p.fd)
-                    {
-                        pollfd.revents |= LINUX_POLLIN | LINUX_POLLRDHUP;
-                    }
-                    // macOS poll() on a regular file returns POLLPRI whenever the
-                    // caller requested it (the BSD vnode "always ready" default);
-                    // Linux only ever sets POLLPRI on a genuine out-of-band
-                    // condition, which only a socket can carry. Strip the spurious
-                    // bit for any fd that cannot hold OOB data so a regular-file
-                    // poll matches Linux (LTP ppoll01 NORMAL: POLLIN|POLLPRI|POLLOUT
-                    // requested on a regular file must return POLLIN|POLLOUT).
-                    if pollfd.revents & libc::POLLPRI != 0 && !this.fd_supports_epoll_oob(pollfd.fd) {
-                        pollfd.revents &= !libc::POLLPRI;
-                    }
-                    if pollfd.revents & (libc::POLLOUT | libc::POLLHUP) != 0
-                        && this.fd_is_listening_socket(pollfd.fd)
-                    {
-                        pollfd.revents &= !(libc::POLLOUT | libc::POLLHUP);
-                    }
-                    if pollfd.revents != 0 {
-                        ready += 1;
-                    }
-                    // Always write back (zeroed revents on a not-ready probe) so a
-                    // later timeout completion needs no further writes.
-                    if write_kernel_struct_raw(memory, addresses[i], &pollfd).is_err() {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
+                // macOS poll() on a regular file returns POLLPRI whenever the
+                // caller requested it (the BSD vnode "always ready" default);
+                // Linux only ever sets POLLPRI on a genuine out-of-band
+                // condition, which only a socket can carry. Strip the spurious
+                // bit for any fd that cannot hold OOB data so a regular-file
+                // poll matches Linux (LTP ppoll01 NORMAL: POLLIN|POLLPRI|POLLOUT
+                // requested on a regular file must return POLLIN|POLLOUT).
+                if pollfd.revents & libc::POLLPRI != 0 && !this.fd_supports_epoll_oob(pollfd.fd) {
+                    pollfd.revents &= !libc::POLLPRI;
                 }
-                if ready > 0 || timeout_ms == 0 {
-                    return Ok(DispatchOutcome::Returned { value: ready });
+                if pollfd.revents & (libc::POLLOUT | libc::POLLHUP) != 0
+                    && this.fd_is_listening_socket(pollfd.fd)
+                {
+                    pollfd.revents &= !(libc::POLLOUT | libc::POLLHUP);
                 }
-                let timeout = if timeout_ms < 0 {
-                    None
-                } else {
-                    Some(std::time::Duration::from_millis(timeout_ms as u64))
-                };
+                if pollfd.revents != 0 {
+                    ready += 1;
+                }
+                // Always write back (zeroed revents on a not-ready probe) so a
+                // later timeout completion needs no further writes.
+                if write_kernel_struct_raw(memory, addresses[index], pollfd).is_err() {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                }
+            }
+            let Some((wait_fds, sampling)) = park.filter(|_| ready == 0) else {
+                return Ok(DispatchOutcome::Returned { value: ready });
+            };
+
+            let timeout = if timeout_ms < 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_millis(timeout_ms as u64))
+            };
+            if matches!(sampling, ParkSampling::HostDescriptors) {
                 // poll/ppoll: a timeout means "no fds ready" → return 0.
-                let wait_fds = match wait_fds_for(&registrations) {
-                    Ok(wait_fds) => wait_fds,
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                };
                 return Ok(DispatchOutcome::WaitOnFds {
                     fds: wait_fds,
                     timeout,
@@ -3461,31 +3309,9 @@ impl<'a> NetView<'a> {
                     completion: FdWaitCompletion::Fd { on_timeout: 0 },
                 });
             }
-
-            // Mixed / synthetic fds: evaluate current readiness and yield cancellable continuation if not ready.
-            let mut ready = 0i64;
-            for (index, pollfd) in fds.iter_mut().enumerate() {
-                pollfd.revents = this.poll_ready_events(pollfd.fd, pollfd.events);
-                if pollfd.revents != 0 {
-                    ready += 1;
-                }
-                if write_kernel_struct_raw(memory, addresses[index], pollfd).is_err() {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
-            }
-            if ready > 0 || timeout_ms == 0 {
-                return Ok(DispatchOutcome::Returned { value: ready });
-            }
-
-            let timeout = if timeout_ms < 0 {
-                None
-            } else {
-                Some(std::time::Duration::from_millis(timeout_ms as u64))
-            };
-            let wait_fds = match wait_fds_for(&registrations) {
-                Ok(wait_fds) => wait_fds,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
+            // A carrick-owned description is invisible to the reactor's pollfd
+            // array, so the park retains the exact descriptions and
+            // re-evaluates them itself.
             let caller_deadline = timeout.map(|duration| std::time::Instant::now() + duration);
             let entries = fds.iter().zip(addresses.iter()).map(|(pollfd, address)| -> Result<_, carrick_abi::LinuxErrno> {
                 let source = if pollfd.fd < 0 {

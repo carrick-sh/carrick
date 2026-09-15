@@ -774,9 +774,15 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
 
     let net_source = include_str!("../../dispatch/net.rs");
     assert!(
-        net_source.matches("this.wait_source_for(").count() >= 2,
-        "pselect/ppoll must classify every guest fd at dispatch: the host half and \
-         the exact slot in ONE registration"
+        net_source.matches("this.assemble_wait(").count() >= 2,
+        "pselect/ppoll must go through the ONE wait assembly, which classifies \
+         every guest fd into a registration carrying both its host half and its \
+         exact slot"
+    );
+    let wait_plan_source = include_str!("../../dispatch/wait_plan.rs");
+    assert!(
+        wait_plan_source.contains("self.wait_source_for(files, entry.fd, entry.requested)"),
+        "the assembly classifies every requested fd at dispatch"
     );
     assert!(
         !net_source.contains("fn host_poll_target")
