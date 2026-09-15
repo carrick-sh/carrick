@@ -309,7 +309,7 @@ impl<'a> NetView<'a> {
                             Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                         };
                         if (flags & LinuxMsgFlags::OOB.bits()) != 0 {
-                            if socket.family == LINUX_AF_UNIX {
+                            if socket.family() == LINUX_AF_UNIX {
                                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                             }
                             if socket.socket_type != LINUX_SOCK_STREAM {
@@ -669,7 +669,7 @@ impl<'a> NetView<'a> {
                         let mut target_buf = vec![0u8; len];
                         let peek = flags & LinuxMsgFlags::PEEK.bits() != 0;
                         if (flags & LinuxMsgFlags::OOB.bits()) != 0 {
-                            if socket.family == LINUX_AF_UNIX {
+                            if socket.family() == LINUX_AF_UNIX {
                                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                             }
                             match socket.recv_oob(&mut target_buf, peek) {
@@ -996,7 +996,7 @@ impl<'a> NetView<'a> {
                 data.extend_from_slice(&chunk);
             }
             if (flags & LinuxMsgFlags::OOB.bits()) != 0 {
-                if socket.family == LINUX_AF_UNIX {
+                if socket.family() == LINUX_AF_UNIX {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 if socket.socket_type != LINUX_SOCK_STREAM {
@@ -1400,7 +1400,7 @@ impl<'a> NetView<'a> {
             let mut target_buf = vec![0u8; total];
             let peek = flags & LinuxMsgFlags::PEEK.bits() != 0;
             let res = if (flags & LinuxMsgFlags::OOB.bits()) != 0 {
-                if socket.family == LINUX_AF_UNIX {
+                if socket.family() == LINUX_AF_UNIX {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 socket

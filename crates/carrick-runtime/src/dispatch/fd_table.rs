@@ -1701,7 +1701,10 @@ impl OpenDescription {
             }
             Self::EventFd { state, .. } => Some(Arc::clone(&state.wait_queue)),
             Self::TimerFd { state, .. } => Some(Arc::clone(&state.wait_queue)),
-            Self::InMemorySocket { socket, .. } => Some(Arc::clone(&socket.wait_queue)),
+            Self::InMemorySocket { socket, base } => base
+                .inzone_listener()
+                .map(|l| l.wait_queue())
+                .or_else(|| Some(Arc::clone(&socket.wait_queue))),
             Self::Epoll { wait_queue, .. } => Some(Arc::clone(wait_queue)),
             Self::Netlink { wait_queue, .. } => Some(Arc::clone(wait_queue)),
             Self::Packet { socket, .. } => Some(Arc::clone(&socket.wait_queue)),
@@ -1917,57 +1920,78 @@ pub(super) fn listening_socket_readiness_sample(
     description: &OpenDescription,
     interest: LinuxEpollEvents,
 ) -> Option<ListenerReadinessSample> {
-    let OpenDescription::HostSocket { host_fd, base, .. } = description else {
-        return None;
-    };
-    if !base.listening() {
-        return None;
-    }
-    if base.pending_socket_error().is_some() {
-        let mut ready = LinuxEpollEvents::ERR;
-        if interest.contains(LinuxEpollEvents::OUT) {
-            ready |= LinuxEpollEvents::OUT;
+    match description {
+        OpenDescription::HostSocket { host_fd, base, .. } => {
+            if !base.listening() {
+                return None;
+            }
+            if base.pending_socket_error().is_some() {
+                let mut ready = LinuxEpollEvents::ERR;
+                if interest.contains(LinuxEpollEvents::OUT) {
+                    ready |= LinuxEpollEvents::OUT;
+                }
+                return Some(ListenerReadinessSample {
+                    ready: ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP),
+                    host_ready: LinuxEpollEvents::ERR,
+                    inzone: None,
+                });
+            }
+            let inzone = base
+                .inzone_listener()
+                .map(|listener| listener.readiness_snapshot());
+            let mut ready = LinuxEpollEvents::empty();
+            let mut host_ready = LinuxEpollEvents::empty();
+            if inzone.is_some_and(|snapshot| snapshot.pending > 0)
+                && interest.contains(LinuxEpollEvents::IN)
+            {
+                ready |= LinuxEpollEvents::IN;
+            }
+            let mut pfd = libc::pollfd {
+                fd: host_fd.raw(),
+                events: 0,
+                revents: 0,
+            };
+            if interest.contains(LinuxEpollEvents::IN) {
+                pfd.events |= libc::POLLIN;
+            }
+            let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if rc > 0 {
+                if pfd.revents & libc::POLLIN != 0 {
+                    ready |= LinuxEpollEvents::IN;
+                    host_ready |= LinuxEpollEvents::IN;
+                }
+                if pfd.revents & libc::POLLERR != 0 {
+                    ready |= LinuxEpollEvents::ERR;
+                    host_ready |= LinuxEpollEvents::ERR;
+                }
+            }
+            Some(ListenerReadinessSample {
+                ready: ready & (interest | LinuxEpollEvents::ERR),
+                host_ready,
+                inzone,
+            })
         }
-        return Some(ListenerReadinessSample {
-            ready: ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP),
-            host_ready: LinuxEpollEvents::ERR,
-            inzone: None,
-        });
-    }
-    let inzone = base
-        .inzone_listener()
-        .map(|listener| listener.readiness_snapshot());
-    let mut ready = LinuxEpollEvents::empty();
-    let mut host_ready = LinuxEpollEvents::empty();
-    if inzone.is_some_and(|snapshot| snapshot.pending > 0)
-        && interest.contains(LinuxEpollEvents::IN)
-    {
-        ready |= LinuxEpollEvents::IN;
-    }
-    let mut pfd = libc::pollfd {
-        fd: host_fd.raw(),
-        events: 0,
-        revents: 0,
-    };
-    if interest.contains(LinuxEpollEvents::IN) {
-        pfd.events |= libc::POLLIN;
-    }
-    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-    if rc > 0 {
-        if pfd.revents & libc::POLLIN != 0 {
-            ready |= LinuxEpollEvents::IN;
-            host_ready |= LinuxEpollEvents::IN;
+        OpenDescription::InMemorySocket { base, .. } => {
+            if !base.listening() {
+                return None;
+            }
+            let inzone = base
+                .inzone_listener()
+                .map(|listener| listener.readiness_snapshot());
+            let mut ready = LinuxEpollEvents::empty();
+            if inzone.is_some_and(|snapshot| snapshot.pending > 0)
+                && interest.contains(LinuxEpollEvents::IN)
+            {
+                ready |= LinuxEpollEvents::IN;
+            }
+            Some(ListenerReadinessSample {
+                ready: ready & (interest | LinuxEpollEvents::ERR),
+                host_ready: LinuxEpollEvents::empty(),
+                inzone,
+            })
         }
-        if pfd.revents & libc::POLLERR != 0 {
-            ready |= LinuxEpollEvents::ERR;
-            host_ready |= LinuxEpollEvents::ERR;
-        }
+        _ => None,
     }
-    Some(ListenerReadinessSample {
-        ready: ready & (interest | LinuxEpollEvents::ERR),
-        host_ready,
-        inzone,
-    })
 }
 
 impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
@@ -2462,8 +2486,13 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 }
                 ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
             }
-            OpenDescription::InMemorySocket { socket, .. } => {
-                let mask = LinuxEpollEvents::from_bits_retain(socket.poll_mask());
+            OpenDescription::InMemorySocket { socket, base } => {
+                let mut mask = LinuxEpollEvents::from_bits_retain(socket.poll_mask());
+                if let Some(listener) = base.inzone_listener() {
+                    if listener.pending() > 0 {
+                        mask |= LinuxEpollEvents::IN;
+                    }
+                }
                 mask & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
             }
         }
@@ -2602,7 +2631,7 @@ impl crate::kernel::FileDescription {
         };
         if socket.socket_type != carrick_abi::LINUX_SOCK_STREAM
             || !matches!(
-                socket.family,
+                socket.family(),
                 carrick_abi::LINUX_AF_INET | carrick_abi::LINUX_AF_INET6
             )
             || socket.protocol != carrick_abi::LINUX_IPPROTO_TCP

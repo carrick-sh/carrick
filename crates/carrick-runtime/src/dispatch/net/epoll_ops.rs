@@ -211,7 +211,7 @@ impl<'a> NetView<'a> {
         match open_file.description.read().as_deref() {
             Some(OpenDescription::HostSocket { .. }) => true,
             Some(OpenDescription::InMemorySocket { socket, .. }) => {
-                (socket.family == LINUX_AF_INET || socket.family == LINUX_AF_INET6)
+                (socket.family() == LINUX_AF_INET || socket.family() == LINUX_AF_INET6)
                     && socket.socket_type == carrick_abi::LINUX_SOCK_STREAM
             }
             _ => false,
@@ -224,7 +224,7 @@ impl<'a> NetView<'a> {
         };
         matches!(
             open_file.description.read().as_deref(),
-            Some(OpenDescription::HostSocket { base, .. }) if base.listening()
+            Some(OpenDescription::HostSocket { base, .. } | OpenDescription::InMemorySocket { base, .. }) if base.listening()
         )
     }
 

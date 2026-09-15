@@ -855,13 +855,60 @@ impl<'a> NetView<'a> {
             }
             (
                 Arc::clone(socket),
-                socket
-                    .local_addr()
-                    .ok_or(carrick_abi::LINUX_EADDRNOTAVAIL)?,
-                base.inzone_cleanup()
-                    .ok_or(carrick_abi::LINUX_EADDRNOTAVAIL)?,
+                socket.local_addr(),
+                base.inzone_cleanup(),
             )
         };
+        let scope = match self.network.spec.namespace_id.as_ref() {
+            Some(id) => crate::network::inzone::InZoneScope::Namespace(id.clone()),
+            None => crate::network::inzone::InZoneScope::CarrierHost,
+        };
+        let (mut local, cleanup) = match (local, cleanup) {
+            (Some(loc), Some(c)) => (loc, c),
+            _ => {
+                let ip = match target.0.ip() {
+                    std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    std::net::IpAddr::V6(v6) => {
+                        if let Some(v4) = v6.to_ipv4_mapped() {
+                            std::net::IpAddr::V4(v4)
+                        } else {
+                            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                        }
+                    }
+                };
+                let addr_family = match target.0 {
+                    std::net::SocketAddr::V4(_) => crate::network::inzone::AddrFamily::V4,
+                    std::net::SocketAddr::V6(_) => crate::network::inzone::AddrFamily::V6,
+                };
+                let Some(lease) = self
+                    .network
+                    .provider
+                    .inzone()
+                    .allocate_ephemeral(&scope, addr_family)
+                else {
+                    return Err(carrick_abi::LINUX_EADDRNOTAVAIL);
+                };
+                let loc = std::net::SocketAddr::new(ip, lease.port().raw());
+                let c = Arc::new(InZonePortGuard {
+                    network: Arc::clone(self.network),
+                    lease,
+                }) as Arc<dyn InZoneCleanup>;
+                (loc, c)
+            }
+        };
+        if local.ip().is_unspecified() {
+            let resolved_ip = match target.0.ip() {
+                std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                std::net::IpAddr::V6(v6) => {
+                    if let Some(v4) = v6.to_ipv4_mapped() {
+                        std::net::IpAddr::V4(v4)
+                    } else {
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                    }
+                }
+            };
+            local.set_ip(resolved_ip);
+        }
         let _ = self.check_inzone_connect_preconditions(fd, listener.key(), target, Some(local))?;
         let admission = listener
             .reserve_admission()
@@ -872,11 +919,35 @@ impl<'a> NetView<'a> {
             uid: creds.euid.raw(),
             gid: creds.egid.raw(),
         };
+        let server_family = match listener.key().addr.0 {
+            std::net::SocketAddr::V6(_) => LINUX_AF_INET6,
+            std::net::SocketAddr::V4(_) => LINUX_AF_INET,
+        };
         let server = socket.new_inet_peer(ucred)?;
+        server.set_family(server_family);
+        let (server_local, server_peer) = if server_family == LINUX_AF_INET6 {
+            let sl = match target.0 {
+                std::net::SocketAddr::V4(v4) => std::net::SocketAddr::new(
+                    std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()),
+                    v4.port(),
+                ),
+                v6 => v6,
+            };
+            let sp = match local {
+                std::net::SocketAddr::V4(v4) => std::net::SocketAddr::new(
+                    std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()),
+                    v4.port(),
+                ),
+                v6 => v6,
+            };
+            (sl, sp)
+        } else {
+            (target.0, local)
+        };
         {
             let mut state = server.state.lock();
-            state.local_sockaddr = Some(target.0);
-            state.peer_sockaddr = Some(local);
+            state.local_sockaddr = Some(server_local);
+            state.peer_sockaddr = Some(server_peer);
             state.inzone_cleanup = Some(Arc::clone(&cleanup));
         }
         let key = crate::network::SocketKey::for_in_memory(Arc::as_ptr(&socket) as usize as u64);
@@ -902,10 +973,15 @@ impl<'a> NetView<'a> {
         })?;
         {
             let mut state = socket.state.lock();
+            state.local_sockaddr = Some(local);
             state.peer_sockaddr = Some(target.0);
+            state.inzone_cleanup = Some(Arc::clone(&cleanup));
+            state.can_rebind = false;
         }
         base.set_connected(true);
         base.set_connect_in_progress(false);
+        base.set_inzone_cleanup(Some(cleanup));
+        base.set_guest_local(Some(GuestSocketAddr(local)));
         base.clear_socket_error_after_send();
         let _ = base.take_pending_socket_error();
         drop(open);
@@ -1244,12 +1320,18 @@ impl<'a> NetView<'a> {
                     base,
                     ..
                 }) => (
-                    host_fd.raw(),
+                    Some(host_fd.raw()),
                     *family,
                     *type_,
                     *protocol,
                     base.inzone_listener(),
                 ),
+                Some(OpenDescription::InMemorySocket { base, socket }) => {
+                    let family = socket.family();
+                    let type_ = socket.socket_type;
+                    let protocol = socket.protocol;
+                    (None, family, type_, protocol, base.inzone_listener())
+                }
                 _ => {
                     return DispatchOutcome::errno(LINUX_ENOTSOCK);
                 }
@@ -1295,9 +1377,6 @@ impl<'a> NetView<'a> {
                 );
                 let mut base = OpenDescriptionBase::new(status_flags);
                 base.set_connected(true);
-                if let Some(cleanup) = server_half.state.lock().inzone_cleanup.clone() {
-                    base.set_inzone_cleanup(Some(cleanup));
-                }
                 let open_desc = OpenDescription::InMemorySocket {
                     base,
                     socket: server_half,
@@ -1314,6 +1393,13 @@ impl<'a> NetView<'a> {
                 return DispatchOutcome::returned_i32(linux_fd);
             }
         }
+        let Some(host_fd) = host_fd else {
+            let nonblocking = self.io_is_nonblocking(fd, 0);
+            if nonblocking {
+                return DispatchOutcome::errno(LINUX_EAGAIN);
+            }
+            return self.wait_in_memory_slot(fd, libc::POLLIN, None);
+        };
         // accept(2) has no per-call non-blocking flag, but listen() already put
         // the host listen socket in non-blocking mode, so this never blocks.
         // Whether EAGAIN becomes a wait or an EAGAIN to the guest is decided by
@@ -1956,6 +2042,92 @@ impl<'a> NetView<'a> {
                         drop(open);
                         return Ok(socket.bind(memory, addr_addr, addrlen));
                     }
+                    OpenDescription::InMemorySocket { base, socket } => {
+                        let family = socket.family();
+                        let type_ = socket.socket_type;
+                        if type_ != LINUX_SOCK_STREAM || !matches!(family, LINUX_AF_INET | LINUX_AF_INET6) {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        if base.listening() || socket.is_listening() || base.connected() || socket.peer_addr().is_some() {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        if !socket.can_rebind() {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        let host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
+                        let Some(requested) = host_sockaddr_to_socket_addr(&host_addr) else {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        };
+                        let ipv6_v6only = base.ipv6_v6only();
+                        if ipv6_v6only
+                            && matches!(requested.ip(), std::net::IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some())
+                        {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        let old_cleanup = base.inzone_cleanup();
+                        base.set_inzone_cleanup(None);
+                        base.set_inzone_listener(None);
+                        {
+                            let mut state = socket.state.lock();
+                            state.inzone_cleanup = None;
+                        }
+                        drop(old_cleanup);
+                        let old_key = crate::network::SocketKey::for_in_memory(Arc::as_ptr(socket) as usize as u64);
+                        this.network.provider.forget_socket_addresses(old_key);
+
+                        let scope = match this.network.spec.namespace_id.as_ref() {
+                            Some(id) => crate::network::inzone::InZoneScope::Namespace(id.clone()),
+                            None => crate::network::inzone::InZoneScope::CarrierHost,
+                        };
+                        let reuseaddr = base.so_reuseaddr();
+                        let reuseport = base.so_reuseport();
+                        let (guest_bound, lease) = if requested.port() == 0 {
+                            let Some(lease) = this.network.provider.inzone().allocate_ephemeral_for_bind(
+                                &scope,
+                                requested.ip(),
+                                reuseaddr,
+                                reuseport,
+                                ipv6_v6only,
+                            ) else {
+                                return Ok(DispatchOutcome::errno(linux_errno::EADDRINUSE));
+                            };
+                            let guest_bound = std::net::SocketAddr::new(requested.ip(), lease.port().raw());
+                            (guest_bound, lease)
+                        } else {
+                            let Some(lease) = this.network.provider.inzone().try_claim_bound_port(
+                                &scope,
+                                requested,
+                                reuseaddr,
+                                reuseport,
+                                ipv6_v6only,
+                            ) else {
+                                return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EADDRINUSE));
+                            };
+                            (requested, lease)
+                        };
+                        let cleanup = Arc::new(InZonePortGuard {
+                            network: Arc::clone(this.network),
+                            lease,
+                        }) as Arc<dyn InZoneCleanup>;
+                        let guest_bound_addr = GuestSocketAddr(guest_bound);
+                        base.set_guest_local(Some(guest_bound_addr));
+                        base.set_inzone_cleanup(Some(Arc::clone(&cleanup)));
+                        {
+                            let mut state = socket.state.lock();
+                            state.local_sockaddr = Some(guest_bound);
+                            state.inzone_cleanup = Some(cleanup);
+                            state.can_rebind = false;
+                        }
+                        let _ = this.network.provider.record_socket_addresses(
+                            this.network.spec.namespace_id.as_ref(),
+                            old_key,
+                            Some(guest_bound_addr),
+                            None,
+                            None,
+                            PortProtocol::Tcp,
+                        );
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
                     _ => {}
                 }
             }
@@ -2475,6 +2647,104 @@ impl<'a> NetView<'a> {
             let Some(mut open) = listen_description.write() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
+            if let OpenDescription::InMemorySocket { base, socket } = &mut *open {
+                let family = socket.family();
+                let type_ = socket.socket_type;
+                if type_ != LINUX_SOCK_STREAM || !matches!(family, LINUX_AF_INET | LINUX_AF_INET6) {
+                    if family == LINUX_AF_UNIX && type_ == LINUX_SOCK_STREAM {
+                        let mut state = socket.state.lock();
+                        state.listening = true;
+                        state.backlog_limit = backlog.max(0) as usize;
+                        base.set_listening(true);
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+                }
+                if base.connected() || socket.peer_addr().is_some() {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                let reuseport = base.so_reuseport();
+                let ipv6_v6only = base.ipv6_v6only();
+                let existing_listener = base.inzone_listener();
+                let scope = match this.network.spec.namespace_id.as_ref() {
+                    Some(id) => crate::network::inzone::InZoneScope::Namespace(id.clone()),
+                    None => crate::network::inzone::InZoneScope::CarrierHost,
+                };
+                let mut logical_local = base.guest_local().or_else(|| {
+                    socket.state.lock().local_sockaddr.map(GuestSocketAddr)
+                });
+                if existing_listener.is_none() && logical_local.is_none() {
+                    let ip = if family == LINUX_AF_INET6 {
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                    } else {
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+                    };
+                    let Some(lease) = this.network.provider.inzone().allocate_ephemeral_for_bind(
+                        &scope,
+                        ip,
+                        base.so_reuseaddr(),
+                        reuseport,
+                        ipv6_v6only,
+                    ) else {
+                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EADDRNOTAVAIL));
+                    };
+                    let guest_bound = std::net::SocketAddr::new(ip, lease.port().raw());
+                    let cleanup = Arc::new(InZonePortGuard {
+                        network: Arc::clone(this.network),
+                        lease,
+                    }) as Arc<dyn InZoneCleanup>;
+                    let guest_bound_addr = GuestSocketAddr(guest_bound);
+                    base.set_guest_local(Some(guest_bound_addr));
+                    base.set_inzone_cleanup(Some(Arc::clone(&cleanup)));
+                    {
+                        let mut state = socket.state.lock();
+                        state.local_sockaddr = Some(guest_bound);
+                        state.inzone_cleanup = Some(cleanup);
+                        state.can_rebind = false;
+                    }
+                    logical_local = Some(guest_bound_addr);
+                }
+                let Some(guest_local) = logical_local else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                let listener_key = crate::network::inzone::InZoneListenerKey {
+                    scope: scope.clone(),
+                    addr: guest_local,
+                };
+                if let Some(existing) = existing_listener {
+                    existing.set_backlog(backlog.max(0) as usize);
+                    let mut state = socket.state.lock();
+                    state.listening = true;
+                    state.backlog_limit = backlog.max(0) as usize;
+                    state.can_rebind = false;
+                    base.set_listening(true);
+                } else {
+                    let Some(reservation) = this
+                        .network
+                        .provider
+                        .inzone()
+                        .reserve_listener_guard(listener_key, reuseport, ipv6_v6only)
+                    else {
+                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EADDRINUSE));
+                    };
+                    let inzone_listener = reservation.commit(backlog.max(0) as usize);
+                    let cleanup_guard = Arc::new(InZoneListenerGuard {
+                        network: Arc::clone(this.network),
+                        listener: Arc::clone(&inzone_listener),
+                        _port_guard: base.inzone_cleanup(),
+                    });
+                    base.set_listening(true);
+                    base.set_inzone_listener(Some(Arc::downgrade(&inzone_listener)));
+                    base.set_inzone_cleanup(Some(cleanup_guard));
+                    {
+                        let mut state = socket.state.lock();
+                        state.listening = true;
+                        state.backlog_limit = backlog.max(0) as usize;
+                        state.can_rebind = false;
+                    }
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             let OpenDescription::HostSocket {
                 base,
                 host_fd,
@@ -2654,7 +2924,7 @@ impl<'a> NetView<'a> {
                     };
                     match &*open {
                         OpenDescription::InMemorySocket { socket, .. } => Some((
-                            socket.family,
+                            socket.family(),
                             socket.socket_type == LINUX_SOCK_STREAM,
                             socket.is_listening(),
                             socket.peer_addr().is_some(),
@@ -2952,6 +3222,10 @@ impl<'a> NetView<'a> {
                             uid: creds.euid.raw(),
                             gid: creds.egid.raw(),
                         };
+                        let server_family = match listener.key().addr.0 {
+                            std::net::SocketAddr::V6(_) => LINUX_AF_INET6,
+                            std::net::SocketAddr::V4(_) => LINUX_AF_INET,
+                        };
                         let (client_half, server_half) =
                             crate::dispatch::net::unix_pure::PureSocketInner::pair_with_family(
                                 family,
@@ -2960,6 +3234,26 @@ impl<'a> NetView<'a> {
                                 ucred,
                                 ucred,
                             );
+                        server_half.set_family(server_family);
+                        let (server_local, server_peer) = if server_family == LINUX_AF_INET6 {
+                            let sl = match target.0 {
+                                std::net::SocketAddr::V4(v4) => std::net::SocketAddr::new(
+                                    std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()),
+                                    v4.port(),
+                                ),
+                                v6 => v6,
+                            };
+                            let sp = match client_local {
+                                std::net::SocketAddr::V4(v4) => std::net::SocketAddr::new(
+                                    std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()),
+                                    v4.port(),
+                                ),
+                                v6 => v6,
+                            };
+                            (sl, sp)
+                        } else {
+                            (target.0, client_local)
+                        };
                         {
                             let mut c = client_half.state.lock();
                             c.local_sockaddr = Some(client_local);
@@ -2967,8 +3261,8 @@ impl<'a> NetView<'a> {
                         }
                         {
                             let mut s = server_half.state.lock();
-                            s.local_sockaddr = Some(target.0);
-                            s.peer_sockaddr = Some(client_local);
+                            s.local_sockaddr = Some(server_local);
+                            s.peer_sockaddr = Some(server_peer);
                             s.inzone_cleanup = Some(Arc::clone(&port_guard));
                         }
                         let in_memory_id = Arc::as_ptr(&client_half) as usize as u64;
