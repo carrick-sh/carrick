@@ -8795,6 +8795,36 @@ mod inzone_tcp {
         assert_eq!(out_fdset[(listen_fd / 8) as usize] & (1 << (listen_fd % 8)), 1 << (listen_fd % 8));
     }
 
+    /// The ONE wait source a single-fd `ppoll`/`pselect6` park registered.
+    ///
+    /// The park used to carry two independently built lists joined by one
+    /// `logical_interest` scalar; asserting on the registration proves the fd
+    /// named its own source, and that nothing was left unclassified.
+    fn sole_wait_source(outcome: &DispatchOutcome) -> crate::dispatch::wait_source::WaitSource {
+        let authority = match outcome {
+            DispatchOutcome::WaitOnFds { fds, .. } => fds.authority().clone(),
+            DispatchOutcome::BlockingFdWait { wait, .. } => wait.authority().clone(),
+            other => panic!("expected WaitOnFds or BlockingFdWait, got {other:?}"),
+        };
+        match authority {
+            WaitFdAuthority::Logical {
+                registrations,
+                unclassified,
+                ..
+            } => {
+                assert!(
+                    unclassified.is_empty(),
+                    "ppoll/pselect6 classify every fd they name"
+                );
+                match registrations.as_slice() {
+                    [registration] => registration.source(),
+                    other => panic!("expected exactly one registration, got {other:?}"),
+                }
+            }
+            other => panic!("expected WaitFdAuthority::Logical, got {other:?}"),
+        }
+    }
+
     fn inzone_connected_pair() -> (InZoneGuest, i32, i32) {
         let mut g = InZoneGuest::new();
         let listen_fd = g.ok(
@@ -8837,7 +8867,7 @@ mod inzone_tcp {
     }
 
     #[test]
-    fn ppoll_on_inzone_accepted_stream_carries_logical_pollin_interest() {
+    fn ppoll_on_inzone_accepted_stream_registers_a_probed_pollin_source() {
         const SYS_PPOLL: u64 = 73;
         let (mut g, _client_fd, accepted_fd) = inzone_connected_pair();
 
@@ -8854,25 +8884,23 @@ mod inzone_tcp {
         g.mem.write_bytes(pollfd_addr, &pfd).unwrap();
 
         let outcome = g.call(SYS_PPOLL, [pollfd_addr, 1, timeout_addr, 0, 0, 0]);
-        let authority = match &outcome {
-            DispatchOutcome::WaitOnFds { fds, .. } => fds.authority().clone(),
-            DispatchOutcome::BlockingFdWait { wait, .. } => wait.authority().clone(),
-            other => panic!("expected WaitOnFds or BlockingFdWait, got {other:?}"),
-        };
-        match authority {
-            authority @ WaitFdAuthority::Logical { .. } => {
-                let interest = authority.probed_interest_for_test();
-                assert!(
-                    interest.contains(carrick_abi::LinuxPollEvents::IN),
-                    "ppoll: expected a probed POLLIN interest, got {interest:?}"
-                );
-            }
-            other => panic!("ppoll: expected WaitFdAuthority::Logical, got {other:?}"),
-        }
+        let source = sole_wait_source(&outcome);
+        assert_eq!(
+            source
+                .description_interest()
+                .map(crate::dispatch::wait_source::WaitInterest::events),
+            Some(carrick_abi::LinuxPollEvents::IN),
+            "ppoll: the fd's OWN POLLIN interest, not a scalar folded across the wait"
+        );
+        assert!(
+            source.probe_after_enrol(),
+            "ppoll: an in-zone producer landing in the enrollment gap is recovered \
+             only by the post-enrollment probe"
+        );
     }
 
     #[test]
-    fn pselect6_on_inzone_accepted_stream_carries_logical_pollin_interest() {
+    fn pselect6_on_inzone_accepted_stream_registers_a_probed_pollin_source() {
         const SYS_PSELECT6: u64 = 72;
         let (mut g, _client_fd, accepted_fd) = inzone_connected_pair();
 
@@ -8891,21 +8919,19 @@ mod inzone_tcp {
             SYS_PSELECT6,
             [accepted_fd as u64 + 1, readfds_addr, 0, 0, timeout_addr, 0],
         );
-        let authority = match &outcome {
-            DispatchOutcome::WaitOnFds { fds, .. } => fds.authority().clone(),
-            DispatchOutcome::BlockingFdWait { wait, .. } => wait.authority().clone(),
-            other => panic!("expected WaitOnFds or BlockingFdWait, got {other:?}"),
-        };
-        match authority {
-            authority @ WaitFdAuthority::Logical { .. } => {
-                let interest = authority.probed_interest_for_test();
-                assert!(
-                    interest.contains(carrick_abi::LinuxPollEvents::IN),
-                    "pselect6: expected a probed POLLIN interest, got {interest:?}"
-                );
-            }
-            other => panic!("pselect6: expected WaitFdAuthority::Logical, got {other:?}"),
-        }
+        let source = sole_wait_source(&outcome);
+        assert_eq!(
+            source
+                .description_interest()
+                .map(crate::dispatch::wait_source::WaitInterest::events),
+            Some(carrick_abi::LinuxPollEvents::IN),
+            "pselect6: the fd's OWN POLLIN interest, not a scalar folded across the wait"
+        );
+        assert!(
+            source.probe_after_enrol(),
+            "pselect6: an in-zone producer landing in the enrollment gap is recovered \
+             only by the post-enrollment probe"
+        );
     }
 
     fn inzone_listener() -> (InZoneGuest, i32) {
@@ -8927,7 +8953,7 @@ mod inzone_tcp {
     }
 
     #[test]
-    fn ppoll_on_inzone_listener_carries_logical_pollin_interest() {
+    fn ppoll_on_inzone_listener_registers_a_dual_host_peers_only_source() {
         const SYS_PPOLL: u64 = 73;
         let (mut g, listen_fd) = inzone_listener();
 
@@ -8944,25 +8970,34 @@ mod inzone_tcp {
         g.mem.write_bytes(pollfd_addr, &pfd).unwrap();
 
         let outcome = g.call(SYS_PPOLL, [pollfd_addr, 1, timeout_addr, 0, 0, 0]);
-        let authority = match &outcome {
-            DispatchOutcome::WaitOnFds { fds, .. } => fds.authority().clone(),
-            DispatchOutcome::BlockingFdWait { wait, .. } => wait.authority().clone(),
-            other => panic!("expected WaitOnFds or BlockingFdWait, got {other:?}"),
-        };
-        match authority {
-            authority @ WaitFdAuthority::Logical { .. } => {
-                let interest = authority.probed_interest_for_test();
-                assert!(
-                    interest.contains(carrick_abi::LinuxPollEvents::IN),
-                    "ppoll: expected a probed POLLIN interest, got {interest:?}"
-                );
-            }
-            other => panic!("ppoll: expected WaitFdAuthority::Logical, got {other:?}"),
-        }
+        let source = sole_wait_source(&outcome);
+        assert_eq!(
+            source
+                .description_interest()
+                .map(crate::dispatch::wait_source::WaitInterest::events),
+            Some(carrick_abi::LinuxPollEvents::IN),
+            "ppoll: the fd's OWN POLLIN interest, not a scalar folded across the wait"
+        );
+        assert!(
+            source.probe_after_enrol(),
+            "ppoll: an in-zone producer landing in the enrollment gap is recovered \
+             only by the post-enrollment probe"
+        );
+        assert!(
+            matches!(
+                source,
+                crate::dispatch::wait_source::WaitSource::Dual {
+                    coverage: crate::dispatch::wait_source::HostProxyCoverage::HostPeersOnly,
+                    ..
+                }
+            ),
+            "ppoll: an in-zone listener is dual — the Darwin listen socket sees host \
+             peers only, so the description still takes the probe; got {source:?}"
+        );
     }
 
     #[test]
-    fn pselect6_on_inzone_listener_carries_logical_pollin_interest() {
+    fn pselect6_on_inzone_listener_registers_a_dual_host_peers_only_source() {
         const SYS_PSELECT6: u64 = 72;
         let (mut g, listen_fd) = inzone_listener();
 
@@ -8981,21 +9016,30 @@ mod inzone_tcp {
             SYS_PSELECT6,
             [listen_fd as u64 + 1, readfds_addr, 0, 0, timeout_addr, 0],
         );
-        let authority = match &outcome {
-            DispatchOutcome::WaitOnFds { fds, .. } => fds.authority().clone(),
-            DispatchOutcome::BlockingFdWait { wait, .. } => wait.authority().clone(),
-            other => panic!("expected WaitOnFds or BlockingFdWait, got {other:?}"),
-        };
-        match authority {
-            authority @ WaitFdAuthority::Logical { .. } => {
-                let interest = authority.probed_interest_for_test();
-                assert!(
-                    interest.contains(carrick_abi::LinuxPollEvents::IN),
-                    "pselect6: expected a probed POLLIN interest, got {interest:?}"
-                );
-            }
-            other => panic!("pselect6: expected WaitFdAuthority::Logical, got {other:?}"),
-        }
+        let source = sole_wait_source(&outcome);
+        assert_eq!(
+            source
+                .description_interest()
+                .map(crate::dispatch::wait_source::WaitInterest::events),
+            Some(carrick_abi::LinuxPollEvents::IN),
+            "pselect6: the fd's OWN POLLIN interest, not a scalar folded across the wait"
+        );
+        assert!(
+            source.probe_after_enrol(),
+            "pselect6: an in-zone producer landing in the enrollment gap is recovered \
+             only by the post-enrollment probe"
+        );
+        assert!(
+            matches!(
+                source,
+                crate::dispatch::wait_source::WaitSource::Dual {
+                    coverage: crate::dispatch::wait_source::HostProxyCoverage::HostPeersOnly,
+                    ..
+                }
+            ),
+            "pselect6: an in-zone listener is dual — the Darwin listen socket sees host \
+             peers only, so the description still takes the probe; got {source:?}"
+        );
     }
 
     #[test]

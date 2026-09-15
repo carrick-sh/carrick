@@ -250,9 +250,8 @@ impl WaitFds {
     /// Build the reactor lowering and the authority from ONE list: a `Host` or
     /// `Dual` source contributes its host descriptor, a `Description` source
     /// contributes none. There is no `-1` sentinel to write.
-    // Tasks 4-6 route every park through this; until then the adapters below
-    // still build the authority from separately captured slots.
-    #[allow(dead_code)]
+    // Tasks 6-7 route the remaining parks through this; until then the
+    // adapters below still build the authority from separately captured slots.
     pub(crate) fn from_registrations(
         registrations: Vec<WaitRegistration>,
         watched: Vec<WatchedSlot>,
