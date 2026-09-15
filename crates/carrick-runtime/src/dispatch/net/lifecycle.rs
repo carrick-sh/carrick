@@ -787,6 +787,26 @@ impl<'a> NetView<'a> {
         Ok(())
     }
 
+    fn check_inzone_client_compatibility(
+        listener_key: &crate::network::inzone::InZoneListenerKey,
+        target: GuestSocketAddr,
+        client_local: Option<std::net::SocketAddr>,
+    ) -> Result<bool, LinuxErrno> {
+        let is_v4_target = listener_key.addr.0.is_ipv4()
+            || target.0.is_ipv4()
+            || matches!(target.0.ip(), std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some());
+        if is_v4_target {
+            if let Some(addr) = client_local {
+                if let std::net::IpAddr::V6(v6) = addr.ip() {
+                    if !v6.is_unspecified() && v6.to_ipv4_mapped().is_none() {
+                        return Err(carrick_abi::LINUX_ENETUNREACH);
+                    }
+                }
+            }
+        }
+        Ok(is_v4_target)
+    }
+
     fn reconnect_disconnected_inzone_stream(
         &self,
         fd: i32,
@@ -823,6 +843,7 @@ impl<'a> NetView<'a> {
                     .ok_or(carrick_abi::LINUX_EADDRNOTAVAIL)?,
             )
         };
+        let _ = Self::check_inzone_client_compatibility(listener.key(), target, Some(local))?;
         let admission = listener
             .reserve_admission()
             .ok_or(carrick_abi::LINUX_ECONNREFUSED)?;
@@ -2834,6 +2855,15 @@ impl<'a> NetView<'a> {
                             None
                         });
 
+                        let is_v4_target = match Self::check_inzone_client_compatibility(
+                            listener.key(),
+                            target,
+                            bound_addr,
+                        ) {
+                            Ok(is_v4) => is_v4,
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        };
+
                         let (client_local, port_guard) = match bound_addr {
                             Some(addr) => {
                                 let port = addr.port();
@@ -2842,7 +2872,11 @@ impl<'a> NetView<'a> {
                                         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
                                     }
                                     std::net::IpAddr::V6(v6) if v6.is_unspecified() => {
-                                        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                                        if is_v4_target {
+                                            std::net::IpAddr::V6(std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped())
+                                        } else {
+                                            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                                        }
                                     }
                                     ip => ip,
                                 };
@@ -2867,10 +2901,14 @@ impl<'a> NetView<'a> {
                                         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                                         ephemeral_lease.port().raw(),
                                     ),
-                                    std::net::SocketAddr::V6(_) => std::net::SocketAddr::new(
-                                        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-                                        ephemeral_lease.port().raw(),
-                                    ),
+                                    std::net::SocketAddr::V6(_) => {
+                                        let ip = if is_v4_target {
+                                            std::net::IpAddr::V6(std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped())
+                                        } else {
+                                            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                                        };
+                                        std::net::SocketAddr::new(ip, ephemeral_lease.port().raw())
+                                    }
                                 };
                                 let guard = Arc::new(InZonePortGuard {
                                     network: Arc::clone(this.network),

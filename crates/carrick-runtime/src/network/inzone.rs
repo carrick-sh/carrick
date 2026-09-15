@@ -154,29 +154,21 @@ impl InZoneListener {
         if self.key.addr.0.is_ipv4() {
             let mut server_state = server_half.state.lock();
             if let Some(SocketAddr::V6(peer_v6)) = server_state.peer_sockaddr {
-                let v4 = peer_v6.ip().to_ipv4_mapped().unwrap_or(Ipv4Addr::LOCALHOST);
-                server_state.peer_sockaddr = Some(SocketAddr::new(IpAddr::V4(v4), peer_v6.port()));
+                if let Some(v4) = peer_v6.ip().to_ipv4_mapped() {
+                    server_state.peer_sockaddr =
+                        Some(SocketAddr::new(IpAddr::V4(v4), peer_v6.port()));
+                }
+                // When mapping is absent, leave sockaddr unchanged. On an IPv4 listener this
+                // branch is unreachable by construction because in-zone loopback connects to an
+                // IPv4 listener must resolve through an IPv4 address or an IPv4-mapped IPv6 address.
             }
             if let Some(SocketAddr::V6(local_v6)) = server_state.local_sockaddr {
-                let v4 = local_v6
-                    .ip()
-                    .to_ipv4_mapped()
-                    .unwrap_or(Ipv4Addr::LOCALHOST);
-                server_state.local_sockaddr =
-                    Some(SocketAddr::new(IpAddr::V4(v4), local_v6.port()));
-            }
-            if let Some(client_weak) = &server_state.peer
-                && let Some(client_half) = client_weak.upgrade()
-            {
-                let mut client_state = client_half.state.lock();
-                if let Some(SocketAddr::V6(client_local_v6)) = client_state.local_sockaddr {
-                    if client_local_v6.ip().is_loopback() {
-                        client_state.local_sockaddr = Some(SocketAddr::new(
-                            IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
-                            client_local_v6.port(),
-                        ));
-                    }
+                if let Some(v4) = local_v6.ip().to_ipv4_mapped() {
+                    server_state.local_sockaddr =
+                        Some(SocketAddr::new(IpAddr::V4(v4), local_v6.port()));
                 }
+                // When mapping is absent, leave sockaddr unchanged. Unreachable by construction
+                // on an IPv4 listener.
             }
         }
         let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
