@@ -138,33 +138,6 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
-      "resource": "current carrier credential scoping the external deadlock-capture request in `publish_capture_request` at line 144"
-    },
-    "expansion": null,
-    "operation": "libc::geteuid",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:144 in `publish_capture_request`, `libc::geteuid` acts only on the current carrier credential scoping the external deadlock-capture request in `publish_capture_request` at line 144; no guest identity selects its host target.",
-    "review_id": "HA-000007",
-    "source": {
-      "byte_end": 5633,
-      "byte_start": 5620,
-      "column": 24,
-      "column_end": 37,
-      "column_start": 24,
-      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
-      "line": 144,
-      "line_end": 144,
-      "line_start": 144
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-PROCESS-GETEUID",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
       "resource": "current operator credential scoping the private control endpoint in `for_container_id` at line 53"
     },
     "expansion": null,
@@ -293,6 +266,33 @@
       "line": 216,
       "line_end": 216,
       "line_start": 216
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-PROCESS-GETEUID",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "the current carrier credential that owns the wedge-capture directory in `prepare_capture_directory`"
+    },
+    "expansion": null,
+    "operation": "libc::geteuid",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/wedge_capture.rs:310, `libc::geteuid` acts only on the current carrier credential that must own the wedge-capture directory; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000656",
+    "source": {
+      "byte_end": 11523,
+      "byte_start": 11510,
+      "column": 24,
+      "column_end": 37,
+      "column_start": 24,
+      "file": "crates/carrick-runtime/src/wedge_capture.rs",
+      "line": 310,
+      "line_end": 310,
+      "line_start": 310
     }
   },
   {
@@ -469,18 +469,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:186 in `arm`, `libc::getpid` acts only on the current carrier deadlock diagnostic used by `arm`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:133 in `arm`, `libc::getpid` acts only on the current carrier deadlock diagnostic used by `arm`; no guest identity selects its host target.",
     "review_id": "HA-000027",
     "source": {
-      "byte_end": 7184,
-      "byte_start": 7172,
+      "byte_end": 5581,
+      "byte_start": 5569,
       "column": 36,
       "column_end": 48,
       "column_start": 36,
       "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
-      "line": 186,
-      "line_end": 186,
-      "line_start": 186
+      "line": 133,
+      "line_end": 133,
+      "line_start": 133
     }
   },
   {
@@ -697,6 +697,33 @@
       "line": 5623,
       "line_end": 5623,
       "line_start": 5623
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-PROCESS-GETPID",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "the carrier identity the reaper checks before it may end this process"
+    },
+    "expansion": null,
+    "operation": "libc::getpid",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/wedge_capture.rs:447, `libc::getpid` reads only this carrier own identity, which the reaper must match before acting; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000662",
+    "source": {
+      "byte_end": 16531,
+      "byte_start": 16519,
+      "column": 33,
+      "column_end": 45,
+      "column_start": 33,
+      "file": "crates/carrick-runtime/src/wedge_capture.rs",
+      "line": 447,
+      "line_end": 447,
+      "line_start": 447
     }
   },
   {
@@ -1838,6 +1865,33 @@
     }
   },
   {
+    "catalog_id": "HA-CATALOG-FS-FILE-CREATE",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the wedge-capture backtrace artifact the debugger stdout is captured into"
+    },
+    "expansion": null,
+    "operation": "std::fs::File::create",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/wedge_capture.rs:388, `std::fs::File::create` creates only the backtrace artifact inside this carrier own capture directory; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000660",
+    "source": {
+      "byte_end": 14163,
+      "byte_start": 14142,
+      "column": 45,
+      "column_end": 66,
+      "column_start": 45,
+      "file": "crates/carrick-runtime/src/wedge_capture.rs",
+      "line": 388,
+      "line_end": 388,
+      "line_start": 388
+    }
+  },
+  {
     "catalog_id": "HA-CATALOG-FS-FILE-OPEN",
     "classification": "declared_backing",
     "evidence": {
@@ -2375,33 +2429,6 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
-      "resource": "run-scoped external deadlock-capture request backing used by `publish_capture_request` at line 147"
-    },
-    "expansion": null,
-    "operation": "std::fs::OpenOptions::new",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:147 in `publish_capture_request`, `std::fs::OpenOptions::new` accesses only the run-scoped external deadlock-capture request backing used by `publish_capture_request` at line 147.",
-    "review_id": "HA-000107",
-    "source": {
-      "byte_end": 5824,
-      "byte_start": 5799,
-      "column": 20,
-      "column_end": 45,
-      "column_start": 20,
-      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
-      "line": 147,
-      "line_end": 147,
-      "line_start": 147
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-NEW",
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
       "resource": "run-scoped SysV IPC backing object used by `with_shm_nattch_file`"
     },
     "expansion": null,
@@ -2665,6 +2692,33 @@
       "line": 822,
       "line_end": 822,
       "line_start": 822
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-NEW",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the wedge-capture manifest backing opened by `write_manifest`"
+    },
+    "expansion": null,
+    "operation": "std::fs::OpenOptions::new",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/wedge_capture.rs:339, `std::fs::OpenOptions::new` opens only the wedge-capture manifest inside this carrier own capture directory; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000658",
+    "source": {
+      "byte_end": 12507,
+      "byte_start": 12482,
+      "column": 20,
+      "column_end": 45,
+      "column_start": 20,
+      "file": "crates/carrick-runtime/src/wedge_capture.rs",
+      "line": 339,
+      "line_end": 339,
+      "line_start": 339
     }
   },
   {
@@ -2937,33 +2991,6 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
-      "resource": "run-scoped external deadlock-capture request backing used by `publish_capture_request` at line 151"
-    },
-    "expansion": null,
-    "operation": "std::fs::OpenOptions::open",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:151 in `publish_capture_request`, `std::fs::OpenOptions::open` accesses only the run-scoped external deadlock-capture request backing used by `publish_capture_request` at line 151.",
-    "review_id": "HA-000130",
-    "source": {
-      "byte_end": 5908,
-      "byte_start": 5904,
-      "column": 10,
-      "column_end": 14,
-      "column_start": 10,
-      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
-      "line": 151,
-      "line_end": 151,
-      "line_start": 151
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-OPEN",
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
       "resource": "run-scoped SysV IPC backing object used by `with_shm_nattch_file`"
     },
     "expansion": null,
@@ -3227,6 +3254,33 @@
       "line": 824,
       "line_end": 824,
       "line_start": 824
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-OPEN",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the wedge-capture manifest file this carrier writes its own provenance into"
+    },
+    "expansion": null,
+    "operation": "std::fs::OpenOptions::open",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/wedge_capture.rs:344, `std::fs::OpenOptions::open` writes only this carrier own capture provenance into its capture directory; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000659",
+    "source": {
+      "byte_end": 12611,
+      "byte_start": 12607,
+      "column": 10,
+      "column_end": 14,
+      "column_start": 10,
+      "file": "crates/carrick-runtime/src/wedge_capture.rs",
+      "line": 344,
+      "line_end": 344,
+      "line_start": 344
     }
   },
   {
@@ -4264,6 +4318,33 @@
       "line": 1411,
       "line_end": 1411,
       "line_start": 1411
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-CREATE-DIR-ALL",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the wedge-capture root this carrier creates before taking ownership of it"
+    },
+    "expansion": null,
+    "operation": "std::fs::create_dir_all",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/wedge_capture.rs:315, `std::fs::create_dir_all` creates only the wedge-capture root this carrier then ownership-checks; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000657",
+    "source": {
+      "byte_end": 11680,
+      "byte_start": 11657,
+      "column": 9,
+      "column_end": 32,
+      "column_start": 9,
+      "file": "crates/carrick-runtime/src/wedge_capture.rs",
+      "line": 315,
+      "line_end": 315,
+      "line_start": 315
     }
   },
   {
@@ -5506,18 +5587,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/runtime.rs:2245 in `rosetta_binary_bytes`, `std::fs::read` accesses only the fixed installed Rosetta interpreter object used by `rosetta_binary_bytes`.",
+    "rationale": "At crates/carrick-runtime/src/runtime.rs:2248 in `rosetta_binary_bytes`, `std::fs::read` accesses only the fixed installed Rosetta interpreter object used by `rosetta_binary_bytes`.",
     "review_id": "HA-000240",
     "source": {
-      "byte_end": 97843,
-      "byte_start": 97830,
+      "byte_end": 98126,
+      "byte_start": 98113,
       "column": 25,
       "column_end": 38,
       "column_start": 25,
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 2245,
-      "line_end": 2245,
-      "line_start": 2245
+      "line": 2248,
+      "line_end": 2248,
+      "line_start": 2248
     }
   },
   {
@@ -6597,18 +6678,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/lib.rs:327 in `rosetta_interpreter_path`, `std::fs::read_to_string` accesses only the fixed binfmt_misc Rosetta registration object at /proc/sys/fs/binfmt_misc/rosetta.",
+    "rationale": "At crates/carrick-runtime/src/lib.rs:328 in `rosetta_interpreter_path`, `std::fs::read_to_string` accesses only the fixed binfmt_misc Rosetta registration object at /proc/sys/fs/binfmt_misc/rosetta.",
     "review_id": "HA-000294",
     "source": {
-      "byte_end": 16716,
-      "byte_start": 16693,
+      "byte_end": 16739,
+      "byte_start": 16716,
       "column": 22,
       "column_end": 45,
       "column_start": 22,
       "file": "crates/carrick-runtime/src/lib.rs",
-      "line": 327,
-      "line_end": 327,
-      "line_start": 327
+      "line": 328,
+      "line_end": 328,
+      "line_start": 328
     }
   },
   {
@@ -8562,45 +8643,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:87 in `ensure_private_directory`, `std::fs::set_permissions` accesses only the run-scoped external deadlock-capture request backing used by `ensure_private_directory` at line 87.",
+    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:91 in `ensure_private_directory`, `std::fs::set_permissions` accesses only the run-scoped external deadlock-capture request backing used by `ensure_private_directory` at line 87.",
     "review_id": "HA-000367",
     "source": {
-      "byte_end": 3425,
-      "byte_start": 3401,
+      "byte_end": 3811,
+      "byte_start": 3787,
       "column": 5,
       "column_end": 29,
       "column_start": 5,
       "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
-      "line": 87,
-      "line_end": 87,
-      "line_start": 87
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-FS-SET-PERMISSIONS",
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
-      "resource": "run-scoped external deadlock-capture request backing used by `publish_capture_request` at line 154"
-    },
-    "expansion": null,
-    "operation": "std::fs::set_permissions",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:154 in `publish_capture_request`, `std::fs::set_permissions` accesses only the run-scoped external deadlock-capture request backing used by `publish_capture_request` at line 154.",
-    "review_id": "HA-000368",
-    "source": {
-      "byte_end": 6034,
-      "byte_start": 6010,
-      "column": 5,
-      "column_end": 29,
-      "column_start": 5,
-      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
-      "line": 154,
-      "line_end": 154,
-      "line_start": 154
+      "line": 91,
+      "line_end": 91,
+      "line_start": 91
     }
   },
   {
@@ -8967,18 +9021,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:70 in `ensure_private_directory`, `std::fs::symlink_metadata` accesses only the run-scoped external deadlock-capture request backing used by `ensure_private_directory` at line 70.",
+    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:74 in `ensure_private_directory`, `std::fs::symlink_metadata` accesses only the run-scoped external deadlock-capture request backing used by `ensure_private_directory` at line 70.",
     "review_id": "HA-000388",
     "source": {
-      "byte_end": 2754,
-      "byte_start": 2729,
+      "byte_end": 3140,
+      "byte_start": 3115,
       "column": 11,
       "column_end": 36,
       "column_start": 11,
       "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
-      "line": 70,
-      "line_end": 70,
-      "line_start": 70
+      "line": 74,
+      "line_end": 74,
+      "line_start": 74
     }
   },
   {
@@ -8994,18 +9048,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:88 in `ensure_private_directory`, `std::fs::symlink_metadata` accesses only the run-scoped external deadlock-capture request backing used by `ensure_private_directory` at line 88.",
+    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:92 in `ensure_private_directory`, `std::fs::symlink_metadata` accesses only the run-scoped external deadlock-capture request backing used by `ensure_private_directory` at line 88.",
     "review_id": "HA-000389",
     "source": {
-      "byte_end": 3518,
-      "byte_start": 3493,
+      "byte_end": 3904,
+      "byte_start": 3879,
       "column": 20,
       "column_end": 45,
       "column_start": 20,
       "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
-      "line": 88,
-      "line_end": 88,
-      "line_start": 88
+      "line": 92,
+      "line_end": 92,
+      "line_start": 92
     }
   },
   {
@@ -9384,6 +9438,33 @@
       "line": 758,
       "line_end": 758,
       "line_start": 758
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-SYMLINK-METADATA",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the wedge-capture artifact this carrier just wrote, sized by `require_evidence`"
+    },
+    "expansion": null,
+    "operation": "std::fs::symlink_metadata",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/wedge_capture.rs:259, `std::fs::symlink_metadata` sizes only the wedge-capture artifact this carrier just wrote under its own capture directory; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000655",
+    "source": {
+      "byte_end": 9867,
+      "byte_start": 9842,
+      "column": 17,
+      "column_end": 42,
+      "column_start": 17,
+      "file": "crates/carrick-runtime/src/wedge_capture.rs",
+      "line": 259,
+      "line_end": 259,
+      "line_start": 259
     }
   },
   {
@@ -13824,18 +13905,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:167 in `arm`, `std::thread::Builder::new` acts only on the current carrier deadlock-watchdog thread used by `arm`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:113 in `arm`, `std::thread::Builder::new` acts only on the current carrier deadlock-watchdog thread used by `arm`; no guest identity selects its host target.",
     "review_id": "HA-000577",
     "source": {
-      "byte_end": 6425,
-      "byte_start": 6400,
+      "byte_end": 4755,
+      "byte_start": 4730,
       "column": 5,
       "column_end": 30,
       "column_start": 5,
       "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
-      "line": 167,
-      "line_end": 167,
-      "line_start": 167
+      "line": 113,
+      "line_end": 113,
+      "line_start": 113
     }
   },
   {
@@ -14187,6 +14268,33 @@
       "line": 1196,
       "line_end": 1196,
       "line_start": 1196
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "the wedge reaper thread that ends this carrier after its capture"
+    },
+    "expansion": null,
+    "operation": "std::thread::Builder::new",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/wedge_capture.rs:455, `std::thread::Builder::new` creates only the reaper thread that ends this carrier after its own capture; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000663",
+    "source": {
+      "byte_end": 16805,
+      "byte_start": 16780,
+      "column": 9,
+      "column_end": 34,
+      "column_start": 9,
+      "file": "crates/carrick-runtime/src/wedge_capture.rs",
+      "line": 455,
+      "line_end": 455,
+      "line_start": 455
     }
   },
   {
@@ -14572,18 +14680,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:174 in `arm`, `std::thread::sleep` acts only on the current carrier deadlock-watchdog thread used by `arm`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/deadlock_watchdog.rs:120 in `arm`, `std::thread::sleep` acts only on the current carrier deadlock-watchdog thread used by `arm`; no guest identity selects its host target.",
     "review_id": "HA-000604",
     "source": {
-      "byte_end": 6688,
-      "byte_start": 6670,
+      "byte_end": 5018,
+      "byte_start": 5000,
       "column": 17,
       "column_end": 35,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
-      "line": 174,
-      "line_end": 174,
-      "line_start": 174
+      "line": 120,
+      "line_end": 120,
+      "line_start": 120
     }
   },
   {
@@ -14827,6 +14935,60 @@
       "line": 444,
       "line_end": 444,
       "line_start": 444
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-SLEEP",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "the capture step poll cadence bounding one debugger invocation in `LldbCaptureRunner`"
+    },
+    "expansion": null,
+    "operation": "std::thread::sleep",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/wedge_capture.rs:427, `std::thread::sleep` paces only the capture step poll that bounds one debugger invocation; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000661",
+    "source": {
+      "byte_end": 15641,
+      "byte_start": 15623,
+      "column": 13,
+      "column_end": 31,
+      "column_start": 13,
+      "file": "crates/carrick-runtime/src/wedge_capture.rs",
+      "line": 427,
+      "line_end": 427,
+      "line_start": 427
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-SLEEP",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "the reaper grace that lets the named wedge failure reach the log first"
+    },
+    "expansion": null,
+    "operation": "std::thread::sleep",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/wedge_capture.rs:458, `std::thread::sleep` waits only the reaper grace that lets the named failure reach the log; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000664",
+    "source": {
+      "byte_end": 16924,
+      "byte_start": 16906,
+      "column": 17,
+      "column_end": 35,
+      "column_start": 17,
+      "file": "crates/carrick-runtime/src/wedge_capture.rs",
+      "line": 458,
+      "line_end": 458,
+      "line_start": 458
     }
   },
   {
@@ -15421,18 +15583,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/runtime.rs:1171 in `run_combined_syscall_loop_with_dispatcher`, `std::thread::yield_now` acts only on the current carrier runtime helper used by `run_combined_syscall_loop_with_dispatcher`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/runtime.rs:1174 in `run_combined_syscall_loop_with_dispatcher`, `std::thread::yield_now` acts only on the current carrier runtime helper used by `run_combined_syscall_loop_with_dispatcher`; no guest identity selects its host target.",
     "review_id": "HA-000637",
     "source": {
-      "byte_end": 48161,
-      "byte_start": 48139,
+      "byte_end": 48444,
+      "byte_start": 48422,
       "column": 17,
       "column_end": 39,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 1171,
-      "line_end": 1171,
-      "line_start": 1171
+      "line": 1174,
+      "line_end": 1174,
+      "line_start": 1174
     }
   },
   {
