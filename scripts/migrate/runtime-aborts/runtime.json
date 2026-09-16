@@ -2251,6 +2251,28 @@
       "rationale": "Duplicate continuation token in active registration table indicates corrupted continuation lifecycle state or stolen wait token.",
       "sink": "fatal",
       "domain": "vcpu_loop::continuation_registry"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mm_quiesce.rs",
+      "function": "<ExactMmStage1Scope as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "b388e60e6c4ea862591f376091a9bfc282092c212c16ce3c8bdb78d892aadb0e",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::exact_mm_stage1_scope",
+      "rationale": "ExactMmStage1Scope stack underflow on drop; indicates unbalanced thread-local stage-1 scope entry and exit.",
+      "sink": "fatal",
+      "domain": "vcpu_loop::exact_mm_stage1_scope"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mm_quiesce.rs",
+      "function": "<ExactMmStage1Scope as Drop>::drop",
+      "ordinal_in_function": 2,
+      "fingerprint": "b388e60e6c4ea862591f376091a9bfc282092c212c16ce3c8bdb78d892aadb0e",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::exact_mm_stage1_scope",
+      "rationale": "ExactMmStage1Scope mismatched MM ID or lease pointer on drop; indicates out-of-order stage-1 scope nesting or corrupted thread-local stack.",
+      "sink": "fatal",
+      "domain": "vcpu_loop::exact_mm_stage1_scope"
     }
   ]
 }
