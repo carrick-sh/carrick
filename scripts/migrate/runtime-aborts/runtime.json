@@ -1099,7 +1099,7 @@
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
       "function": "ProcessContext::wait_result",
       "ordinal_in_function": 1,
-      "fingerprint": "763a2d06173c275d23fb144cca5cd196e4fb2d8da08f233855d8fb92db6fa25a",
+      "fingerprint": "868967b9d72efa148b88640b7739c0793b1296ba1260076831d5be346a064819",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::wait_identity",
       "rationale": "An exited child carried a namespace PID outside the Linux wait ABI range; continuing would return a status for an unrepresentable or aliased child identity.",

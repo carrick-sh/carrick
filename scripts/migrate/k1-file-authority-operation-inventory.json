@@ -25,7 +25,7 @@
     "description_backing": 7,
     "epoll": 39,
     "stream": 19,
-    "mapping": 87,
+    "mapping": 88,
     "lifecycle": 9
   },
   "entries": [
@@ -12000,16 +12000,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 1657,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// mapping collapsed it into the neighbouring EPERM cases.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3712,
+      "line": 3606,
       "categories": [
         "mapping"
       ],
@@ -12018,7 +12009,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3720,
+      "line": 3614,
       "categories": [
         "mapping"
       ],
@@ -12027,7 +12018,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3736,
+      "line": 3630,
       "categories": [
         "mapping"
       ],
@@ -12036,7 +12027,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3749,
+      "line": 3643,
       "categories": [
         "mapping"
       ],
@@ -15814,6 +15805,15 @@
       ],
       "text": "region: crate::dispatch::ioring::IoUringRegion::Sqes,",
       "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/process_lifecycle.rs",
+      "line": 125,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// mapping collapsed it into the neighbouring EPERM cases.",
+      "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/kernel/snapshot.rs",
