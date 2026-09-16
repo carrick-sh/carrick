@@ -1348,7 +1348,9 @@ impl<'a> FsView<'a> {
             || Some(std::borrow::Cow::Owned(context.task().uts_ns().nodename()));
         let open_fds_provider = || Some(std::borrow::Cow::Owned(self.open_fd_numbers()));
         let network_provider = || Some(std::borrow::Cow::Borrowed(&self.network.spec));
-        let network_model_provider = || Some(context.task().net_ns().view().as_ref().clone());
+        let network_model_provider = || {
+            Some(Arc::clone(&*context.task().net_ns().view()) as Arc<dyn crate::vfs::FsNetworkView>)
+        };
         let groups_provider = || Some(std::borrow::Cow::Owned(self.current_groups()));
         let signals_provider = || {
             let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks(context);
@@ -1370,7 +1372,8 @@ impl<'a> FsView<'a> {
                 )
             })
         };
-        let creds_ns_provider = || Some(context.task().creds_ns());
+        let creds_ns_provider =
+            || Some(Arc::new(context.task().creds_ns()) as Arc<dyn crate::vfs::FsCaller>);
         let processes_provider = || {
             Self::synthetic_proc_processes(context, self.hvpatch_process().as_ref())
                 .map(std::borrow::Cow::Owned)

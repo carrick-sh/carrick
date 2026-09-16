@@ -600,6 +600,7 @@ impl Eq for VfsHandle {}
 /// the dispatcher's internal struct.
 use std::borrow::Cow;
 use std::cell::OnceCell;
+use std::sync::Arc;
 
 pub enum LazyProvider<'a, T> {
     Ref(&'a (dyn Fn() -> T + 'a)),
@@ -696,6 +697,55 @@ pub struct OpenContextMemorySnapshot<'a> {
     pub heap_base: u64,
 }
 
+/// What a mount may learn about the task opening a path beyond the plain ids
+/// already on `OpenContext`: its user-namespace id maps and its capability
+/// sets. The kernel's credential snapshot implements this and the dispatcher
+/// hands one to `OpenContext::creds_ns`; the VFS never names the kernel type.
+/// The method set is exactly what the synthetic `/proc` renderer reads:
+/// `/proc/self/{uid_map,gid_map,setgroups}` and the `Cap*` lines of
+/// `/proc/self/status`.
+pub trait FsCaller {
+    /// `/proc/self/uid_map` text (user_namespaces(7)).
+    fn uid_map_text(&self) -> String;
+    /// `/proc/self/gid_map` text, same layout as `uid_map_text`.
+    fn gid_map_text(&self) -> String;
+    /// `/proc/self/setgroups` text: `allow\n` or `deny\n`.
+    fn setgroups_text(&self) -> &'static str;
+    /// The five `Cap*` lines of `/proc/self/status`, in the kernel's order and
+    /// format.
+    fn caps_status_lines(&self) -> String;
+}
+
+/// What a mount may learn about the network namespace of the task opening a
+/// path. The kernel's network-namespace model implements this and the
+/// dispatcher hands the task's current snapshot to `OpenContext::network_model`;
+/// the VFS never names the kernel type. The method set is exactly what the
+/// synthetic `/proc/net/*` renderer reads.
+pub trait FsNetworkView {
+    /// `/proc/net/dev`: the two header lines, then one all-zero-counter row per
+    /// link.
+    fn render_proc_net_dev(&self) -> Vec<u8>;
+    /// `/proc/net/route`: the header, then one row per IPv4 route.
+    fn render_proc_net_route(&self) -> Vec<u8>;
+    /// Every link the namespace advertises and which address families it
+    /// carries — what the presence-only surfaces (`/proc/net/if_inet6`,
+    /// `dev_mcast`, `igmp`, `igmp6`) read.
+    fn interfaces(&self) -> Vec<FsNetworkInterface>;
+}
+
+/// One entry of [`FsNetworkView::interfaces`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsNetworkInterface {
+    /// The link's interface index (`ifi_index`).
+    pub index: u32,
+    /// The link's guest-visible name (`lo`, `eth0`).
+    pub name: String,
+    /// Whether the link carries an IPv4 address.
+    pub has_ipv4: bool,
+    /// Whether the link carries an IPv6 address.
+    pub has_ipv6: bool,
+}
+
 /// Live dispatcher state that some VFS mounts need at `open` time
 /// (e.g. `/proc/self/maps` reflecting the loaded address space).
 /// Threading this through `Vfs::open` keeps the trait independent of
@@ -722,11 +772,11 @@ pub struct OpenContext<'a> {
     pub environ: LazyField<'a, Option<Cow<'a, [Vec<u8>]>>>,
     pub open_fds: LazyField<'a, Option<Cow<'a, [i32]>>>,
     pub network: LazyField<'a, Option<Cow<'a, carrick_spec::NetworkNamespaceSpec>>>,
-    pub(crate) network_model: LazyField<'a, Option<crate::network::model::LinuxNetworkModel>>,
+    pub(crate) network_model: LazyField<'a, Option<Arc<dyn FsNetworkView>>>,
     pub groups: LazyField<'a, Option<Cow<'a, [NsGid]>>>,
     pub signals: LazyField<'a, (u64, u64, u64)>,
     pub oom_score_adj: LazyField<'a, Option<Cow<'a, std::collections::BTreeMap<u32, i32>>>>,
-    pub creds_ns: LazyField<'a, Option<crate::namespace::process::ProcessCredsNs>>,
+    pub creds_ns: LazyField<'a, Option<Arc<dyn FsCaller>>>,
     pub processes: LazyField<'a, Option<Cow<'a, [SyntheticProcProcess]>>>,
     pub threads: LazyField<'a, Option<Cow<'a, [SyntheticProcThread]>>>,
     pub zombies: LazyField<'a, Option<Cow<'a, [SyntheticProcZombie]>>>,
@@ -765,8 +815,8 @@ impl<'a> OpenContext<'a> {
         self.network.get().and_then(|opt| opt.as_deref())
     }
 
-    pub(crate) fn network_model(&self) -> Option<&crate::network::model::LinuxNetworkModel> {
-        self.network_model.get().and_then(|opt| opt.as_ref())
+    pub(crate) fn network_model(&self) -> Option<&dyn FsNetworkView> {
+        self.network_model.get().and_then(|opt| opt.as_deref())
     }
 
     pub fn groups(&self) -> Option<&[NsGid]> {
@@ -789,8 +839,8 @@ impl<'a> OpenContext<'a> {
         self.oom_score_adj.get().and_then(|opt| opt.as_deref())
     }
 
-    pub fn creds_ns(&self) -> Option<&crate::namespace::process::ProcessCredsNs> {
-        self.creds_ns.get().and_then(|opt| opt.as_ref())
+    pub fn creds_ns(&self) -> Option<&dyn FsCaller> {
+        self.creds_ns.get().and_then(|opt| opt.as_deref())
     }
 
     pub fn processes(&self) -> Option<&[SyntheticProcProcess]> {
@@ -881,11 +931,17 @@ impl<'a> From<&'a SyntheticProcContext> for OpenContext<'a> {
             environ: LazyField::from_value(Some(Cow::Borrowed(&ctx.environ))),
             open_fds: LazyField::from_value(Some(Cow::Borrowed(&ctx.open_fds))),
             network: LazyField::from_value(Some(Cow::Borrowed(&ctx.network))),
-            network_model: LazyField::from_value(ctx.network_model.clone()),
+            network_model: LazyField::from_value(
+                ctx.network_model
+                    .clone()
+                    .map(|model| Arc::new(model) as Arc<dyn FsNetworkView>),
+            ),
             groups: LazyField::from_value(Some(Cow::Borrowed(&ctx.groups))),
             signals: LazyField::from_value((ctx.sig_ignored, ctx.sig_caught, ctx.sig_shdpnd)),
             oom_score_adj: LazyField::from_value(Some(Cow::Borrowed(&ctx.oom_score_adj))),
-            creds_ns: LazyField::from_value(Some(ctx.creds_ns.clone())),
+            creds_ns: LazyField::from_value(Some(
+                Arc::new(ctx.creds_ns.clone()) as Arc<dyn FsCaller>
+            )),
             processes: LazyField::from_value(ctx.processes.as_deref().map(Cow::Borrowed)),
             threads: LazyField::from_value(ctx.threads.as_deref().map(Cow::Borrowed)),
             zombies: LazyField::from_value(ctx.zombies.as_deref().map(Cow::Borrowed)),

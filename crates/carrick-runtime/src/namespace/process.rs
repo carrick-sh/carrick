@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::user::UserNs;
 use super::{FIRST_DYNAMIC_NS, NsId};
+use crate::vfs::FsCaller;
 
 /// The Docker default bounded capability set, observed on
 /// `docker run debian:stable` (design §1.2, §4.4). carrick reports this in
@@ -209,6 +210,26 @@ impl Default for ProcessCredsNs {
             caps: CapabilitySet::docker_default(),
             user: UserNs::initial(super::INITIAL_USER_NS),
         }
+    }
+}
+
+/// The `/proc` view of this snapshot, handed to the VFS through
+/// `OpenContext::creds_ns` so the filesystem layer never names this type.
+impl FsCaller for ProcessCredsNs {
+    fn uid_map_text(&self) -> String {
+        self.user.uid_map_text()
+    }
+
+    fn gid_map_text(&self) -> String {
+        self.user.gid_map_text()
+    }
+
+    fn setgroups_text(&self) -> &'static str {
+        self.user.setgroups_text()
+    }
+
+    fn caps_status_lines(&self) -> String {
+        self.caps.status_lines()
     }
 }
 
