@@ -710,7 +710,11 @@ pub(crate) use proctitle::carrier_proc_label;
 pub use proctitle::{init as proctitle_init, set_carrier_process_title, set_host_process_name};
 
 pub use abi_args::{Fd, GuestLen, GuestPtr, HostFd, HostPid, NsPid, Pid, Signal};
-pub use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
+// Imported at the dispatch root so the submodules can name them bare, as
+// they did when the types lived in `crate::vfs`. `pub(crate)`, not `pub`:
+// carrick-runtime must not re-export a carrick-vfs type on its own public
+// surface -- a consumer names `carrick_vfs::ProcMapsEntry` directly.
+pub(crate) use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 use fd_table::*;
 
 pub mod wait_authority;

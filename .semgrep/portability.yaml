@@ -12,6 +12,10 @@ rules:
     paths:
       include:
         - crates/carrick-runtime/
+        # The filesystem model left carrick-runtime for carrick-vfs and took
+        # the densest `libc::` surface in the tree (fs_backend/host.rs) with
+        # it; the rule follows the code, not the crate it used to live in.
+        - crates/carrick-vfs/
       exclude:
         - crates/carrick-portable/
     patterns:

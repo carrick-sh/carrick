@@ -41,6 +41,12 @@ pub mod pathcodec;
 pub mod rootfs;
 pub mod vfs;
 
+// NOTE: this glob does NOT make `carrick_vfs::rootfs` mean `vfs::rootfs`.
+// An explicit item beats a glob import, so `carrick_vfs::rootfs` is the OCI
+// root filesystem above (`src/rootfs.rs`) and the `/` MOUNT that wraps it is
+// `carrick_vfs::vfs::rootfs` (`RootFsVfs`, `OpenDispatchResult`,
+// `RenameOutcome`). Rust resolves that silently, so spell the mount module in
+// full at every call site.
 pub use vfs::*;
 
 // The USDT probe provider is platform-neutral and lives in
