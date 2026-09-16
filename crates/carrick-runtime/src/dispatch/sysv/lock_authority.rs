@@ -159,7 +159,8 @@ impl<'a> SysvProcessGuard<'a> {
         let Some(segment) = paired.state.segments.get(&shmid) else {
             return Err(crate::linux_abi::LINUX_EINVAL);
         };
-        let Some(aligned_len) = align_up_u64(segment.size as u64, crate::trap::HVF_PAGE_SIZE)
+        let Some(aligned_len) =
+            align_up_u64(segment.size as u64, carrick_guest_mem::HOST_PAGE_GRANULE)
         else {
             return Err(crate::linux_abi::LINUX_ENOMEM);
         };

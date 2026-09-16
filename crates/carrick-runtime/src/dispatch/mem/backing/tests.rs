@@ -597,7 +597,7 @@ fn mmap_private_hostfile_hatch_zero_keeps_snapshot_path() {
 fn private_repoint_failure_preserves_prior_overlay_owner_and_vma() {
     const SYS_MMAP: u64 = 222;
     const LENGTH: u64 = 4096;
-    const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+    const MAPPED_LENGTH: usize = carrick_guest_mem::HOST_PAGE_GRANULE as usize;
 
     let dispatcher = SyscallDispatcher::new();
     let registry =
@@ -688,16 +688,16 @@ fn private_repoint_failure_preserves_prior_overlay_owner_and_vma() {
     let reused = mem
         .overlay
         .alloc(
-            crate::trap::HVF_PAGE_SIZE,
+            carrick_guest_mem::HOST_PAGE_GRANULE,
             crate::shared_aperture::BackingObject::PrivateAnon,
         )
         .expect("clean failure candidate is reusable");
-    assert_eq!(reused, prior_overlay + crate::trap::HVF_PAGE_SIZE);
+    assert_eq!(reused, prior_overlay + carrick_guest_mem::HOST_PAGE_GRANULE);
 }
 
 #[test]
 fn indeterminate_repoint_policy_retains_old_and_candidate_storage() {
-    const GRANULE: u64 = crate::trap::HVF_PAGE_SIZE;
+    const GRANULE: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
     let dispatcher = SyscallDispatcher::new();
     let source = crate::memory::LINUX_SHARED_FILE_BASE;
     let (old, candidate) = {
@@ -748,7 +748,7 @@ fn indeterminate_repoint_policy_retains_old_and_candidate_storage() {
 fn assert_shared_owner_survives_partial_private_replacement(replace_offset: u64) {
     const SYS_MMAP: u64 = 222;
     const SYS_MUNMAP: u64 = 215;
-    const GRANULE: u64 = crate::trap::HVF_PAGE_SIZE;
+    const GRANULE: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
     const LENGTH: u64 = 3 * GRANULE;
 
     let dispatcher = SyscallDispatcher::new();
@@ -922,12 +922,14 @@ fn shared_owner_prefix_replacement_then_unmap_reuses_only_prefix() {
 
 #[test]
 fn shared_owner_middle_replacement_then_unmap_reuses_only_middle() {
-    assert_shared_owner_survives_partial_private_replacement(crate::trap::HVF_PAGE_SIZE);
+    assert_shared_owner_survives_partial_private_replacement(carrick_guest_mem::HOST_PAGE_GRANULE);
 }
 
 #[test]
 fn shared_owner_suffix_replacement_then_unmap_reuses_only_suffix() {
-    assert_shared_owner_survives_partial_private_replacement(2 * crate::trap::HVF_PAGE_SIZE);
+    assert_shared_owner_survives_partial_private_replacement(
+        2 * carrick_guest_mem::HOST_PAGE_GRANULE,
+    );
 }
 
 #[test]
@@ -935,7 +937,7 @@ fn partial_shared_file_munmaps_write_exact_fragments_and_close_once() {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     const SYS_MUNMAP: u64 = 215;
-    const GRANULE: u64 = crate::trap::HVF_PAGE_SIZE;
+    const GRANULE: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
     const LENGTH: u64 = 3 * GRANULE;
 
     let dispatcher = SyscallDispatcher::new();
@@ -1032,7 +1034,7 @@ fn clean_private_repoint_failure_does_not_commit_shared_file_writeback() {
 
     const SYS_MMAP: u64 = 222;
     const SYS_MUNMAP: u64 = 215;
-    const LENGTH: u64 = crate::trap::HVF_PAGE_SIZE;
+    const LENGTH: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
 
     let dispatcher = SyscallDispatcher::new();
     let registry =
@@ -1118,7 +1120,7 @@ fn clean_private_repoint_failure_does_not_commit_shared_file_writeback() {
 #[test]
 fn exact_partial_granule_replacement_splits_owner_without_reusing_live_storage() {
     const SYS_MMAP: u64 = 222;
-    const LENGTH: u64 = 2 * crate::trap::HVF_PAGE_SIZE;
+    const LENGTH: u64 = 2 * carrick_guest_mem::HOST_PAGE_GRANULE;
     const PARTIAL: u64 = LINUX_PAGE_SIZE;
 
     let dispatcher = SyscallDispatcher::new();
@@ -1204,11 +1206,11 @@ fn exact_partial_granule_replacement_splits_owner_without_reusing_live_storage()
     let fresh = mem
         .overlay
         .alloc(
-            crate::trap::HVF_PAGE_SIZE,
+            carrick_guest_mem::HOST_PAGE_GRANULE,
             crate::shared_aperture::BackingObject::PrivateAnon,
         )
         .expect("partial physical hole is not independently reusable");
-    assert!(fresh >= replacement + crate::trap::HVF_PAGE_SIZE);
+    assert!(fresh >= replacement + carrick_guest_mem::HOST_PAGE_GRANULE);
 }
 
 #[test]

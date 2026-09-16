@@ -258,7 +258,7 @@ pub use carrick_hal::aarch64::{
 use carrick_hal::trap::{HostAliasBacking, HostAliasSharing};
 pub use carrick_hal::trap::{RawSyscall, SyscallTrap, TrapError};
 
-pub const HVF_PAGE_SIZE: u64 = 0x4000;
+pub const HVF_PAGE_SIZE: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
 // Guest stage-1 uses a 4 KiB granule even though HVF maps stage-2 in 16 KiB
 // chunks. Syscall memory copies must reselect the backing at this boundary.
 const GUEST_STAGE1_PAGE_SIZE: u64 = 0x1000;

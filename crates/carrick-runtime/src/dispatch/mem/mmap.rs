@@ -805,7 +805,7 @@ impl<'a> MemView<'a> {
                 return Ok(DispatchOutcome::returned_ptr(requested)?);
             }
 
-            let hvf_page = crate::trap::HVF_PAGE_SIZE;
+            let hvf_page = carrick_guest_mem::HOST_PAGE_GRANULE;
             // Guest MAP_SHARED of a file: back the guest region with the host
             // file's page cache LIVE, via an aliased stage-2 mapping at a fresh
             // high VA. `mmap(MAP_SHARED, fd)` on the host means guest writes hit
