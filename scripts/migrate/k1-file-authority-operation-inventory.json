@@ -11959,7 +11959,7 @@
       "categories": [
         "mapping"
       ],
-      "text": "//!   mapping on macOS (via `carrick_vmm_hvf`), the identity function on Linux (the",
+      "text": "//!   bridge the product bootstrap installed: the Darwin signal-number mapping",
       "scope_kind": "production_callsite"
     },
     {
@@ -14880,7 +14880,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/netns.rs",
-      "line": 97,
+      "line": 114,
       "categories": [
         "mapping"
       ],
@@ -17437,7 +17437,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/run_state.rs",
-      "line": 141,
+      "line": 159,
       "categories": [
         "mapping"
       ],
@@ -17455,7 +17455,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 1350,
+      "line": 1333,
       "categories": [
         "mapping"
       ],
@@ -17464,7 +17464,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 1355,
+      "line": 1338,
       "categories": [
         "mapping"
       ],
@@ -17473,7 +17473,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 3088,
+      "line": 3036,
       "categories": [
         "mapping"
       ],
@@ -17482,7 +17482,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 3350,
+      "line": 3298,
       "categories": [
         "stream"
       ],
