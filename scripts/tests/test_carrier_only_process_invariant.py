@@ -122,7 +122,7 @@ class CarrierOnlyProcessInvariantTest(unittest.TestCase):
 
     def test_every_workspace_library_source_defaults_to_product_scope(self):
         for path in (
-            "crates/carrick-kernel/src/lib.rs",
+            "crates/carrick-kernel-arena/src/lib.rs",
             "crates/carrick-image/src/lib.rs",
             "crates/carrick-portable/src/lib.rs",
         ):

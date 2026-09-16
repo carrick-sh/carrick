@@ -26,7 +26,7 @@ impl super::core::TaskExitSubscriber for CountingExitSubscriber {
 
 #[test]
 fn two_container_roots_share_one_kernel_graph() {
-    use carrick_kernel::arena::KernelArena;
+    use carrick_kernel_arena::arena::KernelArena;
 
     use super::{
         ClonePlan, Container, KernelFailpoint, LaunchContext, LinuxWaitStatus, RunId, WaitMode,
@@ -272,7 +272,7 @@ fn container_root_publication_is_all_or_nothing_for_concurrent_readers() {
     use std::sync::{Barrier, mpsc};
     use std::time::Duration;
 
-    use carrick_kernel::arena::KernelArena;
+    use carrick_kernel_arena::arena::KernelArena;
 
     use super::{Container, LaunchContext, RunId};
     use crate::namespace::pid::NsSharedRegion;
@@ -380,7 +380,7 @@ fn container_root_publication_is_all_or_nothing_for_concurrent_readers() {
 fn failed_pid_membership_commit_rolls_back_every_staged_root_edge() {
     use std::sync::Barrier;
 
-    use carrick_kernel::arena::KernelArena;
+    use carrick_kernel_arena::arena::KernelArena;
 
     use super::{Container, LaunchContext, RunId};
     use crate::namespace::pid::NsSharedRegion;
@@ -482,7 +482,7 @@ fn failed_pid_membership_commit_rolls_back_every_staged_root_edge() {
 #[test]
 fn same_visible_process_group_is_selected_only_inside_its_container() {
     use carrick_abi::LinuxCloneFlags;
-    use carrick_kernel::arena::KernelArena;
+    use carrick_kernel_arena::arena::KernelArena;
 
     use super::{ClonePlan, Container, LaunchContext, LinuxSignal, RunId};
     use crate::kernel::ExactSignalTargetAuthorization;
@@ -583,7 +583,7 @@ fn same_visible_process_group_is_selected_only_inside_its_container() {
 #[test]
 fn fork_and_thread_clone_allocate_namespace_local_identity() {
     use carrick_abi::LinuxCloneFlags;
-    use carrick_kernel::arena::KernelArena;
+    use carrick_kernel_arena::arena::KernelArena;
 
     use super::{
         ClonePlan, Container, LaunchContext, LinuxTid, LinuxWaitStatus, RunId, WaitMode,
@@ -710,7 +710,7 @@ fn fork_and_thread_clone_allocate_namespace_local_identity() {
 
 #[test]
 fn failed_container_root_preparation_publishes_no_identity_or_epoch() {
-    use carrick_kernel::arena::KernelArena;
+    use carrick_kernel_arena::arena::KernelArena;
 
     use super::{Container, KernelFailpoint, LaunchContext, RunId};
     use crate::namespace::pid::{NS_INIT_PID, NsSharedRegion};
@@ -750,7 +750,7 @@ fn failed_container_root_preparation_publishes_no_identity_or_epoch() {
 #[test]
 fn container_retirement_uses_task_exit_settlement_before_reaping() {
     use carrick_abi::LinuxCloneFlags;
-    use carrick_kernel::arena::KernelArena;
+    use carrick_kernel_arena::arena::KernelArena;
 
     use super::{
         ClonePlan, Container, KernelFailpoint, LaunchContext, LinuxWaitStatus, RunId,
@@ -867,7 +867,7 @@ fn container_retirement_uses_task_exit_settlement_before_reaping() {
 #[test]
 fn retirement_reused_tid_cannot_alias_a_surviving_stale_thread_ref() {
     use carrick_abi::LinuxCloneFlags;
-    use carrick_kernel::arena::KernelArena;
+    use carrick_kernel_arena::arena::KernelArena;
 
     use super::{ClonePlan, Container, LaunchContext, RunId};
     use crate::namespace::pid::NsSharedRegion;

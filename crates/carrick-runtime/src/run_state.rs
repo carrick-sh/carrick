@@ -42,9 +42,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use carrick_kernel::arena::{ArenaError, KernelArena};
-use carrick_kernel::domains::{HostPid, ProcessGeneration};
-use carrick_kernel::process::{
+use carrick_kernel_arena::arena::{ArenaError, KernelArena};
+use carrick_kernel_arena::domains::{HostPid, ProcessGeneration};
+use carrick_kernel_arena::process::{
     ProcessRecord, ProcessRecordRef, ProcessRecordTransitionAction, ProcessRecordTransitionError,
     ProcessSection,
 };
@@ -439,10 +439,10 @@ fn find_record(section: &ProcessSection, id: u32, want_tid: bool) -> Option<Proc
 /// Stamp whose lifetime owns this record, so any arena reader — including a
 /// transitional `carrick exec` joiner in another host process — can tell that
 /// its `host_pid` is a guest pid and host liveness says nothing about it.
-fn mark_owner_domain(record: &carrick_kernel::process::ProcessRecord) {
+fn mark_owner_domain(record: &carrick_kernel_arena::process::ProcessRecord) {
     if crate::dispatch::hvpatch_lane_active() {
         record.flags.fetch_or(
-            carrick_kernel::process::FLAG_OWNER_GUEST_TASK,
+            carrick_kernel_arena::process::FLAG_OWNER_GUEST_TASK,
             Ordering::AcqRel,
         );
     }
@@ -1130,7 +1130,7 @@ mod tests {
     fn claim_record_returns_exhausted_error_when_arena_full() {
         let arena = Box::leak(Box::new(KernelArena::create().expect("test kernel arena")));
         let section = &arena.layout().processes;
-        for i in 0..carrick_kernel::process::PROCESS_RECORDS {
+        for i in 0..carrick_kernel_arena::process::PROCESS_RECORDS {
             let generation = arena.allocate_generation();
             let _ = section.claim(Some(HostPid::new(100_000 + i as u32)), generation, |_| {});
         }
@@ -1139,7 +1139,7 @@ mod tests {
         match err {
             ArenaError::Exhausted { section, capacity } => {
                 assert_eq!(section, "processes");
-                assert_eq!(capacity, carrick_kernel::process::PROCESS_RECORDS);
+                assert_eq!(capacity, carrick_kernel_arena::process::PROCESS_RECORDS);
             }
         }
     }

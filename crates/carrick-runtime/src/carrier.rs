@@ -2068,7 +2068,7 @@ mod tests {
         let live_bindings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let failed_container = Arc::new(Container::new(launch("failed-later")));
         let arena = Box::leak(Box::new(
-            carrick_kernel::arena::KernelArena::create().expect("kernel arena"),
+            carrick_kernel_arena::arena::KernelArena::create().expect("kernel arena"),
         ));
         failed_container
             .install_pid_ns(

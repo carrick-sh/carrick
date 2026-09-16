@@ -34,7 +34,7 @@ Platform code is selected by Cargo features. The default feature is
 | --- | --- |
 | `carrick-abi` | Linux ABI constants and wire structs, with compile-time layout/constant assertions. |
 | `carrick-guest-mem` | Guest-memory trait, memory error type, and syscall-frame hub types shared by handlers and VMM engines. |
-| `carrick-kernel` | Kernel-graph foundations: carrier/container objects, arenas, typed process/task/thread/mm identity, lifecycle transactions, and shared registries. |
+| `carrick-kernel-arena` | The per-run kernel arena: a file-backed `MAP_SHARED` region holding the Linux-visible cross-process delta (identity, leases, shared kernel objects) the host kernel cannot express, with no authority daemon -- processes operate on it via atomics and robust bucket locks. |
 | `carrick-mem` | Guest address-space construction: ELF layout, page tables, trampolines, VDSO/vvar, region helpers. |
 | `carrick-hal` | OS/VMM-neutral traits and shared types: trap contract, hypervisor traits, guest-arch tables, event/futex/threaded-loop/signal/timer surfaces. |
 | `carrick-thread` | Thread registry, private-futex park table, and fork/page-table quiesce barriers. |

@@ -85,7 +85,7 @@ carrick-host-linux = { path = "../carrick-host-linux", optional = true }
 # x86_64-only and live in arch-scoped target tables below.
 carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-host = { path = "../carrick-host" }
-carrick-kernel = { path = "../carrick-kernel" }
+carrick-kernel-arena = { path = "../carrick-kernel-arena" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-observability = { path = "../carrick-observability" }
 carrick-signal-core = { path = "../carrick-signal-core" }

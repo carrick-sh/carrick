@@ -11,27 +11,27 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-kernel/src/arena.rs",
+      "file": "crates/carrick-kernel-arena/src/arena.rs",
       "symbol": "ARENA_FILE_COUNTER",
       "fingerprint": "acc33a042ab56c6664a0163e2f758900ce24f0f25411c6d9911740f2dedb09c1",
       "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator ARENA_FILE_COUNTER in crates/carrick-kernel/src/arena.rs generating unique IDs across the host process."
+      "rationale": "Carrier-wide monotonic allocator ARENA_FILE_COUNTER in crates/carrick-kernel-arena/src/arena.rs generating unique IDs across the host process."
     },
     {
       "kind": "static",
-      "file": "crates/carrick-kernel/src/arena.rs",
+      "file": "crates/carrick-kernel-arena/src/arena.rs",
       "symbol": "GLOBAL",
       "fingerprint": "0dd68b92fa2f7a9cec64a6b68b53aa30f014a78d272e613e12c544362950bc99",
       "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static GLOBAL in crates/carrick-kernel/src/arena.rs maintaining host process lifecycle or VM resources."
+      "rationale": "Carrier-wide host infrastructure static GLOBAL in crates/carrick-kernel-arena/src/arena.rs maintaining host process lifecycle or VM resources."
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-kernel/src/process.rs",
+      "file": "crates/carrick-kernel-arena/src/process.rs",
       "symbol": "release_claimed::CARRICK_RUNSTATE_DEBUG",
       "fingerprint": "79a6006c8e3006cf39645157a139b2df108aa84b7cc2646b9e644374db87e73a",
       "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_RUNSTATE_DEBUG read in release_claimed::CARRICK_RUNSTATE_DEBUG (crates/carrick-kernel/src/process.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable CARRICK_RUNSTATE_DEBUG read in release_claimed::CARRICK_RUNSTATE_DEBUG (crates/carrick-kernel-arena/src/process.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",

@@ -3617,7 +3617,7 @@ mod tests {
     #[test]
     fn kernel_group_signal_finds_surviving_members_after_leader_reap() {
         use carrick_abi::LinuxCloneFlags;
-        use carrick_kernel::arena::KernelArena;
+        use carrick_kernel_arena::arena::KernelArena;
 
         let arena = Box::leak(Box::new(KernelArena::create().expect("test kernel arena")));
         let container = Arc::new(crate::kernel::Container::new(
@@ -3803,7 +3803,7 @@ mod tests {
     fn generated_thread_signal_reports_the_exact_container_visible_sender_pid() {
         use std::sync::Arc;
 
-        use carrick_kernel::arena::KernelArena;
+        use carrick_kernel_arena::arena::KernelArena;
 
         use crate::kernel::{Container, Kernel, LaunchContext, RootBootstrap, RunId};
         use crate::namespace::pid::NsSharedRegion;

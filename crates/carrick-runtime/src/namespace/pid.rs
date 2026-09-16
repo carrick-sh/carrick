@@ -3,7 +3,7 @@
 //!
 //! One record table serves every container in the carrier; each PID namespace
 //! owns one [`NsSharedRegion`], which claims a numbering slot in the arena
-//! (`carrick_kernel::pidns`) and tags its member records with its namespace
+//! (`carrick_kernel_arena::pidns`) and tags its member records with its namespace
 //! id. There is no process-global region: a task reaches its namespace through
 //! its `Container` (`Task::pid_ns_region`), the free functions below resolve
 //! the CALLING task's region from the active dispatch context, and callers
@@ -19,15 +19,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use carrick_fatal::carrick_fatal;
-use carrick_kernel::arena::{ArenaError, KernelArena};
-use carrick_kernel::domains::{HostPid, ProcessGeneration};
-use carrick_kernel::pidns::{PID_NAMESPACE_SLOTS, PidNamespaceRef, PidNamespaceSlot};
-use carrick_kernel::process::{
+use carrick_kernel_arena::arena::{ArenaError, KernelArena};
+use carrick_kernel_arena::domains::{HostPid, ProcessGeneration};
+use carrick_kernel_arena::pidns::{PID_NAMESPACE_SLOTS, PidNamespaceRef, PidNamespaceSlot};
+use carrick_kernel_arena::process::{
     FLAG_ALIVE, FLAG_DEAD, FLAG_ORPHANED, PROCESS_RECORDS, ProcessRecord, ProcessRecordRef,
     ProcessRecordTransitionAction, ProcessRecordTransitionError, ProcessSection,
 };
 #[cfg(test)]
-use carrick_kernel::process::{VirtualPtraceControl, VirtualPtraceState};
+use carrick_kernel_arena::process::{VirtualPtraceControl, VirtualPtraceState};
 
 use super::NsId;
 
@@ -1408,7 +1408,7 @@ impl NsSharedRegion {
             // the task leader exits. A live word means alive; a cleared word
             // means gone and the record is reclaimable exactly as before.
             let owner_is_guest_task = record.flags.load(Ordering::Acquire)
-                & carrick_kernel::process::FLAG_OWNER_GUEST_TASK
+                & carrick_kernel_arena::process::FLAG_OWNER_GUEST_TASK
                 != 0;
             if owner_is_guest_task && record.run_state.load(Ordering::Acquire) != 0 {
                 continue;
@@ -1524,9 +1524,10 @@ fn fill_member(record: &ProcessRecord, ns_id: NsId, ns_pid: u32, parent_host_pid
     record.exit_ready.store(0, Ordering::Relaxed);
     record.guest_ns.store(0, Ordering::Relaxed);
     record.subreaper_pid.store(0, Ordering::Relaxed);
-    record
-        .flags
-        .fetch_and(!carrick_kernel::process::FLAG_ADOPTED, Ordering::AcqRel);
+    record.flags.fetch_and(
+        !carrick_kernel_arena::process::FLAG_ADOPTED,
+        Ordering::AcqRel,
+    );
     record.flags.fetch_or(MEMBER_ALIVE, Ordering::AcqRel);
     record.flags.fetch_and(!MEMBER_ORPHANED, Ordering::AcqRel);
     record.flags.fetch_and(!MEMBER_DEAD, Ordering::AcqRel);
@@ -1607,9 +1608,10 @@ mod tests {
             );
             record.exit_ready.store(1, Ordering::Relaxed);
             record.guest_ns.store(123_456, Ordering::Relaxed);
-            record
-                .flags
-                .store(carrick_kernel::process::FLAG_ADOPTED, Ordering::Relaxed);
+            record.flags.store(
+                carrick_kernel_arena::process::FLAG_ADOPTED,
+                Ordering::Relaxed,
+            );
         }) {
             Ok(r) => r,
             Err(err) => unreachable!("claim: {err:?}"),
@@ -1633,7 +1635,7 @@ mod tests {
                 .raw()
         );
         assert_eq!(
-            record.flags.load(Ordering::Acquire) & carrick_kernel::process::FLAG_ADOPTED,
+            record.flags.load(Ordering::Acquire) & carrick_kernel_arena::process::FLAG_ADOPTED,
             0,
             "stale ADOPTED flag must not survive member reuse"
         );
@@ -1727,7 +1729,7 @@ mod tests {
         let claimed = section
             .claim(Some(HostPid::new(pid)), generation, |record| {
                 record.flags.fetch_or(
-                    carrick_kernel::process::FLAG_OWNER_GUEST_TASK,
+                    carrick_kernel_arena::process::FLAG_OWNER_GUEST_TASK,
                     Ordering::Relaxed,
                 );
             })

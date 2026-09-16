@@ -729,7 +729,7 @@ fn run_address_space_with_hvf_and_dispatcher(
     // The carrier owns the kernel arena; this container owns its pid region
     // inside it. Guest fork/clone creates logical Carrick-kernel tasks, never a
     // host namespace-supervisor process.
-    let _ = carrick_kernel::arena::KernelArena::global();
+    let _ = carrick_kernel_arena::arena::KernelArena::global();
     let container = dispatcher.container();
     if lease.launch().container_id != container.id() || !lease.belongs_to(&carrier) {
         return Err(RuntimeError::CarrierFailed(

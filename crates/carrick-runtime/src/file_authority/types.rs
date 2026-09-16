@@ -3,7 +3,7 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use carrick_abi::LinuxEpollEvents;
-use carrick_kernel::domains::{HostPid, ProcessGeneration};
+use carrick_kernel_arena::domains::{HostPid, ProcessGeneration};
 
 pub(crate) use crate::kernel::{FileDescriptionId, FileSlotNumber, FileTableId};
 
