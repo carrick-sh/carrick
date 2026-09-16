@@ -1371,6 +1371,91 @@ fn dir_cache_refuses_a_symlink_that_escapes_the_sandbox() {
     );
 }
 
+/// Regression test for a type-mismatch bug at the `rename_overlay_entries`
+/// xattr-sidecar callsite (`#[cfg(not(target_os = "macos"))]`, symlink
+/// uid/gid/socket metadata riding along with a rename): `namei_leaf` returns
+/// `Option<_>` while `ensure_parent_dirs` returns `Result<_, i32>`, so the
+/// callsite's `if let (Some(_), Some(dp)) = (Option, Result)` could never
+/// match the `Result` arm at all — it never type-checked, and being gated
+/// out on macOS meant nothing here ever compiled it. Both sides are zipped
+/// through `HostFsBackend::zip_sidecar_rename_endpoints` now; this exercises
+/// that function directly, against a real filesystem, for all four
+/// resolution combinations, so a wrong pairing shows up as a wrong
+/// `Some`/`None` rather than only as a missing compile on a platform this
+/// tree cannot build for.
+#[test]
+fn sidecar_rename_endpoints_skip_when_either_side_unresolved() {
+    let outside = tempfile::TempDir::new().unwrap();
+    let scratch_root = tempfile::TempDir::new().unwrap();
+    let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+
+    // A plain file sitting where a destination sidecar's parent directory
+    // would need to be created: `ensure_parent_dirs` must fail (ENOTDIR),
+    // never silently succeed. Placed under `b.root_path`, the backend's
+    // actual (randomly-named) scratch root -- `new_in` nests a fresh
+    // `TempDir` inside the directory passed in, so paths must be joined
+    // against `root_path`, not the outer `scratch_root`.
+    std::fs::write(b.root_path.join("blocker"), b"x").unwrap();
+    // An absolute symlink escaping the sandbox: `namei_leaf` must refuse a
+    // path through it rather than resolve one.
+    std::os::unix::fs::symlink(outside.path(), b.root_path.join("escape")).unwrap();
+
+    assert!(
+        b.namei_leaf(Path::new("anything")).is_some(),
+        "a root-parented leaf must resolve"
+    );
+    assert!(
+        b.ensure_parent_dirs(Path::new("sub/leaf")).is_ok(),
+        "a fresh parent directory must be creatable"
+    );
+    assert!(
+        b.namei_leaf(Path::new("escape/leaf")).is_none(),
+        "a path through an escaping symlink must not resolve"
+    );
+    assert!(
+        b.ensure_parent_dirs(Path::new("blocker/leaf")).is_err(),
+        "a parent blocked by a plain file must not be creatable"
+    );
+
+    // Both sides resolve: the sidecar rename proceeds.
+    assert!(
+        HostFsBackend::zip_sidecar_rename_endpoints(
+            b.namei_leaf(Path::new("anything")),
+            b.ensure_parent_dirs(Path::new("sub2/leaf")),
+        )
+        .is_some(),
+        "a resolved source and a creatable destination parent must pair"
+    );
+    // Source unresolved, destination fine: skip, never panic.
+    assert!(
+        HostFsBackend::zip_sidecar_rename_endpoints(
+            b.namei_leaf(Path::new("escape/leaf")),
+            b.ensure_parent_dirs(Path::new("sub3/leaf")),
+        )
+        .is_none(),
+        "an unresolved source must skip the sidecar rename"
+    );
+    // Source fine, destination parent blocked: skip, never panic (this is
+    // the exact branch the pre-fix code could never even reach).
+    assert!(
+        HostFsBackend::zip_sidecar_rename_endpoints(
+            b.namei_leaf(Path::new("anything")),
+            b.ensure_parent_dirs(Path::new("blocker/leaf")),
+        )
+        .is_none(),
+        "an unresolvable destination parent must skip the sidecar rename, not panic"
+    );
+    // Both sides fail: skip.
+    assert!(
+        HostFsBackend::zip_sidecar_rename_endpoints(
+            b.namei_leaf(Path::new("escape/leaf")),
+            b.ensure_parent_dirs(Path::new("blocker/leaf")),
+        )
+        .is_none(),
+        "two unresolved sides must skip the sidecar rename"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn host_watch_fds_caches_source_fd_for_stable_fifo() {

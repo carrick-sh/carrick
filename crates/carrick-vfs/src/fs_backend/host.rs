@@ -951,6 +951,10 @@ impl std::fmt::Debug for HostFsBackend {
     }
 }
 
+/// A [`HostFsBackend::namei_leaf`] resolution: a containment-proven parent
+/// dirfd and the leaf's NUL-terminated name.
+type NameiLeaf = (std::sync::Arc<std::os::fd::OwnedFd>, std::ffi::CString);
+
 impl HostFsBackend {
     /// Construct a backend rooted at a fresh per-run scratch directory
     /// under `scratch_root` (default `~/.carrick/scratch/<pid>`).
@@ -1484,17 +1488,11 @@ impl HostFsBackend {
     /// call. `None` means "this path is not servable from the cache" (an
     /// intermediate symlink, an escape, a missing parent, a non-UTF-8-safe
     /// name, or the fast path disabled).
-    pub(crate) fn namei_leaf(
-        &self,
-        rel: &Path,
-    ) -> Option<(std::sync::Arc<std::os::fd::OwnedFd>, std::ffi::CString)> {
+    pub(crate) fn namei_leaf(&self, rel: &Path) -> Option<NameiLeaf> {
         self.namei_leaf_res(rel).ok()
     }
 
-    fn namei_leaf_res(
-        &self,
-        rel: &Path,
-    ) -> Result<(std::sync::Arc<std::os::fd::OwnedFd>, std::ffi::CString), i32> {
+    fn namei_leaf_res(&self, rel: &Path) -> Result<NameiLeaf, i32> {
         let name = rel.file_name().ok_or(libc::EINVAL)?;
         let name_c = cstring_from_osstr(name).ok_or(libc::EINVAL)?;
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
@@ -1541,7 +1539,10 @@ impl HostFsBackend {
     /// Ensure all intermediate parent directories for `rel` exist beneath the
     /// contained sandbox root, creating them on demand (similar to `mkdir -p`),
     /// and return the parent directory fd.
-    fn ensure_parent_dirs(&self, rel: &Path) -> Result<std::sync::Arc<std::os::fd::OwnedFd>, i32> {
+    pub(super) fn ensure_parent_dirs(
+        &self,
+        rel: &Path,
+    ) -> Result<std::sync::Arc<std::os::fd::OwnedFd>, i32> {
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
         if parent.as_os_str().is_empty() {
             return self.dir_fd_for(parent);
@@ -1583,6 +1584,30 @@ impl HostFsBackend {
             current = fd;
         }
         Ok(current)
+    }
+
+    /// Zip a [`namei_leaf`](Self::namei_leaf) source lookup with an
+    /// [`ensure_parent_dirs`](Self::ensure_parent_dirs) destination-parent
+    /// creation for a best-effort sidecar rename: `Some` only when the
+    /// source leaf resolves *and* the destination's parent directories
+    /// exist, `None` otherwise. The caller treats `None` as "skip the
+    /// sidecar rename" — it is opportunistic metadata propagation
+    /// alongside a primary rename that has already committed, so a
+    /// resolution failure on either side must never panic or abort the
+    /// primary result. Kept as its own function so the exact
+    /// `Option`/`Result` pairing has a unit test independent of the
+    /// `#[cfg(not(target_os = "macos"))]` call site (see
+    /// `sidecar_rename_endpoints_skip_when_either_side_unresolved` in
+    /// `fs_backend::tests`).
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub(super) fn zip_sidecar_rename_endpoints(
+        src: Option<NameiLeaf>,
+        dst_parent: Result<std::sync::Arc<std::os::fd::OwnedFd>, i32>,
+    ) -> Option<(NameiLeaf, std::sync::Arc<std::os::fd::OwnedFd>)> {
+        match (src, dst_parent) {
+            (Some(s), Ok(d)) => Some((s, d)),
+            _ => None,
+        }
     }
 
     /// Drop every cached dirfd. Used where this process has just changed
@@ -5156,9 +5181,10 @@ impl FsBackend for HostFsBackend {
                     link_xattr_sidecar_rel(src_rel.as_path(), key),
                     link_xattr_sidecar_rel(dst_rel.as_path(), key),
                 ) {
-                    if let (Some((sp, sl)), Some(dp)) =
-                        (self.namei_leaf(&s), self.ensure_parent_dirs(&d))
-                    {
+                    if let Some(((sp, sl), dp)) = Self::zip_sidecar_rename_endpoints(
+                        self.namei_leaf(&s),
+                        self.ensure_parent_dirs(&d),
+                    ) {
                         if let Some(dl) = d.file_name().and_then(cstring_from_osstr) {
                             unsafe {
                                 libc::renameat(
