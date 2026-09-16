@@ -112,6 +112,50 @@ def collect_scan_targets(rows):
     return targets
 
 
+def apply_host_authority_renames(rows, renames):
+    """Rewrite `source.file` on host-authority rows AND rebind the
+    `At <file>:<line>` prefix embedded in `rationale` prose to match.
+
+    `check-host-authority-transitions.py`'s `validate_source_specific_reviews`
+    requires the exact `f"{source.file}:{source.line}"` string to appear
+    inside `rationale`. The generic `apply_renames` (via `collect_scan_targets`)
+    only ever rewrites the nested `source.file` field -- it has no way to see
+    the sibling `rationale` string on the same row -- so a rename left the two
+    fields pointing at different files and broke that binding. This walks the
+    actual row list (not the flattened `collect_scan_targets` view) so both
+    fields on one row are available together, and edits them as a pair.
+    Only the file segment of the prose is corrected here; if the line number
+    also moved, `reconcile_host_authority_positions`'s own
+    `At <file>:<line>` matcher rebinds that once `source.file` already agrees.
+    """
+    pairs = [r.split("=", 1) for r in renames]
+    changed = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        source = row.get("source")
+        if not isinstance(source, dict):
+            continue
+        old_file = source.get("file")
+        if not isinstance(old_file, str):
+            continue
+        new_file = None
+        for old, new in pairs:
+            if old_file.startswith(old):
+                new_file = new + old_file[len(old) :]
+                break
+        if new_file is None or new_file == old_file:
+            continue
+        source["file"] = new_file
+        changed += 1
+        rationale = row.get("rationale")
+        if isinstance(rationale, str):
+            stale = f"At {old_file}:"
+            if stale in rationale:
+                row["rationale"] = rationale.replace(stale, f"At {new_file}:", 1)
+    return changed
+
+
 def reconcile_runtime_aborts(rehome: bool = False, root: Path = ROOT, renames=None) -> int:
     aborts = load_script("check-runtime-aborts.py", root=root)
     findings = aborts.discover_runtime_aborts(root)
@@ -252,21 +296,35 @@ def reconcile_host_authority(
     inventory_path: Path | None = None,
     capture_path: Path | None = None,
     renames=None,
+    runner=subprocess.run,
 ) -> int:
     rha = load_script("reconcile-host-authority-positions.py", root=root)
     migrate_dir = root / "scripts/migrate"
     inv_path = inventory_path or (migrate_dir / "host-authority-transition-inventory.json")
     cap_path = capture_path or (migrate_dir / "host-authority-macos-capture.json")
 
-    # `reconcile_host_authority_positions` loads inv_path itself, so this is
-    # the single point where its rows can be renamed before that load: rewrite
-    # the file on disk first, before delegating to it.
-    if renames and inv_path.is_file():
+    def apply_inventory_renames() -> None:
+        # `reconcile_host_authority_positions` loads inv_path itself, so this
+        # is the single point where its rows can be renamed before that load:
+        # rewrite the tracked file on disk. This MUST happen only after any
+        # live `--refresh-candidate` capture below has already run against
+        # the still-clean tree: `product_source_snapshot` requires a clean
+        # tracked tree over `scripts/` (PRODUCT_SOURCE_PATHS includes
+        # "scripts"), so writing here any earlier would dirty the very tree
+        # the capture needs to snapshot, and it would then refuse with
+        # "commit the code change first" -- blaming the operator for dirt
+        # this function authored itself.
+        if not renames or not inv_path.is_file():
+            return
         inventory = json.loads(inv_path.read_text(encoding="utf-8"))
-        if isinstance(inventory, list) and apply_renames(collect_scan_targets(inventory), renames):
+        if isinstance(inventory, list) and apply_host_authority_renames(inventory, renames):
             write_json(inv_path, inventory)
 
     if candidate_path is not None:
+        # No live capture in this branch (the caller supplied a candidate
+        # directly, e.g. a test fixture), so there is no clean-tree
+        # precondition to protect and renaming up front is safe.
+        apply_inventory_renames()
         try:
             return rha.reconcile_host_authority_positions(
                 candidate_path=candidate_path,
@@ -280,7 +338,7 @@ def reconcile_host_authority(
 
     with tempfile.TemporaryDirectory() as tmp:
         candidate = Path(tmp) / "candidate.json"
-        subprocess.run(
+        runner(
             [
                 sys.executable,
                 str(MIGRATE / "check-host-authority-transitions.py"),
@@ -305,6 +363,10 @@ def reconcile_host_authority(
                     "tree -- commit the code change first, then rerun"
                 )
             raise RefusedError("host-authority: --refresh-candidate produced no candidate")
+
+        # The capture already ran against the clean tree above; it is now
+        # safe to rewrite the tracked inventory in place.
+        apply_inventory_renames()
 
         try:
             return rha.reconcile_host_authority_positions(
