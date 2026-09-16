@@ -256,7 +256,7 @@ impl std::fmt::Debug for TimerFdChangeListener {
     }
 }
 
-pub(crate) struct TimerFdChangeSubscription {
+pub struct TimerFdChangeSubscription {
     listeners: std::sync::Weak<Mutex<BTreeMap<u64, TimerFdChangeListener>>>,
     id: u64,
 }
@@ -269,7 +269,7 @@ impl Drop for TimerFdChangeSubscription {
     }
 }
 
-pub(crate) enum TimerFdChangeEnrollment {
+pub enum TimerFdChangeEnrollment {
     Ready,
     Subscribed(TimerFdChangeSubscription),
 }
@@ -444,7 +444,7 @@ pub(super) struct OpenDescriptionBase {
     inzone_cleanup: Option<std::sync::Arc<dyn InZoneCleanup>>,
 }
 
-pub(crate) trait InZoneCleanup: std::fmt::Debug + Send + Sync {}
+pub trait InZoneCleanup: std::fmt::Debug + Send + Sync {}
 impl<T: std::fmt::Debug + Send + Sync> InZoneCleanup for T {}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -647,7 +647,7 @@ impl OpenDescriptionBase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum HostWriteKind {
+pub enum HostWriteKind {
     PipeLike,
     SocketLike,
     RegularFile,
@@ -1037,7 +1037,7 @@ fn insert_dirty_range(
 /// authority, never a host process watch. Wrapped so `OpenDescription` can
 /// keep deriving `Debug` (the trait object is not `Debug`); the poll fd (the
 /// kqueue fd on macOS, the epoll fd on Linux) is the only state callers read.
-pub(crate) struct PidfdWatch {
+pub struct PidfdWatch {
     /// Owns the backing fds; held only so `Drop` closes them. Never read
     /// after construction except to fire the user wake.
     /// `Mutex` only to make the otherwise-`!Sync` trait object shareable across
@@ -1547,7 +1547,7 @@ struct HostFdOwner {
 /// drop closes the fd via [`OwnedFd`]. Borrow the number for a libc call via [`HostFdRef::raw`]
 /// or as the Copy view type via [`HostFdRef::view`].
 #[derive(Debug, Clone)]
-pub(crate) struct HostFdRef(Arc<HostFdOwner>);
+pub struct HostFdRef(Arc<HostFdOwner>);
 
 impl HostFdRef {
     pub(super) fn new(fd: i32) -> Self {
@@ -1626,7 +1626,7 @@ pub(in crate::dispatch) enum InMemoryTcpAtMark {
     AtMark(bool),
 }
 
-pub(crate) type OpenFile = crate::kernel::FileSlot;
+pub type OpenFile = crate::kernel::FileSlot;
 
 pub(super) fn kernel_file_description(
     description: OpenDescriptionRef,
@@ -3164,7 +3164,7 @@ impl OpenDescription {
 }
 
 #[cfg(test)]
-pub(crate) struct InMemoryPipeTestFixture {
+pub struct InMemoryPipeTestFixture {
     pub(crate) read: Arc<crate::kernel::FileDescription>,
     pub(crate) write: Arc<crate::kernel::FileDescription>,
     pipe: Arc<super::fs::pipe::PipeInner>,
@@ -3230,7 +3230,7 @@ impl InMemoryPipeTestFixture {
 }
 
 #[cfg(test)]
-pub(crate) struct HostPipeTestFixture {
+pub struct HostPipeTestFixture {
     pub(crate) read: Arc<crate::kernel::FileDescription>,
     _peer_write_end: std::os::fd::OwnedFd,
     shared_capacity: Arc<std::sync::atomic::AtomicI64>,

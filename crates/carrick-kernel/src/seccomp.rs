@@ -99,7 +99,7 @@ pub(crate) const SECCOMP_SET_MODE_FILTER: u32 = 1;
 
 /// A cBPF instruction (`struct sock_filter`), 8 bytes on the wire.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SockFilter {
+pub struct SockFilter {
     pub(crate) code: u16,
     pub(crate) jt: u8,
     pub(crate) jf: u8,
@@ -127,7 +127,7 @@ impl SockFilter {
 
 /// The kernel's `struct seccomp_data` — the read-only input a filter sees.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SeccompData {
+pub struct SeccompData {
     pub(crate) nr: i32,
     pub(crate) arch: u32,
     pub(crate) instruction_pointer: u64,
@@ -293,7 +293,7 @@ fn filter_path_insns(filters: &[Vec<SockFilter>]) -> Option<usize> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SeccompInstallError {
+pub enum SeccompInstallError {
     InvalidProgram,
     PathTooLong,
 }
@@ -302,7 +302,7 @@ pub(crate) enum SeccompInstallError {
 /// self-reexec. The launch-time container policy remains a separate host
 /// boundary; this snapshot is only the irreversible Linux process state.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SeccompSnapshot {
+pub struct SeccompSnapshot {
     filters: Vec<Vec<SockFilter>>,
     strict: bool,
 }
@@ -321,7 +321,7 @@ impl SeccompSnapshot {
 /// `prctl(PR_SET_SECCOMP)` call adds one); a syscall is checked against all of
 /// them and the most restrictive action wins.
 #[derive(Debug)]
-pub(crate) struct SeccompState {
+pub struct SeccompState {
     programs: Mutex<SeccompSnapshot>,
     /// Live JIT gate AND the lock-free source of truth for [`Self::is_active`]:
     /// 1 only while no guest-installed filter exists. Emitted identity code

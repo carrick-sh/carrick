@@ -76,8 +76,8 @@ pub const ORACLE_SIGINFO_SIZE: usize = 0x80;
 pub const AARCH64_FPREGSET_SIZE: usize = 0x210;
 pub const AARCH64_TLS_SIZE: usize = 0x10;
 
-pub(crate) const EHDR_SIZE: u16 = 64;
-pub(crate) const PHDR_SIZE: u16 = 56;
+pub const EHDR_SIZE: u16 = 64;
+pub const PHDR_SIZE: u16 = 56;
 const SHDR_SIZE: u16 = 64;
 /// Every core carries exactly one section header: the reserved index-0 entry.
 /// It is written unconditionally rather than only when [`PN_XNUM`] fires, so
@@ -314,19 +314,19 @@ fn checked_align_up(value: usize, align: usize) -> Option<usize> {
         .map(|rounded| rounded / align * align)
 }
 
-pub(crate) fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
+pub fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes(
         bytes.get(at..at.checked_add(2)?)?.try_into().ok()?,
     ))
 }
 
-pub(crate) fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
+pub fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
         bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
     ))
 }
 
-pub(crate) fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
+pub fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(
         bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
     ))

@@ -223,6 +223,11 @@ pub(crate) use ioctl::{inet4_interfaces_from_model, resolve_tiocspgrp};
 mod legacy_aio;
 pub(crate) mod locks;
 pub(crate) use locks::*;
+// The record-lock contention fixture is part of the kernel's test-support
+// surface (the continuation suites build a blocked writer from it), so it is
+// re-exported `pub` where the rest of the lock glob stays crate-internal.
+#[cfg(any(test, feature = "test-support"))]
+pub use locks::RecordLockContentionFixture;
 pub(crate) mod lookup;
 mod mount;
 pub(crate) mod notify;
@@ -234,17 +239,18 @@ pub(crate) use proc_synthetic::*;
 pub(crate) mod rw;
 mod sendfile;
 mod stat;
-mod state;
+pub mod state;
 mod transfer;
 mod xattr;
 pub(crate) use super::dispatcher::FsView;
 pub(in crate::dispatch) use lookup::{LookupIntent, LookupTarget};
 pub(crate) use open::OpenAtArgs;
 pub(crate) use pipe::*;
+pub use state::MountRetirement;
 pub use state::StdioSink;
 use state::*;
 pub(super) use state::{FsState, RuntimeIo, host_fd_offset};
-pub(crate) use state::{LegacyAioContextId, MountRetirement, SplicePushback};
+pub(crate) use state::{LegacyAioContextId, SplicePushback};
 
 pub(super) fn vfs_md_to_rootfs_md_helper(path: &str, md: &carrick_vfs::Metadata) -> RootFsMetadata {
     vfs_md_to_rootfs_md(path, md)
@@ -828,7 +834,7 @@ impl<'a> FsView<'a> {
         context: &crate::kernel::KernelContext,
         registry: Option<&crate::thread::ThreadRegistry>,
     ) -> Option<Vec<carrick_vfs::SyntheticProcThread>> {
-        #[cfg(feature = "platform-macos")]
+        #[cfg(target_os = "macos")]
         let states: Option<std::collections::HashMap<_, _>> = registry.map(|r| {
             r.thread_ports()
                 .into_iter()
@@ -836,11 +842,7 @@ impl<'a> FsView<'a> {
                 .map(|(id, port)| (id, crate::host_proc::thread_run_state_char(port)))
                 .collect()
         });
-        #[cfg(any(
-            feature = "platform-linux",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        ))]
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
         let states: Option<std::collections::HashMap<_, _>> =
             registry.map(|r| r.thread_state_chars().into_iter().collect());
         let mut threads: Vec<_> = context
@@ -2587,7 +2589,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn check_exec_source(
+    pub fn check_exec_source(
         &self,
         path: &str,
         source: &crate::dispatch::executable_authority::ExecSource,
@@ -2648,7 +2650,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn fanotify_notify_exec(&self, path: &str) {
+    pub fn fanotify_notify_exec(&self, path: &str) {
         self.fs_view().fanotify_notify_exec(path);
     }
 

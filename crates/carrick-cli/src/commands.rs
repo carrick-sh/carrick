@@ -52,8 +52,8 @@
 
 use anyhow::{Context, bail};
 use carrick_image::{ImageReference, ImageStore};
+use carrick_kernel::dispatch::{LinearMemory, SyscallDispatcher, SyscallRequest};
 use carrick_runtime::compat::{CompatReporter, SyscallArgs};
-use carrick_runtime::dispatch::{LinearMemory, SyscallDispatcher, SyscallRequest};
 use carrick_runtime::elf::{inspect_elf, plan_elf_load};
 use carrick_runtime::memory::AddressSpace;
 use carrick_vfs::rootfs::RootFs;
@@ -247,7 +247,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 }
             }
             if let Some(dir) = &exec_args.post_mortem_dir {
-                carrick_runtime::kernel::debug::PostMortem::install_dir(dir.clone());
+                carrick_kernel::kernel::debug::PostMortem::install_dir(dir.clone());
             }
             arm_fatal_debugger_hold_from_env();
 
@@ -293,7 +293,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     std::process::exit(125);
                 }
             };
-            let launch = match carrick_runtime::kernel::LaunchContext::from_process_env() {
+            let launch = match carrick_kernel::kernel::LaunchContext::from_process_env() {
                 Ok(launch) => launch,
                 Err(e) => {
                     eprintln!("carrick: {e:#}");
@@ -520,7 +520,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 }
             }
             if let Some(dir) = &exec_args.post_mortem_dir {
-                carrick_runtime::kernel::debug::PostMortem::install_dir(dir.clone());
+                carrick_kernel::kernel::debug::PostMortem::install_dir(dir.clone());
             }
             arm_fatal_debugger_hold_from_env();
 
@@ -560,9 +560,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_nanos() as u64)
                         .unwrap_or(0);
-                    let id =
-                        carrick_runtime::container::make_id(std::process::id() as u64, entropy);
-                    carrick_runtime::container::short_id(&id).to_string()
+                    let id = carrick_kernel::container::make_id(std::process::id() as u64, entropy);
+                    carrick_kernel::container::short_id(&id).to_string()
                 });
                 // SAFETY: single-threaded here (pre-runtime), like the
                 // forward-env `set_var` later in this function.
@@ -593,7 +592,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     std::process::exit(125);
                 }
             };
-            let launch = match carrick_runtime::kernel::LaunchContext::from_process_env() {
+            let launch = match carrick_kernel::kernel::LaunchContext::from_process_env() {
                 Ok(launch) => launch,
                 Err(e) => {
                     eprintln!("carrick: {e:#}");
@@ -2009,7 +2008,7 @@ pub(crate) fn run_build(args: BuildArgs<'_>) -> anyhow::Result<()> {
     crate::runtime_util::emit_resolve_warnings(&resolved.warnings);
     let carrier =
         carrick_runtime::CarrierRuntime::new_explicit().context("create kaniko build carrier")?;
-    let launch = carrick_runtime::kernel::LaunchContext::from_process_env()
+    let launch = carrick_kernel::kernel::LaunchContext::from_process_env()
         .context("resolve kaniko launch identity")?;
     let result = carrick_runtime::Runtime::execute_on(&carrier, &resolved.spec, launch)
         .context("run kaniko build carrier")?;
@@ -2380,11 +2379,11 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let id = carrick_runtime::container::make_id(std::process::id() as u64, entropy);
+        let id = carrick_kernel::container::make_id(std::process::id() as u64, entropy);
         let name = format!("m0_cli_net_target_{}", &id[..12]);
-        let config = carrick_runtime::container::RunConfig {
+        let config = carrick_kernel::container::RunConfig {
             network: carrick_spec::NetworkMode::Bridge,
-            network_attachments: vec![carrick_runtime::container::NetworkAttachment {
+            network_attachments: vec![carrick_kernel::container::NetworkAttachment {
                 name: "compose_default".to_string(),
                 aliases: Vec::new(),
                 links: Vec::new(),
@@ -2397,12 +2396,12 @@ mod tests {
             }],
             ..Default::default()
         };
-        let state = carrick_runtime::container::ContainerState {
+        let state = carrick_kernel::container::ContainerState {
             id: id.clone(),
             name: Some(name.clone()),
             image: "ubuntu:24.04".to_string(),
             command: vec!["/bin/true".to_string()],
-            status: carrick_runtime::container::ContainerStatus::Created,
+            status: carrick_kernel::container::ContainerStatus::Created,
             supervisor_pid: 0,
             init_pid: 0,
             created_secs: 0,
@@ -2415,12 +2414,12 @@ mod tests {
             launch_ticket: None,
             config,
         };
-        let _ = carrick_runtime::container::ContainerState::remove(&id);
+        let _ = carrick_kernel::container::ContainerState::remove(&id);
         state.create().unwrap();
 
         let parsed = parse_network_mode_arg(&format!("container:{name}")).unwrap();
 
-        let _ = carrick_runtime::container::ContainerState::remove(&id);
+        let _ = carrick_kernel::container::ContainerState::remove(&id);
         assert_eq!(parsed.mode, carrick_spec::NetworkMode::Bridge);
         assert_eq!(parsed.bridge.as_deref(), Some("compose_default"));
         assert_eq!(parsed.container.as_deref(), Some(id.as_str()));
@@ -2718,9 +2717,9 @@ fn parse_container_network_mode(value: &str) -> anyhow::Result<ParsedNetworkMode
         .strip_prefix("container:")
         .filter(|target| !target.is_empty())
         .ok_or_else(|| anyhow::anyhow!("network mode \"container\" requires a target"))?;
-    let target_id = carrick_runtime::container::resolve(target)
+    let target_id = carrick_kernel::container::resolve(target)
         .map_err(|_| anyhow::anyhow!("No such container: {target}"))?;
-    let target_state = carrick_runtime::container::ContainerState::load(&target_id)?;
+    let target_state = carrick_kernel::container::ContainerState::load(&target_id)?;
     let bridge = if target_state.config.network == carrick_spec::NetworkMode::Bridge {
         target_state
             .config

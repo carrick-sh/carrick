@@ -17,9 +17,9 @@ rules:
       `returned_u64`, `returned_i32`, `returned_fd`, `returned_offset`).
     paths:
       include:
-        - "crates/carrick-runtime/src/dispatch/**"
+        - "crates/carrick-kernel/src/dispatch/**"
       exclude:
-        - "crates/carrick-runtime/src/dispatch/retval.rs"
+        - "crates/carrick-kernel/src/dispatch/retval.rs"
         - "**/tests/**"
         - "**/*_test.rs"
         - "**/test_*.rs"
@@ -252,7 +252,7 @@ rules:
     severity: ERROR
     paths:
       exclude:
-        - crates/carrick-runtime/src/dispatch/abi_args.rs
+        - crates/carrick-kernel/src/dispatch/abi_args.rs
         - crates/carrick-guest-mem/
     patterns:
       - pattern: "struct GuestPtr($...ANY);"
@@ -289,7 +289,7 @@ rules:
     severity: ERROR
     paths:
       include:
-        - "crates/carrick-runtime/src/observe/**/*.rs"
+        - "crates/carrick-kernel/src/observe/**/*.rs"
         - "crates/carrick-embed/**/*.rs"
       exclude:
         - "**/tests/**"

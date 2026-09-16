@@ -205,7 +205,7 @@ pub(crate) fn writers_present_read_fd(id: (u64, u64)) -> Option<i32> {
 /// parked opener from `fifo_beacon` (draining presence pipes and removing empty beacon nodes)
 /// and closes any held host fd.
 #[derive(Debug, Clone)]
-pub(crate) struct ParkedOpenerToken(#[allow(dead_code)] std::sync::Arc<ParkedOpenerInner>);
+pub struct ParkedOpenerToken(#[allow(dead_code)] std::sync::Arc<ParkedOpenerInner>);
 
 #[derive(Debug)]
 struct ParkedOpenerInner {

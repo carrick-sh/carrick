@@ -88,7 +88,7 @@ impl Kernel {
     /// in, because `wait(2)`, not `_exit(2)`, is what removes a process from
     /// the table. Job-control shells rely on that: they look up a stopped or
     /// exited member's group before reaping it.
-    pub(crate) fn process_identity(&self, task_id: TaskId) -> Option<ProcessIdentity> {
+    pub fn process_identity(&self, task_id: TaskId) -> Option<ProcessIdentity> {
         let state = self.registry().state.read();
         if let Some(record) = state.tasks.get(&task_id) {
             let container = record.task.container().id();

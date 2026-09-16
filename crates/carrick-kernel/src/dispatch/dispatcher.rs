@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use carrick_fatal::carrick_fatal;
 use parking_lot::{Mutex, RwLock};
 
@@ -48,7 +48,7 @@ pub struct SyscallDispatcher {
     /// consumption, host-disposition mirroring, the cross-process xsignal
     /// ring, signal-number translation). Handed in by the carrier at
     /// construction; dispatch never names a VMM crate for it.
-    pub(crate) host_signal: Arc<dyn HostSignalBridge>,
+    pub host_signal: Arc<dyn HostSignalBridge>,
     /// The execution backend's timer registry + firing mechanism, and the
     /// run-global `TimerDelivery` seam the arm reaches when no exact-task
     /// delivery is bound above.
@@ -280,14 +280,14 @@ impl SyscallDispatcher {
     /// every image/spec/embed mount has been installed: holding the token is
     /// intentionally an additional `Arc` owner, so later reconfiguration
     /// would fail the dispatcher's pre-boot uniqueness invariant.
-    pub(crate) fn prepare_mount_retirement(&self) -> fs::MountRetirement {
+    pub fn prepare_mount_retirement(&self) -> fs::MountRetirement {
         fs::MountRetirement::new(self.container().id(), Arc::clone(&self.fs.vfs_mounts))
     }
 
     /// The container installed by `Runtime::execute`, if any. The HVPatch
     /// root bootstrap uses this to decide whether to fall back to the process
     /// environment (`run-elf`, in-crate fixtures).
-    pub(crate) fn installed_container(&self) -> Option<Arc<crate::kernel::Container>> {
+    pub fn installed_container(&self) -> Option<Arc<crate::kernel::Container>> {
         self.container.read().clone()
     }
 
@@ -329,7 +329,7 @@ impl SyscallDispatcher {
         dispatcher
     }
 
-    pub(crate) fn set_page_geometry(&mut self, page_geometry: crate::page_profile::PageGeometry) {
+    pub fn set_page_geometry(&mut self, page_geometry: crate::page_profile::PageGeometry) {
         self.page_geometry = page_geometry;
     }
 
@@ -343,13 +343,9 @@ impl SyscallDispatcher {
     pub(crate) fn publish_rlimit_cpu_signal_for_test(&self, signum: i32) {
         match self.async_signal_wake_owner {
             AsyncSignalWakeOwner::SignalPump => {
-                #[cfg(feature = "platform-macos")]
+                #[cfg(target_os = "macos")]
                 self.host_signal.publish_process_signal(signum);
-                #[cfg(any(
-                    feature = "platform-linux",
-                    feature = "platform-freebsd",
-                    feature = "platform-netbsd"
-                ))]
+                #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
                 self.timers.deliver(signum);
             }
         }
@@ -359,7 +355,7 @@ impl SyscallDispatcher {
         self.page_geometry
     }
 
-    pub(crate) fn linux_page_size(&self) -> u64 {
+    pub fn linux_page_size(&self) -> u64 {
         self.page_geometry.linux_page_size
     }
 
@@ -368,7 +364,7 @@ impl SyscallDispatcher {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    pub(crate) fn take_signal_pump_request(&self) -> bool {
+    pub fn take_signal_pump_request(&self) -> bool {
         self.signal_pump_requested
             .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
@@ -454,8 +450,8 @@ impl SyscallDispatcher {
     /// Shared kernel objects (open descriptions, filesystem namespace, network)
     /// stay shared; fd numbers, signals, credentials, memory metadata, and
     /// process controls become independent child state.
-    #[cfg(test)]
-    pub(crate) fn fork_clone_in_process(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fork_clone_in_process(
         &self,
         _parent_tid: crate::thread::ThreadId,
         _child_tid: crate::thread::ThreadId,
@@ -471,7 +467,7 @@ impl SyscallDispatcher {
         )
     }
 
-    pub(crate) fn prepare_fork_mm(
+    pub fn prepare_fork_mm(
         &self,
         parent_mm_id: crate::kernel::MmId,
         child_mm_id: crate::kernel::MmId,
@@ -511,7 +507,7 @@ impl SyscallDispatcher {
         })
     }
 
-    pub(crate) fn fork_clone_with_prepared_mm_authorized(
+    pub fn fork_clone_with_prepared_mm_authorized(
         &self,
         observed_parent_mm_id: crate::kernel::MmId,
         observed_child_mm_id: crate::kernel::MmId,
@@ -533,7 +529,7 @@ impl SyscallDispatcher {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn fork_clone_with_prepared_mm(
         &self,
         observed_parent_mm_id: crate::kernel::MmId,
@@ -642,8 +638,11 @@ impl SyscallDispatcher {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn fork_clone_in_process_with_mm_mode(
+    // Test fixture reachable through `test-support`, so `cfg(test)` is not set
+    // for it and clippy's `allow-{unwrap,expect}-in-tests` does not apply.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
+    pub fn fork_clone_in_process_with_mm_mode(
         &self,
         _parent_tid: crate::thread::ThreadId,
         _child_tid: crate::thread::ThreadId,
@@ -692,8 +691,8 @@ impl SyscallDispatcher {
         child
     }
 
-    #[cfg(test)]
-    pub(crate) fn replace_current_mm_for_test(&self, replacement: Arc<DispatchMmAuthority>) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn replace_current_mm_for_test(&self, replacement: Arc<DispatchMmAuthority>) {
         self.mm_binding.current.store(replacement);
     }
 
@@ -767,7 +766,7 @@ impl SyscallDispatcher {
         self.set_executable_identity_inner(path.into(), argv, env, None);
     }
 
-    pub(crate) fn set_executable_identity_with_source(
+    pub fn set_executable_identity_with_source(
         &self,
         path: impl Into<String>,
         argv: Vec<String>,
@@ -823,7 +822,7 @@ impl SyscallDispatcher {
         self.proc_view().current_executable()
     }
 
-    pub(crate) fn current_exec_env(&self) -> Vec<Vec<u8>> {
+    pub fn current_exec_env(&self) -> Vec<Vec<u8>> {
         self.proc_view().current_exec_env()
     }
 }
@@ -1508,7 +1507,7 @@ pub(in crate::dispatch) trait SignalCrossSubsystem: Send + Sync {
     fn host_signal(&self) -> &dyn HostSignalBridge;
     fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials>;
     fn identity_pid(&self) -> u32;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn capture_one_task_context(
         &self,
     ) -> Result<crate::kernel::KernelContext, crate::kernel::KernelError>;
@@ -1534,7 +1533,7 @@ impl SignalCrossSubsystem for SyscallDispatcher {
     fn identity_pid(&self) -> u32 {
         self.identity_pid()
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn capture_one_task_context(
         &self,
     ) -> Result<crate::kernel::KernelContext, crate::kernel::KernelError> {
@@ -2043,7 +2042,7 @@ impl<'a> MemView<'a> {
         self.cross.owns_host_alias_dispatch(guard)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[inline]
     pub(crate) fn mm_mutation_coordinator(&self) -> Arc<mm_mutation::MmMutationCoordinator> {
         Arc::clone(&self.mm_authority().mutation_coordinator)

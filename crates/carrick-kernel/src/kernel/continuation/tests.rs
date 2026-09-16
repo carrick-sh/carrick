@@ -1,5 +1,12 @@
 //! Unit and integration test suite for the kernel continuation model.
 
+// Compiled without `cfg(test)` when a sibling crate builds this through
+// `test-support`, so neither the test-harness import pruning nor clippy's
+// `allow-{unwrap,expect,panic}-in-tests` applies. This is test code either
+// way; state the same allowances explicitly.
+#![allow(dead_code, unused_imports)]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
@@ -80,7 +87,7 @@ fn block_on_timeout<F: std::future::Future>(future: F, timeout: Duration) -> Opt
     }
 }
 
-pub(crate) fn await_event(
+pub fn await_event(
     service: &CarrierWaitService,
     token: ContinuationWakeToken,
 ) -> Result<ContinuationEvent, WaitServiceError> {
@@ -494,7 +501,7 @@ use crate::kernel::objects::{
 use crate::kernel::{ClonePlan, Kernel, KernelContext, RootBootstrap, Scheduler};
 use crate::thread::FutexTable;
 
-pub(crate) fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
+pub fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
     let input = RootBootstrap::for_reference_model(
         pid,
         ThreadId::synthetic_for_tests(pid),
@@ -555,7 +562,7 @@ pub(crate) fn task_state_with_asid(
     }
 }
 
-pub(crate) fn publish(context: &KernelContext, marker: u64) -> ExecutionGeneration {
+pub fn publish(context: &KernelContext, marker: u64) -> ExecutionGeneration {
     context
         .thread()
         .publish_initial_task_state(task_state(context, marker))
@@ -569,10 +576,7 @@ pub(crate) fn request(number: u64) -> SyscallRequest {
     )
 }
 
-pub(crate) fn capture(
-    context: &KernelContext,
-    generation: ExecutionGeneration,
-) -> ContinuationCapture {
+pub fn capture(context: &KernelContext, generation: ExecutionGeneration) -> ContinuationCapture {
     ContinuationCapture::new(
         context,
         generation,
@@ -738,7 +742,7 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
     }
 }
 
-pub(crate) const DISPATCH_FAMILIES: [ContinuationFamily; 17] = [
+pub const DISPATCH_FAMILIES: [ContinuationFamily; 17] = [
     ContinuationFamily::FutexWait,
     ContinuationFamily::FutexWaitv,
     ContinuationFamily::SharedFutexWait,

@@ -17,7 +17,7 @@ use carrick_guest_mem::CurrentMmMemory;
 
 use crate::linux_abi::LinuxErrno;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use super::fd_table::{OpenDescription, OpenDescriptionBase, kernel_file_description};
 use super::fd_table::{TimerFdInner, TimerFdState};
 use super::{
@@ -44,7 +44,7 @@ pub struct BlockingTimerFdRead {
 /// after a rearm without consulting a numeric descriptor which may have been
 /// closed and reused meanwhile.
 #[derive(Clone, Debug)]
-pub(crate) struct TimerFdPollSource {
+pub struct TimerFdPollSource {
     state: std::sync::Arc<TimerFdState>,
     _lease: crate::kernel::objects::FileDescriptionFdLease,
 }
@@ -54,7 +54,7 @@ pub(crate) struct TimerFdPollSource {
 /// must redispatch if `timerfd_settime` changed it in the gap before the queue
 /// subscription became live.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct TimerFdReadPlan {
+pub struct TimerFdReadPlan {
     pub(crate) host_timeout: Option<Duration>,
     pub(crate) virtual_due: Option<Duration>,
     pub(crate) ready: bool,
@@ -109,7 +109,7 @@ impl BlockingTimerFdRead {
         &self.state.clock
     }
 
-    pub(crate) fn complete(self, memory: &mut impl CurrentMmMemory) -> TimerFdReadStep {
+    pub fn complete(self, memory: &mut impl CurrentMmMemory) -> TimerFdReadStep {
         let mut timer = self.state.inner.lock();
         if refresh_timerfd_locked(&self.state.clock, &mut timer) == 0 {
             drop(timer);
@@ -249,8 +249,11 @@ pub(super) fn begin_timerfd_read(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn timerfd_read_for_continuation_test() -> BlockingTimerFdRead {
+// Test fixture reachable through `test-support`, so `cfg(test)` is not set
+// for it and clippy's `allow-{unwrap,expect}-in-tests` does not apply.
+#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+pub fn timerfd_read_for_continuation_test() -> BlockingTimerFdRead {
     let state = std::sync::Arc::new(TimerFdState::new(
         std::sync::Arc::new(crate::kernel::container::ClockDomain::system()),
         LINUX_CLOCK_MONOTONIC,
@@ -275,7 +278,7 @@ pub(crate) fn timerfd_read_for_continuation_test() -> BlockingTimerFdRead {
     }
 }
 
-pub(crate) enum DynamicCpuClock {
+pub enum DynamicCpuClock {
     /// Per-thread CPU clock → target thread kernel CPU accounting.
     PerThread,
     /// Per-process CPU clock → target task kernel CPU accounting.
@@ -773,7 +776,7 @@ pub(super) fn linux_timespec_from_duration(duration: Duration) -> LinuxTimespec 
     )
 }
 
-pub(crate) fn complete_interrupted_sleep(
+pub fn complete_interrupted_sleep(
     memory: &mut impl CurrentMmMemory,
     remaining: Option<GuestPtr>,
     duration: Duration,

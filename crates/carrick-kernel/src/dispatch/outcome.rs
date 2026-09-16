@@ -17,7 +17,7 @@ use super::wait_authority::WaitFds;
 use super::{GuestPtr, HostAliasTransaction, HostSyscallResult};
 
 #[derive(Debug)]
-pub(crate) struct PinnedHostFd {
+pub struct PinnedHostFd {
     fd: OwnedFd,
 }
 
@@ -55,7 +55,7 @@ impl Eq for PinnedHostFd {}
 /// fd which represents that pipe's writable level. Neither variant ever
 /// resolves a numeric guest fd after the syscall has parked.
 #[derive(Clone)]
-pub(crate) enum BlockingWriteTarget {
+pub enum BlockingWriteTarget {
     Host(Arc<PinnedHostFd>),
     InMemoryPipe(Arc<crate::dispatch::fs::pipe::PipeWriteEndpointLease>),
 }
@@ -104,29 +104,29 @@ impl BlockingWrite {
         })
     }
 
-    pub(crate) fn poll_fd(&self) -> i32 {
+    pub fn poll_fd(&self) -> i32 {
         match &self.target {
             BlockingWriteTarget::Host(host_fd) => host_fd.as_raw_fd(),
             BlockingWriteTarget::InMemoryPipe(endpoint) => endpoint.readiness_fd().raw(),
         }
     }
 
-    pub(crate) fn poll_events(&self) -> i16 {
+    pub fn poll_events(&self) -> i16 {
         match &self.target {
             BlockingWriteTarget::Host(_) => libc::POLLOUT,
             BlockingWriteTarget::InMemoryPipe(_) => libc::POLLIN,
         }
     }
 
-    pub(crate) fn offset(&self) -> usize {
+    pub fn offset(&self) -> usize {
         self.committed_prefix.saturating_add(self.offset)
     }
 
-    pub(crate) fn tid(&self) -> crate::thread::ThreadId {
+    pub fn tid(&self) -> crate::thread::ThreadId {
         self.tid
     }
 
-    pub(crate) fn sigpipe_on_epipe(&self) -> bool {
+    pub fn sigpipe_on_epipe(&self) -> bool {
         self.sigpipe_on_epipe
     }
 
@@ -177,9 +177,9 @@ impl BlockingWrite {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
-    pub(crate) fn for_tests(
+    pub fn for_tests(
         host_fd: i32,
         bytes: Vec<u8>,
         offset: usize,
@@ -213,8 +213,8 @@ pub struct BlockingRecordLock {
 }
 
 impl BlockingRecordLock {
-    #[cfg(test)]
-    pub(crate) fn logical(wait: super::fs::LogicalRecordLockWait) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn logical(wait: super::fs::LogicalRecordLockWait) -> Self {
         Self::logical_lock(super::fs::LogicalLockWait::Record { wait, _lease: None })
     }
 
@@ -231,12 +231,12 @@ impl std::fmt::Debug for BlockingRecordLock {
     }
 }
 
-pub(crate) enum BlockingWriteStep {
+pub enum BlockingWriteStep {
     Done(DispatchOutcome),
     Wait,
 }
 
-pub(crate) fn drive_blocking_write(
+pub fn drive_blocking_write(
     write: &mut BlockingWrite,
     host_signal: &dyn carrick_hal::HostSignalBridge,
 ) -> BlockingWriteStep {
@@ -349,7 +349,7 @@ fn drive_in_memory_pipe_write(
     }
 }
 
-pub(crate) fn drive_blocking_record_lock(
+pub fn drive_blocking_record_lock(
     lock: &BlockingRecordLock,
     host_signal: &dyn carrick_hal::HostSignalBridge,
 ) -> DispatchOutcome {
@@ -359,7 +359,7 @@ pub(crate) fn drive_blocking_record_lock(
     }
 }
 
-pub(crate) enum BlockingRecordLockStep {
+pub enum BlockingRecordLockStep {
     Done(DispatchOutcome),
     Wait,
 }

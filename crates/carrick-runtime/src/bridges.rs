@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-pub use crate::dispatch::CarrierBridges;
+pub use carrick_kernel::dispatch::CarrierBridges;
 
 #[cfg(feature = "platform-macos")]
 type ActiveHostSignal = carrick_vmm_hvf::host_signal::HvfHostSignal;

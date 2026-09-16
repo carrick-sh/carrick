@@ -1,8 +1,8 @@
 //! Lazy vCPU register residency tracking and materialization authority for HVPatch executors.
 
-use crate::kernel::objects::ExecutorId;
 use crate::trap::TrapError;
 use carrick_hal::threaded::GuestCpuState;
+use carrick_kernel::kernel::objects::ExecutorId;
 
 /// Typed residency generation counter for a persistent executor vCPU.
 ///

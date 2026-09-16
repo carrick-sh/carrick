@@ -3,13 +3,13 @@
 //! `CarrierLauncher`; the multi-threaded API server never forks or self-spawns
 //! an intermediate CLI helper.
 
-use carrick_runtime::container;
+use carrick_kernel::container;
 
 /// Persist a `Created` entry by invoking `carrick create --name <name> <image>
 /// <cmd...>` and return the 64-hex container id `carrick create` prints on
 /// stdout. The id (not the name) is the Docker-API `Id`; the name is stored as a
 /// label so the container is later resolvable by either, via
-/// `carrick_runtime::container::resolve`.
+/// `carrick_kernel::container::resolve`.
 /// Options for `create_container` beyond the required `image` and `cmd`.
 pub(crate) struct CreateContainerOpts<'a> {
     pub name: Option<&'a str>,
@@ -39,7 +39,7 @@ pub(crate) struct CreateContainerOpts<'a> {
     pub api_auto_remove: bool,
     pub api_network_mode: Option<&'a str>,
     pub network_container: Option<&'a str>,
-    pub network_attachments: &'a [carrick_runtime::container::NetworkAttachment],
+    pub network_attachments: &'a [carrick_kernel::container::NetworkAttachment],
 }
 
 pub(crate) fn create_container(

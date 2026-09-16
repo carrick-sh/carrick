@@ -279,7 +279,7 @@ const MAX_ARCHIVE_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 const ARCHIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl ArchiveRuntime {
-    pub(crate) fn new(authority: crate::dispatch::ArchiveFsAuthority, capacity: usize) -> Self {
+    pub fn new(authority: crate::dispatch::ArchiveFsAuthority, capacity: usize) -> Self {
         Self::new_with_idle_timeout(authority, capacity, ARCHIVE_IDLE_TIMEOUT)
     }
 

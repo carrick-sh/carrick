@@ -1,16 +1,16 @@
 //! execve image loading, split out of runtime.rs (WS-F3): load_execve_image
 //! (rootfs/overlay ELF + shebang + Rosetta redirect). The shebang helpers
 //! (resolve_shebang, parse_shebang) and the signal-death / stop helpers live
-//! in `crate::exec_helpers` (cross-platform); they are re-exported here for
+//! in `carrick_kernel::exec_helpers` (cross-platform); they are re-exported here for
 //! existing call sites.
 //! Free functions reached via `use super::*`.
 use super::*;
-use crate::exec_helpers::parse_shebang;
 use crate::linux_abi::LinuxErrno;
+use carrick_kernel::exec_helpers::parse_shebang;
 
 pub(crate) struct LoadedExecImage {
     pub(crate) image: AddressSpace,
-    pub(crate) source: crate::dispatch::executable_authority::ExecSource,
+    pub(crate) source: carrick_kernel::dispatch::executable_authority::ExecSource,
 }
 
 fn host_io_errno(error: std::io::Error) -> LinuxErrno {
@@ -20,10 +20,14 @@ fn host_io_errno(error: std::io::Error) -> LinuxErrno {
         .unwrap_or(crate::linux_abi::LINUX_EIO)
 }
 
-fn exec_source_errno(error: crate::dispatch::executable_authority::ExecSourceError) -> LinuxErrno {
+fn exec_source_errno(
+    error: carrick_kernel::dispatch::executable_authority::ExecSourceError,
+) -> LinuxErrno {
     match error {
-        crate::dispatch::executable_authority::ExecSourceError::Linux(errno) => errno,
-        crate::dispatch::executable_authority::ExecSourceError::Host(error) => host_io_errno(error),
+        carrick_kernel::dispatch::executable_authority::ExecSourceError::Linux(errno) => errno,
+        carrick_kernel::dispatch::executable_authority::ExecSourceError::Host(error) => {
+            host_io_errno(error)
+        }
     }
 }
 
@@ -72,7 +76,7 @@ fn finalize_hvf_exec_base(
 
 pub(crate) fn load_execve_image(
     dispatcher: &SyscallDispatcher,
-    context: &crate::kernel::KernelContext,
+    context: &carrick_kernel::kernel::KernelContext,
     path: &str,
     // argv/env are opaque BYTE strings (Linux ABI), not UTF-8. `path` is a
     // String (resolved against the String/Path fs layer); argv[0] / shebang
@@ -107,10 +111,14 @@ pub(crate) fn load_execve_image(
                 if !host_fallback {
                     return Err(error);
                 }
-                let file = std::fs::File::open(path)
-                    .map_err(crate::dispatch::executable_authority::ExecSourceError::Host)?;
-                crate::dispatch::executable_authority::ExecSource::host(file, path.to_owned())
-                    .map_err(crate::dispatch::executable_authority::ExecSourceError::Host)
+                let file = std::fs::File::open(path).map_err(
+                    carrick_kernel::dispatch::executable_authority::ExecSourceError::Host,
+                )?;
+                carrick_kernel::dispatch::executable_authority::ExecSource::host(
+                    file,
+                    path.to_owned(),
+                )
+                .map_err(carrick_kernel::dispatch::executable_authority::ExecSourceError::Host)
             })
     };
     let named_source = acquire_source(&abs_path).map_err(exec_source_errno)?;
@@ -239,7 +247,7 @@ pub(crate) fn load_execve_image(
 // cross-platform `exec_helpers` module. Re-export them here so the call sites
 // in `runtime.rs` (`use exec::{…}`) and the vcpu_loop macOS import
 // (`use crate::runtime::exec::{…}`) resolve without change.
-pub(crate) use crate::exec_helpers::{
+pub(crate) use carrick_kernel::exec_helpers::{
     forked_child_die_by_signal, stop_after_traced_exec, stop_by_signal,
 };
 
@@ -251,13 +259,13 @@ mod tests {
     struct ContinueInterceptor;
 
     #[cfg(feature = "syscall-shim")]
-    impl crate::observe::SyscallInterceptor for ContinueInterceptor {
+    impl carrick_kernel::observe::SyscallInterceptor for ContinueInterceptor {
         fn intercept(
             &self,
-            _process: &crate::observe::ProcessInfo<'_>,
-            _call: &crate::observe::InterceptedSyscall<'_>,
-        ) -> crate::observe::InterceptAction {
-            crate::observe::InterceptAction::Continue
+            _process: &carrick_kernel::observe::ProcessInfo<'_>,
+            _call: &carrick_kernel::observe::InterceptedSyscall<'_>,
+        ) -> carrick_kernel::observe::InterceptAction {
+            carrick_kernel::observe::InterceptAction::Continue
         }
     }
 
@@ -302,8 +310,12 @@ mod tests {
         let context = dispatcher
             .capture_one_task_context()
             .expect("exec task context");
-        crate::kernel::identity_page::stamp_identity_page(&mut image, &dispatcher, &context)
-            .expect("closed exec identity page remains stampable");
+        carrick_kernel::kernel::identity_page::stamp_identity_page(
+            &mut image,
+            &dispatcher,
+            &context,
+        )
+        .expect("closed exec identity page remains stampable");
 
         let identity = image_region(&image, carrick_mem::memory::LINUX_IDENTITY_PAGE_BASE);
         let gate = usize::try_from(carrick_mem::memory::IDENTITY_OFF_SHIM_ENABLED)

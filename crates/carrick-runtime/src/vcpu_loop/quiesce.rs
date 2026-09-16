@@ -5,14 +5,16 @@
 //! fork quiesce remains the separate process-topology protocol below.
 
 use super::*;
-use crate::dispatch::mm_quiesce::{MmStage1Authority, PtPauseBudget, acquire_mm_stage1_authority};
 use carrick_fatal::carrick_fatal;
+use carrick_kernel::dispatch::mm_quiesce::{
+    MmStage1Authority, PtPauseBudget, acquire_mm_stage1_authority,
+};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 enum PreparedHvpatchProcessMm {
     Copied(crate::hvpatch::PreparedStage1Mm),
     Shared {
-        parent_task: crate::kernel::TaskKey,
+        parent_task: carrick_kernel::kernel::TaskKey,
         lease: Arc<crate::hvpatch::Stage1MmLease>,
         /// Admission against the shared generation's exec reservations, held
         /// until `publish_shared_child` so an exec cannot freeze the owner
@@ -23,7 +25,7 @@ enum PreparedHvpatchProcessMm {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PreparedHvpatchProcessMm {
-    fn binding(&self) -> crate::kernel::MmBinding {
+    fn binding(&self) -> carrick_kernel::kernel::MmBinding {
         match self {
             Self::Copied(mm) => mm.binding(),
             Self::Shared { lease, .. } => lease.binding(),
@@ -102,7 +104,7 @@ fn enter_hvpatch_guest_or_service_invalidation_inner(
     barrier: &crate::fork_quiesce::PtQuiesce,
     tid: carrick_hal::ThreadId,
     cow_binding: Option<(
-        crate::kernel::objects::ExecutorId,
+        carrick_kernel::kernel::objects::ExecutorId,
         &Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
         &crate::hvpatch::CowInvalidationObserver,
     )>,
@@ -181,7 +183,7 @@ pub(crate) fn enter_hvpatch_guest_or_service_invalidation_for_test(
     in_guest: &carrick_hal::InGuestFlag,
     barrier: &crate::fork_quiesce::PtQuiesce,
     tid: carrick_hal::ThreadId,
-    executor: crate::kernel::objects::ExecutorId,
+    executor: carrick_kernel::kernel::objects::ExecutorId,
     binding: &Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
     observer: &crate::hvpatch::CowInvalidationObserver,
     invalidate: impl FnMut(u16) -> Result<(), carrick_hal::TrapError>,
@@ -198,7 +200,7 @@ pub(crate) fn enter_hvpatch_guest_or_service_invalidation_for_test(
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn foreign_cow_task_binding_for_test(
     stage1: Arc<crate::hvpatch::Stage1MmLease>,
-    mm: crate::kernel::MmId,
+    mm: carrick_kernel::kernel::MmId,
 ) -> Result<Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>, carrick_hal::TrapError> {
     struct ExitJob;
 
@@ -243,13 +245,13 @@ pub(crate) fn foreign_cow_handshake_test_lock() -> parking_lot::MutexGuard<'stat
 /// exec whose old mm stays owned by a live sharer arms no retirement — so the
 /// guard covers a partially armed operation without inventing a transaction id.
 pub(super) struct InventoryAbandon<'a, const N: usize> {
-    authority: &'a crate::kernel::FrameInventoryAuthority,
+    authority: &'a carrick_kernel::kernel::FrameInventoryAuthority,
     transactions: [Option<carrick_hal::KernelTransactionId>; N],
 }
 
 impl<'a, const N: usize> InventoryAbandon<'a, N> {
     pub(super) const fn new(
-        authority: &'a crate::kernel::FrameInventoryAuthority,
+        authority: &'a carrick_kernel::kernel::FrameInventoryAuthority,
         transactions: [Option<carrick_hal::KernelTransactionId>; N],
     ) -> Self {
         Self {
@@ -322,14 +324,14 @@ pub(super) struct ForkRequest {
 pub(super) struct ProcessForkAttempt {
     pub(super) request: ForkRequest,
     pub(super) coordinator: Option<ProcessForkCoordinator>,
-    pub(super) external_exec: Option<crate::kernel::control::ExecWork>,
+    pub(super) external_exec: Option<carrick_kernel::kernel::control::ExecWork>,
 }
 
 pub(super) struct PreparedVforkSuspension {
     pub(super) child_pid: i32,
     pub(super) request: SyscallRequest,
-    pub(super) child: crate::kernel::TaskKey,
-    pub(super) wait: crate::kernel::VforkParentWait,
+    pub(super) child: carrick_kernel::kernel::TaskKey,
+    pub(super) wait: carrick_kernel::kernel::VforkParentWait,
     pub(super) activation: executor::PreparedVforkChildActivation,
 }
 
@@ -339,7 +341,7 @@ pub(super) enum PreparedInProcessFork {
     Retry {
         request: ForkRequest,
         coordinator: Option<ProcessForkCoordinator>,
-        external_exec: Option<crate::kernel::control::ExecWork>,
+        external_exec: Option<carrick_kernel::kernel::control::ExecWork>,
         _subscription: ProcessForkRetrySubscription,
     },
 }
@@ -352,7 +354,7 @@ pub(super) enum ProcessForkRetrySubscription {
         _subscription: carrick_hal::VcpuLeaseChangeSubscription,
     },
     Reservation {
-        _subscription: Option<crate::kernel::ReservationChangeSubscription>,
+        _subscription: Option<carrick_kernel::kernel::ReservationChangeSubscription>,
     },
     /// A process fork that found a sibling fork's transient clone-admission
     /// close; woken when that close lifts.
@@ -481,7 +483,7 @@ where
     pub(super) fn prepare_in_process_fork<M, O>(
         &mut self,
         kernel: &Kernel,
-        parent_context: &crate::kernel::KernelContext,
+        parent_context: &carrick_kernel::kernel::KernelContext,
         memory: &mut M,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         ops: &mut O,
@@ -511,10 +513,10 @@ where
         // `request.exit_signal` is authoritative for both clone spellings: the
         // legacy `CSIGNAL` byte was already lowered out of `flags` by dispatch
         // and `clone3` never carries one there.
-        let clone_plan = match crate::kernel::ClonePlan::from_flags(clone_flags) {
-            Ok(plan) => plan.with_exit_signal(crate::kernel::ChildExitSignal::for_clone_request(
-                request.exit_signal,
-            )),
+        let clone_plan = match carrick_kernel::kernel::ClonePlan::from_flags(clone_flags) {
+            Ok(plan) => plan.with_exit_signal(
+                carrick_kernel::kernel::ChildExitSignal::for_clone_request(request.exit_signal),
+            ),
             Err(_) => {
                 return Ok(PreparedInProcessFork::Complete(Some(
                     crate::linux_abi::LINUX_EINVAL.guest_retval(),
@@ -891,7 +893,7 @@ where
         };
         let reservation = match reservation_result {
             Ok(reservation) => reservation,
-            Err(crate::kernel::KernelOperationError::TaskBusy(busy)) => {
+            Err(carrick_kernel::kernel::KernelOperationError::TaskBusy(busy)) => {
                 // Another kernel transaction (a sibling's exit, a wait, an
                 // exec) holds one of the tasks this fork reserves. That is
                 // ordering, not exhaustion: wait for the reservation epoch to
@@ -921,7 +923,11 @@ where
                     },
                 });
             }
-            Err(error @ crate::kernel::KernelOperationError::ProcessLimitExceeded { .. }) => {
+            Err(
+                error @ carrick_kernel::kernel::KernelOperationError::ProcessLimitExceeded {
+                    ..
+                },
+            ) => {
                 // Reaching RLIMIT_NPROC is an expected guest-visible resource
                 // result, not a degraded carrier condition.  Keep the detail
                 // available to opt-in diagnostics without leaking a host WARN
@@ -938,7 +944,7 @@ where
                 )));
             }
         };
-        let shares_mm = clone_plan.mm() == crate::kernel::CloneObjectMode::Share;
+        let shares_mm = clone_plan.mm() == carrick_kernel::kernel::CloneObjectMode::Share;
         let child_id = reservation.child_id();
         let guest_child_pid = reservation.visible_child_id();
         let child_pid = child_id.raw();
@@ -1035,7 +1041,7 @@ where
         // the K1 execution adapter still prepares a stage-1 root slot for the
         // vCPU. CLONE_VM (including vfork) shares the exact parent `Mm`; plain
         // fork publishes the prepared root-slot backend as the child's copied mm.
-        let prepared_result = if clone_plan.mm() == crate::kernel::CloneObjectMode::Share {
+        let prepared_result = if clone_plan.mm() == carrick_kernel::kernel::CloneObjectMode::Share {
             reservation.prepare_shared_mm(child_tid)
         } else {
             let PreparedHvpatchProcessMm::Copied(prepared) = &prepared_mm else {
@@ -1086,7 +1092,7 @@ where
         // real pause failure remains EAGAIN. Every early return below drops
         // the authority (ending the pause) before the retry re-enters.
         let mut admitted_mm_executor = None;
-        let mm_executor: &mut crate::dispatch::MmExecutorParticipation =
+        let mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation =
             match self.guest_execution.as_mut() {
                 Some(participation) => participation,
                 None => admitted_mm_executor.insert(
@@ -1115,9 +1121,15 @@ where
         };
         let parent_mutation = match &mut parent_authority {
             MmStage1Authority::Sole(sole) => {
-                crate::dispatch::mm_mutation::from_sole_executor(sole, coordinator, parent_mm_id)
+                carrick_kernel::dispatch::mm_mutation::from_sole_executor(
+                    sole,
+                    coordinator,
+                    parent_mm_id,
+                )
             }
-            MmStage1Authority::Paused(pause) => crate::dispatch::mm_mutation::from_pt_pause(pause),
+            MmStage1Authority::Paused(pause) => {
+                carrick_kernel::dispatch::mm_mutation::from_pt_pause(pause)
+            }
         };
         let mut inventory_transaction = None;
         let mut inventory_reserve =
@@ -1479,7 +1491,7 @@ where
             .retain_exact();
         let child_key = child_context.task().key();
         if let Some(chain) = kernel.dispatcher.observers() {
-            let p = crate::observe::ProcessInfo::new(parent_context);
+            let p = carrick_kernel::observe::ProcessInfo::new(parent_context);
             chain.on_process_create(&p, child_key);
         }
         let child_backend_result = match prepared_mm {
@@ -1525,7 +1537,7 @@ where
         if let Some(work) = external_exec {
             child_kernel.install_external_exec_work(work)?;
         }
-        let task_state = crate::kernel::objects::MigratableTaskState {
+        let task_state = carrick_kernel::kernel::objects::MigratableTaskState {
             cpu,
             mm: child_mm_id,
             asid_generation,
@@ -1632,7 +1644,7 @@ where
             child_kernel.crash_capture.clone(),
             Some(Arc::clone(child_context.thread())),
             Some(child_pid),
-            crate::kernel::LinuxTid::for_task_leader(child_id),
+            carrick_kernel::kernel::LinuxTid::for_task_leader(child_id),
             child_kernel.fatal_signal.current_generation(),
             child_tid,
             child_threads.clone(),
@@ -1840,7 +1852,7 @@ where
         // replace a vfork-suspended caller.
         drop(fork_clone_admission);
         drop(process_fork_admission);
-        crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
+        carrick_kernel::event_ring::rec(carrick_kernel::event_ring::FORK, child_pid, 0, 0);
         emit_fork_runtime_stage(
             carrick_observability::probes::HvpatchForkRuntimeStagePhase::Publication,
             fork_stage_started,
@@ -1895,13 +1907,13 @@ where
 #[cfg(test)]
 mod pt_pause_tests {
     use super::*;
-    use crate::dispatch::mm_quiesce::{
-        PtPauseError, acquire_frame_cow_quiesce, acquire_mutation_pause_for_test, acquire_pt_pause,
-        begin_pt_pause, current_thread_holds_pt_pause, pt_barrier,
-    };
     use carrick_hal::stage1_mm::Stage1MmProjection;
     use carrick_hal::vcpu_sched::VcpuScheduler;
     use carrick_hal::{GenericVcpuRegistry, VcpuKickDyn, VcpuRegistry};
+    use carrick_kernel::dispatch::mm_quiesce::{
+        PtPauseError, acquire_frame_cow_quiesce, acquire_mutation_pause_for_test, acquire_pt_pause,
+        begin_pt_pause, current_thread_holds_pt_pause, pt_barrier,
+    };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct NoopKick;
@@ -1944,10 +1956,10 @@ mod pt_pause_tests {
     }
 
     fn enter_for_test(
-        census: &Arc<crate::kernel::GuestExecutorCensus>,
+        census: &Arc<carrick_kernel::kernel::GuestExecutorCensus>,
         registry: &Arc<GenericVcpuRegistry>,
         tid: ThreadId,
-    ) -> crate::kernel::GuestExecutorParticipation {
+    ) -> carrick_kernel::kernel::GuestExecutorParticipation {
         let endpoint: Arc<dyn VcpuRegistry> = registry.clone();
         census
             .enter_with_pause_endpoint(None, endpoint, tid)
@@ -1960,7 +1972,7 @@ mod pt_pause_tests {
         let barrier = Arc::clone(pt_barrier());
         assert!(!barrier.is_quiescing());
         let registry = Arc::new(GenericVcpuRegistry::new());
-        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
         let active_tid = tid(1_701);
         let caller_tid = tid(1_702);
         let active_flag = carrick_hal::InGuestFlag::for_guest_thread();
@@ -1970,10 +1982,10 @@ mod pt_pause_tests {
         let (_pool, stage1) = crate::hvpatch::Stage1MmPool::new_root_for_tests(0x8000, 1)
             .expect("one-slot target stage-1 pool");
         let active_executor =
-            crate::kernel::objects::ExecutorId::for_transitional_thread(active_tid)
+            carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(active_tid)
                 .expect("active executor identity");
         let caller_executor =
-            crate::kernel::objects::ExecutorId::for_transitional_thread(caller_tid)
+            carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(caller_tid)
                 .expect("caller executor identity");
         for executor in [active_executor, caller_executor] {
             stage1
@@ -1983,9 +1995,10 @@ mod pt_pause_tests {
                 .expect("publish exact target residency");
         }
         let caller_observer = stage1.cow_invalidation_observer(caller_executor);
-        let mm = crate::kernel::MmId::from_raw_u64(1_703).expect("test MM");
-        let coordinator = Arc::new(crate::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
-        let authority = crate::dispatch::mm_mutation::ForeignMmMutationAuthority::new(
+        let mm = carrick_kernel::kernel::MmId::from_raw_u64(1_703).expect("test MM");
+        let coordinator =
+            Arc::new(carrick_kernel::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
+        let authority = carrick_kernel::dispatch::mm_mutation::ForeignMmMutationAuthority::new(
             mm,
             coordinator,
             Arc::clone(&census),
@@ -2053,12 +2066,12 @@ mod pt_pause_tests {
         assert_eq!(scheduler.budget(), 1);
         assert!(!scheduler.has_spare_capacity(), "the only vCPU is occupied");
 
-        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
         let (_pool, stage1) = crate::hvpatch::Stage1MmPool::new_root_for_tests(0x8000, 1)
             .expect("one-slot target stage-1 pool");
         let caller_tid = tid(1_711);
         let caller_executor =
-            crate::kernel::objects::ExecutorId::for_transitional_thread(caller_tid)
+            carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(caller_tid)
                 .expect("caller executor identity");
         stage1
             .begin_asid_load(caller_executor)
@@ -2066,9 +2079,10 @@ mod pt_pause_tests {
             .mark_resident()
             .expect("publish inactive target residency");
         let observer = stage1.cow_invalidation_observer(caller_executor);
-        let mm = crate::kernel::MmId::from_raw_u64(1_712).expect("test MM");
-        let coordinator = Arc::new(crate::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
-        let authority = crate::dispatch::mm_mutation::ForeignMmMutationAuthority::new(
+        let mm = carrick_kernel::kernel::MmId::from_raw_u64(1_712).expect("test MM");
+        let coordinator =
+            Arc::new(carrick_kernel::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
+        let authority = carrick_kernel::dispatch::mm_mutation::ForeignMmMutationAuthority::new(
             mm,
             coordinator,
             census,
@@ -2108,11 +2122,12 @@ mod pt_pause_tests {
     fn mm_mutation_alias_waiter_cannot_enter_inner_before_real_pt_pause() {
         let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         let registry = Arc::new(GenericVcpuRegistry::new());
-        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
         let mut first_executor = enter_for_test(&census, &registry, tid(1591));
         let mut second_executor = enter_for_test(&census, &registry, tid(1592));
-        let mm = crate::kernel::MmId::from_raw_u64(91).expect("test MM");
-        let coordinator = Arc::new(crate::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
+        let mm = carrick_kernel::kernel::MmId::from_raw_u64(91).expect("test MM");
+        let coordinator =
+            Arc::new(carrick_kernel::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
 
         let mut outer = acquire_mutation_pause_for_test(
             &barrier,
@@ -2126,7 +2141,7 @@ mod pt_pause_tests {
             },
         )
         .expect("first real page-table pause");
-        let mutation = crate::dispatch::mm_mutation::from_pt_pause(&mut outer);
+        let mutation = carrick_kernel::dispatch::mm_mutation::from_pt_pause(&mut outer);
         let permit = mutation.host_alias_permit();
         let alias = coordinator.begin_alias(&permit);
 
@@ -2148,7 +2163,7 @@ mod pt_pause_tests {
                 },
             )
             .expect("second real page-table pause");
-            let mutation = crate::dispatch::mm_mutation::from_pt_pause(&mut outer);
+            let mutation = carrick_kernel::dispatch::mm_mutation::from_pt_pause(&mut outer);
             let permit = mutation.host_alias_permit();
             let alias = worker_coordinator.begin_alias(&permit);
             entered_tx.send(()).expect("announce inner alias entry");
@@ -2478,7 +2493,7 @@ mod pt_pause_tests {
             .expect("kernel reservation match ends before MM preparation");
         let arm = &reservation_match[..match_end];
         let busy_at = arm
-            .find("Err(crate::kernel::KernelOperationError::TaskBusy(")
+            .find("Err(carrick_kernel::kernel::KernelOperationError::TaskBusy(")
             .expect("TaskBusy is matched explicitly at the reservation");
         let process_limit_at = arm
             .find("KernelOperationError::ProcessLimitExceeded")
@@ -2710,13 +2725,13 @@ mod pt_pause_tests {
 
     #[test]
     fn inventory_guard_abandons_unpublished_runtime_reservation() {
-        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+        let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             1_530,
             tid(1_530),
             "inventory-abandon".to_owned(),
         )
         .unwrap();
-        let (kernel, context) = crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        let (kernel, context) = carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
         let reservation = kernel
             .reserve_frame_inventory(
                 1,
@@ -2734,7 +2749,7 @@ mod pt_pause_tests {
             kernel
                 .frame_inventory()
                 .apply(context.shared().mm().id(), commit),
-            Err(crate::kernel::FrameInventoryError::UnreservedTransaction(id)) if id == transaction
+            Err(carrick_kernel::kernel::FrameInventoryError::UnreservedTransaction(id)) if id == transaction
         ));
     }
 
@@ -2744,7 +2759,7 @@ mod pt_pause_tests {
         let registry = Arc::new(GenericVcpuRegistry::new());
         // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
-        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
         let coordinator = tid(1501);
         let sibling = tid(1502);
         let mut coordinator_participation = enter_for_test(&census, &registry, coordinator);
@@ -2803,7 +2818,7 @@ mod pt_pause_tests {
         let registry = Arc::new(GenericVcpuRegistry::new());
         // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
-        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
         let waiter = tid(1521);
         let mut waiter_participation = enter_for_test(&census, &registry, waiter);
         let waiter_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
@@ -2848,7 +2863,7 @@ mod pt_pause_tests {
         let registry = Arc::new(GenericVcpuRegistry::new());
         // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
-        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
         let coordinator = tid(1511);
         let sibling = tid(1512);
         let mut coordinator_participation = enter_for_test(&census, &registry, coordinator);
@@ -2895,10 +2910,10 @@ mod pt_pause_tests {
     fn nested_frame_cow_borrows_exact_mm_lease_and_extends_real_pause() {
         let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         let registry = Arc::new(GenericVcpuRegistry::new());
-        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
         let coordinator = tid(1513);
         let mut participation = enter_for_test(&census, &registry, coordinator);
-        let mm = crate::kernel::MmId::from_registry_allocation(
+        let mm = carrick_kernel::kernel::MmId::from_registry_allocation(
             std::num::NonZeroU64::new(coordinator.raw() as u64).unwrap(),
         );
 
@@ -2936,7 +2951,7 @@ mod pt_pause_tests {
     #[test]
     fn exact_mm_pause_drains_distinct_dispatcher_registries_and_blocks_admission() {
         let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
-        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
         let coordinator_registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
         let child_registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
         let coordinator_tid = tid(1521);
@@ -3038,7 +3053,7 @@ mod pt_pause_tests {
     #[test]
     fn standalone_frame_cow_sole_witness_blocks_exact_mm_admission() {
         let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
-        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
         let registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
         let _existing = census
             .enter_with_pause_endpoint(None, registry, tid(1531))
@@ -3046,7 +3061,9 @@ mod pt_pause_tests {
 
         let guard = acquire_frame_cow_quiesce(
             &barrier,
-            crate::kernel::MmId::from_registry_allocation(std::num::NonZeroU64::new(1531).unwrap()),
+            carrick_kernel::kernel::MmId::from_registry_allocation(
+                std::num::NonZeroU64::new(1531).unwrap(),
+            ),
             &census,
             tid(1531),
             PtPauseBudget {
@@ -3147,7 +3164,7 @@ mod pt_pause_tests {
         let registry = Arc::new(GenericVcpuRegistry::new());
         // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
-        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
         let coordinator = tid(1531);
         let sibling = tid(1532);
         let mut coordinator_participation = enter_for_test(&census, &registry, coordinator);

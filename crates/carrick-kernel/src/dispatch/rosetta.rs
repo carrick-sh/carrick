@@ -14,12 +14,12 @@
 /// it, and the cached reads below source their bytes from it. Probing a host
 /// that may have put it elsewhere goes through the carrier's
 /// `rosetta_interpreter_path`, which falls back to this const last.
-pub(crate) const ROSETTA_INTERPRETER: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta";
+pub const ROSETTA_INTERPRETER: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta";
 
 /// The installed Rosetta interpreter's bytes, read once and cached. `None` when
 /// Rosetta isn't installed for Linux. Both the ELF-load redirect and the ioctl
 /// handshake source data from this single read.
-pub(crate) fn rosetta_binary_bytes() -> Option<&'static [u8]> {
+pub fn rosetta_binary_bytes() -> Option<&'static [u8]> {
     static CACHE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| std::fs::read(ROSETTA_INTERPRETER).ok())
@@ -32,7 +32,7 @@ pub(crate) fn rosetta_binary_bytes() -> Option<&'static [u8]> {
 /// live from the installed binary rather than embedded in carrick's source.
 /// This keeps Apple's string out of our tree and stays correct if Apple
 /// revises it. Returns the bytes through (and including) the NUL terminator.
-pub(crate) fn rosetta_license_blob() -> Option<&'static [u8]> {
+pub fn rosetta_license_blob() -> Option<&'static [u8]> {
     static CACHE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {

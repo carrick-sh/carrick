@@ -7,7 +7,8 @@ use parking_lot::Mutex;
 
 use super::host_alias::{HostAliasDispatchGuard, HostAliasTransactions};
 use super::outcome::DispatchError;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[allow(unused_imports)]
 use super::{
     LinearMemory, LinuxErrno, ProcMapSharing, ProcMapsEntry, SyscallCtx, SyscallDispatcher,
     SyscallRequest,
@@ -22,7 +23,7 @@ pub use super::mm_mutation::MmTransactionGuard;
 /// state. Only Linux memory metadata and the host-alias transaction boundary
 /// travel together here: `CLONE_VM` selects the same authority while a copied
 /// MM receives an exact fork-private authority.
-pub(crate) struct DispatchMmAuthority {
+pub struct DispatchMmAuthority {
     pub(crate) mm_id: crate::kernel::MmId,
     pub(crate) mem: Arc<mem::MemAuthority>,
     pub(crate) host_alias_transactions: Arc<HostAliasTransactions>,
@@ -149,12 +150,12 @@ impl DispatchMmAuthority {
         self.mem.revision_publisher()
     }
 
-    pub(crate) fn vma_revision(&self) -> crate::kernel::VmaRevision {
+    pub fn vma_revision(&self) -> crate::kernel::VmaRevision {
         self.mem.vma_revision()
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_for_test_with_revision(revision: crate::kernel::VmaRevision) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_for_test_with_revision(revision: crate::kernel::VmaRevision) -> Self {
         let mm_id = crate::kernel::MmId::from_registry_allocation(std::num::NonZeroU64::MIN);
         Self {
             mm_id,
@@ -174,8 +175,8 @@ impl DispatchMmAuthority {
     /// Production-shape MM authority for cross-layer foreign-COW tests. This
     /// uses the real dispatch VMA authority, mutation coordinator, and executor
     /// census; only the single test VMA is synthetic.
-    #[cfg(test)]
-    pub(crate) fn foreign_cow_composition_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn foreign_cow_composition_for_test(
         mm_id: crate::kernel::MmId,
         stage1: Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>,
         start: u64,
@@ -205,7 +206,7 @@ impl DispatchMmAuthority {
         (authority, mutation)
     }
 
-    pub(crate) fn pt_quiesce(&self) -> &Arc<carrick_thread::fork_quiesce::PtQuiesce> {
+    pub fn pt_quiesce(&self) -> &Arc<carrick_thread::fork_quiesce::PtQuiesce> {
         &self.pt_quiesce
     }
 
@@ -213,15 +214,16 @@ impl DispatchMmAuthority {
         &self.fork_quiesce
     }
 
-    #[cfg(test)]
-    pub(crate) fn foreign_cow_executor_census_for_test(
-        &self,
-    ) -> Arc<crate::kernel::GuestExecutorCensus> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn foreign_cow_executor_census_for_test(&self) -> Arc<crate::kernel::GuestExecutorCensus> {
         Arc::clone(&self.guest_executors)
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_foreign_cow_vma_access_for_test(&self, access: crate::kernel::VmaAccess) {
+    // Test fixture reachable through `test-support`, so `cfg(test)` is not set
+    // for it and clippy's `allow-{unwrap,expect}-in-tests` does not apply.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
+    pub fn set_foreign_cow_vma_access_for_test(&self, access: crate::kernel::VmaAccess) {
         let mut mem = self.mem.lock();
         let vma = mem
             .dynamic_maps
@@ -304,7 +306,7 @@ impl MmExecutorParticipation {
         })
     }
 
-    pub(crate) fn mm_id(&self) -> crate::kernel::MmId {
+    pub fn mm_id(&self) -> crate::kernel::MmId {
         self.authority.mm_id
     }
 
@@ -590,7 +592,7 @@ mod mm_executor_release_tests {
     }
 }
 
-pub(crate) struct PreparedDispatchMmFork {
+pub struct PreparedDispatchMmFork {
     pub(crate) parent_mm_id: crate::kernel::MmId,
     pub(crate) child_mm_id: crate::kernel::MmId,
     pub(crate) parent_mm: Arc<DispatchMmAuthority>,
@@ -601,7 +603,7 @@ pub(crate) struct PreparedDispatchMmFork {
 }
 
 impl PreparedDispatchMmFork {
-    pub(crate) fn fork_projection_plan(&self) -> carrick_hal::ForkProjectionPlan {
+    pub fn fork_projection_plan(&self) -> carrick_hal::ForkProjectionPlan {
         match self.mode {
             crate::kernel::CloneObjectMode::Share => carrick_hal::ForkProjectionPlan::Shared {
                 parent_mm: self.parent_mm_id.raw(),
@@ -617,7 +619,7 @@ impl PreparedDispatchMmFork {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum PrepareDispatchMmForkError {
+pub enum PrepareDispatchMmForkError {
     #[error(transparent)]
     Projection(#[from] carrick_hal::ForkProjectionError),
     #[error("shared MM preparation requires identical parent and child MM identities")]
@@ -626,7 +628,7 @@ pub(crate) enum PrepareDispatchMmForkError {
     CopiedIdentityCollision,
 }
 
-pub(crate) struct DispatchMmBinding {
+pub struct DispatchMmBinding {
     pub(in crate::dispatch) current: arc_swap::ArcSwap<DispatchMmAuthority>,
     pub(in crate::dispatch) staged_exec: Mutex<Option<Arc<DispatchMmAuthority>>>,
 }
@@ -743,7 +745,7 @@ impl DispatchMmBinding {
     }
 }
 
-pub(crate) struct PreparedDispatchMmExec {
+pub struct PreparedDispatchMmExec {
     pub(in crate::dispatch) binding: Arc<DispatchMmBinding>,
     pub(in crate::dispatch) predecessor: Arc<DispatchMmAuthority>,
     pub(in crate::dispatch) staged: Arc<DispatchMmAuthority>,
@@ -751,11 +753,11 @@ pub(crate) struct PreparedDispatchMmExec {
 }
 
 impl PreparedDispatchMmExec {
-    pub(crate) fn vma_snapshot_source(&self) -> crate::kernel::SharedVmaSnapshotSource {
+    pub fn vma_snapshot_source(&self) -> crate::kernel::SharedVmaSnapshotSource {
         self.staged.clone()
     }
 
-    pub(crate) fn commit(mut self) {
+    pub fn commit(mut self) {
         let mut staged = self.binding.staged_exec.lock();
         if !staged
             .as_ref()

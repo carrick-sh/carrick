@@ -103,7 +103,7 @@ const SUPPORTED_FS_TYPES: &[&str] = &["tmpfs", "proc", "sysfs", "overlay"];
 /// CMD_* commands: the oracle gives EBUSY for CMD_RECONFIGURE on a fresh
 /// fsopen context and for CMD_CREATE on an fspick context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FsContextPurpose {
+pub enum FsContextPurpose {
     /// `fsopen(2)`: staging parameters toward FSCONFIG_CMD_CREATE.
     NewSuperblock,
     /// `fspick(2)`: staging parameters toward FSCONFIG_CMD_RECONFIGURE.
@@ -114,7 +114,7 @@ pub(crate) enum FsContextPurpose {
 /// interprets: the deferred CMD_CREATE/CMD_RECONFIGURE is where Linux would
 /// consume these.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum StagedParam {
+pub enum StagedParam {
     /// FSCONFIG_SET_FLAG: a bare key ("ro").
     Flag(String),
     /// FSCONFIG_SET_STRING: key=value.
@@ -138,7 +138,7 @@ pub(crate) enum StagedParam {
 /// never reach "created" (CMD_CREATE is deferred), so the reachable states
 /// are exactly `purpose × staging`.
 #[derive(Debug)]
-pub(crate) struct FsContextState {
+pub struct FsContextState {
     /// Filesystem type (fsopen) — `None` for an fspick context, which
     /// reconfigures whatever is mounted at `picked_path`.
     #[allow(dead_code)] // read by the (deferred) CMD_CREATE and by tests

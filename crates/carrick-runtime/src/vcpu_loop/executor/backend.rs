@@ -12,11 +12,6 @@ use carrick_hal::ThreadedEngine as _;
 
 #[path = "residency.rs"]
 pub mod residency;
-use crate::kernel::objects::{
-    ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState, ThreadExecutionLease,
-    ThreadKey,
-};
-use crate::kernel::{Scheduler, SchedulerError};
 use crate::trap::TrapError;
 use crate::vcpu_loop::executor::binding::{
     ExecutorSubmissionContext, HvpatchQuantumControl, PersistentTaskBinding,
@@ -24,6 +19,11 @@ use crate::vcpu_loop::executor::binding::{
 use crate::vcpu_loop::executor::settlement::{
     ExecutorCpuReceipt, ExecutorExit, ExecutorSaveError, RunnableTask, SavedRunnable,
 };
+use carrick_kernel::kernel::objects::{
+    ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState, ThreadExecutionLease,
+    ThreadKey,
+};
+use carrick_kernel::kernel::{Scheduler, SchedulerError};
 pub use residency::*;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -531,13 +531,13 @@ pub(crate) enum FailedCloneRetirement {
     /// the carrier: the generation this rollback exists to retire is already
     /// retired, the child is torn down exactly as before, and the clone still
     /// fails to the guest.
-    AlreadySettled(crate::kernel::objects::ThreadExecutionState),
+    AlreadySettled(carrick_kernel::kernel::objects::ThreadExecutionState),
 }
 
 pub(crate) fn retire_failed_hvpatch_clone_authority(
     scheduler: &Scheduler,
-    kernel: &Arc<crate::kernel::Kernel>,
-    context: &crate::kernel::KernelContext,
+    kernel: &Arc<carrick_kernel::kernel::Kernel>,
+    context: &carrick_kernel::kernel::KernelContext,
     generation: ExecutionGeneration,
     retire_binding: impl FnOnce(ThreadKey, ExecutionGeneration),
 ) -> Result<FailedCloneRetirement, String> {
@@ -551,14 +551,14 @@ pub(crate) fn retire_failed_hvpatch_clone_authority(
         // string: the only refusal that is not a carrier fault is "this exact
         // generation is already terminal".
         Err(SchedulerError::Thread(
-            crate::kernel::objects::ThreadExecutionError::InvalidTransition {
+            carrick_kernel::kernel::objects::ThreadExecutionError::InvalidTransition {
                 operation: "fail_runnable_generation",
                 state,
             },
         )) if matches!(
             state,
-            crate::kernel::objects::ThreadExecutionState::Failed { .. }
-                | crate::kernel::objects::ThreadExecutionState::Exited { .. }
+            carrick_kernel::kernel::objects::ThreadExecutionState::Failed { .. }
+                | carrick_kernel::kernel::objects::ThreadExecutionState::Exited { .. }
         ) =>
         {
             FailedCloneRetirement::AlreadySettled(state)

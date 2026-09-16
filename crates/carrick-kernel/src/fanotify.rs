@@ -79,10 +79,10 @@ thread_local! {
 /// The guard also covers inotify's open hooks, for the same reason and with no
 /// behaviour change to inotify-only guests: it can only ever be active inside a
 /// fanotify read, which does not run unless a fanotify group exists.
-pub(crate) struct InternalOpenGuard(());
+pub struct InternalOpenGuard(());
 
 impl InternalOpenGuard {
-    pub(crate) fn enter() -> Self {
+    pub fn enter() -> Self {
         INTERNAL_OPEN_DEPTH.with(|depth| depth.set(depth.get() + 1));
         Self(())
     }
@@ -96,7 +96,7 @@ impl Drop for InternalOpenGuard {
 
 /// True while an [`InternalOpenGuard`] is held on this thread: the open now in
 /// flight is carrick's own, and must generate no guest-visible event.
-pub(crate) fn internal_open_in_progress() -> bool {
+pub fn internal_open_in_progress() -> bool {
     INTERNAL_OPEN_DEPTH.with(|depth| depth.get() != 0)
 }
 
@@ -108,7 +108,7 @@ pub(crate) fn internal_open_in_progress() -> bool {
 /// forked child triggering an event must not consume a slot in its own table,
 /// and the parent must receive a descriptor it can `fstat` and `close`.
 #[derive(Debug, Clone)]
-pub(crate) struct PendingEvent {
+pub struct PendingEvent {
     /// Deliverable event bits only — never `FAN_EVENT_ON_CHILD`/`FAN_ONDIR`.
     pub(crate) mask: LinuxFanotifyEvents,
     /// Resolved guest path of the object the event happened on.
@@ -124,7 +124,7 @@ pub(crate) struct PendingEvent {
 /// across guest `fork`). Dropping the last reference destroys the group, which
 /// is what invalidates its marks.
 #[derive(Debug)]
-pub(crate) struct FanotifyGroup {
+pub struct FanotifyGroup {
     init_flags: LinuxFanotifyInitFlags,
     /// The `event_f_flags` argument of `fanotify_init(2)`: the open flags each
     /// event descriptor is opened with.
@@ -322,7 +322,7 @@ struct Inner {
 /// for inotify watches but would lose a forked child's events here. See the
 /// module docs for why.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct FanotifyRegistry {
+pub struct FanotifyRegistry {
     inner: Arc<parking_lot::RwLock<Inner>>,
 }
 

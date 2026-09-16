@@ -98,13 +98,13 @@ use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::{Gpa, GuestVa, HostVa};
 
 use crate::compat::CompatReporter;
-use crate::dispatch::rosetta::ROSETTA_INTERPRETER;
-use crate::dispatch::{
+use crate::linux_abi::LinuxErrno;
+use crate::memory::{AddressSpace, AddressSpaceError};
+use carrick_kernel::dispatch::rosetta::ROSETTA_INTERPRETER;
+use carrick_kernel::dispatch::{
     CurrentMmMemory, DispatchOutcome, FdWaitCompletion, GuestMemory, MemoryError, PreparedDispatch,
     PreparedSyscall, SyscallCompletionToken, SyscallDispatcher, SyscallRequest,
 };
-use crate::linux_abi::LinuxErrno;
-use crate::memory::{AddressSpace, AddressSpaceError};
 use carrick_vfs::rootfs::RootFs;
 
 // The EL0 synchronous-fault translation + the threaded vCPU loop were hoisted
@@ -113,12 +113,12 @@ use carrick_vfs::rootfs::RootFs;
 // forked-child / execve helpers in `exec`, so that submodule stays here; it is
 // `pub(crate)` so `vcpu_loop` can reach the same helpers.
 pub(crate) mod exec;
-use crate::kernel::identity_page::stamp_identity_page;
 use crate::vcpu_loop::{
     apply_exec_image_proc_state, apply_image_proc_state, deliver_pending_signal,
     dispatch_with_panic_backstop, partial_write_interrupt_outcome,
     raise_sigpipe_for_blocking_write, signal_wait_expired, signal_wait_slice,
 };
+use carrick_kernel::kernel::identity_page::stamp_identity_page;
 use exec::{load_execve_image, stop_after_traced_exec, stop_by_signal};
 
 use crate::trap::{HvfTrapEngine, TrapError};
@@ -131,10 +131,10 @@ pub use crate::trap::SyscallTrap;
 
 // vDSO attach policy (`VdsoDebugMode`, `with_optional_vdso[_at]`,
 // `vdso_enabled_for_debug`) and the `--debug-state-path` snapshot moved to the
-// platform-NEUTRAL `crate::vdso_policy` / `crate::debug_state` modules so the
+// platform-NEUTRAL `carrick_kernel::vdso_policy` / `crate::debug_state` modules so the
 // native backend resolves them on every host OS. Re-exported here so the
 // original `crate::runtime::…` paths are unchanged on this arm.
-pub(crate) use crate::vdso_policy::{
+pub(crate) use carrick_kernel::vdso_policy::{
     debug_env_flag_enabled, vdso_enabled_for_debug, with_optional_vdso_for_clock_with_visibility,
 };
 
@@ -155,10 +155,10 @@ fn hardware_tso_for_debug_from_env(requested: bool, disable: Option<&str>) -> bo
 // `SplitView`/`HvfTrapEngine` impls and the loop bounds are unchanged.
 
 // `RunResult` / `RuntimeError` are now defined cross-platform in
-// `crate::run_result` (unified with the Linux KVM loop). Re-export them under
+// `carrick_kernel::run_result` (unified with the Linux KVM loop). Re-export them under
 // the original `carrick_runtime::runtime::{RunResult, RuntimeError}` paths so
 // every call site (carrick-engine, carrick-cli, the runtime tests) is unchanged.
-pub use crate::run_result::{RunResult, RuntimeError, TerminalReason};
+pub use carrick_kernel::run_result::{RunResult, RuntimeError, TerminalReason};
 
 pub fn run_static_elf_with_hvf(
     path: impl AsRef<Path>,
@@ -242,7 +242,7 @@ where
         .with_linux_initial_stack_page_size(
             argv,
             env,
-            crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+            carrick_kernel::page_profile::DEFAULT_LINUX_PAGE_SIZE,
         )?;
     let requires_syscall_traps = dispatcher.requires_syscall_traps();
     finish_and_run_image(
@@ -271,7 +271,7 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
-    let plan = crate::page_profile::resolve_execution_plan_for_request(
+    let plan = carrick_kernel::page_profile::resolve_execution_plan_for_request(
         carrick_spec::Platform::host_native(),
         options.exec_backend,
     )?;
@@ -331,7 +331,7 @@ where
         .with_linux_initial_stack_page_size(
             argv,
             env,
-            crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+            carrick_kernel::page_profile::DEFAULT_LINUX_PAGE_SIZE,
         )?;
     let requires_syscall_traps = dispatcher.requires_syscall_traps();
     finish_and_run_image(image, dispatcher, requires_syscall_traps, max_traps, None)
@@ -481,7 +481,7 @@ where
     let image = image.with_linux_initial_stack_page_size(
         argv,
         env,
-        crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+        carrick_kernel::page_profile::DEFAULT_LINUX_PAGE_SIZE,
     )?;
     let requires_syscall_traps = dispatcher.requires_syscall_traps();
     finish_and_run_image_owned(
@@ -496,7 +496,7 @@ where
 
 // `resolve_entrypoint_path` / `resolve_entrypoint_program` (Docker `execvp` PATH
 // search + `#!` shebang resolution) were hoisted into the cross-platform
-// `crate::exec_helpers`, shared by the macOS HVF and Linux KVM `carrick run`
+// `carrick_kernel::exec_helpers`, shared by the macOS HVF and Linux KVM `carrick run`
 // paths — only the run-loop entry that consumes the assembled image differs.
 
 /// Run an ELF whose filesystem is entirely in the dispatcher's overlay
@@ -549,7 +549,12 @@ where
     let argv_for_cmdline = argv.clone();
     let argv_bytes: Vec<Vec<u8>> = argv.into_iter().map(String::into_bytes).collect();
     let resolved_entry = dispatcher.with_kernel_credentials(&launch_context, || {
-        crate::exec_helpers::resolve_entrypoint_program(path, &env, argv_bytes, &dispatcher)
+        carrick_kernel::exec_helpers::resolve_entrypoint_program(
+            path,
+            &env,
+            argv_bytes,
+            &dispatcher,
+        )
     });
     let (resolved, argv) = resolved_entry.map_err(|_| {
         RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
@@ -571,10 +576,12 @@ where
         })
         .map_err(|error| {
             let error = match error {
-                crate::dispatch::executable_authority::ExecSourceError::Linux(errno) => {
+                carrick_kernel::dispatch::executable_authority::ExecSourceError::Linux(errno) => {
                     std::io::Error::from_raw_os_error(errno.get())
                 }
-                crate::dispatch::executable_authority::ExecSourceError::Host(error) => error,
+                carrick_kernel::dispatch::executable_authority::ExecSourceError::Host(error) => {
+                    error
+                }
             };
             RuntimeError::AddressSpace(AddressSpaceError::Io(error))
         })?;
@@ -610,7 +617,7 @@ where
     // with the KVM run path via `exec_helpers::build_run_image`; only the run-loop
     // entry below (HVF `finish_and_run_image`) is macOS-specific.
     let built = dispatcher.with_kernel_credentials(&launch_context, || {
-        crate::exec_helpers::build_run_image(
+        carrick_kernel::exec_helpers::build_run_image(
             &bytes,
             argv,
             &env,
@@ -810,7 +817,7 @@ fn run_address_space_with_hvf_and_dispatcher(
     }
     if !exact_control_installed && let Some(id) = registry_id.as_deref() {
         let exit_code = run.as_ref().map_or(125, |result| result.exit_code);
-        crate::container::mark_exited(id, exit_code);
+        carrick_kernel::container::mark_exited(id, exit_code);
     }
     run
 }
@@ -832,13 +839,13 @@ fn with_hvf_syscall_mailbox(
     // whenever the feature is compiled, and let each container's private
     // identity-page gate decide whether matched calls return in EL1 or fall
     // through to the host dispatcher.
-    let identity_fast_path = crate::syscall_shim_enabled();
+    let identity_fast_path = carrick_kernel::syscall_shim_enabled();
     let image = image.with_el1_vectors_mailbox_fd_ceiling(identity_fast_path)?;
     // The page is part of the compile-enabled transport shape even when its
     // runtime gate is closed. Boot/fork/exec stampers still publish the task
     // identity there; interceptor/observer visibility keeps the gate at zero
     // so every identity call traps through ordinary dispatch.
-    let image = if crate::syscall_shim_enabled() {
+    let image = if carrick_kernel::syscall_shim_enabled() {
         image.with_identity_page()?
     } else {
         image
@@ -924,7 +931,7 @@ fn finish_and_run_image_owned(
 ) -> Result<RunResult, RuntimeError> {
     // Arm the one carrier's deadlock watchdog. Logical fork children advance
     // the same carrier-global counter; no host-child re-arm exists.
-    crate::deadlock_watchdog::arm();
+    carrick_kernel::deadlock_watchdog::arm();
     // Back the guest's default fd table with real host descriptors. Every
     // guest-visible file is a host fd, so the carrier's own `RLIMIT_NOFILE`
     // (macOS starts at 256) must cover the guest default plus headroom, or
@@ -932,8 +939,8 @@ fn finish_and_run_image_owned(
     // ~2500 UDP sockets, LTP creat05/fork09). Carrier-lifetime, idempotent,
     // only ever raises — see the `carrier.rs` ledger. Shared here so the
     // embedded runner gets it, not only the CLI.
-    crate::dispatch::raise_host_nofile_backing(
-        crate::kernel::objects::RlimitSet::carrick_defaults()
+    carrick_kernel::dispatch::raise_host_nofile_backing(
+        carrick_kernel::kernel::objects::RlimitSet::carrick_defaults()
             .get(carrick_abi::LinuxResource::Nofile)
             .rlim_cur,
     );
@@ -1018,7 +1025,7 @@ where
     // doesn't leave the user's terminal wedged. The guard drops at the
     // end of this function and restores the saved state if we touched
     // it.
-    let _termios_guard = crate::host_tty::TermiosRestoreGuard::new();
+    let _termios_guard = carrick_kernel::host_tty::TermiosRestoreGuard::new();
 
     let this_tid = ThreadId::main_from_host_pid();
     // Per-thread blocking-I/O waiter (owns this thread's kqueue).
@@ -1183,7 +1190,7 @@ where
             }
             DispatchOutcome::Execve { path, argv, env } => {
                 crate::probes::execve_argv(&path, &argv);
-                crate::event_ring::rec(crate::event_ring::EXEC, 1, 0, 0);
+                carrick_kernel::event_ring::rec(carrick_kernel::event_ring::EXEC, 1, 0, 0);
                 // proctitle / cmdline identity is display text (lossy decode).
                 let proc_argv: Vec<String> = argv
                     .iter()
@@ -1193,7 +1200,7 @@ where
                 // (`carrick: <argv>`), so a hung exec'd guest is
                 // identifiable in `ps -M` / Activity Monitor.
                 let cmdline = proc_argv.join(" ");
-                crate::dispatch::set_host_process_name(cmdline.as_bytes());
+                carrick_kernel::dispatch::set_host_process_name(cmdline.as_bytes());
                 let proc_env = env.clone();
                 let loaded = dispatcher.with_kernel_credentials(&kernel_context, || {
                     load_execve_image(
@@ -1235,7 +1242,7 @@ where
                         let exec_context =
                             dispatcher.commit_one_task_kernel_exec(prepared_kernel_exec)?;
                         prepared_dispatch_mm_exec.commit();
-                        crate::namespace::pid::mark_self_execed_for(&exec_context);
+                        carrick_kernel::namespace::pid::mark_self_execed_for(&exec_context);
                         // execve_into rebuilt a fresh (zeroed) identity page;
                         // exec retains the caller's captured credential values.
                         let _ = stamp_identity_page(runtime, &dispatcher, &exec_context);
@@ -1649,7 +1656,7 @@ fn retire_single_threaded_syscall(
 
 fn dispatch_single_threaded_syscall<M: CurrentMmMemory>(
     dispatcher: &mut SyscallDispatcher,
-    kernel_context: &crate::kernel::KernelContext,
+    kernel_context: &carrick_kernel::kernel::KernelContext,
     syscall: PreparedSyscall,
     memory: &mut M,
     reporter: &CompatReporter,
@@ -1670,7 +1677,7 @@ fn dispatch_single_threaded_syscall<M: CurrentMmMemory>(
 
 fn dispatch_single_threaded_syscall_with<M, F>(
     dispatcher: &mut SyscallDispatcher,
-    kernel_context: &crate::kernel::KernelContext,
+    kernel_context: &carrick_kernel::kernel::KernelContext,
     syscall: PreparedSyscall,
     memory: &mut M,
     reporter: &CompatReporter,
@@ -1681,11 +1688,11 @@ where
     M: CurrentMmMemory,
     F: FnMut(
         &mut SyscallDispatcher,
-        &crate::kernel::KernelContext,
+        &carrick_kernel::kernel::KernelContext,
         PreparedSyscall,
         &mut M,
         &CompatReporter,
-    ) -> Result<DispatchOutcome, crate::dispatch::DispatchError>,
+    ) -> Result<DispatchOutcome, carrick_kernel::dispatch::DispatchError>,
 {
     use carrick_vmm_hvf::io_wait::WaitResult;
 
@@ -1706,11 +1713,11 @@ where
             DispatchOutcome::BlockingWrite(mut write) => {
                 waiter.ensure_full();
                 loop {
-                    match crate::dispatch::drive_blocking_write(
+                    match carrick_kernel::dispatch::drive_blocking_write(
                         &mut write,
                         &*dispatcher.host_signal,
                     ) {
-                        crate::dispatch::BlockingWriteStep::Done(outcome) => {
+                        carrick_kernel::dispatch::BlockingWriteStep::Done(outcome) => {
                             return Ok(raise_sigpipe_for_blocking_write(
                                 dispatcher,
                                 kernel_context,
@@ -1718,7 +1725,7 @@ where
                                 outcome,
                             ));
                         }
-                        crate::dispatch::BlockingWriteStep::Wait => {
+                        carrick_kernel::dispatch::BlockingWriteStep::Wait => {
                             match waiter.wait(
                                 &[carrick_hal::WaitFd::raw(
                                     write.poll_fd(),
@@ -1750,7 +1757,7 @@ where
                 }
             }
             DispatchOutcome::BlockingRecordLock(lock) => {
-                return Ok(crate::dispatch::drive_blocking_record_lock(
+                return Ok(carrick_kernel::dispatch::drive_blocking_record_lock(
                     &lock,
                     &*dispatcher.host_signal,
                 ));
@@ -1921,7 +1928,7 @@ where
                     )
                 };
                 if sleep_interrupt_pending() {
-                    return Ok(crate::dispatch::complete_interrupted_sleep(
+                    return Ok(carrick_kernel::dispatch::complete_interrupted_sleep(
                         memory,
                         remaining,
                         deadline.saturating_duration_since(Instant::now()),
@@ -1946,7 +1953,7 @@ where
                         continue;
                     }
                     WaitResult::Interrupted => {
-                        return Ok(crate::dispatch::complete_interrupted_sleep(
+                        return Ok(carrick_kernel::dispatch::complete_interrupted_sleep(
                             memory,
                             remaining,
                             deadline.saturating_duration_since(Instant::now()),
@@ -2043,13 +2050,13 @@ impl crate::threaded_loop::HostBackend for HvfHostBackend {
 
     fn pre_loop_setup(&self) -> Box<dyn std::any::Any> {
         carrick_vmm_hvf::host_signal::install_default_handlers();
-        Box::new(crate::host_tty::TermiosRestoreGuard::new())
+        Box::new(carrick_kernel::host_tty::TermiosRestoreGuard::new())
     }
 
     fn start_pump_eagerly(&self) -> bool {
         // Non-interactive runners start pump-free and request a pump lazily;
         // interactive terminals keep prompt Ctrl-C delivery for busy guests.
-        crate::host_tty::host_isatty(0) || crate::host_tty::host_isatty(1)
+        carrick_kernel::host_tty::host_isatty(0) || carrick_kernel::host_tty::host_isatty(1)
     }
 }
 
@@ -2248,7 +2255,7 @@ pub(crate) fn maybe_redirect_to_rosetta<A: AsRef<[u8]>>(
 
     crate::probes::execve_argv("rosetta-redirect", &[target_path.as_bytes().to_vec()]);
 
-    let rosetta_bytes = match crate::dispatch::rosetta::rosetta_binary_bytes() {
+    let rosetta_bytes = match carrick_kernel::dispatch::rosetta::rosetta_binary_bytes() {
         Some(b) => b.to_vec(),
         None => return Some(Err(LINUX_ENOENT)),
     };
@@ -2641,13 +2648,13 @@ mod tests {
 
     struct KillOnEntryObserver;
 
-    impl crate::observe::SyscallObserver for KillOnEntryObserver {
+    impl carrick_kernel::observe::SyscallObserver for KillOnEntryObserver {
         fn on_syscall(
             &self,
-            _process: &crate::observe::ProcessInfo<'_>,
-            _call: &crate::observe::SyscallInfo<'_>,
-        ) -> crate::observe::SyscallAction {
-            crate::observe::SyscallAction::Kill(crate::dispatch::Signal(
+            _process: &carrick_kernel::observe::ProcessInfo<'_>,
+            _call: &carrick_kernel::observe::SyscallInfo<'_>,
+        ) -> carrick_kernel::observe::SyscallAction {
+            carrick_kernel::observe::SyscallAction::Kill(carrick_kernel::dispatch::Signal(
                 crate::linux_abi::LINUX_SIGKILL,
             ))
         }
@@ -2655,14 +2662,14 @@ mod tests {
 
     struct RedispatchCountingInterceptor(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
-    impl crate::observe::SyscallInterceptor for RedispatchCountingInterceptor {
+    impl carrick_kernel::observe::SyscallInterceptor for RedispatchCountingInterceptor {
         fn intercept(
             &self,
-            _process: &crate::observe::ProcessInfo<'_>,
-            _call: &crate::observe::InterceptedSyscall<'_>,
-        ) -> crate::observe::InterceptAction {
+            _process: &carrick_kernel::observe::ProcessInfo<'_>,
+            _call: &carrick_kernel::observe::InterceptedSyscall<'_>,
+        ) -> carrick_kernel::observe::InterceptAction {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            crate::observe::InterceptAction::Continue
+            carrick_kernel::observe::InterceptAction::Continue
         }
     }
 
@@ -2691,7 +2698,8 @@ mod tests {
                 context.retain_exact(),
                 dispatcher.observers().cloned(),
             ));
-            let mut memory = crate::dispatch::LinearMemory::new(0x4000_0000, vec![0; 4096]);
+            let mut memory =
+                carrick_kernel::dispatch::LinearMemory::new(0x4000_0000, vec![0; 4096]);
             let mut waiter = carrick_vmm_hvf::io_wait::ThreadWaiter::new(
                 crate::thread::ThreadId::synthetic_for_tests(72_410 + redispatches),
             );
@@ -2710,7 +2718,7 @@ mod tests {
                         Ok(DispatchOutcome::WaitOnHvpatchChild {
                             target: None,
                             sig_mask: carrick_abi::WaitSigMask::NONE,
-                            precheck: crate::kernel::ChildWaitPrecheck::unsampled(),
+                            precheck: carrick_kernel::kernel::ChildWaitPrecheck::unsampled(),
                         })
                     } else {
                         Ok(DispatchOutcome::Returned { value: 17 })
@@ -2758,7 +2766,7 @@ mod tests {
         ));
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let write = crate::dispatch::BlockingWrite::for_tests(
+        let write = carrick_kernel::dispatch::BlockingWrite::for_tests(
             fds[1],
             vec![1, 2, 3, 4],
             2,
@@ -2768,7 +2776,7 @@ mod tests {
         .unwrap();
         assert_eq!(unsafe { libc::close(fds[0]) }, 0);
         assert_eq!(unsafe { libc::close(fds[1]) }, 0);
-        let mut memory = crate::dispatch::LinearMemory::new(0x4000_0000, vec![0; 4096]);
+        let mut memory = carrick_kernel::dispatch::LinearMemory::new(0x4000_0000, vec![0; 4096]);
         let mut waiter = carrick_vmm_hvf::io_wait::ThreadWaiter::new(
             crate::thread::ThreadId::synthetic_for_tests(72_411),
         );
@@ -2901,13 +2909,13 @@ mod tests {
     struct ContinueInterceptor;
 
     #[cfg(feature = "syscall-shim")]
-    impl crate::observe::SyscallInterceptor for ContinueInterceptor {
+    impl carrick_kernel::observe::SyscallInterceptor for ContinueInterceptor {
         fn intercept(
             &self,
-            _process: &crate::observe::ProcessInfo<'_>,
-            _call: &crate::observe::InterceptedSyscall<'_>,
-        ) -> crate::observe::InterceptAction {
-            crate::observe::InterceptAction::Continue
+            _process: &carrick_kernel::observe::ProcessInfo<'_>,
+            _call: &carrick_kernel::observe::InterceptedSyscall<'_>,
+        ) -> carrick_kernel::observe::InterceptAction {
+            carrick_kernel::observe::InterceptAction::Continue
         }
     }
 
@@ -2915,9 +2923,9 @@ mod tests {
     struct RequiredObserver;
 
     #[cfg(feature = "syscall-shim")]
-    impl crate::observe::SyscallObserver for RequiredObserver {
-        fn wants_fast_path_visibility(&self) -> crate::observe::FastPathVisibility {
-            crate::observe::FastPathVisibility::Required
+    impl carrick_kernel::observe::SyscallObserver for RequiredObserver {
+        fn wants_fast_path_visibility(&self) -> carrick_kernel::observe::FastPathVisibility {
+            carrick_kernel::observe::FastPathVisibility::Required
         }
     }
 
@@ -3108,8 +3116,8 @@ mod tests {
     fn namespace_supervisor_launch_surface_is_deleted() {
         let runtime_source = include_str!("runtime.rs");
         let execute_source = include_str!("execute.rs");
-        let pid_source = include_str!("namespace/pid.rs");
-        let namespace_source = include_str!("namespace/mod.rs");
+        let pid_source = include_str!("../../carrick-kernel/src/namespace/pid.rs");
+        let namespace_source = include_str!("../../carrick-kernel/src/namespace/mod.rs");
 
         for forbidden in [
             ["Supervisor", "Role"].concat(),
@@ -3238,30 +3246,30 @@ mod tests {
 
         // Bare names resolve to the first PATH dir that has them.
         assert_eq!(
-            crate::exec_helpers::resolve_entrypoint_path("ls", &env, &dispatcher),
+            carrick_kernel::exec_helpers::resolve_entrypoint_path("ls", &env, &dispatcher),
             "/bin/ls"
         );
         assert_eq!(
-            crate::exec_helpers::resolve_entrypoint_path("env", &env, &dispatcher),
+            carrick_kernel::exec_helpers::resolve_entrypoint_path("env", &env, &dispatcher),
             "/usr/bin/env"
         );
         // A path containing '/' is returned unchanged (execve, not execvp).
         assert_eq!(
-            crate::exec_helpers::resolve_entrypoint_path("/sbin/foo", &env, &dispatcher),
+            carrick_kernel::exec_helpers::resolve_entrypoint_path("/sbin/foo", &env, &dispatcher),
             "/sbin/foo"
         );
         assert_eq!(
-            crate::exec_helpers::resolve_entrypoint_path("./x", &env, &dispatcher),
+            carrick_kernel::exec_helpers::resolve_entrypoint_path("./x", &env, &dispatcher),
             "./x"
         );
         // Not found anywhere on PATH → keep the bare name (so the load error names it).
         assert_eq!(
-            crate::exec_helpers::resolve_entrypoint_path("nope", &env, &dispatcher),
+            carrick_kernel::exec_helpers::resolve_entrypoint_path("nope", &env, &dispatcher),
             "nope"
         );
         // No PATH in env → fall back to the standard default set (covers /usr/bin).
         assert_eq!(
-            crate::exec_helpers::resolve_entrypoint_path("env", &[], &dispatcher),
+            carrick_kernel::exec_helpers::resolve_entrypoint_path("env", &[], &dispatcher),
             "/usr/bin/env"
         );
     }
@@ -3278,7 +3286,7 @@ mod tests {
         ]);
         let dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
-        let (path, argv) = crate::exec_helpers::resolve_entrypoint_program(
+        let (path, argv) = carrick_kernel::exec_helpers::resolve_entrypoint_program(
             "/entry.sh",
             &[],
             vec![b"/entry.sh".to_vec(), b"arg1".to_vec()],
@@ -3298,7 +3306,7 @@ mod tests {
         // A normal ELF entrypoint is unchanged (no shebang, no argv splice).
         let rootfs = rootfs_with(&[("bin/true", b"\x7fELFx")]);
         let dispatcher = SyscallDispatcher::with_rootfs(rootfs);
-        let (path, argv) = crate::exec_helpers::resolve_entrypoint_program(
+        let (path, argv) = carrick_kernel::exec_helpers::resolve_entrypoint_program(
             "/bin/true",
             &[],
             vec![b"/bin/true".to_vec()],
@@ -3309,7 +3317,7 @@ mod tests {
         assert_eq!(argv, vec![b"/bin/true".to_vec()]);
     }
 
-    // `vdso_debug_control_is_opt_out` moved to `crate::vdso_policy` with the
+    // `vdso_debug_control_is_opt_out` moved to `carrick_kernel::vdso_policy` with the
     // code it tests.
 
     #[test]
@@ -3480,7 +3488,7 @@ mod rosetta_tests {
     fn rosetta_license_blob_is_sourced_from_binary_if_present() {
         // When Rosetta is installed, the licence blob is the NUL-terminated
         // verification string read live from its binary (never embedded here).
-        if let Some(blob) = crate::dispatch::rosetta::rosetta_license_blob() {
+        if let Some(blob) = carrick_kernel::dispatch::rosetta::rosetta_license_blob() {
             assert!(blob.starts_with(b"Our hard work"));
             assert_eq!(blob.last(), Some(&0u8), "blob must end at the NUL");
         }

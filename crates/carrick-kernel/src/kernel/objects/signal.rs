@@ -689,7 +689,7 @@ pub enum SignalReservationOrigin {
 
 /// Signals whose Linux DEFAULT disposition is "ignore" (`Ign`): a `SIG_DFL` /
 /// no-handler instance is dropped, not a terminating action.
-pub(crate) fn is_default_ignore_signal(signum: i32) -> bool {
+pub fn is_default_ignore_signal(signum: i32) -> bool {
     matches!(
         signum,
         crate::linux_abi::LINUX_SIGCHLD
@@ -705,7 +705,7 @@ pub(crate) fn is_default_ignore_signal(signum: i32) -> bool {
 /// when Darwin reports an initial read-only host mapping as a translation-style
 /// fault. The process-wide no-access and no-write sets are the durable VMA
 /// permission evidence; an address in neither set remains a genuine MAPERR.
-pub(crate) fn upgrade_protection_si_code<M: CurrentMmMemory>(
+pub fn upgrade_protection_si_code<M: CurrentMmMemory>(
     memory: &M,
     signum: i32,
     si_code: i32,

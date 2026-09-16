@@ -81,7 +81,7 @@ impl Default for GuestExecutorCensusState {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn saturating_participant_count_for_probe(count: usize) -> i32 {
     i32::try_from(count).unwrap_or(i32::MAX)
 }
@@ -118,14 +118,14 @@ impl GuestExecutorCensus {
     /// (HVPatch); passing it makes this guard carry the crash-safe-point facet
     /// as well, so a loop can never be a member of one population and not the
     /// other.
-    pub(crate) fn enter(
+    pub fn enter(
         self: &Arc<Self>,
         thread: Option<ThreadRef>,
     ) -> Result<GuestExecutorParticipation, GuestExecutorCensusError> {
         self.enter_inner(thread, None)
     }
 
-    pub(crate) fn enter_with_pause_endpoint(
+    pub fn enter_with_pause_endpoint(
         self: &Arc<Self>,
         thread: Option<ThreadRef>,
         registry: Arc<dyn carrick_hal::VcpuRegistry>,
@@ -192,14 +192,14 @@ impl GuestExecutorCensus {
 
     /// Test-only instantaneous projection. It is not mutation authority: the
     /// production sole-or-pause decision must hold [`ExactMmCensusGuard`].
-    #[cfg(test)]
-    pub(crate) fn has_peer_executor(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_peer_executor(&self) -> bool {
         self.state.lock().participants.len() > 1
     }
 
     /// Numeric projection solely for the fixed-width probe ABI.
-    #[cfg(test)]
-    pub(crate) fn participant_count_for_probe(&self) -> i32 {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn participant_count_for_probe(&self) -> i32 {
         saturating_participant_count_for_probe(self.state.lock().participants.len())
     }
 }
@@ -221,7 +221,7 @@ impl fmt::Debug for GuestExecutorPauseEndpoint {
 
 /// Lifetime-held exact-MM census election. While this exists, no new executor
 /// can enter the MM, which closes admission across a page-table mutation.
-pub(crate) struct ExactMmCensusGuard {
+pub struct ExactMmCensusGuard {
     state: ArcMutexGuard<RawMutex, GuestExecutorCensusState>,
 }
 

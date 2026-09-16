@@ -143,28 +143,28 @@ REVIEWED_PROBE_LIMITS = {
 }
 TEST_SOURCE_PATHS = frozenset(
     {
-        PurePosixPath("crates/carrick-runtime/src/dispatch/fs/tests.rs"),
-        PurePosixPath("crates/carrick-runtime/src/dispatch/mem/tests.rs"),
-        PurePosixPath("crates/carrick-runtime/src/dispatch/tests.rs"),
-        PurePosixPath("crates/carrick-runtime/src/file_authority/tests.rs"),
-        PurePosixPath("crates/carrick-runtime/src/kernel/tests.rs"),
+        PurePosixPath("crates/carrick-kernel/src/dispatch/fs/tests.rs"),
+        PurePosixPath("crates/carrick-kernel/src/dispatch/mem/tests.rs"),
+        PurePosixPath("crates/carrick-kernel/src/dispatch/tests.rs"),
+        PurePosixPath("crates/carrick-kernel/src/file_authority/tests.rs"),
+        PurePosixPath("crates/carrick-kernel/src/kernel/tests.rs"),
     }
 )
 TEST_SOURCE_PARENTS = {
-    PurePosixPath("crates/carrick-runtime/src/dispatch/fs/tests.rs"): PurePosixPath(
-        "crates/carrick-runtime/src/dispatch/fs.rs"
+    PurePosixPath("crates/carrick-kernel/src/dispatch/fs/tests.rs"): PurePosixPath(
+        "crates/carrick-kernel/src/dispatch/fs.rs"
     ),
-    PurePosixPath("crates/carrick-runtime/src/dispatch/mem/tests.rs"): PurePosixPath(
-        "crates/carrick-runtime/src/dispatch/mem.rs"
+    PurePosixPath("crates/carrick-kernel/src/dispatch/mem/tests.rs"): PurePosixPath(
+        "crates/carrick-kernel/src/dispatch/mem.rs"
     ),
-    PurePosixPath("crates/carrick-runtime/src/dispatch/tests.rs"): PurePosixPath(
-        "crates/carrick-runtime/src/dispatch/mod.rs"
+    PurePosixPath("crates/carrick-kernel/src/dispatch/tests.rs"): PurePosixPath(
+        "crates/carrick-kernel/src/dispatch/mod.rs"
     ),
-    PurePosixPath("crates/carrick-runtime/src/file_authority/tests.rs"): PurePosixPath(
-        "crates/carrick-runtime/src/file_authority/mod.rs"
+    PurePosixPath("crates/carrick-kernel/src/file_authority/tests.rs"): PurePosixPath(
+        "crates/carrick-kernel/src/file_authority/mod.rs"
     ),
-    PurePosixPath("crates/carrick-runtime/src/kernel/tests.rs"): PurePosixPath(
-        "crates/carrick-runtime/src/kernel/mod.rs"
+    PurePosixPath("crates/carrick-kernel/src/kernel/tests.rs"): PurePosixPath(
+        "crates/carrick-kernel/src/kernel/mod.rs"
     ),
 }
 
@@ -209,12 +209,12 @@ CARRIER_SUBSTRATE_LIMITS = {
         "ptrace",
     ): 3,
     (
-        PurePosixPath("crates/carrick-runtime/src/container.rs"),
+        PurePosixPath("crates/carrick-kernel/src/container.rs"),
         "pid_alive",
         "kill_probe",
     ): 1,
     (
-        PurePosixPath("crates/carrick-runtime/src/kernel/debug/endpoint.rs"),
+        PurePosixPath("crates/carrick-kernel/src/kernel/debug/endpoint.rs"),
         "process_is_alive",
         "kill_probe",
     ): 1,

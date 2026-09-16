@@ -17,7 +17,7 @@ use crate::{
     AuditObserver, ContainerBuilder, ContainerResult, EmbedError, ImageStore, PullPolicy,
     SyscallInterceptor, SyscallObserver,
 };
-use carrick_runtime::observe::KernelAuditor;
+use carrick_kernel::observe::KernelAuditor;
 
 /// Read-only lifecycle telemetry for Carrick's own signed topology tests.
 /// This is not part of the stable embedding API.
@@ -214,7 +214,7 @@ impl TestContainer {
     /// process the moment it is called, so the capture lands there even if the
     /// abort fires before this container's builder is materialised.
     pub fn post_mortem_dir(self, dir: impl Into<std::path::PathBuf>) -> Self {
-        carrick_runtime::kernel::debug::PostMortem::install_dir(dir.into());
+        carrick_kernel::kernel::debug::PostMortem::install_dir(dir.into());
         self
     }
 
@@ -633,9 +633,9 @@ impl SyscallJitter {
 impl SyscallInterceptor for SyscallJitter {
     fn intercept(
         &self,
-        _process: &carrick_runtime::observe::ProcessInfo<'_>,
-        call: &carrick_runtime::observe::InterceptedSyscall<'_>,
-    ) -> carrick_runtime::observe::InterceptAction {
+        _process: &carrick_kernel::observe::ProcessInfo<'_>,
+        call: &carrick_kernel::observe::InterceptedSyscall<'_>,
+    ) -> carrick_kernel::observe::InterceptAction {
         if self.names.contains(&call.name()) {
             let n = self
                 .matched
@@ -645,7 +645,7 @@ impl SyscallInterceptor for SyscallJitter {
                 std::thread::sleep(std::time::Duration::from_micros(micros));
             }
         }
-        carrick_runtime::observe::InterceptAction::Continue
+        carrick_kernel::observe::InterceptAction::Continue
     }
 }
 

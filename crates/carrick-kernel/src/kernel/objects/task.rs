@@ -137,13 +137,13 @@ fn saturating_fork_sibling_count_for_probe(count: usize) -> u32 {
 }
 
 #[derive(Debug)]
-pub(crate) struct ForkBarrierParticipants {
+pub struct ForkBarrierParticipants {
     siblings: BTreeSet<ThreadKey>,
     sibling_tids: Vec<carrick_hal::ThreadId>,
 }
 
 impl ForkBarrierParticipants {
-    pub(crate) fn requires_quiesce(&self) -> bool {
+    pub fn requires_quiesce(&self) -> bool {
         !self.siblings.is_empty()
     }
 
@@ -152,7 +152,7 @@ impl ForkBarrierParticipants {
         self.siblings.contains(&key)
     }
 
-    pub(crate) fn kick_participants(&self, kicker: &(impl carrick_hal::VcpuRegistry + ?Sized)) {
+    pub fn kick_participants(&self, kicker: &(impl carrick_hal::VcpuRegistry + ?Sized)) {
         for &tid in &self.sibling_tids {
             kicker.kick(tid);
         }
@@ -160,18 +160,18 @@ impl ForkBarrierParticipants {
 
     /// Exact durable sibling cardinality solely for the existing USDT probe.
     /// Fork admission and barrier control must use [`Self::requires_quiesce`].
-    pub(crate) fn initial_sibling_count_for_probe(&self) -> u32 {
+    pub fn initial_sibling_count_for_probe(&self) -> u32 {
         saturating_fork_sibling_count_for_probe(self.siblings.len())
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct CrashBarrierParticipants {
+pub struct CrashBarrierParticipants {
     siblings: BTreeSet<ThreadKey>,
 }
 
 impl CrashBarrierParticipants {
-    pub(crate) fn requires_quiesce(&self) -> bool {
+    pub fn requires_quiesce(&self) -> bool {
         self.siblings.iter().next().is_some()
     }
 
@@ -182,7 +182,7 @@ impl CrashBarrierParticipants {
 }
 
 #[derive(Debug)]
-pub(crate) struct ThreadExitParticipants {
+pub struct ThreadExitParticipants {
     survivors: BTreeSet<ThreadKey>,
 }
 
@@ -198,7 +198,7 @@ impl ThreadExitParticipants {
 }
 
 #[derive(Debug)]
-pub(crate) struct CrashCaptureParticipants {
+pub struct CrashCaptureParticipants {
     members: BTreeMap<ThreadKey, ThreadRef>,
 }
 
@@ -209,12 +209,12 @@ impl CrashCaptureParticipants {
 }
 
 #[derive(Debug)]
-pub(crate) struct CoreNoteParticipants {
+pub struct CoreNoteParticipants {
     members: BTreeSet<ThreadKey>,
 }
 
 impl CoreNoteParticipants {
-    pub(crate) fn required_note_count_for_probe(&self) -> u64 {
+    pub fn required_note_count_for_probe(&self) -> u64 {
         u64::try_from(self.members.len()).unwrap_or(u64::MAX)
     }
 }
@@ -236,7 +236,7 @@ impl TaskIdentity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct JobControlStopInvalidationGeneration(u64);
+pub struct JobControlStopInvalidationGeneration(u64);
 
 /// Non-forgeable authority for one exact settled ptrace stop.
 ///
@@ -244,7 +244,7 @@ pub(crate) struct JobControlStopInvalidationGeneration(u64);
 /// the same tracer establishes another settled stop before the consumer
 /// reaches its commit point.
 #[derive(Clone, Debug)]
-pub(crate) struct PtraceMemoryAccessWitness {
+pub struct PtraceMemoryAccessWitness {
     task: Arc<Task>,
     tracer: TaskKey,
     mm_id: MmId,
@@ -254,7 +254,7 @@ pub(crate) struct PtraceMemoryAccessWitness {
 /// Borrowed proof that one exact ptrace stop still authorizes text mutation of
 /// its exact MM. The value exists only while the target lifecycle/job-control
 /// locks are held by `with_revalidated_text` and is deliberately non-cloneable.
-pub(crate) struct PtraceTextAccess<'witness> {
+pub struct PtraceTextAccess<'witness> {
     mm_id: MmId,
     _witness: std::marker::PhantomData<&'witness mut ()>,
 }
@@ -277,7 +277,7 @@ impl PtraceMemoryAccessWitness {
         self.task.with_ptrace_memory_access(self, operation)
     }
 
-    pub(crate) fn with_revalidated_text<T>(
+    pub fn with_revalidated_text<T>(
         &self,
         mm_id: MmId,
         operation: impl for<'witness> FnOnce(PtraceTextAccess<'witness>) -> T,
@@ -340,18 +340,18 @@ fn clear_ptrace_transient_state(state: &mut TaskJobControl) {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PtraceStopSettlement {
+pub enum PtraceStopSettlement {
     NotPtraceStopped,
     Stopped,
     Resumed { signal: Option<LinuxSignal> },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PtraceSynchronousFault {
-    pub(crate) signal: LinuxSignal,
-    pub(crate) si_code: i32,
-    pub(crate) si_addr: u64,
-    pub(crate) interrupted_pc: Option<u64>,
+pub struct PtraceSynchronousFault {
+    pub signal: LinuxSignal,
+    pub si_code: i32,
+    pub si_addr: u64,
+    pub interrupted_pc: Option<u64>,
 }
 
 fn advance_job_control_stop_invalidation_generation(state: &mut TaskJobControl) {
@@ -375,7 +375,7 @@ fn advance_ptrace_stop_generation(state: &mut TaskJobControl) {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TaskJobControlEvent {
+pub enum TaskJobControlEvent {
     Stopped(LinuxSignal),
     Continued,
 }
@@ -1113,7 +1113,7 @@ impl Task {
         self.publish_wake(true)
     }
 
-    pub(crate) fn publish_wake_subscriptions(&self) -> bool {
+    pub fn publish_wake_subscriptions(&self) -> bool {
         self.publish_wake(false)
     }
 
@@ -1374,11 +1374,11 @@ impl Task {
         self.process_credentials.store(credentials);
     }
 
-    pub(crate) fn is_job_control_stopped(&self) -> bool {
+    pub fn is_job_control_stopped(&self) -> bool {
         self.job_control.lock().stopped_by.is_some()
     }
 
-    pub(crate) fn begin_ptrace_memory_access(
+    pub fn begin_ptrace_memory_access(
         self: &Arc<Self>,
         tracer: TaskKey,
     ) -> Result<PtraceMemoryAccessWitness, carrick_abi::LinuxErrno> {
@@ -1820,7 +1820,7 @@ impl Task {
         true
     }
 
-    pub(crate) fn shared(&self) -> Arc<TaskShared> {
+    pub fn shared(&self) -> Arc<TaskShared> {
         self.shared.load_full()
     }
 
@@ -1997,7 +1997,7 @@ impl Task {
         })
     }
 
-    pub(crate) fn threads(&self) -> Vec<ThreadRef> {
+    pub fn threads(&self) -> Vec<ThreadRef> {
         self.threads
             .lock()
             .values()
@@ -2005,7 +2005,7 @@ impl Task {
             .collect()
     }
 
-    pub(crate) fn fork_barrier_participants(
+    pub fn fork_barrier_participants(
         &self,
         owner: ThreadKey,
     ) -> Result<ForkBarrierParticipants, TaskParticipantError> {
@@ -2033,7 +2033,7 @@ impl Task {
         })
     }
 
-    pub(crate) fn crash_barrier_participants(
+    pub fn crash_barrier_participants(
         &self,
         fatal_owner: ThreadKey,
     ) -> Result<CrashBarrierParticipants, TaskParticipantError> {
@@ -2090,7 +2090,7 @@ impl Task {
         }
     }
 
-    pub(crate) fn core_note_participants(&self) -> CoreNoteParticipants {
+    pub fn core_note_participants(&self) -> CoreNoteParticipants {
         CoreNoteParticipants {
             members: self.threads.lock().values().map(|(key, _)| *key).collect(),
         }

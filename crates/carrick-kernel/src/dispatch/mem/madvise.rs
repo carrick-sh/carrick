@@ -12,7 +12,7 @@ use carrick_abi::{
 };
 
 /// Describes the VMA coverage and attributes of a requested address range for `madvise`.
-pub(crate) struct MadviseRangeMeta {
+pub struct MadviseRangeMeta {
     pub(crate) fully_mapped: bool,
     pub(crate) covered: Vec<MadviseCoveredSegment>,
     pub(crate) writable: bool,
@@ -24,7 +24,7 @@ pub(crate) struct MadviseRangeMeta {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct MadviseCoveredSegment {
+pub struct MadviseCoveredSegment {
     pub(crate) start: u64,
     pub(crate) end: u64,
     pub(crate) prot: LinuxProtFlags,

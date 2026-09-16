@@ -15,7 +15,7 @@
 //! kernel's exec rewrite; the flags are retained because they document the
 //! canonical registration and gate faithful behaviors (e.g. `preserve_argv0`).
 
-use crate::dispatch::rosetta::ROSETTA_INTERPRETER;
+use carrick_kernel::dispatch::rosetta::ROSETTA_INTERPRETER;
 
 /// `binfmt_misc` invocation flags (the subset carrick models).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

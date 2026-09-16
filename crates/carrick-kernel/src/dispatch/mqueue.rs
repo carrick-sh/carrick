@@ -130,7 +130,7 @@ pub enum MqueueNotify {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct MqueueRegistration {
+pub struct MqueueRegistration {
     file_table: crate::kernel::FileTableId,
     description: crate::kernel::FileDescriptionId,
 }
@@ -374,12 +374,12 @@ impl MqueueInner {
     }
 }
 
-pub(crate) enum MqueueChangeEnrollment {
+pub enum MqueueChangeEnrollment {
     Ready,
     Subscribed(MqueueChangeSubscription),
 }
 
-pub(crate) struct MqueueChangeSubscription {
+pub struct MqueueChangeSubscription {
     listeners: Weak<MqueueChangeListenerRegistry>,
     id: u64,
 }
@@ -463,13 +463,13 @@ impl PartialEq for BlockingMqueue {
 impl Eq for BlockingMqueue {}
 
 #[derive(Debug)]
-pub(crate) enum BlockingMqueueStep {
+pub enum BlockingMqueueStep {
     Done(DispatchOutcome),
     Wait(BlockingMqueue),
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct MqueueWaitPlan {
+pub struct MqueueWaitPlan {
     pub(crate) deadline: Option<std::time::Instant>,
     pub(crate) queue_generation: u64,
     pub(crate) clock_generation: u64,
@@ -1520,7 +1520,7 @@ impl BlockingMqueue {
         }
     }
 
-    pub(crate) fn complete<M: CurrentMmMemory>(
+    pub fn complete<M: CurrentMmMemory>(
         self,
         dispatcher: &SyscallDispatcher,
         kernel: &crate::kernel::KernelContext,
@@ -1537,10 +1537,8 @@ impl BlockingMqueue {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn blocking_mqueue_for_continuation_test(
-    tid: crate::thread::ThreadId,
-) -> BlockingMqueue {
+#[cfg(any(test, feature = "test-support"))]
+pub fn blocking_mqueue_for_continuation_test(tid: crate::thread::ThreadId) -> BlockingMqueue {
     BlockingMqueue {
         queue: Arc::new(MqueueInner::new(1, 8, 0)),
         clock: Arc::new(crate::kernel::container::ClockDomain::system()),
@@ -1885,7 +1883,8 @@ mod tests {
     #[test]
     fn closing_a_plain_fd_never_walks_the_file_table() {
         let dispatcher = Arc::new(SyscallDispatcher::new());
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_020);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_020).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let context = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
@@ -2131,7 +2130,8 @@ mod tests {
     #[test]
     fn last_mqueue_description_close_clears_registration_for_replacement_generation() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_010);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_010).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let owner = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
@@ -2165,7 +2165,8 @@ mod tests {
     #[test]
     fn dup_keeps_registration_until_last_description_reference_closes() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_011);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_011).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let owner = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
@@ -2195,7 +2196,8 @@ mod tests {
     #[test]
     fn closing_thread_registration_releases_retained_netlink_reference() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_012);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_012).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let owner = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
@@ -2226,7 +2228,8 @@ mod tests {
     #[test]
     fn another_description_for_same_queue_cannot_unregister_owner() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_013);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_013).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let owner = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
@@ -2255,7 +2258,8 @@ mod tests {
     #[test]
     fn registration_holds_description_read_lock_until_queue_publication() {
         let dispatcher = Arc::new(SyscallDispatcher::new());
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_014);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_014).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let owner = dispatcher.capture_one_task_context().unwrap();
         let close_context = dispatcher.capture_one_task_context().unwrap();
@@ -2322,7 +2326,8 @@ mod tests {
     #[test]
     fn copied_file_table_owner_exit_purges_registration_despite_parent_description_ref() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_015);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_015).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let parent = dispatcher.capture_one_task_context().unwrap();
         let parent_binding = parent.task_binding();
@@ -2393,7 +2398,8 @@ mod tests {
     #[test]
     fn copied_file_table_thread_exit_closes_owner_registration_exactly_once() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_031);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_031).expect("test carrier process");
         let process = Arc::new(process);
         dispatcher.bind_hvpatch_process(process.clone());
         let leader = dispatcher.capture_one_task_context().unwrap();
@@ -2474,7 +2480,8 @@ mod tests {
     #[test]
     fn shared_file_table_survives_nonfinal_thread_exit() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_032);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_032).expect("test carrier process");
         let process = Arc::new(process);
         dispatcher.bind_hvpatch_process(process.clone());
         let leader = dispatcher.capture_one_task_context().unwrap();
@@ -2530,7 +2537,8 @@ mod tests {
     #[test]
     fn inherited_parent_close_does_not_clear_child_registration() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_017);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_017).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let parent = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
@@ -2560,7 +2568,8 @@ mod tests {
     #[test]
     fn cloexec_last_owner_alias_clears_with_parent_global_reference() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_018);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_018).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let parent = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
@@ -2600,7 +2609,8 @@ mod tests {
     #[test]
     fn exec_transfer_rebinds_registration_to_successor_file_table() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_019);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_019).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let parent = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
@@ -2637,7 +2647,8 @@ mod tests {
     #[test]
     fn shared_table_peer_close_in_exec_commit_window_rebinds_exact_owner() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_021);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_021).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let parent = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
@@ -2684,7 +2695,8 @@ mod tests {
     #[test]
     fn shared_file_table_owner_exit_purges_without_closing_shared_alias() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_020);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_020).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let parent = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x7000]);
@@ -2743,7 +2755,8 @@ mod tests {
     #[test]
     fn hvpatch_cross_task_signal_targets_exact_registrant_with_sender_identity() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_001);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_001).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let registrant = dispatcher.capture_one_task_context().unwrap();
         let arena = Box::leak(Box::new(
@@ -2848,7 +2861,8 @@ mod tests {
     #[test]
     fn hvpatch_thread_notification_keeps_registrants_exact_netlink_description() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_002);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_002).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let registrant = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x7000]);
@@ -2918,7 +2932,8 @@ mod tests {
     #[test]
     fn hvpatch_unregister_and_delivery_never_follow_reused_pid() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_003);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_003).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let root = dispatcher.capture_one_task_context().unwrap();
         let root_binding = root.task_binding();
@@ -3134,7 +3149,8 @@ mod tests {
     #[test]
     fn blocking_mqueue_receive_subscribes_then_completes_captured_copyout() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_040);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_040).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let context = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x9000]);
@@ -3223,7 +3239,8 @@ mod tests {
     #[test]
     fn blocking_mqueue_send_completes_with_captured_payload_after_space_wake() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_043);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_043).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let context = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x9000]);
@@ -3288,7 +3305,8 @@ mod tests {
     #[test]
     fn blocking_mqueue_timeout_and_cancel_settle_receiver_with_stale_clone() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_041);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_041).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let context = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x9000]);

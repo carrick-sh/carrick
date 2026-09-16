@@ -9,7 +9,7 @@ use super::{SyscallDispatcher, close_open_file, resources};
 /// How carrick's own kernel graph sees a guest-supplied pid that names some
 /// OTHER Linux process. See [`SyscallDispatcher::guest_process_target`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GuestProcessTarget {
+pub enum GuestProcessTarget {
     /// A live Linux process, running as `euid`.
     Live { euid: carrick_abi::NsUid },
     /// Exited but not yet reaped — still addressable, still owned by the `euid`
@@ -66,7 +66,7 @@ pub(crate) fn bootstrap_one_task_binding(
 }
 
 impl SyscallDispatcher {
-    pub(crate) fn launch_fs_context_for_hvpatch_bind(
+    pub fn launch_fs_context_for_hvpatch_bind(
         &self,
     ) -> Result<Option<(String, Option<String>)>, crate::kernel::KernelError> {
         if self.hvpatch_process().is_some() {
@@ -85,7 +85,7 @@ impl SyscallDispatcher {
         )))
     }
 
-    pub(crate) fn bind_hvpatch_process(&self, process: Arc<dyn crate::kernel::CarrierProcess>) {
+    pub fn bind_hvpatch_process(&self, process: Arc<dyn crate::kernel::CarrierProcess>) {
         let launch_fs_context = self
             .launch_fs_context_for_hvpatch_bind()
             .unwrap_or_else(|error| {
@@ -111,7 +111,7 @@ impl SyscallDispatcher {
     /// by its kernel transaction. This avoids recapturing through the registry
     /// before a later root's atomic commit, while preserving every dispatcher
     /// mount, interceptor, observer and filesystem setting already installed.
-    pub(crate) fn bind_hvpatch_process_exact(
+    pub fn bind_hvpatch_process_exact(
         &self,
         process: Arc<dyn crate::kernel::CarrierProcess>,
         process_context: &crate::kernel::KernelContext,
@@ -156,7 +156,7 @@ impl SyscallDispatcher {
     /// Run lifecycle work with credentials from the already captured syscall
     /// boundary. This extends that exact context across deferred exec loading;
     /// it never consults the current registry binding or substitutes a leader.
-    pub(crate) fn with_kernel_credentials<R>(
+    pub fn with_kernel_credentials<R>(
         &self,
         context: &crate::kernel::KernelContext,
         operation: impl FnOnce() -> R,
@@ -168,7 +168,7 @@ impl SyscallDispatcher {
     /// graph. Logical exec uses this after target-user/workdir configuration so
     /// credential, file-table, filesystem-context, MM, PATH, and image reads
     /// cannot fall back to a leader or ambient dispatcher binding.
-    pub(crate) fn with_kernel_resources<R>(
+    pub fn with_kernel_resources<R>(
         &self,
         context: &crate::kernel::KernelContext,
         operation: impl FnOnce() -> R,
@@ -176,14 +176,14 @@ impl SyscallDispatcher {
         resources::with_captured_resources(context, operation)
     }
 
-    pub(crate) fn prepare_one_task_kernel_exec(
+    pub fn prepare_one_task_kernel_exec(
         &self,
         context: &crate::kernel::KernelContext,
     ) -> Result<crate::kernel::PreparedExec, crate::kernel::ExecPrepareError> {
         Ok(context.kernel().prepare_exec(context, None)?)
     }
 
-    pub(crate) fn commit_one_task_kernel_exec(
+    pub fn commit_one_task_kernel_exec(
         &self,
         prepared: crate::kernel::PreparedExec,
     ) -> Result<crate::kernel::KernelContext, crate::kernel::ExecPrepareError> {
@@ -202,7 +202,7 @@ impl SyscallDispatcher {
         Ok(context)
     }
 
-    pub(crate) fn close_draining_file_table(
+    pub fn close_draining_file_table(
         &self,
         kernel: &Arc<crate::kernel::Kernel>,
         files: &Arc<crate::kernel::FileTable>,
@@ -255,7 +255,7 @@ impl SyscallDispatcher {
         });
     }
 
-    pub(crate) fn reset_one_task_kernel_binding_for_current_process(
+    pub fn reset_one_task_kernel_binding_for_current_process(
         &self,
         inherited: &crate::kernel::KernelContext,
         registry_id: crate::thread::ThreadId,
@@ -326,7 +326,7 @@ impl SyscallDispatcher {
     /// kernel's root task id is currently seeded from the host pid. That is a
     /// second source of truth for the same fact, and it would break silently
     /// the moment the id space is reseeded — so it asks the binding instead.
-    pub(crate) fn root_leader_linux_tid(&self) -> crate::kernel::LinuxTid {
+    pub fn root_leader_linux_tid(&self) -> crate::kernel::LinuxTid {
         let binding = self.kernel_binding.read();
         crate::kernel::LinuxTid::for_task_leader(binding.task_id())
     }
@@ -453,7 +453,7 @@ impl SyscallDispatcher {
     /// lifetime cannot rely on host `_exit`. After Kernel exit publication has
     /// made this exact table generation draining, consume its typed close
     /// events without erasing the rows retained for coherent snapshots.
-    pub(crate) fn retire_hvpatch_process_fds(&self, context: &crate::kernel::KernelContext) {
+    pub fn retire_hvpatch_process_fds(&self, context: &crate::kernel::KernelContext) {
         let owner = context.task().key();
         self.fs.classic_record_locks.release_owner(owner);
         let files = self.file_table_for_context(context);

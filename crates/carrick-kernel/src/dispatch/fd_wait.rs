@@ -20,7 +20,7 @@ const LINUX_POLLFD_REVENTS_OFFSET: u64 =
     core::mem::offset_of!(carrick_abi::LinuxPollFd, revents) as u64;
 
 #[derive(Clone, Debug)]
-pub(crate) struct RetainedPollFd {
+pub struct RetainedPollFd {
     pub(crate) guest_fd: i32,
     pub(crate) events: i16,
     pub(crate) address: u64,
@@ -32,14 +32,14 @@ pub(crate) struct RetainedPollFd {
 /// Keeping those cases distinct prevents a bare stdin wait from becoming
 /// permanently unreadable merely because it has no table slot.
 #[derive(Clone, Debug)]
-pub(crate) enum RetainedFdSource {
+pub enum RetainedFdSource {
     Leased(FileDescriptionFdLease),
     BareStdio,
     Negative,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum BlockingFdWaitKind {
+pub enum BlockingFdWaitKind {
     Poll {
         entries: Vec<RetainedPollFd>,
     },
@@ -52,14 +52,14 @@ pub(crate) enum BlockingFdWaitKind {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RetainedSelectFd {
+pub struct RetainedSelectFd {
     pub(crate) fd: i32,
     pub(crate) requested: u8,
     pub(crate) source: RetainedFdSource,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RetainedFdSet {
+pub struct RetainedFdSet {
     pub(crate) address: u64,
     pub(crate) input: Vec<u8>,
 }
@@ -68,7 +68,7 @@ pub(crate) struct RetainedFdSet {
 /// admitted.  Reactor registrations clone this `Arc`; they must never reopen
 /// or duplicate the raw target when a retained operation re-parks.
 #[derive(Clone, Debug)]
-pub(crate) struct RetainedFdRegistration {
+pub struct RetainedFdRegistration {
     pub(crate) fd: Arc<OwnedFd>,
     pub(crate) events: i16,
 }
@@ -95,7 +95,7 @@ impl PartialEq for BlockingFdWait {
 impl Eq for BlockingFdWait {}
 
 #[derive(Debug)]
-pub(crate) enum BlockingFdWaitStep {
+pub enum BlockingFdWaitStep {
     Done(DispatchOutcome),
     Wait(BlockingFdWait),
 }
@@ -179,7 +179,7 @@ impl BlockingFdWait {
         }
     }
 
-    pub(crate) fn complete(
+    pub fn complete(
         self,
         memory: &mut impl CurrentMmMemory,
         dispatcher: &SyscallDispatcher,

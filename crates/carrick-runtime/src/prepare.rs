@@ -28,8 +28,6 @@ use std::sync::Arc;
 use camino::Utf8PathBuf;
 use carrick_spec::{FsBackendKind, InitialIdentity, PidMode, Platform, RunSpec, StdioMode};
 
-pub use crate::dispatch::StdioSink;
-use crate::dispatch::SyscallDispatcher;
 use crate::execute::{
     HostRootLayout, cached_lower_enabled, detached_stable_scratch_path, effective_guest_hostname,
     entrypoint_not_executable_result, entrypoint_not_found_result, install_rosetta_mounts,
@@ -37,11 +35,13 @@ use crate::execute::{
     record_detached_scratch, rosetta_license_notice, seed_guest_baseline,
 };
 use crate::interactive_supervisor::InteractiveSession;
-use crate::kernel::container::LaunchContext;
-use crate::network::RuntimeNetwork;
 #[cfg(feature = "platform-macos")]
 use crate::runtime::{RunElfExecutionOptions, run_elf_from_dispatcher_debug_on};
 use crate::runtime::{RunResult, RuntimeError};
+pub use carrick_kernel::dispatch::StdioSink;
+use carrick_kernel::dispatch::SyscallDispatcher;
+use carrick_kernel::kernel::container::LaunchContext;
+use carrick_kernel::network::RuntimeNetwork;
 use carrick_vfs::fs_backend::{FsBackend, HostFsBackend};
 use carrick_vfs::{BindVfs, HostResolverSnapshot, Vfs};
 
@@ -52,7 +52,7 @@ pub struct Runtime;
 /// the verbatim environment. Owns the [`LaunchContext`].
 pub struct ExecutionPlan {
     launch: LaunchContext,
-    page: crate::page_profile::ExecutionPlan,
+    page: carrick_kernel::page_profile::ExecutionPlan,
     host_resolver: Option<HostResolverSnapshot>,
     network: Arc<RuntimeNetwork>,
     env: Vec<String>,
@@ -65,10 +65,10 @@ impl ExecutionPlan {
 }
 
 pub fn resolve_plan(spec: &RunSpec, launch: LaunchContext) -> Result<ExecutionPlan, RuntimeError> {
-    let page = crate::page_profile::resolve_execution_plan(spec)?;
+    let page = carrick_kernel::page_profile::resolve_execution_plan(spec)?;
     debug_assert_eq!(
         page.page_geometry.linux_page_size,
-        crate::page_profile::DEFAULT_LINUX_PAGE_SIZE
+        carrick_kernel::page_profile::DEFAULT_LINUX_PAGE_SIZE
     );
     let host_resolver = HostResolverSnapshot::capture_for_network(&spec.network.namespace)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
@@ -76,7 +76,7 @@ pub fn resolve_plan(spec: &RunSpec, launch: LaunchContext) -> Result<ExecutionPl
     // ps/Activity Monitor even before the guest sets its own comm via prctl.
     {
         let cmdline = spec.process.argv.join(" ");
-        crate::dispatch::set_host_process_name(cmdline.as_bytes());
+        carrick_kernel::dispatch::set_host_process_name(cmdline.as_bytes());
     }
     let network = Arc::new(
         RuntimeNetwork::create(&spec.network.namespace)
@@ -102,12 +102,12 @@ pub fn resolve_plan(spec: &RunSpec, launch: LaunchContext) -> Result<ExecutionPl
 pub struct RuntimeExtensions {
     vfs_mounts: Vec<(Utf8PathBuf, Box<dyn Vfs>)>,
     stdio: Option<StdioSink>,
-    observers: Vec<Arc<dyn crate::observe::SyscallObserver>>,
-    interceptors: Vec<Arc<dyn crate::observe::SyscallInterceptor>>,
-    time: Option<crate::kernel::container::TimeControl>,
+    observers: Vec<Arc<dyn carrick_kernel::observe::SyscallObserver>>,
+    interceptors: Vec<Arc<dyn carrick_kernel::observe::SyscallInterceptor>>,
+    time: Option<carrick_kernel::kernel::container::TimeControl>,
     scheduler: Option<Arc<dyn carrick_hal::SchedulingPolicy>>,
-    budget: Option<Arc<crate::observe::ResourceBudget>>,
-    network_interposer: Option<crate::network::interposer::NetworkInterposer>,
+    budget: Option<Arc<carrick_kernel::observe::ResourceBudget>>,
+    network_interposer: Option<carrick_kernel::network::interposer::NetworkInterposer>,
 }
 
 impl RuntimeExtensions {
@@ -128,7 +128,7 @@ impl RuntimeExtensions {
     }
 
     /// Register a syscall observer to receive lifecycle and syscall events.
-    pub fn observer(mut self, observer: Arc<dyn crate::observe::SyscallObserver>) -> Self {
+    pub fn observer(mut self, observer: Arc<dyn carrick_kernel::observe::SyscallObserver>) -> Self {
         self.observers.push(observer);
         self
     }
@@ -136,7 +136,7 @@ impl RuntimeExtensions {
     /// Register multiple syscall observers.
     pub fn observers<I>(mut self, observers: I) -> Self
     where
-        I: IntoIterator<Item = Arc<dyn crate::observe::SyscallObserver>>,
+        I: IntoIterator<Item = Arc<dyn carrick_kernel::observe::SyscallObserver>>,
     {
         self.observers.extend(observers);
         self
@@ -146,7 +146,10 @@ impl RuntimeExtensions {
     ///
     /// Interceptors run in registration order and may rewrite only the six
     /// scalar argument words or propose a terminal return/errno.
-    pub fn interceptor(mut self, interceptor: Arc<dyn crate::observe::SyscallInterceptor>) -> Self {
+    pub fn interceptor(
+        mut self,
+        interceptor: Arc<dyn carrick_kernel::observe::SyscallInterceptor>,
+    ) -> Self {
         self.interceptors.push(interceptor);
         self
     }
@@ -154,14 +157,14 @@ impl RuntimeExtensions {
     /// Register multiple trusted syscall interceptors in iterator order.
     pub fn interceptors<I>(mut self, interceptors: I) -> Self
     where
-        I: IntoIterator<Item = Arc<dyn crate::observe::SyscallInterceptor>>,
+        I: IntoIterator<Item = Arc<dyn carrick_kernel::observe::SyscallInterceptor>>,
     {
         self.interceptors.extend(interceptors);
         self
     }
 
     /// Attach a fault injector to simulate syscall and I/O failures.
-    pub fn fault_injector(self, injector: crate::observe::FaultInjector) -> Self {
+    pub fn fault_injector(self, injector: carrick_kernel::observe::FaultInjector) -> Self {
         self.observer(Arc::new(injector))
     }
 
@@ -178,13 +181,13 @@ impl RuntimeExtensions {
         self
     }
 
-    pub fn time(mut self, control: crate::kernel::container::TimeControl) -> Self {
+    pub fn time(mut self, control: carrick_kernel::kernel::container::TimeControl) -> Self {
         self.time = Some(control);
         self
     }
 
     /// Attach a resource budget quota to the container.
-    pub fn resource_budget(mut self, budget: crate::observe::ResourceBudget) -> Self {
+    pub fn resource_budget(mut self, budget: carrick_kernel::observe::ResourceBudget) -> Self {
         self.budget = Some(Arc::new(budget));
         self
     }
@@ -192,7 +195,7 @@ impl RuntimeExtensions {
     /// Register a network interposer to mock or intercept outbound guest connections.
     pub fn network_interposer(
         mut self,
-        interposer: crate::network::interposer::NetworkInterposer,
+        interposer: carrick_kernel::network::interposer::NetworkInterposer,
     ) -> Self {
         self.network_interposer = Some(interposer);
         self
@@ -262,7 +265,7 @@ fn configure_page_geometry(dispatcher: &mut SyscallDispatcher, plan: &ExecutionP
 fn configure_identity_and_policy(
     dispatcher: &mut SyscallDispatcher,
     spec: &RunSpec,
-    container: &crate::kernel::Container,
+    container: &carrick_kernel::kernel::Container,
     credentials: (carrick_abi::NsUid, carrick_abi::NsGid),
 ) {
     if let Some(cwd) = &spec.process.cwd {
@@ -420,7 +423,7 @@ fn layer_paths(spec: &RunSpec) -> Vec<PathBuf> {
 fn prepare_host_backend(
     spec: &RunSpec,
     plan: &ExecutionPlan,
-    container: &Arc<crate::kernel::Container>,
+    container: &Arc<carrick_kernel::kernel::Container>,
 ) -> Result<SyscallDispatcher, RuntimeError> {
     let exec_overlay = container.launch().exec_overlay.as_deref();
     let managed_scratch = match exec_overlay {
@@ -543,7 +546,7 @@ fn prepare_host_backend(
 fn prepare_memory_backend(
     spec: &RunSpec,
     plan: &ExecutionPlan,
-    container: &Arc<crate::kernel::Container>,
+    container: &Arc<carrick_kernel::kernel::Container>,
 ) -> Result<(SyscallDispatcher, carrick_vfs::rootfs::RootFs), RuntimeError> {
     let rootfs = carrick_vfs::rootfs::RootFs::from_layer_paths(&layer_paths(spec))
         .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to compose rootfs: {e}")))?;
@@ -683,7 +686,7 @@ fn prepare_with_lease(
     };
 
     let guest_hostname = effective_guest_hostname(spec);
-    let mut container = crate::kernel::Container::new_with_namespaces(
+    let mut container = carrick_kernel::kernel::Container::new_with_namespaces(
         plan.launch.clone(),
         plan.network.model.clone(),
         guest_hostname.as_ref(),
@@ -700,7 +703,7 @@ fn prepare_with_lease(
     match spec.process.pid {
         PidMode::Host => {}
         PidMode::Private => {
-            let region = crate::namespace::pid::NsSharedRegion::allocate(
+            let region = carrick_kernel::namespace::pid::NsSharedRegion::allocate(
                 carrick_kernel_arena::arena::KernelArena::global(),
             )
             .map_err(|e| {
@@ -782,9 +785,9 @@ fn classify_run_outcome(
         Err(e) if is_entrypoint_not_found(&e) => Ok(entrypoint_not_found_result()),
         Err(e) if is_entrypoint_not_executable(&e) => Ok(entrypoint_not_executable_result()),
         Err(
-            e @ RuntimeError::Dispatch(crate::dispatch::DispatchError::InterceptorPanicked {
-                ..
-            }),
+            e @ RuntimeError::Dispatch(
+                carrick_kernel::dispatch::DispatchError::InterceptorPanicked { .. },
+            ),
         ) => Err(e),
         Err(e @ RuntimeError::Configuration(_)) => Err(e),
         // The kernel-abort sink carries the ONLY copy of the post-mortem. A
@@ -898,20 +901,22 @@ mod tests {
 
     struct ContinueInterceptor;
 
-    impl crate::observe::SyscallInterceptor for ContinueInterceptor {
+    impl carrick_kernel::observe::SyscallInterceptor for ContinueInterceptor {
         fn intercept(
             &self,
-            _process: &crate::observe::ProcessInfo<'_>,
-            _call: &crate::observe::InterceptedSyscall<'_>,
-        ) -> crate::observe::InterceptAction {
-            crate::observe::InterceptAction::Continue
+            _process: &carrick_kernel::observe::ProcessInfo<'_>,
+            _call: &carrick_kernel::observe::InterceptedSyscall<'_>,
+        ) -> carrick_kernel::observe::InterceptAction {
+            carrick_kernel::observe::InterceptAction::Continue
         }
     }
 
     #[test]
     fn runtime_extensions_preserve_interceptor_registration_order() {
-        let first: Arc<dyn crate::observe::SyscallInterceptor> = Arc::new(ContinueInterceptor);
-        let second: Arc<dyn crate::observe::SyscallInterceptor> = Arc::new(ContinueInterceptor);
+        let first: Arc<dyn carrick_kernel::observe::SyscallInterceptor> =
+            Arc::new(ContinueInterceptor);
+        let second: Arc<dyn carrick_kernel::observe::SyscallInterceptor> =
+            Arc::new(ContinueInterceptor);
 
         let extensions = RuntimeExtensions::default()
             .interceptor(Arc::clone(&first))
@@ -924,16 +929,18 @@ mod tests {
 
     #[test]
     fn run_outcome_preserves_typed_interceptor_panics() {
-        let expected = crate::kernel::container::ContainerId::allocate();
-        let panic = RuntimeError::Dispatch(crate::dispatch::DispatchError::InterceptorPanicked {
-            container_id: expected,
-        });
+        let expected = carrick_kernel::kernel::container::ContainerId::allocate();
+        let panic = RuntimeError::Dispatch(
+            carrick_kernel::dispatch::DispatchError::InterceptorPanicked {
+                container_id: expected,
+            },
+        );
 
         let error = classify_run_outcome(Err(panic), "test launch")
             .expect_err("interceptor panic must remain an infrastructure error");
         assert!(matches!(
             error,
-            RuntimeError::Dispatch(crate::dispatch::DispatchError::InterceptorPanicked {
+            RuntimeError::Dispatch(carrick_kernel::dispatch::DispatchError::InterceptorPanicked {
                 container_id,
             }) if container_id == expected
         ));

@@ -236,7 +236,7 @@ fn main() -> anyhow::Result<()> {
     // FIRST statement: the exec-stamp gauge measures kernel exec + dyld +
     // static initializers as `pre-exec -> main-entry`, so nothing may run
     // before it (env-gated; one getenv when off).
-    carrick_runtime::exec_stamps::stamp(carrick_runtime::exec_stamps::ExecStampPhase::MainEntry);
+    carrick_kernel::exec_stamps::stamp(carrick_kernel::exec_stamps::ExecStampPhase::MainEntry);
     seed_vm_lifecycle_command_identity()?;
     #[cfg(feature = "alloc-census")]
     start_alloc_census();
@@ -255,7 +255,7 @@ fn main() -> anyhow::Result<()> {
         0,
         0,
     );
-    carrick_runtime::exec_stamps::stamp(carrick_runtime::exec_stamps::ExecStampPhase::ProbesReady);
+    carrick_kernel::exec_stamps::stamp(carrick_kernel::exec_stamps::ExecStampPhase::ProbesReady);
 
     run_cli(Cli::parse())
 }

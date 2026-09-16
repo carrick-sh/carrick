@@ -31,7 +31,7 @@ pub enum SignalTargetAuthorization {
 /// inspected. The allowed ticket's fields stay private so a bare numeric PID
 /// cannot be substituted between policy and enqueue.
 #[derive(Debug)]
-pub(crate) enum ExactSignalTargetAuthorization {
+pub enum ExactSignalTargetAuthorization {
     Allowed(AuthorizedSignalTarget),
     DropProtectedInit,
     Denied,
@@ -39,14 +39,14 @@ pub(crate) enum ExactSignalTargetAuthorization {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExactThreadSignalPost {
+pub enum ExactThreadSignalPost {
     Posted(Option<ThreadKey>),
     Missing,
     QueueFull,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CarrierControlSignalPost {
+pub enum CarrierControlSignalPost {
     Posted,
     AcceptedProtectedInit,
     Missing,
@@ -59,7 +59,7 @@ impl ExactThreadSignalPost {
 }
 
 #[derive(Debug)]
-pub(crate) struct AuthorizedSignalTarget {
+pub struct AuthorizedSignalTarget {
     domain: Arc<KernelDomain>,
     task: Weak<Task>,
     thread: Option<Weak<crate::kernel::objects::Thread>>,
@@ -107,7 +107,7 @@ impl Kernel {
     /// returned ticket weakly binds the exact objects inspected here; posting
     /// through it fails if that generation exits and can never follow a reused
     /// numeric PID/TID to a different process.
-    pub(crate) fn authorize_signal_target_exact(
+    pub fn authorize_signal_target_exact(
         &self,
         caller: &KernelContext,
         target_task: TaskKey,
@@ -188,7 +188,7 @@ impl Kernel {
     /// Apply a default-stop action to one live Linux task without signaling
     /// the host carrier process. The target's vCPU threads and its parent wait
     /// vehicle are woken only after the task-scoped state is published.
-    pub(crate) fn stop_task_for_job_control(
+    pub fn stop_task_for_job_control(
         &self,
         target: TaskId,
         signal: LinuxSignal,
@@ -221,7 +221,7 @@ impl Kernel {
     /// current parent generation. HVPatch tasks share one host process, so
     /// this relation must live in the guest task graph rather than Darwin's
     /// process-wide ptrace state.
-    pub(crate) fn claim_ptrace_traceme(&self, context: &KernelContext) -> bool {
+    pub fn claim_ptrace_traceme(&self, context: &KernelContext) -> bool {
         if !context.kernel().task_key_is_live(context.task().key()) {
             return false;
         }
@@ -351,7 +351,7 @@ impl Kernel {
         task.begin_ptrace_memory_access(tracer)
     }
 
-    pub(crate) fn stop_task_for_ptrace(&self, target: TaskId, signal: LinuxSignal) -> bool {
+    pub fn stop_task_for_ptrace(&self, target: TaskId, signal: LinuxSignal) -> bool {
         let task = {
             let state = self.registry().state.read();
             let Some(record) = state.tasks.get(&target) else {
@@ -407,10 +407,7 @@ impl Kernel {
         true
     }
 
-    pub(crate) fn take_ptrace_resume_fault(
-        &self,
-        target: TaskId,
-    ) -> Option<PtraceSynchronousFault> {
+    pub fn take_ptrace_resume_fault(&self, target: TaskId) -> Option<PtraceSynchronousFault> {
         self.registry()
             .state
             .read()
@@ -442,7 +439,7 @@ impl Kernel {
         true
     }
 
-    pub(crate) fn settle_task_ptrace_stop(&self, target: TaskId) -> PtraceStopSettlement {
+    pub fn settle_task_ptrace_stop(&self, target: TaskId) -> PtraceStopSettlement {
         let task = {
             let state = self.registry().state.read();
             let Some(record) = state.tasks.get(&target) else {
@@ -698,7 +695,7 @@ impl Kernel {
         }
     }
 
-    pub(crate) fn post_guest_thread_signal_to_authorized_target(
+    pub fn post_guest_thread_signal_to_authorized_target(
         &self,
         target: &AuthorizedSignalTarget,
         signal: LinuxSignal,
@@ -843,7 +840,7 @@ impl Kernel {
     /// lock. After, so the woken task cannot look, find an empty queue, and go
     /// back to sleep having consumed its wake; outside, so a waker that blocks
     /// or re-enters the kernel cannot deadlock against the registry.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn post_signal_to_task(
         &self,
         target: TaskId,
@@ -934,7 +931,7 @@ impl Kernel {
     /// live task in that container has its kernel-owned continuation cancelled
     /// before SIGKILL is queued and its lane waker is fired. Sibling container
     /// tasks are selected out while holding the topology read lock.
-    pub(crate) fn request_container_shutdown(&self, container: ContainerId) -> usize {
+    pub fn request_container_shutdown(&self, container: ContainerId) -> usize {
         let tasks = {
             let state = self.registry().state.read();
             state

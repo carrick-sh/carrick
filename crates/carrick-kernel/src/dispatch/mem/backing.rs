@@ -9,13 +9,13 @@ use carrick_guest_mem::GuestVa;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PrivateRepointRecovery {
+pub enum PrivateRepointRecovery {
     RecoveredCleanly,
     FailStopRetainingOwners,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct MremapMappingMetadata {
+pub struct MremapMappingMetadata {
     pub(crate) start: u64,
     pub(crate) end: u64,
     pub(crate) prot: LinuxProtFlags,
@@ -27,7 +27,7 @@ pub(crate) struct MremapMappingMetadata {
     pub(crate) private_file: Option<PrivateFileMapEntry>,
 }
 
-pub(crate) struct DynamicMappingSemantics {
+pub struct DynamicMappingSemantics {
     pub(crate) file_page_offset: Option<u64>,
     pub(crate) droppable: bool,
     pub(crate) semantic_vmas: Option<Vec<SemanticVma>>,
@@ -65,7 +65,7 @@ pub(crate) fn proc_maps_entry_mremap_metadata(
 /// succeeds. Keeping the complete commit record out of `MemState` until then
 /// makes an mmap/protection failure a no-op for the prior VMA and every
 /// range-derived classification.
-pub(crate) struct HostAliasMmapCommit {
+pub struct HostAliasMmapCommit {
     pub(crate) start: u64,
     pub(crate) len: u64,
     pub(crate) prot: LinuxProtFlags,
@@ -91,7 +91,7 @@ pub(crate) struct HostAliasMmapCommit {
 }
 
 #[derive(Clone)]
-pub(crate) struct PrivateFileMapEntry {
+pub struct PrivateFileMapEntry {
     pub(crate) start: u64,
     pub(crate) end: u64,
     pub(crate) offset: u64,
@@ -99,7 +99,7 @@ pub(crate) struct PrivateFileMapEntry {
 }
 
 #[derive(Clone)]
-pub(crate) enum PrivateFileBacking {
+pub enum PrivateFileBacking {
     Description(Arc<crate::kernel::objects::MappedFileReference>),
     LoadedImage {
         initialized_offset: u64,
@@ -107,9 +107,7 @@ pub(crate) enum PrivateFileBacking {
     },
 }
 
-pub(crate) fn boot_private_file_backings(
-    image: &crate::memory::AddressSpace,
-) -> Vec<PrivateFileMapEntry> {
+pub fn boot_private_file_backings(image: &crate::memory::AddressSpace) -> Vec<PrivateFileMapEntry> {
     let mut sources = Vec::new();
     for mapping in image.file_mappings().iter().filter(|m| !m.path.is_empty()) {
         for region in image.regions() {
@@ -190,14 +188,14 @@ pub(crate) fn trim_private_file_maps(maps: &mut Vec<PrivateFileMapEntry>, start:
 }
 
 #[derive(Clone)]
-pub(crate) struct SharedFileAliasCommit {
+pub struct SharedFileAliasCommit {
     pub(crate) description: Arc<crate::kernel::FileDescription>,
     pub(crate) extent_base: carrick_guest_mem::Gpa,
     pub(crate) row_file_offset: u64,
 }
 
 #[derive(Clone)]
-pub(crate) struct SharedFileAliasEntry {
+pub struct SharedFileAliasEntry {
     pub(crate) range: carrick_vfs::GuestMemoryRange,
     pub(crate) description: Arc<crate::kernel::FileDescription>,
     pub(crate) extent_base: carrick_guest_mem::Gpa,
@@ -580,7 +578,7 @@ pub(crate) fn mmap_file_backed_lowering_enabled() -> bool {
 /// remainder stays zero-filled; pages wholly beyond that boundary are published
 /// as BUS_ADRERR. Carrick's existing private-file approximation is detached from
 /// the vnode, so a later external truncate is deliberately not tracked.
-pub(crate) struct PrivateMmapSnapshot {
+pub struct PrivateMmapSnapshot {
     pub(crate) bytes: Vec<u8>,
     pub(crate) bus_fault_offset: Option<u64>,
 }
@@ -1182,7 +1180,7 @@ impl<'a> MemView<'a> {
             .any(|(_, desc)| std::sync::Arc::ptr_eq(desc, description))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_dynamic_mapping(
         &self,
         start: u64,

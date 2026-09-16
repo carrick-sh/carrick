@@ -148,7 +148,7 @@ fn go_types_survives_an_adversarial_scheduling_policy() {
         // never from a second reading of the host: the policy's `cpu_count()`
         // is also the guest's `nproc`.
         let policy = Arc::new(carrick_embed::testing::AdversarialPolicy::new(
-            carrick_runtime::kernel::scheduler::default_guest_cpu_count(),
+            carrick_kernel::kernel::scheduler::default_guest_cpu_count(),
             seed,
         ));
         let result = ContainerBuilder::from_image(GO_IMAGE)

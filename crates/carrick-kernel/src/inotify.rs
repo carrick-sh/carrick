@@ -27,32 +27,16 @@ use std::os::fd::RawFd;
 use parking_lot::Mutex;
 use zerocopy::IntoBytes;
 
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 use carrick_hal::event::VnodeEvents;
 use carrick_hal::event::{EventMultiplexer, PollEvent};
-#[cfg(feature = "platform-linux")]
+#[cfg(target_os = "linux")]
 use carrick_hal::event::{Interest, TriggerMode};
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 use std::collections::HashSet;
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -61,11 +45,7 @@ use std::time::Duration;
 // macOS emulation needs the individual bits to translate kqueue `NOTE_*` ↔ Linux
 // mask, so it re-aliases the abi constants under the historical short names and
 // keeps the aliases macOS-gated to stay dead-code-clean off-macOS.
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 use carrick_abi::{
     LINUX_IN_ACCESS as IN_ACCESS, LINUX_IN_ATTRIB as IN_ATTRIB,
     LINUX_IN_CLOSE_WRITE as IN_CLOSE_WRITE, LINUX_IN_CREATE as IN_CREATE,
@@ -102,11 +82,7 @@ const UNCONDITIONAL_EVENT_BITS: u32 = carrick_abi::LINUX_IN_IGNORED
 /// register API consumes. Requests the kqueue `NOTE_*` set corresponding to the
 /// Linux watch mask; a mask with no recognized data-changing bit falls back to
 /// the common set so a broad `IN_ALL_EVENTS` watch behaves sensibly.
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 fn linux_mask_to_vnode_events(mask: u32) -> VnodeEvents {
     let mut ev = VnodeEvents::default();
     if mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_ACCESS | IN_CREATE | IN_DELETE) != 0 {
@@ -134,11 +110,7 @@ fn linux_mask_to_vnode_events(mask: u32) -> VnodeEvents {
 
 /// Translate the `NOTE_*` fflags of a fired vnode event back into a Linux
 /// inotify event mask, restricted to the bits the watch actually requested.
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 fn note_to_linux_mask(fflags: u32, requested: u32) -> u32 {
     let mut mask = 0;
     if fflags & (carrick_portable::NOTE_WRITE | carrick_portable::NOTE_EXTEND) != 0 {
@@ -164,11 +136,7 @@ struct Watch {
     mask: u32,
 }
 
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 #[derive(Clone, Debug)]
 struct ScannedDir {
     path: PathBuf,
@@ -178,17 +146,9 @@ struct ScannedDir {
 #[derive(Clone, Debug)]
 struct WatchedFd {
     wd: i32,
-    #[cfg(any(
-        feature = "platform-macos",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ))]
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
     name: Option<Vec<u8>>,
-    #[cfg(any(
-        feature = "platform-macos",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ))]
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
     scan_dir: Option<ScannedDir>,
 }
 
@@ -218,11 +178,7 @@ struct Inner {
     /// `IN_MODIFY`) that break the exact-sequence inotify tests. The kqueue fd
     /// stays registered purely as a `poll_fd` readiness source. Set the first
     /// time a dispatch watch is registered on this instance.
-    #[cfg(any(
-        feature = "platform-macos",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ))]
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
     dispatch_authoritative: bool,
     /// Linux only: native-inotify watch descriptor → guest wd. The kernel hands
     /// out its own wd from `inotify_add_watch`; the guest sees our `wd`, so a
@@ -230,7 +186,7 @@ struct Inner {
     /// shared `Inner` (not the backend) so all bookkeeping lives under the single
     /// `inner` lock — a backend-owned copy would force a two-lock dance and a
     /// deadlock hazard.
-    #[cfg(feature = "platform-linux")]
+    #[cfg(target_os = "linux")]
     native_wd_to_guest: HashMap<i32, i32>,
 }
 
@@ -244,13 +200,9 @@ impl Inner {
             pending: std::collections::VecDeque::new(),
             overflowed: false,
             next_cookie: 1,
-            #[cfg(any(
-                feature = "platform-macos",
-                feature = "platform-freebsd",
-                feature = "platform-netbsd"
-            ))]
+            #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
             dispatch_authoritative: false,
-            #[cfg(feature = "platform-linux")]
+            #[cfg(target_os = "linux")]
             native_wd_to_guest: HashMap::new(),
         }
     }
@@ -320,7 +272,7 @@ trait InotifyBackend: Send + Sync {
 }
 
 /// Native Linux backend: a real kernel `inotify` instance read directly.
-#[cfg(feature = "platform-linux")]
+#[cfg(target_os = "linux")]
 struct NativeLinuxInotify {
     /// The native Linux inotify fd (`IN_NONBLOCK | IN_CLOEXEC`). Pollable
     /// directly; `read(2)` returns native `inotify_event` records.
@@ -330,7 +282,7 @@ struct NativeLinuxInotify {
     mux: Mutex<Box<dyn EventMultiplexer>>,
 }
 
-#[cfg(feature = "platform-linux")]
+#[cfg(target_os = "linux")]
 impl InotifyBackend for NativeLinuxInotify {
     fn poll_fd(&self) -> RawFd {
         self.mux.lock().poll_fd()
@@ -493,11 +445,7 @@ impl InotifyBackend for NativeLinuxInotify {
 /// macOS/BSD backend: bridges Linux inotify to kqueue `EVFILT_VNODE` via the
 /// boxed `EventMultiplexer`, pairing the vnode write with a directory
 /// snapshot/diff to synthesize Linux-style basename child events.
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 struct VnodeDiffInotify {
     /// macOS readiness backend. `Mutex` because the trait's register/drain
     /// methods need `&mut` yet the backend is shared via `Arc` and exposes
@@ -506,11 +454,7 @@ struct VnodeDiffInotify {
     mux: Mutex<Box<dyn EventMultiplexer>>,
 }
 
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 impl InotifyBackend for VnodeDiffInotify {
     fn poll_fd(&self) -> RawFd {
         self.mux.lock().poll_fd()
@@ -662,11 +606,7 @@ impl InotifyBackend for VnodeDiffInotify {
 /// Snapshot/diff a watched directory and synthesize Linux basename
 /// CREATE/DELETE records for entries added/removed since the last scan,
 /// refreshing the stored snapshot. macOS-only, like the vnode emulation itself.
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 fn scan_directory_records(
     inner: &mut Inner,
     fd: RawFd,
@@ -717,7 +657,7 @@ fn scan_directory_records(
 /// `inotify` fd on Linux, a kqueue-backed `EventMultiplexer` on macOS/BSD, and
 /// `None` (unsupported) on any other host.
 fn make_inotify_backend() -> Option<Box<dyn InotifyBackend>> {
-    #[cfg(feature = "platform-linux")]
+    #[cfg(target_os = "linux")]
     {
         // SAFETY: inotify_init1 takes a flags int and returns an fd or -1.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
@@ -744,11 +684,7 @@ fn make_inotify_backend() -> Option<Box<dyn InotifyBackend>> {
             mux: Mutex::new(mux),
         }))
     }
-    #[cfg(any(
-        feature = "platform-macos",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ))]
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
     {
         let mut mux = crate::event_mux::make_event_multiplexer().ok()?;
         mux.register_user(0).ok()?;
@@ -757,10 +693,10 @@ fn make_inotify_backend() -> Option<Box<dyn InotifyBackend>> {
         }))
     }
     #[cfg(not(any(
-        feature = "platform-macos",
-        feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd"
     )))]
     {
         None
@@ -775,7 +711,7 @@ fn make_inotify_backend() -> Option<Box<dyn InotifyBackend>> {
 /// trait. On Linux the backend is a native `inotify` fd read directly. The
 /// platform fork lives behind [`InotifyBackend`]; this struct holds no cfg
 /// fields.
-pub(crate) struct InotifyState {
+pub struct InotifyState {
     /// Platform readiness/watch backend (native inotify on Linux, kqueue
     /// `EVFILT_VNODE` on macOS/BSD).
     backend: Box<dyn InotifyBackend>,
@@ -907,11 +843,7 @@ impl InotifyState {
     /// kqueue fd only as a `poll_fd` readiness source. Idempotent; a no-op on the
     /// native-Linux backend (which has no synthesis to suppress).
     pub(crate) fn mark_dispatch_authoritative(&self) {
-        #[cfg(any(
-            feature = "platform-macos",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        ))]
+        #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
         {
             self.inner.lock().dispatch_authoritative = true;
         }
@@ -1031,7 +963,7 @@ struct RegisteredWatch {
 /// through the fork-coherent kqueue path. The registry covers the same-process
 /// operations the kqueue is too coarse for.
 #[derive(Default)]
-pub(crate) struct InotifyRegistry {
+pub struct InotifyRegistry {
     /// Guest path → the watches registered on exactly that path. A directory
     /// watch is stored under the directory's own path; child events are routed
     /// by looking up the child's parent path here.
@@ -1408,7 +1340,7 @@ fn split_parent_name(path: &str) -> (&str, &str) {
 
 /// Native Linux `inotify_add_watch` against the path `host_fd` currently names.
 /// Returns the kernel's watch descriptor, or `Err(())` on any failure.
-#[cfg(feature = "platform-linux")]
+#[cfg(target_os = "linux")]
 fn native_add_watch(inotify_fd: RawFd, host_fd: RawFd, mask: u32) -> Result<i32, ()> {
     let link = format!("/proc/self/fd/{host_fd}");
     let clink = std::ffi::CString::new(link).map_err(|_| ())?;
@@ -1454,11 +1386,7 @@ fn encode_event_raw(wd: i32, mask: u32, cookie: u32, name: Option<&[u8]>) -> Vec
 
 /// Cookie-less convenience used by the macOS kqueue/diff backend, which never
 /// pairs moves (it only synthesizes CREATE/DELETE/MODIFY/self-events).
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 fn encode_event(wd: i32, mask: u32, name: Option<&[u8]>) -> Vec<u8> {
     encode_event_raw(wd, mask, 0, name)
 }
@@ -1467,11 +1395,7 @@ fn align4(len: usize) -> usize {
     (len + 3) & !3
 }
 
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 fn scan_dir_entries(path: &Path) -> std::io::Result<HashSet<Vec<u8>>> {
     let mut entries = HashSet::new();
     for entry in std::fs::read_dir(path)? {
@@ -1495,7 +1419,7 @@ impl Drop for InotifyState {
     }
 }
 
-#[cfg(feature = "platform-linux")]
+#[cfg(target_os = "linux")]
 impl Drop for NativeLinuxInotify {
     fn drop(&mut self) {
         // Close the native inotify fd; any outstanding watches are torn down
@@ -1631,7 +1555,7 @@ mod tests {
 
 // Native Linux inotify smoke test — exercises the real kernel inotify backend
 // (the non-macOS path) end to end.
-#[cfg(all(test, feature = "platform-linux", target_os = "linux"))]
+#[cfg(all(test, target_os = "linux"))]
 mod linux_tests {
     use super::*;
     use std::io::Write;

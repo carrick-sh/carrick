@@ -264,7 +264,7 @@ mod setid {
 /// present because Linux permits them to diverge per thread; credential reads
 /// always trap through the captured KernelContext path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct IdentitySnapshot {
+pub struct IdentitySnapshot {
     pub pid: u32,
 }
 
@@ -357,10 +357,7 @@ impl SyscallDispatcher {
     /// Capture the process identity snapshot published across the guest-visible
     /// boundary. The context parameter prevents lifecycle callers from silently
     /// reintroducing registry recapture even though PID itself is process-wide.
-    pub(crate) fn identity_snapshot(
-        &self,
-        kernel: &crate::kernel::KernelContext,
-    ) -> IdentitySnapshot {
+    pub fn identity_snapshot(&self, kernel: &crate::kernel::KernelContext) -> IdentitySnapshot {
         let task_id = u32::try_from(kernel.task().key().id.raw()).unwrap_or(0);
         IdentitySnapshot {
             pid: crate::namespace::pid::ns_self_pid_for(kernel, task_id),

@@ -1,7 +1,7 @@
 //! Carrier-side tests of the kernel continuation model: the six that name
 //! `crate::hvpatch`, the neutral host pending store, or executor internals, and so stay
 //! with the carrier while the model itself lives in
-//! `crate::kernel::continuation`.
+//! `carrick_kernel::kernel::continuation`.
 
 use std::sync::Arc;
 
@@ -9,12 +9,12 @@ use carrick_abi::{LinuxCloneFlags, SigSet, WaitSigMask};
 use carrick_hal::ThreadId;
 
 use crate::compat::SyscallArgs;
-use crate::dispatch::{DispatchOutcome, FdWaitCompletion, SyscallRequest, WaitFds};
-use crate::kernel::continuation::tests::{
+use carrick_kernel::dispatch::{DispatchOutcome, FdWaitCompletion, SyscallRequest, WaitFds};
+use carrick_kernel::kernel::continuation::tests::{
     DISPATCH_FAMILIES, await_event, bootstrap, capture, publish,
 };
-use crate::kernel::continuation::*;
-use crate::kernel::{ClonePlan, Scheduler};
+use carrick_kernel::kernel::continuation::*;
+use carrick_kernel::kernel::{ClonePlan, Scheduler};
 
 #[test]
 fn hvpatch_launch_callgraph_never_constructs_the_compatibility_loop_future() {
@@ -126,7 +126,7 @@ fn hvpatch_launch_callgraph_never_constructs_the_compatibility_loop_future() {
 
 #[test]
 fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
-    let continuation_source = include_str!("../../kernel/continuation.rs")
+    let continuation_source = include_str!("../../../../carrick-kernel/src/kernel/continuation.rs")
         .split("#[cfg(test)]\npub(crate) mod tests")
         .next()
         .expect("production continuation source");
@@ -287,7 +287,8 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
     // that variant is added anywhere earlier in the file (the diagnostic
     // renderer did exactly that), and a test that reaims is worse than no
     // test. This region is exactly the reactor body.
-    let wait_service_source = include_str!("../../kernel/continuation/wait_service.rs");
+    let wait_service_source =
+        include_str!("../../../../carrick-kernel/src/kernel/continuation/wait_service.rs");
     let record_reactor = wait_service_source
         .split("fn run_reactor")
         .nth(1)
@@ -295,7 +296,7 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
         .expect("shared record-lock reactor path");
     assert!(record_reactor.contains("try_drive_blocking_record_lock"));
     for prohibited in [
-        "crate::dispatch::drive_blocking_record_lock(",
+        "carrick_kernel::dispatch::drive_blocking_record_lock(",
         "F_SETLKW",
         "Condvar",
     ] {
@@ -318,12 +319,12 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
     assert!(!loop_source.contains("TransitionalSchedulerKick"));
     assert!(!loop_source.contains("continuation_executor"));
 
-    let net_source = include_str!("../../dispatch/net.rs");
+    let net_source = include_str!("../../../../carrick-kernel/src/dispatch/net.rs");
     assert!(
         net_source.matches("with_guest_slots(&files").count() >= 2,
         "pselect/ppoll must capture every exact guest fd slot at dispatch"
     );
-    let io_uring_source = include_str!("../../dispatch/ioring.rs");
+    let io_uring_source = include_str!("../../../../carrick-kernel/src/dispatch/ioring.rs");
     assert!(io_uring_source.contains("with_guest_slots(&files, [ring_fd, sqe.fd])"));
     // RETIRED with the 1:1 native lane's host-pid wait bodies: the only
     // `WaitFds` producer in `dispatch/proc.rs` was the retired lane's
@@ -332,12 +333,12 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
     // subject no longer exists is a test that reaims, so it is deleted rather
     // than loosened; the HVPatch `waitid` parks on the kernel graph
     // (`WaitOnHvpatchChild`), which carries no host fd at all.
-    let proc_source = include_str!("../../dispatch/proc.rs");
+    let proc_source = include_str!("../../../../carrick-kernel/src/dispatch/proc.rs");
     assert!(
         !proc_source.contains("WaitFds"),
         "proc.rs must not reintroduce a host-fd wait producer"
     );
-    let fs_source = include_str!("../../dispatch/fs.rs");
+    let fs_source = include_str!("../../../../carrick-kernel/src/dispatch/fs.rs");
     assert!(!fs_source.contains("WaitFdAuthority::Missing"));
     for required in [
         "captured_slot_authority(guest_fd)",
@@ -356,9 +357,9 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
 
 #[test]
 fn logical_group_wait_dispatch_builds_an_any_child_continuation() {
-    let _lane = crate::dispatch::HvpatchLaneScope::force(false);
+    let _lane = carrick_kernel::dispatch::HvpatchLaneScope::force(false);
     let (process, root) = crate::hvpatch::process_context_for_tests(15_025);
-    let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
     dispatcher.bind_hvpatch_process(Arc::new(process));
     let _child = root
         .kernel()
@@ -381,7 +382,7 @@ fn logical_group_wait_dispatch_builds_an_any_child_continuation() {
         .context(root.task().key().id, root.thread().key().tid)
         .unwrap();
     let generation = publish(&root, 0x325);
-    let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0; 0x100]);
+    let mut memory = carrick_kernel::dispatch::LinearMemory::new(0x4000, vec![0; 0x100]);
     let outcome = dispatcher
         .dispatch(
             &root,
@@ -407,7 +408,7 @@ fn logical_group_wait_dispatch_builds_an_any_child_continuation() {
 fn host_slot_signal_is_reserved_and_cancelled_into_exact_kernel_ownership() {
     let (_kernel, context) = bootstrap(153_693);
     let generation = publish(&context, 0x708);
-    let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+    let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
     let persistent = SigSet::EMPTY.with(10);
     context.signal_authority().set_blocked(persistent);
     let mut action = carrick_abi::LinuxSigaction::empty();
@@ -448,8 +449,8 @@ fn realtime_host_slot_import_preserves_fifo_multiplicity_and_exact_cancellation_
     let (kernel, context) = bootstrap(15_468);
     let generation = publish(&context, 0x913);
     drop(kernel);
-    let rt_a = crate::kernel::LinuxSignal::for_signal_number(32).expect("SIGRTMIN");
-    let rt_b = crate::kernel::LinuxSignal::for_signal_number(33).expect("SIGRTMIN+1");
+    let rt_a = carrick_kernel::kernel::LinuxSignal::for_signal_number(32).expect("SIGRTMIN");
+    let rt_b = carrick_kernel::kernel::LinuxSignal::for_signal_number(33).expect("SIGRTMIN+1");
     for signal in [rt_a, rt_b] {
         let mut action = carrick_abi::LinuxSigaction::empty();
         action.sa_handler = 0x9000 + signal.raw() as u64;
@@ -562,7 +563,7 @@ fn kernel_native_guest_signal_continuation_cancels_and_delivers_without_host_sid
     continuation
         .attach_registration(registration)
         .expect("attach guest-signal registration");
-    let signal = crate::kernel::LinuxSignal::for_signal_number(32).expect("SIGRTMIN");
+    let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(32).expect("SIGRTMIN");
     let info = crate::linux_abi::LinuxSiginfo::kill(
         32,
         crate::linux_abi::LINUX_SI_TKILL,
@@ -575,12 +576,12 @@ fn kernel_native_guest_signal_continuation_cancels_and_delivers_without_host_sid
         Some(context.thread().key()),
         Some(signal),
     ) {
-        crate::kernel::ExactSignalTargetAuthorization::Allowed(ticket) => ticket,
+        carrick_kernel::kernel::ExactSignalTargetAuthorization::Allowed(ticket) => ticket,
         other => panic!("exact guest signal ticket: {other:?}"),
     };
     assert_eq!(
         kernel.post_guest_thread_signal_to_authorized_target(&ticket, signal, Some(info)),
-        crate::kernel::ExactThreadSignalPost::Posted(Some(context.thread().key()))
+        carrick_kernel::kernel::ExactThreadSignalPost::Posted(Some(context.thread().key()))
     );
     assert_eq!(
         carrick_signal_core::take_pending_for(context.thread().key().tid.raw()),

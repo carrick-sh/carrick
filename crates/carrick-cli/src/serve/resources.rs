@@ -9,7 +9,7 @@ use crate::serve::model::{
     NetworkConnectBody, NetworkCreateBody, NetworkCreateResponse, NetworkDisconnectBody,
     NetworkResource, VolumeCreateBody, VolumeListResponse, VolumeResource,
 };
-use carrick_runtime::container;
+use carrick_kernel::container;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};

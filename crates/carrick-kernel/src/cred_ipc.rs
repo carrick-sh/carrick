@@ -30,7 +30,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use carrick_abi::HostUid;
 use carrick_abi::NsUid;
 
@@ -87,7 +87,7 @@ pub fn publish_self(euid: NsUid) {
 /// the owner / permission / staleness guards below. Falling to `None` is
 /// always safe: the kill(2) caller then takes the conservative ALLOW path,
 /// so kill conformance is byte-for-byte unchanged.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn read_target(pid: i32) -> Option<NsUid> {
     use std::os::unix::fs::MetadataExt as _;
     let path = cred_path(pid);

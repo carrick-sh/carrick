@@ -20,7 +20,7 @@ pub(crate) fn next_pipe_id() -> u64 {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct PipeState {
+pub struct PipeState {
     pub(crate) buffer: VecDeque<u8>,
     pub(crate) capacity: usize,
     pub(crate) readers: usize,
@@ -40,7 +40,7 @@ pub(crate) struct PipeState {
 /// Creation is serialised under `state`, so a thread that holds the state
 /// lock must use the `*_locked` accessors; the unlocked ones take the lock.
 #[derive(Debug)]
-pub(crate) struct PipeInner {
+pub struct PipeInner {
     pub(crate) state: Mutex<PipeState>,
     pub(crate) changed: Condvar,
     pub(crate) capacity_cell: Arc<AtomicI64>,
@@ -51,11 +51,11 @@ pub(crate) struct PipeInner {
     pub(crate) wait_queue: Arc<crate::kernel::WaitQueue>,
 }
 
-pub(crate) type PipeRef = Arc<PipeInner>;
+pub type PipeRef = Arc<PipeInner>;
 
 /// Exact publication authority captured before a write parks. It avoids
 /// resolving a numeric guest fd after close or reuse.
-pub(crate) struct PipeWriteNotification {
+pub struct PipeWriteNotification {
     kind: PipeWriteNotificationKind,
 }
 
@@ -116,7 +116,7 @@ enum PipeWriteNotificationKind {
 /// driven by the continuation reactor. Holding only [`PipeRef`] is not enough:
 /// a concurrent final `close(2)` would otherwise drop the writer description's
 /// fd reference and publish EOF before this syscall finished its bytes.
-pub(crate) struct PipeWriteEndpointLease {
+pub struct PipeWriteEndpointLease {
     _description_lease: crate::kernel::objects::FileDescriptionFdLease,
     pipe: PipeRef,
     readiness_fd: HostFdRef,
@@ -400,7 +400,7 @@ pub(crate) fn read_pipe_bytes(
 /// an empty `Vec` made `splice(pipe -> file)` return 0 whenever the reader
 /// outran the writer, so LTP splice02 ended its copy loop early under load.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum PipeDrain {
+pub enum PipeDrain {
     Bytes(Vec<u8>),
     Eof,
     WouldBlock,
@@ -437,7 +437,7 @@ pub(crate) fn restore_pipe_bytes(pipe: &PipeRef, bytes: &[u8]) {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum InMemoryTeeOutcome {
+pub enum InMemoryTeeOutcome {
     SamePipe,
     BrokenPipe,
     Eof,
@@ -517,7 +517,7 @@ pub(crate) fn tee_in_memory_pipes(
 /// Exact operation authority admitted before the pipe state lock. A parked
 /// large write transfers this authority to its continuation; a non-parked
 /// write drops it when the syscall returns.
-pub(crate) struct PipeWriteOperation<I> {
+pub struct PipeWriteOperation<I> {
     pub(crate) writer_lease: crate::kernel::objects::FileDescriptionFdLease,
     pub(crate) tid: crate::thread::ThreadId,
     pub(crate) authority: super::WaitFdAuthority,

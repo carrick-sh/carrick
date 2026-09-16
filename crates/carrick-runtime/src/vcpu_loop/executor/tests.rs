@@ -4,10 +4,10 @@ use std::sync::{Arc, Barrier};
 use std::thread::{self, ThreadId as HostThreadId};
 use std::time::{Duration, Instant};
 
-use crate::kernel::CarrierProcess;
 use carrick_abi::LinuxCloneFlags;
 use carrick_hal::ThreadId;
 use carrick_hal::threaded::{Aarch64SyscallContinuationV1, Aarch64TaskCpuStateV1, GuestCpuState};
+use carrick_kernel::kernel::CarrierProcess;
 
 use super::{
     ExecBindingTransition, ExecutorBoundaryAudit, ExecutorCpuReceipt, ExecutorExit, ExecutorPool,
@@ -20,19 +20,19 @@ use super::{
     retire_failed_hvpatch_clone_authority,
 };
 use crate::compat::SyscallArgs;
-use crate::dispatch::{DispatchOutcome, SyscallDispatcher, SyscallRequest};
-use crate::kernel::objects::{
+use crate::trap::TrapError;
+use carrick_kernel::dispatch::{DispatchOutcome, SyscallDispatcher, SyscallRequest};
+use carrick_kernel::kernel::objects::{
     BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState,
     ThreadExecutionLease, ThreadExecutionState,
 };
-use crate::kernel::scheduler::{
+use carrick_kernel::kernel::scheduler::{
     CpuAffinity, ExecutorBinding, ExecutorKick, ExecutorKickToken, GuestCpuId, GuestCpuPolicy,
 };
-use crate::kernel::{
+use carrick_kernel::kernel::{
     ClonePlan, Kernel, KernelContext, RootBootstrap, Scheduler, SchedulerError,
     SubmissionAuthority, ThreadKey,
 };
-use crate::trap::TrapError;
 
 #[derive(Clone)]
 struct TestVcpuKick;
@@ -66,7 +66,7 @@ enum Step {
 
 #[derive(Debug)]
 struct DescendantPublication {
-    child_thread: Arc<crate::kernel::Thread>,
+    child_thread: Arc<carrick_kernel::kernel::Thread>,
     child_generation: ExecutionGeneration,
     after_progress: usize,
     published: Option<std::sync::mpsc::Sender<()>>,
@@ -85,7 +85,7 @@ struct FakeBinding {
     load_identity: parking_lot::Mutex<Option<TaskLoadIdentity>>,
     required_continuation_sequence: parking_lot::Mutex<Option<u64>>,
     blocked_continuation:
-        parking_lot::Mutex<Option<crate::kernel::continuation::BlockedContinuation>>,
+        parking_lot::Mutex<Option<carrick_kernel::kernel::continuation::BlockedContinuation>>,
     blocked_vfork_activation: parking_lot::Mutex<Option<super::PreparedVforkChildActivation>>,
     terminal_settlement_notification: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     descendant: parking_lot::Mutex<Option<DescendantPublication>>,
@@ -178,7 +178,7 @@ impl FakeBinding {
             .version = version;
     }
 
-    fn override_expected_mm(&self, mm: crate::kernel::MmId) {
+    fn override_expected_mm(&self, mm: carrick_kernel::kernel::MmId) {
         self.load_identity
             .lock()
             .as_mut()
@@ -200,14 +200,14 @@ impl FakeBinding {
 
     fn block_with_continuation(
         &self,
-        continuation: crate::kernel::continuation::BlockedContinuation,
+        continuation: carrick_kernel::kernel::continuation::BlockedContinuation,
     ) {
         *self.blocked_continuation.lock() = Some(continuation);
     }
 
     fn block_with_vfork_continuation(
         &self,
-        continuation: crate::kernel::continuation::BlockedContinuation,
+        continuation: carrick_kernel::kernel::continuation::BlockedContinuation,
         vfork_activation: super::PreparedVforkChildActivation,
     ) {
         *self.blocked_continuation.lock() = Some(continuation);
@@ -397,9 +397,8 @@ impl TaskBindingResolver<FakeBinding> for FakeFactory {
     fn install_scheduler(self: &Arc<Self>, scheduler: &Arc<Scheduler>) -> Result<(), TrapError> {
         *self.scheduler.lock() = Arc::downgrade(scheduler);
         scheduler
-            .install_generation_observer(
-                Arc::clone(self) as Arc<dyn crate::kernel::scheduler::SchedulerGenerationObserver>
-            )
+            .install_generation_observer(Arc::clone(self)
+                as Arc<dyn carrick_kernel::kernel::scheduler::SchedulerGenerationObserver>)
             .map_err(|error| TrapError::Hypervisor(error.to_string()))
     }
 
@@ -459,13 +458,13 @@ impl TaskBindingResolver<FakeBinding> for FakeFactory {
     fn publish_test_root(
         &self,
         scheduler: &Scheduler,
-        thread: Arc<crate::kernel::Thread>,
+        thread: Arc<carrick_kernel::kernel::Thread>,
         authority: SubmissionAuthority,
     ) -> Result<(), SchedulerError> {
         let key = (authority.thread_key(), authority.generation());
         let mut authorities = self.authorities.lock();
         if authorities.contains_key(&key) {
-            return Err(crate::kernel::RunQueueError::SubmissionRejected.into());
+            return Err(carrick_kernel::kernel::RunQueueError::SubmissionRejected.into());
         }
         authority.publish(scheduler, thread)?;
         authorities.insert(key, authority);
@@ -476,7 +475,7 @@ impl TaskBindingResolver<FakeBinding> for FakeFactory {
         &self,
         scheduler: &Scheduler,
         parent: &SubmissionAuthority,
-        thread: Arc<crate::kernel::Thread>,
+        thread: Arc<carrick_kernel::kernel::Thread>,
         generation: ExecutionGeneration,
     ) -> Result<(), TrapError> {
         let authority = parent
@@ -487,41 +486,41 @@ impl TaskBindingResolver<FakeBinding> for FakeFactory {
     }
 }
 
-impl crate::kernel::scheduler::SchedulerGenerationObserver for FakeFactory {
+impl carrick_kernel::kernel::scheduler::SchedulerGenerationObserver for FakeFactory {
     fn transition(
         &self,
         thread: ThreadKey,
         predecessor: ExecutionGeneration,
         successor: ExecutionGeneration,
-        kind: crate::kernel::scheduler::SchedulerGenerationTransition,
-    ) -> Result<(), crate::kernel::RunQueueError> {
+        kind: carrick_kernel::kernel::scheduler::SchedulerGenerationTransition,
+    ) -> Result<(), carrick_kernel::kernel::RunQueueError> {
         let Some(scheduler) = self.scheduler.lock().upgrade() else {
-            return Err(crate::kernel::RunQueueError::Closed);
+            return Err(carrick_kernel::kernel::RunQueueError::Closed);
         };
         let mut authorities = self.authorities.lock();
         let Some(authority) = authorities.remove(&(thread, predecessor)) else {
             return Ok(());
         };
-        if kind == crate::kernel::scheduler::SchedulerGenerationTransition::Terminal {
+        if kind == carrick_kernel::kernel::scheduler::SchedulerGenerationTransition::Terminal {
             return Ok(());
         }
         if authorities.contains_key(&(thread, successor)) {
-            return Err(crate::kernel::RunQueueError::SubmissionRejected);
+            return Err(carrick_kernel::kernel::RunQueueError::SubmissionRejected);
         }
-        let authority = if kind == crate::kernel::scheduler::SchedulerGenerationTransition::Blocked
-        {
-            authority
-                .park_exact(&scheduler, predecessor, successor)
-                .map_err(|(error, _authority)| error)?
-        } else if authority.is_active() {
-            authority
-                .rollover_exact(&scheduler, thread, predecessor, thread, successor)
-                .map_err(|(error, _authority)| error)?
-        } else {
-            authority
-                .reactivate_exact(&scheduler, predecessor, successor)
-                .map_err(|(error, _authority)| error)?
-        };
+        let authority =
+            if kind == carrick_kernel::kernel::scheduler::SchedulerGenerationTransition::Blocked {
+                authority
+                    .park_exact(&scheduler, predecessor, successor)
+                    .map_err(|(error, _authority)| error)?
+            } else if authority.is_active() {
+                authority
+                    .rollover_exact(&scheduler, thread, predecessor, thread, successor)
+                    .map_err(|(error, _authority)| error)?
+            } else {
+                authority
+                    .reactivate_exact(&scheduler, predecessor, successor)
+                    .map_err(|(error, _authority)| error)?
+            };
         authorities.insert((thread, successor), authority);
         Ok(())
     }
@@ -626,13 +625,13 @@ impl TaskBindingResolver<MaliciousBinding> for MaliciousFactory {
     fn publish_test_root(
         &self,
         scheduler: &Scheduler,
-        thread: Arc<crate::kernel::Thread>,
+        thread: Arc<carrick_kernel::kernel::Thread>,
         authority: SubmissionAuthority,
     ) -> Result<(), SchedulerError> {
         let key = (authority.thread_key(), authority.generation());
         let mut authorities = self.authorities.lock();
         if authorities.contains_key(&key) {
-            return Err(crate::kernel::RunQueueError::SubmissionRejected.into());
+            return Err(carrick_kernel::kernel::RunQueueError::SubmissionRejected.into());
         }
         authority.publish(scheduler, thread)?;
         authorities.insert(key, authority);
@@ -1027,11 +1026,11 @@ impl PersistentExecutor for FakeExecutor {
             }
             4 => {
                 let guard =
-                    crate::dispatch::resources::dirty_executor_boundary_resources_guard_for_test();
+                    carrick_kernel::dispatch::resources::dirty_executor_boundary_resources_guard_for_test();
                 self.owner_dirty_cleanup = Some(Box::new(move || drop(guard)));
             }
             5 => {
-                let guard = crate::fanotify::InternalOpenGuard::enter();
+                let guard = carrick_kernel::fanotify::InternalOpenGuard::enter();
                 self.owner_dirty_cleanup = Some(Box::new(move || drop(guard)));
             }
             6 => {
@@ -2349,7 +2348,7 @@ fn a_clone_rollback_tolerates_a_child_that_already_settled() {
         .fail_runnable_exact(
             context.thread().key(),
             generation,
-            crate::kernel::objects::ExecutionFailure::SnapshotRestoreFailed,
+            carrick_kernel::kernel::objects::ExecutionFailure::SnapshotRestoreFailed,
         )
         .expect("settle the child terminally");
 
@@ -2366,7 +2365,7 @@ fn a_clone_rollback_tolerates_a_child_that_already_settled() {
         matches!(
             outcome,
             super::FailedCloneRetirement::AlreadySettled(
-                crate::kernel::objects::ThreadExecutionState::Failed { .. }
+                carrick_kernel::kernel::objects::ThreadExecutionState::Failed { .. }
             )
         ),
         "the rollback must name what it found, not abort: {outcome:?}",
@@ -2482,7 +2481,7 @@ fn a_dropped_dormant_submission_leaves_no_claimable_row_for_its_generation() {
         .fail_runnable_exact(
             context.thread().key(),
             generation,
-            crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+            carrick_kernel::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
         )
         .expect("the rollback owns an unclaimed runnable generation");
     assert_eq!(scheduler.queued_len(), 0);
@@ -3891,7 +3890,7 @@ fn demand_preemption_and_exact_signal_kick_advance_two_compute_tasks_without_sta
     second_gate.wait();
     assert!(matches!(
         scheduler.wake(second.thread().key()),
-        Ok(crate::kernel::WakeDisposition::Kicked)
+        Ok(carrick_kernel::kernel::WakeDisposition::Kicked)
     ));
     drop((first_authority, second_authority));
     let report = pool.shutdown().expect("clean shutdown");
@@ -3932,7 +3931,7 @@ fn rebind_in_delivery_validation_to_mutation_window_cannot_flag_or_receipt_succe
     let receipts = Arc::new(ReceiptLog::default());
     let kick = Arc::new(WorkerKick::new(Arc::clone(&receipts)));
     let registration = scheduler
-        .register_executor(Arc::clone(&kick) as Arc<dyn crate::kernel::ExecutorKick>)
+        .register_executor(Arc::clone(&kick) as Arc<dyn carrick_kernel::kernel::ExecutorKick>)
         .expect("register exact worker kick");
     let authority = enqueue_root(&scheduler, &context, publish(&context, 55));
     drop(authority);
@@ -4025,7 +4024,7 @@ fn rebind_in_delivery_validation_to_mutation_window_cannot_flag_or_receipt_succe
         receipt_lock_held,
         "causal kick receipt must publish while the exact binding lock is retained"
     );
-    assert_eq!(disposition, crate::kernel::WakeDisposition::Kicked);
+    assert_eq!(disposition, carrick_kernel::kernel::WakeDisposition::Kicked);
     assert_ne!(successor_generation, stale_generation);
     assert!(!kick.need_resched.load(Ordering::Acquire));
     let events = receipts.snapshot();
@@ -4088,7 +4087,9 @@ fn blocked_task_releases_the_only_worker_immediately() {
 
 #[test]
 fn pool_drives_owned_blocked_continuation_into_kernel_state() {
-    use crate::kernel::continuation::{BlockedContinuation, ContinuationCapture, RestartClass};
+    use carrick_kernel::kernel::continuation::{
+        BlockedContinuation, ContinuationCapture, RestartClass,
+    };
 
     let (kernel, blocked) = bootstrap(14_045);
     let runnable = sibling(&kernel, &blocked, 24_045);
@@ -4953,7 +4954,7 @@ fn real_owner_boundary_state_fails_or_resets_and_successor_observes_clean_state(
     let receipts = Arc::new(ReceiptLog::default());
     let kick = Arc::new(WorkerKick::new(Arc::clone(&receipts)));
     let registration = scheduler
-        .register_executor(Arc::clone(&kick) as Arc<dyn crate::kernel::ExecutorKick>)
+        .register_executor(Arc::clone(&kick) as Arc<dyn carrick_kernel::kernel::ExecutorKick>)
         .expect("register audit executor");
     let mut backend = BoundaryAuditProbe;
     let boundary = WorkerBoundaryAudit::capture().expect("capture host signal mask baseline");
@@ -4972,13 +4973,14 @@ fn real_owner_boundary_state_fails_or_resets_and_successor_observes_clean_state(
         .audit_runtime(&mut backend)
         .expect("path depth unwound");
 
-    crate::dispatch::resources::with_dirty_captured_resources_for_executor_test(&context, || {
-        assert!(boundary.audit_runtime(&mut backend).is_err())
-    });
+    carrick_kernel::dispatch::resources::with_dirty_captured_resources_for_executor_test(
+        &context,
+        || assert!(boundary.audit_runtime(&mut backend).is_err()),
+    );
     boundary
         .audit_runtime(&mut backend)
         .expect("active/captured resources unwound");
-    crate::dispatch::resources::with_dirty_retiring_resources_for_executor_test(
+    carrick_kernel::dispatch::resources::with_dirty_retiring_resources_for_executor_test(
         context.resources().files(),
         || assert!(boundary.audit_runtime(&mut backend).is_err()),
     );
@@ -4986,7 +4988,7 @@ fn real_owner_boundary_state_fails_or_resets_and_successor_observes_clean_state(
         .audit_runtime(&mut backend)
         .expect("retiring resources unwound");
 
-    let fanotify = crate::fanotify::InternalOpenGuard::enter();
+    let fanotify = carrick_kernel::fanotify::InternalOpenGuard::enter();
     assert!(boundary.audit_runtime(&mut backend).is_err());
     drop(fanotify);
     boundary
@@ -5190,7 +5192,7 @@ struct VforkTestFixture {
     child: KernelContext,
     parent_generation: ExecutionGeneration,
     child_generation: ExecutionGeneration,
-    wait: crate::kernel::VforkParentWait,
+    wait: carrick_kernel::kernel::VforkParentWait,
     scheduler: Arc<Scheduler>,
     factory: Arc<FakeFactory>,
     parent_binding: Arc<FakeBinding>,
@@ -5335,15 +5337,15 @@ impl VforkTestFixture {
         )
     }
 
-    fn make_continuation(&self) -> crate::kernel::continuation::BlockedContinuation {
-        let parent_capture = crate::kernel::continuation::ContinuationCapture::new(
+    fn make_continuation(&self) -> carrick_kernel::kernel::continuation::BlockedContinuation {
+        let parent_capture = carrick_kernel::kernel::continuation::ContinuationCapture::new(
             &self.parent,
             self.parent_generation,
             SyscallRequest::new(220, SyscallArgs([0; 6])),
-            crate::kernel::continuation::RestartClass::Never,
+            carrick_kernel::kernel::continuation::RestartClass::Never,
         )
         .unwrap();
-        crate::kernel::continuation::BlockedContinuation::from_vfork_parent(
+        carrick_kernel::kernel::continuation::BlockedContinuation::from_vfork_parent(
             parent_capture,
             self.child.task().key(),
             self.wait.clone(),
@@ -5392,7 +5394,7 @@ fn vfork_deferred_child_activation_runs_after_parent_backend_saved() {
         kernel
             .exit_task(
                 child.task().key().id,
-                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
                 None,
             )
             .unwrap();
@@ -5489,7 +5491,7 @@ fn vfork_release_during_child_activation_preserves_wake_edge_through_parent_sett
         kernel
             .exit_task(
                 child.task().key().id,
-                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
                 None,
             )
             .unwrap();
@@ -5843,7 +5845,8 @@ fn test_lazy_vcpu_typed_accessor_forces_materialization() {
     };
     executor.load(&task).unwrap();
     let need_resched = AtomicBool::new(false);
-    let publish_test_descendant = |_c: Arc<crate::kernel::Thread>, _g: ExecutionGeneration| Ok(());
+    let publish_test_descendant =
+        |_c: Arc<carrick_kernel::kernel::Thread>, _g: ExecutionGeneration| Ok(());
     let mut submission = ExecutorSubmissionContext {
         scheduler: &scheduler,
         publish_test_descendant: &publish_test_descendant,
@@ -5917,7 +5920,8 @@ fn test_lazy_vcpu_executor_destroy_materializes_resident_task() {
     };
     executor.load(&task).unwrap();
     let need_resched = AtomicBool::new(false);
-    let publish_test_descendant = |_c: Arc<crate::kernel::Thread>, _g: ExecutionGeneration| Ok(());
+    let publish_test_descendant =
+        |_c: Arc<carrick_kernel::kernel::Thread>, _g: ExecutionGeneration| Ok(());
     let mut submission = ExecutorSubmissionContext {
         scheduler: &scheduler,
         publish_test_descendant: &publish_test_descendant,
@@ -5987,7 +5991,8 @@ fn test_lazy_vcpu_stale_record_on_reentry_after_other_executor_run_discards_and_
     };
     executor.load(&task).unwrap();
     let need_resched = AtomicBool::new(false);
-    let publish_test_descendant = |_c: Arc<crate::kernel::Thread>, _g: ExecutionGeneration| Ok(());
+    let publish_test_descendant =
+        |_c: Arc<carrick_kernel::kernel::Thread>, _g: ExecutionGeneration| Ok(());
     let mut submission = ExecutorSubmissionContext {
         scheduler: &scheduler,
         publish_test_descendant: &publish_test_descendant,
@@ -6084,7 +6089,8 @@ fn test_lazy_vcpu_cross_executor_claim_waits_for_idle_flush_and_overlays_materia
     };
     exec1.load(&task1).unwrap();
     let need_resched = AtomicBool::new(false);
-    let publish_test_descendant = |_c: Arc<crate::kernel::Thread>, _g: ExecutionGeneration| Ok(());
+    let publish_test_descendant =
+        |_c: Arc<carrick_kernel::kernel::Thread>, _g: ExecutionGeneration| Ok(());
     let mut submission = ExecutorSubmissionContext {
         scheduler: &scheduler,
         publish_test_descendant: &publish_test_descendant,
@@ -6385,7 +6391,7 @@ fn test_lazy_vcpu_flush_request_in_check_wait_window_not_lost() {
     let outcome = worker_handle.join().unwrap();
     assert_eq!(
         outcome.err(),
-        Some(crate::kernel::RunQueueError::FlushRequested),
+        Some(carrick_kernel::kernel::RunQueueError::FlushRequested),
         "Flush request in check→wait window must return FlushRequested"
     );
 

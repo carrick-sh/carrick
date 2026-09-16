@@ -16,14 +16,14 @@ struct CoordinatorState {
 
 /// Per-MM observation point for structural mutation/alias ownership.
 #[derive(Debug)]
-pub(crate) struct MmMutationCoordinator {
+pub struct MmMutationCoordinator {
     mm: MmId,
     state: Mutex<CoordinatorState>,
     idle: Condvar,
 }
 
 impl MmMutationCoordinator {
-    pub(crate) fn new(mm: MmId) -> Self {
+    pub fn new(mm: MmId) -> Self {
         Self {
             mm,
             state: Mutex::new(CoordinatorState {
@@ -35,7 +35,7 @@ impl MmMutationCoordinator {
         }
     }
 
-    pub(crate) fn begin_alias<'permit>(
+    pub fn begin_alias<'permit>(
         self: &Arc<Self>,
         permit: &'permit HostAliasPermit<'_>,
     ) -> HostAliasCoordinatorGuard<'permit> {
@@ -84,13 +84,13 @@ impl MmMutationCoordinator {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn alias_waiters(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn alias_waiters(&self) -> usize {
         self.state.lock().alias_waiters
     }
 
-    #[cfg(test)]
-    pub(crate) const fn mm(&self) -> MmId {
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn mm(&self) -> MmId {
         self.mm
     }
 }
@@ -174,7 +174,7 @@ impl<'authority> MmMutationGuard<'authority> {
     }
 
     #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
-    pub(crate) fn with_host_alias<T>(&mut self, operation: impl FnOnce(&mut Self) -> T) -> T {
+    pub fn with_host_alias<T>(&mut self, operation: impl FnOnce(&mut Self) -> T) -> T {
         let coordinator = Arc::clone(&self.coordinator);
         let permit = HostAliasPermit {
             coordinator: Arc::clone(&coordinator),
@@ -205,7 +205,7 @@ impl carrick_hal::ForeignMmInvalidator for MmMutationGuard<'_> {
 /// target dispatcher census and borrows the resulting linear guard.
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // Installed now; canonical process_vm consumer lands in Task 8.
-pub(crate) struct ForeignMmMutationAuthority {
+pub struct ForeignMmMutationAuthority {
     mm: MmId,
     coordinator: Arc<MmMutationCoordinator>,
     census: Arc<crate::kernel::GuestExecutorCensus>,
@@ -215,7 +215,7 @@ pub(crate) struct ForeignMmMutationAuthority {
 
 #[allow(dead_code)] // Installed now; canonical process_vm consumer lands in Task 8.
 impl ForeignMmMutationAuthority {
-    pub(crate) fn new(
+    pub fn new(
         mm: MmId,
         coordinator: Arc<MmMutationCoordinator>,
         census: Arc<crate::kernel::GuestExecutorCensus>,
@@ -239,7 +239,7 @@ impl ForeignMmMutationAuthority {
         guard.authorizes(&self.coordinator, self.mm)
     }
 
-    pub(crate) fn with_guard<T>(
+    pub fn with_guard<T>(
         &self,
         tid: carrick_hal::ThreadId,
         operation: impl FnOnce(&mut MmMutationGuard<'_>) -> T,
@@ -266,14 +266,14 @@ impl ForeignMmMutationAuthority {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
-pub(crate) enum ForeignMmMutationError {
+pub enum ForeignMmMutationError {
     #[error("target-MM page-table exclusion timed out")]
     TimedOut,
     #[error("target MM has an executor without a pause endpoint")]
     UnkickableExecutor,
 }
 
-pub(crate) fn from_pt_pause<'authority>(
+pub fn from_pt_pause<'authority>(
     authority: &'authority mut super::mm_quiesce::PtPauseGuard,
 ) -> MmMutationGuard<'authority> {
     let (coordinator, mm) = authority.mutation_identity().unwrap_or_else(|| {
@@ -291,7 +291,7 @@ pub(crate) fn from_pt_pause<'authority>(
     }
 }
 
-pub(crate) fn from_sole_executor<'authority>(
+pub fn from_sole_executor<'authority>(
     authority: &'authority mut super::mm_quiesce::SoleMmStage1<'_>,
     coordinator: Arc<MmMutationCoordinator>,
     mm: MmId,
@@ -343,8 +343,8 @@ pub struct HostAliasPermit<'guard> {
 }
 
 impl HostAliasPermit<'_> {
-    #[cfg(test)]
-    pub(crate) const fn mm(&self) -> MmId {
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn mm(&self) -> MmId {
         self.mm
     }
 
@@ -390,12 +390,12 @@ impl Drop for MmTransactionGuard<'_> {
     }
 }
 
-pub(crate) struct HostAliasCoordinatorGuard<'permit> {
+pub struct HostAliasCoordinatorGuard<'permit> {
     coordinator: Arc<MmMutationCoordinator>,
     _permit: PhantomData<&'permit ()>,
 }
 
-pub(crate) struct MmSnapshotGuard {
+pub struct MmSnapshotGuard {
     coordinator: Arc<MmMutationCoordinator>,
 }
 
@@ -423,7 +423,7 @@ impl Drop for HostAliasCoordinatorGuard<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_support {
     use super::*;
 

@@ -44,7 +44,7 @@ const SUPPORTED_SETUP_FLAGS: u32 = 0;
 /// second mapping. All offsets are reported to the guest via io_uring_params,
 /// so carrick is free to choose them as long as params describes them honestly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RingLayout {
+pub struct RingLayout {
     pub sq_entries: u32,
     pub cq_entries: u32,
     /// Size of the combined SQ+CQ ring mapping (IORING_OFF_SQ_RING).
@@ -138,7 +138,7 @@ pub enum IoUringRegion {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct IoUringRegionLayout {
+pub struct IoUringRegionLayout {
     pub guest_mmap_offset: u64,
     pub backing_offset: u64,
     pub required_len: u64,
@@ -232,7 +232,7 @@ impl Drop for SharedMapping {
     }
 }
 
-pub(crate) struct IoUringBacking {
+pub struct IoUringBacking {
     layout: RingLayout,
     regions: [IoUringRegionLayout; 2],
     data_fd: OwnedFd,
@@ -584,7 +584,7 @@ impl crate::kernel::FileDescriptionBacking for IoUringBacking {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IoUringMapping {
+pub struct IoUringMapping {
     pub description: Arc<crate::kernel::FileDescription>,
     pub region: IoUringRegion,
     pub start: u64,
@@ -626,7 +626,7 @@ impl IoUringMapping {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IoUringMappingSnapshot {
+pub struct IoUringMappingSnapshot {
     pub description: Arc<crate::kernel::FileDescription>,
     pub region: IoUringRegion,
     pub start: u64,
@@ -1542,7 +1542,8 @@ mod tests {
         use zerocopy::IntoBytes as _;
 
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_030);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_030).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let context = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);

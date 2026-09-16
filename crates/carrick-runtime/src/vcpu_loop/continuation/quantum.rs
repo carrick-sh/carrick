@@ -12,10 +12,10 @@ use carrick_fatal::carrick_fatal;
 use carrick_hal::stage1_mm::Stage1MmProjection;
 use parking_lot::{Condvar, Mutex};
 
-use crate::kernel::Scheduler;
-use crate::kernel::objects::ThreadKey;
+use carrick_kernel::kernel::Scheduler;
+use carrick_kernel::kernel::objects::ThreadKey;
 
-use crate::kernel::continuation::next_nonzero;
+use carrick_kernel::kernel::continuation::next_nonzero;
 
 static NEXT_RUNNER_JOB_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -277,7 +277,7 @@ impl HvpatchTaskBinding {
 
     pub(crate) fn begin_asid_load(
         &self,
-        executor: crate::kernel::objects::ExecutorId,
+        executor: carrick_kernel::kernel::objects::ExecutorId,
     ) -> Result<crate::hvpatch::AsidLoad, crate::trap::TrapError> {
         let stage1_mm = self.stage1_mm.as_ref().ok_or_else(|| {
             crate::trap::TrapError::Hypervisor(
@@ -313,7 +313,7 @@ impl HvpatchTaskBinding {
 
     pub(crate) fn cow_invalidation_observer(
         &self,
-        executor: crate::kernel::objects::ExecutorId,
+        executor: carrick_kernel::kernel::objects::ExecutorId,
     ) -> crate::hvpatch::CowInvalidationObserver {
         self.stage1_mm
             .as_ref()
@@ -345,14 +345,14 @@ impl HvpatchTaskBinding {
 
     pub(crate) fn pending_cow_invalidation(
         &self,
-        executor: crate::kernel::objects::ExecutorId,
+        executor: carrick_kernel::kernel::objects::ExecutorId,
     ) -> Option<crate::hvpatch::CowInvalidationTicket> {
         self.stage1_mm.as_ref()?.pending_cow_invalidation(executor)
     }
 
     pub(crate) fn acknowledge_cow_invalidation(
         &self,
-        executor: crate::kernel::objects::ExecutorId,
+        executor: carrick_kernel::kernel::objects::ExecutorId,
         ticket: crate::hvpatch::CowInvalidationTicket,
     ) -> Result<(), crate::hvpatch::CowInvalidationError> {
         self.stage1_mm
@@ -363,7 +363,7 @@ impl HvpatchTaskBinding {
 
     pub(crate) fn validate_state(
         &self,
-        state: &crate::kernel::objects::MigratableTaskState,
+        state: &carrick_kernel::kernel::objects::MigratableTaskState,
     ) -> Result<(), crate::trap::TrapError> {
         if self.identity.mm != state.mm
             || self.identity.asid_generation != state.asid_generation
@@ -402,17 +402,25 @@ impl HvpatchTaskBinding {
                 }
                 HvpatchBindingTerminalGeneration::ExecTransferred => {
                     *generation = HvpatchBindingTerminalGeneration::Settled;
-                    crate::event_ring::rec_hvpatch_settle_step(0, self.identity.mm.raw(), 6);
+                    carrick_kernel::event_ring::rec_hvpatch_settle_step(
+                        0,
+                        self.identity.mm.raw(),
+                        6,
+                    );
                     false
                 }
                 HvpatchBindingTerminalGeneration::Settled => {
-                    crate::event_ring::rec_hvpatch_settle_step(0, self.identity.mm.raw(), 7);
+                    carrick_kernel::event_ring::rec_hvpatch_settle_step(
+                        0,
+                        self.identity.mm.raw(),
+                        7,
+                    );
                     return;
                 }
             }
         };
         if publish_logical_result {
-            crate::event_ring::rec_hvpatch_settle_step(0, self.identity.mm.raw(), 5);
+            carrick_kernel::event_ring::rec_hvpatch_settle_step(0, self.identity.mm.raw(), 5);
             self.quantum.after_terminal_settlement();
         }
     }
@@ -935,10 +943,10 @@ mod tests {
 
     use carrick_hal::threaded::GuestCpuState;
 
-    use crate::kernel::Scheduler;
+    use carrick_kernel::kernel::Scheduler;
 
     use super::*;
-    use crate::kernel::continuation::tests::bootstrap;
+    use carrick_kernel::kernel::continuation::tests::bootstrap;
     #[test]
     fn hvpatch_persistent_quantum_and_binding_exclude_executor_authority() {
         fn assert_send<T: Send>() {}
@@ -1065,11 +1073,11 @@ mod tests {
 
     #[test]
     fn task4_quantum_drives_the_real_hvpatch_job_across_all_seven_boundaries() {
-        use crate::kernel::Scheduler;
         use crate::vcpu_loop::executor::{
             ExecutorExit, ExecutorSubmissionContext, HvpatchQuantumControl,
         };
         use crate::vcpu_loop::{HvpatchLoopJob, HvpatchLoopSuspension};
+        use carrick_kernel::kernel::Scheduler;
 
         let boundaries = [
             HvpatchLoopSuspension::InitialAdmission,
@@ -1082,12 +1090,12 @@ mod tests {
         ];
         let expected = [
             ExecutorExit::Quiesced,
-            ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::HostWait),
+            ExecutorExit::Blocked(carrick_kernel::kernel::objects::BlockedReason::HostWait),
             ExecutorExit::Yielded,
-            ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::ChildState),
-            ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::ChildState),
+            ExecutorExit::Blocked(carrick_kernel::kernel::objects::BlockedReason::ChildState),
+            ExecutorExit::Blocked(carrick_kernel::kernel::objects::BlockedReason::ChildState),
             ExecutorExit::Preempted,
-            ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::ChildState),
+            ExecutorExit::Blocked(carrick_kernel::kernel::objects::BlockedReason::ChildState),
         ];
         let completion = LogicalJobCompletion::pending();
         let quantum = HvpatchTaskQuantum::new(

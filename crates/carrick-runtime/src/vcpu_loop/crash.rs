@@ -6,8 +6,8 @@
 use super::*;
 
 pub(crate) struct PreparedCorePublication {
-    pub(crate) snapshot: crate::dispatch::CoreProcessSnapshot,
-    pub(crate) payload: crate::core_dump::CorePayload,
+    pub(crate) snapshot: carrick_kernel::dispatch::CoreProcessSnapshot,
+    pub(crate) payload: carrick_kernel::core_dump::CorePayload,
     pub(crate) generation: u64,
     pub(crate) fatal_tid: i32,
 }
@@ -103,7 +103,7 @@ where
 }
 
 pub(crate) fn finish_crash_collection<T>(
-    authority: &crate::kernel::CrashCaptureAuthority,
+    authority: &carrick_kernel::kernel::CrashCaptureAuthority,
     barrier: &crate::fork_quiesce::QuiesceBarrier,
     quiesced: bool,
     lease_drain_guard: Option<carrick_hal::VcpuLeaseDrainGuard>,
@@ -145,7 +145,7 @@ where
     /// sibling is collecting one right now.
     pub(crate) fn collecting_crash_generation(
         &self,
-    ) -> Option<crate::kernel::CrashCaptureGeneration> {
+    ) -> Option<carrick_kernel::kernel::CrashCaptureGeneration> {
         self.crash_capture
             .as_ref()
             .and_then(|authority| authority.collecting())
@@ -353,7 +353,7 @@ where
             }
             let fatal_visible_tid = u32::try_from(fatal.tid.raw())
                 .ok()
-                .and_then(|tid| crate::namespace::pid::kernel_to_ns_for(&context, tid))
+                .and_then(|tid| carrick_kernel::namespace::pid::kernel_to_ns_for(&context, tid))
                 .and_then(|tid| i32::try_from(tid).ok())
                 .ok_or_else(|| {
                     RuntimeError::Configuration(format!(
@@ -371,19 +371,23 @@ where
             // loser after `exit_group`), a thread admitted into the graph whose
             // host loop was cancelled before it ever ran, and a live thread
             // parked at the barrier from a path with no readable register file.
-            let quorum =
-                crate::kernel::CrashQuorum::open(std::sync::Arc::clone(context.task()), generation);
+            let quorum = carrick_kernel::kernel::CrashQuorum::open(
+                std::sync::Arc::clone(context.task()),
+                generation,
+            );
             // Structural fix: no wall-clock deadline; quorum blocks.
             let mut threads = loop {
                 match quorum.poll() {
-                    crate::kernel::CrashQuorumPoll::Complete(files) => {
+                    carrick_kernel::kernel::CrashQuorumPoll::Complete(files) => {
                         break files
                             .into_iter()
                             .map(|file| {
                                 let visible_tid = u32::try_from(file.tid.raw())
                                     .ok()
                                     .and_then(|tid| {
-                                        crate::namespace::pid::kernel_to_ns_for(&context, tid)
+                                        carrick_kernel::namespace::pid::kernel_to_ns_for(
+                                            &context, tid,
+                                        )
                                     })
                                     .and_then(|tid| i32::try_from(tid).ok())
                                     .ok_or_else(|| {
@@ -393,7 +397,7 @@ where
                                         ))
                                     })?;
                                 let registers = file.registers;
-                                let mut gregs = [0_u64; crate::core_dump::AARCH64_GREGS];
+                                let mut gregs = [0_u64; carrick_kernel::core_dump::AARCH64_GREGS];
                                 gregs[..31].copy_from_slice(&registers.gprs);
                                 gregs[31] = registers.sp_el0;
                                 // The engine selects live PC/PSTATE for a vCPU
@@ -409,9 +413,9 @@ where
                                     core_note_resume_pair(&registers, synchronous_fatal_owner);
                                 gregs[32] = resume_pc;
                                 gregs[33] = resume_pstate;
-                                Ok(crate::core_dump::ThreadState {
+                                Ok(carrick_kernel::core_dump::ThreadState {
                                     tid: visible_tid,
-                                    registers: crate::core_dump::ThreadRegisters {
+                                    registers: carrick_kernel::core_dump::ThreadRegisters {
                                         gregs,
                                         tpidr_el0: registers.tpidr_el0,
                                         vregs: registers.vregs,
@@ -427,7 +431,7 @@ where
                             })
                             .collect::<Result<Vec<_>, RuntimeError>>()?;
                     }
-                    crate::kernel::CrashQuorumPoll::Waiting(tid) => {
+                    carrick_kernel::kernel::CrashQuorumPoll::Waiting(tid) => {
                         let _ = tid;
                         // Structural fix: capture blocks indefinitely
                         // every live thread of the process at crash
@@ -490,9 +494,10 @@ where
             let mut dumpable_maps = Vec::with_capacity(process.maps.len());
             for map in &process.maps {
                 let size = map.end.saturating_sub(map.start);
-                let flags = crate::core_dump::region_flags(map.read, map.write, map.execute);
+                let flags =
+                    carrick_kernel::core_dump::region_flags(map.read, map.write, map.execute);
                 if !map.read {
-                    regions.push(crate::core_dump::MemoryRegion {
+                    regions.push(carrick_kernel::core_dump::MemoryRegion {
                         start: map.start,
                         flags,
                         bytes: &[],
@@ -519,7 +524,7 @@ where
                     .iter()
                     .any(|fm| fm.start < map.end && map.start < fm.end);
                 if file_backed && map.execute {
-                    regions.push(crate::core_dump::MemoryRegion {
+                    regions.push(carrick_kernel::core_dump::MemoryRegion {
                         start: map.start,
                         flags,
                         bytes: &[],
@@ -536,7 +541,7 @@ where
                     .iter()
                     .any(|&(start, end)| start < map.end && map.start < end)
                 {
-                    regions.push(crate::core_dump::MemoryRegion {
+                    regions.push(carrick_kernel::core_dump::MemoryRegion {
                         start: map.start,
                         flags,
                         bytes: &[],
@@ -546,7 +551,7 @@ where
                     dumpable_maps.push(false);
                     continue;
                 }
-                regions.push(crate::core_dump::MemoryRegion {
+                regions.push(carrick_kernel::core_dump::MemoryRegion {
                     start: map.start,
                     flags,
                     bytes: &[],
@@ -594,9 +599,9 @@ where
                 thread_count,
             );
             lifecycle(2, 0);
-            let dump = crate::core_dump::CoreDump {
+            let dump = carrick_kernel::core_dump::CoreDump {
                 identity: process.identity.clone(),
-                signal: crate::core_dump::SignalInfo {
+                signal: carrick_kernel::core_dump::SignalInfo {
                     signo: fatal.signo,
                     code: fatal.code,
                     errno: 0,
@@ -668,7 +673,7 @@ where
                     let relative_offset = sub_start.saturating_sub(map.start);
                     let file_offset = seg_offset.saturating_add(relative_offset);
                     remaining_budget = remaining_budget.saturating_sub(bytes.len() as u64);
-                    extents.push(crate::core_dump::CoreExtent {
+                    extents.push(carrick_kernel::core_dump::CoreExtent {
                         offset: file_offset,
                         bytes,
                     });
@@ -722,8 +727,8 @@ mod tests {
         NoopPlatformFutex, registration_test_handle,
     };
     use super::*;
-    use crate::dispatch::SyscallDispatcher;
     use carrick_hal::ThreadId;
+    use carrick_kernel::dispatch::SyscallDispatcher;
     use parking_lot::Mutex;
     use std::time::Duration;
 
@@ -984,7 +989,7 @@ mod tests {
     fn crash_teardown_releases_barrier_before_guard() {
         let registry = carrick_hal::GenericVcpuRegistry::new();
         let barrier = Arc::new(crate::fork_quiesce::QuiesceBarrier::new());
-        let authority = crate::kernel::CrashCaptureAuthority::default();
+        let authority = carrick_kernel::kernel::CrashCaptureAuthority::default();
         let generation = authority.issue().expect("test crash generation");
         authority.advertise(generation);
         assert!(barrier.try_begin_fork());
@@ -1031,7 +1036,7 @@ mod tests {
     #[test]
     fn crash_lease_drain_timeout_releases_collection_and_barriers() {
         let (process, root) = crate::hvpatch::process_context_for_tests(70_229);
-        let plan = crate::kernel::ClonePlan::from_flags(
+        let plan = carrick_kernel::kernel::ClonePlan::from_flags(
             carrick_abi::LinuxCloneFlags::THREAD
                 | carrick_abi::LinuxCloneFlags::SIGHAND
                 | carrick_abi::LinuxCloneFlags::VM,
@@ -1129,7 +1134,7 @@ mod tests {
     #[test]
     fn capture_core_sparse_large_vma_reads_only_materialized_subranges_and_preserves_filesz() {
         let (process, root) = crate::hvpatch::process_context_for_tests(70_260);
-        let plan = crate::kernel::ClonePlan::from_flags(
+        let plan = carrick_kernel::kernel::ClonePlan::from_flags(
             carrick_abi::LinuxCloneFlags::THREAD
                 | carrick_abi::LinuxCloneFlags::SIGHAND
                 | carrick_abi::LinuxCloneFlags::VM,
@@ -1285,17 +1290,17 @@ mod tests {
 
         // 3. Verify PT_LOAD in ELF header preserves filesz == memsz == 64 GiB
         let phdr_bytes = &prepared.payload.header;
-        let ehdr_size = usize::from(crate::core_dump::EHDR_SIZE);
-        let phdr_size = usize::from(crate::core_dump::PHDR_SIZE);
-        let phnum = crate::core_dump::read_u16(phdr_bytes, 56).unwrap() as usize;
+        let ehdr_size = usize::from(carrick_kernel::core_dump::EHDR_SIZE);
+        let phdr_size = usize::from(carrick_kernel::core_dump::PHDR_SIZE);
+        let phnum = carrick_kernel::core_dump::read_u16(phdr_bytes, 56).unwrap() as usize;
         let mut found_sparse_load = false;
         for i in 0..phnum {
             let offset = ehdr_size + i * phdr_size;
-            let kind = crate::core_dump::read_u32(phdr_bytes, offset).unwrap();
-            let vaddr = crate::core_dump::read_u64(phdr_bytes, offset + 16).unwrap();
-            let filesz = crate::core_dump::read_u64(phdr_bytes, offset + 32).unwrap();
-            let memsz = crate::core_dump::read_u64(phdr_bytes, offset + 40).unwrap();
-            if kind == crate::core_dump::PT_LOAD && vaddr == sparse_addr {
+            let kind = carrick_kernel::core_dump::read_u32(phdr_bytes, offset).unwrap();
+            let vaddr = carrick_kernel::core_dump::read_u64(phdr_bytes, offset + 16).unwrap();
+            let filesz = carrick_kernel::core_dump::read_u64(phdr_bytes, offset + 32).unwrap();
+            let memsz = carrick_kernel::core_dump::read_u64(phdr_bytes, offset + 40).unwrap();
+            if kind == carrick_kernel::core_dump::PT_LOAD && vaddr == sparse_addr {
                 assert_eq!(
                     filesz, sparse_len as u64,
                     "PT_LOAD filesz must equal VMA length"
@@ -1317,7 +1322,7 @@ mod tests {
     #[test]
     fn capture_core_engine_read_error_fails_closed() {
         let (process, root) = crate::hvpatch::process_context_for_tests(70_270);
-        let plan = crate::kernel::ClonePlan::from_flags(
+        let plan = carrick_kernel::kernel::ClonePlan::from_flags(
             carrick_abi::LinuxCloneFlags::THREAD
                 | carrick_abi::LinuxCloneFlags::SIGHAND
                 | carrick_abi::LinuxCloneFlags::VM,

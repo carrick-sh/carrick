@@ -12,7 +12,7 @@ use std::sync::Arc;
 use super::{FsView, SyscallDispatcher};
 
 #[derive(Debug)]
-pub(crate) enum ExecSourceError {
+pub enum ExecSourceError {
     Linux(carrick_abi::LinuxErrno),
     Host(io::Error),
 }
@@ -35,7 +35,7 @@ enum ExecutableBacking {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ExecutableObjectId {
+pub enum ExecutableObjectId {
     Host { device: u64, inode: u64 },
     Memory(u64),
 }
@@ -141,7 +141,7 @@ impl ExecutableAuthorityRegistry {
 
 /// The exact object selected by one executable lookup.
 #[derive(Clone, Debug)]
-pub(crate) struct ExecSource {
+pub struct ExecSource {
     backing: Arc<ExecutableBacking>,
     object_id: ExecutableObjectId,
     resolved_path: String,
@@ -153,13 +153,13 @@ pub(crate) struct ExecSource {
 /// Process-owned executable identity. Fork shares both the object and its live
 /// dentry display; a rename by any task in the namespace updates every holder.
 #[derive(Clone, Debug)]
-pub(crate) struct CurrentExecutable {
+pub struct CurrentExecutable {
     source: ExecSource,
     display: Arc<parking_lot::RwLock<ExecutableDisplay>>,
 }
 
 impl ExecSource {
-    pub(crate) fn host(file: std::fs::File, resolved_path: String) -> io::Result<Self> {
+    pub fn host(file: std::fs::File, resolved_path: String) -> io::Result<Self> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(io::Error::from_raw_os_error(libc::EACCES));
@@ -256,7 +256,7 @@ impl ExecSource {
         self.object_id
     }
 
-    pub(crate) fn read_head(&self, max: usize) -> io::Result<Vec<u8>> {
+    pub fn read_head(&self, max: usize) -> io::Result<Vec<u8>> {
         match self.backing.as_ref() {
             ExecutableBacking::SharedObject(object) => Ok(object.read_prefix(max)),
             ExecutableBacking::SharedBytes(bytes) => Ok(bytes[..bytes.len().min(max)].to_vec()),
@@ -355,7 +355,7 @@ impl ExecSource {
         }
     }
 
-    pub(crate) fn read_all(&self) -> io::Result<Vec<u8>> {
+    pub fn read_all(&self) -> io::Result<Vec<u8>> {
         match self.backing.as_ref() {
             ExecutableBacking::SharedObject(object) => Ok(object.read_all()),
             ExecutableBacking::SharedBytes(bytes) => Ok(bytes.as_ref().to_vec()),
@@ -387,7 +387,7 @@ impl ExecSource {
         }
     }
 
-    pub(crate) fn hvpatch_cache_key(
+    pub fn hvpatch_cache_key(
         &self,
         linux_page_size: u64,
         vdso: bool,
@@ -572,7 +572,7 @@ impl SyscallDispatcher {
     /// Acquire one exact object through the layered executable view.  Every read
     /// made from the returned source is bound to that object, never a later
     /// lookup of `path`.
-    pub(crate) fn acquire_exec_source(
+    pub fn acquire_exec_source(
         &self,
         context: &crate::kernel::KernelContext,
         path: &str,

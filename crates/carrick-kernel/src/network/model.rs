@@ -17,7 +17,7 @@ use carrick_vfs::{FsNetworkInterface, FsNetworkView};
 /// each surface to invent its own, which is how carrick came to advertise
 /// `eth0` over rtnetlink while `/sys/class/net/eth0` was ENOENT.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LinuxNetworkModel {
+pub struct LinuxNetworkModel {
     pub(crate) links: Vec<LinuxNetworkLink>,
     pub(crate) addresses: Vec<LinuxNetworkAddress>,
     pub(crate) routes: Vec<LinuxNetworkRoute>,
@@ -25,7 +25,7 @@ pub(crate) struct LinuxNetworkModel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LinuxNetworkLink {
+pub struct LinuxNetworkLink {
     pub(crate) index: u32,
     pub(crate) name: String,
     pub(crate) loopback: bool,
@@ -50,7 +50,7 @@ const LOOPBACK_MTU: u32 = 65_536;
 const ETHERNET_MTU: u32 = 1_500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LinuxNetworkAddress {
+pub struct LinuxNetworkAddress {
     pub(crate) addr: IpAddr,
     pub(crate) prefix_len: u8,
     pub(crate) link_name: String,
@@ -111,7 +111,7 @@ impl LinuxNetworkAddress {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LinuxNetworkRoute {
+pub struct LinuxNetworkRoute {
     pub(crate) destination: Option<IpAddr>,
     pub(crate) destination_prefix_len: u8,
     pub(crate) gateway: Option<IpAddr>,
@@ -119,7 +119,7 @@ pub(crate) struct LinuxNetworkRoute {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LinuxResolverConfig {
+pub struct LinuxResolverConfig {
     pub(crate) nameservers: Vec<IpAddr>,
     pub(crate) search: Vec<String>,
     pub(crate) options: Vec<String>,
@@ -130,33 +130,25 @@ pub(crate) struct LinuxResolverConfig {
 // non-macOS run path renders container hosts files too (M0.8+).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
-    any(
-        feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ),
+    any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"),
     allow(dead_code)
 )]
-pub(crate) struct LinuxHostsConfig {
+pub struct LinuxHostsConfig {
     pub(crate) entries: Vec<LinuxHostsEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
-    any(
-        feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ),
+    any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"),
     allow(dead_code)
 )]
-pub(crate) struct LinuxHostsEntry {
+pub struct LinuxHostsEntry {
     pub(crate) addr: String,
     pub(crate) names: Vec<String>,
 }
 
 impl LinuxNetworkModel {
-    pub(crate) fn from_spec(spec: &NetworkNamespaceSpec) -> Self {
+    pub fn from_spec(spec: &NetworkNamespaceSpec) -> Self {
         if spec.mode != NetworkMode::Bridge {
             return Self::loopback_only(spec);
         }
@@ -250,14 +242,10 @@ impl LinuxNetworkModel {
 
     // See `LinuxHostsConfig`: macOS-arm-only consumer today.
     #[cfg_attr(
-        any(
-            feature = "platform-linux",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        ),
+        any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"),
         allow(dead_code)
     )]
-    pub(crate) fn hosts_config<I>(
+    pub fn hosts_config<I>(
         &self,
         spec: &NetworkNamespaceSpec,
         service_entries: I,
@@ -360,11 +348,7 @@ impl LinuxNetworkModel {
 
     // See `LinuxHostsConfig`: macOS-arm-only consumer today.
     #[cfg_attr(
-        any(
-            feature = "platform-linux",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        ),
+        any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"),
         allow(dead_code)
     )]
     fn primary_ipv4_address(&self, spec: &NetworkNamespaceSpec) -> Ipv4Addr {
@@ -384,11 +368,7 @@ impl LinuxNetworkModel {
 
     // See `LinuxHostsConfig`: macOS-arm-only consumer today.
     #[cfg_attr(
-        any(
-            feature = "platform-linux",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        ),
+        any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"),
         allow(dead_code)
     )]
     fn primary_gateway_v4(&self, spec: &NetworkNamespaceSpec) -> Ipv4Addr {
@@ -626,14 +606,10 @@ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packet
 impl LinuxHostsConfig {
     // See `LinuxHostsConfig`: macOS-arm-only consumer today.
     #[cfg_attr(
-        any(
-            feature = "platform-linux",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        ),
+        any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"),
         allow(dead_code)
     )]
-    pub(crate) fn render(&self) -> String {
+    pub fn render(&self) -> String {
         let mut out = String::new();
         for entry in &self.entries {
             if entry.names.is_empty() {
@@ -691,11 +667,7 @@ fn proc_net_route_hex_v4_mask(prefix_len: u8) -> String {
 
 // See `LinuxHostsConfig`: macOS-arm-only consumer today.
 #[cfg_attr(
-    any(
-        feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ),
+    any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"),
     allow(dead_code)
 )]
 fn parse_extra_host(entry: &str, host_gateway: Option<Ipv4Addr>) -> Option<(String, String)> {
@@ -722,7 +694,7 @@ fn parse_extra_host(entry: &str, host_gateway: Option<Ipv4Addr>) -> Option<(Stri
 /// what stops the Mac's `awdl0`, `utun*` and IPv6 addresses reaching a guest
 /// that has no business knowing they exist.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct HostWireSnapshot {
+pub struct HostWireSnapshot {
     pub(crate) interfaces: Vec<HostWireInterface>,
     /// Whether the host's loopback carries `::1`. Mirrored rather than assumed,
     /// so a host with IPv6 disabled does not hand the guest a `::1` it cannot
@@ -732,7 +704,7 @@ pub(crate) struct HostWireSnapshot {
 
 /// One host link, carrying only what the mapping needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct HostWireInterface {
+pub struct HostWireInterface {
     pub(crate) name: String,
     /// Linux `IFF_*`, already translated out of Darwin's numbering.
     pub(crate) flags: u32,

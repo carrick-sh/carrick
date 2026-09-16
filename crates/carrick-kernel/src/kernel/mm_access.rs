@@ -298,7 +298,7 @@ pub struct MmWriteRange<'mm> {
 
 /// Non-copy exceptional range whose lifetime is bounded by the exact settled
 /// ptrace stop that minted it.
-pub(crate) struct PtraceTextWriteRange<'mm, 'witness> {
+pub struct PtraceTextWriteRange<'mm, 'witness> {
     token: &'mm MmToken,
     start: GuestVa,
     len: NonZeroUsize,
@@ -379,7 +379,7 @@ impl CurrentMm<'_> {
     }
 }
 
-pub(crate) trait MmAccessTarget {
+pub trait MmAccessTarget {
     fn access_token(&self) -> &MmToken;
 }
 
@@ -445,7 +445,7 @@ impl std::fmt::Debug for CowBroken<'_, '_, '_> {
 /// Single-use runtime authority for one prepared foreign copy. Commit consumes
 /// the prepared state and performs the write infallibly.
 #[allow(dead_code)] // Minted and consumed by the canonical Task 8 syscall path.
-pub(crate) struct PreparedForeignWrite<'mm, 'src, 'witness, 'guard, 'authority> {
+pub struct PreparedForeignWrite<'mm, 'src, 'witness, 'guard, 'authority> {
     witness: &'witness mut CowBroken<'mm, 'guard, 'authority>,
     src: &'src [u8],
     transport: Box<dyn carrick_hal::ForeignMmPreparedWrite + 'src>,
@@ -487,7 +487,7 @@ impl ForeignWriteReceipt {
 /// Authenticated completion of a private runtime foreign read.
 #[derive(Debug)]
 #[allow(dead_code)] // Task 8 is the first syscall consumer.
-pub(crate) struct ForeignReadReceipt {
+pub struct ForeignReadReceipt {
     transport: Box<dyn carrick_hal::ForeignMmReadReceipt>,
 }
 
@@ -502,7 +502,7 @@ impl ForeignReadReceipt {
 /// only token-bound ranges and never transport snapshots or constructors.
 #[derive(Clone, Copy, Debug, Default)]
 #[allow(dead_code)] // Installed in Task 5; consumed by process_vm in Task 8.
-pub(crate) struct MmAccessAuthority;
+pub struct MmAccessAuthority;
 
 impl MmAccessAuthority {
     #[allow(dead_code)] // Task 8 is the first syscall consumer.
@@ -510,7 +510,7 @@ impl MmAccessAuthority {
 
     const OVERALL_DEADLINE: Duration = Duration::from_millis(50);
 
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self
     }
 
@@ -649,7 +649,7 @@ impl MmAccessAuthority {
             })
     }
 
-    pub(crate) fn write_ptrace_text_under_witness<
+    pub fn write_ptrace_text_under_witness<
         'mm,
         'src,
         'witness,
@@ -692,12 +692,8 @@ impl MmAccessAuthority {
             .commit())
     }
 
-    #[cfg(test)]
-    pub(crate) fn break_foreign_cow_with_final_snapshot_contended_for_test<
-        'mm,
-        'guard,
-        'authority,
-    >(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn break_foreign_cow_with_final_snapshot_contended_for_test<'mm, 'guard, 'authority>(
         &self,
         mutation: &'guard mut crate::dispatch::mm_mutation::MmMutationGuard<'authority>,
         mm: &'mm ForeignMm,
@@ -858,7 +854,7 @@ impl MmAccessAuthority {
     }
 
     #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
-    pub(crate) fn prepare_foreign_write<'mm, 'src, 'witness, 'guard, 'authority>(
+    pub fn prepare_foreign_write<'mm, 'src, 'witness, 'guard, 'authority>(
         &self,
         witness: &'witness mut CowBroken<'mm, 'guard, 'authority>,
         src: &'src [u8],
@@ -1027,7 +1023,7 @@ impl MmAccessAuthority {
     }
 
     #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
-    pub(crate) fn commit_foreign_write(
+    pub fn commit_foreign_write(
         &self,
         prepared: PreparedForeignWrite<'_, '_, '_, '_, '_>,
     ) -> ForeignWriteReceipt {
@@ -1037,9 +1033,9 @@ impl MmAccessAuthority {
 
 #[allow(dead_code)] // Task 8 is the first syscall consumer.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProjectedForeignMmSnapshot {
+pub struct ProjectedForeignMmSnapshot {
     mm: carrick_hal::ForeignMmId,
-    pub(crate) binding: carrick_hal::ForeignMmBinding,
+    pub binding: carrick_hal::ForeignMmBinding,
     backend_revision: carrick_hal::ForeignBackendRevision,
     vma_revision: carrick_hal::ForeignVmaRevision,
     frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision,
@@ -1049,10 +1045,7 @@ pub(crate) struct ProjectedForeignMmSnapshot {
 }
 
 impl ProjectedForeignMmSnapshot {
-    pub(crate) fn from_backend(
-        mm_id: MmId,
-        snapshot: &MmBackendSnapshot,
-    ) -> Result<Self, MmAccessError> {
+    pub fn from_backend(mm_id: MmId, snapshot: &MmBackendSnapshot) -> Result<Self, MmAccessError> {
         let vma_revision = snapshot
             .vma_revision
             .ok_or(MmAccessError::IncompleteForeignSnapshot(mm_id))?;
@@ -1396,8 +1389,14 @@ fn validate_snapshot_vmas(snapshot: &MmBackendSnapshot) -> Result<(), MmAccessEr
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "test-support"))]
+pub mod tests {
+    // Compiled without `cfg(test)` when a sibling crate builds this through
+    // `test-support`, so neither the test-harness import pruning nor clippy's
+    // `allow-{unwrap,expect,panic}-in-tests` applies. This is test code either
+    // way; state the same allowances explicitly.
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
     use std::num::{NonZeroU16, NonZeroU64};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1598,7 +1597,7 @@ pub(crate) mod tests {
     }
 
     #[derive(Debug)]
-    pub(crate) struct MutableFixtureBackend {
+    pub struct MutableFixtureBackend {
         binding: MmBinding,
         backend_revision: Arc<AtomicU64>,
         vma_revision: AtomicU64,
@@ -1677,7 +1676,7 @@ pub(crate) mod tests {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) enum MockCowFault {
+    pub enum MockCowFault {
         None,
         ReacquireSnapshot,
         WrongMm,
@@ -1701,7 +1700,7 @@ pub(crate) mod tests {
     }
 
     #[derive(Clone, Debug, Default)]
-    pub(crate) struct MockCowCounters {
+    pub struct MockCowCounters {
         break_calls: Arc<AtomicUsize>,
         prepare_calls: Arc<AtomicUsize>,
         commit_calls: Arc<AtomicUsize>,
@@ -1711,18 +1710,18 @@ pub(crate) mod tests {
     }
 
     #[derive(Debug)]
-    pub(crate) struct MockCowTransport {
-        pub(crate) owner_generation: Arc<AtomicU64>,
-        pub(crate) bytes: Arc<parking_lot::Mutex<Vec<u8>>>,
-        pub(crate) counters: MockCowCounters,
-        pub(crate) fault: MockCowFault,
-        pub(crate) proof: crate::kernel::KernelForeignCowProof,
-        pub(crate) ptrace_proof: Option<crate::kernel::KernelForeignCowProof>,
-        pub(crate) mapping: carrick_hal::MappingId,
-        pub(crate) frame: carrick_hal::FrameId,
-        pub(crate) physical_base: Gpa,
-        pub(crate) physical_len: u64,
-        pub(crate) post_write_backend_revision: Option<Arc<AtomicU64>>,
+    pub struct MockCowTransport {
+        pub owner_generation: Arc<AtomicU64>,
+        pub bytes: Arc<parking_lot::Mutex<Vec<u8>>>,
+        pub counters: MockCowCounters,
+        pub fault: MockCowFault,
+        pub proof: crate::kernel::KernelForeignCowProof,
+        pub ptrace_proof: Option<crate::kernel::KernelForeignCowProof>,
+        pub mapping: carrick_hal::MappingId,
+        pub frame: carrick_hal::FrameId,
+        pub physical_base: Gpa,
+        pub physical_len: u64,
+        pub post_write_backend_revision: Option<Arc<AtomicU64>>,
     }
 
     #[derive(Debug)]
@@ -1741,19 +1740,19 @@ pub(crate) mod tests {
     }
 
     #[derive(Debug)]
-    pub(crate) struct MockCowReceipt {
-        pub(crate) mm: carrick_hal::ForeignMmId,
-        pub(crate) start: GuestVa,
-        pub(crate) len: usize,
-        pub(crate) backend: carrick_hal::ForeignBackendRevision,
-        pub(crate) vma: carrick_hal::ForeignVmaRevision,
-        pub(crate) inventory: carrick_hal::ForeignFrameInventoryRevision,
-        pub(crate) mapping: carrick_hal::MappingId,
-        pub(crate) frame: carrick_hal::FrameId,
-        pub(crate) physical_base: Gpa,
-        pub(crate) physical_len: u64,
-        pub(crate) owner: carrick_hal::ForeignOwnerGeneration,
-        pub(crate) kernel_proof: carrick_hal::ForeignCowKernelProof,
+    pub struct MockCowReceipt {
+        pub mm: carrick_hal::ForeignMmId,
+        pub start: GuestVa,
+        pub len: usize,
+        pub backend: carrick_hal::ForeignBackendRevision,
+        pub vma: carrick_hal::ForeignVmaRevision,
+        pub inventory: carrick_hal::ForeignFrameInventoryRevision,
+        pub mapping: carrick_hal::MappingId,
+        pub frame: carrick_hal::FrameId,
+        pub physical_base: Gpa,
+        pub physical_len: u64,
+        pub owner: carrick_hal::ForeignOwnerGeneration,
+        pub kernel_proof: carrick_hal::ForeignCowKernelProof,
     }
 
     impl ForeignCowReceipt for MockCowReceipt {
@@ -2092,7 +2091,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn fixture_backend() -> Arc<dyn MmBackend> {
+    pub fn fixture_backend() -> Arc<dyn MmBackend> {
         let asid = Asid::from_registry_allocation(NonZeroU16::new(7).expect("nonzero ASID"));
         let root = Stage1Root::for_aarch64_4k(Gpa(0x8000)).expect("aligned stage-1 root");
         Arc::new(FixtureBackend {
@@ -2100,7 +2099,7 @@ pub(crate) mod tests {
         })
     }
 
-    pub(crate) fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
+    pub fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
         let input = RootBootstrap::with_mm_backend(
             pid,
             ThreadId::synthetic_for_tests(pid),
@@ -2169,11 +2168,11 @@ pub(crate) mod tests {
             .expect("claim exact execution authority")
     }
 
-    pub(crate) fn execution_lease(context: &KernelContext, marker: u64) -> ThreadExecutionLease {
+    pub fn execution_lease(context: &KernelContext, marker: u64) -> ThreadExecutionLease {
         execution_lease_for_mm(context, context.shared().mm().id(), marker)
     }
 
-    pub(crate) fn fork_with_backend(
+    pub fn fork_with_backend(
         kernel: &Arc<Kernel>,
         parent: &KernelContext,
         registry_id: i32,
@@ -2211,7 +2210,7 @@ pub(crate) mod tests {
         child
     }
 
-    pub(crate) fn foreign_mm(
+    pub fn foreign_mm(
         kernel: &Arc<Kernel>,
         caller: &KernelContext,
         execution: &ThreadExecutionLease,
@@ -2226,7 +2225,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn publish_cow_mapping(
+    pub fn publish_cow_mapping(
         kernel: &Arc<Kernel>,
         mm: MmId,
         gpa: Gpa,
@@ -2270,7 +2269,7 @@ pub(crate) mod tests {
     }
 
     #[allow(clippy::type_complexity)]
-    pub(crate) fn cow_fixture(
+    pub fn cow_fixture(
         kernel: &Arc<Kernel>,
         parent: &KernelContext,
         registry_id: i32,
@@ -2364,7 +2363,7 @@ pub(crate) mod tests {
     /// The retained peer bytes model the pre-COW source while `child_bytes`
     /// are the exact backing mutated only after the runtime validates a
     /// genuine kernel proof and commits a prepared write.
-    pub(crate) struct ConsumerCowFixture {
+    pub struct ConsumerCowFixture {
         target: KernelContext,
         backend: Arc<MutableFixtureBackend>,
         peer_bytes: Vec<u8>,
@@ -2439,7 +2438,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn with_foreign_mutation<T>(
+    pub fn with_foreign_mutation<T>(
         foreign: &super::super::ForeignMm,
         run: impl FnOnce(&mut crate::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
     ) -> T {

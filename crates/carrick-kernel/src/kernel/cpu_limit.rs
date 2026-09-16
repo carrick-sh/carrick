@@ -38,7 +38,7 @@ const MIN_RECHECK: Duration = Duration::from_millis(1);
 
 /// What one task's CPU means against its limit right now.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CpuLimitVerdict {
+pub enum CpuLimitVerdict {
     /// Under both limits; nothing to send.
     Within,
     /// At or past the soft limit and due another `SIGXCPU`.
@@ -52,7 +52,7 @@ pub(crate) enum CpuLimitVerdict {
 /// more CPU it may consume before the watchdog must look again (`None` when
 /// nothing further can ever fall due).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CpuLimitEvaluation {
+pub struct CpuLimitEvaluation {
     pub(crate) verdict: CpuLimitVerdict,
     pub(crate) next_soft_due_ns: Option<u64>,
     pub(crate) cpu_until_next_ns: Option<u64>,
@@ -141,7 +141,7 @@ struct WatchInner {
 /// The watchdog thread shares only [`WatchInner`], never the kernel itself,
 /// so a sleeping watchdog never keeps a torn-down kernel alive.
 #[derive(Debug, Default)]
-pub(crate) struct CpuLimitWatch {
+pub struct CpuLimitWatch {
     inner: Arc<WatchInner>,
 }
 

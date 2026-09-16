@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use carrick_runtime::compat::{CompatEvent, CompatReporter, SyscallArgs};
-use carrick_runtime::dispatch::{
+use carrick_kernel::dispatch::{
     DispatchOutcome, GuestMemory, LinearMemory, SyscallDispatcher, SyscallRequest,
 };
+use carrick_runtime::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use carrick_runtime::linux_abi::LinuxErrno;
 use carrick_runtime::memory::LINUX_HEAP_BASE;
 use carrick_runtime::thread::{FutexTable, ThreadRegistry};
@@ -19,8 +19,8 @@ fn tc<'a>(
     tid: carrick_runtime::thread::ThreadId,
     registry: &'a ThreadRegistry,
     futex: &'a FutexTable,
-) -> carrick_runtime::dispatch::ThreadCtx<'a> {
-    carrick_runtime::dispatch::ThreadCtx::new(tid, registry, futex)
+) -> carrick_kernel::dispatch::ThreadCtx<'a> {
+    carrick_kernel::dispatch::ThreadCtx::new(tid, registry, futex)
 }
 
 fn assert_send_sync<T: Send + Sync>() {}
@@ -215,7 +215,7 @@ fn shared_dispatcher_routes_sibling_thread_signals() {
         | carrick_abi::LinuxCloneFlags::FILES
         | carrick_abi::LinuxCloneFlags::SIGHAND
         | carrick_abi::LinuxCloneFlags::THREAD;
-    let plan = carrick_runtime::kernel::ClonePlan::from_flags(flags).unwrap();
+    let plan = carrick_kernel::kernel::ClonePlan::from_flags(flags).unwrap();
     let sibling_context = initial
         .kernel()
         .reserve_thread_clone(&initial, plan, None)
@@ -230,7 +230,7 @@ fn shared_dispatcher_routes_sibling_thread_signals() {
     let context = dispatcher.capture_one_task_context().unwrap();
     // The root task is namespace init and therefore ignores default-lethal
     // signals until it installs a handler. Make delivery observable here.
-    let signal = carrick_runtime::kernel::LinuxSignal::for_signal_number(10).unwrap();
+    let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(10).unwrap();
     let mut action = carrick_runtime::linux_abi::LinuxSigaction::empty();
     action.sa_handler = 0x4000;
     context.shared().sighand().install_action(signal, action);

@@ -52,7 +52,13 @@ target builds.
   contract (`SyscallTrap`, `TrapError`, `RawSyscall`), raw hypervisor traits
   (`HvVm`, `HvVcpu`, `VcpuExit`), guest architecture traits, event and futex
   contracts, threaded-loop glue traits, signal/timer delivery surfaces, and
-  shared error/register types. It has no OS or hypervisor dependency.
+  shared error/register types. It has no OS or hypervisor dependency. It also
+  owns the three seams `carrick-kernel` reaches the execution lane through:
+  `Stage1MmProjection` (the stage-1 address space as the kernel sees it, with
+  no carrier lease type crossing the boundary), `HostSignalBridge` (host-signal
+  capture and self-raise) and `GuestTimerBridge` (guest-visible interval-timer
+  delivery). The carrier selects and installs an implementation of each;
+  `carrick-hal`'s `Null*` doubles serve the bridge-less test surface.
 - `carrick-guest-mem` owns the guest-memory access trait and syscall frame hub
   types used by runtime handlers and live VMM engines.
 - `carrick-mem` owns guest address-space construction: ELF layout, page tables,
@@ -96,9 +102,19 @@ target builds.
 
 ### Runtime and product layers
 
-- `carrick-runtime` owns Linux behavior: ELF execution, syscall dispatch, VFS,
-  fs backends, process model, credentials, namespaces, `/proc`, sockets, IPC,
-  and the platform-selected execution loop.
+- `carrick-kernel` owns Linux behavior: the kernel object graph, syscall
+  dispatch, the process/credential/namespace models, `/proc`, sockets, IPC, the
+  in-zone network and the kernel-view filesystems over `carrick-vfs`. It names
+  no carrier and no `carrick-vmm-*` crate; it reaches the execution lane only
+  through the `carrick-hal` traits above, and `CarrierProcess` (defined in the
+  kernel, implemented by the carrier) is how dispatch reaches "the process this
+  dispatcher is bound to".
+- `carrick-vfs` owns the filesystem model below the kernel: the `Vfs` trait and
+  mount table, the dentry cache, the host/in-memory backends and the OCI rootfs.
+- `carrick-runtime` owns the execution lane: ELF execution, the VM carrier, the
+  vCPU/threaded loops, image preparation, the run lifecycle and the
+  platform-selected backend. It implements the `carrick-hal` bridges the kernel
+  consumes.
 - `carrick-image` owns OCI image acquisition and local content storage.
 - `carrick-engine` lowers docker-shaped CLI requests and image config into a
   resolved `RunSpec`.
@@ -117,7 +133,7 @@ See [../crates/README.md](../crates/README.md) for a compact workspace map.
 The product path remains:
 
 ```text
-carrick-cli -> carrick-engine -> { carrick-image, carrick-runtime } -> carrick-spec
+carrick-cli -> carrick-engine -> { carrick-image, carrick-runtime -> carrick-kernel -> carrick-vfs } -> carrick-spec
 ```
 
 Platform code is selected below `carrick-runtime` and `carrick-cli`:
@@ -142,8 +158,12 @@ platform-netbsd
 
 The VMM crates do not own the Linux syscall semantics. They provide engines,
 register access, guest memory access, signal/timer delivery, and vCPU
-coordination. The runtime owns the dispatcher and calls through the trait
-surfaces exposed by `carrick-hal`.
+coordination. `carrick-kernel` owns the dispatcher and calls through the trait
+surfaces exposed by `carrick-hal`; `carrick-runtime` selects the backend and
+supplies those implementations. A layering gate (`just check-layering`, run by
+`just ci`) asserts the direction: no `carrick-runtime`, `carrick-vmm-*` or
+`applevisor*` in the `carrick-vfs` or `carrick-kernel` closures, and no
+`carrick-kernel` in any `carrick-vmm-*` closure.
 
 ## HAL Contract Classification
 

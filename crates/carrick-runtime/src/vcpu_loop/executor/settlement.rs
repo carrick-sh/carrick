@@ -4,13 +4,13 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::mpsc;
 
-use crate::dispatch::SyscallDispatcher;
-use crate::kernel::objects::{
+use crate::trap::TrapError;
+use carrick_kernel::dispatch::SyscallDispatcher;
+use carrick_kernel::kernel::objects::{
     BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState,
     ThreadExecutionLease, ThreadExecutionState, ThreadKey,
 };
-use crate::kernel::{ExecutorKick as _, ExecutorRegistration, RunnableThread, Scheduler};
-use crate::trap::TrapError;
+use carrick_kernel::kernel::{ExecutorKick as _, ExecutorRegistration, RunnableThread, Scheduler};
 
 use super::binding::{PersistentTaskBinding, PreparedVforkChildActivation, TaskBindingResolver};
 use super::probe_executor_lifecycle;
@@ -67,7 +67,7 @@ pub(crate) enum ExecutorExit {
     Syscall,
     Blocked(BlockedReason),
     BlockedContinuation {
-        continuation: Box<crate::kernel::continuation::BlockedContinuation>,
+        continuation: Box<carrick_kernel::kernel::continuation::BlockedContinuation>,
         vfork_activation: Option<PreparedVforkChildActivation>,
     },
     Yielded,
@@ -266,8 +266,8 @@ impl WorkerBoundaryAudit {
         // path out of a residency — including the error paths that skip the
         // ordinary close — can leave the window open for a different logical
         // thread to inherit. Idempotent: a closed window costs nothing.
-        crate::kernel::close_system_charge_window();
-        if !crate::kernel::system_charge_window_is_closed() {
+        carrick_kernel::kernel::close_system_charge_window();
+        if !carrick_kernel::kernel::system_charge_window_is_closed() {
             return Err(boundary_error("system-charge-window"));
         }
         if !carrick_thread::fork_quiesce::topology_depth_is_zero_for_executor_boundary() {
@@ -276,10 +276,10 @@ impl WorkerBoundaryAudit {
         if !SyscallDispatcher::executor_boundary_path_resolution_is_clear() {
             return Err(boundary_error("path-resolution-depth"));
         }
-        if !crate::dispatch::resources::executor_boundary_is_clear() {
+        if !carrick_kernel::dispatch::resources::executor_boundary_is_clear() {
             return Err(boundary_error("active-kernel-context"));
         }
-        if crate::fanotify::internal_open_in_progress() {
+        if carrick_kernel::fanotify::internal_open_in_progress() {
             return Err(boundary_error("fanotify-internal-open-depth"));
         }
         let _ = SyscallDispatcher::reset_sysv_executor_boundary_state();
@@ -391,7 +391,7 @@ where
     loop {
         let running = match scheduler.take(registration) {
             Ok(running) => running,
-            Err(crate::kernel::RunQueueError::Closed) => return Ok(()),
+            Err(carrick_kernel::kernel::RunQueueError::Closed) => return Ok(()),
             Err(error) => return Err(error.to_string()),
         };
         let executor = running.executor();

@@ -14,7 +14,7 @@ use super::{DispatchMmAuthority, SyscallDispatcher, mem, sysv};
 /// the dispatcher and is published only after the runtime reports success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
-pub(crate) struct HostAliasTransactionId(pub(crate) u64);
+pub struct HostAliasTransactionId(pub(crate) u64);
 
 /// Owned dispatcher-to-runtime alias transaction. Dropping an unclaimed
 /// transaction aborts the matching pending/installing phase, if any, and wakes
@@ -53,7 +53,7 @@ impl Serialize for HostAliasTransaction {
 }
 
 impl HostAliasTransaction {
-    pub(crate) fn claim<'permit>(
+    pub fn claim<'permit>(
         mut self,
         permit: &'permit mm_mutation::HostAliasPermit<'_>,
     ) -> Option<HostAliasInstallGuard<'permit>> {
@@ -86,8 +86,8 @@ impl HostAliasTransaction {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_claim_for_test<T>(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_claim_for_test<T>(
         self,
         use_install: impl FnOnce(HostAliasInstallGuard<'_>) -> T,
     ) -> Option<T> {
@@ -106,7 +106,7 @@ impl Drop for HostAliasTransaction {
     }
 }
 
-pub(crate) struct HostAliasInstallGuard<'permit> {
+pub struct HostAliasInstallGuard<'permit> {
     pub(crate) authority: Arc<DispatchMmAuthority>,
     pub(crate) transactions: Arc<HostAliasTransactions>,
     pub(crate) _structural: mm_mutation::HostAliasCoordinatorGuard<'permit>,
@@ -115,7 +115,7 @@ pub(crate) struct HostAliasInstallGuard<'permit> {
 }
 
 impl HostAliasInstallGuard<'_> {
-    pub(crate) fn bus_fault_range(&self) -> Option<(u64, u64)> {
+    pub fn bus_fault_range(&self) -> Option<(u64, u64)> {
         let phase = self.transactions.phase.lock();
         match &*phase {
             HostAliasPhase::Installing { id, commit } if *id == self.id => commit
@@ -139,7 +139,7 @@ impl Drop for HostAliasInstallGuard<'_> {
     }
 }
 
-pub(crate) struct HostAliasCommit {
+pub struct HostAliasCommit {
     mmap: Option<mem::HostAliasMmapCommit>,
     io_uring_mapping: Option<super::ioring::IoUringMapping>,
     io_uring_mm: Option<Arc<crate::kernel::Mm>>,
@@ -147,9 +147,9 @@ pub(crate) struct HostAliasCommit {
 }
 
 impl HostAliasCommit {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
-    pub(crate) fn empty_for_test() -> Self {
+    pub fn empty_for_test() -> Self {
         Self {
             mmap: None,
             io_uring_mapping: None,
@@ -190,7 +190,7 @@ impl HostAliasCommit {
     }
 }
 
-pub(crate) enum HostAliasPhase {
+pub enum HostAliasPhase {
     Idle,
     Dispatching,
     Pending {
@@ -203,7 +203,7 @@ pub(crate) enum HostAliasPhase {
     },
 }
 
-pub(crate) struct HostAliasTransactions {
+pub struct HostAliasTransactions {
     pub(crate) phase: parking_lot::Mutex<HostAliasPhase>,
     pub(crate) idle: parking_lot::Condvar,
     pub(crate) next_id: std::sync::atomic::AtomicU64,
@@ -263,7 +263,7 @@ impl HostAliasTransactions {
     }
 }
 
-pub(crate) struct HostAliasDispatchGuard<'permit> {
+pub struct HostAliasDispatchGuard<'permit> {
     pub(crate) _structural: mm_mutation::HostAliasCoordinatorGuard<'permit>,
     pub(crate) authority: Option<Arc<DispatchMmAuthority>>,
     pub(crate) transactions: Arc<HostAliasTransactions>,
@@ -292,7 +292,7 @@ impl HostAliasDispatchGuard<'_> {
         self.vma_revision = Some(revision);
     }
 
-    pub(crate) fn publish(
+    pub fn publish(
         mut self,
         commit: HostAliasCommit,
     ) -> Result<HostAliasTransaction, RuntimeError> {
@@ -388,8 +388,8 @@ impl SyscallDispatcher {
         self.mm_binding.begin_dispatch(permit, false)
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_host_alias_dispatch_for_test<T>(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_host_alias_dispatch_for_test<T>(
         &self,
         use_guard: impl FnOnce(HostAliasDispatchGuard<'_>) -> T,
     ) -> T {
@@ -437,7 +437,7 @@ impl SyscallDispatcher {
 
     /// Publish exact range-owned metadata after the host alias and every
     /// required subrange protection are installed successfully.
-    pub(crate) fn commit_host_alias_install(
+    pub fn commit_host_alias_install(
         &self,
         mut install: HostAliasInstallGuard,
     ) -> Result<(), LinuxErrno> {

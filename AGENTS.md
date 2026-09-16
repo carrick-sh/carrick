@@ -130,11 +130,11 @@ Two conventions to keep in mind:
   historical `carrick-hvf`).
 
 ### Where key subsystems live
-- **Trap loop / syscall dispatch** — mature macOS trap loop in `crates/carrick-vmm-hvf/src/trap.rs`; x86 loop in `crates/carrick-x86/src/engine.rs` with backend adapters; dispatch in `crates/carrick-runtime/src/dispatch/mod.rs` (`SyscallDispatcher`, per-subsystem locks); syscall metadata in `crates/carrick-abi/src/syscall.rs` and guest-arch tables under `carrick-hal`.
-- **VFS / rootfs** — `crates/carrick-runtime/src/dispatch/fs.rs`, `crates/carrick-runtime/src/vfs/` (in-memory OCI layer merge; `--fs host` cap-std backend — see [`docs/fs-host-capstd-amplification.md`](docs/fs-host-capstd-amplification.md)).
+- **Trap loop / syscall dispatch** — mature macOS trap loop in `crates/carrick-vmm-hvf/src/trap.rs`; x86 loop in `crates/carrick-x86/src/engine.rs` with backend adapters; dispatch in `crates/carrick-kernel/src/dispatch/mod.rs` (`SyscallDispatcher`, per-subsystem locks); syscall metadata in `crates/carrick-abi/src/syscall.rs` and guest-arch tables under `carrick-hal`.
+- **VFS / rootfs** — `crates/carrick-kernel/src/dispatch/fs.rs`, the kernel-view mounts `crates/carrick-kernel/src/vfs/` and the filesystem model itself `crates/carrick-vfs/src/` (in-memory OCI layer merge; `--fs host` cap-std backend — see [`docs/fs-host-capstd-amplification.md`](docs/fs-host-capstd-amplification.md)).
 - **Memory / paging** — `crates/carrick-mem/src/memory.rs` (the mature VMM
   stage-1 identity map, EL0 trampoline and FEAT_PAN3 workaround; HVPatch differs
-  below); mmap arena `crates/carrick-runtime/src/dispatch/mem.rs`.
+  below); mmap arena `crates/carrick-kernel/src/dispatch/mem.rs`.
 - **HVPatch memory is non-identity.** Semantic guest VA, stage-1 IPA, reusable
   global-frame IPA and host-owner generation are distinct domains. Never feed
   one domain back into a lookup for another: authenticate through the live
@@ -146,7 +146,7 @@ Two conventions to keep in mind:
   the output address to be aligned for the parent block; contiguous children
   alone are insufficient and masking an unaligned IPA silently maps the wrong
   bytes.
-- **Signals** — `crates/carrick-runtime/src/dispatch/signal.rs` (Linux↔macOS signum translation, sigreturn trampoline).
+- **Signals** — `crates/carrick-kernel/src/dispatch/signal.rs` (Linux↔macOS signum translation, sigreturn trampoline).
 - **Threads / futex** — `carrick-thread`; fork barrier
   `crates/carrick-vmm-hvf/src/fork_quiesce.rs`. HVPatch schedules logical guest
   threads on a bounded persistent executor pool with reclaimable HVF vCPU leases.
@@ -154,11 +154,11 @@ Two conventions to keep in mind:
   participates in exec/exit cancellation; ordinary losing transactions lower
   to guest `EAGAIN`; and a selected long blocking wait releases its lease even
   when capacity appears spare before later waiters arrive.
-- **epoll / sockets** — event backends in `carrick-host-bsd` (kqueue) and `carrick-host-linux` (epoll); sockets `crates/carrick-runtime/src/dispatch/net.rs` (synthetic `AF_NETLINK`, AF_UNIX path-hash registry).
-- **ptrace / pty** — `docs/ptrace-darwin-design.md` (Phase 1 only); pty `crates/carrick-runtime/src/pty_relay.rs` + `interactive_supervisor.rs`, `vfs/devpts.rs`.
+- **epoll / sockets** — event backends in `carrick-host-bsd` (kqueue) and `carrick-host-linux` (epoll); sockets `crates/carrick-kernel/src/dispatch/net.rs` (synthetic `AF_NETLINK`, AF_UNIX path-hash registry).
+- **ptrace / pty** — `docs/ptrace-darwin-design.md` (Phase 1 only); pty `crates/carrick-kernel/src/pty_relay.rs` + `crates/carrick-runtime/src/interactive_supervisor.rs`, `crates/carrick-kernel/src/vfs/devpts.rs`.
 - **x86 / Rosetta** — `linux/amd64` images via Apple's in-guest Linux Rosetta (`docs/rosetta.md`).
 - **Event ring (debug)** — always-on lock-free fork/socket/epoll ring
-  `crates/carrick-runtime/src/event_ring.rs`, read via
+  `crates/carrick-kernel/src/event_ring.rs`, read via
   `scripts/carrick_lldb.py`. For HVPatch the authoritative ring and guest-thread
   census live in the VM carrier, not an outer namespace supervisor or detached
   file-authority helper.

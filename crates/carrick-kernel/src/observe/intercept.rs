@@ -72,14 +72,14 @@ pub trait SyscallInterceptor: Send + Sync {
 
 /// The effective scalar arguments and any terminal result proposed by a chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Interception {
+pub struct Interception {
     pub effective_args: SyscallArgs,
     pub proposed: Option<SyscallOutcome>,
 }
 
 /// A sealed, deterministically ordered set of trusted syscall interceptors.
 #[derive(Clone, Default)]
-pub(crate) struct InterceptorChain {
+pub struct InterceptorChain {
     interceptors: Vec<Arc<dyn SyscallInterceptor>>,
 }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check and enforce dispatch lock authority across production runtime sources.
 
-This gate inventories raw lock acquisitions in `crates/carrick-runtime/src`:
+This gate inventories raw lock acquisitions in `crates/carrick-kernel/src`:
 - `proc` dispatcher state
 - `pty_table` state
 - `sysv_process` and `sysv_namespace` state
@@ -29,8 +29,10 @@ from typing import Any, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCAN_PATHS = [
-    REPO_ROOT / "crates" / "carrick-runtime" / "src" / "dispatch",
-    REPO_ROOT / "crates" / "carrick-runtime" / "src" / "kernel" / "objects.rs",
+    # dispatch/ and the kernel graph moved to crates/carrick-kernel; the scope
+    # follows the CODE, not the crate it used to live in.
+    REPO_ROOT / "crates" / "carrick-kernel" / "src" / "dispatch",
+    REPO_ROOT / "crates" / "carrick-kernel" / "src" / "kernel" / "objects.rs",
 ]
 DEFAULT_INVENTORY_PATH = REPO_ROOT / "scripts" / "migrate" / "dispatch-lock-authority.json"
 
@@ -52,8 +54,8 @@ MAX_CATEGORY_CEILINGS: dict[str, int] = {
 MAX_TOTAL_CEILING: int = 107
 
 EXPECTED_TRUSTED_BOUNDARIES: dict[str, str] = {
-    "crates/carrick-runtime/src/dispatch/sysv.rs::IpcView::lock_sysv_process::sysv_process#1": "trusted_minting_boundary",
-    "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs::SysvNamespacePermit::lock_paired::sysv_namespace#1": "trusted_paired_boundary",
+    "crates/carrick-kernel/src/dispatch/sysv.rs::IpcView::lock_sysv_process::sysv_process#1": "trusted_minting_boundary",
+    "crates/carrick-kernel/src/dispatch/sysv/lock_authority.rs::SysvNamespacePermit::lock_paired::sysv_namespace#1": "trusted_paired_boundary",
 }
 
 FILE_TABLE_INTERNAL_FIELDS = frozenset(
@@ -256,6 +258,16 @@ def _matching_delimiter(tokens: Sequence[Token], start: int, opening: str, closi
     return len(tokens) - 1
 
 
+# `feature = "test-support"` is test scope, exactly like `test`. Splitting the
+# runtime into carrick-kernel + carrick-runtime moved test fixtures out of the
+# crate whose tests consume them, and `cfg(test)` is per-crate-compilation, so
+# those fixtures are gated `cfg(any(test, feature = "test-support"))`. No
+# product target enables `test-support`, so the gate still means "test code" in
+# every shipped build. Matching the exact feature NAME keeps this narrow: any
+# other `feature = "..."` term is still production.
+_TEST_SUPPORT_TERMS = ("feature", "=", '"test-support"')
+
+
 def _is_test_only_attribute(tokens: Sequence[Token], start: int, end: int) -> bool:
     """Return True only if the attribute is strictly test-only (e.g. #[test], #[cfg(test)])."""
     attr_texts = [item.text for item in tokens[start:end]]
@@ -264,7 +276,19 @@ def _is_test_only_attribute(tokens: Sequence[Token], start: int, end: int) -> bo
     if attr_texts == ["cfg", "(", "test", ")"]:
         return True
     if "any" in attr_texts:
-        return False
+        # `any(test, feature = "test-support")` (alone or nested inside an
+        # `all(...)`) is still test-only: every disjunct is a test term.
+        stripped = [t for t in attr_texts if t not in ("cfg", "any", "all", "(", ")", ",")]
+        residual = list(stripped)
+        for term in _TEST_SUPPORT_TERMS:
+            if term in residual:
+                residual.remove(term)
+            else:
+                return False
+        return bool(residual) and all(
+            t == "test" or t.startswith('"') or t in ("target_os", "target_arch", "=")
+            for t in residual
+        ) and "test" in residual
     if "not" in attr_texts and "test" in attr_texts:
         return False
     if attr_texts and attr_texts[0] == "cfg" and "test" in attr_texts:
@@ -756,8 +780,8 @@ def validate_sysv_lock_authority_rules(
         full_path = repo_root / rel_path
         return full_path.read_text(encoding="utf-8") if full_path.exists() else ""
 
-    # 1. Check exact visibility tokens in crates/carrick-runtime/src/dispatch/sysv.rs
-    sysv_source = get_source("crates/carrick-runtime/src/dispatch/sysv.rs")
+    # 1. Check exact visibility tokens in crates/carrick-kernel/src/dispatch/sysv.rs
+    sysv_source = get_source("crates/carrick-kernel/src/dispatch/sysv.rs")
     if sysv_source:
         sysv_tokens = lex_rust(sysv_source)
         expected_restricted_fns = {
@@ -784,11 +808,11 @@ def validate_sysv_lock_authority_rules(
                 if not found_pub or vis_tokens != expected_vis:
                     vis_str = "".join(vis_tokens) if vis_tokens else "private"
                     errors.append(
-                        f"crates/carrick-runtime/src/dispatch/sysv.rs: helper '{fn_name}' has unauthorized visibility '{vis_str}' (must be exact 'pub(in crate::dispatch::sysv)')"
+                        f"crates/carrick-kernel/src/dispatch/sysv.rs: helper '{fn_name}' has unauthorized visibility '{vis_str}' (must be exact 'pub(in crate::dispatch::sysv)')"
                     )
 
     # 2. Check strict cross-module caller boundary
-    runtime_src = repo_root / "crates/carrick-runtime/src"
+    runtime_src = repo_root / "crates/carrick-kernel/src"
     if runtime_src.exists() or override_sources:
         restricted_identifiers = {
             "lock_sysv_process",
@@ -803,15 +827,15 @@ def validate_sysv_lock_authority_rules(
         if override_sources:
             for rpath, src in override_sources.items():
                 if (
-                    rpath.startswith("crates/carrick-runtime/src/")
-                    and not rpath.startswith("crates/carrick-runtime/src/dispatch/sysv")
+                    rpath.startswith("crates/carrick-kernel/src/")
+                    and not rpath.startswith("crates/carrick-kernel/src/dispatch/sysv")
                     and not rpath.endswith("dispatch/sysv.rs")
                 ):
                     files_to_check.append((rpath, src))
         else:
             for path in sorted(runtime_src.rglob("*.rs")):
                 rpath = str(path.relative_to(repo_root))
-                if not rpath.startswith("crates/carrick-runtime/src/dispatch/sysv") and not rpath.endswith("dispatch/sysv.rs"):
+                if not rpath.startswith("crates/carrick-kernel/src/dispatch/sysv") and not rpath.endswith("dispatch/sysv.rs"):
                     files_to_check.append((rpath, path.read_text(encoding="utf-8")))
 
         for rpath, src in files_to_check:
@@ -878,11 +902,11 @@ def run_self_tests() -> bool:
     }
     """
     tokens = lex_rust(raw_proc_source)
-    sites = scan_tokens(tokens, "crates/carrick-runtime/src/dispatch/syscall.rs")
+    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/syscall.rs")
     assert len(sites) == 1, f"Expected 1 raw proc site, got {len(sites)}"
     assert sites[0].category == "proc"
     assert sites[0].ordinal == 1
-    assert sites[0].id == "crates/carrick-runtime/src/dispatch/syscall.rs::SyscallDispatcher::handle_syscall::proc#1"
+    assert sites[0].id == "crates/carrick-kernel/src/dispatch/syscall.rs::SyscallDispatcher::handle_syscall::proc#1"
 
     # Test 4: Raw sysv_process boundary is detected
     sysv_proc_source = """
@@ -893,7 +917,7 @@ def run_self_tests() -> bool:
     }
     """
     tokens = lex_rust(sysv_proc_source)
-    sites = scan_tokens(tokens, "crates/carrick-runtime/src/dispatch/sysv.rs")
+    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/sysv.rs")
     assert len(sites) == 1, f"Expected 1 sysv_process site, got {len(sites)}"
     assert sites[0].category == "sysv_process"
     assert sites[0].ordinal == 1
@@ -907,7 +931,7 @@ def run_self_tests() -> bool:
     }
     """
     tokens = lex_rust(sysv_ns_source)
-    sites = scan_tokens(tokens, "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs")
+    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/sysv/lock_authority.rs")
     assert len(sites) == 1, f"Expected 1 sysv_namespace site, got {len(sites)}"
     assert sites[0].category == "sysv_namespace"
     assert sites[0].ordinal == 1
@@ -922,7 +946,7 @@ def run_self_tests() -> bool:
     }
     """
     tokens = lex_rust(multi_source)
-    sites = scan_tokens(tokens, "crates/carrick-runtime/src/dispatch/mod.rs")
+    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/mod.rs")
     assert len(sites) == 2, f"Expected 2 sites, got {len(sites)}"
     assert sites[0].ordinal == 1
     assert sites[1].ordinal == 2
@@ -937,7 +961,7 @@ def run_self_tests() -> bool:
     }
     """
     tokens = lex_rust(file_table_source)
-    sites = scan_tokens(tokens, "crates/carrick-runtime/src/kernel/objects.rs")
+    sites = scan_tokens(tokens, "crates/carrick-kernel/src/kernel/objects.rs")
     assert len(sites) == 1, f"Expected 1 file_table_internals site, got {len(sites)}"
     assert sites[0].category == "file_table_internals"
 
@@ -948,7 +972,7 @@ def run_self_tests() -> bool:
     }
     """
     tokens = lex_rust(paren_compound_source)
-    sites = scan_tokens(tokens, "crates/carrick-runtime/src/dispatch/sysv.rs")
+    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/sysv.rs")
     assert len(sites) == 1, f"Parenthesized compound bypass was not caught: {sites}"
     assert sites[0].category == "sysv_namespace"
 
@@ -961,7 +985,7 @@ def run_self_tests() -> bool:
     }
     """
     tokens = lex_rust(paren_proc_source)
-    sites = scan_tokens(tokens, "crates/carrick-runtime/src/dispatch/proc.rs")
+    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/proc.rs")
     assert len(sites) == 1, f"Parenthesized proc bypass was not caught: {sites}"
     assert sites[0].category == "proc"
 
@@ -975,7 +999,7 @@ def run_self_tests() -> bool:
     }
     """
     tokens = lex_rust(alias_proc_source)
-    sites = scan_tokens(tokens, "crates/carrick-runtime/src/dispatch/mod.rs")
+    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/mod.rs")
     assert len(sites) == 1, f"Local alias bypass was not caught: {sites}"
     assert sites[0].category == "proc"
 
@@ -989,7 +1013,7 @@ def run_self_tests() -> bool:
     }
     """
     tokens = lex_rust(timed_methods_source)
-    sites = scan_tokens(tokens, "crates/carrick-runtime/src/dispatch/mod.rs")
+    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/mod.rs")
     assert len(sites) == 2, f"Timed methods were not caught: {sites}"
     assert sites[0].category == "proc"
     assert sites[1].category == "sysv_process"
@@ -1002,7 +1026,7 @@ def run_self_tests() -> bool:
     }
     """
     tokens = lex_rust(cfg_any_source)
-    sites = scan_tokens(tokens, "crates/carrick-runtime/src/dispatch/mod.rs")
+    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/mod.rs")
     assert len(sites) == 1, f"cfg(any(...)) production code was falsely ignored: {sites}"
     assert sites[0].category == "proc"
 
@@ -1014,8 +1038,8 @@ def run_self_tests() -> bool:
     # Test 14: Unclassified raw lock addition must FAIL validation
     extra_sites = list(sites) + [
         RawLockSite(
-            id="crates/carrick-runtime/src/dispatch/mod.rs::SyscallDispatcher::new_leak::proc#1",
-            file="crates/carrick-runtime/src/dispatch/mod.rs",
+            id="crates/carrick-kernel/src/dispatch/mod.rs::SyscallDispatcher::new_leak::proc#1",
+            file="crates/carrick-kernel/src/dispatch/mod.rs",
             line=100,
             item="SyscallDispatcher::new_leak",
             category="proc",
@@ -1030,8 +1054,8 @@ def run_self_tests() -> bool:
     expanded_inv = dict(inv)
     expanded_entries = list(inv["entries"]) + [
         {
-            "id": "crates/carrick-runtime/src/dispatch/mod.rs::SyscallDispatcher::stale::proc#1",
-            "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+            "id": "crates/carrick-kernel/src/dispatch/mod.rs::SyscallDispatcher::stale::proc#1",
+            "file": "crates/carrick-kernel/src/dispatch/mod.rs",
             "line": 999,
             "item": "SyscallDispatcher::stale",
             "category": "proc",
@@ -1067,7 +1091,7 @@ def run_self_tests() -> bool:
     """
     errs = validate_sysv_lock_authority_rules(
         REPO_ROOT,
-        override_sources={"crates/carrick-runtime/src/dispatch/sysv.rs": widened_vis_source},
+        override_sources={"crates/carrick-kernel/src/dispatch/sysv.rs": widened_vis_source},
     )
     assert any("helper 'with_state' has unauthorized visibility 'pub(crate)'" in e for e in errs), f"Widened visibility did not fail: {errs}"
 
@@ -1079,7 +1103,7 @@ def run_self_tests() -> bool:
     """
     errs = validate_sysv_lock_authority_rules(
         REPO_ROOT,
-        override_sources={"crates/carrick-runtime/src/dispatch/sysv.rs": pub_vis_source},
+        override_sources={"crates/carrick-kernel/src/dispatch/sysv.rs": pub_vis_source},
     )
     assert any("helper 'lock_sysv_process' has unauthorized visibility 'pub'" in e for e in errs), f"Public visibility did not fail: {errs}"
 
@@ -1094,8 +1118,8 @@ def run_self_tests() -> bool:
     errs = validate_sysv_lock_authority_rules(
         REPO_ROOT,
         override_sources={
-            "crates/carrick-runtime/src/dispatch/sysv.rs": "",
-            "crates/carrick-runtime/src/dispatch/fs.rs": sibling_caller_source,
+            "crates/carrick-kernel/src/dispatch/sysv.rs": "",
+            "crates/carrick-kernel/src/dispatch/fs.rs": sibling_caller_source,
         },
     )
     assert any("unauthorized cross-module reference to SysV lock authority identifier 'lock_sysv_process'" in e for e in errs), f"Sibling caller did not fail: {errs}"
@@ -1109,8 +1133,8 @@ def run_self_tests() -> bool:
     errs = validate_sysv_lock_authority_rules(
         REPO_ROOT,
         override_sources={
-            "crates/carrick-runtime/src/dispatch/sysv.rs": "",
-            "crates/carrick-runtime/src/dispatch/net.rs": sibling_ns_caller_source,
+            "crates/carrick-kernel/src/dispatch/sysv.rs": "",
+            "crates/carrick-kernel/src/dispatch/net.rs": sibling_ns_caller_source,
         },
     )
     assert any("unauthorized cross-module call to 'with_state'" in e for e in errs), f"Sibling namespace caller did not fail: {errs}"
@@ -1122,8 +1146,8 @@ def run_self_tests() -> bool:
     errs = validate_sysv_lock_authority_rules(
         REPO_ROOT,
         override_sources={
-            "crates/carrick-runtime/src/dispatch/sysv.rs": "",
-            "crates/carrick-runtime/src/dispatch/mod.rs": sibling_permit_source,
+            "crates/carrick-kernel/src/dispatch/sysv.rs": "",
+            "crates/carrick-kernel/src/dispatch/mod.rs": sibling_permit_source,
         },
     )
     assert any("unauthorized cross-module reference to SysV lock authority identifier 'SysvNamespacePermit'" in e for e in errs), f"Sibling permit reference did not fail: {errs}"

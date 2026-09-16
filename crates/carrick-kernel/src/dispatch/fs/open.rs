@@ -25,7 +25,7 @@ fn trusted_fs_lane_enabled() -> bool {
 
 /// Consolidated path, dirfd, flags, and mode arguments for `openat(2)` / `openat2(2)`.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct OpenAtArgs<'a> {
+pub struct OpenAtArgs<'a> {
     pub dirfd: u64,
     pub path: &'a str,
     pub flags: u64,

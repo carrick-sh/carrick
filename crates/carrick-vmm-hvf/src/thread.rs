@@ -5,28 +5,10 @@
 //! registry live in `carrick-thread` so
 //! the Linux/KVM backend can use them without depending on this crate.
 //!
-//! The Darwin-specific `thread_states` projection is
-//! defined here because they call `host_proc::thread_run_state_char`, which
-//! issues a Mach `thread_info` syscall. Those cannot live in carrick-thread
-//! (which is hypervisor-agnostic and must not import carrick-host).
+//! The Darwin-specific `(tid, state_char)` projection that `/proc` renders is
+//! NOT here: it calls `host_proc::thread_run_state_char` (a Mach `thread_info`
+//! syscall) and is consumed only by the kernel's `/proc` renderer, so it lives
+//! in `carrick_kernel::container_thread_states` over the same carrick-thread
+//! port registry. A copy here would put a second implementation on the macOS
+//! lane and a carrick-vmm-* crate in the kernel's closure.
 pub use carrick_thread::thread::*;
-
-/// Live `(tid, state_char)` for every thread of this process — the data
-/// behind `/proc/<pid>/task/` and `/proc/<tid>/stat`. The state char is
-/// read from the kernel via `thread_info` on each thread's recorded mach
-/// port (`'S'` = WAITING, `'R'` = RUNNING, …); a thread whose port isn't
-/// recorded yet reports `'R'`.
-pub fn container_thread_states(container: carrick_hal::ContainerId) -> Vec<(ThreadId, char)> {
-    let ports = carrick_thread::thread::container_thread_ports(container);
-    ports
-        .into_iter()
-        .map(|(tid, port)| {
-            let state = if port != 0 {
-                crate::host_proc::thread_run_state_char(port)
-            } else {
-                'R'
-            };
-            (tid, state)
-        })
-        .collect()
-}

@@ -245,7 +245,7 @@ fn production() {
 
 #[test]
 fn carrier_process_scan_omits_current_cfg_test_dispatch_proc_host_control() {
-    let source = include_str!("../../../../crates/carrick-runtime/src/dispatch/proc.rs");
+    let source = include_str!("../../../../crates/carrick-kernel/src/dispatch/proc.rs");
     let findings = scan_carrier_process_source(source).unwrap();
     assert!(
         findings.is_empty(),
@@ -446,4 +446,33 @@ fn finding_renderers_are_deterministic() {
         finding.render_text("crates/example/src/lib.rs"),
         "crates/example/src/lib.rs:7:3: libc_syscall: libc::syscall"
     );
+}
+
+#[test]
+fn carrier_process_scan_omits_test_support_gated_items() {
+    // The crate split gates fixtures a SIBLING crate's tests consume on
+    // `cfg(any(test, feature = "test-support"))`, because `cfg(test)` is
+    // per-crate-compilation. That gate is test scope; any other feature is not.
+    let source = r#"
+#[cfg(any(test, feature = "test-support"))]
+pub fn read_target(pid: i32) -> i32 {
+    unsafe { libc::kill(pid, 0) }
+}
+
+#[cfg(all(any(test, feature = "test-support"), target_os = "macos"))]
+pub fn darwin_fixture() {
+    let _ = unsafe { libc::fork() };
+}
+
+#[cfg(feature = "watchpoint")]
+pub fn production_behind_a_debug_feature(pid: i32) -> i32 {
+    unsafe { libc::kill(pid, 0) }
+}
+"#;
+    let findings = scan_carrier_process_source(source).unwrap();
+    let items: Vec<_> = findings
+        .iter()
+        .map(|finding| finding.enclosing_item.as_str())
+        .collect();
+    assert_eq!(items, vec!["production_behind_a_debug_feature"]);
 }

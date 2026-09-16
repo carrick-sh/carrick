@@ -146,7 +146,7 @@ fn write_line_atomically_to_fd(fd: libc::c_int, line: &str) -> std::io::Result<(
 /// process-exit path.
 pub(crate) fn emit_supervisor_record_if_profiling() {
     if should_emit(TOP_LEVEL_PID.get().copied(), std::process::id()) {
-        carrick_runtime::exec_stamps::stamp_run_complete();
+        carrick_kernel::exec_stamps::stamp_run_complete();
     }
     emit_supervisor_record_to_fd_if_top_level(libc::STDERR_FILENO);
 }

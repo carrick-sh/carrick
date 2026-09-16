@@ -11,17 +11,17 @@ use std::sync::Arc;
 
 use carrick_fatal::carrick_fatal;
 
-use crate::dispatch::SyscallDispatcher;
-use crate::kernel::CarrierProcess;
 use crate::memory::{AddressSpace, AddressSpaceError};
+use carrick_hal::{SysReg, ThreadedEngine};
+use carrick_kernel::dispatch::SyscallDispatcher;
+use carrick_kernel::kernel::CarrierProcess;
 #[cfg(all(
     feature = "platform-macos",
     target_os = "macos",
     target_arch = "aarch64"
 ))]
-use crate::run_result::RunResult;
-use crate::run_result::RuntimeError;
-use carrick_hal::{SysReg, ThreadedEngine};
+use carrick_kernel::run_result::RunResult;
+use carrick_kernel::run_result::RuntimeError;
 use carrick_mem::elf::SegmentPerms;
 use info_page::{INFO_PAGE_BASE, InfoPage, info_page_bytes};
 use island::passthrough_island_bytes;
@@ -65,13 +65,13 @@ impl ForeignMmInstallPermit {
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessContext {
     resources: std::sync::Arc<MmResources>,
-    binding: crate::kernel::KernelTaskBinding,
+    binding: carrick_kernel::kernel::KernelTaskBinding,
     /// Immutable container ownership retained independently of task liveness.
     /// Terminal join/cleanup runs after the leader has left the task graph and
     /// must never recapture this identity through a dead task.
-    container_id: crate::kernel::ContainerId,
+    container_id: carrick_kernel::kernel::ContainerId,
     mm_backend: std::sync::Arc<parking_lot::RwLock<std::sync::Arc<stage1_mm::Stage1MmBackend>>>,
-    mm_access: Option<crate::kernel::MmAccessAuthority>,
+    mm_access: Option<carrick_kernel::kernel::MmAccessAuthority>,
     foreign_mm_endpoint: Option<carrick_hal::ForeignMmEndpoint>,
 }
 
@@ -133,9 +133,9 @@ impl RootProcessInitialization {
 #[cfg(test)]
 pub(crate) fn process_context_for_tests(
     pid: i32,
-) -> (ProcessContext, crate::kernel::KernelContext) {
+) -> (ProcessContext, carrick_kernel::kernel::KernelContext) {
     let (resources, backend) = MmResources::new_root(0x4000).expect("test HVPatch root resources");
-    let bootstrap = crate::kernel::RootBootstrap::with_mm_backend(
+    let bootstrap = carrick_kernel::kernel::RootBootstrap::with_mm_backend(
         pid,
         crate::thread::ThreadId::synthetic_for_tests(pid),
         backend.clone(),
@@ -144,7 +144,7 @@ pub(crate) fn process_context_for_tests(
     )
     .expect("test HVPatch bootstrap");
     let (kernel, root) =
-        crate::kernel::Kernel::bootstrap_root(bootstrap).expect("test HVPatch kernel");
+        carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).expect("test HVPatch kernel");
     backend.bind_inventory(&kernel, root.shared().mm().id());
     let resources = std::sync::Arc::new(resources);
     resources
@@ -163,7 +163,7 @@ pub(crate) fn process_context_for_tests(
 
 #[derive(Debug)]
 pub(crate) struct PreparedProcessExec {
-    kernel: crate::kernel::PreparedExec,
+    kernel: carrick_kernel::kernel::PreparedExec,
     backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
     predecessor_backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
     reservation: mm_resources::ExecMmReservation,
@@ -171,15 +171,15 @@ pub(crate) struct PreparedProcessExec {
 }
 
 impl PreparedProcessExec {
-    pub(crate) fn old_mm_id(&self) -> crate::kernel::MmId {
+    pub(crate) fn old_mm_id(&self) -> carrick_kernel::kernel::MmId {
         self.kernel.old_mm_id()
     }
 
-    pub(crate) fn old_file_table(&self) -> std::sync::Arc<crate::kernel::FileTable> {
+    pub(crate) fn old_file_table(&self) -> std::sync::Arc<carrick_kernel::kernel::FileTable> {
         self.kernel.old_file_table()
     }
 
-    pub(crate) fn replacement_mm_id(&self) -> crate::kernel::MmId {
+    pub(crate) fn replacement_mm_id(&self) -> carrick_kernel::kernel::MmId {
         self.kernel.replacement_mm_id()
     }
 
@@ -208,7 +208,7 @@ impl PreparedProcessExec {
 
     pub(crate) fn begin_replacement_load(
         &self,
-        executor: crate::kernel::objects::ExecutorId,
+        executor: carrick_kernel::kernel::objects::ExecutorId,
     ) -> Result<AsidLoad, String> {
         self.reservation
             .begin_replacement_asid_load(executor)
@@ -220,7 +220,7 @@ impl PreparedProcessExec {
 /// carries the still-prepared Kernel transition and exact pinned MM receipt
 /// forward to post-engine publication.
 pub(crate) struct PublishedProcessExec {
-    kernel: crate::kernel::PreparedExec,
+    kernel: carrick_kernel::kernel::PreparedExec,
     receipt: mm_resources::ExecMmCommitReceipt,
 }
 
@@ -234,7 +234,7 @@ impl PublishedProcessExec {
 }
 
 pub(crate) struct CommittedProcessExec {
-    transition: crate::kernel::exec::CommittedExecTransition,
+    transition: carrick_kernel::kernel::exec::CommittedExecTransition,
     replacement_mm: std::sync::Arc<Stage1MmLease>,
     retired_mm: Option<Stage1MmRetirement>,
 }
@@ -247,7 +247,7 @@ pub(crate) struct CommittedProcessExec {
 /// the predecessor generation.
 pub(crate) struct CompleteExecError {
     error: String,
-    committed_context: Option<crate::kernel::KernelContext>,
+    committed_context: Option<carrick_kernel::kernel::KernelContext>,
 }
 
 impl CompleteExecError {
@@ -258,14 +258,14 @@ impl CompleteExecError {
         }
     }
 
-    fn after_commit(error: impl ToString, context: crate::kernel::KernelContext) -> Self {
+    fn after_commit(error: impl ToString, context: carrick_kernel::kernel::KernelContext) -> Self {
         Self {
             error: error.to_string(),
             committed_context: Some(context),
         }
     }
 
-    pub(crate) fn into_parts(self) -> (String, Option<crate::kernel::KernelContext>) {
+    pub(crate) fn into_parts(self) -> (String, Option<carrick_kernel::kernel::KernelContext>) {
         (self.error, self.committed_context)
     }
 }
@@ -277,24 +277,24 @@ impl std::fmt::Display for CompleteExecError {
 }
 
 impl CommittedProcessExec {
-    pub(crate) fn context(&self) -> &crate::kernel::KernelContext {
+    pub(crate) fn context(&self) -> &carrick_kernel::kernel::KernelContext {
         self.transition.context()
     }
 
     #[cfg(test)]
-    pub(crate) fn thread(&self) -> &crate::kernel::ThreadRef {
+    pub(crate) fn thread(&self) -> &carrick_kernel::kernel::ThreadRef {
         self.transition.thread()
     }
 
     #[cfg(test)]
-    pub(crate) fn shared(&self) -> &std::sync::Arc<crate::kernel::TaskShared> {
+    pub(crate) fn shared(&self) -> &std::sync::Arc<carrick_kernel::kernel::TaskShared> {
         self.transition.shared()
     }
 
     pub(crate) fn into_parts(
         self,
     ) -> (
-        crate::kernel::exec::CommittedExecTransition,
+        carrick_kernel::kernel::exec::CommittedExecTransition,
         std::sync::Arc<Stage1MmLease>,
         Option<Stage1MmRetirement>,
     ) {
@@ -339,7 +339,11 @@ impl PendingAddressSpaceRetirement {
         self.retired
             .complete(root_receipt)
             .map_err(|error| error.to_string())?;
-        crate::event_ring::rec_hvpatch_process_exit_end(self.pid, self.tid.raw(), self.exit_code);
+        carrick_kernel::event_ring::rec_hvpatch_process_exit_end(
+            self.pid,
+            self.tid.raw(),
+            self.exit_code,
+        );
         if let Some(event) = self.lifecycle_event {
             crate::probes::hvpatch_guest_lifecycle(event);
         }
@@ -351,7 +355,11 @@ impl PendingAddressSpaceRetirement {
         self.retired
             .complete_for_test()
             .map_err(|error| error.to_string())?;
-        crate::event_ring::rec_hvpatch_process_exit_end(self.pid, self.tid.raw(), self.exit_code);
+        carrick_kernel::event_ring::rec_hvpatch_process_exit_end(
+            self.pid,
+            self.tid.raw(),
+            self.exit_code,
+        );
         if let Some(event) = self.lifecycle_event {
             crate::probes::hvpatch_guest_lifecycle(event);
         }
@@ -362,8 +370,8 @@ impl PendingAddressSpaceRetirement {
 impl ProcessContext {
     fn new(
         resources: std::sync::Arc<MmResources>,
-        binding: crate::kernel::KernelTaskBinding,
-        container_id: crate::kernel::ContainerId,
+        binding: carrick_kernel::kernel::KernelTaskBinding,
+        container_id: carrick_kernel::kernel::ContainerId,
         mm_backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
     ) -> Self {
         Self {
@@ -380,7 +388,7 @@ impl ProcessContext {
     fn with_foreign_mm_endpoint(
         mut self,
         endpoint: carrick_hal::ForeignMmEndpoint,
-        context: &crate::kernel::KernelContext,
+        context: &carrick_kernel::kernel::KernelContext,
     ) -> Result<Self, RuntimeError> {
         if context.task().key() != self.binding.task_key() {
             return Err(RuntimeError::Configuration(
@@ -395,7 +403,7 @@ impl ProcessContext {
                 &ForeignMmInstallPermit::new(),
             );
         self.foreign_mm_endpoint = Some(endpoint);
-        self.mm_access = Some(crate::kernel::MmAccessAuthority::new());
+        self.mm_access = Some(carrick_kernel::kernel::MmAccessAuthority::new());
         Ok(self)
     }
 
@@ -407,15 +415,15 @@ impl ProcessContext {
             return false;
         };
         self.binding
-            .capture(crate::kernel::LinuxTid::for_task_leader(internal))
+            .capture(carrick_kernel::kernel::LinuxTid::for_task_leader(internal))
             .is_ok_and(|context| {
                 context.task().key() == self.task_key()
-                    && crate::namespace::pid::try_ns_self_pid_for(&context, internal_u32)
-                        == Some(crate::namespace::pid::NS_INIT_PID)
+                    && carrick_kernel::namespace::pid::try_ns_self_pid_for(&context, internal_u32)
+                        == Some(carrick_kernel::namespace::pid::NS_INIT_PID)
             })
     }
 
-    pub(crate) fn container_id(&self) -> crate::kernel::ContainerId {
+    pub(crate) fn container_id(&self) -> carrick_kernel::kernel::ContainerId {
         self.container_id
     }
 
@@ -430,7 +438,10 @@ impl ProcessContext {
         self.resources.table_arena_source_for_lease(lease)
     }
 
-    pub(crate) fn owns_final_mm_edge(&self, task: crate::kernel::TaskKey) -> Result<bool, String> {
+    pub(crate) fn owns_final_mm_edge(
+        &self,
+        task: carrick_kernel::kernel::TaskKey,
+    ) -> Result<bool, String> {
         self.resources
             .is_final_owner(task)
             .map_err(|error| error.to_string())
@@ -438,7 +449,7 @@ impl ProcessContext {
 
     pub(crate) fn published_child_context(
         &self,
-        context: &crate::kernel::KernelContext,
+        context: &carrick_kernel::kernel::KernelContext,
         mm_backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
     ) -> Self {
         mm_backend.bind_inventory(context.kernel(), context.shared().mm().id());
@@ -469,7 +480,7 @@ impl ProcessContext {
         self.kernel_graph().registry().task_count()
     }
 
-    pub(crate) fn mm_binding(&self) -> Option<crate::kernel::MmBinding> {
+    pub(crate) fn mm_binding(&self) -> Option<carrick_kernel::kernel::MmBinding> {
         let backend = std::sync::Arc::clone(&self.mm_backend.read());
         Some(backend.binding())
     }
@@ -497,7 +508,7 @@ impl ProcessContext {
         detail: i64,
     ) -> Option<(
         carrick_observability::probes::HvpatchGuestLifecycle,
-        crate::kernel::MmBinding,
+        carrick_kernel::kernel::MmBinding,
     )> {
         let Ok(identity) = self.kernel_graph().task_identity(self.task_id()) else {
             tracing::warn!(
@@ -534,7 +545,7 @@ impl ProcessContext {
 
     fn prepare_root_lifecycle(
         &self,
-        context: &crate::kernel::KernelContext,
+        context: &carrick_kernel::kernel::KernelContext,
         tid: crate::thread::ThreadId,
     ) -> Result<PreparedRootLifecycle, RuntimeError> {
         if context.task().key() != self.task_key() {
@@ -646,7 +657,7 @@ impl ProcessContext {
     #[cfg(test)]
     pub(crate) fn prepare_exec(
         &self,
-        context: &crate::kernel::KernelContext,
+        context: &carrick_kernel::kernel::KernelContext,
     ) -> Result<PreparedProcessExec, String> {
         if context.task().key() != self.task_key() {
             return Err("exec context belongs to another HVPatch task generation".to_owned());
@@ -658,8 +669,8 @@ impl ProcessContext {
     #[cfg(test)]
     pub(crate) fn prepare_exec_for_linux_tid(
         &self,
-        tid: crate::kernel::LinuxTid,
-    ) -> Result<(PreparedProcessExec, crate::kernel::KernelContext), String> {
+        tid: carrick_kernel::kernel::LinuxTid,
+    ) -> Result<(PreparedProcessExec, carrick_kernel::kernel::KernelContext), String> {
         let reservation = self
             .resources
             .reserve_exec(self.task_key())
@@ -677,12 +688,12 @@ impl ProcessContext {
 
     pub(crate) fn prepare_exec_for_linux_tid_with_mm_reservation(
         &self,
-        tid: crate::kernel::LinuxTid,
+        tid: carrick_kernel::kernel::LinuxTid,
         reservation: mm_resources::ExecMmReservation,
-    ) -> Result<(PreparedProcessExec, crate::kernel::KernelContext), String> {
+    ) -> Result<(PreparedProcessExec, carrick_kernel::kernel::KernelContext), String> {
         let predecessor_backend = reservation.predecessor_backend();
         let backend = reservation.replacement_backend();
-        let kernel_backend: std::sync::Arc<dyn crate::kernel::MmBackend> = backend.clone();
+        let kernel_backend: std::sync::Arc<dyn carrick_kernel::kernel::MmBackend> = backend.clone();
         let (kernel, context) = match self
             .kernel_graph()
             .prepare_exec_for_binding_with_mm_backend(&self.binding, tid, kernel_backend, None)
@@ -747,7 +758,7 @@ impl ProcessContext {
     pub(crate) fn publish_exec_mm(
         &self,
         prepared: PreparedProcessExec,
-        vma_source: crate::kernel::SharedVmaSnapshotSource,
+        vma_source: carrick_kernel::kernel::SharedVmaSnapshotSource,
     ) -> Result<PublishedProcessExec, String> {
         let PreparedProcessExec {
             mut kernel,
@@ -832,7 +843,7 @@ impl ProcessContext {
     pub(crate) fn complete_exec(
         &self,
         published: PublishedProcessExec,
-        dispatch_mm: Option<crate::dispatch::PreparedDispatchMmExec>,
+        dispatch_mm: Option<carrick_kernel::dispatch::PreparedDispatchMmExec>,
     ) -> Result<CommittedProcessExec, CompleteExecError> {
         let PublishedProcessExec { kernel, receipt } = published;
         let replacement_mm = kernel.replacement_mm_id();
@@ -869,8 +880,8 @@ impl ProcessContext {
         &self,
         prepared: PreparedProcessExec,
         _stage1_root: u64,
-        vma_source: crate::kernel::SharedVmaSnapshotSource,
-        dispatch_mm: Option<crate::dispatch::PreparedDispatchMmExec>,
+        vma_source: carrick_kernel::kernel::SharedVmaSnapshotSource,
+        dispatch_mm: Option<carrick_kernel::dispatch::PreparedDispatchMmExec>,
     ) -> Result<CommittedProcessExec, String> {
         let published = self.publish_exec_mm(prepared, vma_source)?;
         self.complete_exec(published, dispatch_mm)
@@ -882,7 +893,11 @@ impl ProcessContext {
         exit_code: i32,
         tid: crate::thread::ThreadId,
     ) -> Option<carrick_observability::probes::HvpatchGuestLifecycle> {
-        crate::event_ring::rec_hvpatch_process_exit_begin(self.pid(), tid.raw(), exit_code);
+        carrick_kernel::event_ring::rec_hvpatch_process_exit_begin(
+            self.pid(),
+            tid.raw(),
+            exit_code,
+        );
         self.prepare_lifecycle_event(
             carrick_observability::probes::HvpatchGuestLifecyclePhase::ProcessExit,
             tid,
@@ -901,7 +916,7 @@ impl ProcessContext {
     /// Root-slot/ASID retirement remains deliberately separate and follows output
     /// and fd finalization.
     /// `status` is the Linux `wait(2)` encoding, built by
-    /// [`crate::run_result::RunResult::wait_status_encoding`] so that signal death and
+    /// [`carrick_kernel::run_result::RunResult::wait_status_encoding`] so that signal death and
     /// normal exit cannot be confused. This used to take a bare exit code and
     /// encode `(code & 0xff) << 8` unconditionally, which reported every guest
     /// crash as a NORMAL exit with status `128 + signum`: `WIFSIGNALED` false,
@@ -911,10 +926,10 @@ impl ProcessContext {
     /// can come from.
     pub(crate) fn publish_exit_status(
         &self,
-        status: crate::kernel::LinuxWaitStatus,
-        orphan_adopter: Option<crate::kernel::TaskKey>,
-        notify_parent: impl FnOnce(Option<crate::kernel::TaskKey>),
-    ) -> Result<Option<crate::kernel::TaskKey>, String> {
+        status: carrick_kernel::kernel::LinuxWaitStatus,
+        orphan_adopter: Option<carrick_kernel::kernel::TaskKey>,
+        notify_parent: impl FnOnce(Option<carrick_kernel::kernel::TaskKey>),
+    ) -> Result<Option<carrick_kernel::kernel::TaskKey>, String> {
         self.kernel_graph()
             .exit_task_key_eventually_notifying(
                 self.task_key(),
@@ -956,27 +971,27 @@ impl ProcessContext {
     }
 }
 
-impl crate::kernel::CarrierProcess for ProcessContext {
-    fn kernel_graph(&self) -> &std::sync::Arc<crate::kernel::Kernel> {
+impl carrick_kernel::kernel::CarrierProcess for ProcessContext {
+    fn kernel_graph(&self) -> &std::sync::Arc<carrick_kernel::kernel::Kernel> {
         self.binding.kernel()
     }
 
-    fn task_key(&self) -> crate::kernel::TaskKey {
+    fn task_key(&self) -> carrick_kernel::kernel::TaskKey {
         self.binding.task_key()
     }
 
-    fn task_binding(&self) -> crate::kernel::KernelTaskBinding {
+    fn task_binding(&self) -> carrick_kernel::kernel::KernelTaskBinding {
         self.binding.clone()
     }
 
     fn context_for_linux_tid(
         &self,
-        tid: crate::kernel::LinuxTid,
-    ) -> Result<crate::kernel::KernelContext, crate::kernel::KernelError> {
+        tid: carrick_kernel::kernel::LinuxTid,
+    ) -> Result<carrick_kernel::kernel::KernelContext, carrick_kernel::kernel::KernelError> {
         self.binding.capture(tid)
     }
 
-    fn mm_access_authority(&self) -> Option<&crate::kernel::MmAccessAuthority> {
+    fn mm_access_authority(&self) -> Option<&carrick_kernel::kernel::MmAccessAuthority> {
         self.mm_access.as_ref()
     }
 
@@ -987,17 +1002,19 @@ impl crate::kernel::CarrierProcess for ProcessContext {
             .map(|lease| lease as std::sync::Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>)
     }
 
-    fn bind_vma_source(&self, source: crate::kernel::SharedVmaSnapshotSource) {
+    fn bind_vma_source(&self, source: carrick_kernel::kernel::SharedVmaSnapshotSource) {
         let backend = std::sync::Arc::clone(&self.mm_backend.read());
         backend.bind_vma_source(source);
     }
 
     fn bind_mm_mutation_authority(
         &self,
-        authority: crate::dispatch::mm_mutation::ForeignMmMutationAuthority,
+        authority: carrick_kernel::dispatch::mm_mutation::ForeignMmMutationAuthority,
     ) {
         let context = self
-            .context_for_linux_tid(crate::kernel::LinuxTid::for_task_leader(self.task_id()))
+            .context_for_linux_tid(carrick_kernel::kernel::LinuxTid::for_task_leader(
+                self.task_id(),
+            ))
             .unwrap_or_else(|_| {
                 carrick_fatal!(
                     "hvpatch::process_context",
@@ -1051,14 +1068,14 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
         // identity (which succeeds with no identity env at all, and refuses
         // only an unsafe CARRICK_CONTAINER_ID).
         None => {
-            let container = Arc::new(crate::kernel::Container::new(
-                crate::kernel::LaunchContext::from_process_env()?,
+            let container = Arc::new(carrick_kernel::kernel::Container::new(
+                carrick_kernel::kernel::LaunchContext::from_process_env()?,
             ));
             dispatcher.set_container(Arc::clone(&container));
             container
         }
     };
-    let bootstrap = crate::kernel::RootBootstrap::with_mm_backend(
+    let bootstrap = carrick_kernel::kernel::RootBootstrap::with_mm_backend(
         pid,
         root_tid,
         mm_backend.clone(),
@@ -1107,12 +1124,14 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
                 binding.ttbr0.raw(),
                 engine.get_sys_reg(SysReg::Ttbr0).unwrap_or(0)
             );
-            crate::kernel::identity_page::stamp_identity_page(engine, dispatcher, root_context)
-                .map_err(|error| {
-                    RuntimeError::Configuration(format!(
-                        "stamp HVPatch root identity page: {error}"
-                    ))
-                })?;
+            carrick_kernel::kernel::identity_page::stamp_identity_page(
+                engine,
+                dispatcher,
+                root_context,
+            )
+            .map_err(|error| {
+                RuntimeError::Configuration(format!("stamp HVPatch root identity page: {error}"))
+            })?;
             let lifecycle = prepared.prepare_root_lifecycle(
                 root_context,
                 crate::thread::ThreadId::from_guest_supplied_tid(
@@ -1505,19 +1524,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::{ChildExit, WaitResult, identity_operation_errno};
+    use carrick_kernel::kernel::{ChildExit, WaitResult, identity_operation_errno};
 
     #[test]
     fn process_group_leader_setsid_failure_is_eperm() {
         assert_eq!(
             identity_operation_errno(
-                crate::kernel::KernelOperationError::AlreadyProcessGroupLeader,
+                carrick_kernel::kernel::KernelOperationError::AlreadyProcessGroupLeader,
             ),
             crate::linux_abi::LINUX_EPERM,
         );
     }
-    use crate::kernel::MmBackend as _;
     use crate::memory::AddressSpace;
+    use carrick_kernel::kernel::MmBackend as _;
     use carrick_mem::elf::SegmentPerms;
     use info_page::{INFO_PAGE_BASE, InfoPage};
 
@@ -1526,7 +1545,7 @@ mod tests {
         write: false,
         execute: true,
     };
-    const VMA_RX_ACCESS: crate::kernel::VmaAccess = crate::kernel::VmaAccess {
+    const VMA_RX_ACCESS: carrick_kernel::kernel::VmaAccess = carrick_kernel::kernel::VmaAccess {
         readable: true,
         writable: false,
         executable: true,
@@ -1548,7 +1567,7 @@ mod tests {
             .kernel()
             .exit_task(
                 process.task_id(),
-                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
                 None,
             )
             .expect("retire root task");
@@ -1560,7 +1579,7 @@ mod tests {
         words.iter().flat_map(|word| word.to_le_bytes()).collect()
     }
 
-    fn test_vma_source() -> crate::kernel::SharedVmaSnapshotSource {
+    fn test_vma_source() -> carrick_kernel::kernel::SharedVmaSnapshotSource {
         SyscallDispatcher::new().vma_snapshot_source()
     }
 
@@ -1568,14 +1587,14 @@ mod tests {
     struct ChangeAfterExecValidationVmaSource {
         revision: std::sync::atomic::AtomicU64,
         publish_calls: std::sync::atomic::AtomicUsize,
-        vmas: Vec<crate::kernel::VmaSummary>,
+        vmas: Vec<carrick_kernel::kernel::VmaSummary>,
     }
 
     impl ChangeAfterExecValidationVmaSource {
-        fn new(vmas: Vec<crate::kernel::VmaSummary>) -> Self {
+        fn new(vmas: Vec<carrick_kernel::kernel::VmaSummary>) -> Self {
             Self {
                 revision: std::sync::atomic::AtomicU64::new(
-                    crate::kernel::VmaRevision::INITIAL.raw(),
+                    carrick_kernel::kernel::VmaRevision::INITIAL.raw(),
                 ),
                 publish_calls: std::sync::atomic::AtomicUsize::new(0),
                 vmas,
@@ -1583,31 +1602,32 @@ mod tests {
         }
     }
 
-    impl crate::kernel::VmaSnapshotSource for ChangeAfterExecValidationVmaSource {
+    impl carrick_kernel::kernel::VmaSnapshotSource for ChangeAfterExecValidationVmaSource {
         fn snapshot(
             &self,
             _deadline: std::time::Instant,
-        ) -> Result<crate::kernel::OwnedVmaSnapshot, crate::kernel::SnapshotError> {
-            Ok(crate::kernel::OwnedVmaSnapshot {
+        ) -> Result<carrick_kernel::kernel::OwnedVmaSnapshot, carrick_kernel::kernel::SnapshotError>
+        {
+            Ok(carrick_kernel::kernel::OwnedVmaSnapshot {
                 revision: self.revision(),
                 vmas: self.vmas.clone(),
             })
         }
 
-        fn revision(&self) -> crate::kernel::VmaRevision {
-            crate::kernel::VmaRevision::from_authority_raw(
+        fn revision(&self) -> carrick_kernel::kernel::VmaRevision {
+            carrick_kernel::kernel::VmaRevision::from_authority_raw(
                 self.revision.load(std::sync::atomic::Ordering::Acquire),
             )
         }
 
         fn publish_if_revision(
             &self,
-            expected: crate::kernel::VmaRevision,
+            expected: carrick_kernel::kernel::VmaRevision,
             _deadline: std::time::Instant,
-            publish: &mut dyn FnMut() -> Result<(), crate::kernel::SnapshotError>,
-        ) -> Result<(), crate::kernel::SnapshotError> {
+            publish: &mut dyn FnMut() -> Result<(), carrick_kernel::kernel::SnapshotError>,
+        ) -> Result<(), carrick_kernel::kernel::SnapshotError> {
             if self.revision() != expected {
-                return Err(crate::kernel::SnapshotError::ChangedDuringObservation);
+                return Err(carrick_kernel::kernel::SnapshotError::ChangedDuringObservation);
             }
             let result = publish();
             if result.is_ok()
@@ -1631,10 +1651,10 @@ mod tests {
         u32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("siginfo u32"))
     }
 
-    fn authoritative_root() -> (ProcessContext, crate::kernel::KernelContext) {
+    fn authoritative_root() -> (ProcessContext, carrick_kernel::kernel::KernelContext) {
         let pid = 10_000;
         let (table, backend) = MmResources::new_root(0x4000).unwrap();
-        let bootstrap = crate::kernel::RootBootstrap::with_mm_backend(
+        let bootstrap = carrick_kernel::kernel::RootBootstrap::with_mm_backend(
             pid,
             crate::thread::ThreadId::synthetic_for_tests(pid),
             backend.clone(),
@@ -1642,7 +1662,7 @@ mod tests {
             std::sync::Arc::new(carrick_hal::NullHostSignalBridge::default()),
         )
         .unwrap();
-        let (kernel, root) = crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        let (kernel, root) = carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
         backend.bind_inventory(&kernel, root.shared().mm().id());
         backend.bind_vma_source(test_vma_source());
         let table = std::sync::Arc::new(table);
@@ -1657,7 +1677,9 @@ mod tests {
         let event = process.record_process_exit_begin(exit_code, tid);
         let _ = process
             .publish_exit_status(
-                crate::kernel::LinuxWaitStatus::from_wait_encoding((exit_code & 0xff) << 8),
+                carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(
+                    (exit_code & 0xff) << 8,
+                ),
                 None,
                 |_| {},
             )
@@ -1675,15 +1697,16 @@ mod tests {
 
     fn production_shared_child(
         parent: &ProcessContext,
-        parent_context: &crate::kernel::KernelContext,
+        parent_context: &carrick_kernel::kernel::KernelContext,
         diagnostic_name: &str,
         child_tid: crate::thread::ThreadId,
-    ) -> (ProcessContext, crate::kernel::KernelContext) {
+    ) -> (ProcessContext, carrick_kernel::kernel::KernelContext) {
         let published = parent
             .kernel_graph()
             .reserve_fork(
                 parent_context,
-                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::VM).unwrap(),
+                carrick_kernel::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::VM)
+                    .unwrap(),
                 diagnostic_name.to_owned(),
                 None,
             )
@@ -1715,32 +1738,35 @@ mod tests {
     fn child_wait_reports_still_running_during_an_overlapping_exit_reservation() {
         let (parent, root) = authoritative_root();
         let prepared_mm = parent.mm_resources().prepare_child().unwrap();
-        let child = parent
-            .kernel_graph()
-            .reserve_fork(
-                &root,
-                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+        let child =
+            parent
+                .kernel_graph()
+                .reserve_fork(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::empty(),
+                    )
                     .unwrap(),
-                "wait-retry-child".to_owned(),
-                None,
-            )
-            .unwrap()
-            .prepare_with_mm_backend(
-                prepared_mm.backend(),
-                crate::thread::ThreadId::synthetic_for_tests(10_001),
-            )
-            .unwrap()
-            .commit()
-            .unwrap()
-            .into_parts()
-            .unwrap()
-            .0;
+                    "wait-retry-child".to_owned(),
+                    None,
+                )
+                .unwrap()
+                .prepare_with_mm_backend(
+                    prepared_mm.backend(),
+                    crate::thread::ThreadId::synthetic_for_tests(10_001),
+                )
+                .unwrap()
+                .commit()
+                .unwrap()
+                .into_parts()
+                .unwrap()
+                .0;
         let child_key = child.task().key();
         let prepared_exit = parent
             .kernel_graph()
             .prepare_task_exit_key(
                 child_key,
-                crate::kernel::LinuxWaitStatus::from_wait_encoding(7 << 8),
+                carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(7 << 8),
                 None,
             )
             .unwrap();
@@ -1751,7 +1777,7 @@ mod tests {
         assert!(matches!(
             parent.wait_child_with_job_control(
                 Some(child_key.id.raw()),
-                crate::kernel::WaitChildClass::Sigchld,
+                carrick_kernel::kernel::WaitChildClass::Sigchld,
                 false,
                 false,
                 false,
@@ -1763,7 +1789,7 @@ mod tests {
         // wait — observes the committed zombie.
         let WaitResult::Exited(exit) = parent.wait_child_with_job_control(
             Some(child_key.id.raw()),
-            crate::kernel::WaitChildClass::Sigchld,
+            carrick_kernel::kernel::WaitChildClass::Sigchld,
             false,
             false,
             false,
@@ -1777,7 +1803,7 @@ mod tests {
     #[test]
     fn root_kernel_mm_keeps_the_exact_stage1_backend() {
         let (process, root) = authoritative_root();
-        let expected: std::sync::Arc<dyn crate::kernel::MmBackend> =
+        let expected: std::sync::Arc<dyn carrick_kernel::kernel::MmBackend> =
             process.mm_backend.read().clone();
         let mm = root.shared().mm();
         let actual = mm.backend().expect("root mm backend");
@@ -1823,23 +1849,26 @@ mod tests {
 
         let prepared_mm = parent.mm_resources().prepare_child().unwrap();
         let child_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
-        let child_context = parent
-            .kernel_graph()
-            .reserve_fork(
-                &root,
-                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+        let child_context =
+            parent
+                .kernel_graph()
+                .reserve_fork(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::empty(),
+                    )
                     .unwrap(),
-                "vma-child".to_owned(),
-                None,
-            )
-            .unwrap()
-            .prepare_with_mm_backend(prepared_mm.backend(), child_tid)
-            .unwrap()
-            .commit()
-            .unwrap()
-            .into_parts()
-            .unwrap()
-            .0;
+                    "vma-child".to_owned(),
+                    None,
+                )
+                .unwrap()
+                .prepare_with_mm_backend(prepared_mm.backend(), child_tid)
+                .unwrap()
+                .commit()
+                .unwrap()
+                .into_parts()
+                .unwrap()
+                .0;
         let child_backend = parent
             .mm_resources()
             .publish_child(child_context.task().key(), prepared_mm)
@@ -1893,7 +1922,7 @@ mod tests {
             exec_context.thread().registry_id(),
             parent.pid() as u32,
             exec_child.pid() as u32,
-            crate::kernel::CloneObjectMode::Share,
+            carrick_kernel::kernel::CloneObjectMode::Share,
         );
         exec_dispatcher.bind_hvpatch_process(Arc::new(exec_child.clone()));
 
@@ -1918,7 +1947,8 @@ mod tests {
             .kernel_graph()
             .reserve_fork(
                 &root,
-                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::VM).unwrap(),
+                carrick_kernel::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::VM)
+                    .unwrap(),
                 "second-shared-child".to_owned(),
                 None,
             )
@@ -1996,14 +2026,14 @@ mod tests {
         );
 
         let replacement_backend = std::sync::Arc::clone(&exec_child.mm_backend.read());
-        let replacement = crate::kernel::MmBackend::snapshot(
+        let replacement = carrick_kernel::kernel::MmBackend::snapshot(
             replacement_backend.as_ref(),
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
         .expect("replacement MM observer");
         assert_eq!(
             replacement.vmas,
-            vec![crate::kernel::VmaSummary {
+            vec![carrick_kernel::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x9000),
                 end: carrick_guest_mem::GuestVa(0xa000),
                 access: VMA_RX_ACCESS,
@@ -2019,7 +2049,7 @@ mod tests {
             sharing: carrick_vfs::ProcMapSharing::Private,
             path: "surviving-parent-after-child-exec".to_owned(),
         }]);
-        let replacement_after_parent_mutation = crate::kernel::MmBackend::snapshot(
+        let replacement_after_parent_mutation = carrick_kernel::kernel::MmBackend::snapshot(
             replacement_backend.as_ref(),
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
@@ -2029,14 +2059,14 @@ mod tests {
             "the replacement backend must observe only its replacement VMA source",
         );
 
-        let retained_parent = crate::kernel::MmBackend::snapshot(
+        let retained_parent = carrick_kernel::kernel::MmBackend::snapshot(
             retained_parent_backend.as_ref(),
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
         .expect("retained shared parent MM observer");
         assert_eq!(
             retained_parent.vmas,
-            vec![crate::kernel::VmaSummary {
+            vec![carrick_kernel::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x7000),
                 end: carrick_guest_mem::GuestVa(0x8000),
                 access: VMA_RX_ACCESS,
@@ -2054,9 +2084,9 @@ mod tests {
             .lease(process.task_key())
             .expect("old MM lease");
         let old_mm = root.shared().mm().id();
-        let source: crate::kernel::SharedVmaSnapshotSource =
+        let source: carrick_kernel::kernel::SharedVmaSnapshotSource =
             std::sync::Arc::new(ChangeAfterExecValidationVmaSource::new(vec![
-                crate::kernel::VmaSummary {
+                carrick_kernel::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x1000),
                     end: carrick_guest_mem::GuestVa(0x2000),
                     access: VMA_RX_ACCESS,
@@ -2100,7 +2130,7 @@ mod tests {
             "a failed exec must leave Kernel on the predecessor MM",
         );
 
-        let executor = crate::kernel::objects::ExecutorId::for_transitional_thread(
+        let executor = carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(
             crate::thread::ThreadId::synthetic_for_tests(19_999),
         )
         .expect("test executor");
@@ -2154,7 +2184,7 @@ mod tests {
     #[test]
     fn dropping_mm_published_exec_terminates_parked_predecessor_siblings() {
         let (process, root) = authoritative_root();
-        let plan = crate::kernel::ClonePlan::from_flags(
+        let plan = carrick_kernel::kernel::ClonePlan::from_flags(
             carrick_abi::LinuxCloneFlags::THREAD
                 | carrick_abi::LinuxCloneFlags::SIGHAND
                 | carrick_abi::LinuxCloneFlags::VM,
@@ -2175,7 +2205,7 @@ mod tests {
         let runner_thread = std::thread::spawn(move || {
             loop {
                 match runner.checkpoint() {
-                    crate::kernel::RunnerDirective::Continue => std::thread::yield_now(),
+                    carrick_kernel::kernel::RunnerDirective::Continue => std::thread::yield_now(),
                     directive => break directive,
                 }
             }
@@ -2189,12 +2219,12 @@ mod tests {
 
         assert_eq!(
             runner_thread.join().expect("join predecessor sibling"),
-            crate::kernel::RunnerDirective::Terminate,
+            carrick_kernel::kernel::RunnerDirective::Terminate,
             "forward-only drop must never resume a predecessor sibling",
         );
         assert!(matches!(
             sibling_thread.bind_runner(),
-            Err(crate::kernel::ObjectGraphError::RunnerDraining(_)),
+            Err(carrick_kernel::kernel::ObjectGraphError::RunnerDraining(_)),
         ));
     }
 
@@ -2211,7 +2241,7 @@ mod tests {
             child_context.thread().registry_id(),
             parent.pid() as u32,
             child.pid() as u32,
-            crate::kernel::CloneObjectMode::Share,
+            carrick_kernel::kernel::CloneObjectMode::Share,
         );
         child_dispatcher.bind_hvpatch_process(Arc::new(child.clone()));
 
@@ -2237,14 +2267,14 @@ mod tests {
             path: "post-exec-rebind".to_owned(),
         }]);
         rebound.bind_hvpatch_process(Arc::new(child.clone()));
-        let observed = crate::kernel::MmBackend::snapshot(
+        let observed = carrick_kernel::kernel::MmBackend::snapshot(
             child.mm_backend.read().as_ref(),
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
         .expect("replacement MM observer");
         assert_eq!(
             observed.vmas,
-            vec![crate::kernel::VmaSummary {
+            vec![carrick_kernel::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x9000),
                 end: carrick_guest_mem::GuestVa(0xa000),
                 access: VMA_RX_ACCESS,
@@ -2270,7 +2300,7 @@ mod tests {
             crate::thread::ThreadId::synthetic_for_tests(10_001),
             10_000,
             10_001,
-            crate::kernel::CloneObjectMode::Share,
+            carrick_kernel::kernel::CloneObjectMode::Share,
         );
 
         child.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
@@ -2304,12 +2334,12 @@ mod tests {
         assert_eq!(
             (parent_after_child.vmas, child_after_parent.vmas),
             (
-                vec![crate::kernel::VmaSummary {
+                vec![carrick_kernel::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x3000),
                     end: carrick_guest_mem::GuestVa(0x4000),
                     access: VMA_RX_ACCESS,
                 }],
-                vec![crate::kernel::VmaSummary {
+                vec![carrick_kernel::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x5000),
                     end: carrick_guest_mem::GuestVa(0x6000),
                     access: VMA_RX_ACCESS,
@@ -2357,12 +2387,12 @@ mod tests {
         assert_eq!(
             (parent_observed.vmas, child_observed.vmas),
             (
-                vec![crate::kernel::VmaSummary {
+                vec![carrick_kernel::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x1000),
                     end: carrick_guest_mem::GuestVa(0x2000),
                     access: VMA_RX_ACCESS,
                 }],
-                vec![crate::kernel::VmaSummary {
+                vec![carrick_kernel::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x3000),
                     end: carrick_guest_mem::GuestVa(0x4000),
                     access: VMA_RX_ACCESS,
@@ -2388,11 +2418,11 @@ mod tests {
             crate::thread::ThreadId::synthetic_for_tests(10_001),
             10_000,
             10_001,
-            crate::kernel::CloneObjectMode::Share,
+            carrick_kernel::kernel::CloneObjectMode::Share,
         );
 
         let abandoned = child.publish_exec_image_state(
-            crate::kernel::MmId::from_raw_u64(20_001).expect("replacement MM"),
+            carrick_kernel::kernel::MmId::from_raw_u64(20_001).expect("replacement MM"),
             vec![carrick_vfs::ProcMapsEntry {
                 start: 0x3000,
                 end: 0x4000,
@@ -2412,7 +2442,7 @@ mod tests {
                 .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
                 .expect("live parent while exec is staged")
                 .vmas,
-            vec![crate::kernel::VmaSummary {
+            vec![carrick_kernel::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x1000),
                 end: carrick_guest_mem::GuestVa(0x2000),
                 access: VMA_RX_ACCESS,
@@ -2424,7 +2454,7 @@ mod tests {
                 .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
                 .expect("private staged source")
                 .vmas,
-            vec![crate::kernel::VmaSummary {
+            vec![carrick_kernel::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x3000),
                 end: carrick_guest_mem::GuestVa(0x4000),
                 access: VMA_RX_ACCESS,
@@ -2437,7 +2467,7 @@ mod tests {
                 .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
                 .expect("child remains on live shared source after abandon")
                 .vmas,
-            vec![crate::kernel::VmaSummary {
+            vec![carrick_kernel::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x1000),
                 end: carrick_guest_mem::GuestVa(0x2000),
                 access: VMA_RX_ACCESS,
@@ -2462,10 +2492,10 @@ mod tests {
             crate::thread::ThreadId::synthetic_for_tests(10_001),
             10_000,
             10_001,
-            crate::kernel::CloneObjectMode::Share,
+            carrick_kernel::kernel::CloneObjectMode::Share,
         );
         let prepared = child.publish_exec_image_state(
-            crate::kernel::MmId::from_raw_u64(20_002).expect("replacement MM"),
+            carrick_kernel::kernel::MmId::from_raw_u64(20_002).expect("replacement MM"),
             vec![carrick_vfs::ProcMapsEntry {
                 start: 0x3000,
                 end: 0x4000,
@@ -2496,7 +2526,7 @@ mod tests {
                 .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
                 .expect("promoted child source")
                 .vmas,
-            vec![crate::kernel::VmaSummary {
+            vec![carrick_kernel::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x3000),
                 end: carrick_guest_mem::GuestVa(0x4000),
                 access: VMA_RX_ACCESS,
@@ -2508,7 +2538,7 @@ mod tests {
                 .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
                 .expect("retained parent source")
                 .vmas,
-            vec![crate::kernel::VmaSummary {
+            vec![carrick_kernel::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x5000),
                 end: carrick_guest_mem::GuestVa(0x6000),
                 access: VMA_RX_ACCESS,
@@ -2533,10 +2563,10 @@ mod tests {
             crate::thread::ThreadId::synthetic_for_tests(10_001),
             10_000,
             10_001,
-            crate::kernel::CloneObjectMode::Share,
+            carrick_kernel::kernel::CloneObjectMode::Share,
         );
         let prepared = child.publish_exec_image_state(
-            crate::kernel::MmId::from_raw_u64(20_003).expect("replacement MM"),
+            carrick_kernel::kernel::MmId::from_raw_u64(20_003).expect("replacement MM"),
             vec![carrick_vfs::ProcMapsEntry {
                 start: 0x3000,
                 end: 0x4000,
@@ -2553,7 +2583,7 @@ mod tests {
 
         let parent_transaction = parent.with_host_alias_dispatch_for_test(|guard| {
             guard
-                .publish(crate::dispatch::HostAliasCommit::empty_for_test())
+                .publish(carrick_kernel::dispatch::HostAliasCommit::empty_for_test())
                 .expect("publish host-alias transaction")
         });
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
@@ -2578,7 +2608,7 @@ mod tests {
                 .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
                 .expect("promoted child source")
                 .vmas,
-            vec![crate::kernel::VmaSummary {
+            vec![carrick_kernel::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x3000),
                 end: carrick_guest_mem::GuestVa(0x4000),
                 access: VMA_RX_ACCESS,
@@ -2590,7 +2620,7 @@ mod tests {
                 .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
                 .expect("retained parent source")
                 .vmas,
-            vec![crate::kernel::VmaSummary {
+            vec![carrick_kernel::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x1000),
                 end: carrick_guest_mem::GuestVa(0x2000),
                 access: VMA_RX_ACCESS,
@@ -2615,10 +2645,10 @@ mod tests {
             crate::thread::ThreadId::synthetic_for_tests(10_001),
             10_000,
             10_001,
-            crate::kernel::CloneObjectMode::Share,
+            carrick_kernel::kernel::CloneObjectMode::Share,
         );
         let prepared = child.publish_exec_image_state(
-            crate::kernel::MmId::from_raw_u64(20_004).expect("replacement MM"),
+            carrick_kernel::kernel::MmId::from_raw_u64(20_004).expect("replacement MM"),
             vec![carrick_vfs::ProcMapsEntry {
                 start: 0x3000,
                 end: 0x4000,
@@ -2680,7 +2710,7 @@ mod tests {
             child_context.thread().registry_id(),
             parent.pid() as u32,
             child.pid() as u32,
-            crate::kernel::CloneObjectMode::Share,
+            carrick_kernel::kernel::CloneObjectMode::Share,
         );
         child_dispatcher.bind_hvpatch_process(Arc::new(child.clone()));
 
@@ -2747,12 +2777,12 @@ mod tests {
             sharing: carrick_vfs::ProcMapSharing::Private,
             path: "child-after-private-exec".to_owned(),
         }]);
-        let retained_parent_after_exec = crate::kernel::MmBackend::snapshot(
+        let retained_parent_after_exec = carrick_kernel::kernel::MmBackend::snapshot(
             retained_parent_backend.as_ref(),
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
         .expect("retained parent MM after child exec");
-        let replacement_after_exec = crate::kernel::MmBackend::snapshot(
+        let replacement_after_exec = carrick_kernel::kernel::MmBackend::snapshot(
             child.mm_backend.read().as_ref(),
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
@@ -2766,22 +2796,22 @@ mod tests {
                 replacement_after_exec.vmas,
             ),
             (
-                vec![crate::kernel::VmaSummary {
+                vec![carrick_kernel::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x3000),
                     end: carrick_guest_mem::GuestVa(0x4000),
                     access: VMA_RX_ACCESS,
                 }],
-                vec![crate::kernel::VmaSummary {
+                vec![carrick_kernel::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x5000),
                     end: carrick_guest_mem::GuestVa(0x6000),
                     access: VMA_RX_ACCESS,
                 }],
-                vec![crate::kernel::VmaSummary {
+                vec![carrick_kernel::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x7000),
                     end: carrick_guest_mem::GuestVa(0x8000),
                     access: VMA_RX_ACCESS,
                 }],
-                vec![crate::kernel::VmaSummary {
+                vec![carrick_kernel::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x9000),
                     end: carrick_guest_mem::GuestVa(0xa000),
                     access: VMA_RX_ACCESS,
@@ -2826,7 +2856,7 @@ mod tests {
             .kernel_graph()
             .reserve_thread_clone(
                 &root,
-                crate::kernel::ClonePlan::from_flags(
+                carrick_kernel::kernel::ClonePlan::from_flags(
                     carrick_abi::LinuxCloneFlags::THREAD
                         | carrick_abi::LinuxCloneFlags::SIGHAND
                         | carrick_abi::LinuxCloneFlags::VM,
@@ -2842,26 +2872,29 @@ mod tests {
             .into_context()
             .expect("surviving parent sibling");
         let prepared_mm = parent.mm_resources().prepare_child().unwrap();
-        let child_context = parent
-            .kernel_graph()
-            .reserve_fork(
-                &sibling,
-                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+        let child_context =
+            parent
+                .kernel_graph()
+                .reserve_fork(
+                    &sibling,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::empty(),
+                    )
                     .unwrap(),
-                "retired-leader-child".to_owned(),
-                None,
-            )
-            .unwrap()
-            .prepare_with_mm_backend(
-                prepared_mm.backend(),
-                crate::thread::ThreadId::synthetic_for_tests(10_002),
-            )
-            .unwrap()
-            .commit()
-            .unwrap()
-            .into_parts()
-            .unwrap()
-            .0;
+                    "retired-leader-child".to_owned(),
+                    None,
+                )
+                .unwrap()
+                .prepare_with_mm_backend(
+                    prepared_mm.backend(),
+                    crate::thread::ThreadId::synthetic_for_tests(10_002),
+                )
+                .unwrap()
+                .commit()
+                .unwrap()
+                .into_parts()
+                .unwrap()
+                .0;
         let child_backend = parent
             .mm_resources()
             .publish_child(child_context.task().key(), prepared_mm)
@@ -2897,26 +2930,29 @@ mod tests {
     fn process_timer_delivery_targets_only_the_exact_hvpatch_task() {
         let (parent, root) = authoritative_root();
         let prepared_mm = parent.mm_resources().prepare_child().unwrap();
-        let child_context = parent
-            .kernel_graph()
-            .reserve_fork(
-                &root,
-                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+        let child_context =
+            parent
+                .kernel_graph()
+                .reserve_fork(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::empty(),
+                    )
                     .unwrap(),
-                "timer-child".to_owned(),
-                None,
-            )
-            .unwrap()
-            .prepare_with_mm_backend(
-                prepared_mm.backend(),
-                crate::thread::ThreadId::synthetic_for_tests(10_001),
-            )
-            .unwrap()
-            .commit()
-            .unwrap()
-            .into_parts()
-            .unwrap()
-            .0;
+                    "timer-child".to_owned(),
+                    None,
+                )
+                .unwrap()
+                .prepare_with_mm_backend(
+                    prepared_mm.backend(),
+                    crate::thread::ThreadId::synthetic_for_tests(10_001),
+                )
+                .unwrap()
+                .commit()
+                .unwrap()
+                .into_parts()
+                .unwrap()
+                .0;
         let child_backend = parent
             .mm_resources()
             .publish_child(child_context.task().key(), prepared_mm)
@@ -2957,26 +2993,29 @@ mod tests {
     fn process_parent_pid_follows_authoritative_orphan_reparenting() {
         let (root_process, root) = authoritative_root();
         let child_mm = root_process.mm_resources().prepare_child().unwrap();
-        let child_context = root_process
-            .kernel_graph()
-            .reserve_fork(
-                &root,
-                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+        let child_context =
+            root_process
+                .kernel_graph()
+                .reserve_fork(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::empty(),
+                    )
                     .unwrap(),
-                "reparent-child".to_owned(),
-                None,
-            )
-            .unwrap()
-            .prepare_with_mm_backend(
-                child_mm.backend(),
-                crate::thread::ThreadId::synthetic_for_tests(10_101),
-            )
-            .unwrap()
-            .commit()
-            .unwrap()
-            .into_parts()
-            .unwrap()
-            .0;
+                    "reparent-child".to_owned(),
+                    None,
+                )
+                .unwrap()
+                .prepare_with_mm_backend(
+                    child_mm.backend(),
+                    crate::thread::ThreadId::synthetic_for_tests(10_101),
+                )
+                .unwrap()
+                .commit()
+                .unwrap()
+                .into_parts()
+                .unwrap()
+                .0;
         let child_backend = root_process
             .mm_resources()
             .publish_child(child_context.task().key(), child_mm)
@@ -2984,26 +3023,29 @@ mod tests {
         let child_process = root_process.published_child_context(&child_context, child_backend);
 
         let grandchild_mm = child_process.mm_resources().prepare_child().unwrap();
-        let grandchild_context = child_process
-            .kernel_graph()
-            .reserve_fork(
-                &child_context,
-                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+        let grandchild_context =
+            child_process
+                .kernel_graph()
+                .reserve_fork(
+                    &child_context,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::empty(),
+                    )
                     .unwrap(),
-                "reparent-grandchild".to_owned(),
-                None,
-            )
-            .unwrap()
-            .prepare_with_mm_backend(
-                grandchild_mm.backend(),
-                crate::thread::ThreadId::synthetic_for_tests(10_102),
-            )
-            .unwrap()
-            .commit()
-            .unwrap()
-            .into_parts()
-            .unwrap()
-            .0;
+                    "reparent-grandchild".to_owned(),
+                    None,
+                )
+                .unwrap()
+                .prepare_with_mm_backend(
+                    grandchild_mm.backend(),
+                    crate::thread::ThreadId::synthetic_for_tests(10_102),
+                )
+                .unwrap()
+                .commit()
+                .unwrap()
+                .into_parts()
+                .unwrap()
+                .0;
         let grandchild_backend = child_process
             .mm_resources()
             .publish_child(grandchild_context.task().key(), grandchild_mm)
@@ -3016,12 +3058,12 @@ mod tests {
                 .kernel_graph()
                 .process_identity(grandchild_process.task_id())
                 .and_then(|identity| identity.parent)
-                .map(crate::kernel::TaskId::raw)
+                .map(carrick_kernel::kernel::TaskId::raw)
         };
         assert_eq!(grandchild_parent(), Some(child_process.pid()));
         child_process
             .publish_exit_status(
-                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
                 None,
                 |_| {},
             )
@@ -3115,7 +3157,7 @@ mod tests {
         process.bind_vma_source(old_dispatcher.vma_snapshot_source());
         let old_mm = root.shared().mm().id();
         let old_backend = process.mm_backend.read().clone();
-        let old_snapshot = crate::kernel::MmBackend::snapshot(
+        let old_snapshot = carrick_kernel::kernel::MmBackend::snapshot(
             old_backend.as_ref(),
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
@@ -3166,7 +3208,7 @@ mod tests {
         let replacement_backend = process.mm_backend.read().clone();
         assert!(!std::sync::Arc::ptr_eq(&old_backend, &replacement_backend));
         assert_eq!(old_backend.inventory_mm_for_tests(), Some(old_mm));
-        let retained = crate::kernel::MmBackend::snapshot(
+        let retained = carrick_kernel::kernel::MmBackend::snapshot(
             old_backend.as_ref(),
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
@@ -3177,7 +3219,7 @@ mod tests {
             replacement_backend.inventory_mm_for_tests(),
             Some(replacement_mm)
         );
-        let replacement = crate::kernel::MmBackend::snapshot(
+        let replacement = carrick_kernel::kernel::MmBackend::snapshot(
             replacement_backend.as_ref(),
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
@@ -3193,7 +3235,7 @@ mod tests {
         );
         assert_eq!(
             replacement.vmas,
-            vec![crate::kernel::VmaSummary {
+            vec![carrick_kernel::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x3000),
                 end: carrick_guest_mem::GuestVa(0x4000),
                 access: VMA_RX_ACCESS,
@@ -3232,17 +3274,17 @@ mod tests {
                 backend.as_ref(),
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
             ),
-            Err(crate::kernel::SnapshotError::ChangedDuringObservation)
+            Err(carrick_kernel::kernel::SnapshotError::ChangedDuringObservation)
         );
 
-        let observed = crate::kernel::MmBackend::snapshot(
+        let observed = carrick_kernel::kernel::MmBackend::snapshot(
             backend.as_ref(),
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
         .expect("still-live observer");
         assert_eq!(
             observed.vmas,
-            vec![crate::kernel::VmaSummary {
+            vec![carrick_kernel::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x5000),
                 end: carrick_guest_mem::GuestVa(0x6000),
                 access: VMA_RX_ACCESS,
@@ -3277,14 +3319,14 @@ mod tests {
             sharing: carrick_vfs::ProcMapSharing::Private,
             path: "continued-old-image".to_owned(),
         }]);
-        let observed = crate::kernel::MmBackend::snapshot(
+        let observed = carrick_kernel::kernel::MmBackend::snapshot(
             backend.as_ref(),
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
         .expect("live old observer");
         assert_eq!(
             observed.vmas,
-            vec![crate::kernel::VmaSummary {
+            vec![carrick_kernel::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x5000),
                 end: carrick_guest_mem::GuestVa(0x6000),
                 access: VMA_RX_ACCESS,
@@ -3296,7 +3338,7 @@ mod tests {
     fn shared_mm_fork_keeps_kernel_mm_and_vfork_release_authoritative() {
         let (parent, root) = authoritative_root();
         let prepared_mm = parent.mm_resources().prepare_child().unwrap();
-        let plan = crate::kernel::ClonePlan::from_flags(
+        let plan = carrick_kernel::kernel::ClonePlan::from_flags(
             carrick_abi::LinuxCloneFlags::VM | carrick_abi::LinuxCloneFlags::VFORK,
         )
         .unwrap();
@@ -3325,7 +3367,7 @@ mod tests {
         finalize_test_child(&child, 0, child_tid);
         assert_eq!(
             wait.released_reason(),
-            Some(crate::kernel::VforkReleaseReason::Exit)
+            Some(carrick_kernel::kernel::VforkReleaseReason::Exit)
         );
     }
 
@@ -3339,7 +3381,7 @@ mod tests {
             .kernel_graph()
             .reserve_fork(
                 &root,
-                crate::kernel::ClonePlan::from_flags(
+                carrick_kernel::kernel::ClonePlan::from_flags(
                     carrick_abi::LinuxCloneFlags::VM | carrick_abi::LinuxCloneFlags::VFORK,
                 )
                 .unwrap(),
@@ -3361,7 +3403,7 @@ mod tests {
         let child = parent.published_child_context(&child_context, backend);
         child.bind_vma_source(test_vma_source());
 
-        let leader_tid = crate::kernel::LinuxTid::for_task_leader(child_id);
+        let leader_tid = carrick_kernel::kernel::LinuxTid::for_task_leader(child_id);
         let prepared_exec = child.prepare_exec(&child_context).unwrap();
         let committed = child
             .commit_exec(prepared_exec, stage1_root, test_vma_source(), None)
@@ -3371,7 +3413,7 @@ mod tests {
         finalize_test_child(&child, 0, child_tid);
         assert_eq!(
             wait.released_reason(),
-            Some(crate::kernel::VforkReleaseReason::Exit)
+            Some(carrick_kernel::kernel::VforkReleaseReason::Exit)
         );
     }
 
@@ -3383,7 +3425,7 @@ mod tests {
             .kernel_graph()
             .reserve_thread_clone(
                 &root,
-                crate::kernel::ClonePlan::from_flags(
+                carrick_kernel::kernel::ClonePlan::from_flags(
                     carrick_abi::LinuxCloneFlags::THREAD
                         | carrick_abi::LinuxCloneFlags::SIGHAND
                         | carrick_abi::LinuxCloneFlags::VM,
@@ -3408,12 +3450,12 @@ mod tests {
 
         assert_eq!(
             committed.thread().key().tid,
-            crate::kernel::LinuxTid::for_task_leader(process.task_id())
+            carrick_kernel::kernel::LinuxTid::for_task_leader(process.task_id())
         );
         assert_eq!(committed.thread().registry_id(), sibling_registry_id);
         assert!(matches!(
             process.context_for_linux_tid(sibling_tid),
-            Err(crate::kernel::KernelError::UnknownThread(_))
+            Err(carrick_kernel::kernel::KernelError::UnknownThread(_))
         ));
         assert_eq!(
             committed.shared().mm().backend().map(|backend| backend
@@ -3431,7 +3473,7 @@ mod tests {
             .kernel_graph()
             .reserve_thread_clone(
                 &root,
-                crate::kernel::ClonePlan::from_flags(
+                carrick_kernel::kernel::ClonePlan::from_flags(
                     carrick_abi::LinuxCloneFlags::THREAD
                         | carrick_abi::LinuxCloneFlags::SIGHAND
                         | carrick_abi::LinuxCloneFlags::VM,
@@ -3447,7 +3489,7 @@ mod tests {
             .start_thread()
             .unwrap();
         let selected_survivor = sibling.context().retain_exact();
-        let leader_tid = crate::kernel::LinuxTid::for_task_leader(process.task_id());
+        let leader_tid = carrick_kernel::kernel::LinuxTid::for_task_leader(process.task_id());
         let current_leader = process.context_for_linux_tid(leader_tid).unwrap();
 
         process
@@ -3464,27 +3506,30 @@ mod tests {
     fn copied_mm_fork_keeps_the_prepared_stage1_backend() {
         let (parent, root) = authoritative_root();
         let prepared_mm = parent.mm_resources().prepare_child().unwrap();
-        let expected: std::sync::Arc<dyn crate::kernel::MmBackend> = prepared_mm.backend();
-        let child = parent
-            .kernel_graph()
-            .reserve_fork(
-                &root,
-                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+        let expected: std::sync::Arc<dyn carrick_kernel::kernel::MmBackend> = prepared_mm.backend();
+        let child =
+            parent
+                .kernel_graph()
+                .reserve_fork(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::empty(),
+                    )
                     .unwrap(),
-                "copied-mm-child".to_owned(),
-                None,
-            )
-            .unwrap()
-            .prepare_with_mm_backend(
-                prepared_mm.backend(),
-                crate::thread::ThreadId::synthetic_for_tests(10_001),
-            )
-            .unwrap()
-            .commit()
-            .unwrap()
-            .into_parts()
-            .unwrap()
-            .0;
+                    "copied-mm-child".to_owned(),
+                    None,
+                )
+                .unwrap()
+                .prepare_with_mm_backend(
+                    prepared_mm.backend(),
+                    crate::thread::ThreadId::synthetic_for_tests(10_001),
+                )
+                .unwrap()
+                .commit()
+                .unwrap()
+                .into_parts()
+                .unwrap()
+                .0;
         let mm = child.shared().mm();
         assert!(std::sync::Arc::ptr_eq(
             mm.backend().expect("copied child mm backend"),
@@ -3497,18 +3542,21 @@ mod tests {
         let (parent, root) = authoritative_root();
         let prepared_mm = parent.mm_resources().prepare_child().unwrap();
         let child_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
-        let prepared = parent
-            .kernel_graph()
-            .reserve_fork(
-                &root,
-                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+        let prepared =
+            parent
+                .kernel_graph()
+                .reserve_fork(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::empty(),
+                    )
                     .unwrap(),
-                "adapter-child".to_owned(),
-                None,
-            )
-            .unwrap()
-            .prepare_with_mm_backend(prepared_mm.backend(), child_tid)
-            .unwrap();
+                    "adapter-child".to_owned(),
+                    None,
+                )
+                .unwrap()
+                .prepare_with_mm_backend(prepared_mm.backend(), child_tid)
+                .unwrap();
         let published = prepared.commit().unwrap();
         let (child_context, wait) = published.into_parts().unwrap();
         assert!(wait.is_none());
@@ -3533,7 +3581,7 @@ mod tests {
         assert!(matches!(
             parent.wait_child_with_job_control(
                 Some(child.pid()),
-                crate::kernel::WaitChildClass::Sigchld,
+                carrick_kernel::kernel::WaitChildClass::Sigchld,
                 false,
                 false,
                 false,
@@ -3550,7 +3598,7 @@ mod tests {
         );
         let WaitResult::Exited(exit) = parent.wait_child_key(
             child.task_key(),
-            crate::kernel::WaitChildClass::Sigchld,
+            carrick_kernel::kernel::WaitChildClass::Sigchld,
             false,
         ) else {
             panic!("kernel zombie was not visible through adapter wait");
@@ -3558,7 +3606,7 @@ mod tests {
         assert_eq!(exit.pid(), child_id);
         assert_eq!(exit.status(), 23 << 8);
         assert_eq!(exit.ruid(), child_ruid);
-        let siginfo = crate::dispatch::build_hvpatch_waitid_siginfo(exit);
+        let siginfo = carrick_kernel::dispatch::build_hvpatch_waitid_siginfo(exit);
         assert_eq!(siginfo_i32(&siginfo, 16), child_id.raw());
         assert_eq!(siginfo_u32(&siginfo, 20), child_ruid.raw());
         assert_eq!(siginfo_i32(&siginfo, 8), libc::CLD_EXITED);
@@ -3569,13 +3617,13 @@ mod tests {
     #[test]
     fn waitid_siginfo_uses_the_visible_pid_retained_by_the_wait_receipt() {
         let exit = ChildExit::new(
-            crate::kernel::TaskId::from_abi_positive(42).expect("internal pid"),
+            carrick_kernel::kernel::TaskId::from_abi_positive(42).expect("internal pid"),
             7,
             carrick_abi::NsUid::new(1_000),
             9 << 8,
         );
 
-        let siginfo = crate::dispatch::build_hvpatch_waitid_siginfo(exit);
+        let siginfo = carrick_kernel::dispatch::build_hvpatch_waitid_siginfo(exit);
         assert_eq!(siginfo_i32(&siginfo, 16), 7);
     }
 
@@ -3584,20 +3632,23 @@ mod tests {
         let (parent, root) = authoritative_root();
         let prepared_mm = parent.mm_resources().prepare_child().unwrap();
         let child_tid = crate::thread::ThreadId::synthetic_for_tests(10_002);
-        let published = parent
-            .kernel_graph()
-            .reserve_fork(
-                &root,
-                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+        let published =
+            parent
+                .kernel_graph()
+                .reserve_fork(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::empty(),
+                    )
                     .unwrap(),
-                "job-control-adapter-child".to_owned(),
-                None,
-            )
-            .unwrap()
-            .prepare_with_mm_backend(prepared_mm.backend(), child_tid)
-            .unwrap()
-            .commit()
-            .unwrap();
+                    "job-control-adapter-child".to_owned(),
+                    None,
+                )
+                .unwrap()
+                .prepare_with_mm_backend(prepared_mm.backend(), child_tid)
+                .unwrap()
+                .commit()
+                .unwrap();
         let (child_context, wait) = published.into_parts().unwrap();
         assert!(wait.is_none());
         let child_ruid = carrick_abi::NsUid::new(5_353);
@@ -3614,8 +3665,9 @@ mod tests {
             .publish_child(child_context.task().key(), prepared_mm)
             .unwrap();
         let child = parent.published_child_context(&child_context, backend);
-        let sigstop = crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP)
-            .expect("SIGSTOP");
+        let sigstop =
+            carrick_kernel::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP)
+                .expect("SIGSTOP");
 
         assert!(
             parent
@@ -3624,7 +3676,7 @@ mod tests {
         );
         let WaitResult::StateChanged(stopped) = parent.wait_child_with_job_control(
             Some(child.pid()),
-            crate::kernel::WaitChildClass::Sigchld,
+            carrick_kernel::kernel::WaitChildClass::Sigchld,
             false,
             true,
             false,
@@ -3637,7 +3689,7 @@ mod tests {
             "adapter publishes the Linux wait-status encoding, not Darwin's signal numbers",
         );
         assert_eq!(stopped.ruid(), child_ruid);
-        let stopped_siginfo = crate::dispatch::build_hvpatch_waitid_siginfo(stopped);
+        let stopped_siginfo = carrick_kernel::dispatch::build_hvpatch_waitid_siginfo(stopped);
         assert_eq!(siginfo_u32(&stopped_siginfo, 20), child_ruid.raw());
         assert_eq!(siginfo_i32(&stopped_siginfo, 8), libc::CLD_STOPPED);
         assert_eq!(
@@ -3645,8 +3697,9 @@ mod tests {
             carrick_abi::LINUX_SIGSTOP,
         );
 
-        let sigcont = crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT)
-            .expect("SIGCONT");
+        let sigcont =
+            carrick_kernel::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT)
+                .expect("SIGCONT");
         assert!(
             parent
                 .kernel_graph()
@@ -3655,7 +3708,7 @@ mod tests {
         let WaitResult::StateChanged(continued) = parent
             .wait_child_in_process_group_with_job_control(
                 child.process_group().expect("child process group"),
-                crate::kernel::WaitChildClass::Sigchld,
+                carrick_kernel::kernel::WaitChildClass::Sigchld,
                 false,
                 false,
                 true,
@@ -3665,7 +3718,7 @@ mod tests {
         };
         assert_eq!(continued.status(), 0xffff);
         assert_eq!(continued.ruid(), child_ruid);
-        let continued_siginfo = crate::dispatch::build_hvpatch_waitid_siginfo(continued);
+        let continued_siginfo = carrick_kernel::dispatch::build_hvpatch_waitid_siginfo(continued);
         assert_eq!(siginfo_u32(&continued_siginfo, 20), child_ruid.raw());
         assert_eq!(siginfo_i32(&continued_siginfo, 8), libc::CLD_CONTINUED,);
         assert_eq!(
@@ -3677,7 +3730,7 @@ mod tests {
         assert!(matches!(
             parent.wait_child_with_job_control(
                 Some(child.pid()),
-                crate::kernel::WaitChildClass::Sigchld,
+                carrick_kernel::kernel::WaitChildClass::Sigchld,
                 false,
                 false,
                 false,

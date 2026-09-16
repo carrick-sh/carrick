@@ -6,7 +6,7 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
-use carrick_runtime::dispatch::GuestPtr;
+use carrick_kernel::dispatch::GuestPtr;
 use carrick_runtime::linux_abi::{LINUX_CLOCK_THREAD_CPUTIME_ID, LINUX_SIGPROF, LinuxSysinfo};
 use support::*;
 

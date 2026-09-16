@@ -12,14 +12,16 @@ use super::binding::*;
 use super::executor_worker;
 use super::probe_executor_lifecycle;
 use super::settlement::*;
-#[cfg(test)]
-use crate::kernel::SchedulerError;
-use crate::kernel::objects::{ExecutionFailure, ExecutionGeneration, ExecutorId, ThreadKey};
-use crate::kernel::{
-    ExecutorBinding, ExecutorKick, ExecutorKickToken, ExecutorRegistration, Scheduler,
-};
 use crate::trap::TrapError;
 use carrick_fatal::carrick_fatal;
+#[cfg(test)]
+use carrick_kernel::kernel::SchedulerError;
+use carrick_kernel::kernel::objects::{
+    ExecutionFailure, ExecutionGeneration, ExecutorId, ThreadKey,
+};
+use carrick_kernel::kernel::{
+    ExecutorBinding, ExecutorKick, ExecutorKickToken, ExecutorRegistration, Scheduler,
+};
 
 /// How many `M`s a carrier starts.
 ///
@@ -269,7 +271,7 @@ impl ReceiptLog {
     }
 }
 
-impl crate::kernel::scheduler::DiscardRecorder for ReceiptLog {
+impl carrick_kernel::kernel::scheduler::DiscardRecorder for ReceiptLog {
     fn record_discard(
         &self,
         executor: ExecutorId,
@@ -513,7 +515,7 @@ pub(crate) struct WorkerRuntime<'a> {
 #[derive(Debug)]
 pub(crate) struct PoolControl {
     usable_workers: std::sync::atomic::AtomicUsize,
-    pub(crate) wait_service: crate::kernel::continuation::CarrierWaitService,
+    pub(crate) wait_service: carrick_kernel::kernel::continuation::CarrierWaitService,
     scheduler: Arc<Scheduler>,
     workers: Mutex<std::collections::BTreeMap<ExecutorId, WorkerControlHandle>>,
 }
@@ -543,9 +545,9 @@ impl PoolControl {
     fn new(workers: usize, scheduler: Arc<Scheduler>) -> Self {
         Self {
             usable_workers: std::sync::atomic::AtomicUsize::new(workers),
-            wait_service: crate::kernel::continuation::CarrierWaitService::new(Arc::clone(
-                &scheduler,
-            )),
+            wait_service: carrick_kernel::kernel::continuation::CarrierWaitService::new(
+                Arc::clone(&scheduler),
+            ),
             scheduler,
             workers: Mutex::new(std::collections::BTreeMap::new()),
         }
@@ -820,10 +822,10 @@ impl HvpatchKernelDebugAuxProvider {
     }
 }
 
-impl crate::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvider {
-    fn scheduler_rows(&self) -> Vec<crate::kernel::debug::DebugSchedulerRow> {
+impl carrick_kernel::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvider {
+    fn scheduler_rows(&self) -> Vec<carrick_kernel::kernel::debug::DebugSchedulerRow> {
         let summary = self.scheduler.scheduler_summary();
-        vec![crate::kernel::debug::DebugSchedulerRow {
+        vec![carrick_kernel::kernel::debug::DebugSchedulerRow {
             lifecycle: summary.lifecycle,
             queued_len: summary.queued_len,
             claimed: summary.claimed,
@@ -835,14 +837,14 @@ impl crate::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvi
         }]
     }
 
-    fn run_queue_rows(&self) -> Vec<crate::kernel::debug::DebugRunQueueRow> {
+    fn run_queue_rows(&self) -> Vec<carrick_kernel::kernel::debug::DebugRunQueueRow> {
         let rows = self.scheduler.snapshot_run_queue_rows();
         rows.into_iter()
             .enumerate()
             .map(|(position, (thread, generation, closing_authorized))| {
-                crate::kernel::debug::DebugRunQueueRow {
+                carrick_kernel::kernel::debug::DebugRunQueueRow {
                     position,
-                    thread: crate::kernel::debug::dto::thread_key(thread),
+                    thread: carrick_kernel::kernel::debug::dto::thread_key(thread),
                     generation: generation.raw(),
                     closing_authorized,
                 }
@@ -850,7 +852,7 @@ impl crate::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvi
             .collect()
     }
 
-    fn executor_rows(&self) -> Vec<crate::kernel::debug::DebugExecutorRow> {
+    fn executor_rows(&self) -> Vec<carrick_kernel::kernel::debug::DebugExecutorRow> {
         let entries = self.scheduler.snapshot_executor_entries();
         entries
             .into_iter()
@@ -863,12 +865,12 @@ impl crate::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvi
                     need_resched,
                     hardware_kick_published,
                 )| {
-                    crate::kernel::debug::DebugExecutorRow {
+                    carrick_kernel::kernel::debug::DebugExecutorRow {
                         id: id.raw(),
                         epoch: binding.as_ref().map(|b| b.executor_epoch()),
                         current_binding: binding.map(|b| {
-                            crate::kernel::debug::DebugExecutorBindingRow {
-                                thread: crate::kernel::debug::dto::thread_key(b.thread()),
+                            carrick_kernel::kernel::debug::DebugExecutorBindingRow {
+                                thread: carrick_kernel::kernel::debug::dto::thread_key(b.thread()),
                                 generation: b.generation().raw(),
                             }
                         }),
@@ -886,8 +888,8 @@ impl crate::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvi
     fn executor_receipt_rows(
         &self,
     ) -> (
-        Vec<crate::kernel::debug::DebugExecutorReceiptRow>,
-        Option<crate::kernel::debug::DebugExecutorReceiptSummary>,
+        Vec<carrick_kernel::kernel::debug::DebugExecutorReceiptRow>,
+        Option<carrick_kernel::kernel::debug::DebugExecutorReceiptSummary>,
     ) {
         let receipts = self.receipts.snapshot();
         let total = receipts.len();
@@ -902,14 +904,14 @@ impl crate::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvi
                     ExecutorPoolEvent::AuditPassed => ("AuditPassed", None, None, None, None),
                     ExecutorPoolEvent::Claimed { thread, generation } => (
                         "Claimed",
-                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(carrick_kernel::kernel::debug::dto::thread_key(*thread)),
                         Some(generation.raw()),
                         None,
                         None,
                     ),
                     ExecutorPoolEvent::Loaded { thread, generation } => (
                         "Loaded",
-                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(carrick_kernel::kernel::debug::dto::thread_key(*thread)),
                         Some(generation.raw()),
                         None,
                         None,
@@ -919,42 +921,42 @@ impl crate::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvi
                     }
                     ExecutorPoolEvent::OrdinarySyscall { thread, generation } => (
                         "OrdinarySyscall",
-                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(carrick_kernel::kernel::debug::dto::thread_key(*thread)),
                         Some(generation.raw()),
                         None,
                         None,
                     ),
                     ExecutorPoolEvent::KickDelivered { thread, generation } => (
                         "KickDelivered",
-                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(carrick_kernel::kernel::debug::dto::thread_key(*thread)),
                         Some(generation.raw()),
                         None,
                         None,
                     ),
                     ExecutorPoolEvent::Saved { thread, generation } => (
                         "Saved",
-                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(carrick_kernel::kernel::debug::dto::thread_key(*thread)),
                         Some(generation.raw()),
                         None,
                         None,
                     ),
                     ExecutorPoolEvent::SettledBlocked { thread, generation } => (
                         "SettledBlocked",
-                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(carrick_kernel::kernel::debug::dto::thread_key(*thread)),
                         Some(generation.raw()),
                         None,
                         None,
                     ),
                     ExecutorPoolEvent::SettledRunnable { thread, generation } => (
                         "SettledRunnable",
-                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(carrick_kernel::kernel::debug::dto::thread_key(*thread)),
                         Some(generation.raw()),
                         None,
                         None,
                     ),
                     ExecutorPoolEvent::SettledExited { thread, generation } => (
                         "SettledExited",
-                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(carrick_kernel::kernel::debug::dto::thread_key(*thread)),
                         Some(generation.raw()),
                         None,
                         None,
@@ -966,14 +968,14 @@ impl crate::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvi
                         reason,
                     } => (
                         "DiscardedRow",
-                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(carrick_kernel::kernel::debug::dto::thread_key(*thread)),
                         Some(row_generation.raw()),
                         Some(observed_state.clone()),
                         Some(reason.clone()),
                     ),
                     ExecutorPoolEvent::Failed { thread, generation } => (
                         "Failed",
-                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(carrick_kernel::kernel::debug::dto::thread_key(*thread)),
                         Some(generation.raw()),
                         None,
                         None,
@@ -984,7 +986,7 @@ impl crate::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvi
                         ("TopologyRetrying", None, None, None, None)
                     }
                 };
-                crate::kernel::debug::DebugExecutorReceiptRow {
+                carrick_kernel::kernel::debug::DebugExecutorReceiptRow {
                     sequence: r.sequence,
                     executor: r.executor.raw(),
                     event: event_name.to_owned(),
@@ -995,7 +997,7 @@ impl crate::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvi
                 }
             })
             .collect();
-        let summary = Some(crate::kernel::debug::DebugExecutorReceiptSummary {
+        let summary = Some(carrick_kernel::kernel::debug::DebugExecutorReceiptSummary {
             total,
             returned,
             message: format!("showing last {returned} of {total} receipts"),
@@ -1016,21 +1018,21 @@ where
     receipts: Arc<ReceiptLog>,
     _factory: std::marker::PhantomData<F>,
     resolver: Arc<R>,
-    _debug_aux_provider: Arc<dyn crate::kernel::debug::KernelDebugAuxProvider>,
-    debug_aux_registration: crate::kernel::core::DebugAuxProviderRegistration,
+    _debug_aux_provider: Arc<dyn carrick_kernel::kernel::debug::KernelDebugAuxProvider>,
+    debug_aux_registration: carrick_kernel::kernel::core::DebugAuxProviderRegistration,
     #[cfg(test)]
     pub(crate) control: Arc<PoolControl>,
 }
 
 struct DebugAuxProviderPublication {
-    kernel: Arc<crate::kernel::Kernel>,
-    registration: Option<crate::kernel::core::DebugAuxProviderRegistration>,
+    kernel: Arc<carrick_kernel::kernel::Kernel>,
+    registration: Option<carrick_kernel::kernel::core::DebugAuxProviderRegistration>,
 }
 
 impl DebugAuxProviderPublication {
     fn new(
-        kernel: Arc<crate::kernel::Kernel>,
-        registration: crate::kernel::core::DebugAuxProviderRegistration,
+        kernel: Arc<carrick_kernel::kernel::Kernel>,
+        registration: carrick_kernel::kernel::core::DebugAuxProviderRegistration,
     ) -> Self {
         Self {
             kernel,
@@ -1038,7 +1040,7 @@ impl DebugAuxProviderPublication {
         }
     }
 
-    fn commit(mut self) -> crate::kernel::core::DebugAuxProviderRegistration {
+    fn commit(mut self) -> carrick_kernel::kernel::core::DebugAuxProviderRegistration {
         self.registration
             .take()
             .unwrap_or_else(|| {
@@ -1166,9 +1168,11 @@ where
                 message: format!("install combined task resolver: {error}"),
             })?;
         let receipts = Arc::new(ReceiptLog::default());
-        let debug_aux_provider: Arc<dyn crate::kernel::debug::KernelDebugAuxProvider> = Arc::new(
-            HvpatchKernelDebugAuxProvider::new(Arc::clone(&scheduler), Arc::clone(&receipts)),
-        );
+        let debug_aux_provider: Arc<dyn carrick_kernel::kernel::debug::KernelDebugAuxProvider> =
+            Arc::new(HvpatchKernelDebugAuxProvider::new(
+                Arc::clone(&scheduler),
+                Arc::clone(&receipts),
+            ));
         let debug_aux_publication = DebugAuxProviderPublication::new(
             Arc::clone(scheduler.kernel()),
             scheduler
@@ -1300,9 +1304,9 @@ where
             }
         }
 
-        scheduler.install_discard_recorder(
-            Arc::clone(&receipts) as Arc<dyn crate::kernel::scheduler::DiscardRecorder>
-        );
+        scheduler
+            .install_discard_recorder(Arc::clone(&receipts)
+                as Arc<dyn carrick_kernel::kernel::scheduler::DiscardRecorder>);
         let debug_aux_registration = debug_aux_publication.commit();
 
         Ok(Self {
@@ -1415,7 +1419,7 @@ where
     #[cfg(test)]
     pub fn submit_root(
         &self,
-        thread: Arc<crate::kernel::Thread>,
+        thread: Arc<carrick_kernel::kernel::Thread>,
         generation: ExecutionGeneration,
     ) -> Result<(), SchedulerError> {
         let authority = self.scheduler.admit_root(thread.key(), generation)?;

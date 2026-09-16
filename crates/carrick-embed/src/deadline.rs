@@ -26,7 +26,7 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use carrick_runtime::kernel::debug::{AbortReason, request_abort};
+use carrick_kernel::kernel::debug::{AbortReason, request_abort};
 
 use crate::{ContainerBuilder, ContainerResult, EmbedError};
 

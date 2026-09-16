@@ -11,7 +11,7 @@
 mod support;
 
 #[cfg(target_os = "macos")]
-use carrick_runtime::dispatch::{FdWaitCompletion, ThreadCtx, WaitFds};
+use carrick_kernel::dispatch::{FdWaitCompletion, ThreadCtx, WaitFds};
 use carrick_runtime::linux_abi::{
     LINUX_AF_INET, LINUX_EMFILE, LINUX_SIOCGIFINDEX, LINUX_SIOCGIFNAME, LINUX_SOCK_STREAM,
     LinuxGuestAbi, LinuxX8664EpollEvent,

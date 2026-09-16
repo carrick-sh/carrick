@@ -20,7 +20,7 @@ use std::process::Command;
 use carrick_guest_mem::{
     Aarch64SyscallFrame, CurrentMmMemory, MappingSharing, MemoryError, RepointPrivateError,
 };
-use carrick_runtime::dispatch::{GuestMemory, LinearMemory, SyscallDispatcher};
+use carrick_kernel::dispatch::{GuestMemory, LinearMemory, SyscallDispatcher};
 use carrick_runtime::memory::AddressSpace;
 use carrick_runtime::runtime::{SyscallTrap, run_syscall_loop, run_syscall_loop_with_dispatcher};
 use carrick_runtime::trap::TrapError;

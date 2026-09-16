@@ -203,7 +203,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/container.rs",
+      "file": "crates/carrick-kernel/src/container.rs",
       "symbol": "lifecycle_lock_stripe::STRIPES",
       "fingerprint": "4b70d1b27757137a45c68b0a3ff3fb9ef0f6e6e589c961e8687ffe3f016fc895",
       "classification": "carrier_infra",
@@ -211,7 +211,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/core_dump.rs",
+      "file": "crates/carrick-kernel/src/core_dump.rs",
       "symbol": "oracle_validation::emit_core_for_an_independent_reader::CARRICK_CORE_EMIT_PATH",
       "fingerprint": "d8ee42ecf76e59cc9835069e066ffb892f3b505fd354b1875956be680e9fea1a",
       "classification": "config_debug",
@@ -219,7 +219,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/core_dump.rs",
+      "file": "crates/carrick-kernel/src/core_dump.rs",
       "symbol": "oracle_validation::emit_pn_xnum_core_for_an_independent_reader::CARRICK_CORE_EMIT_PN_XNUM_PATH",
       "fingerprint": "fc0bcfe4a6d50d5f07cea406829610969fe3e38555a6407f266175e919c31009",
       "classification": "config_debug",
@@ -227,7 +227,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/cred_ipc.rs",
+      "file": "crates/carrick-kernel/src/cred_ipc.rs",
       "symbol": "LAST_PUBLISHED",
       "fingerprint": "ab5aeac58df01028913750e63f662bde32b16f15b5bb5d97cd1eff034460a32c",
       "classification": "carrier_infra",
@@ -235,7 +235,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
+      "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
       "symbol": "window_ms::CARRICK_DEADLOCK_WATCHDOG_MS",
       "fingerprint": "2fdbff72de644671485c53733abc818ae8e29060e65c623ee535a1055fd52bb1",
       "classification": "config_debug",
@@ -243,7 +243,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
+      "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
       "symbol": "ARMED",
       "fingerprint": "a7f2aacf891c55c9b568a735116f39b26fa16f04ed7861de0fa6285dd17fc06f",
       "classification": "carrier_infra",
@@ -251,7 +251,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
+      "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
       "symbol": "CAPTURE_CLAIMED",
       "fingerprint": "98cf8d0b4e116fead58135a50c8a921c98c18b5cf591aa7db1bdf79989f063fe",
       "classification": "carrier_infra",
@@ -259,7 +259,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
+      "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
       "symbol": "LOCAL_TICKED",
       "fingerprint": "1870ef16f1d73a9f642d51db696964bac0e8f85be1c7f91c5acc8e034affa7a6",
       "classification": "carrier_infra",
@@ -267,7 +267,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
+      "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
       "symbol": "counter::COUNTER",
       "fingerprint": "08dd817359cb554aff1e9c2465a3e192ad75c1f35a8a8cf35f3f54bde6a9d321",
       "classification": "carrier_infra",
@@ -275,7 +275,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
+      "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
       "symbol": "window_ms::CELL",
       "fingerprint": "aa877e87e881070ff0133ff7c12178fa3a321a1486db1b61313ea73e66e8205b",
       "classification": "carrier_infra",
@@ -283,7 +283,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/core_publication.rs",
+      "file": "crates/carrick-kernel/src/dispatch/core_publication.rs",
       "symbol": "publish_core_atomic::CARRICK_CORE_FAILPOINT",
       "fingerprint": "33a4c376d77e54b0f5f77e36519780e96feea8fcce87baaf8b1ade4443192589",
       "classification": "config_debug",
@@ -291,7 +291,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/fifo_beacon.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fifo_beacon.rs",
       "symbol": "STATE",
       "fingerprint": "c28e9df2b057d480689ea4ce05be309d0815775af9be56076f644d4291b9c2cd",
       "classification": "host_kernel_object",
@@ -299,7 +299,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/fs/fd_helpers.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs",
       "symbol": "OPEN_FD_NUMBERS_CALLS",
       "fingerprint": "0e35528151ec05afe88f94ff04d8674b9532c027b68aff8211ef9d2c74457a7e",
       "classification": "carrier_infra",
@@ -307,7 +307,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
       "symbol": "ficlone_errno::CARRICK_FICLONE_DEBUG",
       "fingerprint": "d81b6311036aa8db461da744b96b226a6a1aff08042108d1e97536d4328f9c4f",
       "classification": "config_debug",
@@ -315,7 +315,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
       "symbol": "ioctl::CARRICK_FICLONE_DEBUG",
       "fingerprint": "d81b6311036aa8db461da744b96b226a6a1aff08042108d1e97536d4328f9c4f",
       "classification": "config_debug",
@@ -323,7 +323,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/fs/open.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fs/open.rs",
       "symbol": "trusted_fs_lane_enabled::CARRICK_FS_TRUSTED_LANE",
       "fingerprint": "2d8b98ce0979b1e11b266d37f3240be459bc06655f7c405419ccb62cdebd6331",
       "classification": "config_debug",
@@ -331,7 +331,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/fs/open.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fs/open.rs",
       "symbol": "trusted_fs_lane_enabled::ENABLED",
       "fingerprint": "810e6edc6ac71f37c4eb86f28b68168eb8d1faac13e5facea0127a51501d3002",
       "classification": "config_debug",
@@ -339,7 +339,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/fs/pathres.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fs/pathres.rs",
       "symbol": "DOTDOT_RESOLVE_DEPTH",
       "fingerprint": "9b73d356e114a12775c765c295df65cdbacd2c313a6e1f4ce0caa18e4887b77f",
       "classification": "carrier_infra",
@@ -347,7 +347,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/fs/pipe.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
       "symbol": "NEXT_PIPE_ID",
       "fingerprint": "4922577439914417f710b5596c202983911c0fee1c8a637fa48143253692efc8",
       "classification": "monotonic_allocator",
@@ -355,7 +355,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fs/sendfile.rs",
       "symbol": "darwin_copyfile_fast_path_disabled::CARRICK_DARWIN_COPYFILE_FAST_PATH",
       "fingerprint": "e5b9013e2aab0b65661da1af07c483a3a62b130764cb6b1e436711a17dafedca",
       "classification": "config_debug",
@@ -363,7 +363,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fs/sendfile.rs",
       "symbol": "darwin_copyfile_fast_path_disabled::DISABLED",
       "fingerprint": "47024f1401e55b3c40f997c52dc7f57d4772d38419e4452b7ca43075a1507e96",
       "classification": "config_debug",
@@ -371,7 +371,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
       "symbol": "strict_durability_enabled::CARRICK_STRICT_DURABILITY",
       "fingerprint": "f3814f075ae168bea59b99647f7a4fd37ef9e7d97ac8b1e8c28e1a1e26402c68",
       "classification": "config_debug",
@@ -379,7 +379,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/io_pipe.rs",
+      "file": "crates/carrick-kernel/src/dispatch/io_pipe.rs",
       "symbol": "AR_MAGIC_SEQ",
       "fingerprint": "e21c7a80ce4c3fcda98345c912b4a4d5da7127a55b9186d3ffecad9eff3556c4",
       "classification": "monotonic_allocator",
@@ -387,7 +387,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/io_pipe.rs",
+      "file": "crates/carrick-kernel/src/dispatch/io_pipe.rs",
       "symbol": "AR_MAGIC_WRITES",
       "fingerprint": "368ee47b5b49d42b13dc24e69a5145d6adfd06c080fe2b2d3ce7e7cc7f4da277",
       "classification": "host_kernel_object",
@@ -395,7 +395,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
       "symbol": "debug_mmap_next_lowering::CARRICK_FORK_DEBUG_VA",
       "fingerprint": "d1a34eb1d01a21e24a1fe67ec5f906a675b02b4c687d50e7e9bbcafbb6808b70",
       "classification": "config_debug",
@@ -403,7 +403,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
       "symbol": "free_regions_insert::CARRICK_FORK_DEBUG_VA",
       "fingerprint": "d1a34eb1d01a21e24a1fe67ec5f906a675b02b4c687d50e7e9bbcafbb6808b70",
       "classification": "config_debug",
@@ -411,7 +411,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
       "symbol": "next_mmap_address::CARRICK_FORK_DEBUG_VA",
       "fingerprint": "d1a34eb1d01a21e24a1fe67ec5f906a675b02b4c687d50e7e9bbcafbb6808b70",
       "classification": "config_debug",
@@ -419,7 +419,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
       "symbol": "next_mmap_address::CARRICK_MMAP_GRANT_DEBUG",
       "fingerprint": "80c748ba662570f06454f1cac60f540e89547595e0d2450b758d1f396f4774c4",
       "classification": "config_debug",
@@ -427,7 +427,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/backing.rs",
       "symbol": "mmap_file_backed_lowering_enabled::CARRICK_MMAP_FILE_BACKED",
       "fingerprint": "19774f51dd70100293a802b7f7ba9b5ca4a3e9815e728ed56850b06e97bb3e2c",
       "classification": "config_debug",
@@ -435,7 +435,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/madvise.rs",
       "symbol": "madvise::CARRICK_MINCORE_EXACT",
       "fingerprint": "4a6206a3e2aa3f4e04f5c34445cd1c90feb37bd6c3bd184e83a49cad3b165ad6",
       "classification": "config_debug",
@@ -443,7 +443,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "symbol": "mmap::CARRICK_MINCORE_EXACT",
       "fingerprint": "4a6206a3e2aa3f4e04f5c34445cd1c90feb37bd6c3bd184e83a49cad3b165ad6",
       "classification": "config_debug",
@@ -451,7 +451,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "symbol": "mremap::CARRICK_FAULT_DEBUG",
       "fingerprint": "4fd4e6d485b718f27cdea4b4c0b45a7d31cb4315060db3bb0c3189664414eb65",
       "classification": "config_debug",
@@ -459,7 +459,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/mem/vma.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/vma.rs",
       "symbol": "VMA_VISIT_COUNT",
       "fingerprint": "1c4d18b8e7c751bce669e8f2b97b9fc31f1e40bb69697754f820f8138a20edcc",
       "classification": "carrier_infra",
@@ -467,7 +467,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mod.rs",
       "symbol": "watch_addr::CARRICK_WATCH_ADDR",
       "fingerprint": "42b2e84a656a95d08fdf542b45cd94f833b8b7ced38daf82353c603572ee747b",
       "classification": "config_debug",
@@ -475,7 +475,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mod.rs",
       "symbol": "HVPATCH_LANE",
       "fingerprint": "18f19ae16b7237f6ec107a32e0f411ddd7000c8966b19e40bd0ef083ef86ef77",
       "classification": "carrier_infra",
@@ -483,7 +483,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mod.rs",
       "symbol": "watch_addr::WATCH_ADDR",
       "fingerprint": "7d730e654a9685c3a6d5e3af8c3450f36ea242df7a16dda72b34a88ae9bbf0e9",
       "classification": "config_debug",
@@ -491,7 +491,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "file": "crates/carrick-kernel/src/dispatch/net.rs",
       "symbol": "description_readiness::VISITED",
       "fingerprint": "f408f8c0ae0cb4b9200f22f10fafea3dfd5630f6080f4126702024046a4d6374",
       "classification": "carrier_infra",
@@ -499,7 +499,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/net/packet.rs",
+      "file": "crates/carrick-kernel/src/dispatch/net/packet.rs",
       "symbol": "PACKET_SOCKETS",
       "fingerprint": "318e7cf8bf189d2874a51e63f00800660280fb46c108664b299dca2b9c730429",
       "classification": "host_kernel_object",
@@ -507,7 +507,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/net/recverr.rs",
+      "file": "crates/carrick-kernel/src/dispatch/net/recverr.rs",
       "symbol": "BOUND",
       "fingerprint": "3c9ddae16ef62655ccedd7a552ec0ec4b5b678536e06ba314a60dea03354874d",
       "classification": "host_kernel_object",
@@ -515,7 +515,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/net/recverr.rs",
+      "file": "crates/carrick-kernel/src/dispatch/net/recverr.rs",
       "symbol": "STATE",
       "fingerprint": "648a7770ea7dba4b93f1ffb31dc8ccbb5ad6afa194034eb7c3be3a2b0ba909c9",
       "classification": "host_kernel_object",
@@ -523,7 +523,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/net/reuseport.rs",
+      "file": "crates/carrick-kernel/src/dispatch/net/reuseport.rs",
       "symbol": "GROUPS",
       "fingerprint": "e21fa15b93a55dd73803736943b283d27015ae9e02c6febe1c5a5efce56ae1d6",
       "classification": "host_kernel_object",
@@ -531,7 +531,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/net/scm_rights.rs",
+      "file": "crates/carrick-kernel/src/dispatch/net/scm_rights.rs",
       "symbol": "VAULT",
       "fingerprint": "fddfdafdae736a2a6d292a42db81c441976e505778a4d2f590a6d1fd1f699992",
       "classification": "host_kernel_object",
@@ -539,7 +539,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net/sctp.rs",
+      "file": "crates/carrick-kernel/src/dispatch/net/sctp.rs",
       "symbol": "begin_send::CARRICK_SCTP_DEBUG",
       "fingerprint": "62788aa1da2b993a700596e57ad8d6a3403f373b3f96a24c607a3dc5b937c9fb",
       "classification": "config_debug",
@@ -547,7 +547,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net/sctp.rs",
+      "file": "crates/carrick-kernel/src/dispatch/net/sctp.rs",
       "symbol": "begin_send::CARRICK_SCTP_DEBUG#2",
       "fingerprint": "62788aa1da2b993a700596e57ad8d6a3403f373b3f96a24c607a3dc5b937c9fb",
       "classification": "config_debug",
@@ -555,7 +555,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net/sctp.rs",
+      "file": "crates/carrick-kernel/src/dispatch/net/sctp.rs",
       "symbol": "complete_read::CARRICK_SCTP_DEBUG",
       "fingerprint": "62788aa1da2b993a700596e57ad8d6a3403f373b3f96a24c607a3dc5b937c9fb",
       "classification": "config_debug",
@@ -563,7 +563,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/net/sctp.rs",
+      "file": "crates/carrick-kernel/src/dispatch/net/sctp.rs",
       "symbol": "STREAMS",
       "fingerprint": "2d984e907b3f8bb3567fbacb1133196145727ca939307fe09f0bfb6cb7509ab5",
       "classification": "host_kernel_object",
@@ -571,7 +571,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
+      "file": "crates/carrick-kernel/src/dispatch/net/support.rs",
       "symbol": "EPOLL_REG_GEN",
       "fingerprint": "390d1319b3eac4db79253d0d8d8986cc062ca9ee7dc412dd0763d12cb15ad267",
       "classification": "monotonic_allocator",
@@ -579,7 +579,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
+      "file": "crates/carrick-kernel/src/dispatch/net/support.rs",
       "symbol": "autobind_unix_host_path::CTR",
       "fingerprint": "be689a3f89867de1535b78665ff6fff20472b97b43b9b6e862a9e1be8b337798",
       "classification": "monotonic_allocator",
@@ -587,7 +587,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
+      "file": "crates/carrick-kernel/src/dispatch/net/support.rs",
       "symbol": "unix_path_registry::REG",
       "fingerprint": "04f5db6e7c9e961727b280bc7072eaf8e27a2f3509c6045e28c53291fd7ceeea",
       "classification": "host_kernel_object",
@@ -595,7 +595,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/perf.rs",
+      "file": "crates/carrick-kernel/src/dispatch/perf.rs",
       "symbol": "next_event_id::NEXT",
       "fingerprint": "3e458ccbf77476584e23f4fd4f83c5afbd371c0ea641ac090a4c6c6c5db0c0ee",
       "classification": "monotonic_allocator",
@@ -603,7 +603,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/perf.rs",
+      "file": "crates/carrick-kernel/src/dispatch/perf.rs",
       "symbol": "wall_ns::BASE",
       "fingerprint": "2dcab7e6cee9ad4cb20ed056f5c33b9f15c698bed825ef25104a485d6b01b852",
       "classification": "carrier_infra",
@@ -611,7 +611,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+      "file": "crates/carrick-kernel/src/dispatch/proc.rs",
       "symbol": "kernel_process_dispatch_tests::FOREIGN_LEASE_RETAINS",
       "fingerprint": "8f9eb03301b6181a71e99f07687c2b5fd6b115baf6b2551dee05ec108b7d2eec",
       "classification": "test_only",
@@ -619,7 +619,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+      "file": "crates/carrick-kernel/src/dispatch/proc.rs",
       "symbol": "kernel_process_dispatch_tests::FOREIGN_LEASE_STALE_ONCE",
       "fingerprint": "0192f2ae90a62594483083d1913a3d84bc7f172440fc763fed9969e6af8ffa19",
       "classification": "test_only",
@@ -627,7 +627,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+      "file": "crates/carrick-kernel/src/dispatch/proc.rs",
       "symbol": "kernel_process_dispatch_tests::FOREIGN_READ_TRANSACTIONS",
       "fingerprint": "2970ae56f4ef338840e3ef5e66539c1f48a069445e395341fed602bbc565e4ff",
       "classification": "test_only",
@@ -635,7 +635,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/proctitle.rs",
+      "file": "crates/carrick-kernel/src/dispatch/proctitle.rs",
       "symbol": "BUFFER",
       "fingerprint": "6896aad11176edb0b980c3bfd49371d6546db8addf197f72504f09066d91a711",
       "classification": "carrier_infra",
@@ -643,7 +643,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/proctitle.rs",
+      "file": "crates/carrick-kernel/src/dispatch/proctitle.rs",
       "symbol": "environ",
       "fingerprint": "b3ff0bd36943e3de71e4fbea6443de7840503303e9f63e4745289585f78b0422",
       "classification": "carrier_infra",
@@ -651,7 +651,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/proctitle.rs",
+      "file": "crates/carrick-kernel/src/dispatch/proctitle.rs",
       "symbol": "linux_capture::ARGC",
       "fingerprint": "fb30064cf4972d68702b8bda916374cd46ac23204f73178212a18855bcdfd2a7",
       "classification": "carrier_infra",
@@ -659,7 +659,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/proctitle.rs",
+      "file": "crates/carrick-kernel/src/dispatch/proctitle.rs",
       "symbol": "linux_capture::ARGV",
       "fingerprint": "8dfa0d847058f323d5967e963e261261aa519cd4c929e9c7d83842f31768bed9",
       "classification": "carrier_infra",
@@ -667,7 +667,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/proctitle.rs",
+      "file": "crates/carrick-kernel/src/dispatch/proctitle.rs",
       "symbol": "linux_capture::CAPTURE_CTOR",
       "fingerprint": "27cedbf80a52da333b79cf0aa46783a2ef28a8063d0c2abdd1e5a0f14910cec3",
       "classification": "carrier_infra",
@@ -675,7 +675,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/pty_registry.rs",
+      "file": "crates/carrick-kernel/src/dispatch/pty_registry.rs",
       "symbol": "MASTERS",
       "fingerprint": "8a60b55c4e9d38bb600887c476bf00f17de00b3bce3b509a4e8064a3e7e99c32",
       "classification": "host_kernel_object",
@@ -683,7 +683,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/resources.rs",
+      "file": "crates/carrick-kernel/src/dispatch/resources.rs",
       "symbol": "ACTIVE_CONTEXT",
       "fingerprint": "c46f8e2eedabfaaaac35ac1547027e06aa622c2fd9ab8bee3c28afad325fe7bd",
       "classification": "carrier_infra",
@@ -691,7 +691,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/resources.rs",
+      "file": "crates/carrick-kernel/src/dispatch/resources.rs",
       "symbol": "CAPTURED_RESOURCES",
       "fingerprint": "7ecab6ee6e0726c019f74800ac1f03a578f1dc599d2fc9a78dacac320db5aed1",
       "classification": "carrier_infra",
@@ -699,7 +699,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/resources.rs",
+      "file": "crates/carrick-kernel/src/dispatch/resources.rs",
       "symbol": "RETIRING_FILE_TABLES",
       "fingerprint": "2cc918379a57db7975609207948c53efdcba6855485beac1be91c6789881bc35",
       "classification": "carrier_infra",
@@ -707,7 +707,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/rosetta.rs",
+      "file": "crates/carrick-kernel/src/dispatch/rosetta.rs",
       "symbol": "rosetta_binary_bytes::CACHE",
       "fingerprint": "3c13ec3261cdbf3ca309bd9fd863023dabca93ee7c6addfd1401bc8a5fe7cd61",
       "classification": "carrier_infra",
@@ -715,7 +715,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/rosetta.rs",
+      "file": "crates/carrick-kernel/src/dispatch/rosetta.rs",
       "symbol": "rosetta_license_blob::CACHE",
       "fingerprint": "3c13ec3261cdbf3ca309bd9fd863023dabca93ee7c6addfd1401bc8a5fe7cd61",
       "classification": "carrier_infra",
@@ -723,7 +723,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/signal.rs",
+      "file": "crates/carrick-kernel/src/dispatch/signal.rs",
       "symbol": "tests::XSIG_RING_TEST_LOCK",
       "fingerprint": "c4906f78d4cd62cb130f198777f557e1c263d2d3e30323bd04095c2cc840efa2",
       "classification": "test_only",
@@ -731,7 +731,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
       "symbol": "ipc_set_tests::proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock::CARRICK_SYSVIPC_TEST_CHILD",
       "fingerprint": "e28376f20995e878ba99603697a82582e826926b3fec69ce4d2cf26aaeb05157",
       "classification": "test_only",
@@ -739,7 +739,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
       "symbol": "ipc_set_tests::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting::CARRICK_SAME_SHMID_TEST_CHILD",
       "fingerprint": "5ce33d23c6269f3e9d7b296cc5ad1d97c03659130da4ada9048d434d10412736",
       "classification": "test_only",
@@ -747,7 +747,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
       "symbol": "ipc_set_tests::watchdog_kills_and_reaps_on_deadlock_timeout::CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK",
       "fingerprint": "e050f8de716dc76a296742adc56a973f60c4915aefd51b0a44653218cf8da7d2",
       "classification": "test_only",
@@ -755,7 +755,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
       "symbol": "SETALL_INTERLEAVING_HOOK",
       "fingerprint": "c2adb22c84c943cdd36986311d36dfbbe022f140d191d276d55896f407d12da1",
       "classification": "test_only",
@@ -763,7 +763,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
       "symbol": "MSG_QUEUE_FD_CACHE",
       "fingerprint": "86bd1f420337ed19f6377584f908fd98a6075fd364dbae7140405a5c29abac75",
       "classification": "carrier_infra",
@@ -771,7 +771,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/wait_authority.rs",
+      "file": "crates/carrick-kernel/src/dispatch/wait_authority.rs",
       "symbol": "internal::NEXT_INTERNAL_WAIT",
       "fingerprint": "b336d734926bae2b1b399a6279596f9fac15467f0615d31f60e1da42d19e14b1",
       "classification": "monotonic_allocator",
@@ -803,7 +803,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/event_ring.rs",
+      "file": "crates/carrick-kernel/src/event_ring.rs",
       "symbol": "dir::CARRICK_EVENTRING",
       "fingerprint": "848bb7eaeede7522988b8e1d1d0365d8dda85785b89b671b0bfddf598ec1acdd",
       "classification": "config_debug",
@@ -811,7 +811,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/event_ring.rs",
+      "file": "crates/carrick-kernel/src/event_ring.rs",
       "symbol": "IDX",
       "fingerprint": "e0fd7642873c3b616f1a67936622eb4441990ca5cd85d8e6b7f513432bc88994",
       "classification": "carrier_infra",
@@ -819,7 +819,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/event_ring.rs",
+      "file": "crates/carrick-kernel/src/event_ring.rs",
       "symbol": "NEXT_HVPWAIT_ID",
       "fingerprint": "4a1e64dca49f71464bb3c42671626578563bc8295aab27960b54707685b80fdf",
       "classification": "monotonic_allocator",
@@ -827,7 +827,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/event_ring.rs",
+      "file": "crates/carrick-kernel/src/event_ring.rs",
       "symbol": "RING",
       "fingerprint": "633c633a122e22dd88d4be0a1599736b9a0514dd04a7d39f1b031a3e9d49878d",
       "classification": "carrier_infra",
@@ -835,7 +835,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/event_ring.rs",
+      "file": "crates/carrick-kernel/src/event_ring.rs",
       "symbol": "WATCHDOG",
       "fingerprint": "ee057f3981134b986886500eec0a6b454ff540fbc5b1db0a0eb60d1264875e89",
       "classification": "carrier_infra",
@@ -843,7 +843,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/event_ring.rs",
+      "file": "crates/carrick-kernel/src/event_ring.rs",
       "symbol": "dir::DIR",
       "fingerprint": "1e51e799f37e7d4a25aed888a292582a5a65c7ca08af55f72536b7b667600967",
       "classification": "carrier_infra",
@@ -851,7 +851,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/eventfd_shm.rs",
+      "file": "crates/carrick-kernel/src/eventfd_shm.rs",
       "symbol": "SLAB",
       "fingerprint": "9cdb5a65d0bfea293471215a440665d765252f97012fe3c69748f09b134df2fc",
       "classification": "carrier_infra",
@@ -859,7 +859,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/exec_helpers.rs",
+      "file": "crates/carrick-kernel/src/exec_helpers.rs",
       "symbol": "stop_for_debug_signal::CARRICK_DEBUG_STOP_ON_SIGNAL",
       "fingerprint": "6cd191fd69f24c95c5e75d17b6c719981679c49b3bec9ae56d9aca05e1e437a2",
       "classification": "config_debug",
@@ -867,7 +867,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/exec_stamps.rs",
+      "file": "crates/carrick-kernel/src/exec_stamps.rs",
       "symbol": "stamp_record::CARRICK_EXEC_STAMPS",
       "fingerprint": "857b733af0acdc35b398e51cf338091b3948d948728d2bcecabe8ce4ac86a6c1",
       "classification": "config_debug",
@@ -875,7 +875,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/exec_stamps.rs",
+      "file": "crates/carrick-kernel/src/exec_stamps.rs",
       "symbol": "FORK_LINK_SEQUENCE",
       "fingerprint": "777a6d48c3506202086f9fc345b08be454afb46b0c0a02fd9671d56c1dcabdfa",
       "classification": "carrier_infra",
@@ -923,7 +923,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/fanotify.rs",
+      "file": "crates/carrick-kernel/src/fanotify.rs",
       "symbol": "INTERNAL_OPEN_DEPTH",
       "fingerprint": "85793fdcc85f1929b4d3479f4d68a7044de0dffcd666777ee05855a5f0b3fd59",
       "classification": "carrier_infra",
@@ -1075,7 +1075,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/host_tty.rs",
+      "file": "crates/carrick-kernel/src/host_tty.rs",
       "symbol": "SAVED_TERMIOS",
       "fingerprint": "7ae03c7da0b020fa6b340b32b56dcb84d284009df4e6d13b44d40b6c1d539557",
       "classification": "carrier_infra",
@@ -1083,7 +1083,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/host_tty.rs",
+      "file": "crates/carrick-kernel/src/host_tty.rs",
       "symbol": "tests::TTY_TEST_LOCK",
       "fingerprint": "e6dc150741c9ba797e14c80c8a3f3efaf873ba60bf234d75271c07f7ac9b1929",
       "classification": "test_only",
@@ -1115,7 +1115,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/kernel/container.rs",
+      "file": "crates/carrick-kernel/src/kernel/container.rs",
       "symbol": "from_process_env::CARRICK_CONTAINER_ID",
       "fingerprint": "1b67e5b5b134ab1ff2cca6220975a5fca2164042ec673eeff0f92b11be2833b1",
       "classification": "config_debug",
@@ -1123,7 +1123,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/kernel/container.rs",
+      "file": "crates/carrick-kernel/src/kernel/container.rs",
       "symbol": "from_process_env::CARRICK_EXEC_OVERLAY",
       "fingerprint": "e5876a6c43141b1fa085753ff7b75bf345c7b4ee71af774a2ab725be1e61b5af",
       "classification": "config_debug",
@@ -1131,7 +1131,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/kernel/container.rs",
+      "file": "crates/carrick-kernel/src/kernel/container.rs",
       "symbol": "from_process_env::CARRICK_LAUNCH_AUTHORIZATION",
       "fingerprint": "5402cc31982f88978b45fa4fc6fb17033e9512bb9badc27cbd206bfa58747707",
       "classification": "config_debug",
@@ -1139,7 +1139,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/kernel/container.rs",
+      "file": "crates/carrick-kernel/src/kernel/container.rs",
       "symbol": "from_process_env::CARRICK_RUN_ID",
       "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
       "classification": "config_debug",
@@ -1147,7 +1147,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/kernel/container.rs",
+      "file": "crates/carrick-kernel/src/kernel/container.rs",
       "symbol": "from_process_env_or_random::CARRICK_RUN_ID",
       "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
       "classification": "carrier_infra",
@@ -1155,7 +1155,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/kernel/container.rs",
+      "file": "crates/carrick-kernel/src/kernel/container.rs",
       "symbol": "tests::with_env::key",
       "fingerprint": "d0eab53b3bdca61a0d38973031cf88d0ea84564679fdf423da6ef171543335b5",
       "classification": "test_only",
@@ -1163,7 +1163,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/kernel/container.rs",
+      "file": "crates/carrick-kernel/src/kernel/container.rs",
       "symbol": "unmanaged_from_process_run_id::CARRICK_RUN_ID",
       "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
       "classification": "carrier_infra",
@@ -1171,7 +1171,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/container.rs",
+      "file": "crates/carrick-kernel/src/kernel/container.rs",
       "symbol": "tests::ENV_LOCK",
       "fingerprint": "d3e8fa8c63e53fe4921dbba7c17f1ebe992389c0367e7e1c2a7aad79f0477143",
       "classification": "test_only",
@@ -1179,7 +1179,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
+      "file": "crates/carrick-kernel/src/kernel/control/endpoint.rs",
       "symbol": "for_container_id::CARRICK_CONTROL_DIR",
       "fingerprint": "33141ab28f135648083af6855a3a55ae9a2ea045ec945ff1925de040dbbe7881",
       "classification": "config_debug",
@@ -1187,7 +1187,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/debug/endpoint.rs",
+      "file": "crates/carrick-kernel/src/kernel/debug/endpoint.rs",
       "symbol": "base_directory::BASE_DIR_ENV",
       "fingerprint": "b22671436a90593b2a6cf5e38ea89268074463dd166be57269ed653c5718e430",
       "classification": "config_debug",
@@ -1195,7 +1195,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/debug/post_mortem.rs",
+      "file": "crates/carrick-kernel/src/kernel/debug/post_mortem.rs",
       "symbol": "configured_dir::POST_MORTEM_DIR_ENV",
       "fingerprint": "823e3b4fed734d90c869df9a51b4e6c57855b32b9b9d85be52a00f06c7c19186",
       "classification": "config_debug",
@@ -1203,7 +1203,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/debug/post_mortem.rs",
+      "file": "crates/carrick-kernel/src/kernel/debug/post_mortem.rs",
       "symbol": "ABORT_REQUEST",
       "fingerprint": "5688857f939b817680046312ba2d93688bc8c0e399932e682ce685cb30c4bcd8",
       "classification": "carrier_infra",
@@ -1211,7 +1211,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/debug/post_mortem.rs",
+      "file": "crates/carrick-kernel/src/kernel/debug/post_mortem.rs",
       "symbol": "INSTALLED_DIR",
       "fingerprint": "0e3d6ca3c71cb6a3e0e101b0f089c59ca43786a7424f405875c60816e89bce5d",
       "classification": "config_debug",
@@ -1219,7 +1219,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/debug/server.rs",
+      "file": "crates/carrick-kernel/src/kernel/debug/server.rs",
       "symbol": "install::DISABLE_ENV",
       "fingerprint": "74a10faac7acd44b2a482888e2c4ab78e4f4976ecc57aa0f8be30f5d095f97f0",
       "classification": "config_debug",
@@ -1227,7 +1227,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/debug/server.rs",
+      "file": "crates/carrick-kernel/src/kernel/debug/server.rs",
       "symbol": "INSTALLED",
       "fingerprint": "8fea9dd0bfa1fae7faafd624029ebd1d14b885603d12c123f2dea9be834b241c",
       "classification": "carrier_infra",
@@ -1235,7 +1235,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/ids.rs",
+      "file": "crates/carrick-kernel/src/kernel/ids.rs",
       "symbol": "NEXT_FILE_DESCRIPTION_ID",
       "fingerprint": "e5de473ba863b6f4206b47d69226d2dbe46e9f2b22d11a52622aea523cfa8623",
       "classification": "monotonic_allocator",
@@ -1251,7 +1251,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects.rs",
       "symbol": "NEXT_FILE_SLOT_GENERATION",
       "fingerprint": "21f82ad5c4d6eb2f8021ae619208a8337f5fc025b624b6c3642e94dde47648f5",
       "classification": "monotonic_allocator",
@@ -1259,7 +1259,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects.rs",
       "symbol": "NEXT_PROCESS_GROUP_GENERATION",
       "fingerprint": "8d9ca8cc664c8e4e0cb71a22cd8e2af00b7b8113f10f5626038f92201b1fd5b8",
       "classification": "monotonic_allocator",
@@ -1267,7 +1267,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects.rs",
       "symbol": "SYSTEM_CHARGE_WINDOW",
       "fingerprint": "761f744a623027ad2ff9fefe442521860f8fcfae43bd03d5dd2c8dbd9b920fee",
       "classification": "carrier_infra",
@@ -1275,7 +1275,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/operations/signal.rs",
+      "file": "crates/carrick-kernel/src/kernel/operations/signal.rs",
       "symbol": "post_signal_to_authorized_target_inner::CARRICK_SIG_DEBUG",
       "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
       "classification": "config_debug",
@@ -1283,7 +1283,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/operations/signal.rs",
+      "file": "crates/carrick-kernel/src/kernel/operations/signal.rs",
       "symbol": "post_signal_to_task_key::CARRICK_SIG_DEBUG",
       "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
       "classification": "config_debug",
@@ -1291,7 +1291,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "symbol": "EXPOSED_GUEST_CPUS",
       "fingerprint": "824718d45ea7131a8342c91ac002435730ef9629093bf75e48a41706555c3838",
       "classification": "carrier_infra",
@@ -1299,7 +1299,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/tty.rs",
+      "file": "crates/carrick-kernel/src/kernel/tty.rs",
       "symbol": "slot::SLOT",
       "fingerprint": "ce379d8b235f81fdcbcc1cdfefa4db0c7d455b43c56b04886cc8265673c26e7c",
       "classification": "carrier_infra",
@@ -1307,7 +1307,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/kernel/wait_set.rs",
+      "file": "crates/carrick-kernel/src/kernel/wait_set.rs",
       "symbol": "CURRENT_EXECUTOR_WAKE_PIPE",
       "fingerprint": "cb7846bd41688a56bc8e86f6ba760acb8179e9c6bd41c665c9ad45eda5034c64",
       "classification": "carrier_infra",
@@ -1331,7 +1331,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/namespace/process.rs",
+      "file": "crates/carrick-kernel/src/namespace/process.rs",
       "symbol": "alloc_ns_id::NEXT_NS_ID",
       "fingerprint": "51fb906a65a2ac194150487d53538f344fe2633228d290614fb2504177b3509a",
       "classification": "monotonic_allocator",
@@ -1339,7 +1339,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
+      "file": "crates/carrick-kernel/src/network/socket_namespace.rs",
       "symbol": "instance_id::INSTANCE",
       "fingerprint": "37c9e841dfc25ac04d73e7dc26d91b9079b468854352baa57a9f0c00c967b927",
       "classification": "carrier_infra",
@@ -1347,7 +1347,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
+      "file": "crates/carrick-kernel/src/network/socket_namespace.rs",
       "symbol": "reclaim_stale_endpoint_records_once::SWEPT",
       "fingerprint": "3285da399fc326a3d9d6c44d2713c1decd6a3040250c39104405d3e14f59b46d",
       "classification": "carrier_infra",
@@ -1355,7 +1355,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
+      "file": "crates/carrick-kernel/src/network/socket_namespace.rs",
       "symbol": "tests::FORK_SOCKET_TEST_LOCK",
       "fingerprint": "89a43985f8334561dbc494384735a6e126e9e5114f23b413e2df7f865dc0a47d",
       "classification": "test_only",
@@ -1363,7 +1363,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
+      "file": "crates/carrick-kernel/src/network/socket_namespace.rs",
       "symbol": "warn_rejected_record::WARNED",
       "fingerprint": "6cf88dd5c95b3c4c206d50ee26a510e8c1a50b7a6de5987f71096608dc1217c0",
       "classification": "carrier_infra",
@@ -1371,7 +1371,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/network/socket_namespace.rs",
+      "file": "crates/carrick-kernel/src/network/socket_namespace.rs",
       "symbol": "write_record_once::SEQUENCE",
       "fingerprint": "afeeb863aff4b9df6b008df39b2711c6e7d75a2eeeb2609651b74ee53daa4061",
       "classification": "monotonic_allocator",
@@ -1379,7 +1379,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/observe/auditor.rs",
+      "file": "crates/carrick-kernel/src/observe/auditor.rs",
       "symbol": "CONTAINER_AUDITORS",
       "fingerprint": "4c45de524f3ca91e6dbcec70f0d44140c53b0e48e8f20fdf146e3ae15d7d6c21",
       "classification": "carrier_infra",
@@ -1387,7 +1387,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/pty_relay.rs",
+      "file": "crates/carrick-kernel/src/pty_relay.rs",
       "symbol": "WINCH_PIPE_WRITE",
       "fingerprint": "0efde91efab0d3df7a93b1a0b6554a008420c9bc83e195109adfe32353429078",
       "classification": "carrier_infra",
@@ -1395,7 +1395,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/run_state.rs",
+      "file": "crates/carrick-kernel/src/run_state.rs",
       "symbol": "MY_SLOT",
       "fingerprint": "4ee16448b1b697cd83d010306fdd1d7ce106a53b41186a336f1273ca03aba04c",
       "classification": "carrier_infra",
@@ -1411,7 +1411,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/syslog.rs",
+      "file": "crates/carrick-kernel/src/syslog.rs",
       "symbol": "NEXT_SYSLOG_SERVICE_ID",
       "fingerprint": "03ae493f3c7763b300e227eebc3769f64d978c0d2bfe003576e06ec35b9aabac",
       "classification": "monotonic_allocator",
@@ -1451,7 +1451,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/continuation.rs",
+      "file": "crates/carrick-kernel/src/kernel/continuation.rs",
       "symbol": "NEXT_CONTINUATION_ID",
       "fingerprint": "a5c1115480c325eba5e831a9d9632f83adfbbc9c699168f2dc52bfcd3bb85f23",
       "classification": "monotonic_allocator",
@@ -1459,7 +1459,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/continuation.rs",
+      "file": "crates/carrick-kernel/src/kernel/continuation.rs",
       "symbol": "NEXT_RESOURCE_GENERATION",
       "fingerprint": "302bfa03219e9cdc7b82cd524c1aa79b535596d7030d7cae596964e5d2e825ec",
       "classification": "monotonic_allocator",
@@ -1475,7 +1475,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "file": "crates/carrick-kernel/src/kernel/continuation/tests.rs",
       "symbol": "event_future_cancelled_observation_drains_inflight_operation_safely::CHILD_MARKER",
       "fingerprint": "f2196b97922c18c843b5e8b263cc01e6548e67f5c5949e88399767be84c1d622",
       "classification": "test_only",
@@ -1483,7 +1483,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "file": "crates/carrick-kernel/src/kernel/continuation/tests.rs",
       "symbol": "lock_ordering_opposing_locks_rendezvous_completes_without_deadlock::CHILD_MARKER",
       "fingerprint": "f2196b97922c18c843b5e8b263cc01e6548e67f5c5949e88399767be84c1d622",
       "classification": "test_only",
@@ -1491,7 +1491,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "file": "crates/carrick-kernel/src/kernel/continuation/tests.rs",
       "symbol": "incoming_drain_waker_clone_runs_outside_registration_locks::VTABLE",
       "fingerprint": "01d31cdf861fb3951fb83b9ba4cc3267501e131b3b379559f0f60ddfe5f40a54",
       "classification": "test_only",
@@ -1499,7 +1499,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "file": "crates/carrick-kernel/src/kernel/continuation/tests.rs",
       "symbol": "incoming_task_waker_clone_runs_outside_registration_locks::VTABLE",
       "fingerprint": "01d31cdf861fb3951fb83b9ba4cc3267501e131b3b379559f0f60ddfe5f40a54",
       "classification": "test_only",
@@ -1507,7 +1507,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/continuation/wait_service.rs",
+      "file": "crates/carrick-kernel/src/kernel/continuation/wait_service.rs",
       "symbol": "NEXT_REGISTRATION_GENERATION",
       "fingerprint": "14cccde4761a985c1c26fff30977d44498b737d1a967212c85f34560e03c014f",
       "classification": "monotonic_allocator",
@@ -1739,7 +1739,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/mm_quiesce.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mm_quiesce.rs",
       "symbol": "EXACT_MM_STAGE1",
       "fingerprint": "1831bf5d7c756e3b61f4c1029d96d250a26dae7fcad2141c09e88c86e8db501e",
       "classification": "carrier_infra",
@@ -1795,7 +1795,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vdso_policy.rs",
+      "file": "crates/carrick-kernel/src/vdso_policy.rs",
       "symbol": "vdso_debug_mode::CARRICK_DISABLE_VDSO",
       "fingerprint": "50d9306ef0f992272a2c4c6776c1a2566d149ea7bd29ab3824ea4a3014278448",
       "classification": "config_debug",
@@ -1803,7 +1803,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vdso_policy.rs",
+      "file": "crates/carrick-kernel/src/vdso_policy.rs",
       "symbol": "vdso_debug_mode::CARRICK_VDSO_MODE",
       "fingerprint": "9b7303b8b91080ab3c18db2ba785de553bafb7200635ca59742a15a0f416c0b3",
       "classification": "config_debug",
@@ -1827,7 +1827,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vfs/proc.rs",
+      "file": "crates/carrick-kernel/src/vfs/proc.rs",
       "symbol": "OOM_SCORE_ADJ_SINGLE_PROCESS",
       "fingerprint": "07c966c9d71bd3ffc6510c6eb2f5c0b936d9ae875ebba6306b19b73b90535517",
       "classification": "carrier_infra",
@@ -1835,7 +1835,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vfs/proc.rs",
+      "file": "crates/carrick-kernel/src/vfs/proc.rs",
       "symbol": "synthetic_proc_config_gz::AARCH64_CACHE",
       "fingerprint": "fdc6122c661fdfd56d264bd0cdb839d41d5695dda0a523e0b7b602eeba99e9ae",
       "classification": "carrier_infra",
@@ -1843,7 +1843,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vfs/proc.rs",
+      "file": "crates/carrick-kernel/src/vfs/proc.rs",
       "symbol": "synthetic_proc_config_gz::X86_64_CACHE",
       "fingerprint": "b8743aa257ccaa9189a1a4dc4bc2a888681c51b0052ffc83f95a16c511020efe",
       "classification": "carrier_infra",
@@ -1851,7 +1851,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vfs/proc.rs",
+      "file": "crates/carrick-kernel/src/vfs/proc.rs",
       "symbol": "sysctl_boot_id::BOOT_ID",
       "fingerprint": "1bf7f880c4f5e57523a0a03a80507cccedb9294b89369c8e77209575120f64a1",
       "classification": "carrier_infra",

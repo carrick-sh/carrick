@@ -56,7 +56,7 @@ impl SyscallCompletionOwnership {
 }
 
 pub(crate) struct PendingExecTerminal {
-    pub(crate) context: crate::kernel::KernelContext,
+    pub(crate) context: carrick_kernel::kernel::KernelContext,
     pub(crate) handoff: ExecTerminalHandoff,
 }
 
@@ -77,7 +77,7 @@ impl ProductionHvpatchPollError {
 
     pub(crate) fn from_exec_error(
         error: RuntimeError,
-        context: crate::kernel::KernelContext,
+        context: carrick_kernel::kernel::KernelContext,
         handoff: ExecTerminalHandoff,
     ) -> Self {
         Self::Exec(Box::new(PendingExecTerminalError {
@@ -270,11 +270,14 @@ fn exec_regions_to_verify(
 /// one — the authority rejects a zero-event commit outright.
 #[cfg_attr(not(test), allow(dead_code))]
 fn apply_exec_inventory<E>(
-    old_mm: crate::kernel::MmId,
-    replacement_mm: crate::kernel::MmId,
+    old_mm: carrick_kernel::kernel::MmId,
+    replacement_mm: carrick_kernel::kernel::MmId,
     retired: Option<carrick_hal::FrameInventoryCommit<()>>,
     replacement: carrick_hal::FrameInventoryCommit<()>,
-    mut apply: impl FnMut(crate::kernel::MmId, carrick_hal::FrameInventoryCommit<()>) -> Result<(), E>,
+    mut apply: impl FnMut(
+        carrick_kernel::kernel::MmId,
+        carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), E>,
 ) -> Result<(), E> {
     if let Some(retired) = retired {
         apply(old_mm, retired)?;
@@ -320,12 +323,12 @@ impl ExecBackendPublicationGate {
 
 enum RuntimePreparedExec {
     Hvpatch(Box<crate::hvpatch::PreparedProcessExec>),
-    Other(Box<crate::kernel::PreparedExec>),
+    Other(Box<carrick_kernel::kernel::PreparedExec>),
 }
 
 enum RuntimePublishedExec {
     Hvpatch(crate::hvpatch::PublishedProcessExec),
-    Other(crate::kernel::PreparedExec),
+    Other(carrick_kernel::kernel::PreparedExec),
 }
 
 pub(super) struct PreparedExecve {
@@ -334,14 +337,14 @@ pub(super) struct PreparedExecve {
     path: String,
     proc_argv: Vec<String>,
     proc_env: Vec<Vec<u8>>,
-    executable_source: crate::dispatch::executable_authority::ExecSource,
+    executable_source: carrick_kernel::dispatch::executable_authority::ExecSource,
     command_line: String,
     inventory_failure_injection: Option<HvpatchExecInventoryFailureInjection>,
     hvpatch_mm_reservation: Option<crate::hvpatch::ExecMmReservation>,
     /// Exact terminal context paired with `clone_admission`. The pair moves
     /// together until the destructive suffix either commits a Kernel successor
     /// or reaches the exec-specific terminal entry.
-    terminal_context: Option<crate::kernel::KernelContext>,
+    terminal_context: Option<carrick_kernel::kernel::KernelContext>,
     clone_admission: Option<ExecCloneAdmission>,
     runtime_region_count: u64,
     runtime_mapped_bytes: u64,
@@ -351,7 +354,10 @@ pub(super) struct PreparedExecve {
 impl PreparedExecve {
     fn take_terminal_authority(
         &mut self,
-    ) -> (crate::kernel::KernelContext, super::ExecTerminalHandoff) {
+    ) -> (
+        carrick_kernel::kernel::KernelContext,
+        super::ExecTerminalHandoff,
+    ) {
         let context = self.terminal_context.take().unwrap_or_else(|| {
             carrick_fatal!(
                 "hvpatch::exec_terminal",
@@ -369,7 +375,10 @@ impl PreparedExecve {
 
     fn into_terminal_authority(
         mut self,
-    ) -> (crate::kernel::KernelContext, super::ExecTerminalHandoff) {
+    ) -> (
+        carrick_kernel::kernel::KernelContext,
+        super::ExecTerminalHandoff,
+    ) {
         self.take_terminal_authority()
     }
 
@@ -398,7 +407,7 @@ impl ExecTerminalFailure {
 
     fn from_admission(
         error: RuntimeError,
-        context: crate::kernel::KernelContext,
+        context: carrick_kernel::kernel::KernelContext,
         clone_admission: ExecCloneAdmission,
     ) -> Self {
         Self(Box::new(PendingExecTerminalError {
@@ -428,7 +437,7 @@ impl std::fmt::Debug for ExecTerminalFailure {
 /// caller has either published the replacement or routed a terminal outcome.
 pub(super) struct FinishedPreparedExecve {
     outcome: Option<VcpuLoopOutcome>,
-    context: crate::kernel::KernelContext,
+    context: carrick_kernel::kernel::KernelContext,
     handoff: super::ExecTerminalHandoff,
 }
 
@@ -437,7 +446,7 @@ impl FinishedPreparedExecve {
         self,
     ) -> (
         Option<VcpuLoopOutcome>,
-        crate::kernel::KernelContext,
+        carrick_kernel::kernel::KernelContext,
         super::ExecTerminalHandoff,
     ) {
         (self.outcome, self.context, self.handoff)
@@ -462,7 +471,10 @@ impl PreparedExecveDrain {
 
     pub(super) fn into_terminal_authority(
         self,
-    ) -> (crate::kernel::KernelContext, super::ExecTerminalHandoff) {
+    ) -> (
+        carrick_kernel::kernel::KernelContext,
+        super::ExecTerminalHandoff,
+    ) {
         let Self {
             prepared,
             drain,
@@ -489,21 +501,21 @@ pub(super) enum ExecvePreparation {
 }
 
 impl RuntimePreparedExec {
-    fn old_mm_id(&self) -> crate::kernel::MmId {
+    fn old_mm_id(&self) -> carrick_kernel::kernel::MmId {
         match self {
             Self::Hvpatch(prepared) => prepared.old_mm_id(),
             Self::Other(prepared) => prepared.old_mm_id(),
         }
     }
 
-    fn old_file_table(&self) -> std::sync::Arc<crate::kernel::FileTable> {
+    fn old_file_table(&self) -> std::sync::Arc<carrick_kernel::kernel::FileTable> {
         match self {
             Self::Hvpatch(prepared) => prepared.old_file_table(),
             Self::Other(prepared) => prepared.old_file_table(),
         }
     }
 
-    fn replacement_mm_id(&self) -> crate::kernel::MmId {
+    fn replacement_mm_id(&self) -> carrick_kernel::kernel::MmId {
         match self {
             Self::Hvpatch(prepared) => prepared.replacement_mm_id(),
             Self::Other(prepared) => prepared.replacement_mm_id(),
@@ -527,7 +539,7 @@ impl RuntimePreparedExec {
     fn prepare_hvpatch_address_space<E: ThreadedEngine>(
         &self,
         engine: &mut E,
-        executor: crate::kernel::objects::ExecutorId,
+        executor: carrick_kernel::kernel::objects::ExecutorId,
     ) -> Result<Option<crate::hvpatch::AsidLoad>, String> {
         let Self::Hvpatch(prepared) = self else {
             return Ok(None);
@@ -556,11 +568,11 @@ fn should_update_host_process_title(is_hvpatch: bool) -> bool {
 }
 
 fn retire_execution_authority_for_exec(
-    thread: &std::sync::Arc<crate::kernel::Thread>,
+    thread: &std::sync::Arc<carrick_kernel::kernel::Thread>,
     lease_slot: &super::ExecutionLeaseCell,
-) -> Result<(), crate::kernel::objects::ThreadExecutionError> {
+) -> Result<(), carrick_kernel::kernel::objects::ThreadExecutionError> {
     let lease = lease_slot.lock().take().ok_or_else(|| {
-        crate::kernel::objects::ThreadExecutionError::InvalidTransition {
+        carrick_kernel::kernel::objects::ThreadExecutionError::InvalidTransition {
             operation: "retire_execution_authority_for_exec_without_lease",
             state: thread.execution_state(),
         }
@@ -571,11 +583,11 @@ fn retire_execution_authority_for_exec(
 }
 
 fn publish_execution_authority_after_exec(
-    replacement: &std::sync::Arc<crate::kernel::Thread>,
-    executor: crate::kernel::objects::ExecutorId,
-    state: crate::kernel::objects::MigratableTaskState,
+    replacement: &std::sync::Arc<carrick_kernel::kernel::Thread>,
+    executor: carrick_kernel::kernel::objects::ExecutorId,
+    state: carrick_kernel::kernel::objects::MigratableTaskState,
     lease_slot: &super::ExecutionLeaseCell,
-) -> Result<(), crate::kernel::objects::ThreadExecutionError> {
+) -> Result<(), carrick_kernel::kernel::objects::ThreadExecutionError> {
     replacement.publish_initial_task_state(state)?;
     let lease = replacement.claim_runnable(executor)?;
     debug_assert!(lease_slot.lock().is_none());
@@ -789,10 +801,10 @@ mod exec_image_verification_tests {
         use carrick_hal::ThreadId;
         use carrick_hal::threaded::GuestCpuState;
 
-        use crate::kernel::objects::{
+        use carrick_kernel::kernel::objects::{
             BlockedReason, ExecutorId, MigratableTaskState, ThreadExecutionState,
         };
-        use crate::kernel::{Kernel, RootBootstrap};
+        use carrick_kernel::kernel::{Kernel, RootBootstrap};
 
         let input = RootBootstrap::for_reference_model(
             19_101,
@@ -890,13 +902,14 @@ mod exec_image_verification_tests {
             "stale or wrong predecessor authority must reject before execve_into destroys the old image"
         );
 
-        let input = crate::kernel::RootBootstrap::for_reference_model(
+        let input = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             19_104,
             carrick_hal::ThreadId::synthetic_for_tests(19_104),
             "missing exec authority".to_owned(),
         )
         .unwrap();
-        let (_kernel, missing_context) = crate::kernel::Kernel::bootstrap_root(input).unwrap();
+        let (_kernel, missing_context) =
+            carrick_kernel::kernel::Kernel::bootstrap_root(input).unwrap();
         let missing_slot = crate::vcpu_loop::ExecutionLeaseCell::owned();
         let missing_destructive_calls = std::cell::Cell::new(0);
         let missing_authorized =
@@ -907,10 +920,10 @@ mod exec_image_verification_tests {
         assert!(missing_authorized.is_err());
         assert_eq!(missing_destructive_calls.get(), 0);
 
-        use crate::kernel::objects::{ExecutorId, MigratableTaskState};
-        use crate::kernel::{Kernel, RootBootstrap};
         use carrick_hal::ThreadId;
         use carrick_hal::threaded::GuestCpuState;
+        use carrick_kernel::kernel::objects::{ExecutorId, MigratableTaskState};
+        use carrick_kernel::kernel::{Kernel, RootBootstrap};
         use std::sync::Arc;
 
         let input = RootBootstrap::for_reference_model(
@@ -1051,13 +1064,13 @@ mod exec_image_verification_tests {
 
     #[test]
     fn exec_inventory_routes_retirement_before_replacement_to_prepared_mms() {
-        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+        let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             1_540,
             carrick_hal::ThreadId::synthetic_for_tests(1_540),
             "exec-inventory-routing".to_owned(),
         )
         .unwrap();
-        let (kernel, context) = crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        let (kernel, context) = carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
         let prepared = kernel.prepare_exec(&context, None).unwrap();
         let old_mm = prepared.old_mm_id();
         let replacement_mm = prepared.replacement_mm_id();
@@ -1095,13 +1108,13 @@ mod exec_image_verification_tests {
     /// non-zero by construction, and the authority rejects a zero-event commit.
     #[test]
     fn exec_inventory_applies_only_replacement_when_old_mm_is_retained() {
-        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+        let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             1_541,
             carrick_hal::ThreadId::synthetic_for_tests(1_541),
             "exec-inventory-retained-old-mm".to_owned(),
         )
         .unwrap();
-        let (kernel, context) = crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        let (kernel, context) = carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
         let prepared = kernel.prepare_exec(&context, None).unwrap();
         let old_mm = prepared.old_mm_id();
         let replacement_mm = prepared.replacement_mm_id();
@@ -1236,7 +1249,7 @@ where
             }
             let out = kernel.dispatcher.stdout();
             let err = kernel.dispatcher.stderr();
-            crate::exec_helpers::forked_child_die_by_signal(
+            carrick_kernel::exec_helpers::forked_child_die_by_signal(
                 &*kernel.dispatcher.host_signal,
                 sigsegv,
                 &out,
@@ -1271,7 +1284,7 @@ where
     pub(super) fn prepare_execve(
         &mut self,
         kernel: &Kernel,
-        kernel_context: &crate::kernel::KernelContext,
+        kernel_context: &carrick_kernel::kernel::KernelContext,
         engine: &mut E,
         path: String,
         argv: Vec<Vec<u8>>,
@@ -1288,16 +1301,16 @@ where
         }
         crate::probes::execve_argv(&path, &argv);
         if let Some(chain) = kernel.dispatcher.observers() {
-            let p = crate::observe::ProcessInfo::new(kernel_context);
+            let p = carrick_kernel::observe::ProcessInfo::new(kernel_context);
             let argv_slices: Vec<&[u8]> = argv.iter().map(|arg| arg.as_slice()).collect();
             match chain.on_exec(&p, path.as_bytes(), &argv_slices) {
-                crate::observe::SyscallAction::Allow => {}
-                crate::observe::SyscallAction::Deny(errno) => {
+                carrick_kernel::observe::SyscallAction::Allow => {}
+                carrick_kernel::observe::SyscallAction::Deny(errno) => {
                     return self
                         .exec_failed_with_errno(kernel, engine, errno, origin)
                         .map(ExecvePreparation::Complete);
                 }
-                crate::observe::SyscallAction::Kill(_sig) => {
+                carrick_kernel::observe::SyscallAction::Kill(_sig) => {
                     return self
                         .exec_failed_with_errno(
                             kernel,
@@ -1307,7 +1320,7 @@ where
                         )
                         .map(ExecvePreparation::Complete);
                 }
-                crate::observe::SyscallAction::Short(_) => {}
+                carrick_kernel::observe::SyscallAction::Short(_) => {}
             }
         }
         let proc_argv: Vec<String> = argv
@@ -1423,7 +1436,7 @@ where
     async fn drive_execve(
         &mut self,
         kernel: &Kernel,
-        kernel_context: &mut crate::kernel::KernelContext,
+        kernel_context: &mut carrick_kernel::kernel::KernelContext,
         engine: &mut E,
         prepared: PreparedExecve,
     ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
@@ -1712,7 +1725,7 @@ where
         };
         let proc_state_started = std::time::Instant::now();
         if should_update_host_process_title(kernel.hvpatch_process.is_some()) {
-            crate::dispatch::set_host_process_name(cmdline.as_bytes());
+            carrick_kernel::dispatch::set_host_process_name(cmdline.as_bytes());
         }
         kernel.dispatcher.set_executable_identity_with_source(
             path.clone(),
@@ -1752,7 +1765,7 @@ where
         let topology_lock_started = std::time::Instant::now();
         let mut admitted_mm_executor = None;
         let mut mm_authority = if kernel.hvpatch_process.is_some() {
-            let mm_executor: &mut crate::dispatch::MmExecutorParticipation = match self
+            let mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation = match self
                 .guest_execution
                 .as_mut()
                 .filter(|p| p.mm_id() == old_mm_id)
@@ -1771,10 +1784,10 @@ where
                 },
             };
             let coordinator = kernel.dispatcher.mm_mutation_coordinator();
-            let authority = match crate::dispatch::mm_quiesce::acquire_mm_stage1_authority(
+            let authority = match carrick_kernel::dispatch::mm_quiesce::acquire_mm_stage1_authority(
                 mm_executor,
                 self.this_tid,
-                crate::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
+                carrick_kernel::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
             ) {
                 Ok(auth) => auth,
                 Err(error) => {
@@ -1794,8 +1807,8 @@ where
             mm_authority
                 .as_mut()
                 .map(|(authority, coordinator, mm_id)| match authority {
-                    crate::dispatch::mm_quiesce::MmStage1Authority::Sole(sole) => {
-                        crate::dispatch::mm_mutation::from_sole_executor(
+                    carrick_kernel::dispatch::mm_quiesce::MmStage1Authority::Sole(sole) => {
+                        carrick_kernel::dispatch::mm_mutation::from_sole_executor(
                             sole,
                             std::sync::Arc::clone(coordinator),
                             *mm_id,
@@ -1804,8 +1817,8 @@ where
                             carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
                         )
                     }
-                    crate::dispatch::mm_quiesce::MmStage1Authority::Paused(pause) => {
-                        crate::dispatch::mm_mutation::from_pt_pause(pause).with_operation(
+                    carrick_kernel::dispatch::mm_quiesce::MmStage1Authority::Paused(pause) => {
+                        carrick_kernel::dispatch::mm_mutation::from_pt_pause(pause).with_operation(
                             carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
                         )
                     }
@@ -1831,7 +1844,7 @@ where
             .execution_lease
             .lock()
             .as_ref()
-            .map(crate::kernel::objects::ThreadExecutionLease::executor)
+            .map(carrick_kernel::kernel::objects::ThreadExecutionLease::executor)
             .ok_or_else(|| {
                 RuntimeError::Configuration(
                     "exec replacement lost worker-authenticated execution lease".to_owned(),
@@ -1854,7 +1867,7 @@ where
             (Some(process), RuntimePreparedExec::Hvpatch(prepared)) => {
                 let replacement_vma_source = prepared_dispatch_mm_exec.as_ref().map_or_else(
                     || kernel.dispatcher.vma_snapshot_source(),
-                    crate::dispatch::PreparedDispatchMmExec::vma_snapshot_source,
+                    carrick_kernel::dispatch::PreparedDispatchMmExec::vma_snapshot_source,
                 );
                 match process.publish_exec_mm(*prepared, replacement_vma_source) {
                     Ok(published) => RuntimePublishedExec::Hvpatch(published),
@@ -2096,7 +2109,7 @@ where
             Ok(state) => state,
             Err(error) => {
                 committed_context.thread().fail_uninitialized_snapshot(
-                    crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+                    carrick_kernel::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
                 );
                 return Self::exec_failed_past_no_return(
                     kernel,
@@ -2106,7 +2119,7 @@ where
                 .map(Some);
             }
         };
-        let replacement_state = crate::kernel::objects::MigratableTaskState {
+        let replacement_state = carrick_kernel::kernel::objects::MigratableTaskState {
             cpu: replacement_cpu,
             mm: committed_mm,
             asid_generation: committed_asid_generation,
@@ -2267,7 +2280,7 @@ where
                 .map(Some);
             }
         }
-        crate::namespace::pid::mark_self_execed_for(&committed_context);
+        carrick_kernel::namespace::pid::mark_self_execed_for(&committed_context);
         // execve_into rebuilt a fresh vCPU: re-stamp the identity page
         // (zeroed) and TPIDR_EL1 (reset) for the same thread/tid.
         let identity_base = if inventory_failure_injection
@@ -2281,7 +2294,7 @@ where
         self.fail_exec_terminal_context_for_test(
             ExecTerminalContextFailpoint::IdentityPublication,
         )?;
-        if let Err(error) = crate::kernel::identity_page::stamp_identity_page_at(
+        if let Err(error) = carrick_kernel::kernel::identity_page::stamp_identity_page_at(
             engine,
             &kernel.dispatcher,
             &committed_context,
@@ -2481,12 +2494,12 @@ pub(crate) mod tests {
         returns: Arc<Mutex<Vec<i64>>>,
     }
 
-    impl crate::observe::SyscallObserver for CompletionOrderObserver {
+    impl carrick_kernel::observe::SyscallObserver for CompletionOrderObserver {
         fn on_syscall_return(
             &self,
-            _process: &crate::observe::ProcessInfo<'_>,
-            _call: &crate::observe::SyscallInfo<'_>,
-            outcome: &crate::observe::SyscallOutcome,
+            _process: &carrick_kernel::observe::ProcessInfo<'_>,
+            _call: &carrick_kernel::observe::SyscallInfo<'_>,
+            outcome: &carrick_kernel::observe::SyscallOutcome,
         ) {
             self.events.lock().push("observer");
             self.returns.lock().push(outcome.value);
@@ -2498,16 +2511,16 @@ pub(crate) mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
     }
 
-    impl crate::observe::SyscallObserver for CountingEntryObserver {
+    impl carrick_kernel::observe::SyscallObserver for CountingEntryObserver {
         fn on_syscall(
             &self,
-            _process: &crate::observe::ProcessInfo<'_>,
-            _call: &crate::observe::SyscallInfo<'_>,
-        ) -> crate::observe::SyscallAction {
+            _process: &carrick_kernel::observe::ProcessInfo<'_>,
+            _call: &carrick_kernel::observe::SyscallInfo<'_>,
+        ) -> carrick_kernel::observe::SyscallAction {
             self.entries
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.events.lock().push("entry");
-            crate::observe::SyscallAction::Allow
+            carrick_kernel::observe::SyscallAction::Allow
         }
     }
 
@@ -2516,15 +2529,15 @@ pub(crate) mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
     }
 
-    impl crate::observe::SyscallInterceptor for CountingPreflightInterceptor {
+    impl carrick_kernel::observe::SyscallInterceptor for CountingPreflightInterceptor {
         fn intercept(
             &self,
-            _process: &crate::observe::ProcessInfo<'_>,
-            _call: &crate::observe::InterceptedSyscall<'_>,
-        ) -> crate::observe::InterceptAction {
+            _process: &carrick_kernel::observe::ProcessInfo<'_>,
+            _call: &carrick_kernel::observe::InterceptedSyscall<'_>,
+        ) -> carrick_kernel::observe::InterceptAction {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.events.lock().push("interceptor");
-            crate::observe::InterceptAction::Continue
+            carrick_kernel::observe::InterceptAction::Continue
         }
     }
 
@@ -2532,19 +2545,19 @@ pub(crate) mod tests {
     struct ObservedCompletionIdentity {
         pid: i32,
         tid: i32,
-        task: crate::kernel::TaskKey,
-        container: crate::kernel::container::ContainerId,
+        task: carrick_kernel::kernel::TaskKey,
+        container: carrick_kernel::kernel::container::ContainerId,
         value: i64,
     }
 
     struct CompletionIdentityObserver(Arc<Mutex<Vec<ObservedCompletionIdentity>>>);
 
-    impl crate::observe::SyscallObserver for CompletionIdentityObserver {
+    impl carrick_kernel::observe::SyscallObserver for CompletionIdentityObserver {
         fn on_syscall_return(
             &self,
-            process: &crate::observe::ProcessInfo<'_>,
-            _call: &crate::observe::SyscallInfo<'_>,
-            outcome: &crate::observe::SyscallOutcome,
+            process: &carrick_kernel::observe::ProcessInfo<'_>,
+            _call: &carrick_kernel::observe::SyscallInfo<'_>,
+            outcome: &carrick_kernel::observe::SyscallOutcome,
         ) {
             self.0.lock().push(ObservedCompletionIdentity {
                 pid: process.pid(),
@@ -2558,15 +2571,15 @@ pub(crate) mod tests {
 
     struct ExecPreparationCounter(Arc<std::sync::atomic::AtomicUsize>);
 
-    impl crate::observe::SyscallObserver for ExecPreparationCounter {
+    impl carrick_kernel::observe::SyscallObserver for ExecPreparationCounter {
         fn on_exec(
             &self,
-            _process: &crate::observe::ProcessInfo<'_>,
+            _process: &carrick_kernel::observe::ProcessInfo<'_>,
             _exe: &[u8],
             _argv: &[&[u8]],
-        ) -> crate::observe::SyscallAction {
+        ) -> carrick_kernel::observe::SyscallAction {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            crate::observe::SyscallAction::Allow
+            carrick_kernel::observe::SyscallAction::Allow
         }
     }
 
@@ -2575,7 +2588,7 @@ pub(crate) mod tests {
         dispatcher: SyscallDispatcher,
     ) -> (
         Arc<KernelState>,
-        crate::kernel::KernelContext,
+        carrick_kernel::kernel::KernelContext,
         ThreadRuntimeState<CrashCaptureTestEngine>,
     ) {
         let (process, root) = crate::hvpatch::process_context_for_tests(pid);
@@ -2614,7 +2627,7 @@ pub(crate) mod tests {
 
     fn install_typed_guest_completion(
         kernel: &Kernel,
-        context: &crate::kernel::KernelContext,
+        context: &carrick_kernel::kernel::KernelContext,
         state: &mut ThreadRuntimeState<CrashCaptureTestEngine>,
     ) -> PreparedSyscall {
         let prepared = kernel
@@ -2827,11 +2840,14 @@ pub(crate) mod tests {
         assert_eq!(*returns.lock(), vec![child_pid]);
         assert!(job.state.syscall_completion.is_idle());
 
-        let child_id =
-            crate::kernel::TaskId::for_root_bootstrap(child_pid as i32).expect("child task id");
+        let child_id = carrick_kernel::kernel::TaskId::for_root_bootstrap(child_pid as i32)
+            .expect("child task id");
         let child_context = root
             .kernel()
-            .context(child_id, crate::kernel::LinuxTid::for_task_leader(child_id))
+            .context(
+                child_id,
+                carrick_kernel::kernel::LinuxTid::for_task_leader(child_id),
+            )
             .expect("published child context");
         let child_generation = child_context
             .thread()
@@ -3326,9 +3342,10 @@ pub(crate) mod tests {
                 .expect("settle Kernel-owned continuation");
 
             if interrupted {
-                let signal =
-                    crate::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGUSR1)
-                        .expect("SIGUSR1");
+                let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(
+                    crate::linux_abi::LINUX_SIGUSR1,
+                )
+                .expect("SIGUSR1");
                 let mut action = carrick_abi::LinuxSigaction::empty();
                 action.sa_handler = 0x4000;
                 root.signal_authority().install_action(signal, action);
@@ -3338,13 +3355,17 @@ pub(crate) mod tests {
                     Some(root.thread().key()),
                     Some(signal),
                 ) {
-                    crate::kernel::ExactSignalTargetAuthorization::Allowed(ticket) => ticket,
+                    carrick_kernel::kernel::ExactSignalTargetAuthorization::Allowed(ticket) => {
+                        ticket
+                    }
                     other => panic!("authorize exact continuation signal: {other:?}"),
                 };
                 assert_eq!(
                     root.kernel()
                         .post_guest_thread_signal_to_authorized_target(&ticket, signal, None),
-                    crate::kernel::ExactThreadSignalPost::Posted(Some(root.thread().key()))
+                    carrick_kernel::kernel::ExactThreadSignalPost::Posted(Some(
+                        root.thread().key()
+                    ))
                 );
             }
 
@@ -3352,7 +3373,7 @@ pub(crate) mod tests {
             let mut resumed_running = loop {
                 match scheduler.take(&root_executor) {
                     Ok(running) => break running,
-                    Err(crate::kernel::scheduler::RunQueueError::QueueEmpty) => {}
+                    Err(carrick_kernel::kernel::scheduler::RunQueueError::QueueEmpty) => {}
                     Err(error) => panic!("{case} scheduler take: {error}"),
                 }
                 assert!(
@@ -3563,7 +3584,7 @@ pub(crate) mod tests {
                 running = loop {
                     match scheduler.take(&root_executor) {
                         Ok(running) => break running,
-                        Err(crate::kernel::scheduler::RunQueueError::QueueEmpty) => {}
+                        Err(carrick_kernel::kernel::scheduler::RunQueueError::QueueEmpty) => {}
                         Err(error) => panic!("readiness {readiness} scheduler take: {error}"),
                     }
                     assert!(
@@ -3616,7 +3637,7 @@ pub(crate) mod tests {
             running = loop {
                 match scheduler.take(&root_executor) {
                     Ok(running) => break running,
-                    Err(crate::kernel::scheduler::RunQueueError::QueueEmpty) => {}
+                    Err(carrick_kernel::kernel::scheduler::RunQueueError::QueueEmpty) => {}
                     Err(error) => panic!("final timer scheduler take: {error}"),
                 }
                 assert!(Instant::now() < deadline, "final timer did not wake");
@@ -3725,9 +3746,14 @@ pub(crate) mod tests {
 
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let write =
-            crate::dispatch::BlockingWrite::for_tests(fds[1], vec![1, 2, 3, 4], 2, this_tid, true)
-                .expect("partial blocking write");
+        let write = carrick_kernel::dispatch::BlockingWrite::for_tests(
+            fds[1],
+            vec![1, 2, 3, 4],
+            2,
+            this_tid,
+            true,
+        )
+        .expect("partial blocking write");
         assert_eq!(unsafe { libc::close(fds[0]) }, 0);
         assert_eq!(unsafe { libc::close(fds[1]) }, 0);
 
@@ -3795,7 +3821,7 @@ pub(crate) mod tests {
         running = loop {
             match scheduler.take(&root_executor) {
                 Ok(running) => break running,
-                Err(crate::kernel::scheduler::RunQueueError::QueueEmpty) => {}
+                Err(carrick_kernel::kernel::scheduler::RunQueueError::QueueEmpty) => {}
                 Err(error) => panic!("blocking-write scheduler take: {error}"),
             }
             assert!(
@@ -4119,9 +4145,9 @@ pub(crate) mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn external_exec_work_for_test(
         path: String,
-        context: &crate::kernel::KernelContext,
-    ) -> crate::kernel::control::ExecWork {
-        use crate::kernel::control::{
+        context: &carrick_kernel::kernel::KernelContext,
+    ) -> carrick_kernel::kernel::control::ExecWork {
+        use carrick_kernel::kernel::control::{
             CarrierExecAdmission, ControlNonce, ExecAttach, ExecCapability, ExecRequest,
             ExecRuntime, ExecStatus,
         };
@@ -4205,7 +4231,7 @@ pub(crate) mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn enable_exec_support_for_test(
         engine: &mut CrashCaptureTestEngine,
-        context: &crate::kernel::KernelContext,
+        context: &carrick_kernel::kernel::KernelContext,
         owner_generation: u64,
     ) {
         engine.exec_support = true;
@@ -4221,7 +4247,7 @@ pub(crate) mod tests {
     struct ImmediateProductionExecFailureCase {
         _executable: tempfile::NamedTempFile,
         kernel: Arc<KernelState>,
-        context: crate::kernel::KernelContext,
+        context: carrick_kernel::kernel::KernelContext,
         job: ProductionHvpatchLoopJob<CrashCaptureTestEngine>,
         engine: CrashCaptureTestEngine,
         preparations: Arc<std::sync::atomic::AtomicUsize>,
@@ -4384,7 +4410,7 @@ pub(crate) mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     struct PendingExecDrainTestCase {
         kernel: Kernel,
-        context: crate::kernel::KernelContext,
+        context: carrick_kernel::kernel::KernelContext,
         job: ProductionHvpatchLoopJob<CrashCaptureTestEngine>,
         engine: CrashCaptureTestEngine,
         sibling: HvpatchExternalTerminalSettlement,
@@ -4480,7 +4506,9 @@ pub(crate) mod tests {
         };
         assert!(matches!(
             first,
-            executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::ChildState)
+            executor::ExecutorExit::Blocked(
+                carrick_kernel::kernel::objects::BlockedReason::ChildState
+            )
         ));
         assert!(matches!(
             job.phase,
@@ -5539,7 +5567,9 @@ pub(crate) mod tests {
             .expect("guest exec must retain its prepared owner while drain is pending");
         assert!(matches!(
             first,
-            executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::ChildState)
+            executor::ExecutorExit::Blocked(
+                carrick_kernel::kernel::objects::BlockedReason::ChildState
+            )
         ));
         assert!(matches!(
             job.phase,
@@ -5622,7 +5652,9 @@ pub(crate) mod tests {
             .expect("internal exec must retain its prepared owner while drain is pending");
         assert!(matches!(
             first,
-            executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::ChildState)
+            executor::ExecutorExit::Blocked(
+                carrick_kernel::kernel::objects::BlockedReason::ChildState
+            )
         ));
         assert!(matches!(
             job.phase,
@@ -5729,7 +5761,7 @@ pub(crate) mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn typed_completion_ownership_immediate_internal_exec_suffix_error_consumes_origin() {
-        use crate::kernel::control::{
+        use carrick_kernel::kernel::control::{
             CarrierExecAdmission, ControlNonce, ExecAttach, ExecCapability, ExecRequest,
             ExecRuntime, ExecStatus,
         };
@@ -5968,7 +6000,7 @@ pub(crate) mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn typed_completion_ownership_external_exec_bootstrap_is_tokenless_and_nonpublishing() {
-        use crate::kernel::control::{
+        use carrick_kernel::kernel::control::{
             CarrierExecAdmission, ControlNonce, ExecAttach, ExecCapability, ExecRequest,
             ExecRuntime, ExecStatus,
         };
@@ -6077,11 +6109,14 @@ pub(crate) mod tests {
         };
         assert_eq!(submitter.join().expect("exec submitter"), Ok(capability));
 
-        let child_id =
-            crate::kernel::TaskId::for_root_bootstrap(child_pid as i32).expect("child task id");
+        let child_id = carrick_kernel::kernel::TaskId::for_root_bootstrap(child_pid as i32)
+            .expect("child task id");
         let child_context = root
             .kernel()
-            .context(child_id, crate::kernel::LinuxTid::for_task_leader(child_id))
+            .context(
+                child_id,
+                carrick_kernel::kernel::LinuxTid::for_task_leader(child_id),
+            )
             .expect("published child context");
         let child_generation = child_context
             .thread()

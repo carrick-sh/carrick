@@ -60,7 +60,7 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(crate) fn dispatch_prepared(
+    pub fn dispatch_prepared(
         &mut self,
         kernel: &crate::kernel::KernelContext,
         syscall: PreparedSyscall,
@@ -120,7 +120,7 @@ impl SyscallDispatcher {
     }
 
     /// Run a non-threaded completion under a fresh exact-MM census admission.
-    pub(crate) fn with_mm_executor_mutation<T>(
+    pub fn with_mm_executor_mutation<T>(
         &mut self,
         run: impl FnOnce(&mut Self, &mut mm_mutation::MmMutationGuard<'_>) -> T,
     ) -> Result<T, DispatchError> {
@@ -191,7 +191,7 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(crate) fn dispatch_threaded_prepared_with_mm_executor_and_lease(
+    pub fn dispatch_threaded_prepared_with_mm_executor_and_lease(
         &self,
         kernel: &crate::kernel::KernelContext,
         syscall: PreparedSyscall,
@@ -317,7 +317,7 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(crate) fn dispatch_threaded_prepared_mutation_with_lease(
+    pub fn dispatch_threaded_prepared_mutation_with_lease(
         &self,
         kernel: &crate::kernel::KernelContext,
         syscall: PreparedSyscall,

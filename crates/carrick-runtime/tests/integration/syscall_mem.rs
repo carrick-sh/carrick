@@ -9,7 +9,7 @@ mod support;
 use support::*;
 
 use carrick_guest_mem::protections::MemoryProtections;
-use carrick_runtime::dispatch::MemoryError;
+use carrick_kernel::dispatch::MemoryError;
 
 struct ProtectedAddressSpace {
     inner: AddressSpace,
@@ -384,7 +384,7 @@ fn dispatcher_mmap_uses_configured_16k_linux_page_size() {
     .unwrap();
     let reporter = CompatReporter::default();
     let mut dispatcher =
-        SyscallDispatcher::with_page_geometry(carrick_runtime::page_profile::PageGeometry {
+        SyscallDispatcher::with_page_geometry(carrick_kernel::page_profile::PageGeometry {
             host_page_size: 16_384,
             linux_page_size: 16_384,
             native_profile: Some(carrick_spec::NativePageProfile::Native16k),
@@ -436,7 +436,7 @@ fn mprotect_rounds_length_to_configured_16k_linux_page_size() {
     );
     let reporter = CompatReporter::default();
     let mut dispatcher =
-        SyscallDispatcher::with_page_geometry(carrick_runtime::page_profile::PageGeometry {
+        SyscallDispatcher::with_page_geometry(carrick_kernel::page_profile::PageGeometry {
             host_page_size: 16_384,
             linux_page_size: 16_384,
             native_profile: Some(carrick_spec::NativePageProfile::Native16k),
@@ -502,7 +502,7 @@ fn mremap_rounds_old_size_to_configured_16k_linux_page_size_when_moving() {
     .unwrap();
     let reporter = CompatReporter::default();
     let mut dispatcher =
-        SyscallDispatcher::with_page_geometry(carrick_runtime::page_profile::PageGeometry {
+        SyscallDispatcher::with_page_geometry(carrick_kernel::page_profile::PageGeometry {
             host_page_size: 16_384,
             linux_page_size: 16_384,
             native_profile: Some(carrick_spec::NativePageProfile::Native16k),

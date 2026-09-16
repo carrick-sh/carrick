@@ -13,7 +13,7 @@ pub(in crate::dispatch) struct DnotifyRegistration {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct LegacyAioContextId(u64);
+pub struct LegacyAioContextId(u64);
 
 impl LegacyAioContextId {
     pub(in crate::dispatch) fn from_guest(raw: u64) -> Option<Self> {
@@ -30,7 +30,7 @@ impl LegacyAioContextId {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct SplicePushback {
+pub struct SplicePushback {
     chunks: VecDeque<SplicePushbackChunk>,
     len: usize,
 }
@@ -199,14 +199,14 @@ pub(in crate::dispatch) struct FsState {
 /// fork and archive endpoint keeps an `Arc` alias while it can still perform a
 /// lookup, and retirement succeeds only after all of those aliases have been
 /// joined and dropped. This preserves the lock-free `entries` read path.
-pub(crate) struct MountRetirement {
+pub struct MountRetirement {
     container: crate::kernel::ContainerId,
     mounts: Option<std::sync::Arc<carrick_vfs::VfsMounts>>,
     prepared: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub(crate) enum MountRetirementError {
+pub enum MountRetirementError {
     #[error("mount retirement belongs to container {actual:?}, not {expected:?}")]
     WrongContainer {
         expected: crate::kernel::ContainerId,
@@ -233,14 +233,14 @@ impl MountRetirement {
         }
     }
 
-    pub(crate) fn mount_count(&self) -> usize {
+    pub fn mount_count(&self) -> usize {
         self.mounts.as_ref().map_or(0, |mounts| mounts.len())
     }
 
     /// Prove that the run loop, every forked dispatcher and archive control
     /// endpoint have relinquished this exact table. Once this succeeds no
     /// actor remains that could create a new `Arc` alias.
-    pub(crate) fn prepare(&mut self) -> Result<(), MountRetirementError> {
+    pub fn prepare(&mut self) -> Result<(), MountRetirementError> {
         let mounts = self
             .mounts
             .as_ref()
@@ -256,7 +256,7 @@ impl MountRetirement {
         Ok(())
     }
 
-    pub(crate) fn prepare_for(
+    pub fn prepare_for(
         &mut self,
         container: crate::kernel::ContainerId,
     ) -> Result<(), MountRetirementError> {
@@ -273,7 +273,7 @@ impl MountRetirement {
     /// `prepare` made the `try_unwrap` invariant stable; failure here means an
     /// impossible post-quiesce ownership change, so continuing would fabricate
     /// cleanup evidence.
-    pub(crate) fn clear(&mut self) -> usize {
+    pub fn clear(&mut self) -> usize {
         if !self.prepared {
             carrick_fatal!(
                 "dispatch::mount_retirement",

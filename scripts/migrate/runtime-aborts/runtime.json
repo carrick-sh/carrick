@@ -1009,7 +1009,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "function": "<ProcessContext as crate::kernel::CarrierProcess>::bind_mm_mutation_authority",
+      "function": "<ProcessContext as carrick_kernel::kernel::CarrierProcess>::bind_mm_mutation_authority",
       "ordinal_in_function": 1,
       "fingerprint": "bd3edc293bbe7bd4ab626eebcbf8cf0906183d6b2a3392e8120c75de827b88b5",
       "verdict": "carrier_fault",

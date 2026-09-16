@@ -252,7 +252,7 @@ bitflags::bitflags! {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ShmPermMode {
+pub struct ShmPermMode {
     bits: u32,
 }
 
@@ -309,7 +309,7 @@ impl ShmPermMode {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ShmSegment {
+pub struct ShmSegment {
     pub path: PathBuf,
     /// Generation-exact attachment counter receipt. The public key path is
     /// reusable immediately after `IPC_RMID`, while this inode-qualified path
@@ -412,14 +412,14 @@ impl std::fmt::Debug for SemSet {
 /// Result of atomically subscribing a parked semop to the generation scanned
 /// when it decided to block.  `Ready` closes the producer-before-enrollment
 /// gap without a polling sleep.
-pub(crate) enum SemopChangeEnrollment {
+pub enum SemopChangeEnrollment {
     Ready,
     Subscribed(SemopChangeSubscription),
 }
 
 type SemopChangeListeners = BTreeMap<u64, Arc<dyn Fn() + Send + Sync>>;
 
-pub(crate) struct SemopChangeSubscription {
+pub struct SemopChangeSubscription {
     listeners: std::sync::Weak<Mutex<SemopChangeListeners>>,
     id: u64,
 }
@@ -726,7 +726,7 @@ impl SemSet {
     }
 }
 
-pub(crate) struct HostAliasShmatCommit {
+pub struct HostAliasShmatCommit {
     pub(super) va: u64,
     pub(super) atime: u64,
     pub(super) lpid: i32,
@@ -738,7 +738,7 @@ pub(crate) struct HostAliasShmatCommit {
 /// this reservation back, so sibling `IPC_RMID` can never erase the metadata
 /// required by a later successful alias install.
 #[derive(Debug)]
-pub(crate) struct PendingShmat {
+pub struct PendingShmat {
     namespace: std::sync::Arc<SysvIpcNamespace>,
     shmid: i32,
     path: PathBuf,
@@ -1500,15 +1500,15 @@ impl SyscallDispatcher {
     /// Clear the host-fd cache before an executor pthread changes task
     /// identity. Wait-word mappings and blocked queue ids are owned by
     /// `SysvWaitState` inside the Kernel continuation and never live in TLS.
-    pub(crate) fn reset_sysv_executor_boundary_state() -> bool {
+    pub fn reset_sysv_executor_boundary_state() -> bool {
         MSG_QUEUE_FD_CACHE.with(|cache| {
             cache.borrow_mut().entries.clear();
         });
         MSG_QUEUE_FD_CACHE.with(|cache| cache.borrow().entries.is_empty())
     }
 
-    #[cfg(test)]
-    pub(crate) fn dirty_sysv_executor_boundary_state_for_test() -> (i32, i32) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn dirty_sysv_executor_boundary_state_for_test() -> (i32, i32) {
         fn pipe_read_end() -> i32 {
             let mut fds = [-1; 2];
             assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -1542,8 +1542,8 @@ impl SyscallDispatcher {
         (cached_fd, wait_word_fd)
     }
 
-    #[cfg(test)]
-    pub(crate) fn sysv_executor_boundary_state_is_clear_for_test() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn sysv_executor_boundary_state_is_clear_for_test() -> bool {
         MSG_QUEUE_FD_CACHE.with(|cache| cache.borrow().entries.is_empty())
     }
 }
@@ -2003,7 +2003,7 @@ impl SysvWaitState {
         self.word.fd.as_raw_fd()
     }
 
-    pub(crate) fn completion_after_wake(&self) -> Option<DispatchOutcome> {
+    pub fn completion_after_wake(&self) -> Option<DispatchOutcome> {
         match msg_queue_identity(&self.queue_path) {
             Ok(identity) if identity == self.word.queue_identity => None,
             Ok(_) | Err(_) => Some(DispatchOutcome::errno(crate::linux_abi::LINUX_EIDRM)),
@@ -3437,7 +3437,7 @@ impl SyscallDispatcher {
         self.ipc_view().note_sysv_remap_file_pages(addr, end)
     }
 
-    pub(crate) fn cleanup_sysv_shm_attachments_on_process_exit(&self) {
+    pub fn cleanup_sysv_shm_attachments_on_process_exit(&self) {
         self.ipc_view()
             .cleanup_sysv_shm_attachments_on_process_exit();
     }
@@ -3450,11 +3450,11 @@ impl SyscallDispatcher {
         self.ipc_view().commit_sysv_fork_inheritance();
     }
 
-    pub(crate) fn cleanup_sysv_ipc_on_process_exit(&self) {
+    pub fn cleanup_sysv_ipc_on_process_exit(&self) {
         self.ipc_view().cleanup_sysv_ipc_on_process_exit();
     }
 
-    pub(crate) fn cleanup_sysv_ipc_on_run_exit(&self) {
+    pub fn cleanup_sysv_ipc_on_run_exit(&self) {
         self.ipc_view().cleanup_sysv_ipc_on_run_exit();
     }
 
@@ -4120,7 +4120,7 @@ impl PartialEq for BlockingSemop {
 
 impl Eq for BlockingSemop {}
 
-pub(crate) enum BlockingSemopStep {
+pub enum BlockingSemopStep {
     Done(DispatchOutcome),
     Wait(BlockingSemop),
 }
@@ -4263,13 +4263,13 @@ impl BlockingSemop {
         BlockingSemopStep::Done(DispatchOutcome::Returned { value: 0 })
     }
 
-    pub(crate) fn complete(self) -> BlockingSemopStep {
+    pub fn complete(self) -> BlockingSemopStep {
         self.try_complete()
     }
 }
 
-#[cfg(test)]
-pub(crate) fn blocking_semop_for_continuation_test() -> BlockingSemop {
+#[cfg(any(test, feature = "test-support"))]
+pub fn blocking_semop_for_continuation_test() -> BlockingSemop {
     let set = SemSet {
         key: LINUX_IPC_PRIVATE,
         scan_index: SemScanIndex(0),
@@ -5236,7 +5236,8 @@ mod ipc_set_tests {
     #[test]
     fn semctl_getpid_reports_namespace_visible_operator() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::kernel::TestCarrierProcess::new(83_101);
+        let (process, _) =
+            crate::kernel::TestCarrierProcess::new(83_101).expect("test carrier process");
         dispatcher.bind_hvpatch_process(Arc::new(process));
         let parent = dispatcher.capture_one_task_context().expect("root context");
         let arena = Box::leak(Box::new(

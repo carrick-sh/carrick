@@ -4,10 +4,10 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::kernel::LinuxTid;
-use crate::run_result::{RunResult, RuntimeError};
 use carrick_fatal::carrick_fatal;
 use carrick_hal::ThreadId;
+use carrick_kernel::kernel::LinuxTid;
+use carrick_kernel::run_result::{RunResult, RuntimeError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CloneAdmissionClose {
@@ -658,9 +658,9 @@ pub(crate) enum VcpuLoopOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch::SyscallDispatcher;
     use crate::vcpu_loop::KernelState;
     use carrick_hal::{SignalPumpControl, ThreadId};
+    use carrick_kernel::dispatch::SyscallDispatcher;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct EndpointTestSignalPump;
@@ -687,14 +687,14 @@ mod tests {
         }
     }
 
-    fn alias_context(pid: i32) -> crate::kernel::KernelContext {
-        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+    fn alias_context(pid: i32) -> carrick_kernel::kernel::KernelContext {
+        let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             pid,
             ThreadId::synthetic_for_tests(pid),
             "alias-inventory".to_owned(),
         )
         .expect("root bootstrap");
-        crate::kernel::Kernel::bootstrap_root(bootstrap)
+        carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap)
             .expect("root kernel")
             .1
     }

@@ -12,7 +12,7 @@
 //! authenticated requests to the carrier's in-kernel control endpoint — they
 //! never talk to a daemon because there isn't one.
 //!
-//! The registry lives in `carrick_runtime::container`: a directory per
+//! The registry lives in `carrick_kernel::container`: a directory per
 //! container holding a serialized [`ContainerState`] (id, name, image, command,
 //! status, compatibility pid fields that both name the carrier, exit code, and
 //! the full [`RunConfig`] needed to relaunch) and an `output.log`. Liveness is
@@ -85,11 +85,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
-use carrick_runtime::container::{
+use carrick_kernel::container::{
     self, CarrierControlState, CarrierTerminalReceipt, ContainerState, ContainerStatus, RunConfig,
     StopSignalAbi,
 };
-use carrick_runtime::kernel::control::{ControlOperation, ControlOutcome};
+use carrick_kernel::kernel::control::{ControlOperation, ControlOutcome};
 
 use crate::runtime_util::{human_age, human_size, truncate_str};
 
@@ -540,10 +540,10 @@ fn default_network_attachments(
     bridge: Option<&str>,
     aliases: &[String],
     ipv4_address: Option<&str>,
-) -> Vec<carrick_runtime::container::NetworkAttachment> {
+) -> Vec<carrick_kernel::container::NetworkAttachment> {
     match network {
         carrick_spec::NetworkMode::Bridge => {
-            vec![carrick_runtime::container::NetworkAttachment {
+            vec![carrick_kernel::container::NetworkAttachment {
                 name: bridge.unwrap_or("bridge").to_string(),
                 aliases: aliases.to_vec(),
                 links: Vec::new(),
@@ -631,7 +631,7 @@ fn run_detached_carrier(
             std::process::exit(1);
         }
     };
-    let launch = match carrick_runtime::kernel::LaunchContext::from_process_env() {
+    let launch = match carrick_kernel::kernel::LaunchContext::from_process_env() {
         Ok(launch) => launch,
         Err(_) => {
             container::mark_exited(id, 1);
@@ -675,7 +675,7 @@ pub(crate) struct InitialContainerMetadata {
     pub api_auto_remove: bool,
     pub api_network_mode: Option<String>,
     pub network_container: Option<String>,
-    pub network_attachments: Vec<carrick_runtime::container::NetworkAttachment>,
+    pub network_attachments: Vec<carrick_kernel::container::NetworkAttachment>,
 }
 
 fn apply_initial_metadata(state: &mut ContainerState, metadata: InitialContainerMetadata) {
@@ -852,7 +852,7 @@ fn bridge_network_attachments(
 }
 
 fn attachment_ipv4_address(
-    attachment: &carrick_runtime::container::NetworkAttachment,
+    attachment: &carrick_kernel::container::NetworkAttachment,
     container_name: Option<&str>,
 ) -> String {
     if let Some(ipv4) = attachment
@@ -974,12 +974,12 @@ fn await_detached_ready(id: &str, child_pid: libc::pid_t) -> anyhow::Result<()> 
         if let Ok(state) = ContainerState::load(id) {
             if let Some(control) = published_control_for_child(&state, child_pid)
                 && matches!(
-                    carrick_runtime::kernel::control::send(
+                    carrick_kernel::kernel::control::send(
                         id,
                         control,
-                        carrick_runtime::kernel::control::ControlOperation::Status,
+                        carrick_kernel::kernel::control::ControlOperation::Status,
                     ),
-                    Ok(carrick_runtime::kernel::control::ControlOutcome::Alive)
+                    Ok(carrick_kernel::kernel::control::ControlOutcome::Alive)
                 )
             {
                 return Ok(());
@@ -1061,7 +1061,7 @@ fn exact_clean_terminal_receipt_for_child(
 fn published_control_for_child(
     state: &ContainerState,
     child_pid: libc::pid_t,
-) -> Option<&carrick_runtime::container::CarrierControlState> {
+) -> Option<&carrick_kernel::container::CarrierControlState> {
     (state.status == ContainerStatus::Running && state.init_pid == child_pid)
         .then_some(state.control.as_ref())
         .flatten()
@@ -1597,7 +1597,7 @@ fn send_logical_signal(
     linux_signal: i32,
     allow_missing_receipt: bool,
 ) -> anyhow::Result<()> {
-    let outcome = match carrick_runtime::kernel::control::send(
+    let outcome = match carrick_kernel::kernel::control::send(
         id,
         control,
         ControlOperation::Signal { linux_signal },
@@ -1731,7 +1731,7 @@ fn wait_for_terminal_receipt(
                 container::short_id(id)
             );
         }
-        match carrick_runtime::kernel::control::send(id, expected, ControlOperation::Status) {
+        match carrick_kernel::kernel::control::send(id, expected, ControlOperation::Status) {
             Ok(ControlOutcome::Alive) => {}
             Ok(ControlOutcome::NotRunning) | Ok(ControlOutcome::TearingDown) => {
                 // The kernel task has stopped (or the carrier is between
@@ -1907,9 +1907,9 @@ pub(crate) fn exec(args: ExecArgs<'_>) -> anyhow::Result<()> {
 pub(crate) fn run_control_exec_capture(
     id: &str,
     state: &ContainerState,
-    request: carrick_runtime::kernel::control::ExecRequest,
-) -> anyhow::Result<carrick_runtime::kernel::control::ExecResult> {
-    use carrick_runtime::kernel::control::{ControlOperation, ControlOutcome};
+    request: carrick_kernel::kernel::control::ExecRequest,
+) -> anyhow::Result<carrick_kernel::kernel::control::ExecResult> {
+    use carrick_kernel::kernel::control::{ControlOperation, ControlOutcome};
 
     let control = state.control.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -1917,7 +1917,7 @@ pub(crate) fn run_control_exec_capture(
             container::short_id(id)
         )
     })?;
-    let capability = match carrick_runtime::kernel::control::send(
+    let capability = match carrick_kernel::kernel::control::send(
         id,
         control,
         ControlOperation::Exec { request },
@@ -1938,7 +1938,7 @@ pub(crate) fn run_control_exec_capture(
         other => bail!("carrier returned invalid exec admission outcome {other:?}"),
     };
     loop {
-        match carrick_runtime::kernel::control::send(
+        match carrick_kernel::kernel::control::send(
             id,
             control,
             ControlOperation::ExecWait { capability },
@@ -1967,14 +1967,14 @@ pub(crate) fn build_control_exec_request(
     user: Option<String>,
     workdir: Option<String>,
     env: Vec<String>,
-) -> anyhow::Result<carrick_runtime::kernel::control::ExecRequest> {
+) -> anyhow::Result<carrick_kernel::kernel::control::ExecRequest> {
     let exec_env = env
         .into_iter()
         .map(|entry| {
             let (key, value) = entry
                 .split_once('=')
                 .ok_or_else(|| anyhow::anyhow!("exec environment must be KEY=VALUE: {entry}"))?;
-            Ok(carrick_runtime::kernel::control::ExecEnvVar {
+            Ok(carrick_kernel::kernel::control::ExecEnvVar {
                 key: key.to_owned(),
                 value: value.to_owned(),
             })
@@ -1982,26 +1982,26 @@ pub(crate) fn build_control_exec_request(
         .collect::<anyhow::Result<Vec<_>>>()?;
     let effective_user = user.or_else(|| state.config.user.clone());
     let exec_user = match effective_user.as_deref() {
-        None | Some("") => Some(carrick_runtime::kernel::control::ExecUser {
+        None | Some("") => Some(carrick_kernel::kernel::control::ExecUser {
             uid: 0,
             gid: 0,
             supplementary_gids: Vec::new(),
         }),
         Some(spec) => Some(parse_exec_numeric_user(spec)?),
     };
-    Ok(carrick_runtime::kernel::control::ExecRequest {
+    Ok(carrick_kernel::kernel::control::ExecRequest {
         argv: command,
         env: exec_env,
         workdir: workdir.or_else(|| state.config.workdir.clone()),
         user: exec_user,
         tty: false,
-        attach: carrick_runtime::kernel::control::ExecAttach::Capture,
+        attach: carrick_kernel::kernel::control::ExecAttach::Capture,
     })
 }
 
 fn parse_exec_numeric_user(
     spec: &str,
-) -> anyhow::Result<carrick_runtime::kernel::control::ExecUser> {
+) -> anyhow::Result<carrick_kernel::kernel::control::ExecUser> {
     let (uid, gid) = match spec.split_once(':') {
         Some((uid, gid)) => (
             uid.parse::<u32>()
@@ -2015,14 +2015,14 @@ fn parse_exec_numeric_user(
             0,
         ),
     };
-    Ok(carrick_runtime::kernel::control::ExecUser {
+    Ok(carrick_kernel::kernel::control::ExecUser {
         uid,
         gid,
         supplementary_gids: Vec::new(),
     })
 }
 
-fn emit_exec_result(result: &carrick_runtime::kernel::control::ExecResult) -> anyhow::Result<()> {
+fn emit_exec_result(result: &carrick_kernel::kernel::control::ExecResult) -> anyhow::Result<()> {
     use std::io::Write as _;
 
     std::io::stdout().write_all(&result.stdout)?;
@@ -2246,8 +2246,8 @@ impl DockerEndpointView {
     }
 }
 
-impl From<&carrick_runtime::container::NetworkAttachment> for DockerEndpointView {
-    fn from(attachment: &carrick_runtime::container::NetworkAttachment) -> Self {
+impl From<&carrick_kernel::container::NetworkAttachment> for DockerEndpointView {
+    fn from(attachment: &carrick_kernel::container::NetworkAttachment) -> Self {
         Self {
             aliases: Some(attachment.aliases.clone()),
             links: Some(attachment.links.clone()),
@@ -2662,7 +2662,7 @@ mod tests {
         assert!(!request.tty);
         assert_eq!(
             request.attach,
-            carrick_runtime::kernel::control::ExecAttach::Capture,
+            carrick_kernel::kernel::control::ExecAttach::Capture,
         );
         let defaults =
             build_control_exec_request(&state, vec!["true".to_owned()], None, None, Vec::new())
@@ -2693,10 +2693,10 @@ mod tests {
     fn detached_readiness_requires_running_control_from_the_exact_child() {
         let mut state = sample_state();
         state.status = ContainerStatus::Created;
-        state.control = Some(carrick_runtime::container::CarrierControlState {
-            schema: carrick_runtime::kernel::control::CARRIER_CONTROL_STATE_SCHEMA.to_owned(),
-            owner_nonce: carrick_runtime::kernel::control::ControlNonce::fresh().expect("nonce"),
-            init: carrick_runtime::kernel::control::ControlTaskKey { pid: 1, serial: 1 },
+        state.control = Some(carrick_kernel::container::CarrierControlState {
+            schema: carrick_kernel::kernel::control::CARRIER_CONTROL_STATE_SCHEMA.to_owned(),
+            owner_nonce: carrick_kernel::kernel::control::ControlNonce::fresh().expect("nonce"),
+            init: carrick_kernel::kernel::control::ControlTaskKey { pid: 1, serial: 1 },
         });
         assert!(published_control_for_child(&state, 6).is_none());
         state.status = ContainerStatus::Running;
@@ -2710,13 +2710,13 @@ mod tests {
     fn detached_readiness_accepts_only_an_exact_clean_terminal_receipt() {
         let mut state = sample_state();
         state.exit_code = Some(0);
-        let control = carrick_runtime::container::CarrierControlState {
-            schema: carrick_runtime::kernel::control::CARRIER_CONTROL_STATE_SCHEMA.to_owned(),
-            owner_nonce: carrick_runtime::kernel::control::ControlNonce::fresh().expect("nonce"),
-            init: carrick_runtime::kernel::control::ControlTaskKey { pid: 1, serial: 7 },
+        let control = carrick_kernel::container::CarrierControlState {
+            schema: carrick_kernel::kernel::control::CARRIER_CONTROL_STATE_SCHEMA.to_owned(),
+            owner_nonce: carrick_kernel::kernel::control::ControlNonce::fresh().expect("nonce"),
+            init: carrick_kernel::kernel::control::ControlTaskKey { pid: 1, serial: 7 },
         };
         state.terminal_control = Some(control.clone());
-        let receipt = carrick_runtime::container::CarrierTerminalReceipt {
+        let receipt = carrick_kernel::container::CarrierTerminalReceipt {
             control: control.clone(),
             exit_code: 0,
         };
@@ -2746,9 +2746,9 @@ mod tests {
         assert!(!exact_clean_terminal_receipt_for_child(
             &nonzero, 6, &receipt
         ));
-        let mismatched = carrick_runtime::container::CarrierTerminalReceipt {
-            control: carrick_runtime::container::CarrierControlState {
-                owner_nonce: carrick_runtime::kernel::control::ControlNonce::fresh()
+        let mismatched = carrick_kernel::container::CarrierTerminalReceipt {
+            control: carrick_kernel::container::CarrierControlState {
+                owner_nonce: carrick_kernel::kernel::control::ControlNonce::fresh()
                     .expect("different nonce"),
                 ..control
             },
@@ -2819,7 +2819,7 @@ mod tests {
             api_auto_remove: true,
             api_network_mode: Some("bridge-a".to_owned()),
             network_container: Some("peer-id".to_owned()),
-            network_attachments: vec![carrick_runtime::container::NetworkAttachment {
+            network_attachments: vec![carrick_kernel::container::NetworkAttachment {
                 name: "bridge-a".to_owned(),
                 aliases: vec!["alias-a".to_owned()],
                 links: Vec::new(),
@@ -2921,7 +2921,7 @@ mod tests {
     fn rebuild_request_preserves_custom_bridge_network_identity() {
         let mut state = sample_state();
         state.config.network = carrick_spec::NetworkMode::Bridge;
-        state.config.network_attachments = vec![carrick_runtime::container::NetworkAttachment {
+        state.config.network_attachments = vec![carrick_kernel::container::NetworkAttachment {
             name: "compose_default".to_string(),
             aliases: vec!["api".to_string()],
             links: Vec::new(),
@@ -2967,7 +2967,7 @@ mod tests {
         state.config.network = carrick_spec::NetworkMode::Bridge;
         state.config.network_aliases = vec!["api".to_string(), "private-api".to_string()];
         state.config.network_attachments = vec![
-            carrick_runtime::container::NetworkAttachment {
+            carrick_kernel::container::NetworkAttachment {
                 name: "compose_default".to_string(),
                 aliases: vec!["api".to_string()],
                 links: Vec::new(),
@@ -2978,7 +2978,7 @@ mod tests {
                 link_local_ips: Vec::new(),
                 driver_opts: std::collections::HashMap::new(),
             },
-            carrick_runtime::container::NetworkAttachment {
+            carrick_kernel::container::NetworkAttachment {
                 name: "compose_private".to_string(),
                 aliases: vec!["private-api".to_string()],
                 links: Vec::new(),
@@ -3043,7 +3043,7 @@ mod tests {
         state.name = Some("web".to_string());
         state.config.network = carrick_spec::NetworkMode::Bridge;
         state.config.network_attachments = vec![
-            carrick_runtime::container::NetworkAttachment {
+            carrick_kernel::container::NetworkAttachment {
                 name: "compose_backend".to_string(),
                 aliases: vec!["web".to_string(), "api-backend".to_string()],
                 links: Vec::new(),
@@ -3054,7 +3054,7 @@ mod tests {
                 link_local_ips: Vec::new(),
                 driver_opts: std::collections::HashMap::new(),
             },
-            carrick_runtime::container::NetworkAttachment {
+            carrick_kernel::container::NetworkAttachment {
                 name: "compose_frontend".to_string(),
                 aliases: vec!["web".to_string(), "api-frontend".to_string()],
                 links: Vec::new(),
@@ -3100,7 +3100,7 @@ mod tests {
         let mut config = sample_state().config;
         config.network = carrick_spec::NetworkMode::Bridge;
         config.network_attachments = vec![
-            carrick_runtime::container::NetworkAttachment {
+            carrick_kernel::container::NetworkAttachment {
                 name: "compose_backend".to_string(),
                 aliases: vec!["web".to_string(), "app".to_string()],
                 links: Vec::new(),
@@ -3111,7 +3111,7 @@ mod tests {
                 link_local_ips: Vec::new(),
                 driver_opts: std::collections::HashMap::new(),
             },
-            carrick_runtime::container::NetworkAttachment {
+            carrick_kernel::container::NetworkAttachment {
                 name: "compose_frontend".to_string(),
                 aliases: vec!["web".to_string(), "api".to_string()],
                 links: Vec::new(),

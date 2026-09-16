@@ -10,7 +10,7 @@ const MAX_ARCHIVE_ENTRIES: usize = 4_096;
 pub(crate) const MAX_ARCHIVE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ArchiveFsError {
+pub enum ArchiveFsError {
     #[error("archive destination path is invalid")]
     InvalidDestination,
     #[error("archive path does not exist")]
@@ -47,13 +47,13 @@ struct PlannedEntry {
 }
 
 #[derive(Clone)]
-pub(crate) struct ArchiveFsAuthority {
+pub struct ArchiveFsAuthority {
     mounts: Arc<carrick_vfs::VfsMounts>,
     root: Arc<carrick_vfs::RootFsVfs>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ArchiveEntryMetadata {
+pub struct ArchiveEntryMetadata {
     pub name: String,
     pub size: u64,
     pub mode: u32,
@@ -63,7 +63,7 @@ pub(crate) struct ArchiveEntryMetadata {
 }
 
 impl SyscallDispatcher {
-    pub(crate) fn archive_authority(&self) -> ArchiveFsAuthority {
+    pub fn archive_authority(&self) -> ArchiveFsAuthority {
         ArchiveFsAuthority {
             mounts: Arc::clone(&self.fs.vfs_mounts),
             root: Arc::clone(&self.fs.rootfs_vfs),

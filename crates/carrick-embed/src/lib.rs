@@ -104,17 +104,16 @@ pub use carrick_hal::{
     SchedulingPolicy, TaskPlacement,
 };
 pub use carrick_image::{ImageStore, PullPolicy};
-pub use carrick_runtime::compat::CompatReport;
-pub use carrick_runtime::dispatch::Signal;
-pub use carrick_runtime::kernel::{
+pub use carrick_kernel::dispatch::Signal;
+pub use carrick_kernel::kernel::{
     ClockDomain, ContainerId, LinuxTid, ObjectIdRegistry, RunId, SignedDuration, TaskId, TaskKey,
     TaskSerial, ThreadKey, ThreadSerial, TimeControl, TimeError,
 };
-pub use carrick_runtime::network::{
+pub use carrick_kernel::network::{
     ConnectionRecord, HttpMock, InterceptRuleBuilder, IntoTargetSpec, MockService,
     NetworkInterposer, TargetSpec,
 };
-pub use carrick_runtime::observe::{
+pub use carrick_kernel::observe::{
     ArgFilter, AuditEvent, AuditObserver, AuditReason, AuditVerdict, AuditorChain, BudgetCounters,
     BudgetResource, BudgetSnapshot, ExceedAction, ExitOwner, ExitStatus, FastPathVisibility,
     FaultAction, FaultCondition, FaultInjector, FaultPredicate, FaultRule, FaultRuleBuilder,
@@ -123,6 +122,7 @@ pub use carrick_runtime::observe::{
     SyscallAction, SyscallArgIndexError, SyscallArgs, SyscallBitset, SyscallInfo,
     SyscallInterceptor, SyscallObserver, SyscallOutcome, WakeRejectionReason, is_shortable_syscall,
 };
+pub use carrick_runtime::compat::CompatReport;
 pub use carrick_runtime::runtime::{RunResult, RuntimeError, TerminalReason};
 pub use carrick_spec::{
     Mount, MountSpec, NetworkSpec, Platform, ProcessSpec, ResourceSpec, RunSpec, SecuritySpec,

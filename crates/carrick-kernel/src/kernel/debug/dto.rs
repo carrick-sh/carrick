@@ -1402,7 +1402,7 @@ pub(crate) fn task_key(key: super::super::objects::TaskKey) -> DebugTaskKey {
     }
 }
 
-pub(crate) fn thread_key(key: super::super::objects::ThreadKey) -> DebugThreadKey {
+pub fn thread_key(key: super::super::objects::ThreadKey) -> DebugThreadKey {
     DebugThreadKey {
         tid: key.tid.raw(),
         serial: key.serial.raw(),

@@ -7,8 +7,8 @@ use std::io::Write;
 use camino::Utf8PathBuf;
 use carrick_engine::{Engine, RunRequest};
 use carrick_image::{ImageStore, PullPolicy};
+use carrick_kernel::run_state::DEFAULT_MAX_TRAPS;
 use carrick_runtime::prepare::{RuntimeExtensions, StdioSink};
-use carrick_runtime::run_state::DEFAULT_MAX_TRAPS;
 use carrick_spec::{Mount, Platform, StdioMode};
 use carrick_vfs::Vfs;
 
@@ -124,14 +124,14 @@ pub struct ContainerBuilder {
     vfs_mounts: Vec<(Utf8PathBuf, Box<dyn Vfs>)>,
     stdout: StdioConfig,
     stderr: StdioConfig,
-    time: Option<carrick_runtime::kernel::TimeControl>,
+    time: Option<carrick_kernel::kernel::TimeControl>,
     scheduler: Option<std::sync::Arc<dyn carrick_hal::SchedulingPolicy>>,
-    budget: Option<carrick_runtime::observe::ResourceBudget>,
+    budget: Option<carrick_kernel::observe::ResourceBudget>,
     max_traps: usize,
-    observers: Vec<std::sync::Arc<dyn carrick_runtime::observe::SyscallObserver>>,
-    interceptors: Vec<std::sync::Arc<dyn carrick_runtime::observe::SyscallInterceptor>>,
-    auditors: Vec<std::sync::Arc<dyn carrick_runtime::observe::KernelAuditor>>,
-    network_interposer: Option<carrick_runtime::network::interposer::NetworkInterposer>,
+    observers: Vec<std::sync::Arc<dyn carrick_kernel::observe::SyscallObserver>>,
+    interceptors: Vec<std::sync::Arc<dyn carrick_kernel::observe::SyscallInterceptor>>,
+    auditors: Vec<std::sync::Arc<dyn carrick_kernel::observe::KernelAuditor>>,
+    network_interposer: Option<carrick_kernel::network::interposer::NetworkInterposer>,
     shared_buffers: Vec<(String, crate::SharedBuffer)>,
 }
 
@@ -308,14 +308,14 @@ impl ContainerBuilder {
     /// `CARRICK_POSTMORTEM_DIR` is the environment spelling of the same knob.
     pub fn post_mortem_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         let _ = &mut self;
-        carrick_runtime::kernel::debug::PostMortem::install_dir(dir.into());
+        carrick_kernel::kernel::debug::PostMortem::install_dir(dir.into());
         self
     }
 
     /// Register a syscall observer to receive lifecycle and syscall events for this container.
     pub fn observer(
         mut self,
-        observer: std::sync::Arc<dyn carrick_runtime::observe::SyscallObserver>,
+        observer: std::sync::Arc<dyn carrick_kernel::observe::SyscallObserver>,
     ) -> Self {
         self.observers.push(observer);
         self
@@ -324,7 +324,7 @@ impl ContainerBuilder {
     /// Register a kernel auditor to receive lifecycle events for this container.
     pub fn auditor(
         mut self,
-        auditor: std::sync::Arc<dyn carrick_runtime::observe::KernelAuditor>,
+        auditor: std::sync::Arc<dyn carrick_kernel::observe::KernelAuditor>,
     ) -> Self {
         self.auditors.push(auditor);
         self
@@ -337,20 +337,20 @@ impl ContainerBuilder {
     /// guest memory through this interface.
     pub fn interceptor(
         mut self,
-        interceptor: std::sync::Arc<dyn carrick_runtime::observe::SyscallInterceptor>,
+        interceptor: std::sync::Arc<dyn carrick_kernel::observe::SyscallInterceptor>,
     ) -> Self {
         self.interceptors.push(interceptor);
         self
     }
 
     /// Attach a fault injector to simulate syscall and I/O failures.
-    pub fn fault_injector(mut self, injector: carrick_runtime::observe::FaultInjector) -> Self {
+    pub fn fault_injector(mut self, injector: carrick_kernel::observe::FaultInjector) -> Self {
         self.observers.push(std::sync::Arc::new(injector));
         self
     }
 
     /// Attach a resource budget quota to the container.
-    pub fn resource_budget(mut self, budget: carrick_runtime::observe::ResourceBudget) -> Self {
+    pub fn resource_budget(mut self, budget: carrick_kernel::observe::ResourceBudget) -> Self {
         self.budget = Some(budget);
         self
     }
@@ -380,7 +380,7 @@ impl ContainerBuilder {
     }
 
     /// Configure time control for the container.
-    pub fn time(mut self, control: carrick_runtime::kernel::TimeControl) -> Self {
+    pub fn time(mut self, control: carrick_kernel::kernel::TimeControl) -> Self {
         self.time = Some(control);
         self
     }
@@ -388,7 +388,7 @@ impl ContainerBuilder {
     /// Register a network interposer to mock or intercept outbound guest connections.
     pub fn network_interposer(
         mut self,
-        interposer: carrick_runtime::network::interposer::NetworkInterposer,
+        interposer: carrick_kernel::network::interposer::NetworkInterposer,
     ) -> Self {
         self.network_interposer = Some(interposer);
         self
@@ -709,14 +709,14 @@ pub struct Container {
     vfs_mounts: Vec<(Utf8PathBuf, Box<dyn Vfs>)>,
     stdout: StdioConfig,
     stderr: StdioConfig,
-    time: Option<carrick_runtime::kernel::TimeControl>,
+    time: Option<carrick_kernel::kernel::TimeControl>,
     scheduler: Option<std::sync::Arc<dyn carrick_hal::SchedulingPolicy>>,
-    budget: Option<carrick_runtime::observe::ResourceBudget>,
+    budget: Option<carrick_kernel::observe::ResourceBudget>,
     max_traps: usize,
-    observers: Vec<std::sync::Arc<dyn carrick_runtime::observe::SyscallObserver>>,
-    interceptors: Vec<std::sync::Arc<dyn carrick_runtime::observe::SyscallInterceptor>>,
-    auditors: Vec<std::sync::Arc<dyn carrick_runtime::observe::KernelAuditor>>,
-    network_interposer: Option<carrick_runtime::network::interposer::NetworkInterposer>,
+    observers: Vec<std::sync::Arc<dyn carrick_kernel::observe::SyscallObserver>>,
+    interceptors: Vec<std::sync::Arc<dyn carrick_kernel::observe::SyscallInterceptor>>,
+    auditors: Vec<std::sync::Arc<dyn carrick_kernel::observe::KernelAuditor>>,
+    network_interposer: Option<carrick_kernel::network::interposer::NetworkInterposer>,
     shared_buffers: Vec<(String, crate::SharedBuffer)>,
 }
 
@@ -754,21 +754,21 @@ mod tests {
 
     struct ContinueInterceptor;
 
-    impl carrick_runtime::observe::SyscallInterceptor for ContinueInterceptor {
+    impl carrick_kernel::observe::SyscallInterceptor for ContinueInterceptor {
         fn intercept(
             &self,
-            _process: &carrick_runtime::observe::ProcessInfo<'_>,
-            _call: &carrick_runtime::observe::InterceptedSyscall<'_>,
-        ) -> carrick_runtime::observe::InterceptAction {
-            carrick_runtime::observe::InterceptAction::Continue
+            _process: &carrick_kernel::observe::ProcessInfo<'_>,
+            _call: &carrick_kernel::observe::InterceptedSyscall<'_>,
+        ) -> carrick_kernel::observe::InterceptAction {
+            carrick_kernel::observe::InterceptAction::Continue
         }
     }
 
     #[test]
     fn builder_preserves_interceptor_registration_order() {
-        let first: std::sync::Arc<dyn carrick_runtime::observe::SyscallInterceptor> =
+        let first: std::sync::Arc<dyn carrick_kernel::observe::SyscallInterceptor> =
             std::sync::Arc::new(ContinueInterceptor);
-        let second: std::sync::Arc<dyn carrick_runtime::observe::SyscallInterceptor> =
+        let second: std::sync::Arc<dyn carrick_kernel::observe::SyscallInterceptor> =
             std::sync::Arc::new(ContinueInterceptor);
 
         let builder = ContainerBuilder::from_image("alpine")
@@ -1255,7 +1255,7 @@ mod tests {
             .image_store(store)
             .pull_policy(PullPolicy::Never)
             .command(["/bin/true"])
-            .time(carrick_runtime::kernel::TimeControl::Frozen(target_time))
+            .time(carrick_kernel::kernel::TimeControl::Frozen(target_time))
             .prepare()
             .await
             .expect("prepare succeeds");

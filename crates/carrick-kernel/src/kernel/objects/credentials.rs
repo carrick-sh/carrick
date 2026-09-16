@@ -111,7 +111,7 @@ impl Credentials {
         self.supplementary_groups_override.as_deref()
     }
 
-    pub(crate) fn seed_identity(&mut self, uid: NsUid, gid: NsGid) {
+    pub fn seed_identity(&mut self, uid: NsUid, gid: NsGid) {
         self.ruid = uid;
         self.euid = uid;
         self.suid = uid;
@@ -125,7 +125,7 @@ impl Credentials {
     pub(crate) const fn is_privileged(&self) -> bool {
         self.euid.is_root()
     }
-    pub(crate) fn set_uid_triple(&mut self, ruid: NsUid, euid: NsUid, suid: NsUid) {
+    pub fn set_uid_triple(&mut self, ruid: NsUid, euid: NsUid, suid: NsUid) {
         self.ruid = ruid;
         self.euid = euid;
         self.suid = suid;

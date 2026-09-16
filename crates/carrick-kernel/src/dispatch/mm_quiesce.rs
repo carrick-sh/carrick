@@ -51,7 +51,7 @@ pub(crate) fn with_sole_mm_stage1<T>(
 /// dispatch. Separate from [`PtPauseGuard`] because exclusivity has two
 /// sources: the pause (which raises the same marker, so the two nest harmlessly
 /// when both apply) and simply having no peer that can execute guest code.
-pub(crate) struct Stage1Exclusive {
+pub struct Stage1Exclusive {
     _private: (),
 }
 
@@ -71,7 +71,7 @@ enum ExactMmStage1LeaseKind {
 
 /// Shareable only within the current host service thread. A nested frame-COW
 /// borrow clones this exact lease rather than trusting ambient thread state.
-pub(crate) struct ExactMmStage1Lease {
+pub struct ExactMmStage1Lease {
     mm: crate::kernel::MmId,
     _kind: ExactMmStage1LeaseKind,
     _not_send_or_sync: std::marker::PhantomData<std::rc::Rc<()>>,
@@ -126,8 +126,8 @@ fn borrow_current_exact_mm_stage1(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn current_thread_holds_pt_pause() -> bool {
+#[cfg(any(test, feature = "test-support"))]
+pub fn current_thread_holds_pt_pause() -> bool {
     EXACT_MM_STAGE1.with(|stack| {
         stack
             .borrow()
@@ -153,7 +153,7 @@ impl Drop for Stage1Exclusive {
 ///
 /// The census election stays locked until drop, preventing a CLONE_VM peer
 /// dispatcher from entering after the proof is minted.
-pub(crate) struct SoleMmStage1<'participant> {
+pub struct SoleMmStage1<'participant> {
     // Scope drops first, removing the lookup before this wrapper releases its
     // lease. Nested borrowers own their own `Rc` and keep exclusion alive.
     _scope: ExactMmStage1Scope,
@@ -199,12 +199,12 @@ impl<'participant> SoleMmStage1<'participant> {
     }
 }
 
-pub(crate) enum MmStage1Authority<'participant> {
+pub enum MmStage1Authority<'participant> {
     Sole(SoleMmStage1<'participant>),
     Paused(PtPauseGuard<'participant>),
 }
 
-pub(crate) fn acquire_mm_stage1_authority<'participant>(
+pub fn acquire_mm_stage1_authority<'participant>(
     participation: &'participant mut crate::dispatch::MmExecutorParticipation,
     tid: ThreadId,
     budget: PtPauseBudget,
@@ -237,7 +237,7 @@ pub(crate) fn acquire_mm_stage1_authority<'participant>(
         .map(MmStage1Authority::Paused)
 }
 
-pub(crate) struct PtPauseGuard<'mm> {
+pub struct PtPauseGuard<'mm> {
     _scope: ExactMmStage1Scope,
     _lease: std::rc::Rc<ExactMmStage1Lease>,
     mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
@@ -282,12 +282,12 @@ impl<'mm> PtPauseGuard<'mm> {
 
 /// Process-wide page-table-edit Pause-Modify-Resume barrier.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn pt_barrier() -> &'static Arc<crate::fork_quiesce::PtQuiesce> {
+pub fn pt_barrier() -> &'static Arc<crate::fork_quiesce::PtQuiesce> {
     crate::fork_quiesce::pt_barrier()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PtPauseError {
+pub enum PtPauseError {
     TimedOut,
     UnkickableExecutor,
 }
@@ -299,7 +299,7 @@ pub(crate) enum PtPauseError {
 /// (spurious `ENOMEM` the moment two threads `mmap` at once) and the drain 30 s
 /// (one stalled sibling freezing the VM for half a minute).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PtPauseBudget {
+pub struct PtPauseBudget {
     /// Wait for the CURRENT coordinator to finish, before we hold anything.
     ///
     /// Far larger than `drain`, and deliberately not shared with it: charging a
@@ -313,13 +313,13 @@ pub(crate) struct PtPauseBudget {
     /// and then triggers frame COW can rebuild it. Bounding here makes the next
     /// instance a named `pt__pause__election__timeout` and a guest `ENOMEM`
     /// instead of a silent, unrecoverable carrier stop.
-    pub(crate) election: Duration,
+    pub election: Duration,
     /// Wait for siblings to leave guest once WE are the coordinator.
-    pub(crate) drain: Duration,
+    pub drain: Duration,
 }
 
 impl PtPauseBudget {
-    pub(crate) const DEFAULT: Self = Self {
+    pub const DEFAULT: Self = Self {
         election: Duration::from_secs(30),
         drain: Duration::from_millis(500),
     };
@@ -331,7 +331,7 @@ impl PtPauseBudget {
 /// [`carrick_hal::VcpuLeaseDrainPoll::Waiting`] to its exact raw `ThreadId`.
 /// Acquire and hold exact-MM admission while every registered participant is
 /// kicked and observed out of guest across all process-local registries.
-pub(crate) fn begin_pt_pause(
+pub fn begin_pt_pause(
     barrier: &crate::fork_quiesce::PtQuiesce,
     tid: ThreadId,
     budget: PtPauseBudget,
@@ -416,8 +416,11 @@ fn drain_exact_mm<'mm>(
     ))
 }
 
-#[cfg(test)]
-pub(crate) fn acquire_pt_pause<'participant>(
+// Test fixture reachable through `test-support`, so `cfg(test)` is not set
+// for it and clippy's `allow-{unwrap,expect}-in-tests` does not apply.
+#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+pub fn acquire_pt_pause<'participant>(
     barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
     participation: &'participant mut crate::kernel::GuestExecutorParticipation,
     tid: ThreadId,
@@ -432,8 +435,11 @@ pub(crate) fn acquire_pt_pause<'participant>(
     drain_exact_mm(barrier, mm, None, census, tid, budget)
 }
 
-#[cfg(test)]
-pub(crate) fn with_real_pt_pause_for_test<T>(
+// Test fixture reachable through `test-support`, so `cfg(test)` is not set
+// for it and clippy's `allow-{unwrap,expect}-in-tests` does not apply.
+#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+pub fn with_real_pt_pause_for_test<T>(
     coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
     run: impl FnOnce(&mut PtPauseGuard<'_>) -> T,
 ) -> T {
@@ -462,7 +468,7 @@ pub(crate) fn with_real_pt_pause_for_test<T>(
 }
 
 #[allow(dead_code)] // Foreign variants are consumed by the canonical Task 8 syscall path.
-pub(crate) enum FrameCowExactMmGuard {
+pub enum FrameCowExactMmGuard {
     Nested {
         _lease: std::rc::Rc<ExactMmStage1Lease>,
         mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
@@ -562,7 +568,7 @@ impl FrameCowExactMmGuard {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ForeignCowInvalidationError {
+pub enum ForeignCowInvalidationError {
     #[error("foreign COW mutation has no exact stage-1 lease")]
     MissingStage1Lease,
     #[error("foreign COW mutation with active target executors has no pause")]
@@ -573,7 +579,7 @@ pub(crate) enum ForeignCowInvalidationError {
     Pause(#[from] crate::fork_quiesce::PtInvalidationError),
 }
 
-pub(crate) fn acquire_frame_cow_quiesce(
+pub fn acquire_frame_cow_quiesce(
     barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
     mm: crate::kernel::MmId,
     census: &crate::kernel::GuestExecutorCensus,
@@ -657,8 +663,8 @@ fn acquire_frame_cow_quiesce_inner(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn acquire_mutation_pause_for_test<'participant>(
+#[cfg(any(test, feature = "test-support"))]
+pub fn acquire_mutation_pause_for_test<'participant>(
     barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
     participation: &'participant mut crate::kernel::GuestExecutorParticipation,
     tid: ThreadId,

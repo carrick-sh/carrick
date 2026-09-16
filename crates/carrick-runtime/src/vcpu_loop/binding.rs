@@ -8,10 +8,10 @@ use parking_lot::Mutex;
 
 use carrick_hal::{PlatformFutex, ThreadedEngine, VcpuRegistry};
 
-use crate::dispatch::DispatchOutcome;
-use crate::run_result::RuntimeError;
 use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
 use crate::trap::TrapError;
+use carrick_kernel::dispatch::DispatchOutcome;
+use carrick_kernel::run_result::RuntimeError;
 
 use super::exec::*;
 use super::lifecycle::*;
@@ -26,12 +26,13 @@ use super::*;
 /// same narrow slot API so exec/continuation helpers cannot accidentally grow
 /// a second scheduler-specific implementation.
 pub(crate) enum ExecutionLeaseCell {
-    Owned(Mutex<Option<crate::kernel::objects::ThreadExecutionLease>>),
+    Owned(Mutex<Option<carrick_kernel::kernel::objects::ThreadExecutionLease>>),
     Injected(Arc<InjectedExecutionLeaseSlot>),
 }
 
 pub(crate) struct InjectedExecutionLeaseSlot {
-    slot: std::sync::atomic::AtomicPtr<Option<crate::kernel::objects::ThreadExecutionLease>>,
+    slot:
+        std::sync::atomic::AtomicPtr<Option<carrick_kernel::kernel::objects::ThreadExecutionLease>>,
 }
 
 impl InjectedExecutionLeaseSlot {
@@ -43,7 +44,7 @@ impl InjectedExecutionLeaseSlot {
 
     pub(crate) fn install(
         self: &Arc<Self>,
-        slot: *mut Option<crate::kernel::objects::ThreadExecutionLease>,
+        slot: *mut Option<carrick_kernel::kernel::objects::ThreadExecutionLease>,
     ) -> InjectedExecutionLeasePublication<'_> {
         if self
             .slot
@@ -84,12 +85,14 @@ impl Drop for InjectedExecutionLeasePublication<'_> {
 }
 
 pub(crate) enum ExecutionLeaseGuard<'a> {
-    Owned(parking_lot::MutexGuard<'a, Option<crate::kernel::objects::ThreadExecutionLease>>),
-    Injected(&'a mut Option<crate::kernel::objects::ThreadExecutionLease>),
+    Owned(
+        parking_lot::MutexGuard<'a, Option<carrick_kernel::kernel::objects::ThreadExecutionLease>>,
+    ),
+    Injected(&'a mut Option<carrick_kernel::kernel::objects::ThreadExecutionLease>),
 }
 
 impl std::ops::Deref for ExecutionLeaseGuard<'_> {
-    type Target = Option<crate::kernel::objects::ThreadExecutionLease>;
+    type Target = Option<carrick_kernel::kernel::objects::ThreadExecutionLease>;
 
     fn deref(&self) -> &Self::Target {
         match self {
@@ -142,8 +145,8 @@ impl ExecutionLeaseCell {
 pub(crate) enum HvpatchBlockInput {
     Dispatch(DispatchOutcome),
     Vfork {
-        child: crate::kernel::TaskKey,
-        wait: crate::kernel::VforkParentWait,
+        child: carrick_kernel::kernel::TaskKey,
+        wait: carrick_kernel::kernel::VforkParentWait,
         activation: executor::PreparedVforkChildActivation,
     },
 }
@@ -151,8 +154,8 @@ pub(crate) enum HvpatchBlockInput {
 pub(crate) enum HvpatchContinuationInput {
     Dispatch(DispatchOutcome),
     Vfork {
-        child: crate::kernel::TaskKey,
-        wait: crate::kernel::VforkParentWait,
+        child: carrick_kernel::kernel::TaskKey,
+        wait: carrick_kernel::kernel::VforkParentWait,
     },
 }
 
@@ -160,13 +163,13 @@ pub(crate) enum HvpatchContinuationInput {
 pub(crate) struct DeferredResumeBlocked {
     frame: carrick_hal::RawSyscall,
     vfork_child_pid: Option<i32>,
-    original_blocked_reason: Option<crate::kernel::objects::BlockedReason>,
+    original_blocked_reason: Option<carrick_kernel::kernel::objects::BlockedReason>,
 }
 
 impl DeferredResumeBlocked {
     pub(super) fn capture(
         phase: &HvpatchProductionPhase,
-        original_blocked_reason: Option<crate::kernel::objects::BlockedReason>,
+        original_blocked_reason: Option<carrick_kernel::kernel::objects::BlockedReason>,
     ) -> Option<Self> {
         match phase {
             HvpatchProductionPhase::ResumeBlocked {
@@ -198,14 +201,14 @@ pub(super) enum HvpatchProductionPhase {
         _subscription: carrick_thread::fork_quiesce::QuiesceSubscription,
     },
     ResumeJobControlStop {
-        _subscription: crate::kernel::objects::TaskWakeSubscription,
+        _subscription: carrick_kernel::kernel::objects::TaskWakeSubscription,
     },
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     RetryProcessFork {
         frame: Option<carrick_hal::RawSyscall>,
         request: quiesce::ForkRequest,
         coordinator: Option<quiesce::ProcessForkCoordinator>,
-        external_exec: Option<crate::kernel::control::ExecWork>,
+        external_exec: Option<carrick_kernel::kernel::control::ExecWork>,
         deferred_resume_blocked: Option<DeferredResumeBlocked>,
         _subscription: quiesce::ProcessForkRetrySubscription,
     },
@@ -213,7 +216,7 @@ pub(super) enum HvpatchProductionPhase {
     RetryCloneThread {
         frame: carrick_hal::RawSyscall,
         request: HvpatchCloneThreadRequest,
-        prepared: Option<crate::kernel::PreparedThreadClone>,
+        prepared: Option<carrick_kernel::kernel::PreparedThreadClone>,
         _subscription: CloneRetrySubscription,
     },
     /// A guest thread exit found the kernel task reservation held
@@ -230,22 +233,22 @@ pub(super) enum HvpatchProductionPhase {
         vfork_child_pid: Option<i32>,
     },
     ExecSiblingDrain {
-        context: crate::kernel::KernelContext,
+        context: carrick_kernel::kernel::KernelContext,
         owner: Box<exec::PreparedExecveDrain>,
     },
     TerminalProcessDrain {
         terminal: PersistentTerminal,
-        context: crate::kernel::KernelContext,
+        context: carrick_kernel::kernel::KernelContext,
         drain: continuation::ProcessDrain,
     },
     TerminalClaimRetry {
         terminal: PersistentTerminal,
-        context: crate::kernel::KernelContext,
+        context: carrick_kernel::kernel::KernelContext,
         _subscription: Option<CloneAdmissionChangeSubscription>,
     },
     TerminalRetireRetry {
         terminal: PersistentTerminal,
-        context: crate::kernel::KernelContext,
+        context: carrick_kernel::kernel::KernelContext,
         _subscription: TerminalRetireSubscription,
     },
     Complete,
@@ -262,15 +265,15 @@ pub(crate) enum TerminalRetireSubscription {
 
 #[cfg(test)]
 pub(crate) fn enter_guest_executor_then_register<F>(
-    census: &Arc<crate::kernel::GuestExecutorCensus>,
-    thread: Option<crate::kernel::ThreadRef>,
+    census: &Arc<carrick_kernel::kernel::GuestExecutorCensus>,
+    thread: Option<carrick_kernel::kernel::ThreadRef>,
     register: F,
 ) -> Result<
     (
-        crate::kernel::GuestExecutorParticipation,
+        carrick_kernel::kernel::GuestExecutorParticipation,
         carrick_hal::VcpuRegistrationEnrollment,
     ),
-    crate::kernel::GuestExecutorCensusError,
+    carrick_kernel::kernel::GuestExecutorCensusError,
 >
 where
     F: FnOnce() -> carrick_hal::VcpuRegistrationEnrollment,
@@ -281,17 +284,17 @@ where
 }
 
 pub(crate) fn enter_mm_executor_then_register<F>(
-    dispatcher: &crate::dispatch::SyscallDispatcher,
-    thread: Option<crate::kernel::ThreadRef>,
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+    thread: Option<carrick_kernel::kernel::ThreadRef>,
     registry: Arc<dyn carrick_hal::VcpuRegistry>,
     tid: ThreadId,
     register: F,
 ) -> Result<
     (
-        crate::dispatch::MmExecutorParticipation,
+        carrick_kernel::dispatch::MmExecutorParticipation,
         carrick_hal::VcpuRegistrationEnrollment,
     ),
-    crate::kernel::GuestExecutorCensusError,
+    carrick_kernel::kernel::GuestExecutorCensusError,
 >
 where
     F: FnOnce() -> carrick_hal::VcpuRegistrationEnrollment,
@@ -326,8 +329,8 @@ pub(super) fn registration_wake_uses_control(
 }
 
 pub(crate) fn registration_wake_callback(
-    scheduler: Arc<crate::kernel::Scheduler>,
-    thread: crate::kernel::ThreadKey,
+    scheduler: Arc<carrick_kernel::kernel::Scheduler>,
+    thread: carrick_kernel::kernel::ThreadKey,
     use_control: bool,
 ) -> Arc<dyn Fn() + Send + Sync + 'static> {
     Arc::new(move || {
@@ -426,9 +429,11 @@ pub(crate) struct ProductionHvpatchLoopJob<E: ThreadedEngine> {
     pub(super) last_signal_progress: Instant,
     pub(super) terminal_runtime: PersistentTerminalRuntimeState,
     pub(super) pending_terminal_retirement: Option<crate::hvpatch::PendingAddressSpaceRetirement>,
-    pub(super) pending_terminal_inventory:
-        Option<(Arc<crate::kernel::Kernel>, crate::kernel::MmId)>,
-    pub(super) external_exec: Option<crate::kernel::control::ExecWork>,
+    pub(super) pending_terminal_inventory: Option<(
+        Arc<carrick_kernel::kernel::Kernel>,
+        carrick_kernel::kernel::MmId,
+    )>,
+    pub(super) external_exec: Option<carrick_kernel::kernel::control::ExecWork>,
 }
 
 pub(crate) trait ProductionHvpatchLoopPoll: Send {
@@ -628,7 +633,7 @@ where
                     Ok(self.suspend(
                         HvpatchLoopSuspension::ExecSiblingDrain,
                         executor::ExecutorExit::Blocked(
-                            crate::kernel::objects::BlockedReason::ChildState,
+                            carrick_kernel::kernel::objects::BlockedReason::ChildState,
                         ),
                     ))
                 }
@@ -638,7 +643,13 @@ where
 
     fn take_terminal_inventory_authority(
         &mut self,
-    ) -> Result<(Arc<crate::kernel::Kernel>, crate::kernel::MmId), TrapError> {
+    ) -> Result<
+        (
+            Arc<carrick_kernel::kernel::Kernel>,
+            carrick_kernel::kernel::MmId,
+        ),
+        TrapError,
+    > {
         self.pending_terminal_inventory.take().ok_or_else(|| {
             TrapError::Hypervisor(
                 "detached terminal cleanup lost its exact Kernel/MM authority".to_owned(),
@@ -649,7 +660,8 @@ where
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn control_quantum(
         &self,
-    ) -> Result<Option<crate::kernel::objects::SchedulerControlQuantum>, RuntimeError> {
+    ) -> Result<Option<carrick_kernel::kernel::objects::SchedulerControlQuantum>, RuntimeError>
+    {
         let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration(
                 "carrier logical exec lost exact root Kernel context".to_owned(),
@@ -736,7 +748,7 @@ where
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
-        work: crate::kernel::control::ExecWork,
+        work: carrick_kernel::kernel::control::ExecWork,
         deferred_resume_blocked: Option<DeferredResumeBlocked>,
     ) -> Result<executor::ExecutorExit, RuntimeError> {
         let context = self
@@ -865,7 +877,7 @@ where
                 Ok(self.suspend(
                     HvpatchLoopSuspension::BlockedContinuation,
                     executor::ExecutorExit::Blocked(
-                        crate::kernel::objects::BlockedReason::HostWait,
+                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
                     ),
                 ))
             }
@@ -875,7 +887,7 @@ where
     fn finalize_persistent_process_terminal(
         &mut self,
         engine: &mut E,
-        terminal_context: crate::kernel::KernelContext,
+        terminal_context: carrick_kernel::kernel::KernelContext,
         terminal: PersistentTerminal,
     ) -> executor::ExecutorExit {
         let process = self.kernel.hvpatch_process.as_ref().unwrap_or_else(|| {
@@ -945,7 +957,7 @@ where
                             return self.suspend(
                                 HvpatchLoopSuspension::TerminalSiblingDrain,
                                 executor::ExecutorExit::Blocked(
-                                    crate::kernel::objects::BlockedReason::HostWait,
+                                    carrick_kernel::kernel::objects::BlockedReason::HostWait,
                                 ),
                             );
                         }
@@ -966,7 +978,7 @@ where
         // transaction depth and, inside, the registry leaf — never a
         // page-table pause, which elected a drain over sibling executors
         // exit_group had already put beyond kicking.
-        let mut topology = crate::dispatch::mm_mutation::terminal_process_transaction();
+        let mut topology = carrick_kernel::dispatch::mm_mutation::terminal_process_transaction();
         topology.set_identity(process.pid(), terminal_context.task().key().id.raw());
         let owns_final_mm = process
             .owns_final_mm_edge(terminal_context.task().key())
@@ -1110,7 +1122,7 @@ where
                     ..
                 } => None,
             };
-            if let Err(error) = work.complete(crate::kernel::control::ExecResult {
+            if let Err(error) = work.complete(carrick_kernel::kernel::control::ExecResult {
                 exit_code,
                 terminating_signal,
                 stdout: out,
@@ -1124,7 +1136,7 @@ where
                 );
             }
         }
-        let status = crate::kernel::LinuxWaitStatus::from_wait_encoding(wait_encoding);
+        let status = carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(wait_encoding);
         let orphan_adopter = self.kernel.dispatcher.hvpatch_orphan_adopter();
         let publish_result = process.publish_exit_status(status, orphan_adopter, |parent| {
             if child {
@@ -1138,8 +1150,11 @@ where
         });
         if publish_result.is_ok() {
             if let Some(chain) = self.kernel.dispatcher.observers() {
-                let p = crate::observe::ProcessInfo::new(&terminal_context);
-                chain.on_process_exit(&p, crate::observe::ExitStatus::from_wait_status(status));
+                let p = carrick_kernel::observe::ProcessInfo::new(&terminal_context);
+                chain.on_process_exit(
+                    &p,
+                    carrick_kernel::observe::ExitStatus::from_wait_status(status),
+                );
             }
         }
         if let Err(failure) = publish_result {
@@ -1165,7 +1180,7 @@ where
         // run-state publication now; run-state-only records are reclaimed here,
         // while namespace-owned records retain their zombie metadata until a
         // consuming wait reaps them.
-        crate::run_state::clear_guest_process(process.pid());
+        carrick_kernel::run_state::clear_guest_process(process.pid());
         if let Some(prepared) = prepared_core {
             if core_dumped {
                 crate::probes::hvpatch_core_lifecycle(
@@ -1217,7 +1232,7 @@ where
         &mut self,
         engine: &mut E,
         code: i32,
-        context: crate::kernel::KernelContext,
+        context: carrick_kernel::kernel::KernelContext,
         disposition: threads::PersistentThreadExitDisposition,
     ) -> executor::ExecutorExit {
         match disposition {
@@ -1283,7 +1298,7 @@ where
     /// this path does not do).
     fn park_thread_exit_retry(
         &mut self,
-        context: &crate::kernel::KernelContext,
+        context: &carrick_kernel::kernel::KernelContext,
         observed_epoch: u64,
         retry_phase: HvpatchProductionPhase,
     ) -> executor::ExecutorExit {
@@ -1313,7 +1328,9 @@ where
         self.phase = retry_phase;
         self.suspend(
             HvpatchLoopSuspension::TerminalSiblingDrain,
-            executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::ChildState),
+            executor::ExecutorExit::Blocked(
+                carrick_kernel::kernel::objects::BlockedReason::ChildState,
+            ),
         )
     }
 
@@ -1321,7 +1338,7 @@ where
         &mut self,
         engine: &mut E,
         terminal: PersistentTerminal,
-        context: crate::kernel::KernelContext,
+        context: carrick_kernel::kernel::KernelContext,
     ) -> executor::ExecutorExit {
         let receipt = self
             .kernel
@@ -1369,7 +1386,7 @@ where
         &mut self,
         engine: &mut E,
         terminal: PersistentTerminal,
-        context: crate::kernel::KernelContext,
+        context: carrick_kernel::kernel::KernelContext,
         receipt: ProcessExitClaimReceipt,
     ) -> executor::ExecutorExit {
         match receipt.claim {
@@ -1419,7 +1436,7 @@ where
                 return self.suspend(
                     HvpatchLoopSuspension::TerminalSiblingDrain,
                     executor::ExecutorExit::Blocked(
-                        crate::kernel::objects::BlockedReason::ChildState,
+                        carrick_kernel::kernel::objects::BlockedReason::ChildState,
                     ),
                 );
             }
@@ -1517,7 +1534,9 @@ where
         };
         self.suspend(
             HvpatchLoopSuspension::TerminalSiblingDrain,
-            executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::ChildState),
+            executor::ExecutorExit::Blocked(
+                carrick_kernel::kernel::objects::BlockedReason::ChildState,
+            ),
         )
     }
 
@@ -1627,16 +1646,16 @@ where
         };
         let task = context.task();
         let ptrace_stop_settled = match context.kernel().settle_task_ptrace_stop(task.key().id) {
-            crate::kernel::objects::PtraceStopSettlement::NotPtraceStopped => false,
-            crate::kernel::objects::PtraceStopSettlement::Stopped
-            | crate::kernel::objects::PtraceStopSettlement::Resumed { .. } => true,
+            carrick_kernel::kernel::objects::PtraceStopSettlement::NotPtraceStopped => false,
+            carrick_kernel::kernel::objects::PtraceStopSettlement::Stopped
+            | carrick_kernel::kernel::objects::PtraceStopSettlement::Resumed { .. } => true,
         };
         if !task.is_job_control_stopped() && !ptrace_stop_settled {
             return Ok(None);
         }
         self.state.withdraw_from_crash_capture();
         self.state
-            .publish_thread_run_state(crate::run_state::RunState::Blocked, 'T');
+            .publish_thread_run_state(carrick_kernel::run_state::RunState::Blocked, 'T');
 
         let scheduler = self
             .kernel
@@ -1657,13 +1676,13 @@ where
                 }),
             );
             match enrollment {
-                crate::kernel::objects::TaskWakeEnrollment::Ready(_) => {
+                carrick_kernel::kernel::objects::TaskWakeEnrollment::Ready(_) => {
                     if !task.is_job_control_stopped() {
                         break;
                     }
                     continue;
                 }
-                crate::kernel::objects::TaskWakeEnrollment::Subscribed(subscription) => {
+                carrick_kernel::kernel::objects::TaskWakeEnrollment::Subscribed(subscription) => {
                     if !task.is_job_control_stopped() {
                         break;
                     }
@@ -1673,7 +1692,7 @@ where
                     let exit = self.suspend(
                         HvpatchLoopSuspension::BlockedContinuation,
                         executor::ExecutorExit::Blocked(
-                            crate::kernel::objects::BlockedReason::HostWait,
+                            carrick_kernel::kernel::objects::BlockedReason::HostWait,
                         ),
                     );
                     return Ok(Some(exit));
@@ -1718,8 +1737,8 @@ where
     fn rollback_published_hvpatch_clone<M: threads::CloneTidMemory>(
         &self,
         memory: &mut M,
-        context: &crate::kernel::KernelContext,
-        generation: crate::kernel::objects::ExecutionGeneration,
+        context: &carrick_kernel::kernel::KernelContext,
+        generation: carrick_kernel::kernel::objects::ExecutionGeneration,
         tid: ThreadId,
         tid_outputs: &threads::CloneTidOutputTransaction,
         logical: Option<PreparedHvpatchLogicalJob>,
@@ -1803,9 +1822,9 @@ where
         &mut self,
         memory: &mut M,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
-        parent_context: &crate::kernel::KernelContext,
+        parent_context: &carrick_kernel::kernel::KernelContext,
         request: HvpatchCloneThreadRequest,
-        retry_prepared: Option<crate::kernel::PreparedThreadClone>,
+        retry_prepared: Option<carrick_kernel::kernel::PreparedThreadClone>,
         ops: &mut O,
     ) -> Result<PersistentHvpatchCloneAttempt, RuntimeError>
     where
@@ -1870,7 +1889,7 @@ where
                 threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN),
             ));
         }
-        let plan = match crate::kernel::ClonePlan::from_flags(
+        let plan = match carrick_kernel::kernel::ClonePlan::from_flags(
             carrick_abi::LinuxCloneFlags::from_bits_retain(flags),
         ) {
             Ok(plan) => plan,
@@ -1914,7 +1933,7 @@ where
                     .reserve_thread_clone(parent_context, plan, None)
                 {
                     Ok(reservation) => reservation,
-                    Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
+                    Err(carrick_kernel::kernel::KernelOperationError::TaskBusy(_)) => {
                         return Ok(wait_for_change(observed, None));
                     }
                     Err(error) => {
@@ -1937,8 +1956,10 @@ where
                 "reserve persistent HVPatch thread publication: {error}"
             ))
         })? {
-            crate::kernel::ThreadPublicationReservationAttempt::Reserved(prepared) => prepared,
-            crate::kernel::ThreadPublicationReservationAttempt::Busy(prepared) => {
+            carrick_kernel::kernel::ThreadPublicationReservationAttempt::Reserved(prepared) => {
+                prepared
+            }
+            carrick_kernel::kernel::ThreadPublicationReservationAttempt::Busy(prepared) => {
                 return Ok(wait_for_change(observed, Some(prepared)));
             }
         };
@@ -2026,7 +2047,7 @@ where
                 )
             })?
             .retain_exact();
-        let task_state = crate::kernel::objects::MigratableTaskState {
+        let task_state = carrick_kernel::kernel::objects::MigratableTaskState {
             cpu,
             mm,
             asid_generation,
@@ -2500,8 +2521,8 @@ where
                 )
             }
         };
-        crate::event_ring::rec(
-            crate::event_ring::CLONESPAWN,
+        carrick_kernel::event_ring::rec(
+            carrick_kernel::event_ring::CLONESPAWN,
             self.state.this_tid.raw(),
             completed_internal_tid,
             completed_errno,
@@ -2571,11 +2592,15 @@ where
                     .as_ref()
                     .is_some_and(|cx| cx.task().is_job_control_stopped());
                 if is_stopped {
-                    self.state
-                        .publish_thread_run_state(crate::run_state::RunState::Blocked, 'T');
+                    self.state.publish_thread_run_state(
+                        carrick_kernel::run_state::RunState::Blocked,
+                        'T',
+                    );
                 } else {
-                    self.state
-                        .publish_thread_run_state(crate::run_state::RunState::Blocked, 'S');
+                    self.state.publish_thread_run_state(
+                        carrick_kernel::run_state::RunState::Blocked,
+                        'S',
+                    );
                 }
             }
             _ => {}
@@ -2641,7 +2666,7 @@ where
         frame: carrick_hal::RawSyscall,
         outcome: DispatchOutcome,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        if crate::kernel::continuation::is_blocking_dispatch_outcome(&outcome) {
+        if carrick_kernel::kernel::continuation::is_blocking_dispatch_outcome(&outcome) {
             let _ = self.state.stash_parked_registers(engine);
             let request = self
                 .state
@@ -2863,7 +2888,7 @@ where
                         self.suspend(
                             HvpatchLoopSuspension::ExecSiblingDrain,
                             executor::ExecutorExit::Blocked(
-                                crate::kernel::objects::BlockedReason::ChildState,
+                                carrick_kernel::kernel::objects::BlockedReason::ChildState,
                             ),
                         )
                     }
@@ -2968,7 +2993,7 @@ where
                             return Ok(self.suspend(
                                 HvpatchLoopSuspension::BlockedContinuation,
                                 executor::ExecutorExit::Blocked(
-                                    crate::kernel::objects::BlockedReason::HostWait,
+                                    carrick_kernel::kernel::objects::BlockedReason::HostWait,
                                 ),
                             ));
                         }
@@ -2999,8 +3024,8 @@ where
                         )
                     }
                 };
-                crate::event_ring::rec(
-                    crate::event_ring::CLONESPAWN,
+                carrick_kernel::event_ring::rec(
+                    carrick_kernel::event_ring::CLONESPAWN,
                     self.state.this_tid.raw(),
                     completed_internal_tid,
                     completed_errno,
@@ -3380,7 +3405,7 @@ where
                     return Ok(self.suspend(
                         HvpatchLoopSuspension::InitialAdmission,
                         executor::ExecutorExit::Blocked(
-                            crate::kernel::objects::BlockedReason::HostWait,
+                            carrick_kernel::kernel::objects::BlockedReason::HostWait,
                         ),
                     ));
                 }
@@ -3432,7 +3457,7 @@ where
         }
 
         self.state
-            .publish_thread_run_state(crate::run_state::RunState::Running, 'R');
+            .publish_thread_run_state(carrick_kernel::run_state::RunState::Running, 'R');
 
         // A control exec is a peer-root operation, not completion of the
         // init's blocked syscall. Service it at this scheduler safe point
@@ -3591,7 +3616,7 @@ where
                         Ok(self.suspend(
                             HvpatchLoopSuspension::BlockedContinuation,
                             executor::ExecutorExit::Blocked(
-                                crate::kernel::objects::BlockedReason::HostWait,
+                                carrick_kernel::kernel::objects::BlockedReason::HostWait,
                             ),
                         ))
                     }
@@ -3637,7 +3662,7 @@ where
                                 "vfork parent identity restore lost Kernel context".to_owned(),
                             )
                         })?;
-                    crate::kernel::identity_page::stamp_identity_page(
+                    carrick_kernel::kernel::identity_page::stamp_identity_page(
                         engine,
                         &self.kernel.dispatcher,
                         parent_context,
@@ -3681,7 +3706,7 @@ where
                     return Ok(self.suspend(
                         HvpatchLoopSuspension::ExecSiblingDrain,
                         executor::ExecutorExit::Blocked(
-                            crate::kernel::objects::BlockedReason::ChildState,
+                            carrick_kernel::kernel::objects::BlockedReason::ChildState,
                         ),
                     ));
                 }
@@ -3712,7 +3737,7 @@ where
                     return Ok(self.suspend(
                         HvpatchLoopSuspension::TerminalSiblingDrain,
                         executor::ExecutorExit::Blocked(
-                            crate::kernel::objects::BlockedReason::ChildState,
+                            carrick_kernel::kernel::objects::BlockedReason::ChildState,
                         ),
                     ));
                 }
@@ -3861,7 +3886,7 @@ where
             return Ok(executor::ExecutorExit::Syscall);
         }
         self.state
-            .publish_thread_run_state(crate::run_state::RunState::Running, 'R');
+            .publish_thread_run_state(carrick_kernel::run_state::RunState::Running, 'R');
         if let Some(thread) = self.state.kernel_thread.as_ref() {
             thread.begin_guest_run();
         }
@@ -4032,7 +4057,7 @@ where
                 // Raw hardware/host faults can decode as MAPERR even when
                 // Carrick tracks a live VMA denying the access. Upgrade from the
                 // shared protection metadata (LTP mmap05 / roprotect probe).
-                let si_code = crate::kernel::objects::signal::upgrade_protection_si_code(
+                let si_code = carrick_kernel::kernel::objects::signal::upgrade_protection_si_code(
                     &*engine, signum, si_code, si_addr,
                 );
                 let interrupted_pc = from_el0_direct.then_some(elr);
@@ -4095,7 +4120,7 @@ where
                 // this directly (fault_addr = CR2). The backend restores the
                 // interrupted user context before surfacing the fault, so the
                 // live PC is the faulting instruction.
-                let si_code = crate::kernel::objects::signal::upgrade_protection_si_code(
+                let si_code = carrick_kernel::kernel::objects::signal::upgrade_protection_si_code(
                     &*engine, signum, si_code, fault_addr,
                 );
                 let interrupted_pc = Some(engine.current_pc()?);
@@ -4523,7 +4548,9 @@ impl<E: ScriptedHvpatchLoopEngine> HvpatchLoopJob<E> {
         let need_resched = control.need_resched();
         match job.poll_quantum_with_engine(engine, need_resched) {
             HvpatchLoopPoll::Suspended(HvpatchLoopSuspension::BlockedContinuation) => {
-                executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::HostWait)
+                executor::ExecutorExit::Blocked(
+                    carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                )
             }
             HvpatchLoopPoll::Suspended(HvpatchLoopSuspension::SchedulerYield) => {
                 executor::ExecutorExit::Yielded
@@ -4535,7 +4562,9 @@ impl<E: ScriptedHvpatchLoopEngine> HvpatchLoopJob<E> {
                 HvpatchLoopSuspension::ExecSiblingDrain
                 | HvpatchLoopSuspension::VforkParent
                 | HvpatchLoopSuspension::TerminalSiblingDrain,
-            ) => executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::ChildState),
+            ) => executor::ExecutorExit::Blocked(
+                carrick_kernel::kernel::objects::BlockedReason::ChildState,
+            ),
             HvpatchLoopPoll::Suspended(HvpatchLoopSuspension::InitialAdmission) => {
                 executor::ExecutorExit::Quiesced
             }
@@ -4601,20 +4630,20 @@ impl<E: 'static> HvpatchLoopJob<E> {
         let exit = production.poll(engine, control);
         job.suspended = match exit {
             executor::ExecutorExit::BlockedContinuation { .. }
-            | executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::HostWait) => {
-                Some(HvpatchLoopSuspension::BlockedContinuation)
-            }
-            executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::ChildState) => {
-                match job.suspended {
-                    Some(HvpatchLoopSuspension::ExecSiblingDrain) => {
-                        Some(HvpatchLoopSuspension::ExecSiblingDrain)
-                    }
-                    Some(HvpatchLoopSuspension::VforkParent) => {
-                        Some(HvpatchLoopSuspension::VforkParent)
-                    }
-                    _ => Some(HvpatchLoopSuspension::TerminalSiblingDrain),
+            | executor::ExecutorExit::Blocked(
+                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+            ) => Some(HvpatchLoopSuspension::BlockedContinuation),
+            executor::ExecutorExit::Blocked(
+                carrick_kernel::kernel::objects::BlockedReason::ChildState,
+            ) => match job.suspended {
+                Some(HvpatchLoopSuspension::ExecSiblingDrain) => {
+                    Some(HvpatchLoopSuspension::ExecSiblingDrain)
                 }
-            }
+                Some(HvpatchLoopSuspension::VforkParent) => {
+                    Some(HvpatchLoopSuspension::VforkParent)
+                }
+                _ => Some(HvpatchLoopSuspension::TerminalSiblingDrain),
+            },
             executor::ExecutorExit::Yielded => Some(HvpatchLoopSuspension::SchedulerYield),
             executor::ExecutorExit::Preempted => Some(HvpatchLoopSuspension::Preemption),
             executor::ExecutorExit::Exited | executor::ExecutorExit::InvalidState => None,
@@ -4850,17 +4879,17 @@ pub(crate) struct PreparedHvpatchLogicalJob {
     pub(crate) completion: continuation::LogicalJobCompletion,
     pub(crate) process_retirement: ProcessPhysicalRetirement,
     pub(crate) terminal_settlement: HvpatchExternalTerminalSettlement,
-    pub(crate) context: crate::kernel::KernelContext,
-    pub(crate) cpu: crate::kernel::objects::MigratableTaskState,
-    pub(crate) generation: crate::kernel::objects::ExecutionGeneration,
-    pub(crate) start_gate: Option<crate::kernel::objects::OpenedStartGate>,
+    pub(crate) context: carrick_kernel::kernel::KernelContext,
+    pub(crate) cpu: carrick_kernel::kernel::objects::MigratableTaskState,
+    pub(crate) generation: carrick_kernel::kernel::objects::ExecutionGeneration,
+    pub(crate) start_gate: Option<carrick_kernel::kernel::objects::OpenedStartGate>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PreparedHvpatchLogicalJob {
     pub(crate) fn install_start_gate(
         &mut self,
-        start_gate: crate::kernel::objects::OpenedStartGate,
+        start_gate: carrick_kernel::kernel::objects::OpenedStartGate,
     ) -> Result<(), TrapError> {
         if self.start_gate.replace(start_gate).is_some() {
             return Err(TrapError::Hypervisor(
@@ -4891,9 +4920,9 @@ pub(crate) struct HvpatchLogicalJobInput<E: ThreadedEngine> {
     pub(crate) kernel: Kernel,
     pub(crate) state: ThreadRuntimeState<E>,
     pub(crate) task_backend: executor::HvpatchTaskEngineBindingState,
-    pub(crate) context: crate::kernel::KernelContext,
-    pub(crate) cpu: crate::kernel::objects::MigratableTaskState,
-    pub(crate) generation: crate::kernel::objects::ExecutionGeneration,
+    pub(crate) context: carrick_kernel::kernel::KernelContext,
+    pub(crate) cpu: carrick_kernel::kernel::objects::MigratableTaskState,
+    pub(crate) generation: carrick_kernel::kernel::objects::ExecutionGeneration,
     pub(crate) injected_lease: Arc<InjectedExecutionLeaseSlot>,
     pub(crate) bootstrap_process_child: Option<ProcessChildBootstrap>,
     pub(crate) bootstrap_thread_child: bool,
@@ -5005,7 +5034,7 @@ pub(crate) fn launch_persistent_hvpatch_job<E: ThreadedEngine + 'static>(
     futex: Arc<FutexTable>,
     platform_futex: Arc<dyn PlatformFutex>,
     platform_futex_factory: PlatformFutexFactory,
-    linux_tid: crate::kernel::LinuxTid,
+    linux_tid: carrick_kernel::kernel::LinuxTid,
     this_tid: ThreadId,
     threads: impl Into<VcpuThreadRegistry>,
     kicker: Arc<dyn VcpuRegistry>,
@@ -5221,17 +5250,17 @@ where
 }
 
 pub(crate) struct PreparedInitialRunnerTask {
-    context: crate::kernel::KernelContext,
-    cpu: crate::kernel::objects::MigratableTaskState,
-    start_gate: crate::kernel::objects::OpenedStartGate,
+    context: carrick_kernel::kernel::KernelContext,
+    cpu: carrick_kernel::kernel::objects::MigratableTaskState,
+    start_gate: carrick_kernel::kernel::objects::OpenedStartGate,
 }
 
 pub(crate) struct PreparedInitialHandoff {
     task: Option<PreparedInitialRunnerTask>,
-    scheduler: Arc<crate::kernel::Scheduler>,
-    wait_service: Arc<crate::kernel::continuation::CarrierWaitService>,
-    thread: crate::kernel::ThreadRef,
-    generation: crate::kernel::objects::ExecutionGeneration,
+    scheduler: Arc<carrick_kernel::kernel::Scheduler>,
+    wait_service: Arc<carrick_kernel::kernel::continuation::CarrierWaitService>,
+    thread: carrick_kernel::kernel::ThreadRef,
+    generation: carrick_kernel::kernel::objects::ExecutionGeneration,
     armed: bool,
 }
 
@@ -5243,7 +5272,7 @@ impl PreparedInitialHandoff {
         let _ = self.scheduler.fail_runnable_exact(
             self.thread.key(),
             self.generation,
-            crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+            carrick_kernel::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
         );
         self.armed = false;
     }
@@ -5263,7 +5292,7 @@ pub(crate) fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
     kernel: &Kernel,
     engine: &mut E,
     kicker: &Arc<dyn VcpuRegistry>,
-    linux_tid: crate::kernel::LinuxTid,
+    linux_tid: carrick_kernel::kernel::LinuxTid,
     this_tid: ThreadId,
 ) -> Result<PreparedInitialHandoff, RuntimeError> {
     let context = kernel
@@ -5324,7 +5353,7 @@ pub(crate) fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
     let cpu = engine
         .save_initial_runner_state()
         .map_err(RuntimeError::Trap)?;
-    let state = crate::kernel::objects::MigratableTaskState {
+    let state = carrick_kernel::kernel::objects::MigratableTaskState {
         cpu,
         mm,
         asid_generation,
@@ -5496,20 +5525,20 @@ mod tests {
         );
     }
 
-    fn alias_context(pid: i32) -> crate::kernel::KernelContext {
-        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+    fn alias_context(pid: i32) -> carrick_kernel::kernel::KernelContext {
+        let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             pid,
             ThreadId::synthetic_for_tests(pid),
             "alias-inventory".to_owned(),
         )
         .expect("root bootstrap");
-        crate::kernel::Kernel::bootstrap_root(bootstrap)
+        carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap)
             .expect("root kernel")
             .1
     }
 
     fn mock_alias_commit(
-        context: &crate::kernel::KernelContext,
+        context: &carrick_kernel::kernel::KernelContext,
     ) -> carrick_hal::FrameInventoryCommit<()> {
         let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).expect("capacity");
         let mut reservation = context
@@ -5605,7 +5634,7 @@ mod tests {
         let mm = context.shared().mm().id();
         context
             .thread()
-            .publish_initial_task_state(crate::kernel::objects::MigratableTaskState {
+            .publish_initial_task_state(carrick_kernel::kernel::objects::MigratableTaskState {
                 cpu: carrick_hal::threaded::GuestCpuState::from_aarch64_v1(
                     carrick_hal::threaded::Aarch64TaskCpuStateV1 {
                         gprs: [0; 31],
@@ -5647,9 +5676,9 @@ mod tests {
                 asid_generation: mm.raw(),
             })
             .expect("initial scheduler state");
-        let scheduler = Arc::new(crate::kernel::scheduler::Scheduler::new(Arc::clone(
-            context.kernel(),
-        )));
+        let scheduler = Arc::new(carrick_kernel::kernel::scheduler::Scheduler::new(
+            Arc::clone(context.kernel()),
+        ));
         let directory = HvpatchRuntimeDirectory::default();
         directory
             .install_scheduler(Arc::clone(&scheduler))
@@ -5681,7 +5710,7 @@ mod tests {
         );
         assert!(matches!(
             context.thread().execution_state(),
-            crate::kernel::objects::ThreadExecutionState::Runnable { .. }
+            carrick_kernel::kernel::objects::ThreadExecutionState::Runnable { .. }
         ));
     }
 
@@ -5689,9 +5718,9 @@ mod tests {
     fn installed_scheduler_rejection_never_falls_back_to_broad_task_wake_authority() {
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().expect("task context");
-        let scheduler = Arc::new(crate::kernel::scheduler::Scheduler::new(Arc::clone(
-            context.kernel(),
-        )));
+        let scheduler = Arc::new(carrick_kernel::kernel::scheduler::Scheduler::new(
+            Arc::clone(context.kernel()),
+        ));
         let directory = HvpatchRuntimeDirectory::default();
         directory
             .install_scheduler(scheduler)
@@ -5958,7 +5987,7 @@ mod tests {
                 runtime.persistent_bindings().as_ref(),
                 &scheduler,
                 running,
-                crate::kernel::objects::ExecutionFailure::SnapshotRestoreFailed,
+                carrick_kernel::kernel::objects::ExecutionFailure::SnapshotRestoreFailed,
             )
             .is_none(),
             "exact failure settlement itself must succeed",
@@ -6492,8 +6521,10 @@ mod tests {
                 wake_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }),
         );
-        let mut memory =
-            crate::dispatch::LinearMemory::new(clear_address, owner.raw().to_le_bytes().to_vec());
+        let mut memory = carrick_kernel::dispatch::LinearMemory::new(
+            clear_address,
+            owner.raw().to_le_bytes().to_vec(),
+        );
 
         threads::clear_persistent_child_tid_and_wake(&mut memory, &registry, &futex, owner);
 
@@ -6600,7 +6631,7 @@ mod tests {
     #[test]
     fn fork_barrier_raise_uses_durable_threads_when_sibling_owns_no_executor() {
         let (process, root) = crate::hvpatch::process_context_for_tests(70_100);
-        let plan = crate::kernel::ClonePlan::from_flags(
+        let plan = carrick_kernel::kernel::ClonePlan::from_flags(
             carrick_abi::LinuxCloneFlags::THREAD
                 | carrick_abi::LinuxCloneFlags::SIGHAND
                 | carrick_abi::LinuxCloneFlags::VM,
@@ -6771,8 +6802,8 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn registration_test_exec_work() -> crate::kernel::control::ExecWork {
-        use crate::kernel::control::{
+    fn registration_test_exec_work() -> carrick_kernel::kernel::control::ExecWork {
+        use carrick_kernel::kernel::control::{
             CarrierExecAdmission, ControlNonce, ControlTaskKey, ExecAttach, ExecCapability,
             ExecRequest, ExecRuntime, ExecStatus,
         };
@@ -6809,7 +6840,7 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn registration_test_retry_phase(
-        external_exec: Option<crate::kernel::control::ExecWork>,
+        external_exec: Option<carrick_kernel::kernel::control::ExecWork>,
     ) -> HvpatchProductionPhase {
         HvpatchProductionPhase::RetryProcessFork {
             frame: None,
@@ -6835,7 +6866,7 @@ mod tests {
     #[test]
     fn census_admission_precedes_registry_publication() {
         let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
-        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().expect("task context");
         let thread = context.thread().clone();
@@ -6884,7 +6915,7 @@ mod tests {
 
     #[test]
     fn failed_crash_admission_suppresses_registry_publication() {
-        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().expect("task context");
         let thread = context.thread().clone();
@@ -6898,7 +6929,7 @@ mod tests {
                 register_called.store(true, std::sync::atomic::Ordering::Release);
                 panic!("failed admission must not invoke registry publication")
             }),
-            Err(crate::kernel::GuestExecutorCensusError::CrashParticipationAlreadyActive {
+            Err(carrick_kernel::kernel::GuestExecutorCensusError::CrashParticipationAlreadyActive {
                 thread: rejected
             }) if rejected == thread.key()
         ));
@@ -6910,7 +6941,7 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn fork_owner_registration_ignores_raised_barrier_and_preserves_phase() {
         let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
-        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
         let owner = ThreadId::synthetic_for_tests(70_203);
         let barrier = Arc::new(crate::fork_quiesce::QuiesceBarrier::new());
         assert!(barrier.try_begin_fork());
@@ -6956,7 +6987,9 @@ mod tests {
             .thread()
             .publish_initial_task_state(executor::tests::task_state(&context, 204))
             .expect("publish test task state");
-        let scheduler = Arc::new(crate::kernel::Scheduler::new(Arc::clone(context.kernel())));
+        let scheduler = Arc::new(carrick_kernel::kernel::Scheduler::new(Arc::clone(
+            context.kernel(),
+        )));
         scheduler
             .make_runnable(context.thread().key())
             .expect("queue test thread");
@@ -7012,7 +7045,9 @@ mod tests {
             .thread()
             .publish_initial_task_state(executor::tests::task_state(&context, 206))
             .expect("publish test task state");
-        let scheduler = Arc::new(crate::kernel::Scheduler::new(Arc::clone(context.kernel())));
+        let scheduler = Arc::new(carrick_kernel::kernel::Scheduler::new(Arc::clone(
+            context.kernel(),
+        )));
         scheduler
             .make_runnable(context.thread().key())
             .expect("queue test thread");
@@ -7336,7 +7371,7 @@ mod tests {
         };
         let deferred = DeferredResumeBlocked::capture(
             &original,
-            Some(crate::kernel::objects::BlockedReason::HostWait),
+            Some(carrick_kernel::kernel::objects::BlockedReason::HostWait),
         )
         .expect("capture ResumeBlocked");
         let mut after_peer_publication = HvpatchProductionPhase::Resident;
@@ -7358,7 +7393,7 @@ mod tests {
         let retry_token = carry_retry_token(
             DeferredResumeBlocked::capture(
                 &original,
-                Some(crate::kernel::objects::BlockedReason::HostWait),
+                Some(carrick_kernel::kernel::objects::BlockedReason::HostWait),
             )
             .expect("capture ResumeBlocked"),
         );
@@ -7397,7 +7432,7 @@ mod tests {
     #[test]
     fn persistent_exec_stop_control_wakes_unreleased_vfork_parent_without_guest_readiness() {
         let (process, root) = crate::hvpatch::process_context_for_tests(70_103);
-        let plan = crate::kernel::ClonePlan::from_flags(
+        let plan = carrick_kernel::kernel::ClonePlan::from_flags(
             carrick_abi::LinuxCloneFlags::THREAD
                 | carrick_abi::LinuxCloneFlags::SIGHAND
                 | carrick_abi::LinuxCloneFlags::VM,
@@ -7424,7 +7459,7 @@ mod tests {
             .thread()
             .publish_initial_task_state(sibling_state)
             .expect("publish sibling state");
-        let executor = crate::kernel::objects::ExecutorId::for_transitional_thread(
+        let executor = carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(
             ThreadId::synthetic_for_tests(71),
         )
         .expect("test executor");
@@ -7436,7 +7471,7 @@ mod tests {
             .kernel_graph()
             .reserve_fork(
                 &root,
-                crate::kernel::ClonePlan::from_flags(
+                carrick_kernel::kernel::ClonePlan::from_flags(
                     carrick_abi::LinuxCloneFlags::VFORK | carrick_abi::LinuxCloneFlags::VM,
                 )
                 .expect("vfork plan"),
@@ -7453,22 +7488,23 @@ mod tests {
             .task_binding()
             .capture(root.thread().key().tid)
             .expect("recapture vfork parent");
-        let continuation = crate::kernel::continuation::BlockedContinuation::from_vfork_parent(
-            crate::kernel::continuation::ContinuationCapture::from_lease(
-                &current,
-                &lease,
-                SyscallRequest::new(220, crate::compat::SyscallArgs([0; 6])),
-                crate::kernel::continuation::RestartClass::RestartSyscall,
+        let continuation =
+            carrick_kernel::kernel::continuation::BlockedContinuation::from_vfork_parent(
+                carrick_kernel::kernel::continuation::ContinuationCapture::from_lease(
+                    &current,
+                    &lease,
+                    SyscallRequest::new(220, crate::compat::SyscallArgs([0; 6])),
+                    carrick_kernel::kernel::continuation::RestartClass::RestartSyscall,
+                )
+                .expect("capture vfork parent"),
+                vfork_child.task().key(),
+                vfork_wait.expect("vfork parent wait"),
             )
-            .expect("capture vfork parent"),
-            vfork_child.task().key(),
-            vfork_wait.expect("vfork parent wait"),
-        )
-        .expect("construct vfork parent continuation");
+            .expect("construct vfork parent continuation");
         root.thread()
             .scheduler_park_continuation_from_executor(
                 lease,
-                crate::kernel::objects::BlockedReason::ChildState,
+                carrick_kernel::kernel::objects::BlockedReason::ChildState,
                 continuation,
             )
             .map_err(|(error, _)| error)
@@ -7485,7 +7521,7 @@ mod tests {
 
         assert!(matches!(
             root.thread().execution_state(),
-            crate::kernel::objects::ThreadExecutionState::Runnable { .. }
+            carrick_kernel::kernel::objects::ThreadExecutionState::Runnable { .. }
         ));
         assert_eq!(scheduler.queued_len(), 1);
         let claimed = root

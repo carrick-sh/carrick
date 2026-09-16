@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 pub(crate) mod dns;
 pub mod interposer;
 pub mod inzone;
-pub(crate) mod model;
+pub mod model;
 pub mod socket_namespace;
 
 pub use interposer::{
@@ -447,7 +447,7 @@ pub fn select_provider(spec: &NetworkNamespaceSpec) -> Box<dyn NetworkProvider> 
 
 pub struct RuntimeNetwork {
     pub spec: NetworkNamespaceSpec,
-    pub(crate) model: model::LinuxNetworkModel,
+    pub model: model::LinuxNetworkModel,
     pub provider: Box<dyn NetworkProvider>,
     pub lease: NetworkLease,
     #[allow(dead_code)]

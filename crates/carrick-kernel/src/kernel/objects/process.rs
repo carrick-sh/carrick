@@ -95,7 +95,7 @@ impl Mm {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(in crate::kernel) fn new_reference_for_fork(id: MmId, parent: &Self) -> Self {
         Self {
             id,
@@ -255,11 +255,11 @@ impl Mm {
         self.id
     }
 
-    pub(crate) fn backend(&self) -> Option<&Arc<dyn MmBackend>> {
+    pub fn backend(&self) -> Option<&Arc<dyn MmBackend>> {
         self.backend.as_ref()
     }
 
-    pub(crate) fn install_foreign_mm_endpoint<I: carrick_hal::stage1_mm::ForeignMmInstaller>(
+    pub fn install_foreign_mm_endpoint<I: carrick_hal::stage1_mm::ForeignMmInstaller>(
         &self,
         endpoint: carrick_hal::ForeignMmEndpoint,
         _permit: &I::InstallPermit,
@@ -267,11 +267,8 @@ impl Mm {
         *self.foreign_mm_endpoint.write() = Some(endpoint);
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_foreign_mm_endpoint_for_test(
-        &self,
-        endpoint: carrick_hal::ForeignMmEndpoint,
-    ) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_foreign_mm_endpoint_for_test(&self, endpoint: carrick_hal::ForeignMmEndpoint) {
         *self.foreign_mm_endpoint.write() = Some(endpoint);
     }
 
@@ -285,9 +282,7 @@ impl Mm {
             .map(|endpoint| endpoint.clone())
     }
 
-    pub(crate) fn install_foreign_mm_mutation_authority<
-        I: carrick_hal::stage1_mm::ForeignMmInstaller,
-    >(
+    pub fn install_foreign_mm_mutation_authority<I: carrick_hal::stage1_mm::ForeignMmInstaller>(
         &self,
         authority: crate::dispatch::mm_mutation::ForeignMmMutationAuthority,
         _permit: &I::InstallPermit,
@@ -295,8 +290,8 @@ impl Mm {
         *self.foreign_mm_mutation.write() = Some(authority);
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_foreign_mm_mutation_authority_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_foreign_mm_mutation_authority_for_test(
         &self,
         authority: crate::dispatch::mm_mutation::ForeignMmMutationAuthority,
     ) {
@@ -340,7 +335,7 @@ impl std::fmt::Debug for Mm {
     }
 }
 
-pub(crate) struct MmLegacyAioWriteGuard<'a> {
+pub struct MmLegacyAioWriteGuard<'a> {
     guard: RwLockWriteGuard<'a, BTreeSet<crate::dispatch::LegacyAioContextId>>,
     revision: &'a ObjectRevision,
 }

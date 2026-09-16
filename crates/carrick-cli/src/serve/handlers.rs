@@ -28,7 +28,7 @@ pub(crate) fn info_json() -> String {
         operating_system: "carrick (HVF)".to_string(),
         os_type: "linux".to_string(),
         architecture: "arm64".to_string(),
-        containers: carrick_runtime::container::list().len() as i64,
+        containers: carrick_kernel::container::list().len() as i64,
         images: carrick_image::ImageStore::default_for_user()
             .list_images()
             .len() as i64,
@@ -146,7 +146,7 @@ pub(crate) fn create_container(body: &[u8], name: Option<&str>) -> (u16, String)
         // `Id` is always that id, not the (optional) name.
         Ok(id) => {
             if !network.attachments.is_empty() {
-                let attach_result = carrick_runtime::container::ContainerState::load(&id)
+                let attach_result = carrick_kernel::container::ContainerState::load(&id)
                     .map_err(anyhow::Error::from)
                     .and_then(|state| {
                         crate::serve::resources::attach_container_to_networks(&state)
@@ -171,7 +171,7 @@ pub(crate) fn create_container(body: &[u8], name: Option<&str>) -> (u16, String)
 struct CreateNetworkSelection {
     cli_mode: Option<String>,
     api_network_mode: Option<String>,
-    attachments: Vec<carrick_runtime::container::NetworkAttachment>,
+    attachments: Vec<carrick_kernel::container::NetworkAttachment>,
     network_container: Option<String>,
 }
 
@@ -332,9 +332,9 @@ fn create_network_selection(
                 .strip_prefix("container:")
                 .filter(|target| !target.is_empty())
                 .ok_or_else(|| "network mode \"container\" requires a target".to_string())?;
-            let target_id = carrick_runtime::container::resolve(target)
+            let target_id = carrick_kernel::container::resolve(target)
                 .map_err(|_| format!("No such container: {target}"))?;
-            let target_state = carrick_runtime::container::ContainerState::load(&target_id)
+            let target_state = carrick_kernel::container::ContainerState::load(&target_id)
                 .map_err(|e| e.to_string())?;
             Ok(CreateNetworkSelection {
                 cli_mode: Some(effective_cli_network_mode(&target_state).to_string()),
@@ -347,7 +347,7 @@ fn create_network_selection(
             let attachments = if has_endpoint {
                 primary_network_first(endpoint_attachments, mode)
             } else {
-                vec![carrick_runtime::container::NetworkAttachment {
+                vec![carrick_kernel::container::NetworkAttachment {
                     name: mode.to_string(),
                     aliases: Vec::new(),
                     links: Vec::new(),
@@ -389,7 +389,7 @@ fn create_network_selection(
     }
 }
 
-fn effective_cli_network_mode(state: &carrick_runtime::container::ContainerState) -> &'static str {
+fn effective_cli_network_mode(state: &carrick_kernel::container::ContainerState) -> &'static str {
     match state.config.network {
         carrick_spec::NetworkMode::Bridge => "bridge",
         carrick_spec::NetworkMode::Host => "host",
@@ -399,7 +399,7 @@ fn effective_cli_network_mode(state: &carrick_runtime::container::ContainerState
 
 fn create_network_attachments(
     networking: Option<&CreateNetworkingConfig>,
-) -> Vec<carrick_runtime::container::NetworkAttachment> {
+) -> Vec<carrick_kernel::container::NetworkAttachment> {
     let Some(endpoints) = networking.and_then(|n| n.endpoints_config.as_ref()) else {
         return Vec::new();
     };
@@ -408,7 +408,7 @@ fn create_network_attachments(
     entries
         .into_iter()
         .map(
-            |(name, endpoint)| carrick_runtime::container::NetworkAttachment {
+            |(name, endpoint)| carrick_kernel::container::NetworkAttachment {
                 name: name.clone(),
                 aliases: endpoint.aliases.clone().unwrap_or_default(),
                 links: endpoint.links.clone().unwrap_or_default(),
@@ -434,9 +434,9 @@ fn create_network_attachments(
 }
 
 fn primary_network_first(
-    mut attachments: Vec<carrick_runtime::container::NetworkAttachment>,
+    mut attachments: Vec<carrick_kernel::container::NetworkAttachment>,
     primary: &str,
-) -> Vec<carrick_runtime::container::NetworkAttachment> {
+) -> Vec<carrick_kernel::container::NetworkAttachment> {
     let primary_name = crate::serve::resources::resolve_network_name(primary)
         .unwrap_or_else(|| primary.to_string());
     if let Some(index) = attachments
@@ -484,7 +484,7 @@ pub(crate) fn wait_container_stream(id: String) -> Response<crate::serve::router
         )
     };
 
-    let real_id = match carrick_runtime::container::resolve(&id) {
+    let real_id = match carrick_kernel::container::resolve(&id) {
         Ok(real_id) => real_id,
         Err(e) => {
             return Response::builder()
@@ -499,7 +499,7 @@ pub(crate) fn wait_container_stream(id: String) -> Response<crate::serve::router
         }
     };
 
-    let state_for_cleanup = carrick_runtime::container::ContainerState::load(&real_id).ok();
+    let state_for_cleanup = carrick_kernel::container::ContainerState::load(&real_id).ok();
     let expected_terminal_control = state_for_cleanup.as_ref().and_then(|state| {
         state
             .control
@@ -532,27 +532,27 @@ pub(crate) fn wait_container_stream(id: String) -> Response<crate::serve::router
 
 fn cleanup_api_auto_remove(
     id: &str,
-    expected: &carrick_runtime::container::CarrierControlState,
+    expected: &carrick_kernel::container::CarrierControlState,
 ) -> anyhow::Result<bool> {
-    let _lifecycle_lock = carrick_runtime::container::lock_lifecycle(id)?;
-    let current = carrick_runtime::container::ContainerState::load(id)?;
-    if current.status != carrick_runtime::container::ContainerStatus::Exited
+    let _lifecycle_lock = carrick_kernel::container::lock_lifecycle(id)?;
+    let current = carrick_kernel::container::ContainerState::load(id)?;
+    if current.status != carrick_kernel::container::ContainerStatus::Exited
         || current.terminal_control.as_ref() != Some(expected)
         || !current.api_auto_remove
     {
         return Ok(false);
     }
     crate::serve::resources::detach_container_from_all_networks(&current);
-    carrick_runtime::container::ContainerState::remove(id)?;
-    carrick_runtime::container::clear_terminal_receipt(id)?;
+    carrick_kernel::container::ContainerState::remove(id)?;
+    carrick_kernel::container::clear_terminal_receipt(id)?;
     Ok(true)
 }
 
 /// Docker returns 204 No Content on a successful remove.
 pub(crate) fn remove_container(id: &str, force: bool, remove_volumes: bool) -> (u16, String) {
-    let state = carrick_runtime::container::resolve(id)
+    let state = carrick_kernel::container::resolve(id)
         .ok()
-        .and_then(|real| carrick_runtime::container::ContainerState::load(&real).ok());
+        .and_then(|real| carrick_kernel::container::ContainerState::load(&real).ok());
     match crate::serve::spawn::remove_container(id, force) {
         Ok(()) => {
             if let Some(state) = state.as_ref() {
@@ -580,18 +580,18 @@ pub(crate) fn error_json(msg: &str) -> String {
 
 pub(crate) fn list_containers(all: bool, query: &str) -> (u16, String) {
     let filters = crate::serve::resources::docker_filters(query);
-    let mut containers = carrick_runtime::container::list();
+    let mut containers = carrick_kernel::container::list();
     // Stable, newest-first by creation time.
     containers.sort_by_key(|c| std::cmp::Reverse(c.created_secs));
 
     let rows: Vec<ContainerSummary> = containers
         .iter()
         .filter_map(|c| {
-            let status = carrick_runtime::container::reconciled_status(c);
+            let status = carrick_kernel::container::reconciled_status(c);
             let state_str = match status {
-                carrick_runtime::container::ContainerStatus::Created => "created",
-                carrick_runtime::container::ContainerStatus::Running => "running",
-                carrick_runtime::container::ContainerStatus::Exited => "exited",
+                carrick_kernel::container::ContainerStatus::Created => "created",
+                carrick_kernel::container::ContainerStatus::Running => "running",
+                carrick_kernel::container::ContainerStatus::Exited => "exited",
             };
             if !container_matches_filters(c, state_str, &filters)
                 || (!all && state_str != "running")
@@ -599,14 +599,14 @@ pub(crate) fn list_containers(all: bool, query: &str) -> (u16, String) {
                 return None;
             }
             let status_str = match status {
-                carrick_runtime::container::ContainerStatus::Created => "Created".to_string(),
-                carrick_runtime::container::ContainerStatus::Running => {
+                carrick_kernel::container::ContainerStatus::Created => "Created".to_string(),
+                carrick_kernel::container::ContainerStatus::Running => {
                     format!(
                         "Up {}",
                         crate::runtime_util::human_age(c.created_secs).trim_end_matches(" ago")
                     )
                 }
-                carrick_runtime::container::ContainerStatus::Exited => format!(
+                carrick_kernel::container::ContainerStatus::Exited => format!(
                     "Exited ({}) {}",
                     c.exit_code.unwrap_or(0),
                     crate::runtime_util::human_age(c.created_secs)
@@ -641,7 +641,7 @@ pub(crate) fn list_containers(all: bool, query: &str) -> (u16, String) {
 }
 
 fn container_matches_filters(
-    c: &carrick_runtime::container::ContainerState,
+    c: &carrick_kernel::container::ContainerState,
     status: &str,
     filters: &HashMap<String, Vec<String>>,
 ) -> bool {
@@ -659,7 +659,7 @@ fn container_matches_filters(
     })
 }
 
-fn container_name_matches(c: &carrick_runtime::container::ContainerState, value: &str) -> bool {
+fn container_name_matches(c: &carrick_kernel::container::ContainerState, value: &str) -> bool {
     if c.id.starts_with(value) {
         return true;
     }
@@ -667,7 +667,7 @@ fn container_name_matches(c: &carrick_runtime::container::ContainerState, value:
     name.contains(value) || format!("/{name}").contains(value)
 }
 
-fn container_network_matches(c: &carrick_runtime::container::ContainerState, value: &str) -> bool {
+fn container_network_matches(c: &carrick_kernel::container::ContainerState, value: &str) -> bool {
     if c.config.network_container.is_some() {
         return false;
     }
@@ -687,7 +687,7 @@ fn container_network_matches(c: &carrick_runtime::container::ContainerState, val
     }
 }
 
-fn container_network_mode(c: &carrick_runtime::container::ContainerState) -> String {
+fn container_network_mode(c: &carrick_kernel::container::ContainerState) -> String {
     if let Some(target) = c.config.network_container.as_deref() {
         return format!("container:{target}");
     }
@@ -706,7 +706,7 @@ fn container_network_mode(c: &carrick_runtime::container::ContainerState) -> Str
 }
 
 fn container_networks(
-    c: &carrick_runtime::container::ContainerState,
+    c: &carrick_kernel::container::ContainerState,
 ) -> std::collections::HashMap<String, EndpointSettings> {
     if c.config.network_container.is_some() {
         return std::collections::HashMap::new();
@@ -755,7 +755,7 @@ fn container_networks(
     std::collections::HashMap::new()
 }
 
-fn has_no_effective_network_endpoint(c: &carrick_runtime::container::ContainerState) -> bool {
+fn has_no_effective_network_endpoint(c: &carrick_kernel::container::ContainerState) -> bool {
     c.config.network == carrick_spec::NetworkMode::None
         && c.config.network_attachments.is_empty()
         && c.config
@@ -785,8 +785,8 @@ impl EndpointView {
     }
 }
 
-impl From<&carrick_runtime::container::NetworkAttachment> for EndpointView {
-    fn from(attachment: &carrick_runtime::container::NetworkAttachment) -> Self {
+impl From<&carrick_kernel::container::NetworkAttachment> for EndpointView {
+    fn from(attachment: &carrick_kernel::container::NetworkAttachment) -> Self {
         Self {
             aliases: Some(attachment.aliases.clone()),
             links: Some(attachment.links.clone()),
@@ -801,7 +801,7 @@ impl From<&carrick_runtime::container::NetworkAttachment> for EndpointView {
 }
 
 fn endpoint_settings(
-    c: &carrick_runtime::container::ContainerState,
+    c: &carrick_kernel::container::ContainerState,
     network_name: &str,
     endpoint: EndpointView,
 ) -> EndpointSettings {
@@ -866,7 +866,7 @@ fn endpoint_ipam_config(
 }
 
 fn endpoint_dns_names(
-    c: &carrick_runtime::container::ContainerState,
+    c: &carrick_kernel::container::ContainerState,
     network_name: &str,
     aliases: Option<&[String]>,
 ) -> Option<Vec<String>> {
@@ -892,7 +892,7 @@ fn endpoint_dns_names(
 }
 
 fn container_summary_ports(
-    c: &carrick_runtime::container::ContainerState,
+    c: &carrick_kernel::container::ContainerState,
 ) -> Vec<serde_json::Value> {
     if matches!(
         c.config.network,
@@ -929,15 +929,15 @@ fn port_protocol_str(protocol: carrick_spec::PortProtocol) -> &'static str {
 }
 
 pub(crate) fn inspect_container(id: &str) -> (u16, String) {
-    let real = match carrick_runtime::container::resolve(id) {
+    let real = match carrick_kernel::container::resolve(id) {
         Ok(r) => r,
         Err(e) => return (404, error_json(&e)),
     };
-    let state = match carrick_runtime::container::ContainerState::load(&real) {
+    let state = match carrick_kernel::container::ContainerState::load(&real) {
         Ok(s) => s,
         Err(e) => return (500, error_json(&e.to_string())),
     };
-    let status = carrick_runtime::container::reconciled_status(&state);
+    let status = carrick_kernel::container::reconciled_status(&state);
     let json_val = crate::lifecycle::container_to_json(&state, status);
     (
         200,
@@ -976,11 +976,11 @@ struct ContainerEventSnapshot {
     name: String,
     image: String,
     labels: HashMap<String, String>,
-    status: carrick_runtime::container::ContainerStatus,
+    status: carrick_kernel::container::ContainerStatus,
 }
 
 impl ContainerEventSnapshot {
-    fn from_state(state: &carrick_runtime::container::ContainerState) -> Self {
+    fn from_state(state: &carrick_kernel::container::ContainerState) -> Self {
         Self {
             id: state.id.clone(),
             name: state
@@ -989,7 +989,7 @@ impl ContainerEventSnapshot {
                 .unwrap_or_else(|| state.id[..12].to_string()),
             image: state.image.clone(),
             labels: state.labels.clone(),
-            status: carrick_runtime::container::reconciled_status(state),
+            status: carrick_kernel::container::reconciled_status(state),
         }
     }
 }
@@ -1042,19 +1042,19 @@ async fn run_events_task(
 }
 
 fn current_event_snapshots() -> Vec<ContainerEventSnapshot> {
-    carrick_runtime::container::list()
+    carrick_kernel::container::list()
         .iter()
         .map(ContainerEventSnapshot::from_state)
         .collect()
 }
 
 fn event_action_for_status(
-    status: carrick_runtime::container::ContainerStatus,
+    status: carrick_kernel::container::ContainerStatus,
 ) -> Option<&'static str> {
     match status {
-        carrick_runtime::container::ContainerStatus::Created => Some("create"),
-        carrick_runtime::container::ContainerStatus::Running => Some("start"),
-        carrick_runtime::container::ContainerStatus::Exited => Some("die"),
+        carrick_kernel::container::ContainerStatus::Created => Some("create"),
+        carrick_kernel::container::ContainerStatus::Running => Some("start"),
+        carrick_kernel::container::ContainerStatus::Exited => Some("die"),
     }
 }
 
@@ -1145,11 +1145,11 @@ pub(crate) fn restart_container(id: &str, time: Option<u64>) -> (u16, String) {
 }
 
 pub(crate) fn resize_container_tty(id: &str) -> (u16, String) {
-    let real = match carrick_runtime::container::resolve(id) {
+    let real = match carrick_kernel::container::resolve(id) {
         Ok(r) => r,
         Err(e) => return (404, error_json(&e)),
     };
-    match carrick_runtime::container::ContainerState::load(&real) {
+    match carrick_kernel::container::ContainerState::load(&real) {
         Ok(_) => (200, String::new()),
         Err(e) => (500, error_json(&e.to_string())),
     }
@@ -1173,7 +1173,7 @@ pub(crate) fn logs_container(
         )
     };
 
-    let real_id = match carrick_runtime::container::resolve(&id) {
+    let real_id = match carrick_kernel::container::resolve(&id) {
         Ok(r) => r,
         Err(e) => {
             return Response::builder()
@@ -1187,7 +1187,7 @@ pub(crate) fn logs_container(
         }
     };
 
-    let state = match carrick_runtime::container::ContainerState::load(&real_id) {
+    let state = match carrick_kernel::container::ContainerState::load(&real_id) {
         Ok(s) => s,
         Err(e) => {
             return Response::builder()
@@ -1202,7 +1202,7 @@ pub(crate) fn logs_container(
     };
 
     let tty = state.config.tty;
-    let path = match carrick_runtime::container::log_path(&real_id) {
+    let path = match carrick_kernel::container::log_path(&real_id) {
         Ok(p) => p,
         Err(e) => {
             return Response::builder()
@@ -1247,7 +1247,7 @@ pub(crate) async fn attach_container_route(
         )
     };
 
-    let real_id = match carrick_runtime::container::resolve(&id) {
+    let real_id = match carrick_kernel::container::resolve(&id) {
         Ok(r) => r,
         Err(e) => {
             return Response::builder()
@@ -1260,7 +1260,7 @@ pub(crate) async fn attach_container_route(
                 .unwrap_or_else(|_| fallback());
         }
     };
-    let state = match carrick_runtime::container::ContainerState::load(&real_id) {
+    let state = match carrick_kernel::container::ContainerState::load(&real_id) {
         Ok(s) => s,
         Err(e) => {
             return Response::builder()
@@ -1273,7 +1273,7 @@ pub(crate) async fn attach_container_route(
                 .unwrap_or_else(|_| fallback());
         }
     };
-    let path = match carrick_runtime::container::log_path(&real_id) {
+    let path = match carrick_kernel::container::log_path(&real_id) {
         Ok(p) => p,
         Err(e) => {
             return Response::builder()
@@ -1436,16 +1436,16 @@ struct DownloadedArchive {
 /// cannot pin the bounded table until expiry.
 struct ArchiveCapabilityGuard {
     real_id: String,
-    control: carrick_runtime::container::CarrierControlState,
-    capability: carrick_runtime::kernel::control::ArchiveCapability,
+    control: carrick_kernel::container::CarrierControlState,
+    capability: carrick_kernel::kernel::control::ArchiveCapability,
     armed: bool,
 }
 
 impl ArchiveCapabilityGuard {
     fn new(
         real_id: String,
-        control: carrick_runtime::container::CarrierControlState,
-        capability: carrick_runtime::kernel::control::ArchiveCapability,
+        control: carrick_kernel::container::CarrierControlState,
+        capability: carrick_kernel::kernel::control::ArchiveCapability,
     ) -> Self {
         Self {
             real_id,
@@ -1455,7 +1455,7 @@ impl ArchiveCapabilityGuard {
         }
     }
 
-    fn capability(&self) -> carrick_runtime::kernel::control::ArchiveCapability {
+    fn capability(&self) -> carrick_kernel::kernel::control::ArchiveCapability {
         self.capability
     }
 
@@ -1469,10 +1469,10 @@ impl Drop for ArchiveCapabilityGuard {
         if !self.armed {
             return;
         }
-        let _ = carrick_runtime::kernel::control::send(
+        let _ = carrick_kernel::kernel::control::send(
             &self.real_id,
             &self.control,
-            carrick_runtime::kernel::control::ControlOperation::ArchiveAbort {
+            carrick_kernel::kernel::control::ControlOperation::ArchiveAbort {
                 capability: self.capability,
             },
         );
@@ -1481,17 +1481,17 @@ impl Drop for ArchiveCapabilityGuard {
 
 fn archive_control_target(
     id: &str,
-) -> Result<(String, carrick_runtime::container::CarrierControlState), ArchiveHttpError> {
-    let real_id = carrick_runtime::container::resolve(id).map_err(|message| ArchiveHttpError {
+) -> Result<(String, carrick_kernel::container::CarrierControlState), ArchiveHttpError> {
+    let real_id = carrick_kernel::container::resolve(id).map_err(|message| ArchiveHttpError {
         status: StatusCode::NOT_FOUND,
         message,
     })?;
     let _lifecycle_lock =
-        carrick_runtime::container::lock_lifecycle(&real_id).map_err(|error| ArchiveHttpError {
+        carrick_kernel::container::lock_lifecycle(&real_id).map_err(|error| ArchiveHttpError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("lock container archive lifecycle: {error}"),
         })?;
-    let state = carrick_runtime::container::ContainerState::load(&real_id).map_err(|error| {
+    let state = carrick_kernel::container::ContainerState::load(&real_id).map_err(|error| {
         ArchiveHttpError {
             status: if error.kind() == std::io::ErrorKind::NotFound {
                 StatusCode::NOT_FOUND
@@ -1501,7 +1501,7 @@ fn archive_control_target(
             message: error.to_string(),
         }
     })?;
-    if state.status != carrick_runtime::container::ContainerStatus::Running {
+    if state.status != carrick_kernel::container::ContainerStatus::Running {
         return Err(ArchiveHttpError {
             status: StatusCode::CONFLICT,
             message: "stopped-container archive is unavailable: persisted state does not authenticate the exact writable upper and immutable lower filesystem authorities".to_owned(),
@@ -1515,12 +1515,12 @@ fn archive_control_target(
 }
 
 fn archive_metadata(id: &str, path: String) -> Result<String, ArchiveHttpError> {
-    use carrick_runtime::kernel::control::{ControlOperation, ControlOutcome};
+    use carrick_kernel::kernel::control::{ControlOperation, ControlOutcome};
 
     let (real_id, control) = archive_control_target(id)?;
-    let request = carrick_runtime::kernel::control::ArchiveRequest::new(path)
+    let request = carrick_kernel::kernel::control::ArchiveRequest::new(path)
         .map_err(archive_http_control_error)?;
-    let outcome = carrick_runtime::kernel::control::send(
+    let outcome = carrick_kernel::kernel::control::send(
         &real_id,
         &control,
         ControlOperation::ArchiveMetadata { request },
@@ -1536,12 +1536,12 @@ fn archive_metadata(id: &str, path: String) -> Result<String, ArchiveHttpError> 
 }
 
 fn download_archive(id: &str, path: String) -> Result<DownloadedArchive, ArchiveHttpError> {
-    use carrick_runtime::kernel::control::{ControlOperation, ControlOutcome};
+    use carrick_kernel::kernel::control::{ControlOperation, ControlOutcome};
 
     let (real_id, control) = archive_control_target(id)?;
-    let request = carrick_runtime::kernel::control::ArchiveRequest::new(path)
+    let request = carrick_kernel::kernel::control::ArchiveRequest::new(path)
         .map_err(archive_http_control_error)?;
-    let outcome = carrick_runtime::kernel::control::send(
+    let outcome = carrick_kernel::kernel::control::send(
         &real_id,
         &control,
         ControlOperation::ArchiveBeginRead { request },
@@ -1562,7 +1562,7 @@ fn download_archive(id: &str, path: String) -> Result<DownloadedArchive, Archive
         })?;
     let mut result = Vec::new();
     loop {
-        let outcome = carrick_runtime::kernel::control::send(
+        let outcome = carrick_kernel::kernel::control::send(
             &guard.real_id,
             &guard.control,
             ControlOperation::ArchiveReadChunk {
@@ -1572,7 +1572,7 @@ fn download_archive(id: &str, path: String) -> Result<DownloadedArchive, Archive
         .map_err(archive_http_transport_error)?;
         match outcome {
             ControlOutcome::ArchiveChunk { chunk } => {
-                if chunk.bytes.len() > carrick_runtime::kernel::control::MAX_ARCHIVE_CHUNK_BYTES
+                if chunk.bytes.len() > carrick_kernel::kernel::control::MAX_ARCHIVE_CHUNK_BYTES
                     || result.len().saturating_add(chunk.bytes.len())
                         > crate::serve::router::MAX_HTTP_ARCHIVE_BYTES
                     || (chunk.bytes.is_empty() && !chunk.eof)
@@ -1599,7 +1599,7 @@ fn download_archive(id: &str, path: String) -> Result<DownloadedArchive, Archive
 }
 
 fn docker_archive_stat_header(
-    metadata: &carrick_runtime::kernel::control::ArchiveMetadata,
+    metadata: &carrick_kernel::kernel::control::ArchiveMetadata,
 ) -> Result<String, String> {
     use base64::Engine as _;
 
@@ -1628,12 +1628,12 @@ fn docker_archive_stat_header(
 }
 
 fn upload_archive(id: &str, path: String, bytes: &[u8]) -> Result<(), ArchiveHttpError> {
-    use carrick_runtime::kernel::control::{ControlOperation, ControlOutcome};
+    use carrick_kernel::kernel::control::{ControlOperation, ControlOutcome};
 
     let (real_id, control) = archive_control_target(id)?;
-    let request = carrick_runtime::kernel::control::ArchiveRequest::new(path)
+    let request = carrick_kernel::kernel::control::ArchiveRequest::new(path)
         .map_err(archive_http_control_error)?;
-    let outcome = carrick_runtime::kernel::control::send(
+    let outcome = carrick_kernel::kernel::control::send(
         &real_id,
         &control,
         ControlOperation::ArchiveBeginWrite { request },
@@ -1645,7 +1645,7 @@ fn upload_archive(id: &str, path: String, bytes: &[u8]) -> Result<(), ArchiveHtt
     let mut guard = ArchiveCapabilityGuard::new(real_id, control, capability);
 
     if bytes.is_empty() {
-        let outcome = carrick_runtime::kernel::control::send(
+        let outcome = carrick_kernel::kernel::control::send(
             &guard.real_id,
             &guard.control,
             ControlOperation::ArchiveWriteChunk {
@@ -1665,12 +1665,12 @@ fn upload_archive(id: &str, path: String, bytes: &[u8]) -> Result<(), ArchiveHtt
     }
 
     for (index, chunk) in bytes
-        .chunks(carrick_runtime::kernel::control::MAX_ARCHIVE_CHUNK_BYTES)
+        .chunks(carrick_kernel::kernel::control::MAX_ARCHIVE_CHUNK_BYTES)
         .enumerate()
     {
         let eof =
-            (index + 1) * carrick_runtime::kernel::control::MAX_ARCHIVE_CHUNK_BYTES >= bytes.len();
-        let outcome = carrick_runtime::kernel::control::send(
+            (index + 1) * carrick_kernel::kernel::control::MAX_ARCHIVE_CHUNK_BYTES >= bytes.len();
+        let outcome = carrick_kernel::kernel::control::send(
             &guard.real_id,
             &guard.control,
             ControlOperation::ArchiveWriteChunk {
@@ -1701,9 +1701,9 @@ fn archive_http_transport_error(error: impl ToString) -> ArchiveHttpError {
 }
 
 fn archive_http_control_error(
-    error: carrick_runtime::kernel::control::ArchiveControlError,
+    error: carrick_kernel::kernel::control::ArchiveControlError,
 ) -> ArchiveHttpError {
-    use carrick_runtime::kernel::control::ArchiveControlError;
+    use carrick_kernel::kernel::control::ArchiveControlError;
     let status = match error {
         ArchiveControlError::InvalidPath | ArchiveControlError::InvalidArchive => {
             StatusCode::BAD_REQUEST
@@ -1723,9 +1723,9 @@ fn archive_http_control_error(
 }
 
 fn archive_http_outcome_error(
-    outcome: carrick_runtime::kernel::control::ControlOutcome,
+    outcome: carrick_kernel::kernel::control::ControlOutcome,
 ) -> ArchiveHttpError {
-    if let carrick_runtime::kernel::control::ControlOutcome::ArchiveError { error } = outcome {
+    if let carrick_kernel::kernel::control::ControlOutcome::ArchiveError { error } = outcome {
         archive_http_control_error(error)
     } else {
         ArchiveHttpError {
@@ -1789,7 +1789,7 @@ fn decode_archive_query_path(query: &str) -> Result<String, String> {
     }
     let path =
         String::from_utf8(decoded).map_err(|_| "archive path is not valid UTF-8".to_owned())?;
-    carrick_runtime::kernel::control::ArchiveRequest::new(path.clone())
+    carrick_kernel::kernel::control::ArchiveRequest::new(path.clone())
         .map_err(|error| error.to_string())?;
     Ok(path)
 }
@@ -1848,10 +1848,10 @@ async fn run_attach_task(
             offset = new_offset;
         }
 
-        match carrick_runtime::container::ContainerState::load(&id) {
+        match carrick_kernel::container::ContainerState::load(&id) {
             Ok(state) => {
-                if carrick_runtime::container::reconciled_status(&state)
-                    == carrick_runtime::container::ContainerStatus::Exited
+                if carrick_kernel::container::reconciled_status(&state)
+                    == carrick_kernel::container::ContainerStatus::Exited
                 {
                     if let Ok((new_data, _)) = read_appended_async(&path, offset).await
                         && !new_data.is_empty()
@@ -1964,7 +1964,7 @@ async fn run_logs_task(
         }
 
         // Check if init is still alive
-        let alive = match carrick_runtime::container::ContainerState::load(&id) {
+        let alive = match carrick_kernel::container::ContainerState::load(&id) {
             Ok(s) => s.init_alive(),
             Err(_) => false,
         };
@@ -2140,7 +2140,7 @@ pub(crate) struct ExecInstanceState {
     pub running: bool,
     pub exit_code: i64,
     pub pid: i64,
-    pub guest_result: Option<carrick_runtime::kernel::control::ExecResult>,
+    pub guest_result: Option<carrick_kernel::kernel::control::ExecResult>,
     pub transport_failed: bool,
 }
 
@@ -2258,7 +2258,7 @@ impl ExecApiRegistry {
     fn complete_guest(
         &mut self,
         id: &str,
-        result: carrick_runtime::kernel::control::ExecResult,
+        result: carrick_kernel::kernel::control::ExecResult,
         transport_failed: bool,
         now: std::time::Instant,
     ) -> bool {
@@ -2328,7 +2328,7 @@ pub(crate) fn create_exec(body: &[u8], container_id: &str) -> (u16, String) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let exec_id = carrick_runtime::container::make_id(std::process::id() as u64, entropy);
+    let exec_id = carrick_kernel::container::make_id(std::process::id() as u64, entropy);
 
     let config = ExecConfig {
         container_id: container_id.to_string(),
@@ -2542,7 +2542,7 @@ pub(crate) async fn start_exec_route(
 
 async fn run_exec_detached(
     config: ExecConfig,
-) -> anyhow::Result<carrick_runtime::kernel::control::ExecResult> {
+) -> anyhow::Result<carrick_kernel::kernel::control::ExecResult> {
     execute_noninteractive_config(config).await
 }
 
@@ -2568,7 +2568,7 @@ async fn run_exec_attached(
 
 async fn deliver_exec_result<W>(
     writer: &mut W,
-    result: &carrick_runtime::kernel::control::ExecResult,
+    result: &carrick_kernel::kernel::control::ExecResult,
 ) -> Option<anyhow::Error>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -2587,15 +2587,15 @@ where
 
 async fn execute_noninteractive_config(
     config: ExecConfig,
-) -> anyhow::Result<carrick_runtime::kernel::control::ExecResult> {
+) -> anyhow::Result<carrick_kernel::kernel::control::ExecResult> {
     if config.tty || config.interactive {
         anyhow::bail!(
             "interactive/TTY Docker exec is unavailable until carrier-control stdin and TTY framing is implemented"
         );
     }
     tokio::task::spawn_blocking(move || {
-        let state = carrick_runtime::container::ContainerState::load(&config.container_id)?;
-        if state.status != carrick_runtime::container::ContainerStatus::Running {
+        let state = carrick_kernel::container::ContainerState::load(&config.container_id)?;
+        if state.status != carrick_kernel::container::ContainerStatus::Running {
             anyhow::bail!("container is not running");
         }
         let request = crate::lifecycle::build_control_exec_request(
@@ -2672,7 +2672,7 @@ mod exec_control_tests {
             .build()
             .expect("tokio runtime");
         runtime.block_on(async {
-            let result = carrick_runtime::kernel::control::ExecResult {
+            let result = carrick_kernel::kernel::control::ExecResult {
                 exit_code: 42,
                 terminating_signal: None,
                 stdout: b"output".to_vec(),
@@ -2733,7 +2733,7 @@ mod exec_control_tests {
             "running entries must not be evicted to admit unbounded instances",
         );
 
-        let result = carrick_runtime::kernel::control::ExecResult {
+        let result = carrick_kernel::kernel::control::ExecResult {
             exit_code: 7,
             terminating_signal: None,
             stdout: Vec::new(),
@@ -2782,16 +2782,16 @@ mod archive_control_tests {
 
     #[test]
     fn stopped_archive_fails_closed_after_the_exact_lifecycle_lock() {
-        let id = carrick_runtime::container::make_id(
+        let id = carrick_kernel::container::make_id(
             u64::from(std::process::id()),
             0x0061_7263_6869_7665,
         );
-        let state = carrick_runtime::container::ContainerState {
+        let state = carrick_kernel::container::ContainerState {
             id: id.clone(),
             name: None,
             image: "archive-stopped-test".to_owned(),
             command: Vec::new(),
-            status: carrick_runtime::container::ContainerStatus::Exited,
+            status: carrick_kernel::container::ContainerStatus::Exited,
             supervisor_pid: 0,
             init_pid: 0,
             created_secs: 0,
@@ -2802,12 +2802,12 @@ mod archive_control_tests {
             control: None,
             terminal_control: None,
             launch_ticket: None,
-            config: carrick_runtime::container::RunConfig::default(),
+            config: carrick_kernel::container::RunConfig::default(),
         };
-        std::fs::create_dir_all(carrick_runtime::container::container_dir(&id))
+        std::fs::create_dir_all(carrick_kernel::container::container_dir(&id))
             .expect("create test container directory");
         state.persist().expect("persist stopped state");
-        let held = carrick_runtime::container::lock_lifecycle(&id).expect("hold lifecycle lock");
+        let held = carrick_kernel::container::lock_lifecycle(&id).expect("hold lifecycle lock");
         let thread_id = id.clone();
         let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
         let join = std::thread::spawn(move || {
@@ -2828,13 +2828,13 @@ mod archive_control_tests {
         assert_eq!(error.status, hyper::StatusCode::CONFLICT);
         assert!(error.message.contains("does not authenticate"));
         join.join().expect("archive thread");
-        carrick_runtime::container::ContainerState::remove(&id).expect("remove test state");
+        carrick_kernel::container::ContainerState::remove(&id).expect("remove test state");
     }
 
     #[test]
     fn docker_archive_stat_header_carries_exact_carrier_metadata() {
         let encoded =
-            docker_archive_stat_header(&carrick_runtime::kernel::control::ArchiveMetadata {
+            docker_archive_stat_header(&carrick_kernel::kernel::control::ArchiveMetadata {
                 name: "payload".to_owned(),
                 size: 7,
                 mode: 0o100640,
@@ -2944,24 +2944,24 @@ pub(crate) fn tag_image(source_name: &str, repo: &str, tag: &str) -> (u16, Strin
 
 /// `POST /containers/{id}/rename?name=new_name`: rename a container.
 pub(crate) fn rename_container(id: &str, new_name: &str) -> (u16, String) {
-    let real = match carrick_runtime::container::resolve(id) {
+    let real = match carrick_kernel::container::resolve(id) {
         Ok(r) => r,
         Err(e) => return (404, error_json(&e)),
     };
-    let _lifecycle_lock = match carrick_runtime::container::lock_lifecycle(&real) {
+    let _lifecycle_lock = match carrick_kernel::container::lock_lifecycle(&real) {
         Ok(lock) => lock,
         Err(e) => return (500, error_json(&e.to_string())),
     };
-    let _name_lock = match carrick_runtime::container::lock_name_registry() {
+    let _name_lock = match carrick_kernel::container::lock_name_registry() {
         Ok(lock) => lock,
         Err(e) => return (500, error_json(&e.to_string())),
     };
-    if let Ok(owner) = carrick_runtime::container::resolve(new_name)
+    if let Ok(owner) = carrick_kernel::container::resolve(new_name)
         && owner != real
     {
         return (409, error_json("container name is already in use"));
     }
-    let mut state = match carrick_runtime::container::ContainerState::load(&real) {
+    let mut state = match carrick_kernel::container::ContainerState::load(&real) {
         Ok(s) => s,
         Err(e) => return (500, error_json(&e.to_string())),
     };
@@ -2975,20 +2975,20 @@ pub(crate) fn rename_container(id: &str, new_name: &str) -> (u16, String) {
 /// `GET /containers/{id}/top`: list processes running inside the container.
 /// Runs `ps -eo pid,user,comm` in the container via `carrick exec`.
 pub(crate) fn top_container(id: &str) -> (u16, String) {
-    let real = match carrick_runtime::container::resolve(id) {
+    let real = match carrick_kernel::container::resolve(id) {
         Ok(r) => r,
         Err(e) => return (404, error_json(&e)),
     };
-    let state = match carrick_runtime::container::ContainerState::load(&real) {
+    let state = match carrick_kernel::container::ContainerState::load(&real) {
         Ok(s) => s,
         Err(e) => return (500, error_json(&e.to_string())),
     };
     if !state.init_alive() {
         return (409, error_json(&format!("Container {id} is not running")));
     }
-    let snapshot = match carrick_runtime::kernel::debug::fetch(
+    let snapshot = match carrick_kernel::kernel::debug::fetch(
         &real,
-        Some(vec![carrick_runtime::kernel::debug::KernelDebugTable::Task]),
+        Some(vec![carrick_kernel::kernel::debug::KernelDebugTable::Task]),
     ) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -3026,8 +3026,8 @@ pub(crate) fn top_container(id: &str) -> (u16, String) {
 mod lifecycle_transaction_tests {
     use super::*;
 
-    fn created_state(id: &str, name: &str) -> carrick_runtime::container::ContainerState {
-        let mut state: carrick_runtime::container::ContainerState = serde_json::from_str(
+    fn created_state(id: &str, name: &str) -> carrick_kernel::container::ContainerState {
+        let mut state: carrick_kernel::container::ContainerState = serde_json::from_str(
             r#"{"id":"placeholder","name":null,"image":"img","command":[],
                 "status":"created","supervisor_pid":0,"init_pid":0,"created_secs":0,
                 "exit_code":null,"auto_remove":false}"#,
@@ -3045,8 +3045,8 @@ mod lifecycle_transaction_tests {
         let second_id = format!("rename-second-{suffix}");
         let first_name = format!("rename-owned-{suffix}");
         let second_name = format!("rename-other-{suffix}");
-        let _ = carrick_runtime::container::ContainerState::remove(&first_id);
-        let _ = carrick_runtime::container::ContainerState::remove(&second_id);
+        let _ = carrick_kernel::container::ContainerState::remove(&first_id);
+        let _ = carrick_kernel::container::ContainerState::remove(&second_id);
         created_state(&first_id, &first_name)
             .create()
             .expect("first state");
@@ -3056,51 +3056,51 @@ mod lifecycle_transaction_tests {
 
         assert_eq!(rename_container(&second_id, &first_name).0, 409);
         assert_eq!(
-            carrick_runtime::container::ContainerState::load(&second_id)
+            carrick_kernel::container::ContainerState::load(&second_id)
                 .expect("preserved second")
                 .name
                 .as_deref(),
             Some(second_name.as_str())
         );
 
-        carrick_runtime::container::ContainerState::remove(&first_id).expect("release first name");
+        carrick_kernel::container::ContainerState::remove(&first_id).expect("release first name");
         assert_eq!(rename_container(&second_id, &first_name).0, 204);
         assert_eq!(
-            carrick_runtime::container::ContainerState::load(&second_id)
+            carrick_kernel::container::ContainerState::load(&second_id)
                 .expect("renamed second")
                 .name
                 .as_deref(),
             Some(first_name.as_str())
         );
-        let _ = carrick_runtime::container::ContainerState::remove(&second_id);
+        let _ = carrick_kernel::container::ContainerState::remove(&second_id);
     }
 
     #[test]
     fn api_auto_remove_requires_the_exact_terminal_incarnation() {
         let id = format!("api-auto-remove-exact-{}", std::process::id());
-        let _ = carrick_runtime::container::ContainerState::remove(&id);
-        let expected = carrick_runtime::container::CarrierControlState {
-            schema: carrick_runtime::kernel::control::CARRIER_CONTROL_STATE_SCHEMA.to_owned(),
-            owner_nonce: carrick_runtime::kernel::control::ControlNonce::fresh().expect("nonce"),
-            init: carrick_runtime::kernel::control::ControlTaskKey { pid: 1, serial: 8 },
+        let _ = carrick_kernel::container::ContainerState::remove(&id);
+        let expected = carrick_kernel::container::CarrierControlState {
+            schema: carrick_kernel::kernel::control::CARRIER_CONTROL_STATE_SCHEMA.to_owned(),
+            owner_nonce: carrick_kernel::kernel::control::ControlNonce::fresh().expect("nonce"),
+            init: carrick_kernel::kernel::control::ControlTaskKey { pid: 1, serial: 8 },
         };
-        let stale = carrick_runtime::container::CarrierControlState {
-            schema: carrick_runtime::kernel::control::CARRIER_CONTROL_STATE_SCHEMA.to_owned(),
-            owner_nonce: carrick_runtime::kernel::control::ControlNonce::fresh().expect("nonce"),
-            init: carrick_runtime::kernel::control::ControlTaskKey { pid: 1, serial: 7 },
+        let stale = carrick_kernel::container::CarrierControlState {
+            schema: carrick_kernel::kernel::control::CARRIER_CONTROL_STATE_SCHEMA.to_owned(),
+            owner_nonce: carrick_kernel::kernel::control::ControlNonce::fresh().expect("nonce"),
+            init: carrick_kernel::kernel::control::ControlTaskKey { pid: 1, serial: 7 },
         };
         let mut state = created_state(&id, "api-auto-remove");
-        state.status = carrick_runtime::container::ContainerStatus::Exited;
+        state.status = carrick_kernel::container::ContainerStatus::Exited;
         state.exit_code = Some(23);
         state.api_auto_remove = true;
         state.terminal_control = Some(expected.clone());
         state.create().expect("terminal state");
 
         assert!(!cleanup_api_auto_remove(&id, &stale).expect("stale cleanup rejected"));
-        assert!(carrick_runtime::container::ContainerState::load(&id).is_ok());
+        assert!(carrick_kernel::container::ContainerState::load(&id).is_ok());
         assert!(cleanup_api_auto_remove(&id, &expected).expect("exact cleanup"));
         assert_eq!(
-            carrick_runtime::container::ContainerState::load(&id)
+            carrick_kernel::container::ContainerState::load(&id)
                 .expect_err("exact cleanup removed state")
                 .kind(),
             std::io::ErrorKind::NotFound

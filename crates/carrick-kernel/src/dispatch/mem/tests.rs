@@ -65,7 +65,7 @@ fn locked_ranges_insert_keeps_the_set_sorted_and_merged() {
     );
 }
 
-pub(crate) struct CountingMmapMemory {
+pub struct CountingMmapMemory {
     pub(crate) defer_anon: bool,
     pub(crate) fail_protect_non_zero: Cell<bool>,
     pub(crate) base: u64,
@@ -196,7 +196,7 @@ impl GuestMemory for CountingMmapMemory {
 
 impl CurrentMmMemory for CountingMmapMemory {}
 
-pub(crate) struct Stage1MmapMemory {
+pub struct Stage1MmapMemory {
     inner: CountingMmapMemory,
     page_tables: carrick_mem::page_table::PageTableManager,
 }
@@ -271,7 +271,7 @@ impl GuestMemory for ConcurrentExecMemory {
 
 impl CurrentMmMemory for ConcurrentExecMemory {}
 
-pub(crate) struct ProtectionTrackingMemory {
+pub struct ProtectionTrackingMemory {
     pub(crate) inner: CountingMmapMemory,
     pub(crate) protections: carrick_guest_mem::protections::MemoryProtections,
     pub(crate) repoint_calls: usize,

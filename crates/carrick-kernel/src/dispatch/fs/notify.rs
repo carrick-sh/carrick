@@ -12,7 +12,7 @@ use crate::linux_abi::{
 use std::path::Path;
 use std::sync::Arc;
 
-pub(crate) struct ReadFanotifyRequest<'a, M> {
+pub struct ReadFanotifyRequest<'a, M> {
     pub(crate) context: &'a crate::kernel::KernelContext,
     pub(crate) registry: Option<&'a crate::thread::ThreadRegistry>,
     pub(crate) reporter: &'a CompatReporter,

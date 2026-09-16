@@ -11,10 +11,10 @@ use std::time::Duration;
 use carrick_fatal::carrick_fatal;
 use parking_lot::{Condvar, Mutex};
 
-use crate::run_result::{RunResult, RuntimeError};
 use crate::vcpu_loop::Kernel;
 use crate::vcpu_loop::continuation;
 use crate::vcpu_loop::terminal::VcpuLoopOutcome;
+use carrick_kernel::run_result::{RunResult, RuntimeError};
 
 /// The only points at which the HVPatch logical loop may give its physical
 /// executor back to the pool.  Keeping the list typed makes additions
@@ -88,7 +88,7 @@ const LIVENESS_CLAIM_STALL_WINDOWS: u32 = 32;
 #[derive(Clone)]
 pub(crate) struct KernelAbortRecord {
     pub(crate) reason: String,
-    pub(crate) post_mortem: Arc<crate::kernel::debug::PostMortem>,
+    pub(crate) post_mortem: Arc<carrick_kernel::kernel::debug::PostMortem>,
 }
 
 impl KernelAbortRecord {
@@ -102,8 +102,8 @@ impl KernelAbortRecord {
 
 #[derive(Clone)]
 pub(crate) struct ProcessGraphLiveness {
-    pub(crate) kernel: Option<Weak<crate::kernel::Kernel>>,
-    pub(crate) scheduler: Option<Arc<crate::kernel::scheduler::Scheduler>>,
+    pub(crate) kernel: Option<Weak<carrick_kernel::kernel::Kernel>>,
+    pub(crate) scheduler: Option<Arc<carrick_kernel::kernel::scheduler::Scheduler>>,
     /// Where this carrier's one abort is recorded and re-read.
     pub(crate) recorded: Arc<Mutex<Option<KernelAbortRecord>>>,
     /// Test seam: a census the fixture drives directly, so the confirm state
@@ -211,7 +211,7 @@ impl ProcessGraphLiveness {
 
     #[cfg(test)]
     pub(crate) fn for_tests(
-        kernel: Option<&Arc<crate::kernel::Kernel>>,
+        kernel: Option<&Arc<carrick_kernel::kernel::Kernel>>,
         fixed_census: Option<Arc<Mutex<Option<GraphCensus>>>>,
         confirm: std::time::Duration,
     ) -> Self {
@@ -258,7 +258,7 @@ impl ProcessGraphLiveness {
     /// bounces out of the run queue with `RunQueueError::ControlPoked` at its
     /// next boundary and cannot claim a new row, so the capture reads a graph
     /// nothing is mutating. No new lock is taken.
-    pub(crate) fn abort(&self, reason: crate::kernel::debug::AbortReason) -> RuntimeError {
+    pub(crate) fn abort(&self, reason: carrick_kernel::kernel::debug::AbortReason) -> RuntimeError {
         // One capture per carrier. A second abort would describe a graph that
         // the FIRST abort already froze and published over, so it could only
         // ever be a later, weaker answer to the same question.
@@ -273,7 +273,7 @@ impl ProcessGraphLiveness {
             .ok()
             .filter(|id| !id.is_empty());
         let mut post_mortem =
-            crate::kernel::debug::PostMortem::capture(kernel.as_ref(), reason, run_id);
+            carrick_kernel::kernel::debug::PostMortem::capture(kernel.as_ref(), reason, run_id);
         post_mortem.enrich_from_capture();
         let summary = post_mortem.reason.summary();
         tracing::error!(
@@ -309,17 +309,19 @@ impl ProcessGraphLiveness {
         census: GraphCensus,
         unpublished_jobs: usize,
     ) -> RuntimeError {
-        self.abort(crate::kernel::debug::AbortReason::ProcessGraphLiveness {
-            unpublished_jobs,
-            live_tasks: census.tasks,
-            // Filled from the capture's own rows: naming a zombie costs a
-            // snapshot, and one taken before the freeze would describe a
-            // different graph from the one in the post-mortem.
-            live_threads: 0,
-            runnable_rows: census.runnable,
-            zombies: Vec::new(),
-            confirmed_after_ms: u64::try_from(self.confirm.as_millis()).unwrap_or(u64::MAX),
-        })
+        self.abort(
+            carrick_kernel::kernel::debug::AbortReason::ProcessGraphLiveness {
+                unpublished_jobs,
+                live_tasks: census.tasks,
+                // Filled from the capture's own rows: naming a zombie costs a
+                // snapshot, and one taken before the freeze would describe a
+                // different graph from the one in the post-mortem.
+                live_threads: 0,
+                runnable_rows: census.runnable,
+                zombies: Vec::new(),
+                confirmed_after_ms: u64::try_from(self.confirm.as_millis()).unwrap_or(u64::MAX),
+            },
+        )
     }
 }
 
@@ -353,7 +355,10 @@ impl HvpatchLoopResult {
         }
         *slot = Some(result);
         self.state.ready.notify_all();
-        crate::event_ring::rec_hvpatch_settle_object(Arc::as_ptr(&self.state) as usize, 18);
+        carrick_kernel::event_ring::rec_hvpatch_settle_object(
+            Arc::as_ptr(&self.state) as usize,
+            18,
+        );
     }
 
     #[cfg(test)]
@@ -448,7 +453,7 @@ impl HvpatchLoopResult {
             // An operator's `carrick debug abort --run-id` is latched by the
             // debug server and executed HERE, through the same sink, so a
             // requested abort and an invariant abort produce one shape.
-            if let Some(reason) = crate::kernel::debug::take_abort_request() {
+            if let Some(reason) = carrick_kernel::kernel::debug::take_abort_request() {
                 // A requested abort is carrier-terminal by the operator's own
                 // decision, so it is answered even if this one job settled in
                 // the same instant: the point of `carrick debug abort` is that
@@ -481,7 +486,7 @@ impl HvpatchLoopResult {
                         // was published, so the premise of the verdict is gone.
                         Some(result) => result,
                         None => {
-                            crate::event_ring::rec_hvpatch_settle_object(
+                            carrick_kernel::event_ring::rec_hvpatch_settle_object(
                                 Arc::as_ptr(&self.state) as usize,
                                 19,
                             );
@@ -756,7 +761,7 @@ mod tests {
         assert!(
             matches!(
                 post_mortem.reason,
-                crate::kernel::debug::AbortReason::ProcessGraphLiveness {
+                carrick_kernel::kernel::debug::AbortReason::ProcessGraphLiveness {
                     unpublished_jobs: 1,
                     live_tasks: 0,
                     runnable_rows: 0,
@@ -986,14 +991,14 @@ mod tests {
     /// fixture seam above proves the state machine, this proves the reading.
     #[test]
     fn a_real_kernel_with_a_live_root_task_reads_as_alive() {
-        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+        let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             81_207,
             ThreadId::synthetic_for_tests(81_207),
             "liveness-census".to_owned(),
         )
         .expect("root bootstrap");
         let (kernel, _context) =
-            crate::kernel::Kernel::bootstrap_root(bootstrap).expect("root kernel");
+            carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).expect("root kernel");
         let liveness = ProcessGraphLiveness::for_tests(Some(&kernel), None, LIVENESS_CONFIRM);
         let census = liveness.census().expect("a bound kernel answers a census");
         assert_eq!(census.tasks, 1, "the root task is live");
@@ -1004,14 +1009,14 @@ mod tests {
     /// must not invent a dead-graph verdict from the absence.
     #[test]
     fn a_dropped_kernel_stops_the_invariant_rather_than_convicting_it() {
-        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+        let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             81_208,
             ThreadId::synthetic_for_tests(81_208),
             "liveness-dropped".to_owned(),
         )
         .expect("root bootstrap");
         let (kernel, context) =
-            crate::kernel::Kernel::bootstrap_root(bootstrap).expect("root kernel");
+            carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).expect("root kernel");
         let liveness = ProcessGraphLiveness::for_tests(Some(&kernel), None, LIVENESS_CONFIRM);
         drop(context);
         drop(kernel);

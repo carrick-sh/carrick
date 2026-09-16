@@ -1041,7 +1041,7 @@ pub(crate) fn trim_dynamic_maps_for_range(maps: &mut Vec<ProcMapsEntry>, start: 
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct MremapForkSemantics {
+pub struct MremapForkSemantics {
     pub(crate) source_start: u64,
     pub(crate) source_end: u64,
     pub(crate) vmas: Vec<SemanticVma>,

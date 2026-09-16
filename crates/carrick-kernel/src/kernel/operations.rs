@@ -28,10 +28,9 @@ pub(super) use identity::namespace_visible_task_id;
 pub mod signal;
 pub use identity::{ProcessIdentity, ProcessState, TaskIdentity};
 pub(crate) use session::TtyControlError;
+pub(crate) use signal::CarrierControlSignalPost;
 pub use signal::SignalTargetAuthorization;
-pub(crate) use signal::{
-    CarrierControlSignalPost, ExactSignalTargetAuthorization, ExactThreadSignalPost,
-};
+pub use signal::{ExactSignalTargetAuthorization, ExactThreadSignalPost};
 pub use wait::{ChildWaitPrecheck, WaitChildClass, WaitMode, WaitOutcome};
 pub mod thread;
 pub use thread::{
@@ -54,7 +53,7 @@ pub enum KernelFailpoint {
 /// dispatcher close path before using `context`: when this was the final table
 /// owner, the old slots are transferred to the successor rather than simply
 /// discarded.
-pub(crate) struct CloseRangeUnshare {
+pub struct CloseRangeUnshare {
     context: KernelContext,
     old_files: Arc<FileTable>,
 }
@@ -329,7 +328,7 @@ impl TaskSetReservation {
 /// the registry write guard is released — subscriber callbacks may re-enter
 /// the registry lock.
 #[must_use = "reservation-change subscribers are not notified until publish() runs after the registry guard drops"]
-pub(crate) struct PendingReservationPublication {
+pub struct PendingReservationPublication {
     kernel: Arc<Kernel>,
 }
 
@@ -440,8 +439,8 @@ impl ForkReservation {
         self.prepare(None, child_registry_id, None)
     }
 
-    #[cfg(test)]
-    pub(crate) fn prepare_reference(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn prepare_reference(
         self,
         child_registry_id: ThreadId,
     ) -> Result<PreparedFork, KernelOperationError> {
@@ -569,7 +568,7 @@ impl PreparedFork {
         self.child.key()
     }
 
-    pub(crate) fn retain_stdio_only(&mut self) -> Result<(), KernelOperationError> {
+    pub fn retain_stdio_only(&mut self) -> Result<(), KernelOperationError> {
         let old_files = self.child_resources.files();
         let files = Arc::new(FileTable::for_external_exec(
             self.reservation.kernel.object_ids().file_table_id()?,
@@ -584,7 +583,7 @@ impl PreparedFork {
         Ok(())
     }
 
-    pub(crate) fn prepared_execution_identity(
+    pub fn prepared_execution_identity(
         &self,
     ) -> (
         TaskKey,
@@ -919,7 +918,7 @@ impl Kernel {
         })
     }
 
-    pub(crate) fn reserve_external_peer_root(
+    pub fn reserve_external_peer_root(
         self: &Arc<Self>,
         source: &KernelContext,
         plan: ClonePlan,
@@ -1382,7 +1381,7 @@ pub(super) mod tests {
     };
 
     #[derive(Debug, Default)]
-    pub(crate) struct CountingExitSubscriber(pub(crate) AtomicUsize);
+    pub struct CountingExitSubscriber(pub(crate) AtomicUsize);
 
     impl super::super::core::TaskExitSubscriber for CountingExitSubscriber {
         fn publish_exit(&self) {

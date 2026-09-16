@@ -1,8 +1,8 @@
 //! Authenticated host-operator control for one managed HVPatch carrier.
 
-mod archive;
+pub mod archive;
 mod endpoint;
-mod exec;
+pub mod exec;
 mod teardown;
 
 use std::io::{Read, Write};
@@ -442,7 +442,7 @@ impl ManagedCarrierControl {
     /// Container teardown uses this after guest executors join and before its
     /// mount table is destroyed; [`Self::complete`] records the exact outcome
     /// once teardown itself has succeeded or failed.
-    pub(crate) fn quiesce(&mut self) {
+    pub fn quiesce(&mut self) {
         if let Some(mut server) = self.server.take() {
             server.quiesce_admission();
             // Dropping the server releases its exec/archive authorities; the

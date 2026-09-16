@@ -4,7 +4,7 @@
 //! (the fix for Go's netpollBreak lost-wakeup / high-P netpoller stall).
 use super::*;
 
-pub(crate) type EpollWakeRegistry = std::sync::Arc<Mutex<Vec<i32>>>;
+pub type EpollWakeRegistry = std::sync::Arc<Mutex<Vec<i32>>>;
 
 /// A retained capability to publish an in-memory readiness wake.
 ///
@@ -12,7 +12,7 @@ pub(crate) type EpollWakeRegistry = std::sync::Arc<Mutex<Vec<i32>>>;
 /// that table (or any file description) alive across an asynchronous
 /// continuation.
 #[derive(Clone, Debug)]
-pub(crate) struct EpollWakeHandle(EpollWakeRegistry);
+pub struct EpollWakeHandle(EpollWakeRegistry);
 
 impl EpollWakeHandle {
     pub(crate) fn from_registry(registry: &EpollWakeRegistry) -> Self {

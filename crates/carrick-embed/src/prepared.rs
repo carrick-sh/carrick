@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use carrick_engine::ResolveWarning;
-use carrick_runtime::container::{make_id, short_id};
-use carrick_runtime::kernel::container::{LaunchContext, RunId};
+use carrick_kernel::container::{make_id, short_id};
+use carrick_kernel::kernel::container::{LaunchContext, RunId};
 use carrick_runtime::prepare::RuntimeExtensions;
 use carrick_runtime::{CarrierLease, CarrierRuntime, prepare_on};
 use carrick_spec::RunSpec;
@@ -25,7 +25,7 @@ pub struct PreparedContainer {
     retired: Arc<AtomicBool>,
     current_generation: Arc<AtomicU64>,
     shared_buffers: Vec<(String, SharedBuffer)>,
-    auditors: Arc<carrick_runtime::observe::AuditorChain>,
+    auditors: Arc<carrick_kernel::observe::AuditorChain>,
     carrier: PreparedCarrierOwnership,
 }
 
@@ -42,14 +42,14 @@ impl PreparedContainer {
         extensions: RuntimeExtensions,
         captured: CapturedStreams,
         shared_buffers: Vec<(String, SharedBuffer)>,
-        auditors: Vec<Arc<dyn carrick_runtime::observe::KernelAuditor>>,
+        auditors: Vec<Arc<dyn carrick_kernel::observe::KernelAuditor>>,
         carrier: PreparedCarrierOwnership,
     ) -> Self {
         let launch = carrier.lease.launch().clone();
         let generation = 1;
         let retired = Arc::new(AtomicBool::new(false));
         let current_generation = Arc::new(AtomicU64::new(generation));
-        let auditors = Arc::new(carrick_runtime::observe::AuditorChain::new(auditors));
+        let auditors = Arc::new(carrick_kernel::observe::AuditorChain::new(auditors));
         Self {
             spec,
             warnings,
@@ -104,11 +104,11 @@ impl PreparedContainer {
         let implicit_carrier = self.carrier.implicit;
         let retired = Arc::clone(&self.retired);
         let container_id = self.launch.container_id;
-        carrick_runtime::observe::register_container_auditors(container_id, self.auditors.clone());
-        struct UnregisterGuard(carrick_runtime::kernel::ContainerId);
+        carrick_kernel::observe::register_container_auditors(container_id, self.auditors.clone());
+        struct UnregisterGuard(carrick_kernel::kernel::ContainerId);
         impl Drop for UnregisterGuard {
             fn drop(&mut self) {
-                carrick_runtime::observe::unregister_container_auditors(self.0);
+                carrick_kernel::observe::unregister_container_auditors(self.0);
             }
         }
         let _guard = UnregisterGuard(container_id);

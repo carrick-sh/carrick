@@ -23,7 +23,7 @@
 //!
 //! Per-container state (pid namespace root and region, rootfs + mount table,
 //! clock domain, granted caps, and kernel process tree) is owned by
-//! `crate::kernel::container::Container` and retired by [`Kernel::retire_container_root`](crate::kernel::Kernel::retire_container_root).
+//! `carrick_kernel::kernel::container::Container` and retired by [`Kernel::retire_container_root`](carrick_kernel::kernel::Kernel::retire_container_root).
 //! Root UTS/network launch state remains carrier-scoped until the next
 //! isolation phase moves those namespaces onto `Container`; executor services
 //! deliberately remain shared carrier infrastructure.
@@ -33,11 +33,13 @@ use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use crate::kernel::container::{CarrierScopeId, Container, ContainerId, LaunchContext, RunId};
-use crate::kernel::control::ContainerTeardown;
-use crate::run_result::RuntimeError;
 use crate::vm_lifecycle::VmRunTerminalOutcome;
 use carrick_fatal::carrick_fatal;
+use carrick_kernel::kernel::container::{
+    CarrierScopeId, Container, ContainerId, LaunchContext, RunId,
+};
+use carrick_kernel::kernel::control::ContainerTeardown;
+use carrick_kernel::run_result::RuntimeError;
 
 static NEXT_CARRIER_GENERATION: AtomicU64 = AtomicU64::new(1);
 static CARRIER_PROCESS_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -126,7 +128,7 @@ pub enum CarrierAdmissionState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerInitSnapshot {
     pub container_id: ContainerId,
-    pub internal_task_id: crate::kernel::TaskId,
+    pub internal_task_id: carrick_kernel::kernel::TaskId,
     pub namespace_pid: i32,
 }
 
@@ -183,12 +185,12 @@ struct CarrierState {
 }
 
 pub(crate) struct CarrierKernelRuntime {
-    kernel: Arc<crate::kernel::Kernel>,
+    kernel: Arc<carrick_kernel::kernel::Kernel>,
     directory: Arc<crate::vcpu_loop::HvpatchRuntimeDirectory>,
 }
 
 impl CarrierKernelRuntime {
-    pub(crate) fn kernel(&self) -> &Arc<crate::kernel::Kernel> {
+    pub(crate) fn kernel(&self) -> &Arc<carrick_kernel::kernel::Kernel> {
         &self.kernel
     }
 
@@ -205,7 +207,7 @@ enum CarrierKernelRuntimeSlot {
 
 struct PendingCarrierKernelRuntime {
     runtime: Arc<CarrierKernelRuntime>,
-    root_task: crate::kernel::TaskKey,
+    root_task: carrick_kernel::kernel::TaskKey,
     root_rollback: FirstRootRollback,
     activation_claimed: bool,
     owner: std::thread::ThreadId,
@@ -231,8 +233,8 @@ impl Drop for KernelBootClaim<'_> {
 }
 
 struct FirstRootRollback {
-    container: Arc<crate::kernel::Container>,
-    task: crate::kernel::TaskKey,
+    container: Arc<carrick_kernel::kernel::Container>,
+    task: carrick_kernel::kernel::TaskKey,
     armed: bool,
 }
 
@@ -253,14 +255,14 @@ impl Drop for FirstRootRollback {
 pub(crate) struct CarrierKernelRoot {
     carrier: CarrierRuntime,
     runtime: Arc<CarrierKernelRuntime>,
-    context: crate::kernel::KernelContext,
+    context: carrick_kernel::kernel::KernelContext,
     first_boot: bool,
 }
 
 pub(crate) struct CarrierKernelActivation {
     carrier: CarrierRuntime,
     runtime: Arc<CarrierKernelRuntime>,
-    root_task: crate::kernel::TaskKey,
+    root_task: carrick_kernel::kernel::TaskKey,
     armed: bool,
 }
 
@@ -330,7 +332,7 @@ impl std::fmt::Debug for CarrierKernelRoot {
 
 impl CarrierKernelRoot {
     #[cfg(test)]
-    pub(crate) fn kernel(&self) -> &Arc<crate::kernel::Kernel> {
+    pub(crate) fn kernel(&self) -> &Arc<carrick_kernel::kernel::Kernel> {
         self.runtime.kernel()
     }
 
@@ -343,7 +345,7 @@ impl CarrierKernelRoot {
         self.first_boot
     }
 
-    pub(crate) fn context(&self) -> &crate::kernel::KernelContext {
+    pub(crate) fn context(&self) -> &carrick_kernel::kernel::KernelContext {
         &self.context
     }
 
@@ -531,7 +533,10 @@ impl CarrierRuntime {
     }
 
     fn publish_process_title(&self, live_containers: usize) {
-        crate::dispatch::set_carrier_process_title(self.inner.scope.as_str(), live_containers);
+        carrick_kernel::dispatch::set_carrier_process_title(
+            self.inner.scope.as_str(),
+            live_containers,
+        );
     }
 
     pub fn initialize_facilities(&self) {
@@ -548,11 +553,11 @@ impl CarrierRuntime {
     #[cfg(test)]
     pub(crate) fn boot_kernel_root(
         &self,
-        bootstrap: crate::kernel::RootBootstrap,
+        bootstrap: carrick_kernel::kernel::RootBootstrap,
         initialize: impl FnOnce(
-            &Arc<crate::kernel::Kernel>,
+            &Arc<carrick_kernel::kernel::Kernel>,
             &Arc<crate::vcpu_loop::HvpatchRuntimeDirectory>,
-            &crate::kernel::KernelContext,
+            &carrick_kernel::kernel::KernelContext,
         ) -> Result<(), RuntimeError>,
     ) -> Result<CarrierKernelRoot, RuntimeError> {
         self.boot_kernel_root_prepared(bootstrap, initialize)
@@ -567,11 +572,11 @@ impl CarrierRuntime {
     /// an unpublished root.
     pub(crate) fn boot_kernel_root_prepared<Prepared>(
         &self,
-        bootstrap: crate::kernel::RootBootstrap,
+        bootstrap: carrick_kernel::kernel::RootBootstrap,
         initialize: impl FnOnce(
-            &Arc<crate::kernel::Kernel>,
+            &Arc<carrick_kernel::kernel::Kernel>,
             &Arc<crate::vcpu_loop::HvpatchRuntimeDirectory>,
-            &crate::kernel::KernelContext,
+            &carrick_kernel::kernel::KernelContext,
         ) -> Result<Prepared, RuntimeError>,
     ) -> Result<(CarrierKernelRoot, Prepared), RuntimeError> {
         self.ensure_current_process()?;
@@ -623,7 +628,7 @@ impl CarrierRuntime {
             armed: true,
         };
 
-        let boot = crate::kernel::Kernel::bootstrap_root(bootstrap)
+        let boot = carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap)
             .map_err(|error| RuntimeError::Configuration(error.to_string()));
         let (kernel, context) = boot?;
         let root_rollback = FirstRootRollback {
@@ -673,7 +678,7 @@ impl CarrierRuntime {
 
     pub(crate) fn claim_kernel_activation(
         &self,
-        root_task: crate::kernel::TaskKey,
+        root_task: carrick_kernel::kernel::TaskKey,
     ) -> Result<Option<CarrierKernelActivation>, RuntimeError> {
         let mut slot = self.inner.kernel_runtime.lock();
         match &mut *slot {
@@ -712,7 +717,7 @@ impl CarrierRuntime {
 
     fn rollback_pending_kernel_activation(
         &self,
-        root_task: crate::kernel::TaskKey,
+        root_task: carrick_kernel::kernel::TaskKey,
         runtime: &Arc<CarrierKernelRuntime>,
     ) {
         let mut slot = self.inner.kernel_runtime.lock();
@@ -1146,7 +1151,10 @@ impl CarrierLease {
             .values()
             .filter(|record| record.phase == ContainerPhase::Running)
             .count();
-        crate::dispatch::set_carrier_process_title(self.carrier.scope.as_str(), live_containers);
+        carrick_kernel::dispatch::set_carrier_process_title(
+            self.carrier.scope.as_str(),
+            live_containers,
+        );
         self.carrier.changed.notify_all();
         Ok(())
     }
@@ -1242,7 +1250,10 @@ impl CarrierLease {
             .values()
             .filter(|record| record.phase == ContainerPhase::Running)
             .count();
-        crate::dispatch::set_carrier_process_title(self.carrier.scope.as_str(), live_containers);
+        carrick_kernel::dispatch::set_carrier_process_title(
+            self.carrier.scope.as_str(),
+            live_containers,
+        );
         self.carrier.changed.notify_all();
     }
 }
@@ -1353,7 +1364,7 @@ pub fn live_container_count() -> usize {
 pub(crate) fn retire_leased_container(
     container: Arc<Container>,
     lease: &mut CarrierLease,
-    mounts: &mut crate::dispatch::MountRetirement,
+    mounts: &mut carrick_kernel::dispatch::MountRetirement,
 ) -> Result<ContainerTeardown, RuntimeError> {
     mounts
         .prepare_for(container.id())
@@ -1678,10 +1689,10 @@ mod tests {
         }
     }
 
-    fn launch(name: &str) -> crate::kernel::container::LaunchContext {
-        crate::kernel::container::LaunchContext::unmanaged(crate::kernel::container::RunId::new(
-            name,
-        ))
+    fn launch(name: &str) -> carrick_kernel::kernel::container::LaunchContext {
+        carrick_kernel::kernel::container::LaunchContext::unmanaged(
+            carrick_kernel::kernel::container::RunId::new(name),
+        )
     }
 
     fn snapshot(carrier: &CarrierRuntime) -> CarrierSnapshot {
@@ -1718,7 +1729,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             workers.push(std::thread::spawn(move || {
                 let container = Arc::new(Container::new(launch(name)));
-                let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+                let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
                     pid,
                     carrick_hal::ThreadId::synthetic_for_tests(pid),
                     format!("{name}-init"),
@@ -1755,7 +1766,7 @@ mod tests {
         let _serial = TEST_LOCK.lock();
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let failed_container = Arc::new(Container::new(launch("failed")));
-        let failed = crate::kernel::RootBootstrap::for_reference_model(
+        let failed = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_300,
             carrick_hal::ThreadId::synthetic_for_tests(5_300),
             "failed-init".to_owned(),
@@ -1773,7 +1784,7 @@ mod tests {
         assert_eq!(carrier.snapshot().expect("after failure").kernel_graphs, 0);
 
         let replacement_container = Arc::new(Container::new(launch("replacement")));
-        let replacement = crate::kernel::RootBootstrap::for_reference_model(
+        let replacement = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_400,
             carrick_hal::ThreadId::synthetic_for_tests(5_400),
             "replacement-init".to_owned(),
@@ -1793,7 +1804,7 @@ mod tests {
     fn later_root_waits_until_first_root_activation_commits() {
         let _serial = TEST_LOCK.lock();
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
-        let first = crate::kernel::RootBootstrap::for_reference_model(
+        let first = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_410,
             carrick_hal::ThreadId::synthetic_for_tests(5_410),
             "pending-first".to_owned(),
@@ -1811,7 +1822,7 @@ mod tests {
         let waiter_carrier = carrier.clone();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let waiter = std::thread::spawn(move || {
-            let later = crate::kernel::RootBootstrap::for_reference_model(
+            let later = carrick_kernel::kernel::RootBootstrap::for_reference_model(
                 5_411,
                 carrick_hal::ThreadId::synthetic_for_tests(5_411),
                 "waiting-later".to_owned(),
@@ -1842,7 +1853,7 @@ mod tests {
         let _serial = TEST_LOCK.lock();
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let container = Arc::new(Container::new(launch("dropped-activation")));
-        let first = crate::kernel::RootBootstrap::for_reference_model(
+        let first = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_420,
             carrick_hal::ThreadId::synthetic_for_tests(5_420),
             "dropped-activation".to_owned(),
@@ -1861,7 +1872,7 @@ mod tests {
         assert_eq!(container.pid_root(), None);
         assert_eq!(carrier.snapshot().expect("rolled back").kernel_graphs, 0);
 
-        let replacement = crate::kernel::RootBootstrap::for_reference_model(
+        let replacement = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_421,
             carrick_hal::ThreadId::synthetic_for_tests(5_421),
             "replacement".to_owned(),
@@ -1878,7 +1889,7 @@ mod tests {
     fn first_root_services_publish_only_inside_final_activation() {
         let _serial = TEST_LOCK.lock();
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
-        let first = crate::kernel::RootBootstrap::for_reference_model(
+        let first = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_430,
             carrick_hal::ThreadId::synthetic_for_tests(5_430),
             "service-order-init".to_owned(),
@@ -1940,7 +1951,7 @@ mod tests {
         let _serial = TEST_LOCK.lock();
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let failed_container = Arc::new(Container::new(launch("panic")));
-        let failed = crate::kernel::RootBootstrap::for_reference_model(
+        let failed = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_500,
             carrick_hal::ThreadId::synthetic_for_tests(5_500),
             "panic-init".to_owned(),
@@ -1954,7 +1965,7 @@ mod tests {
         assert_eq!(failed_container.pid_root(), None);
         assert_eq!(carrier.snapshot().expect("after panic").kernel_graphs, 0);
 
-        let replacement = crate::kernel::RootBootstrap::for_reference_model(
+        let replacement = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_501,
             carrick_hal::ThreadId::synthetic_for_tests(5_501),
             "replacement-init".to_owned(),
@@ -1971,7 +1982,7 @@ mod tests {
     fn duplicate_later_root_is_rejected_before_initializer_side_effects() {
         let _serial = TEST_LOCK.lock();
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
-        let base = crate::kernel::RootBootstrap::for_reference_model(
+        let base = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_600,
             carrick_hal::ThreadId::synthetic_for_tests(5_600),
             "base-init".to_owned(),
@@ -1993,7 +2004,7 @@ mod tests {
         let worker_release = Arc::clone(&release);
         let worker_calls = Arc::clone(&initializer_calls);
         let worker = std::thread::spawn(move || {
-            let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
                 5_601,
                 carrick_hal::ThreadId::synthetic_for_tests(5_601),
                 "later-init".to_owned(),
@@ -2008,7 +2019,7 @@ mod tests {
             })
         });
         entered.wait();
-        let duplicate = crate::kernel::RootBootstrap::for_reference_model(
+        let duplicate = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_602,
             carrick_hal::ThreadId::synthetic_for_tests(5_602),
             "duplicate-init".to_owned(),
@@ -2043,7 +2054,7 @@ mod tests {
 
         let _serial = TEST_LOCK.lock();
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
-        let base = crate::kernel::RootBootstrap::for_reference_model(
+        let base = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_610,
             carrick_hal::ThreadId::synthetic_for_tests(5_610),
             "base-init".to_owned(),
@@ -2062,11 +2073,11 @@ mod tests {
         ));
         failed_container
             .install_pid_ns(
-                crate::namespace::pid::NsSharedRegion::allocate(arena)
+                carrick_kernel::namespace::pid::NsSharedRegion::allocate(arena)
                     .expect("container pid namespace"),
             )
             .expect("install container pid namespace");
-        let failed = crate::kernel::RootBootstrap::for_reference_model(
+        let failed = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_611,
             carrick_hal::ThreadId::synthetic_for_tests(5_611),
             "failed-later-init".to_owned(),
@@ -2092,7 +2103,7 @@ mod tests {
         assert_eq!(live_bindings.load(Ordering::Acquire), 0);
         assert_eq!(base_root.kernel().container_count(), 1);
 
-        let retry = crate::kernel::RootBootstrap::for_reference_model(
+        let retry = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_612,
             carrick_hal::ThreadId::synthetic_for_tests(5_612),
             "retry-later-init".to_owned(),
@@ -2116,7 +2127,7 @@ mod tests {
     fn later_root_post_publication_initialization_failure_retires_only_that_root() {
         let _serial = TEST_LOCK.lock();
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
-        let base = crate::kernel::RootBootstrap::for_reference_model(
+        let base = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_620,
             carrick_hal::ThreadId::synthetic_for_tests(5_620),
             "base-init".to_owned(),
@@ -2130,7 +2141,7 @@ mod tests {
 
         let failed_container = Arc::new(Container::new(launch("failed-post-publication")));
         let failed_id = failed_container.id();
-        let failed = crate::kernel::RootBootstrap::for_reference_model(
+        let failed = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_621,
             carrick_hal::ThreadId::synthetic_for_tests(5_621),
             "failed-post-publication-init".to_owned(),
@@ -2155,7 +2166,7 @@ mod tests {
             "sibling init authority must survive the failed later initialization"
         );
 
-        let retry = crate::kernel::RootBootstrap::for_reference_model(
+        let retry = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_622,
             carrick_hal::ThreadId::synthetic_for_tests(5_622),
             "retry-after-post-publication-failure".to_owned(),
@@ -2195,7 +2206,7 @@ mod tests {
         alpha.mark_running().expect("start alpha");
         assert_eq!(snapshot(&carrier).live_containers, 1);
         let alpha_container = Arc::new(Container::new(alpha.launch().clone()));
-        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
         dispatcher.set_container(Arc::clone(&alpha_container));
         let mut mounts = dispatcher.prepare_mount_retirement();
         let expected_mounts = mounts.mount_count();
@@ -2241,7 +2252,7 @@ mod tests {
         assert_eq!(beta.launch().carrier_scope_id, *carrier.scope());
         assert_ne!(alpha.launch().run_id, beta.launch().run_id);
         assert_eq!(
-            crate::dispatch::carrier_proc_label(carrier.scope().as_str(), 2),
+            carrick_kernel::dispatch::carrier_proc_label(carrier.scope().as_str(), 2),
             format!("carrick:{}: 2 containers", carrier.scope().as_str())
         );
     }
@@ -2275,7 +2286,7 @@ mod tests {
         let container = Arc::new(Container::new(lease.launch().clone()));
         let entered = Arc::new(std::sync::Barrier::new(2));
         let release = Arc::new(std::sync::Barrier::new(2));
-        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
         dispatcher.set_container(Arc::clone(&container));
         dispatcher.register_mount(
             "/retirement-barrier",
@@ -2743,7 +2754,7 @@ mod tests {
         let launch = launch("retry-retirement");
         let mut lease = carrier.reserve(launch.clone()).expect("reserve");
         let container = Arc::new(Container::new(launch));
-        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+        let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_700,
             carrick_hal::ThreadId::synthetic_for_tests(5_700),
             "retry-retirement-init".to_owned(),
@@ -2755,16 +2766,18 @@ mod tests {
             .expect("root");
         activate_first_root(&carrier, &root);
         lease.mark_running().expect("running");
-        let reservation = root
-            .kernel()
-            .reserve_fork(
-                root.context(),
-                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+        let reservation =
+            root.kernel()
+                .reserve_fork(
+                    root.context(),
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::empty(),
+                    )
                     .expect("fork plan"),
-                "block retirement".to_owned(),
-                None,
-            )
-            .expect("reservation");
+                    "block retirement".to_owned(),
+                    None,
+                )
+                .expect("reservation");
 
         assert!(lease.retire(Arc::clone(&container)).is_err());
         assert_eq!(snapshot(&carrier).state, CarrierAdmissionState::Open);

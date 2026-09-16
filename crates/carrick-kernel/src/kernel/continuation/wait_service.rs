@@ -59,7 +59,7 @@ fn make_control_pipe() -> Result<(OwnedFd, OwnedFd), RuntimeError> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RegistrationState {
+pub enum RegistrationState {
     Prepared,
     Enrolled,
     Ready,
@@ -68,7 +68,7 @@ pub(crate) enum RegistrationState {
 }
 
 #[allow(dead_code)]
-pub(crate) enum ProducerSubscription {
+pub enum ProducerSubscription {
     Futex(carrick_thread::thread::FutexGenerationSubscription),
     Task(crate::kernel::objects::TaskWakeSubscription),
     Vfork(crate::kernel::core::VforkReleaseSubscription),
@@ -99,21 +99,21 @@ impl std::fmt::Debug for ProducerSubscription {
 }
 
 #[derive(Debug)]
-pub(crate) struct RegistrationOperationGate {
+pub struct RegistrationOperationGate {
     pub(super) token: ContinuationWakeToken,
     pub(crate) state: Mutex<OperationGateState>,
     drain_condvar: Condvar,
 }
 
 #[derive(Debug)]
-pub(crate) struct OperationGateState {
+pub struct OperationGateState {
     cancelled: bool,
     consumed: bool,
     in_flight: usize,
     drain_waker: Option<Waker>,
 }
 
-pub(crate) struct OperationClaimGuard {
+pub struct OperationClaimGuard {
     gate: Arc<RegistrationOperationGate>,
 }
 
@@ -185,7 +185,7 @@ impl RegistrationOperationGate {
 }
 
 #[derive(Debug)]
-pub(crate) struct RegistrationEntry {
+pub struct RegistrationEntry {
     pub(crate) token: ContinuationWakeToken,
     pub(crate) state: RegistrationState,
     pub(crate) event: Option<ContinuationEvent>,
@@ -216,7 +216,7 @@ pub(crate) struct RegistrationEntry {
 /// a state transition desynchronise the index, so the source-shape test in this
 /// module refuses one.
 #[derive(Debug, Default)]
-pub(crate) struct ReactorWorkSet {
+pub struct ReactorWorkSet {
     /// Enrolled registrations that contribute host pollfds.
     pub(crate) pollable: BTreeSet<ContinuationId>,
     /// Enrolled registrations carrying a deadline, ordered BY deadline, so the
@@ -279,7 +279,7 @@ impl ReactorWorkSet {
 /// A registration borrowed for mutation together with the index that must be
 /// resynchronised afterwards. `Drop` does the resync, so a caller cannot leave
 /// the reactor's view stale by taking an early return out of the borrow.
-pub(crate) struct IndexedEntryMut<'state> {
+pub struct IndexedEntryMut<'state> {
     id: ContinuationId,
     /// The two facts membership is derived from, read when the borrow opened.
     /// `Drop` resynchronises only when one of them moved, so the many borrows
@@ -323,7 +323,7 @@ fn membership_inputs(
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct CarrierWaitState {
+pub struct CarrierWaitState {
     pub(super) entries: BTreeMap<ContinuationId, RegistrationEntry>,
     pub(super) reactor_work: ReactorWorkSet,
     #[cfg(test)]
@@ -424,7 +424,7 @@ impl std::fmt::Debug for ReactorTestHooks {
 }
 
 #[derive(Debug)]
-pub(crate) struct CarrierWaitServiceInner {
+pub struct CarrierWaitServiceInner {
     scheduler: Arc<Scheduler>,
     pub(super) state: Mutex<CarrierWaitState>,
     shutdown: AtomicBool,
@@ -438,7 +438,7 @@ pub(crate) struct CarrierWaitServiceInner {
     /// cost: it used to be the whole registration map, and this counter is how
     /// a test proves it no longer is.
     reactor_cycle_visits: AtomicU64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fail_next_enroll: AtomicBool,
     #[cfg(test)]
     /// Test observer for "a poll cycle completed", paired with the
@@ -961,7 +961,7 @@ impl CarrierWaitService {
             control_write,
             reactor_poll_calls: AtomicU64::new(0),
             reactor_cycle_visits: AtomicU64::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             fail_next_enroll: AtomicBool::new(false),
             #[cfg(test)]
             reactor_poll_observer: Mutex::new(None),
@@ -1046,7 +1046,7 @@ impl CarrierWaitService {
         &self,
         registration: &mut ContinuationRegistration,
     ) -> Result<(), WaitServiceError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if self.inner.fail_next_enroll.swap(false, Ordering::AcqRel) {
             return Err(WaitServiceError::StaleRegistration);
         }
@@ -1077,8 +1077,8 @@ impl CarrierWaitService {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn fail_next_enroll_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_enroll_for_test(&self) {
         self.inner.fail_next_enroll.store(true, Ordering::Release);
     }
 

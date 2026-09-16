@@ -19,7 +19,7 @@ pub fn prepare() {
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         }
 
-        crate::dispatch::proctitle_init();
+        carrick_kernel::dispatch::proctitle_init();
 
         unsafe {
             let key = c"OS_ACTIVITY_MODE";

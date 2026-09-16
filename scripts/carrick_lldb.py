@@ -378,7 +378,7 @@ def cmd_where(debugger, command, exe_ctx, result, internal_dict):
 # Reads the lock-free in-memory diagnostic ring from a LIVE carrick process or a
 # CORE file — the durable, non-perturbing way to see the fork/socket/epoll event
 # history of a hung guest process (e.g. the forkserver-from-forkserver deadlock).
-# Mirrors the Rust decode in `crates/carrick-runtime/src/event_ring.rs`.
+# Mirrors the Rust decode in `crates/carrick-kernel/src/event_ring.rs`.
 
 _EVENTRING_N = 8192  # must match event_ring::N
 _EVENTRING_SLOT_BYTES = 24  # generation + lo + hi (three u64 cells)

@@ -7,13 +7,13 @@ use carrick_fatal::carrick_fatal;
 use carrick_hal::{SignalArrival, VcpuRegistry};
 use carrick_thread::thread::FutexTable;
 
-use crate::run_result::RuntimeError;
 use crate::vcpu_loop::continuation;
 use crate::vcpu_loop::executor;
 use crate::vcpu_loop::{
     HvpatchLoopResult, KernelAbortRecord, KernelState, LIVENESS_CONFIRM, LIVENESS_POLL,
     ProcessGraphLiveness,
 };
+use carrick_kernel::run_result::RuntimeError;
 
 /// Runtime-only delivery endpoint for one live HVPatch task generation.
 /// Linux parentage remains authoritative in `Kernel`; this table only turns
@@ -25,19 +25,19 @@ pub(crate) struct HvpatchRuntimeEndpoint {
     /// Exact parent task generation retained at endpoint publication. Each
     /// notification recaptures one CURRENT live thread through this binding so
     /// exec's replacement Sighand is observed without accepting PID reuse.
-    pub(crate) task_binding: crate::kernel::KernelTaskBinding,
+    pub(crate) task_binding: carrick_kernel::kernel::KernelTaskBinding,
     /// Migration-only exact scheduler endpoint. While absent, the welded
     /// runner below remains the explicitly transitional fallback. When
     /// present, exact-generation scheduler wake is authoritative and the
     /// legacy wake vehicles are compatibility nudges only.
-    pub(crate) scheduler: Option<Arc<crate::kernel::scheduler::Scheduler>>,
+    pub(crate) scheduler: Option<Arc<carrick_kernel::kernel::scheduler::Scheduler>>,
 }
 
 impl HvpatchRuntimeEndpoint {
     pub(crate) fn wake_scheduler_exact(
         &self,
-        snapshot: &crate::kernel::core::KernelTaskSignalSnapshot,
-    ) -> Result<bool, crate::kernel::scheduler::SchedulerError> {
+        snapshot: &carrick_kernel::kernel::core::KernelTaskSignalSnapshot,
+    ) -> Result<bool, carrick_kernel::kernel::scheduler::SchedulerError> {
         let Some(scheduler) = self.scheduler.as_ref() else {
             return Ok(false);
         };
@@ -46,10 +46,12 @@ impl HvpatchRuntimeEndpoint {
             match scheduler.wake(thread.key()) {
                 Ok(_) => delivered = true,
                 Err(
-                    crate::kernel::scheduler::SchedulerError::Thread(
-                        crate::kernel::objects::ThreadExecutionError::InvalidTransition { .. },
+                    carrick_kernel::kernel::scheduler::SchedulerError::Thread(
+                        carrick_kernel::kernel::objects::ThreadExecutionError::InvalidTransition {
+                            ..
+                        },
                     )
-                    | crate::kernel::scheduler::SchedulerError::UnknownThread,
+                    | carrick_kernel::kernel::scheduler::SchedulerError::UnknownThread,
                 ) => {}
                 Err(error) => return Err(error),
             }
@@ -58,7 +60,7 @@ impl HvpatchRuntimeEndpoint {
     }
 }
 
-/// The kernel lane's [`TaskWaker`](crate::kernel::TaskWaker): the three vehicles a guest task on this
+/// The kernel lane's [`TaskWaker`](carrick_kernel::kernel::TaskWaker): the three vehicles a guest task on this
 /// lane can be parked on, kicked together.
 ///
 /// A parked guest is waiting on one of them and the kernel cannot tell which,
@@ -88,7 +90,7 @@ impl std::fmt::Debug for HvpatchTaskWaker {
     }
 }
 
-impl crate::kernel::TaskWaker for HvpatchTaskWaker {
+impl carrick_kernel::kernel::TaskWaker for HvpatchTaskWaker {
     fn wake_task(&self) {
         self.signal_pump
             .publish_kernel_wake(&self.kicker, &self.platform_futex);
@@ -106,14 +108,15 @@ impl crate::kernel::TaskWaker for HvpatchTaskWaker {
 }
 
 pub(crate) struct HvpatchRuntimeDirectory {
-    pub(crate) endpoints: Mutex<BTreeMap<crate::kernel::TaskKey, HvpatchRuntimeEndpoint>>,
-    continuation_wait_service: Mutex<Option<Arc<crate::kernel::continuation::CarrierWaitService>>>,
-    pub(crate) scheduler: Mutex<Option<Arc<crate::kernel::scheduler::Scheduler>>>,
+    pub(crate) endpoints: Mutex<BTreeMap<carrick_kernel::kernel::TaskKey, HvpatchRuntimeEndpoint>>,
+    continuation_wait_service:
+        Mutex<Option<Arc<carrick_kernel::kernel::continuation::CarrierWaitService>>>,
+    pub(crate) scheduler: Mutex<Option<Arc<carrick_kernel::kernel::scheduler::Scheduler>>>,
     /// The kernel this carrier's jobs live in, for the always-on
     /// `ProcessGraphLiveness` invariant and its post-mortem capture. `Weak`
     /// because the directory outlives no kernel: the runner OBSERVES the graph,
     /// it never keeps it alive.
-    liveness_kernel: Mutex<Option<Weak<crate::kernel::Kernel>>>,
+    liveness_kernel: Mutex<Option<Weak<carrick_kernel::kernel::Kernel>>>,
     /// The one abort this carrier has suffered, if any.
     ///
     /// An abort is CARRIER-terminal, not job-terminal. The kernel graph it
@@ -154,8 +157,8 @@ pub(crate) struct HvpatchRuntimeDirectory {
 pub(crate) struct ProcessJobDirectoryState {
     pub(crate) closing: bool,
     pub(crate) active_drains: usize,
-    pub(crate) groups: BTreeMap<crate::kernel::ContainerId, ContainerJobState>,
-    pub(crate) closed_groups: BTreeSet<crate::kernel::ContainerId>,
+    pub(crate) groups: BTreeMap<carrick_kernel::kernel::ContainerId, ContainerJobState>,
+    pub(crate) closed_groups: BTreeSet<carrick_kernel::kernel::ContainerId>,
 }
 
 #[derive(Default)]
@@ -277,8 +280,8 @@ enum RuntimeDirectoryShutdown {
 }
 
 pub(crate) struct PreparedPersistentServices {
-    pub(crate) scheduler: Arc<crate::kernel::Scheduler>,
-    pub(crate) wait_service: Arc<crate::kernel::continuation::CarrierWaitService>,
+    pub(crate) scheduler: Arc<carrick_kernel::kernel::Scheduler>,
+    pub(crate) wait_service: Arc<carrick_kernel::kernel::continuation::CarrierWaitService>,
 }
 
 pub(crate) enum HvpatchProcessJobHandle {
@@ -292,12 +295,12 @@ pub(crate) enum HvpatchProcessJobHandle {
 #[derive(Clone)]
 pub(crate) struct ContainerJobGroup {
     directory: Arc<HvpatchRuntimeDirectory>,
-    container_id: crate::kernel::ContainerId,
+    container_id: carrick_kernel::kernel::ContainerId,
 }
 
 pub(crate) struct ContainerJobReservation {
     directory: Arc<HvpatchRuntimeDirectory>,
-    container_id: crate::kernel::ContainerId,
+    container_id: carrick_kernel::kernel::ContainerId,
     armed: bool,
 }
 
@@ -576,7 +579,7 @@ impl Default for HvpatchRuntimeDirectory {
 impl HvpatchRuntimeDirectory {
     pub(crate) fn container_job_group(
         self: &Arc<Self>,
-        container_id: crate::kernel::ContainerId,
+        container_id: carrick_kernel::kernel::ContainerId,
     ) -> ContainerJobGroup {
         ContainerJobGroup {
             directory: Arc::clone(self),
@@ -618,7 +621,7 @@ impl HvpatchRuntimeDirectory {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn carrier_tasks(
         &self,
-        kernel: &Arc<crate::kernel::Kernel>,
+        kernel: &Arc<carrick_kernel::kernel::Kernel>,
     ) -> Arc<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskStateDirectory> {
         let mut installed = self.carrier_tasks.lock();
         Arc::clone(installed.get_or_insert_with(|| {
@@ -713,7 +716,7 @@ impl HvpatchRuntimeDirectory {
     /// Bind the kernel the runner's liveness invariant observes. Idempotent
     /// for one kernel; a DIFFERENT kernel replaces it, because the carrier has
     /// exactly one live kernel graph and the invariant must judge that one.
-    fn bind_liveness_kernel(&self, kernel: &Arc<crate::kernel::Kernel>) {
+    fn bind_liveness_kernel(&self, kernel: &Arc<carrick_kernel::kernel::Kernel>) {
         let mut slot = self.liveness_kernel.lock();
         if slot
             .as_ref()
@@ -727,7 +730,7 @@ impl HvpatchRuntimeDirectory {
 
     pub(crate) fn prepare_persistent_services(
         &self,
-        kernel: &Arc<crate::kernel::Kernel>,
+        kernel: &Arc<carrick_kernel::kernel::Kernel>,
     ) -> PreparedPersistentServices {
         self.bind_liveness_kernel(kernel);
         if let Some(scheduler) = self.scheduler.lock().clone() {
@@ -743,9 +746,9 @@ impl HvpatchRuntimeDirectory {
             };
         }
         let scheduler = self.carrier_scheduler(kernel);
-        let wait_service = Arc::new(crate::kernel::continuation::CarrierWaitService::new(
-            Arc::clone(&scheduler),
-        ));
+        let wait_service = Arc::new(
+            carrick_kernel::kernel::continuation::CarrierWaitService::new(Arc::clone(&scheduler)),
+        );
         PreparedPersistentServices {
             scheduler,
             wait_service,
@@ -759,11 +762,11 @@ impl HvpatchRuntimeDirectory {
     /// guest's answer.
     fn carrier_scheduler(
         &self,
-        kernel: &Arc<crate::kernel::Kernel>,
-    ) -> Arc<crate::kernel::scheduler::Scheduler> {
+        kernel: &Arc<carrick_kernel::kernel::Kernel>,
+    ) -> Arc<carrick_kernel::kernel::scheduler::Scheduler> {
         let policy = self.scheduling_policy();
-        crate::kernel::scheduler::publish_guest_cpu_count(policy.cpu_count());
-        Arc::new(crate::kernel::Scheduler::new_with_policy(
+        carrick_kernel::kernel::scheduler::publish_guest_cpu_count(policy.cpu_count());
+        Arc::new(carrick_kernel::kernel::Scheduler::new_with_policy(
             Arc::clone(kernel),
             policy,
         ))
@@ -774,7 +777,7 @@ impl HvpatchRuntimeDirectory {
     fn scheduling_policy(&self) -> Arc<dyn carrick_hal::SchedulingPolicy> {
         self.scheduling_policy.lock().clone().unwrap_or_else(|| {
             Arc::new(carrick_hal::GuestCpuPolicy::new(
-                crate::kernel::scheduler::default_guest_cpu_count(),
+                carrick_kernel::kernel::scheduler::default_guest_cpu_count(),
             ))
         })
     }
@@ -812,16 +815,16 @@ impl HvpatchRuntimeDirectory {
 
     pub(crate) fn continuation_services(
         &self,
-        kernel: &Arc<crate::kernel::Kernel>,
+        kernel: &Arc<carrick_kernel::kernel::Kernel>,
     ) -> (
-        Arc<crate::kernel::Scheduler>,
-        Arc<crate::kernel::continuation::CarrierWaitService>,
+        Arc<carrick_kernel::kernel::Scheduler>,
+        Arc<carrick_kernel::kernel::continuation::CarrierWaitService>,
     ) {
         self.bind_liveness_kernel(kernel);
         let scheduler = {
             let mut slot = self.scheduler.lock();
             Arc::clone(slot.get_or_insert_with(|| {
-                Arc::new(crate::kernel::Scheduler::new_with_policy(
+                Arc::new(carrick_kernel::kernel::Scheduler::new_with_policy(
                     Arc::clone(kernel),
                     self.scheduling_policy(),
                 ))
@@ -835,9 +838,11 @@ impl HvpatchRuntimeDirectory {
         let service = {
             let mut slot = self.continuation_wait_service.lock();
             Arc::clone(slot.get_or_insert_with(|| {
-                Arc::new(crate::kernel::continuation::CarrierWaitService::new(
-                    Arc::clone(&scheduler),
-                ))
+                Arc::new(
+                    carrick_kernel::kernel::continuation::CarrierWaitService::new(Arc::clone(
+                        &scheduler,
+                    )),
+                )
             }))
         };
         (scheduler, service)
@@ -852,7 +857,7 @@ impl HvpatchRuntimeDirectory {
     )]
     pub(crate) fn install_scheduler(
         &self,
-        scheduler: Arc<crate::kernel::scheduler::Scheduler>,
+        scheduler: Arc<carrick_kernel::kernel::scheduler::Scheduler>,
     ) -> Result<(), RuntimeError> {
         let mut installed = self.scheduler.lock();
         if installed.is_some() || !self.endpoints.lock().is_empty() {
@@ -867,9 +872,9 @@ impl HvpatchRuntimeDirectory {
 
     pub(crate) fn register_endpoint(
         &self,
-        task: crate::kernel::TaskKey,
+        task: carrick_kernel::kernel::TaskKey,
         kernel: Weak<KernelState>,
-        task_binding: crate::kernel::KernelTaskBinding,
+        task_binding: carrick_kernel::kernel::KernelTaskBinding,
     ) {
         let scheduler = self.scheduler.lock().clone();
         self.register(
@@ -882,7 +887,11 @@ impl HvpatchRuntimeDirectory {
         );
     }
 
-    pub(crate) fn register(&self, task: crate::kernel::TaskKey, endpoint: HvpatchRuntimeEndpoint) {
+    pub(crate) fn register(
+        &self,
+        task: carrick_kernel::kernel::TaskKey,
+        endpoint: HvpatchRuntimeEndpoint,
+    ) {
         self.endpoints.lock().insert(task, endpoint);
     }
 
@@ -908,7 +917,7 @@ impl HvpatchRuntimeDirectory {
         }
     }
 
-    pub(crate) fn remove(&self, task: crate::kernel::TaskKey) {
+    pub(crate) fn remove(&self, task: carrick_kernel::kernel::TaskKey) {
         self.endpoints.lock().remove(&task);
     }
 
@@ -969,7 +978,11 @@ impl HvpatchRuntimeDirectory {
         result.map_err(RuntimeError::CarrierFailed)
     }
 
-    pub(crate) fn notify_child_exit(&self, parent: crate::kernel::TaskKey, signal: Option<i32>) {
+    pub(crate) fn notify_child_exit(
+        &self,
+        parent: carrick_kernel::kernel::TaskKey,
+        signal: Option<i32>,
+    ) {
         let Some(endpoint) = self.endpoints.lock().get(&parent).cloned() else {
             tracing::error!(
                 parent = ?parent,
@@ -1060,18 +1073,18 @@ pub(crate) fn trace_shared_futex_requeue(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch::SyscallDispatcher;
     use crate::thread::ThreadId;
     use crate::vcpu_loop::VcpuLoopOutcome;
+    use carrick_kernel::dispatch::SyscallDispatcher;
 
-    fn alias_context(pid: i32) -> crate::kernel::KernelContext {
-        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+    fn alias_context(pid: i32) -> carrick_kernel::kernel::KernelContext {
+        let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             pid,
             ThreadId::synthetic_for_tests(pid),
             "alias-inventory".to_owned(),
         )
         .expect("root bootstrap");
-        crate::kernel::Kernel::bootstrap_root(bootstrap)
+        carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap)
             .expect("root kernel")
             .1
     }
@@ -1107,7 +1120,7 @@ mod tests {
         }
 
         let directory = Arc::new(HvpatchRuntimeDirectory::default());
-        let group = directory.container_job_group(crate::kernel::ContainerId::allocate());
+        let group = directory.container_job_group(carrick_kernel::kernel::ContainerId::allocate());
         let reservation = group.reserve().expect("reserve process job");
         let result = HvpatchLoopResult::pending();
         let completion = continuation::LogicalJobCompletion::pending();
@@ -1159,7 +1172,7 @@ mod tests {
         drop(dispatcher);
 
         let directory = Arc::new(HvpatchRuntimeDirectory::default());
-        let group = directory.container_job_group(crate::kernel::ContainerId::allocate());
+        let group = directory.container_job_group(carrick_kernel::kernel::ContainerId::allocate());
         let root_result = HvpatchLoopResult::pending();
         let root_completion = continuation::LogicalJobCompletion::pending();
         let root_quantum = Arc::new(continuation::HvpatchTaskQuantum::new(
@@ -1230,8 +1243,8 @@ mod tests {
     #[test]
     fn container_job_groups_are_scoped() {
         let directory = Arc::new(HvpatchRuntimeDirectory::default());
-        let alpha_id = crate::kernel::ContainerId::allocate();
-        let beta_id = crate::kernel::ContainerId::allocate();
+        let alpha_id = carrick_kernel::kernel::ContainerId::allocate();
+        let beta_id = carrick_kernel::kernel::ContainerId::allocate();
         let alpha = directory.container_job_group(alpha_id);
         let beta = directory.container_job_group(beta_id);
         let alpha_result = HvpatchLoopResult::pending();
@@ -1286,7 +1299,7 @@ mod tests {
     #[test]
     fn container_job_close_waits_for_preclose_reservation_and_reclaims_row() {
         let directory = Arc::new(HvpatchRuntimeDirectory::default());
-        let group = directory.container_job_group(crate::kernel::ContainerId::allocate());
+        let group = directory.container_job_group(carrick_kernel::kernel::ContainerId::allocate());
         let reservation = group.reserve().expect("reserve before close");
         let (joined_tx, joined_rx) = std::sync::mpsc::sync_channel(1);
         let closer = group.clone();
@@ -1318,7 +1331,7 @@ mod tests {
     #[test]
     fn dropped_job_reservation_rolls_back_without_leaking_group_row() {
         let directory = Arc::new(HvpatchRuntimeDirectory::default());
-        let group = directory.container_job_group(crate::kernel::ContainerId::allocate());
+        let group = directory.container_job_group(carrick_kernel::kernel::ContainerId::allocate());
         drop(group.reserve().expect("reserve"));
         assert_eq!(directory.live_job_group_count(), 0);
         assert!(directory.process_jobs.lock().groups.is_empty());
@@ -1327,7 +1340,7 @@ mod tests {
     #[test]
     fn carrier_shutdown_closes_admission_and_replays_one_failure() {
         let directory = Arc::new(HvpatchRuntimeDirectory::default());
-        let group = directory.container_job_group(crate::kernel::ContainerId::allocate());
+        let group = directory.container_job_group(carrick_kernel::kernel::ContainerId::allocate());
         let result = HvpatchLoopResult::pending();
         let completion = continuation::LogicalJobCompletion::pending();
         group
@@ -1369,7 +1382,7 @@ mod tests {
     #[test]
     fn carrier_shutdown_waits_for_container_specific_active_drain() {
         let directory = Arc::new(HvpatchRuntimeDirectory::default());
-        let group = directory.container_job_group(crate::kernel::ContainerId::allocate());
+        let group = directory.container_job_group(carrick_kernel::kernel::ContainerId::allocate());
         let result = HvpatchLoopResult::pending();
         let completion = continuation::LogicalJobCompletion::pending();
         group
@@ -1516,7 +1529,7 @@ mod tests {
             .commit_one_task_kernel_exec(prepared)
             .expect("commit exec");
         let chld = crate::linux_abi::LINUX_SIGCHLD;
-        let signal = crate::kernel::LinuxSignal::for_signal_number(chld).expect("SIGCHLD");
+        let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(chld).expect("SIGCHLD");
         let mut caught = carrick_abi::LinuxSigaction::empty();
         caught.sa_handler = 0x4000;
         post_exec.shared().sighand().install_action(signal, caught);
@@ -1547,7 +1560,7 @@ mod tests {
         );
         assert_eq!(
             post_exec.shared().sighand().disposition(signal),
-            crate::kernel::SignalDisposition::Caught
+            carrick_kernel::kernel::SignalDisposition::Caught
         );
         directory.notify_child_exit(task, Some(chld));
         assert!(

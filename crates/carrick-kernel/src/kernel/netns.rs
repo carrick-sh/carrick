@@ -162,7 +162,7 @@ impl UtsNs {
 /// because `unshare(CLONE_NEWNET | CLONE_NEWUTS)` moves a task into both at once
 /// and no reader may observe it half-moved.
 #[derive(Debug, Clone)]
-pub(crate) struct NsProxy {
+pub struct NsProxy {
     net: Arc<NetNs>,
     uts: Arc<UtsNs>,
     /// The container this task is a member of — the slot Linux's `nsproxy`

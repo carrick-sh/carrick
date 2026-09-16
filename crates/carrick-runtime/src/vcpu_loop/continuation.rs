@@ -1,5 +1,5 @@
 //! Executor-side quantum accounting for the kernel's continuation model
-//! (`crate::kernel::continuation`): persistent quantum jobs, task bindings,
+//! (`carrick_kernel::kernel::continuation`): persistent quantum jobs, task bindings,
 //! logical job completions and process drains. This stays in the carrier
 //! because it names `crate::hvpatch` and `crate::trap`.
 
