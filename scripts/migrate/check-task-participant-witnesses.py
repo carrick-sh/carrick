@@ -21,6 +21,9 @@ from typing import Iterable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SCAN_ROOT = REPO_ROOT / "crates" / "carrick-runtime" / "src"
+# The filesystem model moved to crates/carrick-vfs; keep it in scope so a
+# task-participant witness cannot be lost by relocating a file.
+DEFAULT_SCAN_ROOTS = (DEFAULT_SCAN_ROOT, REPO_ROOT / "crates" / "carrick-vfs" / "src")
 
 RAW_TASK_MEMBERSHIP = "raw task membership arithmetic"
 RAW_TASK_PROJECTION = "generic task membership projection"
@@ -712,7 +715,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def requested_paths(raw_paths: Sequence[str]) -> list[Path]:
     if not raw_paths:
-        return list(DEFAULT_SCAN_ROOT.rglob("*.rs"))
+        return [p for root in DEFAULT_SCAN_ROOTS for p in root.rglob("*.rs")]
     paths: list[Path] = []
     repo = REPO_ROOT.resolve()
     for raw in raw_paths:

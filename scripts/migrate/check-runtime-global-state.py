@@ -23,6 +23,10 @@ LEDGER_PATH = REPO_ROOT / "scripts" / "migrate" / "runtime-global-state.json"
 
 DEFAULT_SCAN_ROOTS = (
     "crates/carrick-runtime/src",
+    # The filesystem model moved out of carrick-runtime (plan
+    # 2026-09-13-extract-carrick-vfs-and-carrick-kernel); its reviewed global
+    # state moved with it and is still reviewed.
+    "crates/carrick-vfs/src",
     "crates/carrick-kernel-arena/src",
     "crates/carrick-vmm-hvf/src",
     "crates/carrick-thread/src",
