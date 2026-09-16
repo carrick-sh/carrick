@@ -1657,7 +1657,14 @@ impl RootFsVfs {
     ) -> Result<(), VfsError> {
         let parent = permit.parent(path).ok_or(LINUX_EINVAL)?;
         if let Some(ref pfd) = parent.parent_fd {
-            #[cfg(test)]
+            // A raw `libc::fstatat`, not the counted `host_fstatat!` macro (that
+            // macro is private to the host backend), so this is the only thing
+            // that puts it on the amplification counter. Gate it exactly like
+            // the macro sites: `cfg(test)` alone is false when carrick-vfs is
+            // compiled as a dependency of carrick-runtime's test binary, which
+            // is where `test_mkdirat_under_resolved_parent_zero_openat_budget`
+            // reads the count from.
+            #[cfg(any(test, feature = "test-support"))]
             crate::fs_backend::host::record_test_host_stat();
             let mut st: libc::stat = unsafe { core::mem::zeroed() };
             let rc = unsafe {
