@@ -2,7 +2,7 @@
 //! EXECUTABLE is not entitled", not "the guest failed".
 
 use crate::EmbedError;
-use carrick_runtime::runtime::RuntimeError;
+use carrick_kernel::run_result::RuntimeError;
 
 /// `HV_DENIED` exactly as applevisor prints it (`error {:#08x}`).
 pub(crate) const HV_DENIED_MARKER: &str = "(error 0xfae94007)";

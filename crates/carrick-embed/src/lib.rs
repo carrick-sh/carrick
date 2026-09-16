@@ -122,8 +122,8 @@ pub use carrick_kernel::observe::{
     SyscallAction, SyscallArgIndexError, SyscallArgs, SyscallBitset, SyscallInfo,
     SyscallInterceptor, SyscallObserver, SyscallOutcome, WakeRejectionReason, is_shortable_syscall,
 };
+pub use carrick_kernel::run_result::{RunResult, RuntimeError, TerminalReason};
 pub use carrick_runtime::compat::CompatReport;
-pub use carrick_runtime::runtime::{RunResult, RuntimeError, TerminalReason};
 pub use carrick_spec::{
     Mount, MountSpec, NetworkSpec, Platform, ProcessSpec, ResourceSpec, RunSpec, SecuritySpec,
     StdioMode,

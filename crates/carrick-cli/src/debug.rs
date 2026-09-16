@@ -988,7 +988,7 @@ fn container_gate_request(
 }
 
 fn container_gate_outcome(
-    run: &Result<carrick_runtime::runtime::RunResult, carrick_runtime::runtime::RuntimeError>,
+    run: &Result<carrick_kernel::run_result::RunResult, carrick_kernel::run_result::RuntimeError>,
 ) -> serde_json::Value {
     match run {
         Ok(result) => serde_json::json!({

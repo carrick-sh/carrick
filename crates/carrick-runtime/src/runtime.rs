@@ -154,11 +154,12 @@ fn hardware_tso_for_debug_from_env(requested: bool, disable: Option<&str>) -> bo
 // from `crate::trap`; imported here via the `use crate::trap::{…}` below so
 // `SplitView`/`HvfTrapEngine` impls and the loop bounds are unchanged.
 
-// `RunResult` / `RuntimeError` are now defined cross-platform in
-// `carrick_kernel::run_result` (unified with the Linux KVM loop). Re-export them under
-// the original `carrick_runtime::runtime::{RunResult, RuntimeError}` paths so
-// every call site (carrick-engine, carrick-cli, the runtime tests) is unchanged.
-pub use carrick_kernel::run_result::{RunResult, RuntimeError, TerminalReason};
+// `RunResult` / `RuntimeError` / `TerminalReason` are kernel types
+// (`carrick_kernel::run_result`, unified with the Linux KVM loop). This is a
+// PRIVATE import: the carrier does not re-export a moved type, so every
+// consumer — carrick-engine, carrick-cli, carrick-embed, the tests — names
+// `carrick_kernel::run_result::…` and there is exactly one path to each type.
+use carrick_kernel::run_result::{RunResult, RuntimeError, TerminalReason};
 
 pub fn run_static_elf_with_hvf(
     path: impl AsRef<Path>,

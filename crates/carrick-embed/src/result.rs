@@ -3,8 +3,8 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use carrick_kernel::run_result::RunResult;
 use carrick_runtime::compat::CompatReport;
-use carrick_runtime::runtime::RunResult;
 
 use crate::{EmbedError, Signal};
 
@@ -57,7 +57,7 @@ pub struct ContainerResult {
     /// The run stopped at `max_traps` without the guest exiting.
     pub trap_limit_hit: bool,
     /// Typed reason why the run terminated, if due to a limit or budget.
-    pub terminal_reason: Option<carrick_runtime::runtime::TerminalReason>,
+    pub terminal_reason: Option<carrick_kernel::run_result::TerminalReason>,
     /// Syscall traps serviced during the run.
     pub traps: usize,
     /// The runtime's compat summary (unhandled/deferred/partial syscalls).

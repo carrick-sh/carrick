@@ -634,7 +634,7 @@ pub(crate) fn assemble_run_result(
     kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
     let report = kernel.reporter.snapshot();
     let terminal_reason = if trap_limit_hit {
-        Some(crate::runtime::TerminalReason::TrapLimit)
+        Some(carrick_kernel::run_result::TerminalReason::TrapLimit)
     } else {
         None
     };
