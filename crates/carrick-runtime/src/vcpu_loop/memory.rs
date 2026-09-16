@@ -718,38 +718,17 @@ pub(crate) fn stamp_identity_values<M: CurrentMmMemory>(
     Ok(())
 }
 
-/// The tid the guest must observe for this thread, in its OWN pid namespace.
-///
-/// `getpid` is namespace-translated (the identity page publishes
-/// `ns_self_pid_for`), so `gettid` has to be too, or a thread-group leader
-/// observes `gettid() != getpid()` -- which no Linux process can, because a
-/// leader's tid IS its tgid. Inside a container the two numbering spaces are
-/// offset, so every containerized guest saw it.
-///
-/// Every task and secondary thread owns an exact namespace identity. A missing
-/// mapping is an invariant failure; returning zero would publish a TID Linux
-/// can never assign and could be mistaken for a successful fast-path stamp.
-pub(crate) fn ns_visible_guest_tid(
-    _dispatcher: &SyscallDispatcher,
-    context: &crate::kernel::KernelContext,
-) -> Option<u32> {
-    u32::try_from(context.thread().key().tid.raw())
-        .ok()
-        .and_then(|tid| crate::namespace::pid::kernel_to_ns_for(context, tid))
-}
-
 /// Stamp the EL1 `gettid` fast-path register with the NAMESPACE-visible tid.
 ///
 /// The guest reads this register in userspace with no vm exit and compares it
 /// against a namespace-translated `getpid`, so publishing the raw kernel-graph
 /// tid here is what let a leader observe `gettid() != getpid()`. See
-/// [`ns_visible_guest_tid`].
+/// [`crate::namespace::pid::ns_visible_guest_tid`].
 pub(crate) fn stamp_ns_visible_guest_tid<E: ThreadedEngine>(
     engine: &E,
-    dispatcher: &SyscallDispatcher,
     context: &crate::kernel::KernelContext,
 ) -> Result<(), TrapError> {
-    stamp_ns_visible_guest_tid_with(crate::syscall_shim_enabled(), dispatcher, context, |tid| {
+    stamp_ns_visible_guest_tid_with(crate::syscall_shim_enabled(), context, |tid| {
         engine.set_guest_thread_id(tid)
     })
 }
@@ -759,14 +738,13 @@ pub(crate) fn stamp_ns_visible_guest_tid<E: ThreadedEngine>(
 /// published answers `gettid` from whatever the previous lease left there.
 pub(crate) fn stamp_ns_visible_guest_tid_with(
     shim_enabled: bool,
-    dispatcher: &SyscallDispatcher,
     context: &crate::kernel::KernelContext,
     set: impl FnOnce(u64) -> Result<(), TrapError>,
 ) -> Result<(), TrapError> {
     if !shim_enabled {
         return Ok(());
     }
-    let tid = ns_visible_guest_tid(dispatcher, context).ok_or_else(|| {
+    let tid = crate::namespace::pid::ns_visible_guest_tid(context).ok_or_else(|| {
         TrapError::Hypervisor(format!(
             "live thread {} is missing its container-visible TID",
             context.thread().key().tid.raw()
@@ -970,8 +948,7 @@ mod tests {
     #[test]
     fn mandatory_child_contextidr_stamp_propagates_injected_failure() {
         let (_, context) = crate::hvpatch::process_context_for_tests(70_200);
-        let dispatcher = crate::dispatch::SyscallDispatcher::new();
-        let error = stamp_ns_visible_guest_tid_with(true, &dispatcher, &context, |_| {
+        let error = stamp_ns_visible_guest_tid_with(true, &context, |_| {
             Err(TrapError::Hypervisor(
                 "injected CONTEXTIDR failure".to_owned(),
             ))

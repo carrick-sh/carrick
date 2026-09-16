@@ -121,34 +121,6 @@ pub(crate) fn el0_fault_access(esr: u64) -> Option<carrick_mem::page_table::Leaf
 // every `el0_debug_signal` call path resolve unchanged.
 pub(crate) use carrick_aarch64::esr::el0_debug_signal;
 
-/// Upgrade `SEGV_MAPERR` to `SEGV_ACCERR` when Carrick's protection metadata
-/// says the faulting VA belongs to a live mapping that denies the access.
-/// Linux reports ACCERR there because the VMA exists. Carrick can otherwise
-/// see MAPERR when `PROT_NONE` is represented by a non-present guest leaf, or
-/// when Darwin reports an initial read-only host mapping as a translation-style
-/// fault. The process-wide no-access and no-write sets are the durable VMA
-/// permission evidence; an address in neither set remains a genuine MAPERR.
-pub(crate) fn upgrade_protection_si_code<M: CurrentMmMemory>(
-    memory: &M,
-    signum: i32,
-    si_code: i32,
-    fault_addr: u64,
-) -> i32 {
-    const SIGSEGV: i32 = 11;
-    const SEGV_MAPERR: i32 = 1;
-    const SEGV_ACCERR: i32 = 2;
-    if signum == SIGSEGV
-        && si_code == SEGV_MAPERR
-        && memory
-            .protections()
-            .is_some_and(|p| p.range_fault_is_access_error(fault_addr, 1))
-    {
-        SEGV_ACCERR
-    } else {
-        si_code
-    }
-}
-
 /// Lower a raw aarch64 `EL0Fault` (raw `ESR_EL1` + `elr`/`far`) to the
 /// ISA-neutral resolved signal triple `(signum, si_code, fault_addr)`, or `None`
 /// for a class we don't translate (kept fatal → caller terminates by SIGSEGV).
@@ -819,23 +791,15 @@ where
         None if pending == crate::linux_abi::LINUX_SIGCONT => {
             Ok(Some(PendingSignalAction::ignored()))
         }
-        None if is_default_ignore_signal(pending) => Ok(Some(PendingSignalAction::ignored())),
+        None if crate::kernel::objects::signal::is_default_ignore_signal(pending) => {
+            Ok(Some(PendingSignalAction::ignored()))
+        }
         None if is_default_stop_signal(pending) => Ok(Some(PendingSignalAction::stop(
             pending,
             job_control_generation,
         ))),
         None => Ok(Some(PendingSignalAction::terminate(pending))),
     }
-}
-
-/// Signals whose DEFAULT disposition is "ignore" (Linux `Ign`).
-pub(crate) fn is_default_ignore_signal(signum: i32) -> bool {
-    matches!(
-        signum,
-        crate::linux_abi::LINUX_SIGCHLD
-            | crate::linux_abi::LINUX_SIGURG
-            | crate::linux_abi::LINUX_SIGWINCH
-    )
 }
 
 #[cfg(all(test, target_os = "macos"))]

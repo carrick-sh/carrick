@@ -570,7 +570,7 @@ impl SyscallDispatcher {
                     .unwrap_or_else(|| DispatchOutcome::errno(LINUX_ESRCH))
                 }
             }
-            178 => match crate::vcpu_loop::ns_visible_guest_tid(self, kernel) {
+            178 => match crate::namespace::pid::ns_visible_guest_tid(kernel) {
                 Some(tid) => DispatchOutcome::Returned {
                     value: i64::from(tid),
                 },

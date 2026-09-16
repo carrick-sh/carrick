@@ -3215,7 +3215,7 @@ fn munmap_clears_read_only_tracking_before_writable_reuse() {
         "an unmapped VA must not retain stale read-only VMA evidence"
     );
     assert_eq!(
-        crate::vcpu_loop::upgrade_protection_si_code(
+        crate::kernel::objects::signal::upgrade_protection_si_code(
             &memory,
             crate::linux_abi::LINUX_SIGSEGV,
             1,

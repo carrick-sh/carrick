@@ -4029,8 +4029,9 @@ where
                 // Raw hardware/host faults can decode as MAPERR even when
                 // Carrick tracks a live VMA denying the access. Upgrade from the
                 // shared protection metadata (LTP mmap05 / roprotect probe).
-                let si_code =
-                    signal::upgrade_protection_si_code(&*engine, signum, si_code, si_addr);
+                let si_code = crate::kernel::objects::signal::upgrade_protection_si_code(
+                    &*engine, signum, si_code, si_addr,
+                );
                 let interrupted_pc = from_el0_direct.then_some(elr);
                 let faulting_tid = self.state.linux_tid;
                 if self.kernel.dispatcher.fault_requires_mm_mutation(si_addr)
@@ -4091,8 +4092,9 @@ where
                 // this directly (fault_addr = CR2). The backend restores the
                 // interrupted user context before surfacing the fault, so the
                 // live PC is the faulting instruction.
-                let si_code =
-                    signal::upgrade_protection_si_code(&*engine, signum, si_code, fault_addr);
+                let si_code = crate::kernel::objects::signal::upgrade_protection_si_code(
+                    &*engine, signum, si_code, fault_addr,
+                );
                 let interrupted_pc = Some(engine.current_pc()?);
                 let faulting_tid = self.state.linux_tid;
                 if self
