@@ -281,10 +281,10 @@ const RAW_HASH: &str = r##" std::env::var_os("IGNORED"); "##;
         source = 'fn helper() { let _ = std::env::var("CARRICK_RUN_ID"); }'
         with self.assertRaises(LedgerError):
             GATE.validate_concurrent_source(
-                Path("crates/carrick-runtime/src/dispatch/proctitle.rs"), source
+                Path("crates/carrick-kernel/src/dispatch/proctitle.rs"), source
             )
         GATE.validate_concurrent_source(
-            Path("crates/carrick-runtime/src/kernel/container.rs"), source
+            Path("crates/carrick-kernel/src/kernel/container.rs"), source
         )
 
     def test_concurrent_source_policy_allows_container_keyed_endpoint_map(self):

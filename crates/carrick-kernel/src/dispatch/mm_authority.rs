@@ -949,7 +949,7 @@ mod mm_transaction_tests {
         }
 
         let expected_matches = BTreeSet::from([(
-            "carrick-runtime/src/dispatch/mm_mutation.rs".to_string(),
+            "carrick-kernel/src/dispatch/mm_mutation.rs".to_string(),
             concat!("MmTransaction", "Guard {").to_string(),
         )]);
 
@@ -959,7 +959,7 @@ mod mm_transaction_tests {
         );
 
         let mutation_source =
-            std::fs::read_to_string(crates_dir.join("carrick-runtime/src/dispatch/mm_mutation.rs"))
+            std::fs::read_to_string(crates_dir.join("carrick-kernel/src/dispatch/mm_mutation.rs"))
                 .expect("read mm_mutation.rs");
         let expected_snippet_lf = format!(
             "pub fn begin_transaction(&self) -> MmTransactionGuard<'_> {{\n        {struct_init_pattern}"
