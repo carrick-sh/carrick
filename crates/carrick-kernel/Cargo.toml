@@ -1,0 +1,99 @@
+[package]
+name = "carrick-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_kernel"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[features]
+# Guest-side syscall shim (docs/syscall-shim-design.md). NO default here on
+# purpose: the binary (carrick-cli) is the single control point and forwards
+# through carrick-runtime, which forwards here.
+syscall-shim = []
+# In-memory fs backend selection (default OFF; control point is carrick-cli).
+fs-memory = ["carrick-vfs/fs-memory", "carrick-spec/fs-memory"]
+# Debug-only tracing (compile-gated, default OFF). Only the gates the kernel's
+# own code names live here; the carrier/VMM gates (trace-hvf, trace-traps,
+# debug-stats, trace-elf, trace-syscalls) stay on carrick-runtime.
+trace-tty = []
+trace-io = []
+watchpoint = []
+event-ring-dump = []
+# The bridge-less test surface: carrick-hal's Null host-signal / guest-timer
+# bridges, `SyscallDispatcher::new()` and the other constructors that build a
+# dispatcher on them, `process_context_for_tests`, and the `CarrierProcess`
+# test doubles. Enabled for this crate's own test targets through the self
+# dev-dependency below (a unit test sees `cfg(test)`, an integration test does
+# not); a product build never compiles it. `carrick-kernel-example` enables it
+# to build its backend from the doubles.
+test-support = ["carrick-hal/test-support"]
+
+# NOTE: no `platform-*` features. This crate selects no VMM and no host
+# backend: the host-OS glue it needs (the kqueue/epoll readiness multiplexer,
+# the host errno table) arrives through carrick-host-bsd / carrick-host-linux
+# in the `cfg(target_os)` tables at the bottom, exactly as in carrick-vfs. The
+# backend selection stays above, in carrick-runtime.
+
+[dependencies]
+carrick-fatal.workspace = true
+carrick-abi = { path = "../carrick-abi" }
+carrick-hal = { path = "../carrick-hal" }
+carrick-portable = { path = "../carrick-portable" }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
+carrick-thread = { path = "../carrick-thread" }
+carrick-host = { path = "../carrick-host" }
+carrick-kernel-arena = { path = "../carrick-kernel-arena" }
+carrick-mem = { path = "../carrick-mem" }
+carrick-observability = { path = "../carrick-observability" }
+carrick-signal-core = { path = "../carrick-signal-core" }
+carrick-timer-core = { path = "../carrick-timer-core" }
+carrick-spec = { path = "../carrick-spec" }
+carrick-vfs = { path = "../carrick-vfs" }
+anyhow.workspace = true
+arc-swap.workspace = true
+bitflags.workspace = true
+camino.workspace = true
+flate2.workspace = true
+getrandom.workspace = true
+goblin.workspace = true
+hickory-proto = "0.26.1"
+libc.workspace = true
+parking_lot.workspace = true
+parking_lot_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+
+# `host_to_linux_errno` and the readiness multiplexer are the two host-OS edges
+# below the kernel: the BSD tables on macOS/FreeBSD/NetBSD, the Linux ones on
+# Linux. Gated on `target_os` rather than a `platform-*` feature because this
+# crate has no backend selection — the host errno space and the host event
+# backend are properties of the host it is compiled for.
+[target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))'.dependencies]
+carrick-host-bsd = { path = "../carrick-host-bsd" }
+[target.'cfg(target_os = "linux")'.dependencies]
+carrick-host-linux = { path = "../carrick-host-linux" }
+
+[dev-dependencies]
+# Self dev-dependency: enables `test-support` on this crate's own lib when it
+# is built for an integration test (`tests/`), which sees no `cfg(test)`.
+carrick-kernel = { path = ".", features = ["test-support"] }
+# The host-open/stat/xattr amplification counters live on carrick-vfs's hot
+# path and are compiled out of a normal build; the kernel's fs tests assert on
+# them.
+carrick-vfs = { path = "../carrick-vfs", features = ["test-support"] }
+proptest.workspace = true
+static_assertions = "1"
+tempfile.workspace = true
