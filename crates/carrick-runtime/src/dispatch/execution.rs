@@ -89,7 +89,7 @@ impl SyscallDispatcher {
         if syscall_requires_mm_mutation(request.number.raw(), request.args) {
             let coordinator = executor.mutation_coordinator();
             let mm = executor.mm_id();
-            crate::vcpu_loop::with_sole_mm_stage1(&mut executor, |authority| {
+            super::mm_quiesce::with_sole_mm_stage1(&mut executor, |authority| {
                 let mut guard = mm_mutation::from_sole_executor(authority, coordinator, mm);
                 self.dispatch_inner(
                     kernel,
@@ -129,7 +129,7 @@ impl SyscallDispatcher {
             .map_err(DispatchError::MmExecutorAdmission)?;
         let coordinator = executor.mutation_coordinator();
         let mm = executor.mm_id();
-        crate::vcpu_loop::with_sole_mm_stage1(&mut executor, |authority| {
+        super::mm_quiesce::with_sole_mm_stage1(&mut executor, |authority| {
             let mut guard = mm_mutation::from_sole_executor(authority, coordinator, mm);
             run(self, &mut guard)
         })
@@ -240,7 +240,7 @@ impl SyscallDispatcher {
                 if syscall_requires_mm_mutation(syscall.request.number.raw(), syscall.request.args)
                 {
                     let coordinator = executor.mutation_coordinator();
-                    crate::vcpu_loop::with_sole_mm_stage1(executor, |outer| {
+                    super::mm_quiesce::with_sole_mm_stage1(executor, |outer| {
                         let mut guard = mm_mutation::from_sole_executor(
                             outer,
                             coordinator,

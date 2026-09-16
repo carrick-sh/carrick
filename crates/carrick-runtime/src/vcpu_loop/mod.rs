@@ -45,6 +45,7 @@ use parking_lot::{Condvar, Mutex};
 use carrick_hal::{PlatformFutex, SignalPumpControl, ThreadedEngine, VcpuRegistry};
 
 use crate::compat::CompatReporter;
+use crate::dispatch::mm_quiesce;
 use crate::dispatch::routing::{MutationDispatchRoute, OrdinaryDispatchRoute};
 use crate::dispatch::{
     CurrentMmMemory, DispatchError, DispatchOutcome, PreparedDispatch, PreparedSyscall,
@@ -94,14 +95,11 @@ pub(crate) mod memory;
 pub(crate) use memory::{
     KernelFrameCowAuthority, RefuseAliasInstallSpec, apply_alias_frame_inventory,
     apply_exec_image_proc_state, apply_image_proc_state, refuse_alias_install,
-    requires_no_unwind_host_exit, stamp_identity_page, stamp_identity_page_at,
-    stamp_identity_values, stamp_ns_visible_guest_tid, syscall_takes_pre_dispatch_pt_pause,
-    with_foreign_mm_mutation_guard, with_sole_mm_stage1,
+    requires_no_unwind_host_exit, stamp_ns_visible_guest_tid, syscall_takes_pre_dispatch_pt_pause,
 };
 #[cfg(test)]
 pub(crate) use memory::{
     fixed_frame_cow_owner_inventory_for_test, kernel_frame_cow_authority_for_test,
-    with_real_pt_pause_for_test,
 };
 
 // ---------------------------------------------------------------------------
@@ -1428,10 +1426,10 @@ where
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let coordinator = kernel.dispatcher.mm_mutation_coordinator();
         let mm = context.shared().mm().id();
-        let mut authority = quiesce::acquire_mm_stage1_authority(
+        let mut authority = mm_quiesce::acquire_mm_stage1_authority(
             executor,
             self.this_tid,
-            quiesce::PtPauseBudget::DEFAULT,
+            mm_quiesce::PtPauseBudget::DEFAULT,
         )
         .map_err(|error| {
             RuntimeError::Configuration(format!(
@@ -1439,10 +1437,10 @@ where
             ))
         })?;
         let mut mutation = match &mut authority {
-            quiesce::MmStage1Authority::Sole(sole) => {
+            mm_quiesce::MmStage1Authority::Sole(sole) => {
                 crate::dispatch::mm_mutation::from_sole_executor(sole, coordinator, mm)
             }
-            quiesce::MmStage1Authority::Paused(pause) => {
+            mm_quiesce::MmStage1Authority::Paused(pause) => {
                 crate::dispatch::mm_mutation::from_pt_pause(pause)
             }
         };
@@ -1600,20 +1598,21 @@ where
         // (`carrick_hal::stage1_exclusive` documents what leaks when it cannot).
         enum SyscallMmPhase<'executor> {
             Ordinary(&'executor mut crate::dispatch::MmExecutorParticipation),
-            Mutation(quiesce::MmStage1Authority<'executor>),
+            Mutation(mm_quiesce::MmStage1Authority<'executor>),
         }
 
         let edits_stage1 =
             syscall_takes_pre_dispatch_pt_pause(request.number.raw(), request.args.0[2], true);
         let mut mm_phase = if edits_stage1 {
-            match quiesce::acquire_mm_stage1_authority(
+            match mm_quiesce::acquire_mm_stage1_authority(
                 mm_executor,
                 self.this_tid,
-                quiesce::PtPauseBudget::DEFAULT,
+                mm_quiesce::PtPauseBudget::DEFAULT,
             ) {
                 Ok(authority) => SyscallMmPhase::Mutation(authority),
                 Err(
-                    quiesce::PtPauseError::TimedOut | quiesce::PtPauseError::UnkickableExecutor,
+                    mm_quiesce::PtPauseError::TimedOut
+                    | mm_quiesce::PtPauseError::UnkickableExecutor,
                 ) => {
                     // No dispatcher/backend mapping call has started yet. Return
                     // a clean Linux allocation failure after pt_pause rolled the
@@ -1662,7 +1661,7 @@ where
                             }
                         };
                         match stage1_authority {
-                            quiesce::MmStage1Authority::Sole(authority) => {
+                            mm_quiesce::MmStage1Authority::Sole(authority) => {
                                 let mut mutation = crate::dispatch::mm_mutation::from_sole_executor(
                                     authority,
                                     coordinator,
@@ -1682,7 +1681,7 @@ where
                                         },
                                     )
                             }
-                            quiesce::MmStage1Authority::Paused(authority) => {
+                            mm_quiesce::MmStage1Authority::Paused(authority) => {
                                 let mut mutation =
                                     crate::dispatch::mm_mutation::from_pt_pause(authority);
                                 kernel
@@ -1954,7 +1953,7 @@ where
                         }
                     };
                     let installed = match stage1_authority {
-                        quiesce::MmStage1Authority::Sole(authority) => {
+                        mm_quiesce::MmStage1Authority::Sole(authority) => {
                             let mutation = crate::dispatch::mm_mutation::from_sole_executor(
                                 authority,
                                 coordinator,
@@ -1963,7 +1962,7 @@ where
                             let permit = mutation.host_alias_permit();
                             install_alias(&permit)
                         }
-                        quiesce::MmStage1Authority::Paused(authority) => {
+                        mm_quiesce::MmStage1Authority::Paused(authority) => {
                             let mutation = crate::dispatch::mm_mutation::from_pt_pause(authority);
                             let permit = mutation.host_alias_permit();
                             install_alias(&permit)
