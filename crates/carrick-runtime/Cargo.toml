@@ -46,6 +46,13 @@ trace-hvf = ["carrick-vmm-hvf/trace-hvf"]
 trace-syscalls = ["carrick-vmm-hvf?/trace-syscalls", "carrick-observability/trace-syscalls"]
 debug-stats = ["carrick-vmm-hvf/debug-stats"]
 trace-elf = ["carrick-mem/trace-elf"]
+# The bridge-less test surface: carrick-hal's Null host-signal / guest-timer
+# bridges, `SyscallDispatcher::new()` and the other constructors that build a
+# dispatcher on them, and `RootBootstrap::for_reference_model`. Enabled for
+# this crate's own test targets through the self dev-dependency below (a unit
+# test sees `cfg(test)`, an integration test does not); a product build never
+# compiles it.
+test-support = ["carrick-hal/test-support"]
 
 # Platform backend selection (exactly one active at a time). carrick-cli's
 # `default` enables `platform-macos`; a `platform-linux` build links NO HVF.
@@ -71,11 +78,7 @@ platform-netbsd = ["dep:carrick-vmm-nvmm", "dep:carrick-host-bsd"]
 [dependencies]
 carrick-fatal.workspace = true
 carrick-abi = { path = "../carrick-abi" }
-# `test-support` (the Null host-signal / guest-timer bridges) is enabled on the
-# NORMAL dependency for now because `SyscallDispatcher::new()` -- the
-# bridge-less constructor -- is still an ungated public constructor; Task 2.8
-# cfg-gates `new()` to test builds and moves this feature to the dev-dependency.
-carrick-hal = { path = "../carrick-hal", features = ["test-support"] }
+carrick-hal = { path = "../carrick-hal" }
 carrick-portable = { path = "../carrick-portable" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-thread = { path = "../carrick-thread" }
@@ -153,6 +156,12 @@ applevisor-sys.workspace = true
 mach2.workspace = true
 
 [dev-dependencies]
+# Self dev-dependency: enables `test-support` on this crate's own lib when it
+# is built for an integration test (`tests/`), which sees no `cfg(test)`.
+# `default-features = false` so it adds ONLY that feature: with the default
+# on, a `--no-default-features --features platform-<other>` cross-check would
+# get `platform-macos` (and carrick-vmm-hvf) re-enabled through this edge.
+carrick-runtime = { path = ".", default-features = false, features = ["test-support"] }
 carrick-test-support = { path = "../carrick-test-support" }
 # The host-open/stat/xattr amplification counters live on carrick-vfs's hot
 # path and are compiled out of a normal build; the fs tests here assert on them.

@@ -1,5 +1,7 @@
 //! BSD-family EventMultiplexer implementation based on kqueue.
 
+#[cfg(target_os = "macos")]
+use crate::kqueue::NOTE_EXITSTATUS;
 #[cfg(any(target_os = "macos", target_os = "openbsd", target_os = "dragonfly"))]
 use crate::kqueue::{EVFILT_EXCEPT, NOTE_OOB};
 use crate::kqueue::{Kevent, Kqueue};
@@ -9,6 +11,23 @@ use carrick_hal::event::{
 };
 use std::os::fd::RawFd;
 use std::time::Duration;
+
+/// Decode a `waitpid(2)`-format status word into the BARE exit code the
+/// [`PollEvent::exit_status`](carrick_hal::event::PollEvent::exit_status)
+/// contract carries: `WEXITSTATUS` for a normal exit, `128 + WTERMSIG` for a
+/// signal death (the shell convention, matching the Linux `EpollMultiplexer`'s
+/// `waitid(P_PIDFD)` si_status). A still-running/unknown word falls back to the
+/// low byte so the value is always a small integer.
+#[cfg(target_os = "macos")]
+fn wait_status_to_bare(status: i32) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        status & 0xff
+    }
+}
 
 pub struct KqueueMultiplexer {
     kq: Kqueue,
@@ -74,6 +93,11 @@ impl EventMultiplexer for KqueueMultiplexer {
     fn register_vnode(&mut self, fd: RawFd, token: u64, mask: VnodeEvents) -> Result<(), OsError> {
         let note = mask.to_note();
         let ev = Kevent::vnode(fd, note).with_udata_u64(token);
+        self.kq.apply(&[ev]).map_err(OsError::from_raw)
+    }
+
+    fn watch_process_exit(&mut self, pid: i32, token: u64) -> Result<(), OsError> {
+        let ev = Kevent::proc_exit(pid).with_udata_u64(token);
         self.kq.apply(&[ev]).map_err(OsError::from_raw)
     }
 
@@ -145,6 +169,8 @@ impl EventMultiplexer for KqueueMultiplexer {
 
             let mut readiness = Readiness::empty();
             let mut is_eof = false;
+            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+            let mut exit_status = None;
             let mut vnode = None;
 
             match filter {
@@ -180,6 +206,21 @@ impl EventMultiplexer for KqueueMultiplexer {
                     if fflags & libc::NOTE_EXIT != 0 {
                         is_eof = true;
                     }
+                    // macOS delivers the exit status in `data` only when the
+                    // NOTE_EXITSTATUS fflag was requested. `data` is the raw
+                    // `waitpid(2)` out-parameter STATUS WORD; the
+                    // `PollEvent.exit_status` contract is the BARE exit code
+                    // (WEXITSTATUS, or 128+signal for a signal death — matching
+                    // the Linux `EpollMultiplexer`'s `waitid(P_PIDFD)` si_status).
+                    // Decode here so both backends agree.
+                    #[cfg(target_os = "macos")]
+                    if fflags & NOTE_EXITSTATUS != 0 {
+                        exit_status = Some(wait_status_to_bare(ev.data() as i32));
+                    }
+                    // FreeBSD carries the wait-status in `data` UNCONDITIONALLY
+                    // under NOTE_EXIT. TODO(part-c): wire it into exit_status with
+                    // a proc-exit kqueue test when EventMultiplexer::watch_process_exit
+                    // lands (the proc_exit_status accessor already reads `data`).
                 }
                 // A user-triggered wake is a "something changed, re-check"
                 // signal, not fd readiness: it carries NO IO readiness bits (the
@@ -200,6 +241,7 @@ impl EventMultiplexer for KqueueMultiplexer {
                 readiness_count: ev.data(),
                 error,
                 eof: is_eof,
+                exit_status,
                 vnode,
             });
         }

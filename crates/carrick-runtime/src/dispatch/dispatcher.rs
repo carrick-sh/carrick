@@ -134,6 +134,7 @@ pub struct SyscallDispatcher {
     pub(crate) exec_host_fs_fallback: bool,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for SyscallDispatcher {
     fn default() -> Self {
         Self::new()
@@ -150,11 +151,12 @@ pub struct CarrierBridges {
 impl CarrierBridges {
     /// The bridge-less pair a dispatcher boots with when no carrier hands it
     /// real ones: the neutral pending/timer bookkeeping with no host glue
-    /// behind it. Test and reference-model use only.
+    /// behind it. Test and reference-model use only, and compiled only there.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn null() -> Self {
         Self {
-            host_signal: Arc::new(carrick_hal::NullHostSignalBridge),
-            timers: Arc::new(carrick_hal::NullGuestTimerBridge),
+            host_signal: Arc::new(carrick_hal::NullHostSignalBridge::default()),
+            timers: Arc::new(carrick_hal::NullGuestTimerBridge::default()),
         }
     }
 }
@@ -177,7 +179,8 @@ struct ForkCloneObservedArgs<'a> {
 impl SyscallDispatcher {
     /// The bridge-less test/reference-model constructor: the Null bridges of
     /// [`CarrierBridges::null`]. Product carriers construct with
-    /// [`Self::with_bridges`].
+    /// [`Self::with_bridges`]; this one does not exist in a product build.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new() -> Self {
         Self::with_bridges(CarrierBridges::null())
     }
@@ -231,6 +234,7 @@ impl SyscallDispatcher {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_network(network: std::sync::Arc<crate::network::RuntimeNetwork>) -> Self {
         Self::with_network_and_host_resolver(network, None, CarrierBridges::null())
     }
@@ -318,6 +322,7 @@ impl SyscallDispatcher {
         );
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_page_geometry(page_geometry: crate::page_profile::PageGeometry) -> Self {
         let mut dispatcher = Self::new();
         dispatcher.page_geometry = page_geometry;
@@ -368,6 +373,7 @@ impl SyscallDispatcher {
             .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_rootfs(rootfs: RootFs) -> Self {
         let mut s = Self::new();
         s.fs.rootfs_vfs_mut().rootfs = Some(rootfs);
@@ -376,11 +382,14 @@ impl SyscallDispatcher {
         s
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_rootfs_and_executable(rootfs: RootFs, executable_path: impl Into<String>) -> Self {
         Self::with_rootfs_and_executable_on(CarrierBridges::null(), rootfs, executable_path)
     }
 
-    /// [`Self::with_rootfs_and_executable`] wired to a carrier's real bridges.
+    /// The rootfs-plus-executable constructor wired to a carrier's real
+    /// bridges (`with_rootfs_and_executable` is its test-support twin on the
+    /// Null bridges).
     pub fn with_rootfs_and_executable_on(
         bridges: CarrierBridges,
         rootfs: RootFs,

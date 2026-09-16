@@ -2106,6 +2106,7 @@ pub(crate) mod tests {
             ThreadId::synthetic_for_tests(pid),
             fixture_backend(),
             "mm-authority root".to_owned(),
+            Arc::new(carrick_hal::NullHostSignalBridge::default()),
         )
         .expect("root bootstrap");
         Kernel::bootstrap_root(input).expect("root kernel")

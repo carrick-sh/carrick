@@ -17,7 +17,7 @@
 //! | Deadlock watchdog thread | `deadlock_watchdog::arm` (`ARMED` swap) | guarded | process exit |
 //! | vCPU admission scheduler | `vcpu_sched::install_for_budget` (`OnceLock`) | first wins | process exit |
 //! | Shared HVPatch runtime directory and executor services | first root activation | later roots use the same services | [`shutdown`] |
-//! | `TimerDelivery` handle | `timer_delivery::register_delivery` (`OnceLock`; `HvfTimerDelivery` is a unit struct) | first wins | process exit |
+//! | `TimerDelivery` handle | `carrick_hal::guest_timer_bridge::register_delivery` (`OnceLock`; `HvfTimerDelivery` is a unit struct) | first wins | process exit |
 //! | `RLIMIT_NOFILE` soft raise | `runtime::finish_and_run_image` (every `run_*` entry, CLI and embed); `dispatch/time.rs::raise_host_nofile_backing` | only ever raises | process exit |
 //! | VM lifecycle ledger terminal + artifact | [`shutdown`] | single terminal per carrier | — |
 //!

@@ -152,7 +152,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let outcome = write_host_pipe(
             &bytes,
             HostPipeWriteTarget {
-                host_signal: &carrick_hal::NullHostSignalBridge,
+                host_signal: &carrick_hal::NullHostSignalBridge::default(),
                 host_fd: fds[1],
                 host_fd_owner: None,
                 nonblocking: false,
@@ -210,7 +210,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let outcome = write_host_pipe(
             &bytes,
             HostPipeWriteTarget {
-                host_signal: &carrick_hal::NullHostSignalBridge,
+                host_signal: &carrick_hal::NullHostSignalBridge::default(),
                 host_fd: fds[1],
                 host_fd_owner: None,
                 nonblocking: true,
@@ -269,7 +269,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let outcome = write_host_pipe(
             &bytes,
             HostPipeWriteTarget {
-                host_signal: &carrick_hal::NullHostSignalBridge,
+                host_signal: &carrick_hal::NullHostSignalBridge::default(),
                 host_fd: fds[0],
                 host_fd_owner: None,
                 nonblocking: true,

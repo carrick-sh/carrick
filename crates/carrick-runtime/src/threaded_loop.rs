@@ -515,15 +515,9 @@ where
         kernel.dispatcher.container().id(),
     );
     // Install the backend `TimerDelivery` the dispatch arm reaches through the
-    // lane's process-global seam (`GuestTimerBridge::delivery`).
+    // hal-wide process-global seam (`GuestTimerBridge::delivery`), the same
+    // seam on every lane.
     let timer_delivery = host_for_factory.make_timer_delivery(Arc::clone(&kicker), main_tid);
-    #[cfg(feature = "platform-macos")]
-    carrick_vmm_hvf::timer_delivery::register_delivery(timer_delivery);
-    #[cfg(any(
-        feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ))]
     carrick_hal::guest_timer_bridge::register_delivery(timer_delivery);
 
     // Finish every fallible control-plane setup step before the logical job is

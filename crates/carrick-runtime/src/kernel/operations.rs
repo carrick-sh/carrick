@@ -1514,6 +1514,7 @@ pub(super) mod tests {
             ThreadId::synthetic_for_tests(pid),
             Arc::new(TestMmBackend(test_binding())),
             "root".to_string(),
+            Arc::new(carrick_hal::NullHostSignalBridge::default()),
         )
         .expect("bootstrap input");
         Kernel::bootstrap_root(input).expect("kernel")

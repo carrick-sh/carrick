@@ -3361,6 +3361,7 @@ mod tests {
             readiness_count: 0,
             error,
             eof,
+            exit_status: None,
             vnode: None,
         };
 

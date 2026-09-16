@@ -881,6 +881,7 @@ pub(crate) mod test_support {
                 carrick_hal::ThreadId::synthetic_for_tests(pid),
                 Arc::clone(&backend) as Arc<dyn crate::kernel::MmBackend>,
                 "hvpatch-test-root".to_owned(),
+                Arc::new(carrick_hal::NullHostSignalBridge::default()),
             )
             .expect("test kernel bootstrap");
             let (kernel, root) =

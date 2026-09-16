@@ -22,9 +22,10 @@
 //!   this crate's macOS docs). It replaces the runtime's former inline Linux
 //!   `host_signal` module, which was parameterised the same way through an
 //!   `ActiveGlue` alias.
-//! - [`NullHostSignalBridge`] (feature `test-support`), the bridge a dispatcher
-//!   boots with when no carrier has handed it one: the neutral
-//!   `carrick-signal-core` pending bookkeeping with NO host glue behind it.
+//! - `NullHostSignalBridge` (feature `test-support`, so not linkable from a
+//!   product docs build), the bridge a dispatcher boots with when no carrier
+//!   has handed it one: the SAME generic body over `NullHostSignalGlue`, a
+//!   glue with no host plumbing behind it.
 
 use std::marker::PhantomData;
 use std::os::fd::RawFd;
@@ -179,9 +180,16 @@ impl std::fmt::Debug for dyn HostSignalBridge {
 /// closes the lost-wakeup window.
 pub struct GenericHostSignalBridge<G: HostSignalGlue>(PhantomData<fn() -> G>);
 
+impl<G: HostSignalGlue> GenericHostSignalBridge<G> {
+    /// The bridge over glue `G`; `const` so a lane can hold one in a `static`.
+    pub const fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
 impl<G: HostSignalGlue> Default for GenericHostSignalBridge<G> {
     fn default() -> Self {
-        Self(PhantomData)
+        Self::new()
     }
 }
 
@@ -283,100 +291,70 @@ impl<G: HostSignalGlue> HostSignalBridge for GenericHostSignalBridge<G> {
     }
 }
 
-/// The bridge a dispatcher boots with when no carrier has handed it one
-/// (`SyscallDispatcher::new()`, the example backend): the neutral
-/// `carrick-signal-core` pending store and xsignal ring with NO host glue —
-/// no host dispositions are mirrored, no waiter is woken, no sibling is
-/// nudged, and signal numbers translate as identity. The pending bookkeeping
-/// is kernel (compat-zone) state, not host state, which is why it is kept:
-/// a test that publishes a signal and expects the dispatcher to see it is
-/// exercising the kernel, not the host.
+/// The [`HostSignalGlue`] of a lane with NO host signal plumbing behind it:
+/// signal numbers translate as identity, every disposition mirror is skipped
+/// (the host's real dispositions are not this lane's to touch), the pump poke
+/// is a no-op and no kick or nudge signal exists (`0`; nothing ever installs
+/// them). [`GenericHostSignalBridge`] over this glue is
+/// [`NullHostSignalBridge`], the bridge a dispatcher boots with when no
+/// carrier has handed it one (`SyscallDispatcher::new()`, the example
+/// backend). It is one instantiation of the shared body, not a second
+/// implementation: the neutral `carrick-signal-core` pending store and xsignal
+/// ring it reads and writes are kernel (compat-zone) state — which is why a
+/// test that publishes a signal and expects the dispatcher to see it still
+/// exercises the kernel — while nothing behind them happens: no host
+/// disposition is mirrored, no waiter is woken, no sibling is nudged.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default, Clone, Copy)]
-pub struct NullHostSignalBridge;
+pub struct NullHostSignalGlue;
 
 #[cfg(any(test, feature = "test-support"))]
-impl HostSignalBridge for NullHostSignalBridge {
-    fn has_unblocked_pending_for(&self, tid: i32, block_mask: SigBlockMask) -> bool {
-        if carrick_signal_core::xsig::xsig_has_unblocked_for_self(block_mask) {
-            return true;
-        }
-        carrick_signal_core::has_unblocked_pending_for(tid, block_mask)
+impl HostSignalGlue for NullHostSignalGlue {
+    /// No kick mechanism: nothing installs or sends it.
+    fn kick_signal() -> i32 {
+        0
     }
 
-    fn take_pending_for(&self, tid: i32) -> i32 {
-        carrick_signal_core::take_pending_for(tid)
+    /// No nudge mechanism either (the default would derive `kick + 1`).
+    fn nudge_signum() -> i32 {
+        0
     }
 
-    fn take_pending_in_for(&self, tid: i32, wait_set: SigSet) -> i32 {
-        carrick_signal_core::take_pending_in_for(tid, wait_set)
-    }
-
-    fn publish_pending_for(&self, tid: i32, signum: i32) {
-        carrick_signal_core::publish_pending_for(tid, signum);
-    }
-
-    fn publish_process_signal(&self, signum: i32) {
-        carrick_signal_core::publish_process_signal(signum);
-    }
-
-    fn last_sender_for(&self, signum: i32) -> i32 {
-        carrick_signal_core::last_sender_for(signum)
-    }
-
-    fn raise_for_self(&self, signum: i32) {
-        // The sender is THIS process; record it so delivery's si_pid is self.
-        carrick_signal_core::record_sender(signum, std::process::id() as i32);
-        carrick_signal_core::publish_process_signal(signum);
-    }
-
-    fn wake_all_waiters(&self) {}
-
-    fn ensure_host_handler(&self, _linux_signum: i32) {}
-
-    fn set_host_ignore(&self, _linux_signum: i32) {}
-
-    fn set_host_default(&self, _linux_signum: i32) {}
-
-    fn reset_routed_handlers_after_execve(&self, _ignored: SigSet) {}
-
-    fn xsig_enqueue(
-        &self,
-        target_host_pid: i32,
-        signum: i32,
-        code: i32,
-        sender_ns_pid: i32,
-        sender_uid: u32,
-        value: i64,
-        target_ns_tid: i32,
-    ) -> bool {
-        carrick_signal_core::xsig::xsig_enqueue(
-            target_host_pid,
-            signum,
-            code,
-            sender_ns_pid,
-            sender_uid,
-            value,
-            target_ns_tid,
-        )
-    }
-
-    fn xsig_nudge(&self, _target_host_pid: i32) {
-        carrick_signal_core::xsig::mark_xsig_dirty();
-    }
-
-    fn xsig_drain_for_self(&self) -> Vec<(i32, i32, i32, u32, i64, i32)> {
-        carrick_signal_core::xsig::xsig_drain_for_self()
-    }
-
-    fn host_to_linux_signum(&self, host_signum: i32) -> i32 {
+    fn host_to_linux(host_signum: i32) -> i32 {
         host_signum
     }
 
-    fn linux_to_host_signum(&self, linux_signum: i32) -> i32 {
+    fn linux_to_host(linux_signum: i32) -> i32 {
         linux_signum
     }
+
+    /// Every signal stays the host's own: the mirror never installs, ignores
+    /// or resets a host disposition on this lane.
+    fn is_claimed(_linux_signum: i32) -> bool {
+        true
+    }
+
+    fn skip_install_routing(_linux_signum: i32) -> bool {
+        true
+    }
+
+    fn skip_ignore_mirror(_linux_signum: i32) -> bool {
+        true
+    }
+
+    fn skip_execve_reset(_linux_signum: i32) -> bool {
+        true
+    }
+
+    fn poke() {}
+
+    fn install_kick_handler() {}
 }
+
+/// The bridge a dispatcher boots with when no carrier has handed it one: the
+/// shared [`GenericHostSignalBridge`] body over [`NullHostSignalGlue`].
+#[cfg(any(test, feature = "test-support"))]
+pub type NullHostSignalBridge = GenericHostSignalBridge<NullHostSignalGlue>;
 
 #[cfg(test)]
 mod tests {
@@ -395,18 +373,27 @@ mod tests {
 
     #[test]
     fn null_bridge_is_identity_on_signum_translation_and_inert_on_host_glue() {
-        let bridge = NullHostSignalBridge;
+        let bridge = NullHostSignalBridge::default();
         assert_eq!(bridge.linux_to_host_signum(10), 10);
         assert_eq!(bridge.host_to_linux_signum(31), 31);
         // The host-glue methods are no-ops; they must not touch the process's
         // real dispositions, so calling them for every signal is safe here.
+        // The shared install mask is the observable: a mirrored route marks
+        // it, and the Null glue must never mark it.
         for signum in 1..=64 {
+            carrick_signal_core::host_disposition::clear_installed(signum);
             bridge.ensure_host_handler(signum);
+            assert!(
+                !carrick_signal_core::host_disposition::is_installed(signum),
+                "signal {signum} must not be routed onto the host by the Null glue"
+            );
             bridge.set_host_ignore(signum);
             bridge.set_host_default(signum);
         }
         bridge.reset_routed_handlers_after_execve(SigSet::EMPTY);
         bridge.wake_all_waiters();
         bridge.xsig_nudge(0);
+        assert_eq!(NullHostSignalGlue::kick_signal(), 0);
+        assert_eq!(NullHostSignalGlue::nudge_signum(), 0);
     }
 }

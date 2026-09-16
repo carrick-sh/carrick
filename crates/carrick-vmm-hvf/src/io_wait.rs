@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 use crate::darwin_kqueue::{Kevent, Kqueue};
 
 // The wait-fd descriptor is backend-neutral (the dispatcher builds it), so it
-// lives in carrick-hal; re-exported here so this module's callers name one path.
-pub use carrick_hal::WaitFd;
+// lives in carrick-hal and every consumer names it there.
+use carrick_hal::WaitFd;
 
 /// Result of a blocking-I/O wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
