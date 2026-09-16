@@ -188,7 +188,7 @@ impl Default for RunRequest {
             tty: false,
             stdio: StdioMode::default(),
             name: None,
-            max_traps: carrick_runtime::runtime::DEFAULT_MAX_TRAPS,
+            max_traps: carrick_runtime::run_state::DEFAULT_MAX_TRAPS,
             debug_state_path: None,
             fs: None,
             pull: carrick_image::PullPolicy::default(),
@@ -1266,7 +1266,7 @@ mod tests {
     #[test]
     fn run_request_default_is_a_runnable_docker_shaped_baseline() {
         let d = RunRequest::default();
-        assert_eq!(d.max_traps, carrick_runtime::runtime::DEFAULT_MAX_TRAPS);
+        assert_eq!(d.max_traps, carrick_runtime::run_state::DEFAULT_MAX_TRAPS);
         assert_eq!(d.pull, carrick_image::PullPolicy::Missing);
         assert_eq!(d.exec_backend, carrick_spec::ExecBackendRequest::HvPatch);
         assert_eq!(d.pid, PidMode::Private);

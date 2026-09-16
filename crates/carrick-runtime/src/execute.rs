@@ -241,22 +241,13 @@ pub(crate) fn install_fs_backend(
     Ok(())
 }
 
-/// Default nodename used while constructing a container whose run spec does
-/// not supply `--hostname`. Guest-facing reads never call this function: once
-/// bootstrapped, they resolve the calling task's UTS namespace.
-pub fn guest_hostname() -> String {
-    carrick_host::host_facts::host_short_hostname()
-        .unwrap_or(crate::linux_abi::CARRICK_HOSTNAME)
-        .to_owned()
-}
-
 pub(crate) fn effective_guest_hostname(spec: &RunSpec) -> Cow<'_, str> {
     spec.network
         .hostname
         .as_deref()
         .filter(|hostname| !hostname.is_empty())
         .map(Cow::Borrowed)
-        .unwrap_or_else(|| Cow::Owned(guest_hostname()))
+        .unwrap_or_else(|| Cow::Owned(crate::kernel::netns::default_nodename()))
 }
 
 pub(crate) fn seed_guest_baseline(

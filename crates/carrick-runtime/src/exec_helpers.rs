@@ -7,9 +7,9 @@
 //! Every dependency is reached through `crate::...` paths that resolve
 //! per-platform:
 //!
-//! - `HostSignalBridge::linux_to_host_signum` — the Darwin signal-number
-//!   mapping on macOS (via `carrick_vmm_hvf`), the identity function on Linux (the
-//!   stub in `lib.rs`).
+//! - `carrick_hal::HostSignalBridge::linux_to_host_signum` — the host signal
+//!   bridge the product bootstrap installed: the Darwin signal-number mapping
+//!   on macOS, the identity function on a Linux host.
 //! - `crate::guest_cpu::{record_child_exit, total_ns}` — always from
 //!   `carrick_host` (an unconditional dependency on both platforms).
 //! - `crate::linux_abi::LINUX_{ENOENT,SIGTRAP}` — always from `carrick_abi`.

@@ -49,6 +49,24 @@ use carrick_kernel_arena::process::{
     ProcessSection,
 };
 
+/// Default guest trap budget: **unlimited**.
+///
+/// This was `1_000_000` — a bring-up-era watchdog for a guest wedged in a loop
+/// carrick could not service. It outlived its usefulness and became a source of
+/// false failures on real workloads: a legitimate CPython `unittest` run blows
+/// through a million traps, and the conformance harness had to pass
+/// `--max-traps 18446744073709551615` on **every** invocation to get a true
+/// verdict. A limit that every real caller must override is not a safety net —
+/// it is a trap for anyone who forgets, because the resulting kill looks like a
+/// guest failure rather than a harness artifact. (It had also already been seen
+/// killing a legitimate `SIGALRM` busy-wait in `cpython-io`.)
+///
+/// `--max-traps N` remains available as an opt-in debugging bound — e.g. to
+/// stop a runaway guest while tracing — but nothing imposes one by default.
+/// Detecting a genuinely stuck guest is the job of a progress-aware check, not
+/// a fixed count of successfully-serviced syscalls.
+pub const DEFAULT_MAX_TRAPS: usize = usize::MAX;
+
 /// Published guest run-state of a process. The encoded value lives in the high
 /// 8 bits of a shared `u64` slot whose low bits hold the owning host pid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

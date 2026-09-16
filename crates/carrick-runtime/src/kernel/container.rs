@@ -1196,8 +1196,7 @@ impl Container {
     /// runtime's entry points (`execute.rs`, `hvpatch::initialize_root_process`,
     /// later `prepare.rs`) construct it; embedders go through `LaunchContext`.
     pub(crate) fn new(launch: LaunchContext) -> Self {
-        let hostname = carrick_host::host_facts::host_short_hostname()
-            .unwrap_or(crate::linux_abi::CARRICK_HOSTNAME);
+        let hostname = super::netns::default_nodename();
         Self::new_with_namespaces(
             launch,
             LinuxNetworkModel::host_mirror(&HostWireSnapshot::probe()),
@@ -1306,8 +1305,7 @@ impl Container {
     /// view. Unlike [`Self::for_reference_model`], this does not probe the host
     /// network only to discard that model immediately.
     pub(crate) fn for_reference_model_with_network(network: LinuxNetworkModel) -> Self {
-        let hostname = carrick_host::host_facts::host_short_hostname()
-            .unwrap_or(crate::linux_abi::CARRICK_HOSTNAME);
+        let hostname = super::netns::default_nodename();
         Self::new_with_namespaces(
             LaunchContext::unmanaged(RunId::new("reference-model")),
             network,
@@ -1475,7 +1473,7 @@ impl Container {
     /// region back to the carrier arena.
     pub(crate) fn retire(
         self: std::sync::Arc<Self>,
-    ) -> Result<crate::carrier::ContainerTeardown, crate::run_result::RuntimeError> {
+    ) -> Result<super::control::ContainerTeardown, crate::run_result::RuntimeError> {
         let kernel = self
             .kernel
             .lock()
@@ -1493,7 +1491,7 @@ impl Container {
                     .pid_region()
                     .map(|region| region.retire())
                     .unwrap_or(false);
-                Ok(crate::carrier::ContainerTeardown {
+                Ok(super::control::ContainerTeardown {
                     id,
                     carrier_scope_id: self.launch.carrier_scope_id.clone(),
                     run_id: self.launch.run_id.clone(),

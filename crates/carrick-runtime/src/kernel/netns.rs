@@ -93,6 +93,23 @@ impl NetNs {
     }
 }
 
+/// The nodename a UTS namespace starts life with when the run spec names none.
+///
+/// The `--net=host` contract carrick ships today: the guest is called what the
+/// host is called (short name only — `uname(2)`'s `nodename` is the host part,
+/// never the FQDN), falling back to `carrick` when the host has no usable one.
+///
+/// Guest-facing reads never call this: once a container is built they resolve
+/// the calling task's [`UtsNs`], which is what `sethostname(2)` writes. It is
+/// the construction-time default and the answer for a context-free procfs
+/// lookup that has no task to resolve against — one function so `uname(2)`,
+/// `/proc/sys/kernel/hostname` and the seeded `/etc/hostname` cannot disagree.
+pub fn default_nodename() -> String {
+    carrick_host::host_facts::host_short_hostname()
+        .unwrap_or(crate::linux_abi::CARRICK_HOSTNAME)
+        .to_owned()
+}
+
 /// A UTS namespace: the nodename `uname(2)`, `/proc/sys/kernel/hostname` and the
 /// `/etc/hosts` self-mapping report. (`setdomainname` is unconditional EPERM and
 /// nothing renders a domainname, so there is none to hold yet; it belongs here

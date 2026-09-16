@@ -539,7 +539,7 @@ fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
 
 #[test]
 fn synthetic_proc_surface_serves_common_process_and_system_files() {
-    let root_nodename = carrick_runtime::execute::guest_hostname();
+    let root_nodename = carrick_runtime::kernel::netns::default_nodename();
     let paths: [(&str, &[u8]); 20] = [
         ("/proc/cmdline", b"BOOT_IMAGE="),
         ("/proc/diskstats", b""),
@@ -560,7 +560,7 @@ fn synthetic_proc_surface_serves_common_process_and_system_files() {
         ("/proc/self/status", b"Name:\texe"),
         ("/proc/sys/kernel/osrelease", b"carrick"),
         // /proc/sys/kernel/hostname is the ROOT UTS NAMESPACE's nodename
-        // (`guest_hostname()`, in lockstep with uname's), NOT a fixed string.
+        // (`default_nodename()`, in lockstep with uname's), NOT a fixed string.
         // Derive from that single source so any host name passes; the namespace
         // is seeded from the host's short name under the --net=host contract and
         // falls back to "carrick" when the host has no usable one.

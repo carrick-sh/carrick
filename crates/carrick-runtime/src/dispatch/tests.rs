@@ -3699,7 +3699,7 @@ mod rosetta_handshake_tests {
         let outcome = rosetta_handshake_ioctl(&mut m, 0x80456125, BASE)
             .expect("licence ioctl must be handled");
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
-        if crate::runtime::rosetta_license_blob().is_some() {
+        if crate::rosetta_license_blob().is_some() {
             let buf = m.read_bytes(BASE, 13).unwrap();
             assert_eq!(&buf, b"Our hard work");
         }

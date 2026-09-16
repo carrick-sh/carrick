@@ -16,22 +16,23 @@
 //! `real_in` → master, master → `real_out`, a shutdown self-pipe (so
 //! [`PtyRelay::stop`] terminates the thread without a signal or timeout), a
 //! SIGWINCH self-pipe, and an optional out-of-band winsize-message fd
-//! (`winsize_r`; the carrier-local [`interactive_supervisor`](crate::interactive_supervisor)
-//! passes none, so that fifth slot is inert in production). The user's real
-//! terminal is put in raw mode while the relay runs so the guest's slave-side
-//! line discipline is the only one cooking input; a [`crate::host_tty`] guard
-//! restores it on teardown (even on a guest crash).
+//! (`winsize_r`; the carrier-local interactive supervisor passes none, so that
+//! fifth slot is inert in production). The user's real terminal is put in raw
+//! mode while the relay runs so the guest's slave-side line discipline is the
+//! only one cooking input; a [`crate::host_tty`] guard restores it on teardown
+//! (even on a guest crash).
 //!
 //! # SIGWINCH and the resize poll
 //!
 //! Window-size changes propagate two ways, because neither alone is reliable in
-//! carrick's HVF context. The fast path is a classic async-signal-safe SIGWINCH
-//! self-pipe (handler writes one byte to a non-blocking pipe; the relay reads it
-//! and copies the new `winsize` to the master via `TIOCSWINSZ`). But
-//! applevisor/HVF often masks SIGWINCH on the vCPU threads, so the handler may
-//! never fire — the relay therefore **also** polls the terminal size on a
-//! timeout as a backstop. There is exactly one live `PtyRelay` per process, so
-//! the handler's write-end fd lives in a single process-global atomic.
+//! carrick's hypervisor context. The fast path is a classic async-signal-safe
+//! SIGWINCH self-pipe (handler writes one byte to a non-blocking pipe; the
+//! relay reads it and copies the new `winsize` to the master via `TIOCSWINSZ`).
+//! But the host hypervisor backend often masks SIGWINCH on the vCPU threads, so
+//! the handler may never fire — the relay therefore **also** polls the terminal
+//! size on a timeout as a backstop. There is exactly one live `PtyRelay` per
+//! process, so the handler's write-end fd lives in a single process-global
+//! atomic.
 //!
 //! # Resource ownership and the rollback guard
 //!
@@ -77,9 +78,9 @@ static WINCH_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
 
 /// Async-signal-safe SIGWINCH handler. Only calls `write(2)` and reads one
 /// atomic — both are async-signal-safe per POSIX. No ioctl, no allocation,
-/// no mutex. NOTE: in carrick's HVF context SIGWINCH delivery to this handler
-/// is unreliable (HVF/applevisor masks signals on the vCPU threads), so the
-/// relay ALSO polls for size changes on a timeout — see `relay_loop`. This
+/// no mutex. NOTE: in carrick's hypervisor context SIGWINCH delivery to this
+/// handler is unreliable (the backend masks signals on the vCPU threads), so
+/// the relay ALSO polls for size changes on a timeout — see `relay_loop`. This
 /// handler is the low-latency path when delivery does happen.
 extern "C" fn handle_sigwinch(_signum: libc::c_int) {
     let w = WINCH_PIPE_WRITE.load(Ordering::SeqCst);
@@ -260,9 +261,9 @@ impl PtyRelay {
     }
 
     /// Production entry over a pty the caller already allocated: the
-    /// carrier-local [`InteractiveSession`](crate::interactive_supervisor::InteractiveSession)
-    /// allocates the pair, starts this relay, then `dup2`s the slave over the
-    /// carrier's fds 0-2 before any guest traffic flows.
+    /// carrier-local interactive session allocates the pair, starts this relay,
+    /// then `dup2`s the slave over the carrier's fds 0-2 before any guest
+    /// traffic flows.
     pub fn start_with_pair(pair: PtyPair, real_in: RawFd, real_out: RawFd) -> io::Result<Self> {
         Self::start_with_pair_and_winsize(pair, real_in, real_out, -1)
     }
