@@ -844,7 +844,9 @@ fn proc_net_dev(context: &crate::kernel::KernelContext) -> String {
 
     let network = context.task().net_ns().view();
     let open_context = crate::vfs::OpenContext {
-        network_model: crate::vfs::LazyField::from_value(Some((**network).clone())),
+        network_model: crate::vfs::LazyField::from_value(Some(
+            Arc::clone(&*network) as Arc<dyn crate::vfs::FsNetworkView>
+        )),
         ..crate::vfs::OpenContext::default()
     };
     let crate::vfs::VfsHandle::Bytes { contents, .. } = crate::vfs::ProcVfs::new()

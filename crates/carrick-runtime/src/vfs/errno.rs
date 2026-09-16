@@ -2,7 +2,7 @@
 //!
 //! Two pieces the filesystem layer needs to turn a failure into a Linux errno,
 //! placed below the dispatcher so `vfs/rootfs.rs` and the `fs_backend` host
-//! backend do not reach upward into `crate::dispatch` for them:
+//! backend do not reach upward into the dispatcher for them:
 //!
 //! * [`HostSyscallResult`] (with its `Err` type [`HostSyscallError`]) captures
 //!   the host libc's `errno` at the moment a raw host call returned a negative

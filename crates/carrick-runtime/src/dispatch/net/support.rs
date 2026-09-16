@@ -2627,6 +2627,8 @@ mod tests {
 
     #[test]
     fn two_bridge_network_model_drives_guest_visible_renderers() {
+        use crate::vfs::FsNetworkView;
+
         let mut spec = carrick_spec::NetworkNamespaceSpec::bridge_default(
             Some("web".to_string()),
             Vec::new(),

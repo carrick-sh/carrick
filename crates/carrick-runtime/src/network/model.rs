@@ -6,6 +6,8 @@ use carrick_abi::{
 use carrick_spec::{NetworkMode, NetworkNamespaceSpec};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use crate::vfs::{FsNetworkInterface, FsNetworkView};
+
 /// What the guest's network namespace looks like: which links exist, what
 /// addresses they carry, how packets leave, and who resolves names.
 ///
@@ -224,51 +226,6 @@ impl LinuxNetworkModel {
         !self.resolver.nameservers.is_empty()
             || !self.resolver.search.is_empty()
             || !self.resolver.options.is_empty()
-    }
-
-    pub(crate) fn render_proc_net_dev(&self) -> Vec<u8> {
-        let mut out = String::from(
-            "Inter-|   Receive                                                |  Transmit\n \
-face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n",
-        );
-        for link in &self.links {
-            out.push_str(&format!(
-                "{:>6}: 0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n",
-                link.name
-            ));
-        }
-        out.into_bytes()
-    }
-
-    pub(crate) fn render_proc_net_route(&self) -> Vec<u8> {
-        let mut out = String::from(
-            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n",
-        );
-        for route in &self.routes {
-            let destination = match route.destination {
-                Some(IpAddr::V4(addr)) => addr,
-                Some(IpAddr::V6(_)) => continue,
-                None => Ipv4Addr::UNSPECIFIED,
-            };
-            let gateway = match route.gateway {
-                Some(IpAddr::V4(addr)) => addr,
-                Some(IpAddr::V6(_)) => continue,
-                None => Ipv4Addr::UNSPECIFIED,
-            };
-            let flags = if route.gateway.is_some() {
-                "0003"
-            } else {
-                "0001"
-            };
-            out.push_str(&format!(
-                "{}\t{}\t{}\t{flags}\t0\t0\t0\t{}\t0\t0\t0\n",
-                route.link_name,
-                proc_net_route_hex_v4(destination),
-                proc_net_route_hex_v4(gateway),
-                proc_net_route_hex_v4_mask(route.destination_prefix_len),
-            ));
-        }
-        out.into_bytes()
     }
 
     pub(crate) fn render_resolv_conf(&self) -> Vec<u8> {
@@ -604,6 +561,65 @@ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packet
         self.addresses
             .iter()
             .any(|address| address.link_name == link_name && address.addr.is_ipv6() == v6)
+    }
+}
+
+impl FsNetworkView for LinuxNetworkModel {
+    fn render_proc_net_dev(&self) -> Vec<u8> {
+        let mut out = String::from(
+            "Inter-|   Receive                                                |  Transmit\n \
+face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n",
+        );
+        for link in &self.links {
+            out.push_str(&format!(
+                "{:>6}: 0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n",
+                link.name
+            ));
+        }
+        out.into_bytes()
+    }
+
+    fn render_proc_net_route(&self) -> Vec<u8> {
+        let mut out = String::from(
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n",
+        );
+        for route in &self.routes {
+            let destination = match route.destination {
+                Some(IpAddr::V4(addr)) => addr,
+                Some(IpAddr::V6(_)) => continue,
+                None => Ipv4Addr::UNSPECIFIED,
+            };
+            let gateway = match route.gateway {
+                Some(IpAddr::V4(addr)) => addr,
+                Some(IpAddr::V6(_)) => continue,
+                None => Ipv4Addr::UNSPECIFIED,
+            };
+            let flags = if route.gateway.is_some() {
+                "0003"
+            } else {
+                "0001"
+            };
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{flags}\t0\t0\t0\t{}\t0\t0\t0\n",
+                route.link_name,
+                proc_net_route_hex_v4(destination),
+                proc_net_route_hex_v4(gateway),
+                proc_net_route_hex_v4_mask(route.destination_prefix_len),
+            ));
+        }
+        out.into_bytes()
+    }
+
+    fn interfaces(&self) -> Vec<FsNetworkInterface> {
+        self.links
+            .iter()
+            .map(|link| FsNetworkInterface {
+                index: link.index,
+                name: link.name.clone(),
+                has_ipv4: self.link_carries(&link.name, false),
+                has_ipv6: self.link_carries(&link.name, true),
+            })
+            .collect()
     }
 }
 

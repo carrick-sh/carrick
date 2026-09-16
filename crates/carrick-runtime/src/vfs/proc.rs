@@ -73,7 +73,10 @@ use crate::memory::{
     LINUX_SIGRETURN_TRAMPOLINE_BASE, LINUX_STACK_SIZE, LINUX_STACK_TOP,
 };
 
-use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
+use super::{
+    DirEnt, EntryKind, FsNetworkInterface, FsNetworkView, Metadata, OpenContext, OpenFlags, Vfs,
+    VfsError, VfsHandle,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcMapsEntry {
@@ -1152,17 +1155,17 @@ pub(crate) fn synthetic_file_for_open(path: &str, ctx: &OpenContext<'_>) -> Opti
         // — see ProcVfs::open + the write(2) handler.
         "/proc/self/uid_map" => Some(
             ctx.creds_ns()
-                .map(|c| c.user.uid_map_text().into_bytes())
+                .map(|c| c.uid_map_text().into_bytes())
                 .unwrap_or_default(),
         ),
         "/proc/self/gid_map" => Some(
             ctx.creds_ns()
-                .map(|c| c.user.gid_map_text().into_bytes())
+                .map(|c| c.gid_map_text().into_bytes())
                 .unwrap_or_default(),
         ),
         "/proc/self/setgroups" => Some(
             ctx.creds_ns()
-                .map(|c| c.user.setgroups_text().as_bytes().to_vec())
+                .map(|c| c.setgroups_text().as_bytes().to_vec())
                 .unwrap_or_default(),
         ),
         _ => {
@@ -1539,26 +1542,6 @@ fn proc_symlink_metadata(size: u64) -> Metadata {
     }
 }
 
-/// (index, name, has_ipv4, has_ipv6) for each interface Carrick advertises.
-/// Driven entirely by `LinuxNetworkModel`, so the guest's view is consistent and
-/// isolated from host network configuration.
-fn linux_interfaces_model(
-    model: &crate::network::model::LinuxNetworkModel,
-) -> Vec<(u32, String, bool, bool)> {
-    model
-        .links
-        .iter()
-        .map(|link| {
-            (
-                link.index,
-                link.name.clone(),
-                model.link_carries(&link.name, false),
-                model.link_carries(&link.name, true),
-            )
-        })
-        .collect()
-}
-
 /// Render `/proc/net/<name>` (and its `self/net` / `<pid>/net` aliases). carrick
 /// is host-socket-passthrough, so the socket tables (tcp/udp/unix/…) are emitted
 /// header-only — the high-fidelity idle case; a present, correctly-headered file
@@ -1588,10 +1571,7 @@ fn synthetic_proc_net_file_for_context(name: &str, context: &OpenContext<'_>) ->
     }
 }
 
-fn synthetic_proc_net_file_from_model(
-    name: &str,
-    network: &crate::network::model::LinuxNetworkModel,
-) -> Option<Vec<u8>> {
+fn synthetic_proc_net_file_from_model(name: &str, network: &dyn FsNetworkView) -> Option<Vec<u8>> {
     let bytes: Vec<u8> = match name {
         "dev" => return Some(network.render_proc_net_dev()),
         "igmp" => return Some(synthetic_proc_net_igmp_model(network)),
@@ -1621,11 +1601,15 @@ fn synthetic_proc_net_file_from_model(
 
 /// `/proc/net/if_inet6`: one row per IPv6 interface (proc_net(5)). Loopback's
 /// `::1/128` plus a row per mapped uplink; glibc's `__check_pf` reads this.
-fn synthetic_proc_net_if_inet6_model(
-    network: &crate::network::model::LinuxNetworkModel,
-) -> Vec<u8> {
+fn synthetic_proc_net_if_inet6_model(network: &dyn FsNetworkView) -> Vec<u8> {
     let mut s = String::new();
-    for (idx, name, _v4, v6) in linux_interfaces_model(network) {
+    for FsNetworkInterface {
+        index: idx,
+        name,
+        has_ipv6: v6,
+        ..
+    } in network.interfaces()
+    {
         if name == "lo" {
             s.push_str(&format!(
                 "00000000000000000000000000000001 {idx:02x} 80 10 80 {name:>9}\n"
@@ -1648,11 +1632,15 @@ fn synthetic_proc_net_dev(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<u
 
 /// `/proc/net/dev_mcast`: the standard all-nodes multicast MAC memberships per
 /// interface (333300000001 = IPv6 all-nodes, 01005e000001 = IPv4 all-hosts).
-fn synthetic_proc_net_dev_mcast_model(
-    network: &crate::network::model::LinuxNetworkModel,
-) -> Vec<u8> {
+fn synthetic_proc_net_dev_mcast_model(network: &dyn FsNetworkView) -> Vec<u8> {
     let mut s = String::new();
-    for (idx, name, v4, v6) in linux_interfaces_model(network) {
+    for FsNetworkInterface {
+        index: idx,
+        name,
+        has_ipv4: v4,
+        has_ipv6: v6,
+    } in network.interfaces()
+    {
         if v6 {
             s.push_str(&format!("{idx:<4} {name:<15} 1     0     333300000001\n"));
         }
@@ -1724,9 +1712,15 @@ IpExt: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n".to_vec()
 /// `/proc/net/igmp`: one block per IPv4 interface listing the all-hosts group
 /// (224.0.0.1), matching the format Go's `parseProcNetIGMP` reads (the group is
 /// the address in NATIVE/little-endian hex).
-fn synthetic_proc_net_igmp_model(network: &crate::network::model::LinuxNetworkModel) -> Vec<u8> {
+fn synthetic_proc_net_igmp_model(network: &dyn FsNetworkView) -> Vec<u8> {
     let mut s = String::from("Idx\tDevice    : Count Querier\tGroup    Users Timer\tReporter\n");
-    for (idx, name, v4, _v6) in linux_interfaces_model(network) {
+    for FsNetworkInterface {
+        index: idx,
+        name,
+        has_ipv4: v4,
+        ..
+    } in network.interfaces()
+    {
         if !v4 {
             continue;
         }
@@ -1740,9 +1734,15 @@ fn synthetic_proc_net_igmp_model(network: &crate::network::model::LinuxNetworkMo
 /// `/proc/net/igmp6`: the all-nodes link-local (ff02::1) and interface-local
 /// (ff01::1) groups per IPv6 interface — the address is straight network-order
 /// hex, as Go's `parseProcNetIGMP6` reads.
-fn synthetic_proc_net_igmp6_model(network: &crate::network::model::LinuxNetworkModel) -> Vec<u8> {
+fn synthetic_proc_net_igmp6_model(network: &dyn FsNetworkView) -> Vec<u8> {
     let mut s = String::new();
-    for (idx, name, _v4, v6) in linux_interfaces_model(network) {
+    for FsNetworkInterface {
+        index: idx,
+        name,
+        has_ipv6: v6,
+        ..
+    } in network.interfaces()
+    {
         if !v6 {
             continue;
         }
@@ -3189,7 +3189,7 @@ fn synthetic_proc_self_status(ctx: &OpenContext<'_>) -> String {
     // set — capability-probing tools (apt/dpkg/setpriv) refuse to proceed if
     // they think they hold nothing (docs/namespaces-design.md §4.4).
     let default_creds = crate::namespace::process::ProcessCredsNs::default();
-    let cap_lines = ctx.creds_ns().unwrap_or(&default_creds).caps.status_lines();
+    let cap_lines = ctx.creds_ns().unwrap_or(&default_creds).caps_status_lines();
     let locked_kb = locked_memory_kb(ctx);
     format!(
         "Name:\t{comm}\n\
