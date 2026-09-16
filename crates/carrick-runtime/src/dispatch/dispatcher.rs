@@ -24,6 +24,7 @@ use super::mqueue;
 use super::normalize_abs_path;
 use super::proc;
 use super::sysv;
+use carrick_hal::{GuestTimerBridge, HostSignalBridge};
 use carrick_vfs::fs_backend::FsBackend;
 use carrick_vfs::rootfs::{RootFs, RootFsMetadata};
 
@@ -41,8 +42,17 @@ pub struct SyscallDispatcher {
     /// Process-scoped timer delivery for lanes that multiplex multiple Linux
     /// processes inside one host process. HVPatch binds an exact-task delivery
     /// here; VMM/native leave it empty and use their established run-global
-    /// backend registered in `crate::timer_delivery`.
+    /// backend registered through the carrier's `GuestTimerBridge`.
     pub(crate) timer_delivery: RwLock<Option<Arc<dyn carrick_hal::TimerDelivery>>>,
+    /// The execution backend's host-signal plumbing (pending publication and
+    /// consumption, host-disposition mirroring, the cross-process xsignal
+    /// ring, signal-number translation). Handed in by the carrier at
+    /// construction; dispatch never names a VMM crate for it.
+    pub(crate) host_signal: Arc<dyn HostSignalBridge>,
+    /// The execution backend's timer registry + firing mechanism, and the
+    /// run-global `TimerDelivery` seam the arm reaches when no exact-task
+    /// delivery is bound above.
+    pub(crate) timers: Arc<dyn GuestTimerBridge>,
     /// The direct in-carrier FileAuthority endpoint for this run. Activated
     /// immediately after the final root process binding (in HVPatch or the
     /// mature VMM one-task loop) on the captured root `FileTable`. Syscall
@@ -130,6 +140,31 @@ impl Default for SyscallDispatcher {
     }
 }
 
+/// The two backend seams a carrier hands every dispatcher it builds.
+#[derive(Clone)]
+pub struct CarrierBridges {
+    pub host_signal: Arc<dyn HostSignalBridge>,
+    pub timers: Arc<dyn GuestTimerBridge>,
+}
+
+impl CarrierBridges {
+    /// The bridge-less pair a dispatcher boots with when no carrier hands it
+    /// real ones: the neutral pending/timer bookkeeping with no host glue
+    /// behind it. Test and reference-model use only.
+    pub fn null() -> Self {
+        Self {
+            host_signal: Arc::new(carrick_hal::NullHostSignalBridge),
+            timers: Arc::new(carrick_hal::NullGuestTimerBridge),
+        }
+    }
+}
+
+impl std::fmt::Debug for CarrierBridges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CarrierBridges")
+    }
+}
+
 struct ForkCloneObservedArgs<'a> {
     observed_parent_mm_id: crate::kernel::MmId,
     observed_child_mm_id: crate::kernel::MmId,
@@ -140,17 +175,35 @@ struct ForkCloneObservedArgs<'a> {
 }
 
 impl SyscallDispatcher {
+    /// The bridge-less test/reference-model constructor: the Null bridges of
+    /// [`CarrierBridges::null`]. Product carriers construct with
+    /// [`Self::with_bridges`].
     pub fn new() -> Self {
-        Self::new_with_host_resolver(None)
+        Self::with_bridges(CarrierBridges::null())
     }
 
-    fn new_with_host_resolver(snapshot: Option<&carrick_vfs::HostResolverSnapshot>) -> Self {
-        let (kernel_binding, mm_id) = bootstrap_one_task_binding();
+    /// The production constructor: a dispatcher wired to the carrier's
+    /// execution backend through its host-signal and guest-timer bridges.
+    pub fn with_bridges(bridges: CarrierBridges) -> Self {
+        Self::new_with_host_resolver(None, bridges)
+    }
+
+    fn new_with_host_resolver(
+        snapshot: Option<&carrick_vfs::HostResolverSnapshot>,
+        bridges: CarrierBridges,
+    ) -> Self {
+        let CarrierBridges {
+            host_signal,
+            timers,
+        } = bridges;
+        let (kernel_binding, mm_id) = bootstrap_one_task_binding(Arc::clone(&host_signal));
         let mm_authority = Arc::new(DispatchMmAuthority::new(mm_id));
         Self {
             kernel_binding: RwLock::new(kernel_binding),
             container: RwLock::new(None),
             timer_delivery: RwLock::new(None),
+            host_signal,
+            timers,
             file_authority: RwLock::new(None),
             io: fs::RuntimeIo::new(),
             mm_binding: DispatchMmBinding::new(mm_authority),
@@ -179,14 +232,15 @@ impl SyscallDispatcher {
     }
 
     pub fn with_network(network: std::sync::Arc<crate::network::RuntimeNetwork>) -> Self {
-        Self::with_network_and_host_resolver(network, None)
+        Self::with_network_and_host_resolver(network, None, CarrierBridges::null())
     }
 
     pub fn with_network_and_host_resolver(
         network: std::sync::Arc<crate::network::RuntimeNetwork>,
         snapshot: Option<&carrick_vfs::HostResolverSnapshot>,
+        bridges: CarrierBridges,
     ) -> Self {
-        let mut dispatcher = Self::new_with_host_resolver(snapshot);
+        let mut dispatcher = Self::new_with_host_resolver(snapshot, bridges);
         // Bare/reference-model callers do not subsequently install the
         // product container that `Runtime::prepare` supplies. Give those
         // callers one coherent namespace object now so `/sys`, rtnetlink,
@@ -282,7 +336,18 @@ impl SyscallDispatcher {
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn publish_rlimit_cpu_signal_for_test(&self, signum: i32) {
-        self.async_signal_wake_owner.publish_process_signal(signum);
+        match self.async_signal_wake_owner {
+            AsyncSignalWakeOwner::SignalPump => {
+                #[cfg(feature = "platform-macos")]
+                self.host_signal.publish_process_signal(signum);
+                #[cfg(any(
+                    feature = "platform-linux",
+                    feature = "platform-freebsd",
+                    feature = "platform-netbsd"
+                ))]
+                self.timers.deliver(signum);
+            }
+        }
     }
 
     pub fn page_geometry(&self) -> crate::page_profile::PageGeometry {
@@ -312,7 +377,16 @@ impl SyscallDispatcher {
     }
 
     pub fn with_rootfs_and_executable(rootfs: RootFs, executable_path: impl Into<String>) -> Self {
-        let mut s = Self::new();
+        Self::with_rootfs_and_executable_on(CarrierBridges::null(), rootfs, executable_path)
+    }
+
+    /// [`Self::with_rootfs_and_executable`] wired to a carrier's real bridges.
+    pub fn with_rootfs_and_executable_on(
+        bridges: CarrierBridges,
+        rootfs: RootFs,
+        executable_path: impl Into<String>,
+    ) -> Self {
+        let mut s = Self::with_bridges(bridges);
         s.fs.rootfs_vfs_mut().rootfs = Some(rootfs);
         s.exec_host_fs_fallback = false;
         s.set_executable_path(executable_path);
@@ -506,6 +580,8 @@ impl SyscallDispatcher {
             kernel_binding: RwLock::new(self.kernel_binding.read().clone()),
             container: RwLock::new(self.container.read().clone()),
             timer_delivery: RwLock::new(None),
+            host_signal: Arc::clone(&self.host_signal),
+            timers: Arc::clone(&self.timers),
             file_authority: RwLock::new(self.file_authority.read().clone()),
             io: self.io.fork_clone(),
             mm_binding: child_binding,
@@ -759,6 +835,7 @@ pub(crate) fn resolv_conf_contents_for_network(
 
 /// Cross-subsystem capabilities required during filesystem operations (such as fd close lifecycle).
 pub(in crate::dispatch) trait FsCrossSubsystem: Send + Sync {
+    fn host_signal(&self) -> &dyn HostSignalBridge;
     fn detach_fd_from_epolls(&self, _fd: i32) {}
     fn close_open_file_and_free_pty(&self, _open_file: &OpenFile) {}
     fn mqueue_owner_alias_closed(
@@ -894,6 +971,9 @@ pub(in crate::dispatch) trait FsCrossSubsystem: Send + Sync {
 }
 
 impl FsCrossSubsystem for SyscallDispatcher {
+    fn host_signal(&self) -> &dyn HostSignalBridge {
+        &*self.host_signal
+    }
     fn detach_fd_from_epolls(&self, fd: i32) {
         self.detach_fd_from_epolls(fd);
     }
@@ -1054,6 +1134,7 @@ impl FsCrossSubsystem for SyscallDispatcher {
 
 /// Cross-subsystem capabilities required during network operations (such as fd lifecycle and signal suspend).
 pub(in crate::dispatch) trait NetCrossSubsystem: Send + Sync {
+    fn host_signal(&self) -> &dyn HostSignalBridge;
     fn caller_net_ns(&self, context: &crate::kernel::KernelContext) -> Arc<crate::kernel::NetNs>;
     fn captured_file_table(&self) -> Arc<crate::kernel::FileTable>;
     fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials>;
@@ -1116,6 +1197,9 @@ pub(in crate::dispatch) trait NetCrossSubsystem: Send + Sync {
 }
 
 impl NetCrossSubsystem for SyscallDispatcher {
+    fn host_signal(&self) -> &dyn HostSignalBridge {
+        &*self.host_signal
+    }
     fn caller_net_ns(&self, context: &crate::kernel::KernelContext) -> Arc<crate::kernel::NetNs> {
         self.caller_net_ns(context)
     }
@@ -1412,6 +1496,7 @@ pub struct ProcView<'a> {
 
 /// Cross-subsystem capabilities required during signal operations.
 pub(in crate::dispatch) trait SignalCrossSubsystem: Send + Sync {
+    fn host_signal(&self) -> &dyn HostSignalBridge;
     fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials>;
     fn identity_pid(&self) -> u32;
     #[cfg(test)]
@@ -1431,6 +1516,9 @@ pub(in crate::dispatch) trait SignalCrossSubsystem: Send + Sync {
 }
 
 impl SignalCrossSubsystem for SyscallDispatcher {
+    fn host_signal(&self) -> &dyn HostSignalBridge {
+        &*self.host_signal
+    }
     fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
         self.cred_snapshot()
     }
@@ -1477,6 +1565,7 @@ pub struct SignalView<'a> {
 }
 
 pub(in crate::dispatch) trait IpcCrossSubsystem {
+    fn host_signal(&self) -> &dyn HostSignalBridge;
     fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials>;
     fn identity_pid(&self) -> u32;
     fn hvpatch_process(&self) -> Option<Arc<dyn crate::kernel::CarrierProcess>>;
@@ -1523,6 +1612,9 @@ pub(in crate::dispatch) trait IpcCrossSubsystem {
 }
 
 impl IpcCrossSubsystem for SyscallDispatcher {
+    fn host_signal(&self) -> &dyn HostSignalBridge {
+        &*self.host_signal
+    }
     fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
         self.cred_snapshot()
     }

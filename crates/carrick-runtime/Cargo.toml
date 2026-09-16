@@ -71,7 +71,11 @@ platform-netbsd = ["dep:carrick-vmm-nvmm", "dep:carrick-host-bsd"]
 [dependencies]
 carrick-fatal.workspace = true
 carrick-abi = { path = "../carrick-abi" }
-carrick-hal = { path = "../carrick-hal" }
+# `test-support` (the Null host-signal / guest-timer bridges) is enabled on the
+# NORMAL dependency for now because `SyscallDispatcher::new()` -- the
+# bridge-less constructor -- is still an ungated public constructor; Task 2.8
+# cfg-gates `new()` to test builds and moves this feature to the dev-dependency.
+carrick-hal = { path = "../carrick-hal", features = ["test-support"] }
 carrick-portable = { path = "../carrick-portable" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-thread = { path = "../carrick-thread" }

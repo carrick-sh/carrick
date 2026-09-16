@@ -1198,8 +1198,8 @@ fn deliver_notify(
                 if pid == local_pid {
                     this.record_pending_siginfo(context, tid, signo, info);
                     this.mark_signal_pending(context, tid, signo);
-                    crate::host_signal::raise_for_self(signo);
-                } else if crate::host_signal::xsig_enqueue(
+                    this.cross.host_signal().raise_for_self(signo);
+                } else if this.cross.host_signal().xsig_enqueue(
                     pid,
                     signo,
                     crate::linux_abi::LINUX_SI_MESGQ,
@@ -1208,7 +1208,7 @@ fn deliver_notify(
                     value,
                     0,
                 ) {
-                    crate::host_signal::xsig_nudge(pid);
+                    this.cross.host_signal().xsig_nudge(pid);
                 }
             }
         },

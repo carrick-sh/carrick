@@ -208,8 +208,8 @@ pub(crate) fn make_readiness_pipe() -> Option<(HostFdRef, HostFdRef)> {
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return None;
     }
-    let read_fd = crate::host_signal::relocate_internal_fd(fds[0]);
-    let write_fd = crate::host_signal::relocate_internal_fd(fds[1]);
+    let read_fd = carrick_host::internal_fd::relocate_internal_fd(fds[0]);
+    let write_fd = carrick_host::internal_fd::relocate_internal_fd(fds[1]);
     for fd in [read_fd, write_fd] {
         unsafe {
             let fl = libc::fcntl(fd, libc::F_GETFL);
@@ -1032,15 +1032,14 @@ fn insert_dirty_range(
 }
 
 /// Pidfd readiness backend: a boxed [`EventMultiplexer`](carrick_hal::event::EventMultiplexer)
-/// watching the real host process. On macOS the backend is kqueue
-/// (`EVFILT_PROC`/`NOTE_EXIT`+`NOTE_EXITSTATUS`); on Linux it is the
-/// `EpollMultiplexer` (a real `pidfd_open(2)` added to the epoll set). Wrapped so
-/// `OpenDescription` can keep deriving `Debug` (the trait object is not `Debug`);
-/// the poll fd (the kqueue fd on macOS, the pidfd-bearing epoll fd on Linux) is
-/// the only state callers read.
+/// whose user-wake channel the process table pulses when the guest-virtual
+/// target exits (`publish_exit`); the kernel's own zombie record is the
+/// authority, never a host process watch. Wrapped so `OpenDescription` can
+/// keep deriving `Debug` (the trait object is not `Debug`); the poll fd (the
+/// kqueue fd on macOS, the epoll fd on Linux) is the only state callers read.
 pub(crate) struct PidfdWatch {
-    /// Owns the backing fds; held only so `Drop` closes them (the registered
-    /// process-exit watch is reclaimed with it). Never read after construction.
+    /// Owns the backing fds; held only so `Drop` closes them. Never read
+    /// after construction except to fire the user wake.
     /// `Mutex` only to make the otherwise-`!Sync` trait object shareable across
     /// threads (the dispatcher's `KernelState` must be `Send`); never locked.
     #[allow(dead_code)]

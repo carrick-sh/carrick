@@ -28,9 +28,9 @@
 //! `setitimer(ITIMER_REAL, …)`) keep their state in the proc subsystem's
 //! `ProcState::itimers`; the POSIX per-process timers
 //! (`timer_create`/`timer_settime`/…) live in
-//! `crate::posix_timer`. Both share one delivery mechanism the dispatcher
+//! the carrier's `GuestTimerBridge`. Both share one delivery mechanism the dispatcher
 //! cannot perform itself: the expiry SIGNAL is raised by an `EVFILT_TIMER`
-//! event on the signal pump's kqueue (see `crate::itimer`), because firing a
+//! event on the signal pump's kqueue (the HVF `itimer` glue), because firing a
 //! signal requires reaching the vCPU, which the syscall handler cannot. The
 //! handlers here therefore only ARM/DISARM and report time-remaining; the
 //! actual SIGALRM/SIGVTALRM/SIGPROF/`sigev_signo` delivery is the runtime's.
@@ -445,12 +445,12 @@ impl SyscallDispatcher {
                     // clear the neutral slot.
                     match this.timer_delivery() {
                         Some(d) => d.disarm_itimer(idx),
-                        None => crate::itimer::disarm(idx),
+                        None => this.timers.itimer_disarm(idx),
                     }
                 } else {
                     let spec_ns = TimerSpecNs::from_durations(value, interval);
                     let needs_periodic = !interval.is_zero() && value != interval;
-                    let signum = crate::itimer::signum_for(idx);
+                    let signum = this.timers.itimer_signum_for(idx);
                     let signal_name = match signum {
                         crate::linux_abi::LINUX_SIGVTALRM => "SIGVTALRM",
                         crate::linux_abi::LINUX_SIGPROF => "SIGPROF",
@@ -482,12 +482,12 @@ impl SyscallDispatcher {
                     {
                         0
                     } else {
-                        crate::itimer::arm(idx, spec_ns, needs_periodic)
+                        this.timers.itimer_arm(idx, spec_ns, needs_periodic)
                     };
                     let owned = delivery
                         .is_some_and(|d| d.arm_itimer(idx, spec_ns, needs_periodic, signum));
                     if !owned {
-                        crate::itimer::spawn_fallback_timer(idx, generation, spec_ns);
+                        this.timers.itimer_spawn_fallback_timer(idx, generation, spec_ns);
                     }
                 }
             }
@@ -505,7 +505,7 @@ impl SyscallDispatcher {
                 this.proc.lock().itimers[idx] = None;
                 match this.timer_delivery() {
                     Some(d) => d.disarm_itimer(idx),
-                    None => crate::itimer::disarm(idx),
+                    None => this.timers.itimer_disarm(idx),
                 }
                 return Ok(DispatchOutcome::returned_u64(previous)?);
             }
@@ -519,7 +519,7 @@ impl SyscallDispatcher {
             });
 
             let spec_ns = TimerSpecNs::from_durations(value, interval);
-            let signum = crate::itimer::signum_for(idx);
+            let signum = this.timers.itimer_signum_for(idx);
             let delivery = this.timer_delivery();
             let generation = if delivery
                 .as_ref()
@@ -527,11 +527,11 @@ impl SyscallDispatcher {
             {
                 0
             } else {
-                crate::itimer::arm(idx, spec_ns, false)
+                this.timers.itimer_arm(idx, spec_ns, false)
             };
             let owned = delivery.is_some_and(|d| d.arm_itimer(idx, spec_ns, false, signum));
             if !owned {
-                crate::itimer::spawn_fallback_timer(idx, generation, spec_ns);
+                this.timers.itimer_spawn_fallback_timer(idx, generation, spec_ns);
             }
 
             Ok(DispatchOutcome::returned_u64(previous)?)
@@ -666,7 +666,7 @@ impl SyscallDispatcher {
                     }
                 }
             }
-            let timer_id = crate::posix_timer::create_with_target_and_value(
+            let timer_id = this.timers.posix_create_with_target_and_value(
                 clock_id as i32,
                 signum,
                 target_tid,
@@ -679,7 +679,7 @@ impl SyscallDispatcher {
             // stack canary (LTP timer_delete01: "stack smashing detected").
             let id_bytes = (timer_id).to_le_bytes();
             if memory.write_bytes(id_out.0, &id_bytes).is_err() {
-                let _ = crate::posix_timer::delete(timer_id);
+                let _ = this.timers.posix_delete(timer_id);
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -692,7 +692,7 @@ impl SyscallDispatcher {
         fn timer_settime(this, cx, timer_id: u64, flags: u64, new_ptr: GuestPtr, old_ptr: GuestPtr) {
             let memory = &mut *cx.memory;
             let id = timer_id as i64 as i32;
-            if !crate::posix_timer::exists(id) {
+            if !this.timers.posix_exists(id) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // Only TIMER_ABSTIME is a valid flag; reject any other bit. (audit M4)
@@ -732,7 +732,7 @@ impl SyscallDispatcher {
                         // Absolute deadline on the timer's clock -> relative.
                         let clock = Arc::clone(cx.kernel.task().container().clock());
                         let now =
-                            linux_clock_duration(&clock, crate::posix_timer::clock_id(id) as u64)
+                            linux_clock_duration(&clock, this.timers.posix_clock_id(id) as u64)
                                 .unwrap_or(Duration::ZERO);
                         if interval_ns > 0 && deadline < now {
                             let past_ns = duration_to_nanos(now - deadline);
@@ -760,16 +760,16 @@ impl SyscallDispatcher {
             // pump-less path).
             let old = match this.timer_delivery() {
                 Some(d) => d.arm_posix(id, spec_ns),
-                None => crate::posix_timer::arm(id, spec_ns),
+                None => this.timers.posix_arm(id, spec_ns),
             };
             // Seed the missed-interval overrun for a past absolute deadline (the
             // arm above reset the counter to 0); `fetch_max` keeps it above any
             // increment the firing thread has already recorded.
             if seed_overrun > 0 {
-                crate::posix_timer::seed_overrun(id, seed_overrun);
+                this.timers.posix_seed_overrun(id, seed_overrun);
             }
             if old_ptr.0 != 0 {
-                let prev = old.unwrap_or(crate::posix_timer::PosixTimerSpec {
+                let prev = old.unwrap_or(carrick_hal::PosixTimerSpec {
                     signum: 0,
                     spec: TimerSpecNs::DISARM,
                     si_value: 0,
@@ -789,7 +789,7 @@ impl SyscallDispatcher {
         fn timer_gettime(this, cx, timer_id: u64, cur_ptr: GuestPtr) {
             let memory = &mut *cx.memory;
             let id = timer_id as i64 as i32;
-            let Some(remaining) = crate::posix_timer::remaining(id) else {
+            let Some(remaining) = this.timers.posix_remaining(id) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             if cur_ptr.0 == 0 {
@@ -803,7 +803,7 @@ impl SyscallDispatcher {
         /// `timer_delete(id)`: tear down a timer.
         fn timer_delete(this, cx, timer_id: u64) {
             let id = timer_id as i64 as i32;
-            if crate::posix_timer::delete(id) {
+            if this.timers.posix_delete(id) {
                 Ok(DispatchOutcome::Returned { value: 0 })
             } else {
                 Ok(DispatchOutcome::errno(LINUX_EINVAL))
@@ -813,7 +813,7 @@ impl SyscallDispatcher {
         /// `timer_getoverrun(id)`: number of missed expiries since last query.
         fn timer_getoverrun(this, cx, timer_id: u64) {
             let id = timer_id as i64 as i32;
-            match crate::posix_timer::getoverrun(id) {
+            match this.timers.posix_getoverrun(id) {
                 Some(n) => Ok(DispatchOutcome::returned_u32(n)),
                 None => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             }

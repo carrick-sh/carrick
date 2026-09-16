@@ -7,7 +7,7 @@
 //! Every dependency is reached through `crate::...` paths that resolve
 //! per-platform:
 //!
-//! - `crate::host_signal::linux_to_host_signum` — the Darwin signal-number
+//! - `HostSignalBridge::linux_to_host_signum` — the Darwin signal-number
 //!   mapping on macOS (via `carrick_vmm_hvf`), the identity function on Linux (the
 //!   stub in `lib.rs`).
 //! - `crate::guest_cpu::{record_child_exit, total_ns}` — always from
@@ -298,6 +298,7 @@ fn sigdeath_marker_path(host_pid: u32) -> std::path::PathBuf {
 /// host number (identity on Linux, Darwin mapping on macOS) so the host wait
 /// status carries the right value.
 pub(crate) fn forked_child_die_by_signal(
+    host_signal: &dyn carrick_hal::HostSignalBridge,
     signum: i32,
     stdout_buf: impl AsRef<[u8]>,
     stderr_buf: impl AsRef<[u8]>,
@@ -309,7 +310,7 @@ pub(crate) fn forked_child_die_by_signal(
     // drains the ring on an adopted reap, so the ring entry must exist by the
     // time the exit record is observable.
     if let Some(parent) = adopted_parent {
-        let _ = crate::host_signal::xsig_enqueue(
+        let _ = host_signal.xsig_enqueue(
             parent as i32,
             crate::linux_abi::LINUX_SIGCHLD,
             0,
@@ -318,7 +319,7 @@ pub(crate) fn forked_child_die_by_signal(
             0,
             0,
         );
-        crate::host_signal::xsig_nudge(parent as i32);
+        host_signal.xsig_nudge(parent as i32);
     }
     crate::guest_cpu::record_child_exit_status(
         pid,
@@ -329,7 +330,7 @@ pub(crate) fn forked_child_die_by_signal(
     flush_fork_child_fd(1, stdout_buf.as_ref());
     flush_fork_child_fd(2, stderr_buf.as_ref());
     stop_for_debug_signal(signum);
-    let host_signum = crate::host_signal::linux_to_host_signum(signum);
+    let host_signum = host_signal.linux_to_host_signum(signum);
     #[cfg(not(target_os = "linux"))]
     if host_signum == 0 {
         let _ = std::fs::write(sigdeath_marker_path(std::process::id()), [signum as u8]);
@@ -378,8 +379,8 @@ fn debug_stop_matches_signal(raw: &str, signum: i32) -> bool {
 ///
 /// `signum` is a Linux signal number; translated to the host signal via
 /// `linux_to_host_signum` (identity on Linux, Darwin mapping on macOS).
-pub(crate) fn stop_by_signal(signum: i32) {
-    let host_signum = crate::host_signal::linux_to_host_signum(signum);
+pub(crate) fn stop_by_signal(host_signal: &dyn carrick_hal::HostSignalBridge, signum: i32) {
+    let host_signum = host_signal.linux_to_host_signum(signum);
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = libc::SIG_DFL;
@@ -470,7 +471,7 @@ pub(crate) fn stop_for_ptrace_signal(dispatcher: &SyscallDispatcher, signum: i32
         PtraceSignalRoute::DeliverNormally => false,
         PtraceSignalRoute::LegacyStop => {
             crate::guest_cpu::mark_self_ptrace_stop_pending(signum);
-            stop_by_signal(crate::linux_abi::LINUX_SIGSTOP);
+            stop_by_signal(&*dispatcher.host_signal, crate::linux_abi::LINUX_SIGSTOP);
             true
         }
         PtraceSignalRoute::VirtualStop => {
@@ -479,7 +480,7 @@ pub(crate) fn stop_for_ptrace_signal(dispatcher: &SyscallDispatcher, signum: i32
             }) {
                 return false;
             }
-            stop_by_signal(crate::linux_abi::LINUX_SIGSTOP);
+            stop_by_signal(&*dispatcher.host_signal, crate::linux_abi::LINUX_SIGSTOP);
             true
         }
         PtraceSignalRoute::Terminate => {
@@ -487,7 +488,7 @@ pub(crate) fn stop_for_ptrace_signal(dispatcher: &SyscallDispatcher, signum: i32
             if !native {
                 crate::guest_cpu::mark_self_ptrace_stop_pending(signum);
             }
-            stop_by_signal(crate::linux_abi::LINUX_SIGKILL);
+            stop_by_signal(&*dispatcher.host_signal, crate::linux_abi::LINUX_SIGKILL);
             true
         }
     }
@@ -516,7 +517,7 @@ pub(crate) fn stop_after_traced_exec(dispatcher: &SyscallDispatcher) {
     {
         let _ = stop_for_ptrace_signal(dispatcher, crate::linux_abi::LINUX_SIGTRAP);
     } else if dispatcher.is_ptrace_traceme() {
-        stop_by_signal(crate::linux_abi::LINUX_SIGTRAP);
+        stop_by_signal(&*dispatcher.host_signal, crate::linux_abi::LINUX_SIGTRAP);
     }
 }
 

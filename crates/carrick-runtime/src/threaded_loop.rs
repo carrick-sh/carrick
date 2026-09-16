@@ -100,7 +100,11 @@ pub trait HostBackend: Send + Sync + 'static {
             feature = "platform-freebsd",
             feature = "platform-netbsd"
         ))]
-        crate::timer_delivery::register(std::sync::Arc::clone(kicker), main_tid, container);
+        carrick_hal::guest_timer_bridge::register_kicker(
+            std::sync::Arc::clone(kicker),
+            main_tid,
+            Box::new(move || crate::thread::notify_container_futex_signal_pending(container)),
+        );
         #[cfg(feature = "platform-macos")]
         {
             let _ = (kicker, main_tid, container);
@@ -511,10 +515,16 @@ where
         kernel.dispatcher.container().id(),
     );
     // Install the backend `TimerDelivery` the dispatch arm reaches through the
-    // process-global (`dispatch/time.rs` has no KernelState ref).
-    crate::timer_delivery::register_delivery(
-        host_for_factory.make_timer_delivery(Arc::clone(&kicker), main_tid),
-    );
+    // lane's process-global seam (`GuestTimerBridge::delivery`).
+    let timer_delivery = host_for_factory.make_timer_delivery(Arc::clone(&kicker), main_tid);
+    #[cfg(feature = "platform-macos")]
+    carrick_vmm_hvf::timer_delivery::register_delivery(timer_delivery);
+    #[cfg(any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
+    carrick_hal::guest_timer_bridge::register_delivery(timer_delivery);
 
     // Finish every fallible control-plane setup step before the logical job is
     // launched. Returning after launch but before the join path would detach a

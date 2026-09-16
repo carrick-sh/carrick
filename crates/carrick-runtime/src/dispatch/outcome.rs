@@ -236,19 +236,27 @@ pub(crate) enum BlockingWriteStep {
     Wait,
 }
 
-pub(crate) fn drive_blocking_write(write: &mut BlockingWrite) -> BlockingWriteStep {
+pub(crate) fn drive_blocking_write(
+    write: &mut BlockingWrite,
+    host_signal: &dyn carrick_hal::HostSignalBridge,
+) -> BlockingWriteStep {
     // Copy the target handle before mutating progress.  A parked continuation
     // owns this handle, so the clone keeps the same descriptor/endpoint
     // authority without borrowing `write.target` across the progress update.
     match write.target.clone() {
-        BlockingWriteTarget::Host(host_fd) => drive_host_blocking_write(write, &host_fd),
-        BlockingWriteTarget::InMemoryPipe(endpoint) => drive_in_memory_pipe_write(write, &endpoint),
+        BlockingWriteTarget::Host(host_fd) => {
+            drive_host_blocking_write(write, &host_fd, host_signal)
+        }
+        BlockingWriteTarget::InMemoryPipe(endpoint) => {
+            drive_in_memory_pipe_write(write, &endpoint, host_signal)
+        }
     }
 }
 
 fn drive_host_blocking_write(
     write: &mut BlockingWrite,
     host_fd: &Arc<PinnedHostFd>,
+    host_signal: &dyn carrick_hal::HostSignalBridge,
 ) -> BlockingWriteStep {
     loop {
         if write.offset >= write.bytes.len() {
@@ -268,10 +276,7 @@ fn drive_host_blocking_write(
         crate::probes::host_pipe_io(host_fd.as_raw_fd(), 1, n as i64);
         if let Err(errno) = n.host_syscall_errno() {
             if errno == LINUX_EAGAIN || errno == LINUX_EINTR {
-                if crate::host_signal::has_unblocked_pending_for(
-                    write.tid.raw(),
-                    SigBlockMask::NONE,
-                ) {
+                if host_signal.has_unblocked_pending_for(write.tid.raw(), SigBlockMask::NONE) {
                     return BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(
                         write.offset(),
                     ));
@@ -294,7 +299,7 @@ fn drive_host_blocking_write(
                 write.committed_prefix + write.bytes.len(),
             ));
         }
-        if crate::host_signal::has_unblocked_pending_for(write.tid.raw(), SigBlockMask::NONE) {
+        if host_signal.has_unblocked_pending_for(write.tid.raw(), SigBlockMask::NONE) {
             return BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(write.offset()));
         }
     }
@@ -303,6 +308,7 @@ fn drive_host_blocking_write(
 fn drive_in_memory_pipe_write(
     write: &mut BlockingWrite,
     endpoint: &Arc<crate::dispatch::fs::pipe::PipeWriteEndpointLease>,
+    host_signal: &dyn carrick_hal::HostSignalBridge,
 ) -> BlockingWriteStep {
     if write.offset >= write.bytes.len() {
         return BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(
@@ -336,15 +342,18 @@ fn drive_in_memory_pipe_write(
         BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(
             write.committed_prefix + write.bytes.len(),
         ))
-    } else if crate::host_signal::has_unblocked_pending_for(write.tid.raw(), SigBlockMask::NONE) {
+    } else if host_signal.has_unblocked_pending_for(write.tid.raw(), SigBlockMask::NONE) {
         BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(write.offset()))
     } else {
         BlockingWriteStep::Wait
     }
 }
 
-pub(crate) fn drive_blocking_record_lock(lock: &BlockingRecordLock) -> DispatchOutcome {
-    match lock.logical.acquire() {
+pub(crate) fn drive_blocking_record_lock(
+    lock: &BlockingRecordLock,
+    host_signal: &dyn carrick_hal::HostSignalBridge,
+) -> DispatchOutcome {
+    match lock.logical.acquire(host_signal) {
         Ok(()) => DispatchOutcome::Returned { value: 0 },
         Err(errno) => DispatchOutcome::errno(errno),
     }

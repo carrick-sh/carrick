@@ -47,7 +47,7 @@
 //! recorded as an observable mask inherited by logical child tasks without
 //! physically pinning the host thread. `getrandom` and the interval timers
 //! (`itimers`, whose expiry signal is delivered by an `EVFILT_TIMER` on the
-//! signal pump's kqueue — see `crate::itimer`) round out the file.
+//! signal pump's kqueue — the HVF `itimer` glue) round out the file.
 //!
 //! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
 //! dispatcher struct and the normalized dispatch table.
@@ -515,7 +515,7 @@ pub(super) struct ProcState {
     /// glibc's `alarm()` is `setitimer(ITIMER_REAL, …)` and returns the
     /// previous timer's remaining seconds. The matching expiry signal
     /// (SIGALRM/SIGVTALRM/SIGPROF) is delivered by an EVFILT_TIMER event on the
-    /// signal pump's kqueue (see crate::itimer). VIRTUAL/PROF are keyed to
+    /// signal pump's kqueue (the HVF `itimer` glue). VIRTUAL/PROF are keyed to
     /// guest CPU accounting and use wall-clock kqueue timers only as rechecks.
     pub itimers: [Option<ItimerState>; 3],
     /// Whether hardware x86_64 TSO memory ordering is active for this guest

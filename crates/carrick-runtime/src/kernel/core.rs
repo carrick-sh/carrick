@@ -5,7 +5,7 @@ use std::sync::{Arc, Weak};
 use arc_swap::ArcSwap;
 use carrick_fatal::carrick_fatal;
 
-use carrick_hal::{FrameEventCapacity, FrameInventoryReservation, ThreadId};
+use carrick_hal::{FrameEventCapacity, FrameInventoryReservation, HostSignalBridge, ThreadId};
 use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::address::MmBackend;
@@ -307,6 +307,11 @@ pub struct RootBootstrap {
     diagnostic_name: String,
     /// The container this kernel boots its root task into.
     container: Arc<Container>,
+    /// The execution backend's host-signal bridge this kernel's continuation
+    /// readiness consults. Defaults to the Null bridge (neutral bookkeeping,
+    /// no host glue) for the reference model; product bootstraps override it
+    /// with `with_host_signal`.
+    host_signal: Arc<dyn HostSignalBridge>,
 }
 
 impl RootBootstrap {
@@ -343,6 +348,7 @@ impl RootBootstrap {
             mm_backend,
             diagnostic_name,
             container: Arc::new(Container::for_reference_model()),
+            host_signal: Arc::new(carrick_hal::NullHostSignalBridge),
         })
     }
 
@@ -350,6 +356,13 @@ impl RootBootstrap {
     /// built from the CLI's `LaunchContext` and installed on the dispatcher).
     pub fn with_container(mut self, container: Arc<Container>) -> Self {
         self.container = container;
+        self
+    }
+
+    /// Reach the carrier's execution backend for host-signal state (the
+    /// bridge the dispatcher was built with). Every product bootstrap sets it.
+    pub fn with_host_signal(mut self, host_signal: Arc<dyn HostSignalBridge>) -> Self {
+        self.host_signal = host_signal;
         self
     }
 
@@ -467,6 +480,10 @@ pub struct Kernel {
     auditors: ArcSwap<crate::observe::auditor::AuditorChain>,
     abort_reason: Arc<Mutex<Option<crate::observe::auditor::AuditReason>>>,
     unpublished_jobs: AtomicUsize,
+    /// The execution backend's host-signal bridge, consulted by continuation
+    /// readiness for the per-thread host pending slot. One per kernel (per
+    /// VM): the bridge is carrier-wide glue, so every task shares it.
+    host_signal: Arc<dyn HostSignalBridge>,
 }
 
 /// A fully constructed container-init graph that is still invisible to the
@@ -1212,6 +1229,10 @@ impl std::fmt::Debug for TaskExitSubscribers {
 }
 
 impl Kernel {
+    /// The execution backend's host-signal bridge this kernel was booted with.
+    pub fn host_signal(&self) -> &Arc<dyn HostSignalBridge> {
+        &self.host_signal
+    }
     pub fn bootstrap_root(
         bootstrap: RootBootstrap,
     ) -> Result<(Arc<Self>, KernelContext), KernelError> {
@@ -1348,6 +1369,7 @@ impl Kernel {
             carrick_hal::HvpatchChildTokenIssuer::new_pair();
         let kernel = Arc::new(Self {
             domain: Arc::new(KernelDomain),
+            host_signal: bootstrap.host_signal,
             registry,
             ids,
             object_ids,

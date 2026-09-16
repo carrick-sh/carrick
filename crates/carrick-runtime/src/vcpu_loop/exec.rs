@@ -1236,7 +1236,12 @@ where
             }
             let out = kernel.dispatcher.stdout();
             let err = kernel.dispatcher.stderr();
-            crate::exec_helpers::forked_child_die_by_signal(sigsegv, &out, &err);
+            crate::exec_helpers::forked_child_die_by_signal(
+                &*kernel.dispatcher.host_signal,
+                sigsegv,
+                &out,
+                &err,
+            );
         }
         let result = super::assemble_run_result(kernel, 128 + sigsegv, Some(sigsegv), 0, false);
         Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)))

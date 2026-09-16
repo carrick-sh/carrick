@@ -91,7 +91,7 @@ impl<'a> NetView<'a> {
                     drop(open);
                     wq.wake_all();
                     self.notify_inmem_epoll();
-                    crate::host_signal::wake_all_waiters();
+                    self.cross.host_signal().wake_all_waiters();
                 }
             }
         }
@@ -190,7 +190,7 @@ impl<'a> NetView<'a> {
         // A thread may be blocked in recvfrom() directly rather than through
         // an epoll instance. The queue mutation above is durable; wake the
         // dispatcher-aware private waiter so it re-samples the synthetic fd.
-        crate::host_signal::wake_all_waiters();
+        self.cross.host_signal().wake_all_waiters();
         Ok(())
     }
 }

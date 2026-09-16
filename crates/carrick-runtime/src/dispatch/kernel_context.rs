@@ -30,8 +30,9 @@ impl GuestProcessTarget {
     }
 }
 
-pub(crate) fn try_bootstrap_one_task_binding()
--> Result<(crate::kernel::KernelTaskBinding, crate::kernel::MmId), crate::run_result::RuntimeError>
+pub(crate) fn try_bootstrap_one_task_binding(
+    host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
+) -> Result<(crate::kernel::KernelTaskBinding, crate::kernel::MmId), crate::run_result::RuntimeError>
 {
     let observed_pid = i32::try_from(std::process::id()).unwrap_or(1);
     let registry_id = crate::thread::ThreadId::main_from_host_pid();
@@ -45,7 +46,8 @@ pub(crate) fn try_bootstrap_one_task_binding()
         crate::run_result::RuntimeError::CarrierFailed(format!(
             "cannot build mandatory one-task kernel adapter: {error}"
         ))
-    })?;
+    })?
+    .with_host_signal(host_signal);
     let (_, context) = crate::kernel::Kernel::bootstrap_root(bootstrap).map_err(|error| {
         tracing::error!(%error, "cannot bootstrap mandatory one-task kernel adapter");
         crate::run_result::RuntimeError::CarrierFailed(format!(
@@ -57,9 +59,10 @@ pub(crate) fn try_bootstrap_one_task_binding()
 }
 
 #[allow(clippy::expect_used)]
-pub(crate) fn bootstrap_one_task_binding() -> (crate::kernel::KernelTaskBinding, crate::kernel::MmId)
-{
-    try_bootstrap_one_task_binding().expect("mandatory one-task kernel adapter")
+pub(crate) fn bootstrap_one_task_binding(
+    host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
+) -> (crate::kernel::KernelTaskBinding, crate::kernel::MmId) {
+    try_bootstrap_one_task_binding(host_signal).expect("mandatory one-task kernel adapter")
 }
 
 impl SyscallDispatcher {
@@ -914,7 +917,7 @@ mod tests {
 
     #[test]
     fn try_bootstrap_one_task_binding_succeeds() {
-        let res = try_bootstrap_one_task_binding();
+        let res = try_bootstrap_one_task_binding(Arc::new(carrick_hal::NullHostSignalBridge));
         assert!(res.is_ok());
     }
 }

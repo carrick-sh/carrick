@@ -5,10 +5,108 @@
 //! wall-clock fallback thread. POSIX per-process timers delegate to the existing
 //! HVF `posix_timer::arm` (its own firing thread). The neutral slot mutation is
 //! the timer-core's; this struct only owns the kqueue glue.
-use carrick_hal::{PosixTimerSpec, TimerArm, TimerDelivery, TimerSpecNs};
+use std::sync::{Arc, OnceLock};
+
+use carrick_hal::{GuestTimerBridge, PosixTimerSpec, TimerArm, TimerDelivery, TimerSpecNs};
 use carrick_timer_core::{CpuNs, WallNs};
 
 pub struct HvfTimerDelivery;
+
+// The process-global `TimerDelivery` handle for the macOS/HVF backend. HVF has
+// no kicker-based wall-clock `deliver` (it arms EVFILT_TIMER on the pump
+// kqueue), so this is ONLY the `register_delivery`/`delivery` seam the dispatch
+// arm consumes through [`HvfGuestTimers`]. Mirrors the kick+futex lanes'
+// `carrick_hal::guest_timer_bridge::{register_delivery, delivery}`.
+static DELIVERY: OnceLock<Arc<dyn TimerDelivery>> = OnceLock::new();
+
+/// Install the backend `TimerDelivery` ([`HvfTimerDelivery`]). Called once at
+/// run-loop startup. Subsequent calls are ignored.
+pub fn register_delivery(delivery: Arc<dyn TimerDelivery>) {
+    let _ = DELIVERY.set(delivery);
+}
+
+/// The registered backend `TimerDelivery`, or `None` if no run loop has
+/// registered one (e.g. a unit test exercising the dispatcher without a
+/// backing run loop). Every real run-loop entry registers a backend before
+/// the dispatcher can run a `setitimer`/`timer_settime`, so the `None` arm
+/// only matters for tests, where the caller falls back to the shared
+/// wall-clock timer thread (the pre-trait `kq < 0` behavior).
+pub fn delivery() -> Option<Arc<dyn TimerDelivery>> {
+    DELIVERY.get().map(Arc::clone)
+}
+
+/// HVF's [`GuestTimerBridge`]: the neutral timer-core registry plus this
+/// lane's firing glue (`itimer::spawn_fallback_timer`, `posix_timer::arm`) and
+/// the process-global [`delivery`] seam, reached by the dispatcher only
+/// through the trait.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HvfGuestTimers;
+
+impl GuestTimerBridge for HvfGuestTimers {
+    fn itimer_arm(&self, which: usize, spec: TimerSpecNs, needs_periodic: bool) -> u64 {
+        crate::itimer::arm(which, spec, needs_periodic)
+    }
+
+    fn itimer_disarm(&self, which: usize) {
+        crate::itimer::disarm(which);
+    }
+
+    fn itimer_signum_for(&self, which: usize) -> i32 {
+        crate::itimer::signum_for(which)
+    }
+
+    fn itimer_spawn_fallback_timer(&self, which: usize, generation: u64, spec: TimerSpecNs) {
+        crate::itimer::spawn_fallback_timer(which, generation, spec);
+    }
+
+    fn posix_create_with_target_and_value(
+        &self,
+        clock_id: i32,
+        signum: i32,
+        target_tid: Option<i32>,
+        si_value: i64,
+    ) -> i32 {
+        crate::posix_timer::create_with_target_and_value(clock_id, signum, target_tid, si_value)
+    }
+
+    fn posix_arm(&self, id: i32, spec: TimerSpecNs) -> Option<PosixTimerSpec> {
+        crate::posix_timer::arm(id, spec)
+    }
+
+    fn posix_remaining(&self, id: i32) -> Option<TimerSpecNs> {
+        crate::posix_timer::remaining(id)
+    }
+
+    fn posix_getoverrun(&self, id: i32) -> Option<u32> {
+        crate::posix_timer::getoverrun(id)
+    }
+
+    fn posix_seed_overrun(&self, id: i32, count: u32) {
+        crate::posix_timer::seed_overrun(id, count);
+    }
+
+    fn posix_exists(&self, id: i32) -> bool {
+        crate::posix_timer::exists(id)
+    }
+
+    fn posix_clock_id(&self, id: i32) -> i32 {
+        crate::posix_timer::clock_id(id)
+    }
+
+    fn posix_delete(&self, id: i32) -> bool {
+        crate::posix_timer::delete(id)
+    }
+
+    /// Publish a process-directed signal from a host-side producer: the
+    /// kqueue signal pump wakes parked waiters and kicks any in-guest vCPU.
+    fn deliver(&self, signum: i32) {
+        crate::host_signal::publish_process_signal(signum);
+    }
+
+    fn delivery(&self) -> Option<Arc<dyn TimerDelivery>> {
+        delivery()
+    }
+}
 
 impl TimerDelivery for HvfTimerDelivery {
     /// Arm `which` as an `EVFILT_TIMER` on the pump kqueue. The neutral slot

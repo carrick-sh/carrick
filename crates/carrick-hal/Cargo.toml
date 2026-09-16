@@ -11,6 +11,12 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+# The Null host-signal / guest-timer bridges a dispatcher boots with when no
+# carrier hands it real ones (`SyscallDispatcher::new()`, the example backend).
+# Test-only surface: nothing in a product carrier constructs them.
+test-support = []
+
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 carrick-fatal.workspace = true

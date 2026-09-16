@@ -21,6 +21,10 @@ pub mod kvm_signal_backend;
 pub mod kvm_xsig;
 
 pub use kvm_signal_backend::KvmGlue;
+/// The KVM lane's [`HostSignalBridge`](carrick_hal::HostSignalBridge): the
+/// shared kick+futex body over this lane's glue (identity signal numbering,
+/// `SIGRTMIN` kick, `SIGRTMIN+1` xsignal nudge).
+pub type KvmHostSignal = carrick_hal::GenericHostSignalBridge<KvmGlue>;
 // `KvmSignalArrival` was byte-identical to bhyve's; both collapsed into the
 // shared `carrick_hal::GenericSignalArrival` (kicker + futex wake). The KVM run
 // loop constructs that directly, so this backend has no SignalArrival module.

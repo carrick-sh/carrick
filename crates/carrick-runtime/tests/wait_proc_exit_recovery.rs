@@ -19,7 +19,7 @@ fn wait_proc_exit_recovers_when_kqueue_fd_closed_mid_wait() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use carrick_runtime::io_wait::{ThreadWaiter, WaitResult};
+    use carrick_vmm_hvf::io_wait::{ThreadWaiter, WaitResult};
 
     // A child that exits shortly: a correct waiter observes the exit and returns
     // Ready (the caller then re-dispatches waitid to reap).

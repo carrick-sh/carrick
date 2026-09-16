@@ -154,7 +154,7 @@ fn with_vmm_vdso_for_dispatcher<A: carrick_hal::GuestArch>(
 // fork/execve/threads/futex guests. So the forked-child shutdown and
 // default-signal-death helpers must be REAL here, not `unreachable!()`: their
 // bodies are portable libc (`_exit`, `raise`, `sigprocmask`) plus the
-// cross-platform `crate::guest_cpu` / `crate::host_signal` shims, identical to
+// cross-platform `crate::guest_cpu` shim and the carrier's `HostSignalBridge`, identical to
 // the macOS versions in `crate::runtime::exec`. Without them a forked child that
 // runs `exit_group`/dies-by-signal panics instead of `_exit`ing with the guest's
 // code (the `shared-futex-fork` exit-5 bug: the child reached `_exit(7)` but the
@@ -681,7 +681,7 @@ impl KernelState {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             let weak_directory = Arc::downgrade(directory);
-            crate::host_signal::set_process_signal_wake_hook(Box::new(move || {
+            carrick_vmm_hvf::host_signal::set_process_signal_wake_hook(Box::new(move || {
                 if let Some(directory) = weak_directory.upgrade() {
                     directory.wake_all_tasks_for_process_signal();
                 }
@@ -2204,7 +2204,7 @@ pub(super) fn service_signals_threaded<E: ThreadedEngine>(
                         )));
                     }
                 } else {
-                    stop_by_signal(signum);
+                    stop_by_signal(&*kernel.dispatcher.host_signal, signum);
                 }
                 return Ok(None);
             }
@@ -2216,7 +2216,7 @@ pub(super) fn service_signals_threaded<E: ThreadedEngine>(
                     engine.process_exit_cleanup()?;
                     let out = kernel.dispatcher.stdout();
                     let err = kernel.dispatcher.stderr();
-                    forked_child_die_by_signal(signum, &out, &err);
+                    forked_child_die_by_signal(&*kernel.dispatcher.host_signal, signum, &out, &err);
                 }
                 kernel.record_fatal_signal(FatalSignalRecord {
                     image_generation: fatal_image_generation,

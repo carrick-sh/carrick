@@ -348,6 +348,7 @@ pub(crate) enum ReadinessProbe {
         poll_events: i16,
         write: Arc<Mutex<BlockingWrite>>,
         completion: Arc<Mutex<Option<DispatchOutcome>>>,
+        host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
     },
     TimerFdRead {
         read: Arc<Mutex<Option<BlockingTimerFdRead>>>,
@@ -389,6 +390,7 @@ pub(crate) enum ReadinessProbe {
 #[derive(Clone, Debug)]
 pub(crate) struct SignalReadinessProbe {
     pub(crate) kernel: Weak<Kernel>,
+    pub(crate) host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
     pub(crate) task_ref: Weak<Task>,
     pub(crate) observed_task_wake: u64,
     pub(crate) observed_task_event: u64,
@@ -421,6 +423,7 @@ impl SignalReadinessProbe {
         };
         Self {
             kernel: state.authority.kernel.clone(),
+            host_signal: Arc::clone(&state.authority.host_signal),
             task_ref: state.authority.task_ref.clone(),
             observed_task_wake,
             observed_task_event: state.authority.task_event_generation,
@@ -455,7 +458,7 @@ impl SignalReadinessProbe {
             return None;
         }
         let authority = context.signal_authority();
-        let host_signum = crate::host_signal::take_pending_for(self.thread.tid.raw());
+        let host_signum = self.host_signal.take_pending_for(self.thread.tid.raw());
         if self.family == ContinuationFamily::VforkParent {
             // Linux waits for vfork completion in TASK_KILLABLE. That means
             // only SIGKILL may interrupt the wait; caught signals and other
@@ -464,7 +467,8 @@ impl SignalReadinessProbe {
             // event so the delivery tail terminates the parent without ever
             // manufacturing a successful vfork return.
             if host_signum != 0 && host_signum != crate::linux_abi::LINUX_SIGKILL {
-                crate::host_signal::publish_pending_for(self.thread.tid.raw(), host_signum);
+                self.host_signal
+                    .publish_pending_for(self.thread.tid.raw(), host_signum);
             }
             let kill_only = WaitSigMask::Replace(
                 SigSet::EMPTY
@@ -489,12 +493,14 @@ impl SignalReadinessProbe {
         }
         if let Some(wait_set) = self.wait_set {
             if host_signum != 0 && wait_set.contains(host_signum) {
-                crate::host_signal::publish_pending_for(self.thread.tid.raw(), host_signum);
+                self.host_signal
+                    .publish_pending_for(self.thread.tid.raw(), host_signum);
                 return Some(ContinuationEvent::Ready);
             }
             if authority.has_pending_in(wait_set) {
                 if host_signum != 0 {
-                    crate::host_signal::publish_pending_for(self.thread.tid.raw(), host_signum);
+                    self.host_signal
+                        .publish_pending_for(self.thread.tid.raw(), host_signum);
                 }
                 return Some(ContinuationEvent::Ready);
             }
@@ -625,6 +631,7 @@ impl ReadinessProbe {
                     poll_events,
                     write: Arc::clone(write),
                     completion: Arc::clone(&state.producer_completion),
+                    host_signal: Arc::clone(&state.authority.host_signal),
                 }
             }
             ContinuationDetail::TimerFdRead(read) => {
@@ -797,11 +804,14 @@ impl ReadinessProbe {
                     .then_some(ContinuationEvent::Ready)
             }
             Self::BlockingWrite {
-                write, completion, ..
+                write,
+                completion,
+                host_signal,
+                ..
             } => {
                 let outcome = {
                     let mut write = write.lock();
-                    match crate::dispatch::drive_blocking_write(&mut write) {
+                    match crate::dispatch::drive_blocking_write(&mut write, &**host_signal) {
                         crate::dispatch::BlockingWriteStep::Done(outcome) => Some(outcome),
                         crate::dispatch::BlockingWriteStep::Wait => None,
                     }

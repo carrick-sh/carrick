@@ -23,42 +23,9 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use crate::darwin_kqueue::{Kevent, Kqueue};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WaitFd {
-    fd: RawFd,
-    events: i16,
-    anchored: bool,
-}
-
-impl WaitFd {
-    pub fn raw(fd: RawFd, events: i16) -> Self {
-        Self {
-            fd,
-            events,
-            anchored: false,
-        }
-    }
-
-    pub fn anchored(fd: RawFd, events: i16) -> Self {
-        Self {
-            fd,
-            events,
-            anchored: true,
-        }
-    }
-
-    pub fn fd(&self) -> RawFd {
-        self.fd
-    }
-
-    pub fn events(&self) -> i16 {
-        self.events
-    }
-
-    fn is_anchored(&self) -> bool {
-        self.anchored
-    }
-}
+// The wait-fd descriptor is backend-neutral (the dispatcher builds it), so it
+// lives in carrick-hal; re-exported here so this module's callers name one path.
+pub use carrick_hal::WaitFd;
 
 /// Result of a blocking-I/O wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
