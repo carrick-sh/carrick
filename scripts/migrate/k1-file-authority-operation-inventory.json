@@ -12000,7 +12000,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3034,
+      "line": 3060,
       "categories": [
         "mapping"
       ],
@@ -12009,7 +12009,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3042,
+      "line": 3068,
       "categories": [
         "mapping"
       ],
@@ -12018,7 +12018,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3058,
+      "line": 3084,
       "categories": [
         "mapping"
       ],
@@ -12027,7 +12027,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3071,
+      "line": 3097,
       "categories": [
         "mapping"
       ],
@@ -12036,7 +12036,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
-      "line": 1378,
+      "line": 1391,
       "categories": [
         "mapping"
       ],
@@ -12090,7 +12090,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/carrier_process.rs",
-      "line": 739,
+      "line": 814,
       "categories": [
         "mapping"
       ],
@@ -14997,7 +14997,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects/process.rs",
-      "line": 402,
+      "line": 404,
       "categories": [
         "lifecycle"
       ],
@@ -15006,7 +15006,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects/process.rs",
-      "line": 433,
+      "line": 435,
       "categories": [
         "lifecycle"
       ],
@@ -15015,7 +15015,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects/process.rs",
-      "line": 486,
+      "line": 488,
       "categories": [
         "mapping"
       ],
@@ -18094,7 +18094,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "line": 247,
+      "line": 248,
       "categories": [
         "mapping"
       ],
@@ -18103,7 +18103,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "line": 568,
+      "line": 569,
       "categories": [
         "mapping"
       ],
@@ -18112,7 +18112,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "line": 576,
+      "line": 577,
       "categories": [
         "mapping"
       ],
@@ -18139,7 +18139,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "line": 3015,
+      "line": 3019,
       "categories": [
         "mapping"
       ],
