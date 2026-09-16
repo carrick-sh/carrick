@@ -779,8 +779,18 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
     );
     let io_uring_source = include_str!("../../dispatch/ioring.rs");
     assert!(io_uring_source.contains("with_guest_slots(&files, [ring_fd, sqe.fd])"));
+    // RETIRED with the 1:1 native lane's host-pid wait bodies: the only
+    // `WaitFds` producer in `dispatch/proc.rs` was the retired lane's
+    // `waitid(P_PIDFD)` park on a host pidfd, so there is no proc.rs fd
+    // producer left to hold to this invariant. An `include_str!` clause whose
+    // subject no longer exists is a test that reaims, so it is deleted rather
+    // than loosened; the HVPatch `waitid` parks on the kernel graph
+    // (`WaitOnHvpatchChild`), which carries no host fd at all.
     let proc_source = include_str!("../../dispatch/proc.rs");
-    assert!(proc_source.contains("with_guest_slots(&files, [id as i32])"));
+    assert!(
+        !proc_source.contains("WaitFds"),
+        "proc.rs must not reintroduce a host-fd wait producer"
+    );
     let fs_source = include_str!("../../dispatch/fs.rs");
     assert!(!fs_source.contains("WaitFdAuthority::Missing"));
     for required in [
