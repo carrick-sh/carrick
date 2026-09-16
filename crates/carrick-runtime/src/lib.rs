@@ -91,40 +91,12 @@
 #![allow(rustdoc::private_intra_doc_links)]
 
 pub mod binfmt;
-pub mod container;
-pub mod cred_ipc;
-// Cross-platform forked-child exit helpers and shebang resolution, hoisted out
-// of the per-platform copies in `runtime/exec.rs` (macOS) and
-// `vcpu_loop::macos_helper_stubs` (Linux). No cfg gate: the functions are
-// portable libc + `crate::...` path helpers that resolve per-platform.
-pub mod core_dump;
-pub mod deadlock_watchdog;
-
-pub mod dispatch;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub mod dtrace_consumer;
 #[cfg(target_os = "macos")]
 pub mod dtrace_symbols;
-pub mod event_mux;
-pub mod event_ring;
-pub(crate) mod eventfd_shm;
-pub(crate) mod exec_helpers;
-pub(crate) mod fanotify;
 pub mod host_process;
-pub mod host_tty;
-pub(crate) mod inotify;
 pub mod interactive_supervisor;
-// The Linux kernel keyring subsystem behind `add_key`/`request_key`/`keyctl`.
-// The key objects are VM-wide (one service on `kernel::Kernel`); the
-// per-thread, per-process and per-uid keyring POINTERS live in the kernel
-// graph, never in a host-process global. Rendered docs live in the module
-// itself so its intra-doc links resolve in its own scope.
-pub(crate) mod keyring;
-pub mod namespace;
-pub mod observe;
-
-pub mod network;
-pub mod page_profile;
 // `linux_abi` was lifted into the leaf crate `carrick-abi` (build-graph split,
 // docs/archive/build-decomposition-design.md §3.A-A1). Re-exported under the original
 // path so every `crate::linux_abi::…` / `carrick_runtime::linux_abi::…` site is
@@ -243,42 +215,22 @@ pub mod trap {
     pub fn dump_kick_stats() {}
 }
 
-pub mod run_state;
-
-/// Typed object identities and reservation contracts for the backend-neutral
-/// kernel model.
-pub mod kernel;
-
-// Cross-platform run-loop result/error + kernel-half state. Single home for
-// `RunResult` / `RuntimeError` / `KernelState` / `Kernel` / `VcpuLoopOutcome`,
-// shared by the generic threaded `vcpu_loop` on BOTH backends — the HVF setup
-// wrapper on macOS and `run_threaded_kvm_loop` on Linux (the `runtime` modules
-// below).
-pub mod run_result;
-
 pub mod carrier;
 pub use carrier::{
     CarrierAdmissionState, CarrierLease, CarrierRuntime, CarrierSnapshot, ContainerInitSnapshot,
 };
-pub(crate) mod container_policy;
 pub mod threaded_loop;
 pub mod vcpu_loop;
 // Platform-NEUTRAL debug-state snapshot + vDSO attach policy (moved out of the
 // macOS `runtime.rs` arm; both `runtime` arms re-export them so the original
 // `crate::runtime::…` call-site paths resolve on every platform).
 pub mod debug_state;
-pub mod exec_stamps;
 #[cfg(feature = "platform-macos")]
 pub mod execute;
 pub(crate) mod hvpatch;
 pub mod prepare;
-pub mod pty_relay;
 #[cfg(feature = "platform-macos")]
 pub mod runtime;
-pub(crate) mod seccomp;
-pub mod syslog;
-pub(crate) mod vdso_policy;
-pub mod vfs;
 pub use prepare::{
     ExecutionPlan, PreparedRun, Runtime, RuntimeExtensions, StdioSink, prepare_on, resolve_plan,
 };
@@ -398,5 +350,3 @@ mod rosetta_detection_tests {
         assert_eq!(parse_binfmt_interpreter(""), None);
     }
 }
-
-pub(crate) mod file_authority;
