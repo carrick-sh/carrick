@@ -793,7 +793,7 @@ where
         let mut last = false;
         if let Some(process) = kernel.hvpatch_process.as_ref() {
             match process.exit_thread(self.linux_tid) {
-                Ok(crate::hvpatch::ProcessThreadExit::Retired(retired)) => {
+                Ok(crate::kernel::ProcessThreadExit::Retired(retired)) => {
                     kernel.dispatcher.close_draining_file_table(
                         process.kernel_graph(),
                         &retired.files(),
@@ -801,11 +801,11 @@ where
                         None,
                     );
                 }
-                Ok(crate::hvpatch::ProcessThreadExit::AlreadyRetired) => {}
-                Ok(crate::hvpatch::ProcessThreadExit::Busy { observed_epoch }) => {
+                Ok(crate::kernel::ProcessThreadExit::AlreadyRetired) => {}
+                Ok(crate::kernel::ProcessThreadExit::Busy { observed_epoch }) => {
                     return PersistentThreadExitDisposition::Busy { observed_epoch };
                 }
-                Ok(crate::hvpatch::ProcessThreadExit::LastThread) | Err(_) => last = true,
+                Ok(crate::kernel::ProcessThreadExit::LastThread) | Err(_) => last = true,
             }
         }
         // Runtime withdrawal (registry exit, kick unregister, host-signal

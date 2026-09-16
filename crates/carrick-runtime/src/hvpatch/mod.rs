@@ -12,6 +12,9 @@ use std::sync::Arc;
 use carrick_fatal::carrick_fatal;
 
 use crate::dispatch::SyscallDispatcher;
+use crate::kernel::{
+    ChildExit, ProcessThreadExit, RetiredThreadResources, WaitResult, identity_operation_errno,
+};
 use crate::memory::{AddressSpace, AddressSpaceError};
 #[cfg(all(
     feature = "platform-macos",
@@ -598,39 +601,6 @@ impl CommittedProcessExec {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ChildExit {
-    pid: crate::kernel::TaskId,
-    visible_pid: i32,
-    ruid: carrick_abi::NsUid,
-    status: i32,
-}
-
-impl ChildExit {
-    #[cfg(test)]
-    pub(crate) const fn pid(self) -> crate::kernel::TaskId {
-        self.pid
-    }
-
-    pub(crate) const fn visible_pid(self) -> i32 {
-        self.visible_pid
-    }
-
-    pub(crate) const fn status(self) -> i32 {
-        self.status
-    }
-
-    pub(crate) const fn ruid(self) -> carrick_abi::NsUid {
-        self.ruid
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct RetiredThreadResources {
-    owner: crate::kernel::TaskKey,
-    files: std::sync::Arc<crate::kernel::FileTable>,
-}
-
 #[derive(Debug)]
 pub struct PendingAddressSpaceRetirement {
     retired: RetiredStage1Mm,
@@ -686,43 +656,6 @@ impl PendingAddressSpaceRetirement {
         }
         Ok(())
     }
-}
-
-impl RetiredThreadResources {
-    pub(crate) const fn owner(&self) -> crate::kernel::TaskKey {
-        self.owner
-    }
-
-    pub(crate) fn files(&self) -> std::sync::Arc<crate::kernel::FileTable> {
-        std::sync::Arc::clone(&self.files)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum ProcessThreadExit {
-    Retired(RetiredThreadResources),
-    AlreadyRetired,
-    LastThread,
-    /// The kernel graph holds a task reservation (a sibling's exec/fork/exit
-    /// transaction in flight). The caller must NOT block an executor waiting
-    /// for it: an exec survivor's ASID-ack wait can be the reservation
-    /// holder, and it needs THIS executor back at its command-service point
-    /// (the execfromthread ABBA wedge: leader parked on the reservation
-    /// condvar inside its exit while the survivor's executor waited for the
-    /// leader's ack). Carries the observed reservation epoch so the caller
-    /// can subscribe for the change and park as a scheduler-visible retry,
-    /// exactly like the thread-clone TaskBusy path.
-    Busy {
-        observed_epoch: u64,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WaitResult {
-    Exited(ChildExit),
-    StateChanged(ChildExit),
-    StillRunning(crate::kernel::ChildWaitPrecheck),
-    NoChild,
 }
 
 /// `WNOWAIT` peeks; every other wait reaps.
@@ -1442,10 +1375,8 @@ impl ProcessContext {
         // Kernel publication removes the thread from the authoritative graph.
         // Callers use this receipt to consume only that generation's close
         // events; recapturing afterward could select a surviving peer table.
-        let retired = RetiredThreadResources {
-            owner: context.task().key(),
-            files: context.resources().files(),
-        };
+        let retired =
+            RetiredThreadResources::new(context.task().key(), context.resources().files());
         let observed = self.kernel_graph().reservation_epoch();
         match self.kernel_graph().exit_thread(&context, None) {
             Ok(_) => Ok(ProcessThreadExit::Retired(retired)),
@@ -1560,12 +1491,12 @@ impl ProcessContext {
                         "zombie namespace_pid exceeds i32 in wait_result"
                     );
                 };
-                WaitResult::Exited(ChildExit {
-                    pid: zombie.key.id,
+                WaitResult::Exited(ChildExit::new(
+                    zombie.key.id,
                     visible_pid,
-                    ruid: zombie.ruid,
-                    status: zombie.status.raw(),
-                })
+                    zombie.ruid,
+                    zombie.status.raw(),
+                ))
             }
             // A P_PIDFD wait runs in Consume mode too, so reporting a
             // job-control event as "still running" DISCARDS it. Render the
@@ -1575,23 +1506,18 @@ impl ProcessContext {
                 let Some(visible_pid) = self.visible_task_id(task) else {
                     return WaitResult::NoChild;
                 };
-                WaitResult::StateChanged(ChildExit {
-                    pid: task,
+                WaitResult::StateChanged(ChildExit::new(
+                    task,
                     visible_pid,
                     ruid,
-                    status: (signal.raw() << 8) | 0x7f,
-                })
+                    (signal.raw() << 8) | 0x7f,
+                ))
             }
             Ok(crate::kernel::WaitOutcome::Continued { task, ruid }) => {
                 let Some(visible_pid) = self.visible_task_id(task) else {
                     return WaitResult::NoChild;
                 };
-                WaitResult::StateChanged(ChildExit {
-                    pid: task,
-                    visible_pid,
-                    ruid,
-                    status: 0xffff,
-                })
+                WaitResult::StateChanged(ChildExit::new(task, visible_pid, ruid, 0xffff))
             }
             Ok(crate::kernel::WaitOutcome::StillRunning(precheck)) => {
                 WaitResult::StillRunning(precheck)
@@ -1635,38 +1561,6 @@ impl ProcessContext {
             .task_identity(self.task_id())
             .map(|identity| identity.process_group.raw())
             .map_err(identity_operation_errno)
-    }
-}
-
-/// The errno a guest-identity operation on the kernel graph reports.
-///
-/// Shared with the `setpgid`/`setsid` dispatch paths so an identity failure has
-/// ONE spelling: those used to reach this through per-call wrappers on
-/// `ProcessContext`, which existed only because the dispatch side could not see
-/// the graph directly. It can, so the wrappers are gone.
-pub(crate) fn identity_operation_errno(
-    error: crate::kernel::KernelOperationError,
-) -> crate::linux_abi::LinuxErrno {
-    match error {
-        crate::kernel::KernelOperationError::UnknownTask(_) => crate::linux_abi::LINUX_ESRCH,
-        // setpgid(2) singles this case out: "EACCES — An attempt was made to
-        // change the process group ID of one of the children of the calling
-        // process and the child had already performed an execve(2)." The kernel
-        // graph models it exactly (`ChildExeced` off a real `has_execed` flag),
-        // and the pre-HVPatch path already returned EACCES; only this errno
-        // mapping collapsed it into the neighbouring EPERM cases.
-        crate::kernel::KernelOperationError::ChildExeced(_) => crate::linux_abi::LINUX_EACCES,
-        // setsid(2) refuses with EPERM when "the process group ID of any
-        // process equals the PID of the calling process" — not only when the
-        // caller is still that group's member. LTP `setsid01` leaves its own
-        // group behind with a child in it and expects EPERM; the catch-all
-        // below reported EINVAL.
-        crate::kernel::KernelOperationError::IdentityPermission
-        | crate::kernel::KernelOperationError::AlreadyProcessGroupLeader
-        | crate::kernel::KernelOperationError::IdentityInUseByCallerPid => {
-            crate::linux_abi::LINUX_EPERM
-        }
-        _ => crate::linux_abi::LINUX_EINVAL,
     }
 }
 
@@ -4218,12 +4112,12 @@ mod tests {
 
     #[test]
     fn waitid_siginfo_uses_the_visible_pid_retained_by_the_wait_receipt() {
-        let exit = ChildExit {
-            pid: crate::kernel::TaskId::from_abi_positive(42).expect("internal pid"),
-            visible_pid: 7,
-            ruid: carrick_abi::NsUid::new(1_000),
-            status: 9 << 8,
-        };
+        let exit = ChildExit::new(
+            crate::kernel::TaskId::from_abi_positive(42).expect("internal pid"),
+            7,
+            carrick_abi::NsUid::new(1_000),
+            9 << 8,
+        );
 
         let siginfo = crate::dispatch::build_hvpatch_waitid_siginfo(exit);
         assert_eq!(siginfo_i32(&siginfo, 16), 7);
