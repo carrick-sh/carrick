@@ -16,19 +16,52 @@
 // off-macOS where the casts are genuinely redundant.
 #![cfg_attr(not(target_os = "macos"), allow(clippy::unnecessary_cast))]
 
-//! carrick-kernel: the Carrick kernel. The kernel object graph, the syscall
-//! dispatcher and every in-zone subsystem the guest talks to — process and
-//! thread identity, memory authority, file descriptions, signals, waits,
-//! futexes, namespaces, the in-zone network, the kernel-view filesystems
-//! (`/proc`, `/sys`, `/dev`, `/dev/pts`) over the `carrick-vfs` filesystem
-//! model, and the container/run state that frames them.
+//! # What this is
 //!
-//! It names no carrier and no VMM crate. Everything it needs from the
-//! execution lane arrives through `carrick-hal` traits the carrier implements
-//! (`SyscallTrap`, `CarrierProcess`, `Stage1MmProjection`, `HostSignalBridge`,
-//! `GuestTimerBridge`); everything it needs from the host arrives through the
-//! leaf crates below. That is what lets an execution backend other than
-//! carrick-runtime's HVPatch carrier reuse the kernel.
+//! The Carrick kernel: the half of Carrick that answers syscalls. There is **no
+//! guest Linux kernel** anywhere in the picture — a guest's `openat`, `clone`,
+//! `futex` or `epoll_wait` is answered by the Rust code in this crate, against
+//! kernel objects this crate owns. That is the object graph (`kernel/` — task
+//! and process identity, address-space authority, file descriptions, wait sets,
+//! continuations, the scheduler view), the syscall dispatcher and its
+//! subsystems (`dispatch/` — fs, mem, signal, net, futex, creds, sysv, time,
+//! …), the namespaces (`namespace/`), the in-zone network (`network/`), the
+//! file authority (`file_authority/`), the observation/sandbox policy
+//! (`observe/`), the kernel-view filesystems (`vfs/` — `/proc`, `/sys`, `/dev`,
+//! `/dev/pts`) over the `carrick-vfs` filesystem model, and the single-file
+//! subsystems the guest reaches through them (containers, seccomp,
+//! inotify/fanotify, the keyring, core dumps, ptys, the event ring, the syslog,
+//! …).
+//!
+//! It exists as its own crate so an execution backend **other than**
+//! `carrick-runtime`'s HVPatch carrier can drive the same kernel: it names no
+//! carrier module and no `carrick-vmm-*` crate, and it selects no platform
+//! (there are no `platform-*` features here).
+//!
+//! **Status — experimental.** Syscall coverage is partial and several syscalls
+//! are only partially emulated (count the table with
+//! `grep -c 'SupportLevel::BringUp' crates/carrick-abi/src/syscall.rs`; the
+//! per-syscall fidelity map is `docs/syscalls-emulation-map.md`). Guest
+//! behaviour is incomplete, and there has been **no adversarial security
+//! review**: a guest under this kernel is **not a hardened trust boundary**. Do
+//! not run untrusted code under it.
+//!
+//! # Stability
+//!
+//! Experimental. **No semver.** The API changes without notice — this crate
+//! exists to split Carrick's build graph and to let an execution backend other
+//! than the HVPatch carrier reuse the kernel, not to be a general-purpose
+//! library. If you depend on it, pin a git rev. It is not published to
+//! crates.io (no crate in this workspace is).
+//!
+//! # Modules
+//!
+//! Modules a backend uses: [`dispatch`], [`kernel`], [`observe`]. Modules a
+//! backend may ignore: everything else (they are `pub` because dispatch is one
+//! crate, not because they are stable).
+//!
+//! `README.md` carries the rest of the backend contract: what a backend
+//! supplies, the `DispatchOutcome` obligations, and the bootstrap sequence.
 //!
 //! # The leaf-crate aliases
 //!

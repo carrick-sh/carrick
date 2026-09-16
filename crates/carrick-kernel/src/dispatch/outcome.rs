@@ -420,36 +420,67 @@ pub enum FdWaitCompletion {
     Select { clear_on_timeout: Vec<(u64, usize)> },
 }
 
+/// What one dispatched syscall asks of the execution backend.
+///
+/// Every variant carries a `Backend:` line stating that obligation; the
+/// `carrick-kernel` README tabulates the same set. Most variants are "write
+/// this value back", the rest are work only the execution lane can do (create
+/// a task, replace an address space, touch a vCPU) or a wait the kernel owns.
+///
+/// # The blocking-outcome contract
+///
+/// [`crate::kernel::continuation::is_blocking_dispatch_outcome`] names the
+/// variants that mean "this task must wait". A backend must NOT park its host
+/// worker on one: hand the owned outcome to
+/// [`crate::kernel::continuation::BlockedContinuation::from_dispatch_outcome`]
+/// with a capture taken from the task's execution lease, release the execution
+/// lease, and re-enter the task when the continuation completes or asks for a
+/// re-dispatch. A bounded executor pool full of parked workers cannot run the
+/// task that would wake them, and a wait that re-parks must keep the exact
+/// description, offset and completion authority it started with — restarting a
+/// partially completed operation from zero corrupts the stream.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchOutcome {
-    Returned {
-        value: i64,
-    },
+    /// Backend: write `value` into the guest's syscall return register, service any
+    /// signal that became pending during the call, and resume the task.
+    Returned { value: i64 },
     /// `sched_yield(2)` reached the threaded runtime. A bounded M:N backend
     /// must release its current vCPU lease before yielding so a runnable guest
     /// thread queued behind the budget can make progress; yielding only the
     /// host pthread retains the scarce lease and can deadlock oversubscribed
     /// thread groups. Unbounded backends reduce this to the historical host
     /// `yield_now` fast path.
+    ///
+    /// Backend: complete the syscall with 0, service pending signals (a thread
+    /// looping on `sched_yield` must still take them), then RELEASE the guest
+    /// execution lease before yielding.
     SchedulerYield,
-    Errno {
-        errno: LinuxErrno,
-    },
-    Exit {
-        code: i32,
-    },
-    SignalDeath {
-        signum: i32,
-    },
-    /// `clone(2)` with process-creation flags. The runtime must perform
-    /// a real macOS fork against the trap engine, then write the child
-    /// pid (parent) or 0 (child) into x0 to complete the syscall.
+    /// Backend: complete the syscall with `errno.guest_retval()` (the negative
+    /// errno), service pending signals, and resume the task.
+    Errno { errno: LinuxErrno },
+    /// Backend: retire the syscall and take this Linux PROCESS through its terminal
+    /// with `code`; nothing is written back.
+    Exit { code: i32 },
+    /// Backend: retire the syscall, record the fatal signal for the crash report,
+    /// and terminate this Linux process with status `128 + signum`.
+    SignalDeath { signum: i32 },
+    /// `clone(2)` with process-creation flags. The backend materializes a new
+    /// Linux task on the kernel's prepared fork — it creates no host process —
+    /// and writes the child pid (parent) or 0 (child) into x0 to complete the
+    /// syscall.
     ///
     /// `pidfd_out` is `Some(addr)` when `CLONE_PIDFD` was requested: the
     /// runtime allocates a pidfd for the new child and writes its (32-bit) fd
     /// to `addr` in the parent. Go's `os/exec` clones with `CLONE_PIDFD` and
     /// then waits on that fd.
+    ///
+    /// Backend: publish the prepared fork through
+    /// `kernel::operations::PreparedFork::commit`, then start executing the child
+    /// task at the caller's frame with return value 0 (on `child_stack` when
+    /// nonzero) while the caller's syscall completes with the child's visible pid;
+    /// a `vfork` request instead suspends the caller until the child execs or
+    /// exits. See `carrick-kernel-example/src/scripted.rs::on_fork`.
     Fork {
         /// Complete clone flag set used to derive the authoritative kernel plan.
         flags: u64,
@@ -496,6 +527,9 @@ pub enum DispatchOutcome {
     /// Because `execve` does not return on success, the syscall has
     /// no retval to write into x0 — the runtime simply resumes the
     /// loop with the new entry point.
+    ///
+    /// Backend: drain the sibling threads, then perform the three steps above and
+    /// resume at the new entry point without completing a syscall return.
     Execve {
         path: String,
         // argv/env are opaque BYTE strings (Linux ABI), not UTF-8 — a guest may
@@ -510,15 +544,22 @@ pub enum DispatchOutcome {
     /// turn on hardware x86_64 TSO ordering. The dispatcher has no access to the
     /// vCPU, so the runtime loop performs the `ACTLR_EL1.EnTSO` write on the
     /// active vCPU thread and then completes the syscall with 0.
-    SetMemoryModel {
-        tso: bool,
-    },
+    ///
+    /// Backend: apply the memory-ordering model on the active vCPU, then complete
+    /// the syscall with 0.
+    SetMemoryModel { tso: bool },
     /// Back a dynamic high-VA `mmap` (a guest VA at/above 1 TiB that can't be
     /// identity-mapped — HVF's IPA is 40 bits). Apple Rosetta reserves its
     /// translation working set at ~240 TiB. The runtime `hv_vm_map`s anonymous
     /// memory at `ipa`, builds a VA→IPA stage-1 path for `[va, va+len)`, and
     /// completes the `mmap` with `va`. The dispatcher has already reserved `ipa`
     /// from the low alias arena (`crate::memory::LINUX_ALIAS_IPA_BASE`).
+    ///
+    /// Backend: claim `transaction` under a host-alias permit, map `backing` at
+    /// `ipa` for `[va, va+len)` with `payload` at offset 0, publish the frame
+    /// inventory, make the range guest-inaccessible when `prot_none`, commit the
+    /// claimed install, and complete with `success_retval` — on any failure abandon
+    /// the transaction and lower to a guest errno, never abort the carrier.
     MapHostAlias {
         /// Opaque pending metadata commit. Every runtime consumer must claim it
         /// immediately before host mapping, then commit exactly once on full
@@ -564,9 +605,17 @@ pub enum DispatchOutcome {
     /// state, and resume — without advancing PC the way a normal SVC
     /// completion would. There is no retval to write into x0; the
     /// restored x0 IS the return value.
+    ///
+    /// Backend: restore the saved registers and signal mask from the sigframe and
+    /// resume at the restored PC WITHOUT completing a syscall return; a bad frame
+    /// is `force_sigsegv` on this process, never a carrier abort.
     SigReturn,
     /// Thread-creating `clone(2)`/`clone3(2)` (CLONE_VM|CLONE_THREAD|...).
     /// The runtime spawns a new host thread + vCPU sharing this process's VM.
+    ///
+    /// Backend: start a new logical guest thread on this mm at `stack`/`tls` with
+    /// the requested tid stores, completing the caller with the child's visible
+    /// tid — or with `EAGAIN` when admission refuses the thread.
     CloneThread {
         stack: u64,       // child SP (clone arg)
         tls: Option<u64>, // CLONE_SETTLS value -> TPIDR_EL0
@@ -578,14 +627,21 @@ pub enum DispatchOutcome {
     /// A single thread exited via `exit(2)` (NOT exit_group): the runtime
     /// performs the CLONE_CHILD_CLEARTID futex wake and ends just this host
     /// thread. If it was the last live thread the process exits.
-    ThreadExit {
-        code: i32,
-    },
+    ///
+    /// Backend: perform the `CLONE_CHILD_CLEARTID` zero-store and futex wake,
+    /// retire this thread from the kernel graph (`CarrierProcess::exit_thread`),
+    /// stop executing it, and take the process terminal if it was the last live
+    /// thread.
+    ThreadExit { code: i32 },
     /// Guest `tgkill`/`tkill` targeting a *sibling* thread (not self). The
     /// handler can't reach the target's vCPU, so the runtime publishes the
     /// signal for `tid` and forces that vCPU out of the guest (vcpu_kick) so it
     /// delivers promptly. Completes the calling syscall with 0, or -ESRCH if
     /// the target raced to exit. Only emitted on the multi-threaded path.
+    ///
+    /// Backend: publish `signum` for the target thread and force it out of the
+    /// guest so it delivers promptly, completing the caller with 0, or `-ESRCH` if
+    /// the target raced to exit.
     SignalThread {
         tid: crate::thread::ThreadId,
         signum: i32,
@@ -598,10 +654,15 @@ pub enum DispatchOutcome {
     /// `FUTEX_WAKE` would deadlock), so it returns this outcome and the
     /// runtime drops the lock, parks on the prepared futex token, then completes the
     /// syscall with 0 (woken) or -ETIMEDOUT (timed out).
+    ///
+    /// Backend: suspend the task (see the blocking-outcome contract on
+    /// [`DispatchOutcome`]); the private futex wake or the timeout completes it.
     FutexWait {
         wait: crate::thread::FutexWait,
         timeout: Option<Duration>,
     },
+    /// Backend: as [`DispatchOutcome::FutexWait`], and complete a woken wait with
+    /// `index` (the waitv slot that fired).
     FutexWaitv {
         wait: crate::thread::FutexWait,
         timeout: Option<Duration>,
@@ -614,12 +675,18 @@ pub enum DispatchOutcome {
     /// VA of the futex word). Like `FutexWait` it must not block under the
     /// dispatcher lock; the runtime waits interruptibly and completes the
     /// syscall. `value` is the expected futex word (the kernel re-compares).
+    ///
+    /// Backend: suspend the task; the wait must ride the cross-process
+    /// `PlatformFutex` seam on the shared page so it pairs with a
+    /// [`DispatchOutcome::SharedFutexWake`] from another carrick process.
     SharedFutexWait {
         target: SharedFutexTarget,
         generation: crate::thread::FutexWait,
         value: u32,
         timeout: Option<Duration>,
     },
+    /// Backend: as [`DispatchOutcome::SharedFutexWait`], completing a woken wait
+    /// with `index`.
     SharedFutexWaitv {
         target: SharedFutexTarget,
         generation: crate::thread::FutexWait,
@@ -637,10 +704,15 @@ pub enum DispatchOutcome {
     /// side uses, keeping the wait/wake pair on ONE seam. `count` is the guest's
     /// requested wake count (`FUTEX_WAKE`'s `val`); the loop completes the syscall
     /// with the number actually woken.
+    ///
+    /// Backend: wake up to `count` waiters on the shared page through the
+    /// `PlatformFutex` seam and complete with the number actually woken.
     SharedFutexWake {
         target: SharedFutexTarget,
         count: u32,
     },
+    /// Backend: wake `wake` and requeue `requeue` waiters from `from` to `to` on
+    /// that same seam, completing with woken + requeued.
     SharedFutexRequeue {
         from: SharedFutexTarget,
         to: SharedFutexTarget,
@@ -652,6 +724,9 @@ pub enum DispatchOutcome {
     /// message queues: the wait condition is not the syscall result, it only says
     /// the object state might have changed. The loop must release dispatcher and
     /// vCPU resources while parked, then retry the handler under fresh state.
+    ///
+    /// Backend: suspend the task until the word changes, then RE-DISPATCH the
+    /// original syscall; the word says only that the object state may have changed.
     WaitOnSharedWord {
         location: SharedFutexLocation,
         waiter_key: usize,
@@ -674,6 +749,10 @@ pub enum DispatchOutcome {
     /// ready → the handler now finds it and returns the revents). The handler
     /// has already written zeroed revents into guest memory, so a timeout
     /// completion needs no further writes.
+    ///
+    /// Backend: suspend the task on the exact fd descriptions in `fds` under
+    /// `sig_mask` and complete per `completion`; do not poll host fds from the
+    /// syscall handler's worker.
     WaitOnFds {
         /// (host_fd, poll events) pairs to wait on.
         fds: WaitFds,
@@ -699,20 +778,35 @@ pub enum DispatchOutcome {
     /// threads that may close the read end or deliver the interrupting signal.
     /// The runtime owns this staged continuation, waits for POLLOUT with the
     /// dispatcher lock released, and completes with the Linux-visible result.
+    ///
+    /// Backend: suspend the task holding this staged write's exact endpoint and
+    /// completed byte offset; never restart the write from offset 0 and never
+    /// invent a short write.
     BlockingWrite(BlockingWrite),
     /// A timerfd read waiting on a Carrick-owned timer.  Unlike a generic fd
     /// wait, this owns the exact description and must complete that operation
     /// even if its numeric fd was subsequently reused.
+    ///
+    /// Backend: suspend the task holding this exact description, so a reused
+    /// numeric fd cannot retarget the completion.
     BlockingTimerFdRead(#[serde(skip)] crate::dispatch::format_time::BlockingTimerFdRead),
     /// A parsed SysV semaphore operation parked outside the dispatcher.  It
     /// retains the exact semaphore-set generation and operation array, so an
     /// `IPC_RMID`/id-reuse race cannot retarget completion.
+    ///
+    /// Backend: suspend the task holding this exact set generation and operation
+    /// array.
     BlockingSemop(#[serde(skip)] crate::dispatch::sysv::BlockingSemop),
     /// A POSIX message-queue send or receive parked outside the dispatcher.
     /// It retains the exact queue and captured operation across fd close/reuse.
+    ///
+    /// Backend: suspend the task holding this exact queue and captured operation.
     BlockingMqueue(#[serde(skip)] crate::dispatch::mqueue::BlockingMqueue),
     /// Retained poll/select operation.  Its completion samples the admission
     /// snapshot and either writes final output or re-parks itself.
+    ///
+    /// Backend: suspend the task holding this retained operation; its completion
+    /// either writes the final output or re-parks itself.
     BlockingFdWait {
         #[serde(skip)]
         wait: crate::dispatch::fd_wait::BlockingFdWait,
@@ -721,10 +815,16 @@ pub enum DispatchOutcome {
     /// A pending record-lock or flock operation. The dispatcher retains its
     /// parsed request and exact ownership; the continuation reactor attempts
     /// acquisition without occupying a guest executor while a conflict remains.
+    ///
+    /// Backend: suspend the task holding this retained request; the continuation
+    /// reactor retries acquisition without occupying a guest executor.
     BlockingRecordLock(BlockingRecordLock),
     /// An in-process HvPatch child is still running. There is no Darwin child
     /// fd/kqueue event to wait on, so the threaded loop performs a short,
     /// signal/fork-interruptible park and re-dispatches the original wait.
+    ///
+    /// Backend: suspend on the child selector enrolled against THIS `precheck`
+    /// generation, then re-dispatch the wait; there is no host child to wait on.
     WaitOnHvpatchChild {
         /// Exact guest PID for `wait4(pid)` / `waitid(P_PID, pid)`, or `None`
         /// for an any-child selector. This is guest-domain process identity;
@@ -749,6 +849,10 @@ pub enum DispatchOutcome {
     /// for an unblocked signal OUTSIDE `wait_set`, which must interrupt the
     /// wait with EINTR after its handler is delivered (sigtimedwait is never
     /// restarted, even under SA_RESTART — signal(7)).
+    ///
+    /// Backend: suspend until a `wait_set` signal arrives (re-dispatching so the
+    /// kernel dequeues it and writes `siginfo_t`), `timeout` elapses, or an
+    /// unblocked signal outside the set interrupts the wait with EINTR.
     WaitOnSignals {
         wait_set: SigSet,
         /// Signals that must NOT wake the park
@@ -770,6 +874,10 @@ pub enum DispatchOutcome {
     /// The run loop preserves the deadline across re-dispatch (quiesce-park),
     /// so the sleep is not restarted. `duration` is the (relative) remaining
     /// time; an ABSTIME clock_nanosleep is pre-converted by the handler.
+    ///
+    /// Backend: suspend for `duration` through the task's waiter — never a host
+    /// `nanosleep` in the handler — preserving the deadline across re-dispatch so
+    /// the sleep is not restarted.
     WaitOnSleep {
         duration: Duration,
         remaining: Option<GuestPtr>,
