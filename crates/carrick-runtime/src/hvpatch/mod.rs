@@ -12,9 +12,7 @@ use std::sync::Arc;
 use carrick_fatal::carrick_fatal;
 
 use crate::dispatch::SyscallDispatcher;
-use crate::kernel::{
-    ChildExit, ProcessThreadExit, RetiredThreadResources, WaitResult, identity_operation_errno,
-};
+use crate::kernel::CarrierProcess;
 use crate::memory::{AddressSpace, AddressSpaceError};
 #[cfg(all(
     feature = "platform-macos",
@@ -157,307 +155,6 @@ pub(crate) fn process_context_for_tests(
         ),
         root,
     )
-}
-
-#[cfg(test)]
-impl ProcessContext {
-    /// Enable the already-installed Task 7 foreign-MM facade in a dispatcher
-    /// unit fixture without exposing a production authority constructor.
-    pub(crate) fn enable_mm_access_for_tests(&mut self) {
-        self.mm_access = Some(crate::kernel::MmAccessAuthority::new());
-    }
-}
-
-#[derive(Clone)]
-struct ProcessTimerTarget {
-    kernel: std::sync::Weak<crate::kernel::Kernel>,
-    task: crate::kernel::TaskKey,
-}
-
-impl ProcessTimerTarget {
-    fn task(&self) -> Option<std::sync::Arc<crate::kernel::Task>> {
-        let kernel = self.kernel.upgrade()?;
-        if !kernel.task_key_is_live(self.task) {
-            return None;
-        }
-        kernel
-            .registry()
-            .task(self.task.id)
-            .filter(|task| task.key() == self.task)
-    }
-
-    fn deliver(&self, signum: i32, siginfo: Option<crate::linux_abi::LinuxSiginfo>) -> bool {
-        if signum == 0 {
-            return self.task().is_some();
-        }
-        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
-            return false;
-        };
-        let Some(kernel) = self.kernel.upgrade() else {
-            return false;
-        };
-        kernel.post_signal_to_task_key(self.task, signal, siginfo)
-    }
-
-    fn deliver_to_thread(
-        &self,
-        tid: i32,
-        signum: i32,
-        siginfo: Option<crate::linux_abi::LinuxSiginfo>,
-    ) -> bool {
-        if signum == 0 {
-            return self.task().is_some();
-        }
-        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
-            return false;
-        };
-        let Some(kernel) = self.kernel.upgrade() else {
-            return false;
-        };
-        let Some(task) = self.task() else {
-            return false;
-        };
-        let Ok(linux_tid) = crate::kernel::LinuxTid::from_abi_positive(tid) else {
-            return false;
-        };
-        if let Some(thread) = task.thread(linux_tid) {
-            kernel.post_signal_to_thread_key(task.key(), thread.key(), signal, siginfo)
-        } else {
-            kernel.post_signal_to_task_key(self.task, signal, siginfo)
-        }
-    }
-}
-
-struct ProcessItimerSlot {
-    generation: std::sync::atomic::AtomicU64,
-    spec: parking_lot::Mutex<Option<carrick_hal::TimerSpecNs>>,
-}
-
-impl ProcessItimerSlot {
-    fn new() -> Self {
-        Self {
-            generation: std::sync::atomic::AtomicU64::new(0),
-            spec: parking_lot::Mutex::new(None),
-        }
-    }
-
-    fn replace(&self, spec: Option<carrick_hal::TimerSpecNs>) -> u64 {
-        use std::sync::atomic::Ordering;
-        let mut current = self.spec.lock();
-        let generation = self
-            .generation
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
-        *current = spec;
-        generation
-    }
-
-    fn generation_matches(&self, generation: u64) -> bool {
-        self.generation.load(std::sync::atomic::Ordering::Acquire) == generation
-    }
-
-    fn retire_one_shot(&self, generation: u64) {
-        let mut current = self.spec.lock();
-        if self.generation_matches(generation) {
-            *current = None;
-        }
-    }
-}
-
-pub(crate) struct ProcessTimerDelivery {
-    target: ProcessTimerTarget,
-    slots: [std::sync::Arc<ProcessItimerSlot>; carrick_timer_core::itimer::ITIMER_COUNT],
-}
-
-impl ProcessTimerDelivery {
-    fn new(process: &ProcessContext) -> Self {
-        Self {
-            target: ProcessTimerTarget {
-                kernel: std::sync::Arc::downgrade(process.kernel_graph()),
-                task: process.task_key(),
-            },
-            slots: std::array::from_fn(|_| std::sync::Arc::new(ProcessItimerSlot::new())),
-        }
-    }
-
-    fn drive_itimer(
-        target: ProcessTimerTarget,
-        slot: std::sync::Arc<ProcessItimerSlot>,
-        which: usize,
-        generation: u64,
-        spec: carrick_hal::TimerSpecNs,
-        signum: i32,
-    ) {
-        if carrick_timer_core::itimer::is_cpu_timer(which) {
-            // ITIMER_VIRTUAL/PROF measure THIS process's CPU. Under HVPatch
-            // every guest process shares the carrier, so the carrier-wide
-            // counters would charge siblings' CPU to this timer; read the
-            // task's own threads instead. A vanished task ends the timer.
-            let cpu_now = || {
-                target
-                    .task()
-                    .map(|task| task.self_cpu_ns_including_active())
-            };
-            let Some(start_ns) = cpu_now() else {
-                return;
-            };
-            let mut cpu_due_ns = start_ns.saturating_add(spec.value);
-            loop {
-                if !slot.generation_matches(generation) {
-                    return;
-                }
-                let Some(now_ns) = cpu_now() else {
-                    return;
-                };
-                if now_ns >= cpu_due_ns {
-                    let siginfo = crate::linux_abi::LinuxSiginfo::kernel(signum);
-                    if !target.deliver(signum, Some(siginfo)) {
-                        return;
-                    }
-                    if spec.interval == 0 {
-                        slot.retire_one_shot(generation);
-                        return;
-                    }
-                    cpu_due_ns = now_ns.saturating_add(spec.interval);
-                } else {
-                    let diff = cpu_due_ns - now_ns;
-                    let delay_ns = carrick_timer_core::itimer::cpu_timer_recheck_delay_ns(
-                        carrick_timer_core::CpuNs(diff),
-                    );
-                    std::thread::sleep(std::time::Duration::from_nanos(delay_ns.raw()));
-                }
-            }
-        }
-
-        std::thread::sleep(std::time::Duration::from_nanos(spec.value));
-
-        loop {
-            if !slot.generation_matches(generation) {
-                return;
-            }
-            let siginfo = crate::linux_abi::LinuxSiginfo::kernel(signum);
-            if !target.deliver(signum, Some(siginfo)) {
-                return;
-            }
-            if spec.interval == 0 {
-                slot.retire_one_shot(generation);
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_nanos(spec.interval));
-        }
-    }
-}
-
-impl Drop for ProcessTimerDelivery {
-    fn drop(&mut self) {
-        for slot in &self.slots {
-            slot.replace(None);
-        }
-    }
-}
-
-impl carrick_hal::TimerDelivery for ProcessTimerDelivery {
-    fn owns_itimer_state(&self) -> bool {
-        true
-    }
-
-    fn arm_itimer(
-        &self,
-        which: usize,
-        spec: carrick_hal::TimerSpecNs,
-        _needs_periodic: bool,
-        signum: i32,
-    ) -> bool {
-        let Some(slot) = self.slots.get(which).cloned() else {
-            return false;
-        };
-        let generation = slot.replace(Some(spec));
-        let target = self.target.clone();
-        let pid = self.target.task.id.raw();
-        let _ = std::thread::Builder::new()
-            .name(format!("carrick-hvpatch-itimer-{pid}-{which}"))
-            .spawn(move || {
-                Self::drive_itimer(target, slot, which, generation, spec, signum);
-            });
-        true
-    }
-
-    fn disarm_itimer(&self, which: usize) {
-        if let Some(slot) = self.slots.get(which) {
-            slot.replace(None);
-        }
-    }
-
-    fn arm_posix(
-        &self,
-        id: i32,
-        spec: carrick_hal::TimerSpecNs,
-    ) -> Option<carrick_hal::PosixTimerSpec> {
-        let armed = carrick_timer_core::posix::arm(id, spec)?;
-        if spec.value > 0 {
-            let target = self.target.clone();
-            let signum = armed.signum;
-            let generation = armed.generation;
-            let slot = armed.slot.clone();
-            let target_tid = armed.target_tid;
-            let target_cpu = target.clone();
-            let si_value = armed.si_value;
-            let cpu_now: Option<std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>> =
-                if carrick_timer_core::posix::is_process_cpu_clock(slot.clock_id) {
-                    // CLOCK_PROCESS_CPUTIME_ID or dynamic per-process clock
-                    Some(std::sync::Arc::new(move || {
-                        let task = target_cpu.task()?;
-                        Some(
-                            task.self_cpu_ns_including_active()
-                                .saturating_add(task.self_system_cpu_us().saturating_mul(1000)),
-                        )
-                    }))
-                } else if carrick_timer_core::posix::is_thread_cpu_clock(slot.clock_id) {
-                    // CLOCK_THREAD_CPUTIME_ID or dynamic per-thread clock
-                    Some(std::sync::Arc::new(move || {
-                        let task = target_cpu.task()?;
-                        if let Some(tid) = target_tid {
-                            let linux_tid = crate::kernel::LinuxTid::from_abi_positive(tid).ok()?;
-                            let thread = task.thread(linux_tid)?;
-                            Some(thread.total_cpu_ns_including_active())
-                        } else {
-                            Some(
-                                task.self_cpu_ns_including_active()
-                                    .saturating_add(task.self_system_cpu_us().saturating_mul(1000)),
-                            )
-                        }
-                    }))
-                } else {
-                    None
-                };
-            let on_fire = move || {
-                let siginfo = crate::linux_abi::LinuxSiginfo::timer(signum, id, 0, si_value);
-                if let Some(tid) = target_tid {
-                    target.deliver_to_thread(tid, signum, Some(siginfo));
-                } else {
-                    target.deliver(signum, Some(siginfo));
-                }
-            };
-            let _ = std::thread::Builder::new()
-                .name(format!("carrick-hvpatch-ptimer-{id}"))
-                .spawn(move || {
-                    carrick_timer_core::posix::run_fallback_with_cpu(
-                        slot, generation, spec, cpu_now, on_fire,
-                    );
-                });
-        }
-        Some(armed.old)
-    }
-
-    fn disarm_posix(&self, id: i32) {
-        let _ = carrick_timer_core::posix::arm(id, carrick_hal::TimerSpecNs::DISARM);
-    }
-
-    fn current_arm(&self, _which: usize) -> Option<carrick_hal::TimerArm> {
-        // HVPatch interval timers are not inherited across fork. Exec retains
-        // this delivery object with its dispatcher, so no replay seam is needed.
-        None
-    }
 }
 
 #[derive(Debug)]
@@ -658,15 +355,6 @@ impl PendingAddressSpaceRetirement {
     }
 }
 
-/// `WNOWAIT` peeks; every other wait reaps.
-fn wait_mode(nowait: bool) -> crate::kernel::WaitMode {
-    if nowait {
-        crate::kernel::WaitMode::Observe
-    } else {
-        crate::kernel::WaitMode::Consume
-    }
-}
-
 impl ProcessContext {
     fn new(
         resources: std::sync::Arc<MmResources>,
@@ -704,26 +392,6 @@ impl ProcessContext {
         Ok(self)
     }
 
-    pub(crate) fn mm_access_authority(&self) -> Option<&crate::kernel::MmAccessAuthority> {
-        self.mm_access.as_ref()
-    }
-
-    pub(crate) fn pid(&self) -> i32 {
-        self.binding.task_id().raw()
-    }
-
-    pub(crate) fn task_id(&self) -> crate::kernel::TaskId {
-        self.binding.task_id()
-    }
-
-    pub(crate) fn task_key(&self) -> crate::kernel::TaskKey {
-        self.binding.task_key()
-    }
-
-    pub(crate) fn task_binding(&self) -> crate::kernel::KernelTaskBinding {
-        self.binding.clone()
-    }
-
     /// Root validation keeps the scheduler's carrier-wide TaskId distinct
     /// from the PID namespace identity presented to Linux.
     pub(crate) fn has_namespace_root_identity(&self) -> bool {
@@ -744,38 +412,6 @@ impl ProcessContext {
         self.container_id
     }
 
-    pub(crate) fn process_timer_delivery(&self) -> std::sync::Arc<dyn carrick_hal::TimerDelivery> {
-        std::sync::Arc::new(ProcessTimerDelivery::new(self))
-    }
-
-    pub(crate) fn stop_for_ptrace_signal(&self, signum: i32) -> bool {
-        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
-            return false;
-        };
-        self.kernel_graph()
-            .stop_task_for_ptrace(self.task_id(), signal)
-    }
-
-    pub(crate) fn stop_for_ptrace_fault(
-        &self,
-        fault: crate::kernel::objects::PtraceSynchronousFault,
-    ) -> bool {
-        self.kernel_graph()
-            .stop_task_for_ptrace_fault(self.task_id(), fault)
-    }
-
-    pub(crate) fn consume_ptrace_resume_signal(&self, signum: i32) -> bool {
-        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
-            return false;
-        };
-        self.kernel_graph()
-            .consume_ptrace_resume_signal(self.task_id(), signal)
-    }
-
-    pub(crate) fn kernel_graph(&self) -> &std::sync::Arc<crate::kernel::Kernel> {
-        self.binding.kernel()
-    }
-
     pub(crate) fn mm_resources(&self) -> &std::sync::Arc<MmResources> {
         &self.resources
     }
@@ -791,13 +427,6 @@ impl ProcessContext {
         self.resources
             .is_final_owner(task)
             .map_err(|error| error.to_string())
-    }
-
-    pub(crate) fn context_for_linux_tid(
-        &self,
-        tid: crate::kernel::LinuxTid,
-    ) -> Result<crate::kernel::KernelContext, crate::kernel::KernelError> {
-        self.binding.capture(tid)
     }
 
     pub(crate) fn published_child_context(
@@ -825,29 +454,6 @@ impl ProcessContext {
         child
     }
 
-    pub(crate) fn bind_vma_source(&self, source: crate::kernel::SharedVmaSnapshotSource) {
-        let backend = std::sync::Arc::clone(&self.mm_backend.read());
-        backend.bind_vma_source(source);
-    }
-
-    pub(crate) fn bind_mm_mutation_authority(
-        &self,
-        authority: crate::dispatch::mm_mutation::ForeignMmMutationAuthority,
-    ) {
-        let context = self
-            .context_for_linux_tid(crate::kernel::LinuxTid::for_task_leader(self.task_id()))
-            .unwrap_or_else(|_| {
-                carrick_fatal!(
-                    "hvpatch::process_context",
-                    "cannot resolve context_for_linux_tid in bind_mm_mutation_authority"
-                );
-            });
-        context
-            .shared()
-            .mm()
-            .install_foreign_mm_mutation_authority(authority, &ForeignMmInstallPermit::new());
-    }
-
     #[cfg(test)]
     pub(crate) fn live_process_count(&self) -> usize {
         self.kernel_graph().registry().task_count()
@@ -862,35 +468,10 @@ impl ProcessContext {
         self.mm_backend.read().asid_generation().generation()
     }
 
-    pub(crate) fn stage1_mm_lease(&self) -> Result<std::sync::Arc<Stage1MmLease>, RuntimeError> {
-        self.resources
-            .lease(self.task_key())
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))
-    }
-
     pub(crate) fn syscall_trace_identity(&self) -> Option<(i32, u32)> {
         let identity = self.kernel_graph().task_identity(self.task_id()).ok()?;
         let binding = self.mm_binding()?;
         Some((identity.task.id.raw(), u32::from(binding.asid.raw())))
-    }
-
-    pub(crate) fn register_pidfd_watch(
-        &self,
-        target: i32,
-        watch: &std::sync::Arc<crate::dispatch::fd_table::PidfdWatch>,
-    ) -> Option<crate::kernel::TaskKey> {
-        let target = crate::kernel::TaskId::from_abi_positive(target).ok()?;
-        self.kernel_graph()
-            .register_task_exit_subscriber(target, watch)
-    }
-
-    pub(crate) fn process_is_live(&self, target: crate::kernel::TaskKey) -> bool {
-        self.kernel_graph().task_key_is_live(target)
-    }
-
-    pub(crate) fn live_process_key(&self, target: i32) -> Option<crate::kernel::TaskKey> {
-        let target = crate::kernel::TaskId::from_abi_positive(target).ok()?;
-        self.kernel_graph().live_task_key(target)
     }
 
     pub(crate) fn is_child(&self) -> bool {
@@ -1350,217 +931,59 @@ impl ProcessContext {
             lifecycle_event,
         })
     }
+}
 
-    pub(crate) fn exit_thread(
+impl crate::kernel::CarrierProcess for ProcessContext {
+    fn kernel_graph(&self) -> &std::sync::Arc<crate::kernel::Kernel> {
+        self.binding.kernel()
+    }
+
+    fn task_key(&self) -> crate::kernel::TaskKey {
+        self.binding.task_key()
+    }
+
+    fn task_binding(&self) -> crate::kernel::KernelTaskBinding {
+        self.binding.clone()
+    }
+
+    fn context_for_linux_tid(
         &self,
         tid: crate::kernel::LinuxTid,
-    ) -> Result<ProcessThreadExit, crate::kernel::KernelOperationError> {
-        let context = match self.context_for_linux_tid(tid) {
-            Ok(context) => context,
-            Err(crate::kernel::KernelError::UnknownThread(_)) => {
-                // Exec replacement may already have retired this exact old
-                // thread while its host loop is unwinding.
-                return Ok(ProcessThreadExit::AlreadyRetired);
-            }
-            Err(_) if !self.kernel_graph().task_is_live(self.task_id()) => {
-                return Ok(ProcessThreadExit::AlreadyRetired);
-            }
-            Err(_) => {
-                return Err(crate::kernel::KernelOperationError::UnknownTask(
-                    self.task_id(),
-                ));
-            }
-        };
-        // Capture the retiring thread's exact owner/table generation before
-        // Kernel publication removes the thread from the authoritative graph.
-        // Callers use this receipt to consume only that generation's close
-        // events; recapturing afterward could select a surviving peer table.
-        let retired =
-            RetiredThreadResources::new(context.task().key(), context.resources().files());
-        let observed = self.kernel_graph().reservation_epoch();
-        match self.kernel_graph().exit_thread(&context, None) {
-            Ok(_) => Ok(ProcessThreadExit::Retired(retired)),
-            Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
-                // NEVER park the executor host thread on the reservation
-                // condvar here: the holder can be an exec survivor's
-                // terminal path waiting for THIS executor's ASID ack — a
-                // cycle observed live (executor-2 in this condvar,
-                // executor-4 in `invalidate_after_exec`'s recv, nine of
-                // ten acks). The caller parks as a retryable job instead.
-                Ok(ProcessThreadExit::Busy {
-                    observed_epoch: observed,
-                })
-            }
-            Err(crate::kernel::KernelOperationError::LastThreadRequiresTaskExit(_)) => {
-                Ok(ProcessThreadExit::LastThread)
-            }
-            Err(crate::kernel::KernelOperationError::UnknownThread(_))
-                if !context.exact_thread_is_live() =>
-            {
-                Ok(ProcessThreadExit::AlreadyRetired)
-            }
-            Err(crate::kernel::KernelOperationError::ParentExited)
-            | Err(crate::kernel::KernelOperationError::UnknownTask(_))
-                if !self.kernel_graph().task_is_live(self.task_id()) =>
-            {
-                Ok(ProcessThreadExit::AlreadyRetired)
-            }
-            Err(error) => Err(error),
-        }
+    ) -> Result<crate::kernel::KernelContext, crate::kernel::KernelError> {
+        self.binding.capture(tid)
     }
 
-    /// Ask the kernel graph for a reapable child. NEVER blocks: every caller
-    /// runs inside dispatch, implements a blocking wait by re-dispatching on
-    /// [`WaitResult::StillRunning`] (the vcpu loop's bounded child-wait park),
-    /// and hands `WNOHANG` straight back to the guest.
-    pub(crate) fn wait_child_with_job_control(
+    fn mm_access_authority(&self) -> Option<&crate::kernel::MmAccessAuthority> {
+        self.mm_access.as_ref()
+    }
+
+    fn stage1_mm_lease(&self) -> Result<std::sync::Arc<Stage1MmLease>, RuntimeError> {
+        self.resources
+            .lease(self.task_key())
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))
+    }
+
+    fn bind_vma_source(&self, source: crate::kernel::SharedVmaSnapshotSource) {
+        let backend = std::sync::Arc::clone(&self.mm_backend.read());
+        backend.bind_vma_source(source);
+    }
+
+    fn bind_mm_mutation_authority(
         &self,
-        target: Option<i32>,
-        class: crate::kernel::WaitChildClass,
-        nowait: bool,
-        include_stopped: bool,
-        include_continued: bool,
-    ) -> WaitResult {
-        let target = target.and_then(|raw| crate::kernel::TaskId::from_abi_positive(raw).ok());
-        let outcome = self.kernel_graph().wait_child_with_job_control(
-            self.task_id(),
-            target,
-            class,
-            include_stopped,
-            include_continued,
-            wait_mode(nowait),
-        );
-        self.wait_result("authoritative child wait failed", outcome)
-    }
-
-    pub(crate) fn wait_child_key(
-        &self,
-        target: crate::kernel::TaskKey,
-        class: crate::kernel::WaitChildClass,
-        nowait: bool,
-    ) -> WaitResult {
-        let outcome =
-            self.kernel_graph()
-                .wait_child_key(self.task_id(), target, class, wait_mode(nowait));
-        self.wait_result("authoritative pidfd child wait failed", outcome)
-    }
-
-    pub(crate) fn wait_child_in_process_group_with_job_control(
-        &self,
-        group: i32,
-        class: crate::kernel::WaitChildClass,
-        nowait: bool,
-        include_stopped: bool,
-        include_continued: bool,
-    ) -> WaitResult {
-        let Ok(group) = crate::kernel::ProcessGroupId::from_abi_positive(group) else {
-            return WaitResult::NoChild;
-        };
-        let outcome = self
-            .kernel_graph()
-            .wait_child_in_process_group_with_job_control(
-                self.task_id(),
-                group,
-                class,
-                include_stopped,
-                include_continued,
-                wait_mode(nowait),
-            );
-        self.wait_result("authoritative process-group child wait failed", outcome)
-    }
-
-    /// Lower a kernel-graph wait outcome to the dispatch-side result the
-    /// three wait entry points share.
-    fn wait_result(
-        &self,
-        failure: &'static str,
-        outcome: Result<crate::kernel::WaitOutcome, crate::kernel::KernelOperationError>,
-    ) -> WaitResult {
-        // Sampled before this outcome is interpreted, so the `TaskBusy` arm
-        // below — which reports "nothing reapable yet" WITHOUT having scanned
-        // the child set — still hands the continuation a generation that
-        // precedes any edge a concurrent exit can publish. An earlier reading
-        // is always safe (at worst one spurious redispatch); a later one loses
-        // the edge. See `ChildWaitPrecheck`.
-        let busy_precheck = crate::kernel::ChildWaitPrecheck::unsampled();
-        match outcome {
-            Ok(crate::kernel::WaitOutcome::Exited(zombie)) => {
-                let Ok(visible_pid) = i32::try_from(zombie.namespace_pid) else {
-                    carrick_fatal!(
-                        "hvpatch::wait_identity",
-                        "zombie namespace_pid exceeds i32 in wait_result"
-                    );
-                };
-                WaitResult::Exited(ChildExit::new(
-                    zombie.key.id,
-                    visible_pid,
-                    zombie.ruid,
-                    zombie.status.raw(),
-                ))
-            }
-            // A P_PIDFD wait runs in Consume mode too, so reporting a
-            // job-control event as "still running" DISCARDS it. Render the
-            // wait-status encoding and let the caller decide whether it asked
-            // for it.
-            Ok(crate::kernel::WaitOutcome::Stopped { task, signal, ruid }) => {
-                let Some(visible_pid) = self.visible_task_id(task) else {
-                    return WaitResult::NoChild;
-                };
-                WaitResult::StateChanged(ChildExit::new(
-                    task,
-                    visible_pid,
-                    ruid,
-                    (signal.raw() << 8) | 0x7f,
-                ))
-            }
-            Ok(crate::kernel::WaitOutcome::Continued { task, ruid }) => {
-                let Some(visible_pid) = self.visible_task_id(task) else {
-                    return WaitResult::NoChild;
-                };
-                WaitResult::StateChanged(ChildExit::new(task, visible_pid, ruid, 0xffff))
-            }
-            Ok(crate::kernel::WaitOutcome::StillRunning(precheck)) => {
-                WaitResult::StillRunning(precheck)
-            }
-            Ok(crate::kernel::WaitOutcome::NoChild) => WaitResult::NoChild,
-            Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
-                // A reservation is mid-flight — typically THIS process's
-                // own fork holding its task reserved from admission
-                // through child materialization. Report "nothing reapable
-                // yet" instead of parking on the reservation condvar: a
-                // guest `WNOHANG` must return 0 immediately (CPython's
-                // `Pool._join_exited_workers` polls `waitpid(WNOHANG)`
-                // from one thread while another forks the replacement
-                // worker, and blocking here stalled the poll for the
-                // whole fork), and a BLOCKING wait re-dispatches through
-                // the vcpu loop's bounded park, which re-runs this query.
-                // The condvar park was also invisible to fork-quiesce
-                // kicks — an unbounded parking_lot wait inside dispatch.
-                WaitResult::StillRunning(busy_precheck)
-            }
-            Err(error) => {
-                tracing::error!(pid = self.pid(), %error, "{failure}");
-                WaitResult::NoChild
-            }
-        }
-    }
-
-    fn visible_task_id(&self, task: crate::kernel::TaskId) -> Option<i32> {
-        let observer = self.binding.capture_signal_snapshot().ok()?;
-        let internal = u32::try_from(task.raw()).ok()?;
-        crate::namespace::pid::kernel_to_ns_for(observer.context(), internal)
-            .and_then(|visible| i32::try_from(visible).ok())
-    }
-
-    /// This process's OWN process group. A peer's group is a different
-    /// question with a different answer — `Kernel::process_identity` includes
-    /// the zombie table, because Linux keeps an unreaped process addressable —
-    /// so it deliberately has no `target` parameter to be reached through.
-    pub(crate) fn process_group(&self) -> Result<i32, crate::linux_abi::LinuxErrno> {
-        self.kernel_graph()
-            .task_identity(self.task_id())
-            .map(|identity| identity.process_group.raw())
-            .map_err(identity_operation_errno)
+        authority: crate::dispatch::mm_mutation::ForeignMmMutationAuthority,
+    ) {
+        let context = self
+            .context_for_linux_tid(crate::kernel::LinuxTid::for_task_leader(self.task_id()))
+            .unwrap_or_else(|_| {
+                carrick_fatal!(
+                    "hvpatch::process_context",
+                    "cannot resolve context_for_linux_tid in bind_mm_mutation_authority"
+                );
+            });
+        context
+            .shared()
+            .mm()
+            .install_foreign_mm_mutation_authority(authority, &ForeignMmInstallPermit::new());
     }
 }
 
@@ -1695,7 +1118,11 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     }
 
     let process = initialization.process();
-    dispatcher.bind_hvpatch_process_exact(process.clone(), root.context(), launch_fs_context);
+    dispatcher.bind_hvpatch_process_exact(
+        Arc::new(process.clone()),
+        root.context(),
+        launch_fs_context,
+    );
     let first_root_publications = if root.is_first_boot() {
         Some(initialization)
     } else {
@@ -2051,6 +1478,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::{ChildExit, WaitResult, identity_operation_errno};
 
     #[test]
     fn process_group_leader_setsid_failure_is_eperm() {
@@ -2352,7 +1780,7 @@ mod tests {
             sharing: carrick_vfs::ProcMapSharing::Private,
             path: "root".to_owned(),
         }]);
-        root_dispatcher.bind_hvpatch_process(parent.clone());
+        root_dispatcher.bind_hvpatch_process(Arc::new(parent.clone()));
         root_dispatcher.mark_child_subreaper_for_test();
         assert_eq!(
             parent
@@ -2395,7 +1823,7 @@ mod tests {
             10_000,
             10_001,
         );
-        child_dispatcher.bind_hvpatch_process(child.clone());
+        child_dispatcher.bind_hvpatch_process(Arc::new(child.clone()));
 
         assert_eq!(
             child_dispatcher.hvpatch_orphan_adopter(),
@@ -2427,7 +1855,7 @@ mod tests {
             sharing: carrick_vfs::ProcMapSharing::Private,
             path: "shared-old-image".to_owned(),
         }]);
-        parent_dispatcher.bind_hvpatch_process(parent.clone());
+        parent_dispatcher.bind_hvpatch_process(Arc::new(parent.clone()));
 
         let exec_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
         let (exec_child, exec_context) =
@@ -2439,7 +1867,7 @@ mod tests {
             exec_child.pid() as u32,
             crate::kernel::CloneObjectMode::Share,
         );
-        exec_dispatcher.bind_hvpatch_process(exec_child.clone());
+        exec_dispatcher.bind_hvpatch_process(Arc::new(exec_child.clone()));
 
         let mut prepared = exec_child
             .prepare_exec(&exec_context)
@@ -2502,7 +1930,7 @@ mod tests {
             sharing: carrick_vfs::ProcMapSharing::Private,
             path: "shared-parent-before-exec".to_owned(),
         }]);
-        parent_dispatcher.bind_hvpatch_process(parent.clone());
+        parent_dispatcher.bind_hvpatch_process(Arc::new(parent.clone()));
         let retained_parent_backend = std::sync::Arc::clone(&parent.mm_backend.read());
 
         let exec_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
@@ -2746,7 +2174,7 @@ mod tests {
     fn shared_child_private_exec_accepts_later_dispatcher_vma_binding() {
         let (parent, root) = authoritative_root();
         let parent_dispatcher = SyscallDispatcher::new();
-        parent_dispatcher.bind_hvpatch_process(parent.clone());
+        parent_dispatcher.bind_hvpatch_process(Arc::new(parent.clone()));
         let child_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
         let (child, child_context) =
             production_shared_child(&parent, &root, "shared-rebind-child", child_tid);
@@ -2757,7 +2185,7 @@ mod tests {
             child.pid() as u32,
             crate::kernel::CloneObjectMode::Share,
         );
-        child_dispatcher.bind_hvpatch_process(child.clone());
+        child_dispatcher.bind_hvpatch_process(Arc::new(child.clone()));
 
         let prepared = child
             .prepare_exec(&child_context)
@@ -2780,7 +2208,7 @@ mod tests {
             sharing: carrick_vfs::ProcMapSharing::Private,
             path: "post-exec-rebind".to_owned(),
         }]);
-        rebound.bind_hvpatch_process(child.clone());
+        rebound.bind_hvpatch_process(Arc::new(child.clone()));
         let observed = crate::kernel::MmBackend::snapshot(
             child.mm_backend.read().as_ref(),
             std::time::Instant::now() + std::time::Duration::from_secs(1),
@@ -3214,7 +2642,7 @@ mod tests {
             sharing: carrick_vfs::ProcMapSharing::Private,
             path: "shared-initial".to_owned(),
         }]);
-        parent_dispatcher.bind_hvpatch_process(parent.clone());
+        parent_dispatcher.bind_hvpatch_process(Arc::new(parent.clone()));
         let retained_parent_backend = std::sync::Arc::clone(&parent.mm_backend.read());
         let child_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
         let (child, child_context) =
@@ -3226,7 +2654,7 @@ mod tests {
             child.pid() as u32,
             crate::kernel::CloneObjectMode::Share,
         );
-        child_dispatcher.bind_hvpatch_process(child.clone());
+        child_dispatcher.bind_hvpatch_process(Arc::new(child.clone()));
 
         child_dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x3000,
@@ -3347,7 +2775,7 @@ mod tests {
             .fs_context()
             .set_chroot_root(Some("/launch/root".to_owned()));
 
-        dispatcher.bind_hvpatch_process(process);
+        dispatcher.bind_hvpatch_process(Arc::new(process));
 
         let rebound = dispatcher
             .capture_one_task_context()
@@ -3364,7 +2792,7 @@ mod tests {
         let (parent, root) = authoritative_root();
         let dispatcher = SyscallDispatcher::new();
         dispatcher.set_cwd("/launch/workdir");
-        dispatcher.bind_hvpatch_process(parent.clone());
+        dispatcher.bind_hvpatch_process(Arc::new(parent.clone()));
 
         let sibling = parent
             .kernel_graph()
@@ -3430,7 +2858,7 @@ mod tests {
             "a fork child already owns an inherited kernel FsContext"
         );
 
-        child_dispatcher.bind_hvpatch_process(child);
+        child_dispatcher.bind_hvpatch_process(Arc::new(child));
         let rebound = child_dispatcher
             .capture_one_task_context()
             .expect("bound child context");

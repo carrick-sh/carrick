@@ -778,7 +778,7 @@ impl<'a> FsView<'a> {
     }
 
     #[inline]
-    pub(crate) fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext> {
+    pub(crate) fn hvpatch_process(&self) -> Option<Arc<dyn crate::kernel::CarrierProcess>> {
         self.proc.lock().hvpatch_process.clone()
     }
 
@@ -818,7 +818,7 @@ impl<'a> FsView<'a> {
 
     pub(super) fn synthetic_proc_processes(
         context: &crate::kernel::KernelContext,
-        hvpatch_process: Option<&crate::hvpatch::ProcessContext>,
+        hvpatch_process: Option<&dyn crate::kernel::CarrierProcess>,
     ) -> Option<Vec<carrick_vfs::SyntheticProcProcess>> {
         SyscallDispatcher::synthetic_proc_processes(context, hvpatch_process)
     }
@@ -943,7 +943,7 @@ impl<'a> FsView<'a> {
             })
             .unwrap_or_default();
         let creds_ns = context.task().creds_ns();
-        let processes = Self::synthetic_proc_processes(context, hvpatch_process.as_ref());
+        let processes = Self::synthetic_proc_processes(context, hvpatch_process.as_deref());
         let zombies = hvpatch_process.map(|process| {
             process
                 .kernel_graph()

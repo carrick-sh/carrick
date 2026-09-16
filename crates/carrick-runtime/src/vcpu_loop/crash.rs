@@ -224,7 +224,7 @@ where
         let process_pid = kernel
             .hvpatch_process
             .as_ref()
-            .map(crate::hvpatch::ProcessContext::pid)
+            .map(|process| process.pid())
             .ok_or_else(|| {
                 RuntimeError::Configuration(
                     "HVPatch crash capture lacks process identity authority".to_owned(),
@@ -1049,7 +1049,7 @@ mod tests {
             .expect("start crash sibling")
             .into_context();
         let dispatcher = SyscallDispatcher::new();
-        dispatcher.bind_hvpatch_process(process.clone());
+        dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
         let kernel = Arc::new(KernelState::new(
             dispatcher,
             Arc::new(EndpointTestSignalPump),
@@ -1153,7 +1153,7 @@ mod tests {
         auxv_bytes.extend_from_slice(&0_u64.to_le_bytes()); // AT_NULL
         auxv_bytes.extend_from_slice(&0_u64.to_le_bytes());
         dispatcher.set_auxv_image(auxv_bytes);
-        dispatcher.bind_hvpatch_process(process.clone());
+        dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
         let kernel = Arc::new(KernelState::new(
             dispatcher,
             Arc::new(EndpointTestSignalPump),
@@ -1341,7 +1341,7 @@ mod tests {
         auxv_bytes.extend_from_slice(&0_u64.to_le_bytes()); // AT_NULL
         auxv_bytes.extend_from_slice(&0_u64.to_le_bytes());
         dispatcher.set_auxv_image(auxv_bytes);
-        dispatcher.bind_hvpatch_process(process.clone());
+        dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
         let kernel = Arc::new(KernelState::new(
             dispatcher,
             Arc::new(EndpointTestSignalPump),

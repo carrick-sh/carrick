@@ -6269,7 +6269,7 @@ mod tests {
 
         let (process, root) = crate::hvpatch::process_context_for_tests(70_222);
         let dispatcher = SyscallDispatcher::new();
-        dispatcher.bind_hvpatch_process(process.clone());
+        dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
         let kernel = Arc::new(KernelState::new(
             dispatcher,
             Arc::new(EndpointTestSignalPump),
@@ -6613,7 +6613,7 @@ mod tests {
             .unwrap()
             .into_context();
         let dispatcher = SyscallDispatcher::new();
-        dispatcher.bind_hvpatch_process(process);
+        dispatcher.bind_hvpatch_process(Arc::new(process));
         let runtime = KernelState::new(
             dispatcher,
             Arc::new(EndpointTestSignalPump),

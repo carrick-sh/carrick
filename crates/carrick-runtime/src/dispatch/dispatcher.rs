@@ -1479,7 +1479,7 @@ pub struct SignalView<'a> {
 pub(in crate::dispatch) trait IpcCrossSubsystem {
     fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials>;
     fn identity_pid(&self) -> u32;
-    fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext>;
+    fn hvpatch_process(&self) -> Option<Arc<dyn crate::kernel::CarrierProcess>>;
     fn is_forked_guest_process(&self) -> bool;
     fn begin_host_alias_dispatch<'permit>(
         &self,
@@ -1529,7 +1529,7 @@ impl IpcCrossSubsystem for SyscallDispatcher {
     fn identity_pid(&self) -> u32 {
         self.identity_pid()
     }
-    fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext> {
+    fn hvpatch_process(&self) -> Option<Arc<dyn crate::kernel::CarrierProcess>> {
         self.hvpatch_process()
     }
     fn is_forked_guest_process(&self) -> bool {
@@ -1625,7 +1625,7 @@ impl<'a> IpcView<'a> {
     }
 
     #[inline]
-    pub(crate) fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext> {
+    pub(crate) fn hvpatch_process(&self) -> Option<Arc<dyn crate::kernel::CarrierProcess>> {
         self.cross.hvpatch_process()
     }
 

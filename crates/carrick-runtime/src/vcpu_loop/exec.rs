@@ -2576,7 +2576,7 @@ pub(crate) mod tests {
         ThreadRuntimeState<CrashCaptureTestEngine>,
     ) {
         let (process, root) = crate::hvpatch::process_context_for_tests(pid);
-        dispatcher.bind_hvpatch_process(process.clone());
+        dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
         let kernel = Arc::new(KernelState::new(
             dispatcher,
             Arc::new(EndpointTestSignalPump),

@@ -4,6 +4,7 @@
 //! mm to an ASID-owned stage-1 root over globally addressed frames.
 
 pub mod address;
+pub(crate) mod carrier_process;
 pub mod clone_plan;
 pub mod container;
 pub mod control;
@@ -57,6 +58,9 @@ pub use mm_access::{
 };
 pub use mm_transaction::{MmTransaction, StagedMmOp};
 
+pub(crate) use carrier_process::CarrierProcess;
+#[cfg(test)]
+pub(crate) use carrier_process::{TestCarrierProcess, TestMmBackend};
 pub(crate) use core::ReservationChangeSubscription;
 pub use core::{
     Kernel, KernelContext, KernelError, KernelTaskBinding, Registry, RegistryInvariantError,

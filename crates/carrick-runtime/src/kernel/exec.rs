@@ -877,32 +877,9 @@ mod tests {
 
     use super::*;
     use crate::kernel::{
-        Asid, ClonePlan, FileDescription, FileSlotNumber, LinuxSignal, LinuxWaitStatus,
-        MmBackendSnapshot, MmBinding, RootBootstrap, SignalDisposition, SnapshotError, Stage1Root,
+        Asid, ClonePlan, FileDescription, FileSlotNumber, LinuxSignal, LinuxWaitStatus, MmBinding,
+        RootBootstrap, SignalDisposition, Stage1Root, TestMmBackend,
     };
-
-    #[derive(Debug)]
-    struct TestMmBackend(MmBinding);
-
-    impl MmBackend for TestMmBackend {
-        fn snapshot(
-            &self,
-            _deadline: std::time::Instant,
-        ) -> Result<MmBackendSnapshot, SnapshotError> {
-            Ok(MmBackendSnapshot {
-                revision: 1,
-                binding: self.0,
-                vmas: Vec::new(),
-                vma_revision: None,
-                mapping_ids: Vec::new(),
-                frame_inventory_revision: None,
-            })
-        }
-
-        fn revision(&self) -> u64 {
-            1
-        }
-    }
 
     fn test_binding(asid: u16, stage1_root: u64) -> MmBinding {
         let asid =
@@ -968,7 +945,8 @@ mod tests {
         assert!(Arc::ptr_eq(&parent_mm, &child.shared.mm()));
 
         let replacement_binding = test_binding(17, 0x44_000);
-        let replacement_backend: Arc<dyn MmBackend> = Arc::new(TestMmBackend(replacement_binding));
+        let replacement_backend: Arc<dyn MmBackend> =
+            Arc::new(TestMmBackend::new(replacement_binding));
         let prepared = kernel
             .prepare_exec_with_mm_backend(&child, replacement_backend, None)
             .expect("prepare replacement mm");
@@ -1012,7 +990,7 @@ mod tests {
             )
             .expect("shared-mm child");
         let shared_mm = parent.shared.mm();
-        let backend = Arc::new(TestMmBackend(test_binding(18, 0x48_000)));
+        let backend = Arc::new(TestMmBackend::new(test_binding(18, 0x48_000)));
         let backend_weak = Arc::downgrade(&backend);
 
         assert!(matches!(
