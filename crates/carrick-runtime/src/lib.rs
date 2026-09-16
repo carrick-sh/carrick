@@ -228,7 +228,7 @@ pub mod trap {
     // resolves identically on both platform arms).
     pub use carrick_host::clock::host_clock_uptime_ns;
     pub use carrick_host::futex_key::{shared_file_key_base, shared_futex_waiter_key};
-    pub const HVF_PAGE_SIZE: u64 = 0x4000;
+    pub const HVF_PAGE_SIZE: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
 
     // Cross-process VM-topology bookkeeping the shared threaded loop references
     // around a guest fork/exec. The shared `vcpu_loop` fork/exec paths RUN on

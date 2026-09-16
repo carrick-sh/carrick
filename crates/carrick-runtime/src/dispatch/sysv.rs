@@ -2660,7 +2660,7 @@ impl<'a> IpcView<'a> {
             // Reserve a guest alias-VA window and return MapHostAlias so the
             // runtime hv_vm_maps the host file into the guest's address
             // space — same path mmap(MAP_SHARED, fd) uses for file mappings.
-            let hvf_page = crate::trap::HVF_PAGE_SIZE;
+            let hvf_page = carrick_guest_mem::HOST_PAGE_GRANULE;
             let map_len = align_up_u64(size as u64, hvf_page).unwrap_or(size as u64);
             if addr == 0 && !attach_flags.contains(ShmAttachFlags::RDONLY) {
                 let mut process = this.lock_sysv_process();
@@ -5872,7 +5872,7 @@ mod ipc_set_tests {
         let dispatcher = SyscallDispatcher::new();
         let shmid = 4245;
         let addr = crate::memory::LINUX_HIGH_VA_THRESHOLD;
-        let len = crate::trap::HVF_PAGE_SIZE;
+        let len = carrick_guest_mem::HOST_PAGE_GRANULE;
         dispatcher.sysv.state.lock().segments.insert(
             shmid,
             ShmSegment {
@@ -5966,7 +5966,7 @@ mod ipc_set_tests {
         let _file = insert_test_shm_segment(&dispatcher, shmid, LINUX_PAGE_SIZE as usize);
         dispatcher.commit_host_alias_mmap(crate::dispatch::mem::HostAliasMmapCommit {
             start: REQUESTED,
-            len: crate::trap::HVF_PAGE_SIZE,
+            len: carrick_guest_mem::HOST_PAGE_GRANULE,
             prot: crate::linux_abi::LinuxProtFlags::READ,
             sharing: ProcMapSharing::Private,
             path: "occupied-dynamic".into(),
@@ -6009,7 +6009,7 @@ mod ipc_set_tests {
         let _file = insert_test_shm_segment(&dispatcher, shmid, LINUX_PAGE_SIZE as usize);
         dispatcher.set_address_space_regions(vec![ProcMapsEntry {
             start: REQUESTED,
-            end: REQUESTED + crate::trap::HVF_PAGE_SIZE,
+            end: REQUESTED + carrick_guest_mem::HOST_PAGE_GRANULE,
             read: true,
             write: false,
             execute: true,
@@ -6355,7 +6355,7 @@ mod ipc_set_tests {
                     );
                     assert_eq!(
                         child.lock_sysv_process().validate_shmdt(detachable_va),
-                        Ok((shmid_1, crate::trap::HVF_PAGE_SIZE as usize))
+                        Ok((shmid_1, carrick_guest_mem::HOST_PAGE_GRANULE as usize))
                     );
                     child.cleanup_sysv_shm_attachments_on_process_exit();
                     std::thread::yield_now();

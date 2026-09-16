@@ -724,7 +724,7 @@ fn native16k_rejects_shared_write_exec_mmap() {
 fn shared_anon_deferred_setter_failure_rolls_back_before_commit() {
     const SYS_MMAP: u64 = 222;
     const LENGTH: u64 = 4096;
-    const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+    const MAPPED_LENGTH: usize = carrick_guest_mem::HOST_PAGE_GRANULE as usize;
 
     let dispatcher = SyscallDispatcher::new();
     let registry =
@@ -768,7 +768,7 @@ fn shared_anon_deferred_setter_failure_rolls_back_before_commit() {
 fn mmap_publishes_shared_rx_and_private_fixed_replacement() {
     const SYS_MMAP: u64 = 222;
     const LENGTH: u64 = 4096;
-    const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+    const MAPPED_LENGTH: usize = carrick_guest_mem::HOST_PAGE_GRANULE as usize;
 
     let dispatcher = SyscallDispatcher::new();
     let registry =
@@ -841,7 +841,7 @@ fn file_private_fixed_shared_aperture_repoints_snapshot_and_publishes_map_time_b
     const SYS_MMAP: u64 = 222;
     const SYS_MPROTECT: u64 = 226;
     const LENGTH: u64 = 3 * LINUX_PAGE_SIZE;
-    const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+    const MAPPED_LENGTH: usize = carrick_guest_mem::HOST_PAGE_GRANULE as usize;
     const FD: i32 = 9;
 
     let dispatcher = SyscallDispatcher::new();
@@ -1498,7 +1498,7 @@ fn shared_anonymous_mremap_shrink_retains_shared_prefix_metadata() {
         crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1068));
     let reporter = CompatReporter::default();
     let base = crate::memory::LINUX_SHARED_FILE_BASE;
-    let map_len = crate::trap::HVF_PAGE_SIZE * 2;
+    let map_len = carrick_guest_mem::HOST_PAGE_GRANULE * 2;
     let mut memory = CountingMmapMemory::new(base, map_len as usize);
     let source = returned(threaded_memory_call(
         &dispatcher,
@@ -1524,7 +1524,14 @@ fn shared_anonymous_mremap_shrink_retains_shared_prefix_metadata() {
         &reporter,
         SyscallRequest::new(
             SYS_MREMAP,
-            SyscallArgs([source, map_len, crate::trap::HVF_PAGE_SIZE, 0, 0, 0]),
+            SyscallArgs([
+                source,
+                map_len,
+                carrick_guest_mem::HOST_PAGE_GRANULE,
+                0,
+                0,
+                0,
+            ]),
         ),
     );
     assert_eq!(Ok(shrunk), DispatchOutcome::returned_u64(source));
@@ -1532,7 +1539,7 @@ fn shared_anonymous_mremap_shrink_retains_shared_prefix_metadata() {
     let mem = mem_authority_109.lock();
     assert!(mem.dynamic_maps.iter().any(|map| {
         map.start == source
-            && map.end == source + crate::trap::HVF_PAGE_SIZE
+            && map.end == source + carrick_guest_mem::HOST_PAGE_GRANULE
             && map.sharing == ProcMapSharing::Shared
     }));
 }
@@ -1541,7 +1548,7 @@ fn shared_anonymous_mremap_shrink_retains_shared_prefix_metadata() {
 fn private_overlay_mremap_shrink_carves_source_tail_and_reuses_only_storage() {
     const SYS_MMAP: u64 = 222;
     const SYS_MREMAP: u64 = 216;
-    const GRANULE: u64 = crate::trap::HVF_PAGE_SIZE;
+    const GRANULE: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
     const LENGTH: u64 = 2 * GRANULE;
 
     let dispatcher = SyscallDispatcher::new();
@@ -2432,7 +2439,7 @@ fn shared_mremap_shrink_unmap_failure_keeps_live_length_and_tail_accounting() {
     let registry =
         crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1072));
     let reporter = CompatReporter::default();
-    let map_len = crate::trap::HVF_PAGE_SIZE * 2;
+    let map_len = carrick_guest_mem::HOST_PAGE_GRANULE * 2;
     let mut memory =
         DeferredSetterFailureMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, map_len as usize)
             .demand_paged()
@@ -2462,7 +2469,14 @@ fn shared_mremap_shrink_unmap_failure_keeps_live_length_and_tail_accounting() {
         &reporter,
         SyscallRequest::new(
             SYS_MREMAP,
-            SyscallArgs([source, map_len, crate::trap::HVF_PAGE_SIZE, 0, 0, 0]),
+            SyscallArgs([
+                source,
+                map_len,
+                carrick_guest_mem::HOST_PAGE_GRANULE,
+                0,
+                0,
+                0,
+            ]),
         ),
     );
     assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
@@ -2483,7 +2497,7 @@ fn shared_mremap_shrink_unmap_failure_keeps_live_length_and_tail_accounting() {
         let mut mem = mem_authority_116.lock();
         mem.shared
             .alloc(
-                crate::trap::HVF_PAGE_SIZE,
+                carrick_guest_mem::HOST_PAGE_GRANULE,
                 crate::shared_aperture::BackingObject::SharedAnon,
             )
             .expect("failed shrink must not free the tail for reuse")
@@ -2495,7 +2509,7 @@ fn shared_mremap_shrink_unmap_failure_keeps_live_length_and_tail_accounting() {
 fn demand_paged_shared_anon_keeps_best_effort_mapping_on_protection_failure() {
     const SYS_MMAP: u64 = 222;
     const LENGTH: u64 = 4096;
-    const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+    const MAPPED_LENGTH: usize = carrick_guest_mem::HOST_PAGE_GRANULE as usize;
 
     let dispatcher = SyscallDispatcher::new();
     let registry =
@@ -2572,7 +2586,7 @@ fn concurrent_exec_mmap_does_not_commit_consumed_protection_failure_outside_aren
 fn shared_anon_persistent_rollback_failure_aborts_concurrent_exec_backend() {
     const SYS_MMAP: u64 = 222;
     const LENGTH: u64 = 4096;
-    const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+    const MAPPED_LENGTH: usize = carrick_guest_mem::HOST_PAGE_GRANULE as usize;
 
     // SAFETY: the child owns an isolated dispatcher and intentionally takes
     // the fail-stop abort after two injected host-unmap failures.
@@ -6223,7 +6237,7 @@ fn darwin_private_file_mapping_detaches_from_truncate() {
 #[test]
 fn indeterminate_private_repoint_failure_fails_stopped() {
     const SYS_MMAP: u64 = 222;
-    const LENGTH: u64 = crate::trap::HVF_PAGE_SIZE;
+    const LENGTH: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
 
     let child = unsafe { libc::fork() };
     assert!(child >= 0, "fork indeterminate-repoint child failed");
@@ -6301,7 +6315,7 @@ fn indeterminate_private_repoint_failure_fails_stopped() {
 
 fn assert_partial_private_overlay_replacement(replace_offset: u64) {
     const SYS_MMAP: u64 = 222;
-    const GRANULE: u64 = crate::trap::HVF_PAGE_SIZE;
+    const GRANULE: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
     const LENGTH: u64 = 3 * GRANULE;
 
     let dispatcher = SyscallDispatcher::new();
@@ -6468,19 +6482,19 @@ fn private_overlay_prefix_replacement_carves_exact_storage() {
 
 #[test]
 fn private_overlay_middle_replacement_carves_exact_storage() {
-    assert_partial_private_overlay_replacement(crate::trap::HVF_PAGE_SIZE);
+    assert_partial_private_overlay_replacement(carrick_guest_mem::HOST_PAGE_GRANULE);
 }
 
 #[test]
 fn private_overlay_suffix_replacement_carves_exact_storage() {
-    assert_partial_private_overlay_replacement(2 * crate::trap::HVF_PAGE_SIZE);
+    assert_partial_private_overlay_replacement(2 * carrick_guest_mem::HOST_PAGE_GRANULE);
 }
 
 #[test]
 fn post_repoint_protection_failure_aborts_instead_of_publishing_split_ownership() {
     const SYS_MMAP: u64 = 222;
     const LENGTH: u64 = 4096;
-    const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+    const MAPPED_LENGTH: usize = carrick_guest_mem::HOST_PAGE_GRANULE as usize;
 
     let child = unsafe { libc::fork() };
     assert!(child >= 0, "fork protection-failure child failed");

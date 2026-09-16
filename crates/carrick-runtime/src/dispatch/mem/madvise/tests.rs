@@ -321,7 +321,7 @@ fn mincore_overflowing_length_is_enomem_not_abort() {
 fn madvise_reports_vma_rejection_before_unmapped_hole_enomem() {
     const SYS_MMAP: u64 = 222;
     const SYS_MADVISE: u64 = 233;
-    const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+    const MAPPED_LENGTH: usize = carrick_guest_mem::HOST_PAGE_GRANULE as usize;
 
     let map = |flags: u64, thread: i32| {
         let dispatcher = SyscallDispatcher::new();
