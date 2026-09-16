@@ -72,7 +72,7 @@ fn frame_publication_sites_contain_no_carrier_topology_lock() {
 
     // 5. install_alias in vcpu_loop/mod.rs
     let install_alias = vcpu_loop_src
-        .split("let install_alias = |permit:")
+        .split("let install_alias =")
         .nth(1)
         .expect("install_alias closure exists");
     let install_alias_body = install_alias
@@ -117,7 +117,7 @@ fn frame_inventory_publication_and_retirement_sites_hold_registry_guard() {
 
     // 1. apply_alias_frame_inventory in vcpu_loop/mod.rs (install_alias)
     let install_alias_block = vcpu_loop_src
-        .split("let install_alias = |permit:")
+        .split("let install_alias =")
         .nth(1)
         .expect("install_alias exists")
         .split("break 'service installed;")

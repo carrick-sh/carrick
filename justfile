@@ -352,6 +352,10 @@ test-integration:
     set -euo pipefail
     if [ "{{os()}}" = "macos" ]; then
         cargo test -p carrick-runtime --test integration
+        # The P5 blocking-host-I/O ratchet scans `dispatch/{net,fs,mod}.rs`
+        # by path, so it lives in the crate that owns them. It has no crate
+        # dependency at all -- it reads source and asserts.
+        cargo test -p carrick-kernel --test io_blocking_guard
         cargo test -p carrick-runtime --test syscall_process
         # `PreparedRun::execute(self)` single-use contract is a compile_fail
         # doctest; `just test`'s `--lib --bins` never runs doctests.

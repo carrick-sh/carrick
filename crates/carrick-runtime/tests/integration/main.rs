@@ -28,7 +28,6 @@ mod address_space;
 mod compat_report;
 mod concurrency_contracts;
 mod elf_inspector;
-mod io_blocking_guard;
 mod io_wait;
 mod oci_layout;
 mod rootfs_overlay;
