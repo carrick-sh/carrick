@@ -12098,6 +12098,177 @@
       "scope_kind": "test_or_definition"
     },
     {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 2118,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"split epoll authority\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 2128,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"epoll continuation\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 2134,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"enroll epoll wait\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 2153,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let watched = run_case(15_461, false).expect(\"watched change recomputes epoll\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 5290,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// inner epoll watches efd (EPOLLIN, data=101)",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 5318,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// outer epoll watches inner (EPOLLIN, data=202)",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 5358,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"nested epoll wait must yield: {outcome:?}\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 5363,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"actual nested epoll continuation\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 5368,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"enroll nested epoll\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 5372,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"attach nested epoll registration\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 5418,
+      "categories": [
+        "epoll"
+      ],
+      "text": "panic!(\"nested epoll lost synthetic producer wake; fresh logical recheck={observed:?}\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 5420,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let event = event.unwrap().expect(\"nested epoll wake\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 5828,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// epoll_pwait on outermost admitted epoll (ep5) with no timeout",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 5841,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"nested 5-level epoll wait must yield: {outcome:?}\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 5846,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"actual 5-level nested epoll continuation\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 5851,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"enroll 5-level nested epoll\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 5855,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"attach 5-level nested epoll registration\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 5902,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"5-level nested epoll lost synthetic producer wake; fresh logical recheck={observed:?}\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
+      "line": 5905,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let event = event.unwrap().expect(\"5-level nested epoll wake\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
       "file": "crates/carrick-runtime/src/kernel/core.rs",
       "line": 1946,
       "categories": [
@@ -14943,7 +15114,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects/thread.rs",
-      "line": 2587,
+      "line": 2586,
       "categories": [
         "lifecycle"
       ],
@@ -17302,7 +17473,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 3326,
+      "line": 3328,
       "categories": [
         "stream"
       ],
@@ -17374,182 +17545,11 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 796,
+      "line": 326,
       "categories": [
         "mapping"
       ],
       "text": "let io_uring_source = include_str!(\"../../dispatch/ioring.rs\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 2502,
-      "categories": [
-        "epoll"
-      ],
-      "text": ".expect(\"split epoll authority\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 2512,
-      "categories": [
-        "epoll"
-      ],
-      "text": ".expect(\"epoll continuation\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 2518,
-      "categories": [
-        "epoll"
-      ],
-      "text": ".expect(\"enroll epoll wait\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 2537,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let watched = run_case(15_461, false).expect(\"watched change recomputes epoll\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 5892,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// inner epoll watches efd (EPOLLIN, data=101)",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 5920,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// outer epoll watches inner (EPOLLIN, data=202)",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 5960,
-      "categories": [
-        "epoll"
-      ],
-      "text": "\"nested epoll wait must yield: {outcome:?}\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 5965,
-      "categories": [
-        "epoll"
-      ],
-      "text": ".expect(\"actual nested epoll continuation\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 5970,
-      "categories": [
-        "epoll"
-      ],
-      "text": ".expect(\"enroll nested epoll\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 5974,
-      "categories": [
-        "epoll"
-      ],
-      "text": ".expect(\"attach nested epoll registration\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6020,
-      "categories": [
-        "epoll"
-      ],
-      "text": "panic!(\"nested epoll lost synthetic producer wake; fresh logical recheck={observed:?}\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6022,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let event = event.unwrap().expect(\"nested epoll wake\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6430,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// epoll_pwait on outermost admitted epoll (ep5) with no timeout",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6443,
-      "categories": [
-        "epoll"
-      ],
-      "text": "\"nested 5-level epoll wait must yield: {outcome:?}\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6448,
-      "categories": [
-        "epoll"
-      ],
-      "text": ".expect(\"actual 5-level nested epoll continuation\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6453,
-      "categories": [
-        "epoll"
-      ],
-      "text": ".expect(\"enroll 5-level nested epoll\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6457,
-      "categories": [
-        "epoll"
-      ],
-      "text": ".expect(\"attach 5-level nested epoll registration\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6504,
-      "categories": [
-        "epoll"
-      ],
-      "text": "\"5-level nested epoll lost synthetic producer wake; fresh logical recheck={observed:?}\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6507,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let event = event.unwrap().expect(\"5-level nested epoll wake\");",
       "scope_kind": "test_or_definition"
     },
     {
@@ -17977,7 +17977,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1564,
+      "line": 1569,
       "categories": [
         "mapping"
       ],
@@ -17986,7 +17986,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1622,
+      "line": 1627,
       "categories": [
         "mapping"
       ],
@@ -17995,7 +17995,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1812,
+      "line": 1817,
       "categories": [
         "mapping"
       ],
@@ -18004,7 +18004,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1815,
+      "line": 1820,
       "categories": [
         "mapping"
       ],
@@ -18013,7 +18013,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1822,
+      "line": 1827,
       "categories": [
         "mapping"
       ],
@@ -18022,7 +18022,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1826,
+      "line": 1831,
       "categories": [
         "mapping"
       ],
@@ -18031,7 +18031,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1840,
+      "line": 1845,
       "categories": [
         "mapping"
       ],
@@ -18040,7 +18040,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3098,
+      "line": 3103,
       "categories": [
         "mapping"
       ],
@@ -18049,7 +18049,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3100,
+      "line": 3105,
       "categories": [
         "mapping"
       ],
@@ -18058,7 +18058,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3108,
+      "line": 3113,
       "categories": [
         "mapping"
       ],
@@ -18067,7 +18067,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3120,
+      "line": 3125,
       "categories": [
         "mapping"
       ],
@@ -18076,7 +18076,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3124,
+      "line": 3129,
       "categories": [
         "mapping"
       ],
@@ -18085,7 +18085,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3127,
+      "line": 3132,
       "categories": [
         "mapping"
       ],

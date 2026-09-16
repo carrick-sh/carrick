@@ -13897,6 +13897,33 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
+      "resource": "carrier-owned continuation readiness reactor thread used by `new` at line 2875"
+    },
+    "expansion": null,
+    "operation": "std::thread::Builder::new",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/kernel/continuation/wait_service.rs:966 in `try_new`, `std::thread::Builder::new` acts only on the carrier-owned continuation readiness reactor thread used by `new` at line 2875; no guest identity selects its host target.",
+    "review_id": "HA-000587",
+    "source": {
+      "byte_end": 36997,
+      "byte_start": 36972,
+      "column": 22,
+      "column_end": 47,
+      "column_start": 22,
+      "file": "crates/carrick-runtime/src/kernel/continuation/wait_service.rs",
+      "line": 966,
+      "line_end": 966,
+      "line_start": 966
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
       "resource": "carrier-owned authenticated control server thread used by `start_at_inner` at line 270"
     },
     "expansion": null,
@@ -14097,8 +14124,8 @@
     "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:4370 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
     "review_id": "HA-000644",
     "source": {
-      "byte_end": 185253,
-      "byte_start": 185228,
+      "byte_end": 185268,
+      "byte_start": 185243,
       "column": 35,
       "column_end": 60,
       "column_start": 35,
@@ -14106,33 +14133,6 @@
       "line": 4370,
       "line_end": 4370,
       "line_start": 4370
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
-      "resource": "carrier-owned continuation readiness reactor thread used by `new` at line 2875"
-    },
-    "expansion": null,
-    "operation": "std::thread::Builder::new",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/continuation/wait_service.rs:975 in `try_new`, `std::thread::Builder::new` acts only on the carrier-owned continuation readiness reactor thread used by `new` at line 2875; no guest identity selects its host target.",
-    "review_id": "HA-000587",
-    "source": {
-      "byte_end": 37556,
-      "byte_start": 37531,
-      "column": 22,
-      "column_end": 47,
-      "column_start": 22,
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/wait_service.rs",
-      "line": 975,
-      "line_end": 975,
-      "line_start": 975
     }
   },
   {
@@ -14151,8 +14151,8 @@
     "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor/pool.rs:1196 in `start`, `std::thread::Builder::new` acts only on the bounded carrier-owned persistent executor thread used by `start` at line 2878; no guest identity selects its host target.",
     "review_id": "HA-000588",
     "source": {
-      "byte_end": 44651,
-      "byte_start": 44626,
+      "byte_end": 44645,
+      "byte_start": 44620,
       "column": 30,
       "column_end": 55,
       "column_start": 30,
