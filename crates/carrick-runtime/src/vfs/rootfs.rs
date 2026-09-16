@@ -505,7 +505,7 @@ impl RootFsVfs {
 
     /// Truncate path-based file and update dentry cache.
     pub fn truncate_path(&self, path: &str, length: u64) -> Result<(), LinuxErrno> {
-        use crate::dispatch::HostSyscallResult as _;
+        use crate::vfs::errno::HostSyscallResult as _;
         match self.overlay.open_raw_fd(path, true, false, false) {
             crate::fs_backend::HostFdOpen::Served(host_fd) => {
                 let inode = Self::host_fd_inode_identity(host_fd);
@@ -609,8 +609,8 @@ impl RootFsVfs {
 
     /// Read xattr for `path` via the dentry cache across layers.
     pub fn get_xattr(&self, path: &str, name: &str, follow: bool) -> Result<Vec<u8>, LinuxErrno> {
-        use crate::dispatch::HostSyscallResult as _;
         use crate::fs_backend::{is_guest_xattr_namespace, is_internal_carrick_xattr};
+        use crate::vfs::errno::HostSyscallResult as _;
 
         if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {
             return Err(crate::linux_abi::LINUX_ENODATA);
@@ -651,8 +651,8 @@ impl RootFsVfs {
 
     /// List xattrs for `path` via the dentry cache across layers.
     pub fn list_xattr(&self, path: &str, follow: bool) -> Result<Vec<String>, LinuxErrno> {
-        use crate::dispatch::HostSyscallResult as _;
         use crate::fs_backend::{is_guest_xattr_namespace, is_internal_carrick_xattr};
+        use crate::vfs::errno::HostSyscallResult as _;
 
         fn collect_names(
             needed: isize,
@@ -702,8 +702,8 @@ impl RootFsVfs {
 
     /// Remove xattr on path via overlay or dentry cache fallback.
     pub fn remove_xattr(&self, path: &str, name: &str, follow: bool) -> Result<(), LinuxErrno> {
-        use crate::dispatch::HostSyscallResult as _;
         use crate::fs_backend::{is_guest_xattr_namespace, is_internal_carrick_xattr};
+        use crate::vfs::errno::HostSyscallResult as _;
 
         if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {
             return Err(crate::linux_abi::LINUX_ENODATA);
@@ -1142,7 +1142,7 @@ impl RootFsVfs {
             match rootfs.metadata(path) {
                 Ok(metadata) => Some(metadata),
                 Err(RootFsError::NotFound(_)) => None,
-                Err(e) => return Err(crate::dispatch::rootfs_errno(e)),
+                Err(e) => return Err(crate::vfs::errno::rootfs_errno(e)),
             }
         } else {
             None
@@ -1227,7 +1227,7 @@ impl RootFsVfs {
                         }
                         let contents = rootfs
                             .read_shared(path)
-                            .map_err(crate::dispatch::rootfs_errno)?;
+                            .map_err(crate::vfs::errno::rootfs_errno)?;
                         self.overlay
                             .create_file_from_rootfs(path, Arc::clone(&contents), metadata.mode)
                             .map_err(|_| LINUX_EINVAL)?;
@@ -1253,7 +1253,7 @@ impl RootFsVfs {
                             writable: true,
                         });
                     }
-                    let contents = rootfs.read(path).map_err(crate::dispatch::rootfs_errno)?;
+                    let contents = rootfs.read(path).map_err(crate::vfs::errno::rootfs_errno)?;
                     Ok(OpenDispatchResult::File {
                         metadata,
                         contents,
@@ -1398,7 +1398,7 @@ impl RootFsVfs {
                         self.rootfs.as_ref(),
                         to,
                     )
-                    .map_err(crate::dispatch::rootfs_errno)?;
+                    .map_err(crate::vfs::errno::rootfs_errno)?;
                     if !entries.is_empty() {
                         return Err(LINUX_ENOTEMPTY);
                     }
@@ -1466,7 +1466,7 @@ impl RootFsVfs {
                     .as_ref()
                     .ok_or(LINUX_ENOENT)?
                     .read(from)
-                    .map_err(crate::dispatch::rootfs_errno)?;
+                    .map_err(crate::vfs::errno::rootfs_errno)?;
                 self.overlay
                     .set_file_contents(to, contents)
                     .map_err(|_| LINUX_EINVAL)?;

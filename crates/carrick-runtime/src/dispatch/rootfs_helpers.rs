@@ -5,14 +5,14 @@ use zerocopy::IntoBytes;
 
 pub(crate) use carrick_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_CHR, LINUX_DT_DIR, LINUX_DT_FIFO, LINUX_DT_LNK,
-    LINUX_DT_REG, LINUX_DT_SOCK, LINUX_E2BIG, LINUX_EACCES, LINUX_EFAULT, LINUX_EINVAL,
-    LINUX_ENAMETOOLONG, LINUX_ENOENT, LINUX_S_IFCHR, LINUX_S_IFDIR, LINUX_S_IFIFO, LINUX_S_IFLNK,
-    LINUX_S_IFREG, LINUX_S_IFSOCK, LinuxDirent64Header,
+    LINUX_DT_REG, LINUX_DT_SOCK, LINUX_E2BIG, LINUX_EACCES, LINUX_EFAULT, LINUX_ENAMETOOLONG,
+    LINUX_S_IFCHR, LINUX_S_IFDIR, LINUX_S_IFIFO, LINUX_S_IFLNK, LINUX_S_IFREG, LINUX_S_IFSOCK,
+    LinuxDirent64Header,
 };
 use carrick_guest_mem::CurrentMmMemory;
 
 use crate::linux_abi::LinuxErrno;
-use crate::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
+use crate::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
 
 use super::DispatchOutcome;
 
@@ -268,17 +268,6 @@ pub(super) fn display_rootfs_path(path: &Path) -> String {
         "/".to_owned()
     } else {
         format!("/{trimmed}")
-    }
-}
-
-pub fn rootfs_errno(error: RootFsError) -> LinuxErrno {
-    match error {
-        RootFsError::NotFound(_) => LINUX_ENOENT,
-        RootFsError::UnsafePath(_) | RootFsError::Utf8(_) | RootFsError::TooManySymlinks(_) => {
-            LINUX_EINVAL
-        }
-        RootFsError::DirectoryTooLarge(_) => LINUX_E2BIG,
-        RootFsError::Io(_) => LINUX_EINVAL,
     }
 }
 
