@@ -10,7 +10,10 @@
 
 use std::sync::Arc;
 
-pub use carrick_kernel::dispatch::CarrierBridges;
+// `use`, not `pub use`: the bundle type belongs to the kernel and every
+// consumer names `carrick_kernel::dispatch::CarrierBridges` directly. A
+// re-export here would be a transitional path for a type that moved.
+use carrick_kernel::dispatch::CarrierBridges;
 
 #[cfg(feature = "platform-macos")]
 type ActiveHostSignal = carrick_vmm_hvf::host_signal::HvfHostSignal;

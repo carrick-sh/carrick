@@ -659,7 +659,7 @@ def validate_concurrent_source(path: Path, source: str) -> None:
         if (
             finding.kind in {"env_var", "env_var_os"}
             and finding.symbol.endswith("::CARRICK_RUN_ID")
-            and path_text != "crates/carrick-runtime/src/kernel/container.rs"
+            and path_text != "crates/carrick-kernel/src/kernel/container.rs"
             and "/src/bin/" not in path_text
         ):
             raise LedgerError(

@@ -2668,16 +2668,16 @@ class ProductionInventoryTest(unittest.TestCase):
 
     def test_retired_process_liveness_channels_are_absent(self):
         retired_operations = {
-            "crates/carrick-runtime/src/cred_ipc.rs": {
+            "crates/carrick-kernel/src/cred_ipc.rs": {
                 "std::fs::metadata",
                 "std::fs::read",
             },
-            "crates/carrick-runtime/src/exec_helpers.rs": {
+            "crates/carrick-kernel/src/exec_helpers.rs": {
                 "std::fs::read",
                 "std::fs::remove_file",
             },
             "crates/carrick-runtime/src/interactive_supervisor.rs": {"libc::waitpid"},
-            "crates/carrick-runtime/src/namespace/supervisor.rs": {
+            "crates/carrick-kernel/src/namespace/supervisor.rs": {
                 "libc::kill",
                 "libc::waitpid",
             },
@@ -2703,27 +2703,27 @@ class ProductionInventoryTest(unittest.TestCase):
 
     def test_reviewer_identified_semantic_channels_are_classified_from_source(self):
         semantic = {
-            ("crates/carrick-runtime/src/exec_helpers.rs", 335, "std::fs::write"):
+            ("crates/carrick-kernel/src/exec_helpers.rs", 335, "std::fs::write"):
                 "guest child signal wait status",
-            ("crates/carrick-runtime/src/exec_helpers.rs", 353, "std::fs::write"):
+            ("crates/carrick-kernel/src/exec_helpers.rs", 353, "std::fs::write"):
                 "guest child signal wait status",
-            ("crates/carrick-runtime/src/exec_helpers.rs", 335, "std::process::id"):
+            ("crates/carrick-kernel/src/exec_helpers.rs", 335, "std::process::id"):
                 "guest signal-death and SIGCHLD publication identity",
-            ("crates/carrick-runtime/src/exec_helpers.rs", 353, "std::process::id"):
+            ("crates/carrick-kernel/src/exec_helpers.rs", 353, "std::process::id"):
                 "guest child signal wait status",
-            ("crates/carrick-runtime/src/vfs/dev.rs", 150, "std::process::id"):
+            ("crates/carrick-kernel/src/vfs/dev.rs", 150, "std::process::id"):
                 "guest PTY entry ownership",
-            ("crates/carrick-runtime/src/vfs/devpts.rs", 263, "std::process::id"):
+            ("crates/carrick-kernel/src/vfs/devpts.rs", 263, "std::process::id"):
                 "guest PTY entry ownership",
-            ("crates/carrick-runtime/src/network/socket_namespace.rs", 1648, "std::process::id"):
+            ("crates/carrick-kernel/src/network/socket_namespace.rs", 1648, "std::process::id"):
                 "guest service-name record liveness",
-            ("crates/carrick-runtime/src/network/socket_namespace.rs", 1665, "std::process::id"):
+            ("crates/carrick-kernel/src/network/socket_namespace.rs", 1665, "std::process::id"):
                 "guest listener-reservation liveness",
-            ("crates/carrick-runtime/src/network/socket_namespace.rs", 1731, "std::process::id"):
+            ("crates/carrick-kernel/src/network/socket_namespace.rs", 1731, "std::process::id"):
                 "guest endpoint-record liveness",
-            ("crates/carrick-runtime/src/vfs/proc.rs", 2330, "libc::proc_listallpids"):
+            ("crates/carrick-kernel/src/vfs/proc.rs", 2330, "libc::proc_listallpids"):
                 "guest /proc process enumeration count",
-            ("crates/carrick-runtime/src/vfs/proc.rs", 2336, "libc::proc_listallpids"):
+            ("crates/carrick-kernel/src/vfs/proc.rs", 2336, "libc::proc_listallpids"):
                 "guest /proc process enumeration table",
         }
         for (file, line, operation), resource in semantic.items():
@@ -2733,9 +2733,9 @@ class ProductionInventoryTest(unittest.TestCase):
                 self.assertIn(resource, row["evidence"]["resource"])
 
         diagnostic = {
-            ("crates/carrick-runtime/src/network/socket_namespace.rs", 1685):
+            ("crates/carrick-kernel/src/network/socket_namespace.rs", 1685):
                 "diagnostic instance identity",
-            ("crates/carrick-runtime/src/network/socket_namespace.rs", 1874):
+            ("crates/carrick-kernel/src/network/socket_namespace.rs", 1874):
                 "NSREJECT diagnostic event",
         }
         for (file, line), resource in diagnostic.items():

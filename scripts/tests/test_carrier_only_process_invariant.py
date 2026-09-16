@@ -54,7 +54,7 @@ class CarrierOnlyProcessInvariantTest(unittest.TestCase):
         self.assertEqual(
             GATE.classify(
                 finding(
-                    "crates/carrick-runtime/src/dispatch/signal.rs",
+                    "crates/carrick-kernel/src/dispatch/signal.rs",
                     "bootstrap_signal_send_as",
                     "kill",
                 )
@@ -64,7 +64,7 @@ class CarrierOnlyProcessInvariantTest(unittest.TestCase):
         self.assertEqual(
             GATE.classify(
                 finding(
-                    "crates/carrick-runtime/src/kernel/control/endpoint.rs",
+                    "crates/carrick-kernel/src/kernel/control/endpoint.rs",
                     "process_is_alive",
                     "kill_probe",
                 )
@@ -74,7 +74,7 @@ class CarrierOnlyProcessInvariantTest(unittest.TestCase):
         self.assertEqual(
             GATE.classify(
                 finding(
-                    "crates/carrick-runtime/src/kernel/control/endpoint.rs",
+                    "crates/carrick-kernel/src/kernel/control/endpoint.rs",
                     "process_is_alive",
                     "kill",
                 )
@@ -175,7 +175,7 @@ class CarrierOnlyProcessInvariantTest(unittest.TestCase):
 
     def test_test_and_fixture_paths_are_classified_before_product_scope(self):
         for path in (
-            "crates/carrick-runtime/src/dispatch/tests.rs",
+            "crates/carrick-kernel/src/dispatch/tests.rs",
             "crates/carrick-runtime/tests/runtime_loop.rs",
             "crates/carrick-vmm-bhyve/fixtures/bhyve-fork/src/main.rs",
         ):

@@ -615,8 +615,8 @@ class RehomeInventoriesTests(unittest.TestCase):
 
     def test_dispatch_lock_moved_verbatim_rehomes(self):
         """Dispatch lock site moved verbatim to a new file re-homes its row."""
-        rel_a = "crates/carrick-runtime/src/dispatch/source_mod.rs"
-        rel_b = "crates/carrick-runtime/src/dispatch/target_mod.rs"
+        rel_a = "crates/carrick-kernel/src/dispatch/source_mod.rs"
+        rel_b = "crates/carrick-kernel/src/dispatch/target_mod.rs"
 
         old_id = f"{rel_a}::SyscallDispatcher::moved_lock_fn::proc#1"
         new_id = f"{rel_b}::SyscallDispatcher::moved_lock_fn::proc#1"
@@ -669,8 +669,8 @@ class RehomeInventoriesTests(unittest.TestCase):
 
     def test_dispatch_lock_expression_differs_refused(self):
         """Dispatch lock site with expression changed is refused."""
-        rel_a = "crates/carrick-runtime/src/dispatch/source_mod.rs"
-        rel_b = "crates/carrick-runtime/src/dispatch/target_mod.rs"
+        rel_a = "crates/carrick-kernel/src/dispatch/source_mod.rs"
+        rel_b = "crates/carrick-kernel/src/dispatch/target_mod.rs"
 
         old_id = f"{rel_a}::SyscallDispatcher::moved_lock_fn::proc#1"
         new_id = f"{rel_b}::SyscallDispatcher::moved_lock_fn::proc#1"
@@ -709,9 +709,9 @@ class RehomeInventoriesTests(unittest.TestCase):
 
     def test_dispatch_lock_two_duplicate_candidates_refused(self):
         """Two duplicate candidates for dispatch lock are refused."""
-        rel_a = "crates/carrick-runtime/src/dispatch/source_mod.rs"
-        rel_b1 = "crates/carrick-runtime/src/dispatch/target_mod1.rs"
-        rel_b2 = "crates/carrick-runtime/src/dispatch/target_mod2.rs"
+        rel_a = "crates/carrick-kernel/src/dispatch/source_mod.rs"
+        rel_b1 = "crates/carrick-kernel/src/dispatch/target_mod1.rs"
+        rel_b2 = "crates/carrick-kernel/src/dispatch/target_mod2.rs"
 
         old_id = f"{rel_a}::SyscallDispatcher::moved_lock_fn::proc#1"
         new_id1 = f"{rel_b1}::SyscallDispatcher::moved_lock_fn::proc#1"
@@ -746,7 +746,7 @@ class RehomeInventoriesTests(unittest.TestCase):
 
     def test_dispatch_lock_vanished_site_refused(self):
         """Dispatch lock site with no candidates is refused."""
-        rel_a = "crates/carrick-runtime/src/dispatch/source_mod.rs"
+        rel_a = "crates/carrick-kernel/src/dispatch/source_mod.rs"
         old_id = f"{rel_a}::SyscallDispatcher::moved_lock_fn::proc#1"
 
         inv_path = self.migrate_dir / "dispatch-lock-authority.json"
