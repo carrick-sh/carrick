@@ -1,0 +1,24 @@
+[package]
+name = "carrick-kernel-example"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The bring-your-own-execution-backend template for carrick-kernel: a VM-less backend that runs scripted Linux tasks on host threads over Vec-backed guest memory."
+
+[lib]
+name = "carrick_kernel_example"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# `test-support` is the bridge-less surface a non-carrier backend boots on:
+# carrick-hal's Null host-signal / guest-timer bridges and the dispatcher
+# constructors that accept them. A product build of carrick never compiles it.
+carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
+carrick-hal = { path = "../carrick-hal", features = ["test-support"] }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
+carrick-abi = { path = "../carrick-abi" }
+parking_lot.workspace = true
+thiserror.workspace = true

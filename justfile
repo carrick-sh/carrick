@@ -272,6 +272,13 @@ test *ARGS:
         # those belong to a guest-capable lane (`just conformance*`,
         # `cargo test -p carrick-cli --test <name>`).
         cargo test --workspace --exclude carrick-runtime --exclude carrick-kernel --exclude carrick-cli --exclude carrick-host --exclude carrick-vfs --exclude carrick-vmm-hvf --lib --bins {{ARGS}}
+        # carrick-kernel-example's proof (`tests/fork_pipe_wait.rs`) is an
+        # integration target, and the `--lib --bins` line above never reaches
+        # a crate's `tests/` directory -- the same house trap the `--bins`
+        # note describes -- so it is named here. Its Linux tasks are host
+        # threads (no `libc::fork()` from the harness), so it needs no serial
+        # slot. One case deliberately costs its 5 s wait bound.
+        cargo test -p carrick-kernel-example --tests {{ARGS}}
         # The authenticated jit-shape builders/parsers have measured >1 MiB
         # debug frames. Several tests need two in one body; libtest's ~2 MiB
         # default has repeatedly been tipped over by unrelated additions. Keep
