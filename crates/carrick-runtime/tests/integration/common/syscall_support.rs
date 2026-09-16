@@ -13,8 +13,8 @@
 
 pub use carrick_runtime::compat::{CompatReporter, SyscallArgs};
 pub use carrick_runtime::dispatch::{
-    CurrentMmMemory, DispatchOutcome, GuestMemory, LinearMemory, ProcMapSharing, ProcMapsEntry,
-    SyscallDispatcher, SyscallRequest, ThreadCtx,
+    CurrentMmMemory, DispatchOutcome, GuestMemory, LinearMemory, SyscallDispatcher, SyscallRequest,
+    ThreadCtx,
 };
 pub use carrick_runtime::elf::SegmentPerms;
 pub use carrick_runtime::linux_abi::{
@@ -33,6 +33,7 @@ pub use carrick_runtime::memory::{
 };
 pub use carrick_runtime::thread::ThreadId;
 pub use carrick_vfs::rootfs::{LayerSource, RootFs};
+pub use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 
 /// Synthetic thread registry key for tests (`ThreadId`'s named-constructor
 /// discipline; production code never fabricates keys).
