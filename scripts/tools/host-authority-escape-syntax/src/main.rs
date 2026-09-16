@@ -10,6 +10,8 @@ use host_authority_escape_syntax::{
 const CHECKED_NON_SOURCE_SYMLINKS: &[(&str, &str)] = &[
     ("crates/carrick-cli/fixtures", "../../fixtures"),
     ("crates/carrick-cli/scripts", "../../scripts"),
+    ("crates/carrick-kernel/fixtures", "../../fixtures"),
+    ("crates/carrick-kernel/scripts", "../../scripts"),
     ("crates/carrick-runtime/fixtures", "../../fixtures"),
     ("crates/carrick-runtime/scripts", "../../scripts"),
 ];
