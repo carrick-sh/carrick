@@ -37,7 +37,7 @@
       "domain": "carrier::lease_ownership"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/creds.rs",
+      "file": "crates/carrick-kernel/src/dispatch/creds.rs",
       "function": "SyscallDispatcher::cred_snapshot",
       "ordinal_in_function": 1,
       "fingerprint": "e6b34edb6b029ea7855015c952b28536af033a6ddfe304ace6ee6f4e2e15b21a",
@@ -48,7 +48,7 @@
       "domain": "dispatch::credentials"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/creds.rs",
+      "file": "crates/carrick-kernel/src/dispatch/creds.rs",
       "function": "SyscallDispatcher::identity_pid",
       "ordinal_in_function": 1,
       "fingerprint": "d1b89ef322b9e22ac6fcfa3081cbe31b153c869736264238e7970e60dd19d53e",
@@ -59,7 +59,7 @@
       "domain": "dispatch::pid_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
       "function": "OpenDescription::stat_source",
       "ordinal_in_function": 1,
       "fingerprint": "0ef8b864ddfaca9eb8078b65aab8f5c13ca97793c5f173ea00d4a147fe5c3cb7",
@@ -71,7 +71,7 @@
       "domain": "dispatch::fd_table"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
       "function": "kernel_file_description",
       "ordinal_in_function": 1,
       "fingerprint": "bab96fc7ca7e60536376eda45e4baa6325d4efb7ad25d5bdc9597a8d10ff4c06",
@@ -83,7 +83,7 @@
       "domain": "dispatch::fd_table"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
       "function": "MemAuthority::bump_revision",
       "ordinal_in_function": 1,
       "fingerprint": "b84e12d50d6e54686ee20f43a24dfc0df6f82700c9243ac07f10c14d4b940927",
@@ -94,7 +94,7 @@
       "domain": "dispatch::mem_revision"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
       "function": "MemAuthority::fork_private_with_policy",
       "ordinal_in_function": 1,
       "fingerprint": "5817ce05a921acd9c95a4d3f1d3902dd404d5e05fa3ac2594db5a6d430dc359d",
@@ -105,7 +105,7 @@
       "domain": "dispatch::deferred_anonymous_fork"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/brk.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/brk.rs",
       "function": "MemView<'a>::brk",
       "ordinal_in_function": 1,
       "fingerprint": "c3af1011b19cfbfbc57dccb894cf9f12f148f1ec12a538a6df6e608e845bb6a0",
@@ -116,7 +116,7 @@
       "domain": "dispatch::brk"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/brk.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/brk.rs",
       "function": "MemView<'a>::brk",
       "ordinal_in_function": 2,
       "fingerprint": "c3af1011b19cfbfbc57dccb894cf9f12f148f1ec12a538a6df6e608e845bb6a0",
@@ -127,7 +127,7 @@
       "domain": "dispatch::brk"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/brk.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/brk.rs",
       "function": "MemView<'a>::brk",
       "ordinal_in_function": 3,
       "fingerprint": "c3af1011b19cfbfbc57dccb894cf9f12f148f1ec12a538a6df6e608e845bb6a0",
@@ -138,7 +138,7 @@
       "domain": "dispatch::brk"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/backing.rs",
       "function": "MemView<'a>::commit_host_alias_mmap_on",
       "ordinal_in_function": 1,
       "fingerprint": "4107c843f6ad5b842514cadbe28694837bd72313ebea8273f3f342d931b5fe6a",
@@ -149,7 +149,7 @@
       "domain": "dispatch::host_alias"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/backing.rs",
       "function": "MemView<'a>::commit_host_alias_mmap_on",
       "ordinal_in_function": 2,
       "fingerprint": "b72877ef3decfe14aa2deb42e129aa300f280d3c05bf6e4402e73dd0a92edecd",
@@ -160,7 +160,7 @@
       "domain": "dispatch::host_alias"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/backing.rs",
       "function": "MemView<'a>::commit_host_alias_mmap_on",
       "ordinal_in_function": 3,
       "fingerprint": "c4458d4389f84a4af3f486070c68d91aaa40fee697b80e8f61f63c4f131bd9b2",
@@ -171,7 +171,7 @@
       "domain": "dispatch::host_alias"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/fault.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
       "function": "MemView<'a>::commit_mmap_growdown",
       "ordinal_in_function": 1,
       "fingerprint": "c4aea678c7339eddb29b575dc610fe1fdefdacc38c9009b78c4519df38144ab1",
@@ -182,7 +182,7 @@
       "domain": "dispatch::mmap_growdown"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/fault.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
       "function": "MemView<'a>::commit_resident_fault",
       "ordinal_in_function": 1,
       "fingerprint": "8ef51523a78b2acdc6d56763f5b12cea108ab4d90518b2c34508cb6d09ed1e09",
@@ -193,7 +193,7 @@
       "domain": "dispatch::resident_fault"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mmap",
       "ordinal_in_function": 1,
       "fingerprint": "edca27f7286d5b8fb2fb17255e718a254c65e98a9a0c4823b56f1063e8d2a3ab",
@@ -204,7 +204,7 @@
       "domain": "dispatch::mmap_ioring"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mmap",
       "ordinal_in_function": 2,
       "fingerprint": "000d844e0bdeea234feda2f75d363ea04a12d0bb7f371e0bcc40675406c8cd9c",
@@ -215,7 +215,7 @@
       "domain": "dispatch::mmap_overlay"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mmap",
       "ordinal_in_function": 3,
       "fingerprint": "000d844e0bdeea234feda2f75d363ea04a12d0bb7f371e0bcc40675406c8cd9c",
@@ -226,7 +226,7 @@
       "domain": "dispatch::mmap_overlay"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mmap",
       "ordinal_in_function": 4,
       "fingerprint": "000d844e0bdeea234feda2f75d363ea04a12d0bb7f371e0bcc40675406c8cd9c",
@@ -237,7 +237,7 @@
       "domain": "dispatch::mmap_overlay"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mmap",
       "ordinal_in_function": 5,
       "fingerprint": "000d844e0bdeea234feda2f75d363ea04a12d0bb7f371e0bcc40675406c8cd9c",
@@ -248,7 +248,7 @@
       "domain": "dispatch::mmap_overlay"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mmap",
       "ordinal_in_function": 6,
       "fingerprint": "000d844e0bdeea234feda2f75d363ea04a12d0bb7f371e0bcc40675406c8cd9c",
@@ -259,7 +259,7 @@
       "domain": "dispatch::mmap_overlay"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mmap",
       "ordinal_in_function": 7,
       "fingerprint": "000d844e0bdeea234feda2f75d363ea04a12d0bb7f371e0bcc40675406c8cd9c",
@@ -270,7 +270,7 @@
       "domain": "dispatch::mmap_overlay"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mmap",
       "ordinal_in_function": 8,
       "fingerprint": "b5c86b392f2f73af35786f1719719810dd2815681d8c95bc576fd921c9aa390f",
@@ -281,7 +281,7 @@
       "domain": "dispatch::mmap_shared"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mmap",
       "ordinal_in_function": 9,
       "fingerprint": "b5c86b392f2f73af35786f1719719810dd2815681d8c95bc576fd921c9aa390f",
@@ -292,7 +292,7 @@
       "domain": "dispatch::mmap_shared"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mprotect",
       "ordinal_in_function": 1,
       "fingerprint": "1d5684eff4d84a1d9c50f6fe036c11a824ae502946649817439856eb23c178c0",
@@ -303,7 +303,7 @@
       "domain": "dispatch::mprotect"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mremap",
       "ordinal_in_function": 1,
       "fingerprint": "970391625205832e8731dd95c0d2562497c16d85c25c0c01751e25b87d7abbfd",
@@ -314,7 +314,7 @@
       "domain": "dispatch::mremap"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mremap",
       "ordinal_in_function": 2,
       "fingerprint": "970391625205832e8731dd95c0d2562497c16d85c25c0c01751e25b87d7abbfd",
@@ -325,7 +325,7 @@
       "domain": "dispatch::mremap_shared"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mremap",
       "ordinal_in_function": 3,
       "fingerprint": "970391625205832e8731dd95c0d2562497c16d85c25c0c01751e25b87d7abbfd",
@@ -336,7 +336,7 @@
       "domain": "dispatch::mremap_shared"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mremap",
       "ordinal_in_function": 4,
       "fingerprint": "970391625205832e8731dd95c0d2562497c16d85c25c0c01751e25b87d7abbfd",
@@ -347,7 +347,7 @@
       "domain": "dispatch::mremap_shared"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mremap",
       "ordinal_in_function": 5,
       "fingerprint": "970391625205832e8731dd95c0d2562497c16d85c25c0c01751e25b87d7abbfd",
@@ -358,7 +358,7 @@
       "domain": "dispatch::mremap_overlay"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mremap",
       "ordinal_in_function": 6,
       "fingerprint": "7cba672ac67165f0d2ebfff0216d65d133bea8f175d5f3a36584452d80e4036c",
@@ -369,7 +369,7 @@
       "domain": "dispatch::mremap"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::munmap",
       "ordinal_in_function": 1,
       "fingerprint": "933aaec15cd75057d6e7476df26088e40b213c53fabfa91eb85199a1bea4445e",
@@ -380,7 +380,7 @@
       "domain": "dispatch::munmap_overlay"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::munmap",
       "ordinal_in_function": 2,
       "fingerprint": "b0d6b7a417eaf049fd0fdfffe4964052aea2087e1e3dfd1632340a959539d7cc",
@@ -391,7 +391,7 @@
       "domain": "dispatch::munmap_overlay"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::munmap",
       "ordinal_in_function": 3,
       "fingerprint": "b0d6b7a417eaf049fd0fdfffe4964052aea2087e1e3dfd1632340a959539d7cc",
@@ -402,7 +402,7 @@
       "domain": "dispatch::munmap_shared"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::munmap",
       "ordinal_in_function": 4,
       "fingerprint": "65662c9baa2211e57ce9b728bceb5060db399fbb769cb8f702e786d2341d657c",
@@ -413,7 +413,7 @@
       "domain": "dispatch::munmap_overlay"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/backing.rs",
       "function": "MemView<'a>::record_alias_vma",
       "ordinal_in_function": 1,
       "fingerprint": "938caa465e5fc4b9e3f3334c00995087b235db5ad7b88487ecb79fe1d47253ee",
@@ -424,7 +424,7 @@
       "domain": "dispatch::host_alias"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/backing.rs",
       "function": "MemView<'a>::record_alias_vma",
       "ordinal_in_function": 2,
       "fingerprint": "eef346335b0fec47bf28f9432b120d91758ae32ed79e638242f5eb6e9249ebf6",
@@ -435,7 +435,7 @@
       "domain": "dispatch::host_alias"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/backing.rs",
       "function": "MemView<'a>::record_remapped_dynamic_mapping",
       "ordinal_in_function": 1,
       "fingerprint": "d7c4fdc15b406c800b9fc43712459f885d98549db0d31a93e14853b9a7f459a5",
@@ -446,7 +446,7 @@
       "domain": "dispatch::mremap"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem/backing.rs",
       "function": "MemView<'a>::recover_private_repoint_failure",
       "ordinal_in_function": 1,
       "fingerprint": "cab94f646104e2486883eed7c7302a59a0f4af683d185266a50a016afd7fc03e",
@@ -457,7 +457,7 @@
       "domain": "dispatch::mem_overlay"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
       "function": "MemView<'a>::rollback_fresh_arena_mapping",
       "ordinal_in_function": 1,
       "fingerprint": "54058893df635b231863c780f13fa93aabebe7813c3633288b43a629ba7a58be",
@@ -468,7 +468,7 @@
       "domain": "dispatch::mmap_rollback"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
       "function": "MemView<'a>::rollback_shared_anon_mapping",
       "ordinal_in_function": 1,
       "fingerprint": "0caaebadaef70ce0aaa09c88c0a6b8b61a2e5f84f39ca059ed4b12f200403149",
@@ -479,7 +479,7 @@
       "domain": "dispatch::mmap_rollback"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mm_mutation.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mm_mutation.rs",
       "function": "<MmSnapshotGuard as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "cf15c4e8aa946c850d2d11d85a3079003160d3122aa098375e4f79e29d5ad2a7",
@@ -490,7 +490,7 @@
       "domain": "dispatch::mm_mutation"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mm_mutation.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mm_mutation.rs",
       "function": "from_frame_cow",
       "ordinal_in_function": 1,
       "fingerprint": "a313d914f1efcb502c6d22a7b1d1a949bf44eb33dc9bd6054e1b424c38a2d5db",
@@ -501,7 +501,7 @@
       "domain": "dispatch::mm_mutation"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mm_mutation.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mm_mutation.rs",
       "function": "from_pt_pause",
       "ordinal_in_function": 1,
       "fingerprint": "a525ed9327acc12b1faf20975517e068e1ef848376ef4c0d1e6ac7d558e36d18",
@@ -512,7 +512,7 @@
       "domain": "dispatch::mm_mutation"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "file": "crates/carrick-kernel/src/dispatch/host_alias.rs",
       "function": "<HostAliasDispatchGuard<'_> as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "f49624eac3ea22e23576535dcc326d7ff4bd0c9222c5b1611df9d57bfab1b38b",
@@ -523,7 +523,7 @@
       "domain": "dispatch::mem_revision"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mm_authority.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mm_authority.rs",
       "function": "DispatchMmBinding::rebind_prepared_root",
       "ordinal_in_function": 1,
       "fingerprint": "95a3e30e28bdfefdfd10ca31403374bfde67c323ba2d4fd65c210f6e6af4b9f4",
@@ -534,7 +534,7 @@
       "domain": "dispatch::mm_binding"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mm_authority.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mm_authority.rs",
       "function": "DispatchMmBinding::stage_private_exec",
       "ordinal_in_function": 1,
       "fingerprint": "4cf254739a9d86140b156fc9683fec9579b5617d6e08e2487301f371192904bf",
@@ -545,7 +545,7 @@
       "domain": "dispatch::mm_binding"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "file": "crates/carrick-kernel/src/dispatch/host_alias.rs",
       "function": "HostAliasDispatchGuard<'_>::publish",
       "ordinal_in_function": 1,
       "fingerprint": "f8bcea04aa49a5898808a9640ced88393e1339d743d9a6f65fbd9aaa2a7406ca",
@@ -556,7 +556,7 @@
       "domain": "dispatch::host_alias_transactions"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "file": "crates/carrick-kernel/src/dispatch/host_alias.rs",
       "function": "HostAliasDispatchGuard<'_>::with_authority",
       "ordinal_in_function": 1,
       "fingerprint": "2b7a9c4dbfeced482bf7f142f302c08b7d5d78f5d7602d5e4630ad95cd501b18",
@@ -567,7 +567,7 @@
       "domain": "dispatch::host_alias_transactions"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mm_authority.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mm_authority.rs",
       "function": "MmExecutorParticipation::participation_mut",
       "ordinal_in_function": 1,
       "fingerprint": "7b4470815c28e947603f9a8a0f6a3e3c88132ea25b560702d3c2faf0890b1929",
@@ -578,7 +578,7 @@
       "domain": "dispatch::mm_executor_participation"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mm_authority.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mm_authority.rs",
       "function": "MmExecutorParticipation::reenter_exact",
       "ordinal_in_function": 1,
       "fingerprint": "943f7d94656f10965a4c99e51be6386f9eeb7897dbd1f700b560f343b6392cb4",
@@ -589,7 +589,7 @@
       "domain": "dispatch::mm_executor_participation"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mm_authority.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mm_authority.rs",
       "function": "PreparedDispatchMmExec::commit",
       "ordinal_in_function": 1,
       "fingerprint": "df1e00241c924d3655780d711e4ed37c65242bba6fe04cb3d4fe0b6d36422a58",
@@ -600,7 +600,7 @@
       "domain": "dispatch::mm_exec_commit"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mm_authority.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mm_authority.rs",
       "function": "PreparedDispatchMmExec::commit",
       "ordinal_in_function": 2,
       "fingerprint": "7afa329bbfce4d67a674fd50b4a1a5cb72f20b7279a6a1c166fa1b95062875e3",
@@ -611,7 +611,7 @@
       "domain": "dispatch::mm_exec_commit"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
+      "file": "crates/carrick-kernel/src/dispatch/kernel_context.rs",
       "function": "SyscallDispatcher::bind_hvpatch_process",
       "ordinal_in_function": 1,
       "fingerprint": "30945dc9120382d67851b68c0f55f4273fb85dfe7da40b17fd2b1487cb5ccac2",
@@ -622,7 +622,7 @@
       "domain": "dispatch::hvpatch_binding"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
+      "file": "crates/carrick-kernel/src/dispatch/kernel_context.rs",
       "function": "SyscallDispatcher::bind_hvpatch_process",
       "ordinal_in_function": 2,
       "fingerprint": "7339858a121b1fe9d5102dcf64ebbc7b7c04cd8a2b7f4c27205e20e159793a02",
@@ -633,7 +633,7 @@
       "domain": "dispatch::hvpatch_binding"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
+      "file": "crates/carrick-kernel/src/dispatch/kernel_context.rs",
       "function": "SyscallDispatcher::bind_hvpatch_process_exact",
       "ordinal_in_function": 1,
       "fingerprint": "b72dba1ec864481df0a0856fbd0db6e2c0594ebd13441f27bc99212eb550b1ce",
@@ -644,7 +644,7 @@
       "domain": "dispatch::hvpatch_binding"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mod.rs",
       "function": "SyscallDispatcher::captured_file_table",
       "ordinal_in_function": 1,
       "fingerprint": "2f0d9ef99fcdce1033725ae927b6e3285af6f794b52812c0818190e0570adf27",
@@ -655,7 +655,7 @@
       "domain": "dispatch::file_authority"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mod.rs",
       "function": "SyscallDispatcher::captured_fs_context",
       "ordinal_in_function": 1,
       "fingerprint": "c9602577d1ee7b0fe9233e7f229d04352b2bc2125a71dcbf2ddd0abc1cb121d1",
@@ -666,7 +666,7 @@
       "domain": "dispatch::fs_context"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mod.rs",
       "function": "SyscallDispatcher::captured_mm",
       "ordinal_in_function": 1,
       "fingerprint": "93f20ffc2262343babffea75420c25c1f9e308ea8241e88809e6dddef71575c4",
@@ -677,7 +677,7 @@
       "domain": "dispatch::mm_authority"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "file": "crates/carrick-kernel/src/dispatch/host_alias.rs",
       "function": "SyscallDispatcher::commit_host_alias_install",
       "ordinal_in_function": 1,
       "fingerprint": "d1288d2a935f542b2e958737eebcd08d6ff7db0ddbe079f6f3f783ce4ce8a95b",
@@ -688,7 +688,7 @@
       "domain": "dispatch::host_alias_commit"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mod.rs",
       "function": "SyscallDispatcher::enter_mm_executor_inner",
       "ordinal_in_function": 1,
       "fingerprint": "3941d164f4b56580856bb3e8315d65a6b9a336c4752757cb85ed73afb516700e",
@@ -699,7 +699,7 @@
       "domain": "dispatch::mm_executor_admission"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "file": "crates/carrick-kernel/src/dispatch/host_alias.rs",
       "function": "SyscallDispatcher::mark_vma_dispatch",
       "ordinal_in_function": 1,
       "fingerprint": "97c09b9c7ace02a91e0135fa4bcb9f4a07603580f10e1ffd196e9d69bf72f42c",
@@ -710,7 +710,7 @@
       "domain": "dispatch::mm_binding"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mod.rs",
       "function": "SyscallDispatcher::with_current_mm_executor_released",
       "ordinal_in_function": 1,
       "fingerprint": "aec14f8fcac8d70f0268871bd848dea211f665cc4ddd1607eec5a2b10fbdbdd6",
@@ -721,7 +721,7 @@
       "domain": "dispatch::mm_executor_reentry"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mod.rs",
       "function": "SyscallDispatcher::with_current_mm_executor_released",
       "ordinal_in_function": 2,
       "fingerprint": "2ba8c1f952a552300d7dfd16c5c3842a12591d8874f2976404e57cc78bfe920e",
@@ -732,7 +732,7 @@
       "domain": "dispatch::mm_executor_reentry"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/resources.rs",
+      "file": "crates/carrick-kernel/src/dispatch/resources.rs",
       "function": "with_resource_scope",
       "ordinal_in_function": 1,
       "fingerprint": "086b74fafeedb1c99db1403a847dc568361db73026ec304ff689c307bc078e36",
@@ -744,7 +744,7 @@
       "domain": "dispatch::file_table_lease"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/signal.rs",
+      "file": "crates/carrick-kernel/src/dispatch/signal.rs",
       "function": "SyscallDispatcher::install_signal_action",
       "ordinal_in_function": 1,
       "fingerprint": "6a230fd6f7052eeba301cd6997b5a13d5773de190388afa05c62353fe576cf45",
@@ -755,7 +755,7 @@
       "domain": "dispatch::signal_disposition"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/signal.rs",
+      "file": "crates/carrick-kernel/src/dispatch/signal.rs",
       "function": "SyscallDispatcher::required_signal_thread",
       "ordinal_in_function": 1,
       "fingerprint": "2a11c9a346be1a82709e2064b2e1d00680cbd6df0abe9f9afa59785912116b60",
@@ -766,7 +766,7 @@
       "domain": "dispatch::signal_authority"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/signal.rs",
+      "file": "crates/carrick-kernel/src/dispatch/signal.rs",
       "function": "ns_visible_sender_pid",
       "ordinal_in_function": 1,
       "fingerprint": "94f80a958b314388a009a367af5f2d457fee38544857e50cef398de81815e1ff",
@@ -777,7 +777,7 @@
       "domain": "dispatch::signal_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
       "function": "<PendingShmat as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "cfbd3e0ed4d3fdc4f5892f26639d641cb2088b9d00db77e8f2cad826466f8684",
@@ -788,7 +788,7 @@
       "domain": "dispatch::sysv_shm"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
       "function": "IpcView<'a>::shmdt",
       "ordinal_in_function": 1,
       "fingerprint": "53f882d9518a7ab87f0e324f7a598547a0466dde63d9aecb789c0d4856462342",
@@ -799,7 +799,7 @@
       "domain": "dispatch::sysv_shmdt"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs",
+      "file": "crates/carrick-kernel/src/dispatch/sysv/lock_authority.rs",
       "function": "SysvProcessGuard<'a>::commit_host_alias_shmat",
       "ordinal_in_function": 1,
       "fingerprint": "ee78869449b16e670e119993b00ed1b029dc35e8ee3279ff563f936a08089016",
@@ -810,7 +810,7 @@
       "domain": "dispatch::sysv_shmat"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs",
+      "file": "crates/carrick-kernel/src/dispatch/sysv/lock_authority.rs",
       "function": "SysvProcessGuard<'a>::commit_host_alias_shmat",
       "ordinal_in_function": 2,
       "fingerprint": "e0e778915a4e673e4c5b507a4a6ecb792387d146a82bfd3a1ea2d105f58dfd1a",
@@ -821,7 +821,7 @@
       "domain": "dispatch::sysv_shmat"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs",
+      "file": "crates/carrick-kernel/src/dispatch/sysv/lock_authority.rs",
       "function": "SysvProcessGuard<'a>::commit_remapped_shmat",
       "ordinal_in_function": 1,
       "fingerprint": "63ab2c18ad5f89cf3d27c026033f64f0346e32fd0541148afa1212a9b7879e1f",
@@ -832,7 +832,7 @@
       "domain": "dispatch::sysv_shmat"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs",
+      "file": "crates/carrick-kernel/src/dispatch/sysv/lock_authority.rs",
       "function": "SysvProcessGuard<'a>::commit_remapped_shmat",
       "ordinal_in_function": 2,
       "fingerprint": "2225cb2ee02065ffa8334c8308cf7bcaeb9664e38be16dc7a2013001975d31d3",
@@ -843,7 +843,7 @@
       "domain": "dispatch::sysv_shmat"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs",
+      "file": "crates/carrick-kernel/src/dispatch/sysv/lock_authority.rs",
       "function": "SysvProcessGuard<'a>::commit_shmdt",
       "ordinal_in_function": 1,
       "fingerprint": "43bf4cc2481205b13ff64c67e7b66493c5c705551132deb2b0209e56040d8545",
@@ -854,7 +854,7 @@
       "domain": "dispatch::sysv_shmdt"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs",
+      "file": "crates/carrick-kernel/src/dispatch/sysv/lock_authority.rs",
       "function": "SysvProcessGuard<'a>::commit_shmdt",
       "ordinal_in_function": 2,
       "fingerprint": "a953f31d43b8ca4ba03eab8c38acafe37b1d89e4679edcdfb16c35857237f784",
@@ -865,7 +865,7 @@
       "domain": "dispatch::sysv_shmdt"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs",
+      "file": "crates/carrick-kernel/src/dispatch/sysv/lock_authority.rs",
       "function": "SysvProcessGuard<'a>::commit_shmdt",
       "ordinal_in_function": 3,
       "fingerprint": "ec3c66b5a704d6f46887de06a1d84fc2272f2452a31025471a51552cde292ad8",
@@ -876,7 +876,7 @@
       "domain": "dispatch::sysv_shmdt"
     },
     {
-      "file": "crates/carrick-runtime/src/file_authority/core.rs",
+      "file": "crates/carrick-kernel/src/file_authority/core.rs",
       "function": "abort_fatal",
       "ordinal_in_function": 1,
       "fingerprint": "e3d4e8d00c1d75b595fc301336af3b83664dba410bba22eb13b5935ff7b39e78",
@@ -887,7 +887,7 @@
       "domain": "file_authority::core"
     },
     {
-      "file": "crates/carrick-runtime/src/file_authority/stream.rs",
+      "file": "crates/carrick-kernel/src/file_authority/stream.rs",
       "function": "PipeStreamState::release",
       "ordinal_in_function": 1,
       "fingerprint": "84ccddc33fedac9d63fd06b83a762afa36d8a9e4a9afdf5f82cfa96fd23695bf",
@@ -1011,7 +1011,7 @@
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
       "function": "<ProcessContext as carrick_kernel::kernel::CarrierProcess>::bind_mm_mutation_authority",
       "ordinal_in_function": 1,
-      "fingerprint": "bd3edc293bbe7bd4ab626eebcbf8cf0906183d6b2a3392e8120c75de827b88b5",
+      "fingerprint": "57bc729e83691f612143b3c80351163afa9045d45c59762eda94d340b00af486",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::process_context",
       "rationale": "Capturing leader task context in ProcessContext::bind_mm_mutation_authority failed; cannot install foreign MM mutation authority without active task context in kernel graph.",
@@ -1096,7 +1096,7 @@
       "domain": "hvpatch::exec_commit"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/carrier_process.rs",
+      "file": "crates/carrick-kernel/src/kernel/carrier_process.rs",
       "function": "wait_result",
       "ordinal_in_function": 1,
       "fingerprint": "fa22285edc3b75d92a25d221a951a34bda21dac1a2e985c5c6e51c5eb1a78821",
@@ -1316,7 +1316,7 @@
       "domain": "interactive::session_ownership"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "DebugAuxProviderRegistry::reserve_id",
       "ordinal_in_function": 1,
       "fingerprint": "f854b54646579d8de09f1b9eece29ee6f7f71050033f8f2dcfca1cd8fc54704b",
@@ -1327,7 +1327,7 @@
       "domain": "kernel::debug_provider_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "Kernel::bootstrap_root",
       "ordinal_in_function": 1,
       "fingerprint": "04320b69965a227011e79c80a1e96215eab1bd983b1dbadf4f9bbaf690e2bd85",
@@ -1338,7 +1338,7 @@
       "domain": "kernel::bootstrap_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "Kernel::retire_container_root",
       "ordinal_in_function": 1,
       "fingerprint": "c1efb56d41485bf6e23ae599c3e4a5ede628507a166c1834927f6916ffa71d59",
@@ -1349,7 +1349,7 @@
       "domain": "kernel::container_retirement"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "Kernel::retire_container_root",
       "ordinal_in_function": 2,
       "fingerprint": "c1efb56d41485bf6e23ae599c3e4a5ede628507a166c1834927f6916ffa71d59",
@@ -1360,7 +1360,7 @@
       "domain": "kernel::container_retirement"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "Kernel::retire_container_root",
       "ordinal_in_function": 3,
       "fingerprint": "c1efb56d41485bf6e23ae599c3e4a5ede628507a166c1834927f6916ffa71d59",
@@ -1371,7 +1371,7 @@
       "domain": "kernel::container_retirement"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "Kernel::retire_container_root",
       "ordinal_in_function": 4,
       "fingerprint": "c1efb56d41485bf6e23ae599c3e4a5ede628507a166c1834927f6916ffa71d59",
@@ -1382,7 +1382,7 @@
       "domain": "kernel::container_retirement"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "Kernel::retire_container_root",
       "ordinal_in_function": 5,
       "fingerprint": "c1efb56d41485bf6e23ae599c3e4a5ede628507a166c1834927f6916ffa71d59",
@@ -1393,7 +1393,7 @@
       "domain": "kernel::container_retirement"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "Kernel::retire_container_root",
       "ordinal_in_function": 6,
       "fingerprint": "c1efb56d41485bf6e23ae599c3e4a5ede628507a166c1834927f6916ffa71d59",
@@ -1404,7 +1404,7 @@
       "domain": "kernel::container_retirement"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "PreparedContainerRoot::commit",
       "ordinal_in_function": 1,
       "fingerprint": "9a99331f0e49bb6027bc22cf965ecdea4d9589361d280c46977c65967541b116",
@@ -1415,7 +1415,7 @@
       "domain": "kernel::container_root_publication"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "PreparedContainerRoot::commit",
       "ordinal_in_function": 2,
       "fingerprint": "e1f4a4916161e5b6917b8e7eca67733ff362782d0f11d869118d72e86ae215cb",
@@ -1426,7 +1426,7 @@
       "domain": "kernel::container_root_publication"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "RegistryState::publish_epoch",
       "ordinal_in_function": 1,
       "fingerprint": "06f410d6251c93455efea1a3bd583438c02662b44914e181852f3458ba0d7bf3",
@@ -1437,7 +1437,7 @@
       "domain": "kernel::registry_epoch"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "RegistryState::publish_process_group",
       "ordinal_in_function": 1,
       "fingerprint": "9f3910b0900419bf6c3fd16a8f0560d5bfa647eafcda56aed4e9dd9772536d86",
@@ -1448,7 +1448,7 @@
       "domain": "kernel::process_group_index"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "RegistryState::publish_session",
       "ordinal_in_function": 1,
       "fingerprint": "172748a77fec274c8df4a1f6d2a0f169fb380ecf65352410db4ca19744bfec3b",
@@ -1459,7 +1459,7 @@
       "domain": "kernel::session_index"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "RegistryState::remove_process_group",
       "ordinal_in_function": 1,
       "fingerprint": "d4f1b42bf281d05b64c24dddd9893b042408ffb69ebece0b527fd186eeb1feb0",
@@ -1470,7 +1470,7 @@
       "domain": "kernel::process_group_index"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "RegistryState::remove_session",
       "ordinal_in_function": 1,
       "fingerprint": "d34a07c21f5356f82c2f8f1b51802640cf9a7f53af412298c4927724146d94c7",
@@ -1481,7 +1481,7 @@
       "domain": "kernel::session_index"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "ReservationGate::subscribe",
       "ordinal_in_function": 1,
       "fingerprint": "891c000bd5526f116ee0fa24e96ab8a23cc00e1166c258704bfaaba254b7acab",
@@ -1492,7 +1492,7 @@
       "domain": "kernel::reservation_gate"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/frame_inventory.rs",
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
       "function": "FrameInventoryAuthority::apply_retirement_with_receipt",
       "ordinal_in_function": 1,
       "fingerprint": "3f142e3e5e72c3d11b96151993d5d384c049b8d854250024546b983b05d1aa75",
@@ -1503,7 +1503,7 @@
       "domain": "kernel::frame_inventory"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/frame_inventory.rs",
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
       "function": "FrameInventoryAuthority::apply_with_receipt",
       "ordinal_in_function": 1,
       "fingerprint": "155a86b08a7bb112ff010ca5b4f2c935c24bbcd1b67b11fb3fefef0939792fb1",
@@ -1514,7 +1514,7 @@
       "domain": "kernel::frame_inventory"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/guest_execution.rs",
+      "file": "crates/carrick-kernel/src/kernel/guest_execution.rs",
       "function": "<GuestExecutorParticipation as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "984107163f58fe462c3c944b1fea4a1852277e4f5f59ec659cc0ee592634036f",
@@ -1525,7 +1525,7 @@
       "domain": "kernel::guest_executor_census"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects/thread.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects/thread.rs",
       "function": "<CrashSafePointParticipation as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "e596fdfdfef72272201092f6dd7e012162d3d1843f9d26bada5cc6bda7b0148d",
@@ -1536,7 +1536,7 @@
       "domain": "kernel::crash_safe_point_participation"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects.rs",
       "function": "<FileTableFunctionalLease as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "343ebd30ff8887b98f45ed11632cd16feb7926d4305a60f82952e062bec978a0",
@@ -1547,7 +1547,7 @@
       "domain": "kernel::file_table_gate"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects.rs",
       "function": "<FileTableMutationLease as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "cc1fe24ded2e9e52477cb85d5e3473a1a0e19cd5b0eeafe944da7ad72c7efa49",
@@ -1558,7 +1558,7 @@
       "domain": "kernel::file_table_gate"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects.rs",
       "function": "DescriptionCommon::release_fd_ref",
       "ordinal_in_function": 1,
       "fingerprint": "e87a7220881e390a885751acbe41d7c9fe9a5d2ca6e79af9962ae0aca0fd0f55",
@@ -1569,7 +1569,7 @@
       "domain": "kernel::file_description_refs"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects.rs",
       "function": "<MappedFileReference as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "eb0e79fae5ae74f15084aa16953b8bbe3764bcdffacd9fee560973f116ca95ea",
@@ -1580,7 +1580,7 @@
       "domain": "kernel::file_description_refs"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects.rs",
       "function": "FileDescription::retain_mapping",
       "ordinal_in_function": 1,
       "fingerprint": "f99681100c24162c74af8907d6aef5cd40f511ae1a78a8a33c4966935bdf75c6",
@@ -1591,7 +1591,7 @@
       "domain": "kernel::file_description_refs"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects.rs",
       "function": "FileTable::mutation_lease",
       "ordinal_in_function": 1,
       "fingerprint": "b1c6ebd6bff4b8c3833de8e0447c58e9a7c308aa52c146676ee541c5f46b99fa",
@@ -1603,7 +1603,7 @@
       "domain": "kernel::file_table_gate"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects/process.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects/process.rs",
       "function": "Mm::replace_io_uring_mappings",
       "ordinal_in_function": 1,
       "fingerprint": "9246e4fe4c24869050836e40438c18720face1ebb55bfb9158fe61192845c0fe",
@@ -1614,7 +1614,7 @@
       "domain": "kernel::mm_io_uring"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects.rs",
       "function": "ObjectRevision::publish",
       "ordinal_in_function": 1,
       "fingerprint": "281b8472f62bc62ceae2b90f633ba2eed87e3686b46ba16e48bb99ac6b701de6",
@@ -1625,7 +1625,7 @@
       "domain": "kernel::object_revision"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects/signal.rs",
       "function": "PendingQueue::entries",
       "ordinal_in_function": 1,
       "fingerprint": "f06278cfa5448cf220a8768099cdf847e2ff3fdc0a35c10f278221c5d574fa00",
@@ -1636,7 +1636,7 @@
       "domain": "kernel::pending_signals"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects/session.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects/session.rs",
       "function": "ProcessGroup::new",
       "ordinal_in_function": 1,
       "fingerprint": "d4a55ae392cf44587e26b549ac1900ea08796f25fd872979d50a2a5bb9532683",
@@ -1647,7 +1647,7 @@
       "domain": "kernel::process_group_generation"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects/process.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects/process.rs",
       "function": "Zombie::from_task",
       "ordinal_in_function": 1,
       "fingerprint": "8aea0a65ad68f742c0067dda239660e06424303b86c1f533392364be91b4c5c2",
@@ -1658,7 +1658,7 @@
       "domain": "kernel::zombie_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects/process.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects/process.rs",
       "function": "Zombie::from_task",
       "ordinal_in_function": 2,
       "fingerprint": "708a0945c05fbfec777eb64b3244da040dffa828643009930c714fc9a4aa88ab",
@@ -1669,7 +1669,7 @@
       "domain": "kernel::zombie_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects/task.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects/task.rs",
       "function": "advance_job_control_stop_invalidation_generation",
       "ordinal_in_function": 1,
       "fingerprint": "9f358b788a5845a340158ca0b8ac5f33f9871adc5078fd9a952de7cfb403a8f4",
@@ -1680,7 +1680,7 @@
       "domain": "kernel::job_control"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects/task.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects/task.rs",
       "function": "advance_ptrace_stop_generation",
       "ordinal_in_function": 1,
       "fingerprint": "3bcdc5729a3f7a1ee875ba9f8f1c40b3d07c7b3e1de996e82ab219355f9cfa3a",
@@ -1691,7 +1691,7 @@
       "domain": "kernel::ptrace_stop_authority"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-kernel/src/kernel/objects.rs",
       "function": "next_file_slot_generation",
       "ordinal_in_function": 1,
       "fingerprint": "6281aa97b713ca11ed1a5522210c7ceb46052d2f3ac1599b32a865b525796b90",
@@ -1702,7 +1702,7 @@
       "domain": "kernel::file_slot_generation"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations/exit.rs",
+      "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
       "function": "Kernel::commit_task_exit_notifying",
       "ordinal_in_function": 1,
       "fingerprint": "bacdf1e940b9eb1cea493ce7019ea2f566fe9f76ba599b7d07969dab72f4edaa",
@@ -1713,7 +1713,7 @@
       "domain": "kernel::task_exit_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations/exit.rs",
+      "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
       "function": "Kernel::commit_task_exit_notifying",
       "ordinal_in_function": 2,
       "fingerprint": "597582362627a10c245b5e4fe600ca452a4917d1cf2969b45a370801ba999339",
@@ -1724,7 +1724,7 @@
       "domain": "kernel::task_exit_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations/exit.rs",
+      "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
       "function": "Kernel::exit_thread",
       "ordinal_in_function": 1,
       "fingerprint": "e26ae01fabcca7e2d0b7743d391daa1b81a421e564f0f52aeba533af8c46a3fe",
@@ -1735,7 +1735,7 @@
       "domain": "kernel::thread_retirement"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations/exit.rs",
+      "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
       "function": "Kernel::exit_thread",
       "ordinal_in_function": 2,
       "fingerprint": "e26ae01fabcca7e2d0b7743d391daa1b81a421e564f0f52aeba533af8c46a3fe",
@@ -1746,7 +1746,7 @@
       "domain": "kernel::thread_retirement"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations/session.rs",
+      "file": "crates/carrick-kernel/src/kernel/operations/session.rs",
       "function": "Kernel::initialize_launch_controlling_tty",
       "ordinal_in_function": 1,
       "fingerprint": "dd5c19cb1be241c48359148f3766f722f2d6415936624bfb4a3c0a1fe2187340",
@@ -1757,7 +1757,7 @@
       "domain": "kernel::tty_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations/session.rs",
+      "file": "crates/carrick-kernel/src/kernel/operations/session.rs",
       "function": "Kernel::initialize_launch_controlling_tty",
       "ordinal_in_function": 2,
       "fingerprint": "1f89c1300b7d2eb9a2f7e178b20d38c121ba1a77d0a600a889076ab2ad7a0807",
@@ -1768,7 +1768,7 @@
       "domain": "kernel::tty_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations/session.rs",
+      "file": "crates/carrick-kernel/src/kernel/operations/session.rs",
       "function": "Kernel::set_process_group",
       "ordinal_in_function": 1,
       "fingerprint": "e716380b6db7bfc3decd6c4dedf9dd7ec88c6144e11c1b6ed1e9f2d2a37accdc",
@@ -1779,7 +1779,7 @@
       "domain": "kernel::process_group_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations/identity.rs",
+      "file": "crates/carrick-kernel/src/kernel/operations/identity.rs",
       "function": "Kernel::update_fs_umask",
       "ordinal_in_function": 1,
       "fingerprint": "8e83e6c2b52a63cd9366e43273a0835fb7348cb7c1adf4f4c8b5401f110d4dee",
@@ -1790,7 +1790,7 @@
       "domain": "kernel::fs_context_publication"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations/wait.rs",
+      "file": "crates/carrick-kernel/src/kernel/operations/wait.rs",
       "function": "Kernel::wait_child_matching",
       "ordinal_in_function": 1,
       "fingerprint": "2bf13088d6b40fcfe444997b60af74a0a76d3c23a990a0f43ce03cf7fd19ef41",
@@ -1801,7 +1801,7 @@
       "domain": "kernel::child_reaping"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations/wait.rs",
+      "file": "crates/carrick-kernel/src/kernel/operations/wait.rs",
       "function": "Kernel::wait_child_matching",
       "ordinal_in_function": 2,
       "fingerprint": "2bf13088d6b40fcfe444997b60af74a0a76d3c23a990a0f43ce03cf7fd19ef41",
@@ -1812,7 +1812,7 @@
       "domain": "kernel::child_reaping"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations/thread.rs",
+      "file": "crates/carrick-kernel/src/kernel/operations/thread.rs",
       "function": "PreparedThreadClone::commit",
       "ordinal_in_function": 1,
       "fingerprint": "ff51fd853427c91afa74b951d0b74ab14e59690a79fc3e51ee8b59d909b7bcff",
@@ -1823,7 +1823,7 @@
       "domain": "kernel::thread_publication"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "IdleAnnouncement<'a>::release",
       "ordinal_in_function": 1,
       "fingerprint": "62ea8405d8f0ec17e5239087519e6a7b8a118b7a2950f68b744d0f7942e7f423",
@@ -1834,10 +1834,10 @@
       "domain": "kernel::run_queue"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "RunQueue::close",
       "ordinal_in_function": 1,
-      "fingerprint": "9cb676cb37ced9f941dd17ac676252aa9d65272bfc594f7d26f9be573f48c23a",
+      "fingerprint": "0af82c6ab23571b0409a8ac1475cd344ea0ec659ad4f707dc92cbc89ea9d0369",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::run_queue",
       "rationale": "RunQueue close_epoch counter overflow in close; wrapping epoch numbers corrupts queue close synchronization.",
@@ -1845,7 +1845,7 @@
       "domain": "kernel::run_queue"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "RunQueue::observe_close",
       "ordinal_in_function": 1,
       "fingerprint": "b19bdb4e781339e61740f77834ea20dd75e106361f96fa22835fee257f13f93b",
@@ -1856,7 +1856,7 @@
       "domain": "kernel::run_queue"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "RunQueue::park_spare",
       "ordinal_in_function": 1,
       "fingerprint": "06a45053424f024761bfa474f26b49ce536be4b7e2bb45c55a579c199ecd8afc",
@@ -1867,7 +1867,7 @@
       "domain": "kernel::run_queue"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "RunQueue::park_spare",
       "ordinal_in_function": 2,
       "fingerprint": "06a45053424f024761bfa474f26b49ce536be4b7e2bb45c55a579c199ecd8afc",
@@ -1878,7 +1878,7 @@
       "domain": "kernel::run_queue"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "RunQueue::park_spare",
       "ordinal_in_function": 3,
       "fingerprint": "06a45053424f024761bfa474f26b49ce536be4b7e2bb45c55a579c199ecd8afc",
@@ -1889,7 +1889,7 @@
       "domain": "kernel::run_queue"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "RunQueue::retire_executor",
       "ordinal_in_function": 1,
       "fingerprint": "050e2f354b3c1788a1fd00c8fda185964bcee814eaf76ca8da30b6aa34ee8f24",
@@ -1900,10 +1900,10 @@
       "domain": "kernel::run_queue"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "RunQueue::take_row",
       "ordinal_in_function": 1,
-      "fingerprint": "7167e91ce7ac919309401c3434fc5ac9b53b6e6b1c4dfe1f774efe35276f0ede",
+      "fingerprint": "cf3ceea90f3e70a9ceb456a2917ec4abc21232a20fb9b4cd63fbe7a1c5879ee1",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::run_queue",
       "rationale": "RunQueue claimed count overflow in take_row; corrupts run queue claim accounting.",
@@ -1911,10 +1911,10 @@
       "domain": "kernel::run_queue"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "RunQueue::take_row",
       "ordinal_in_function": 2,
-      "fingerprint": "7167e91ce7ac919309401c3434fc5ac9b53b6e6b1c4dfe1f774efe35276f0ede",
+      "fingerprint": "cf3ceea90f3e70a9ceb456a2917ec4abc21232a20fb9b4cd63fbe7a1c5879ee1",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::run_queue",
       "rationale": "RunQueue closed_waiter_observations count overflow in take_row; corrupts queue close draining synchronization.",
@@ -1922,7 +1922,7 @@
       "domain": "kernel::run_queue"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "RunQueueInner::finish_claim",
       "ordinal_in_function": 1,
       "fingerprint": "bbf7ee4c6ef51172aa7a48382ee843246c3c2020e50104c6b41980348d7ee27f",
@@ -1933,7 +1933,7 @@
       "domain": "kernel::run_queue"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "RunQueueInner::poke_control",
       "ordinal_in_function": 1,
       "fingerprint": "85069a20690cf68735010503d90fdf06028fa78de4c99e1b03fbe9b2fd8c756c",
@@ -1944,7 +1944,7 @@
       "domain": "kernel::scheduler_control"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "RunQueueInner::release_authority",
       "ordinal_in_function": 1,
       "fingerprint": "8741fb598dd771a9b74eb1b6be8a25b5c80ecbedae0818c41ba51ce33893b080",
@@ -1955,7 +1955,7 @@
       "domain": "kernel::run_queue"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "RunQueueInner::release_wake_admission",
       "ordinal_in_function": 1,
       "fingerprint": "f4f45e60e838f524d659efbfb4f8a2b11b3011762d480a27f4a0437ded70e9d2",
@@ -1966,7 +1966,7 @@
       "domain": "kernel::run_queue_admissions"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "RunQueueInner::set_executor_online",
       "ordinal_in_function": 1,
       "fingerprint": "4a28c04b5dae3a438fae3463c596561e3854dd0fe0d830d8c119bf4478d4185e",
@@ -1977,7 +1977,7 @@
       "domain": "kernel::run_queue"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "RunnableThread::lease",
       "ordinal_in_function": 1,
       "fingerprint": "e2ba348619e4dd35566fd8ca06e42e038dd8ecfcef18c30d12bc68eae3486dae",
@@ -1988,7 +1988,7 @@
       "domain": "kernel::runnable_thread"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "RunnableThread::take_lease",
       "ordinal_in_function": 1,
       "fingerprint": "3439a5a802abc857a43edddda4d884fc577635acd02b8676b188e16f95032222",
@@ -1999,7 +1999,7 @@
       "domain": "kernel::runnable_thread"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "Scheduler::retarget_running_exec",
       "ordinal_in_function": 1,
       "fingerprint": "5fea6c5514dacd5b506585d013722a6e24b784f959597696903a6e39f9c833d7",
@@ -2010,7 +2010,7 @@
       "domain": "kernel::scheduler_exec_retarget"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "Scheduler::retarget_running_exec",
       "ordinal_in_function": 2,
       "fingerprint": "788fd7b28da9339b56cfc3fce7ca5f86bf9167ce092adc7a575119bc9a6f3a73",
@@ -2021,7 +2021,7 @@
       "domain": "kernel::scheduler_exec_retarget"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "Scheduler::retarget_running_exec",
       "ordinal_in_function": 3,
       "fingerprint": "24d1631339095126bc4854b06fea411e3b525cc3fe450e963e92998a180fa328",
@@ -2032,7 +2032,7 @@
       "domain": "kernel::scheduler_exec_retarget"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "Scheduler::settle_failed",
       "ordinal_in_function": 1,
       "fingerprint": "af1200d2410050c0e0282ee91a3a0129e408b361f7cebcc762a7c47388c2cb52",
@@ -2043,7 +2043,7 @@
       "domain": "kernel::thread_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "file": "crates/carrick-kernel/src/kernel/scheduler.rs",
       "function": "publish_guest_cpu_count",
       "ordinal_in_function": 1,
       "fingerprint": "63f762daca0bb3840a91abebfa1521f779d858fe252139696e7bcd2dd8ea4195",
@@ -2054,7 +2054,7 @@
       "domain": "kernel::scheduler"
     },
     {
-      "file": "crates/carrick-runtime/src/namespace/pid.rs",
+      "file": "crates/carrick-kernel/src/namespace/pid.rs",
       "function": "mark_self_execed_for",
       "ordinal_in_function": 1,
       "fingerprint": "e74b562f7d4edeb895d0798f59a0334c9e4e96be64495bab6b96bb9e84a4a0dc",
@@ -2065,7 +2065,7 @@
       "domain": "namespace::exec_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/namespace/pid.rs",
+      "file": "crates/carrick-kernel/src/namespace/pid.rs",
       "function": "ns_self_pid_for",
       "ordinal_in_function": 1,
       "fingerprint": "36780eb8881be29c27c934e810d0ad0af57801d673be839661c09339d707ca04",
@@ -2079,7 +2079,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 1,
-      "fingerprint": "e4457e6c54c243a0d129e8c1e0e305860302e2b923d48f5efcc1cc3e90efd6ee",
+      "fingerprint": "0fed491ae4acba4823ad8a5c569535412d077b25cfb5fd6bffc4a91a6d21c80b",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "runtime.map_host_alias backend failure during alias installation; leaves hardware page tables and stage-2 mappings in an unrecoverable split state.",
@@ -2090,7 +2090,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 2,
-      "fingerprint": "e4457e6c54c243a0d129e8c1e0e305860302e2b923d48f5efcc1cc3e90efd6ee",
+      "fingerprint": "0fed491ae4acba4823ad8a5c569535412d077b25cfb5fd6bffc4a91a6d21c80b",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "Host alias mapping length overflowed usize after backend mapping was installed; cannot apply memory protection to live mapping.",
@@ -2101,7 +2101,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 3,
-      "fingerprint": "e4457e6c54c243a0d129e8c1e0e305860302e2b923d48f5efcc1cc3e90efd6ee",
+      "fingerprint": "0fed491ae4acba4823ad8a5c569535412d077b25cfb5fd6bffc4a91a6d21c80b",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "runtime.protect_range failed to apply PROT_NONE to installed host alias mapping; continuing would leave inaccessible memory readable.",
@@ -2112,7 +2112,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 4,
-      "fingerprint": "e4457e6c54c243a0d129e8c1e0e305860302e2b923d48f5efcc1cc3e90efd6ee",
+      "fingerprint": "0fed491ae4acba4823ad8a5c569535412d077b25cfb5fd6bffc4a91a6d21c80b",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "Host alias bus fault length overflowed usize after backend mapping was installed; cannot apply bus-fault guard protection.",
@@ -2123,7 +2123,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 5,
-      "fingerprint": "e4457e6c54c243a0d129e8c1e0e305860302e2b923d48f5efcc1cc3e90efd6ee",
+      "fingerprint": "0fed491ae4acba4823ad8a5c569535412d077b25cfb5fd6bffc4a91a6d21c80b",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "runtime.protect_range failed to apply guard protection to bus fault range of host alias mapping; leaves invalid file region accessible.",
@@ -2134,7 +2134,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 6,
-      "fingerprint": "e4457e6c54c243a0d129e8c1e0e305860302e2b923d48f5efcc1cc3e90efd6ee",
+      "fingerprint": "0fed491ae4acba4823ad8a5c569535412d077b25cfb5fd6bffc4a91a6d21c80b",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "dispatcher.commit_host_alias_install failed after backend host mapping was installed; leaves uncommitted alias mapping in guest address space.",
@@ -2167,7 +2167,7 @@
       "file": "crates/carrick-runtime/src/threaded_loop.rs",
       "function": "run_threaded_loop_inner",
       "ordinal_in_function": 1,
-      "fingerprint": "58eedb5c1a7246d3d88b9029df14aca9cac489136108557b50a5466f909bd8ec",
+      "fingerprint": "af3a615c24de93762245ec2d4bc302fe84856e2bf2f04bc53d129f27b2b92eda",
       "verdict": "carrier_fault",
       "failure_domain": "threaded_loop::root_activation",
       "rationale": "The first-root activation callback lost the prepared publication bundle it exclusively owned; continuing would publish a ready kernel without its lifecycle and frame commitments.",
@@ -2178,7 +2178,7 @@
       "file": "crates/carrick-runtime/src/threaded_loop.rs",
       "function": "run_threaded_loop_inner",
       "ordinal_in_function": 2,
-      "fingerprint": "58eedb5c1a7246d3d88b9029df14aca9cac489136108557b50a5466f909bd8ec",
+      "fingerprint": "af3a615c24de93762245ec2d4bc302fe84856e2bf2f04bc53d129f27b2b92eda",
       "verdict": "carrier_fault",
       "failure_domain": "threaded_loop::root_activation",
       "rationale": "The activated root could not recapture its exact kernel context before terminal-route publication; continuing could bind carrier-wide TTY service to the wrong task generation.",
@@ -2186,7 +2186,7 @@
       "domain": "threaded_loop::root_activation"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
       "function": "FsState::vfs_mounts_mut",
       "ordinal_in_function": 1,
       "fingerprint": "6303405f788787a2813b1db198d3b43f425202fdf69964846dfa3b7202b25e52",
@@ -2198,7 +2198,7 @@
       "domain": "dispatch::fs_mounts"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
       "function": "MountRetirement::clear",
       "ordinal_in_function": 1,
       "fingerprint": "acbfc19c323ba47be71e2495557def22844465fa75ce5295260b9efb06273ec2",
@@ -2209,7 +2209,7 @@
       "domain": "dispatch::mount_retirement"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
       "function": "MountRetirement::clear",
       "ordinal_in_function": 2,
       "fingerprint": "cb128a606f2b0fcdef5386728381304d89536435cd2822bad349485c05c9d2e2",
@@ -2220,7 +2220,7 @@
       "domain": "dispatch::mount_retirement"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
       "function": "MountRetirement::clear",
       "ordinal_in_function": 3,
       "fingerprint": "09a047115c0c4eb4b34f8e19102415e203617274b356a089e34621872b851823",
@@ -2231,7 +2231,7 @@
       "domain": "dispatch::mount_retirement"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/continuation.rs",
+      "file": "crates/carrick-kernel/src/kernel/continuation.rs",
       "function": "next_nonzero",
       "ordinal_in_function": 1,
       "fingerprint": "4a402066f73b17402b452e03015e87017d0f1b5671b1b05822a014d7324688ff",
@@ -2242,7 +2242,7 @@
       "domain": "vcpu_loop::continuation_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/continuation/wait_service.rs",
+      "file": "crates/carrick-kernel/src/kernel/continuation/wait_service.rs",
       "function": "CarrierWaitService::prepare_registration",
       "ordinal_in_function": 1,
       "fingerprint": "ce0040fcb03c714fb31cbbfb642f3db4dad07ffbfbe631137241527358b6dd5b",
@@ -2253,7 +2253,7 @@
       "domain": "vcpu_loop::continuation_registry"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mm_quiesce.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mm_quiesce.rs",
       "function": "<ExactMmStage1Scope as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "b388e60e6c4ea862591f376091a9bfc282092c212c16ce3c8bdb78d892aadb0e",
@@ -2264,7 +2264,7 @@
       "domain": "vcpu_loop::exact_mm_stage1_scope"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mm_quiesce.rs",
+      "file": "crates/carrick-kernel/src/dispatch/mm_quiesce.rs",
       "function": "<ExactMmStage1Scope as Drop>::drop",
       "ordinal_in_function": 2,
       "fingerprint": "b388e60e6c4ea862591f376091a9bfc282092c212c16ce3c8bdb78d892aadb0e",
