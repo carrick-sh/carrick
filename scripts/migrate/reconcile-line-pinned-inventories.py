@@ -74,7 +74,45 @@ def normalize_function_name(name: str) -> str:
     return parts[-1]
 
 
-def reconcile_runtime_aborts(rehome: bool = False, root: Path = ROOT) -> int:
+PATH_KEYS = ("path", "file")
+
+
+def apply_renames(rows, renames):
+    """Rewrite the path field of each row whose path starts with an OLD prefix."""
+    pairs = [r.split("=", 1) for r in renames]
+    changed = 0
+    for row in rows:
+        for key in PATH_KEYS:
+            value = row.get(key)
+            if not isinstance(value, str):
+                continue
+            for old, new in pairs:
+                if value.startswith(old):
+                    row[key] = new + value[len(old) :]
+                    changed += 1
+                    break
+    return changed
+
+
+def collect_scan_targets(rows):
+    """`rows` plus any nested `source` sub-object each row carries.
+
+    Most inventories keep `path`/`file` directly on the row
+    (dispatch-lock-authority.json, the k1 inventories, the runtime-aborts
+    shards); `host-authority-transition-inventory.json` instead nests it
+    under `row["source"]["file"]`. `apply_renames` only ever looks at the
+    top level of whatever it is given, so this is the one place that widens
+    the scan to include that nested shape too.
+    """
+    targets = list(rows)
+    for row in rows:
+        source = row.get("source") if isinstance(row, dict) else None
+        if isinstance(source, dict):
+            targets.append(source)
+    return targets
+
+
+def reconcile_runtime_aborts(rehome: bool = False, root: Path = ROOT, renames=None) -> int:
     aborts = load_script("check-runtime-aborts.py", root=root)
     findings = aborts.discover_runtime_aborts(root)
     by_shard: dict[str, list] = collections.defaultdict(list)
@@ -88,7 +126,9 @@ def reconcile_runtime_aborts(rehome: bool = False, root: Path = ROOT) -> int:
     for shard in aborts.SHARD_NAMES:
         path = migrate_dir / "runtime-aborts" / shard
         if path.is_file():
-            all_ledgers[shard] = json.loads(path.read_text(encoding="utf-8"))
+            ledger = json.loads(path.read_text(encoding="utf-8"))
+            apply_renames(collect_scan_targets(ledger["rows"]), renames or [])
+            all_ledgers[shard] = ledger
 
     if not rehome:
         for shard in aborts.SHARD_NAMES:
@@ -211,11 +251,20 @@ def reconcile_host_authority(
     candidate_path: Path | None = None,
     inventory_path: Path | None = None,
     capture_path: Path | None = None,
+    renames=None,
 ) -> int:
     rha = load_script("reconcile-host-authority-positions.py", root=root)
     migrate_dir = root / "scripts/migrate"
     inv_path = inventory_path or (migrate_dir / "host-authority-transition-inventory.json")
     cap_path = capture_path or (migrate_dir / "host-authority-macos-capture.json")
+
+    # `reconcile_host_authority_positions` loads inv_path itself, so this is
+    # the single point where its rows can be renamed before that load: rewrite
+    # the file on disk first, before delegating to it.
+    if renames and inv_path.is_file():
+        inventory = json.loads(inv_path.read_text(encoding="utf-8"))
+        if isinstance(inventory, list) and apply_renames(collect_scan_targets(inventory), renames):
+            write_json(inv_path, inventory)
 
     if candidate_path is not None:
         try:
@@ -274,6 +323,7 @@ def reconcile_dispatch_locks(
     root: Path = ROOT,
     candidate_path: Path | None = None,
     inventory_path: Path | None = None,
+    renames=None,
 ) -> int:
     path = inventory_path or (root / "scripts/migrate/dispatch-lock-authority.json")
     if candidate_path is not None:
@@ -309,6 +359,7 @@ def reconcile_dispatch_locks(
 
     fresh_rows = rows(fresh)
     inventory_rows = rows(inventory)
+    apply_renames(collect_scan_targets(inventory_rows), renames or [])
 
     fresh_by_id = {r["id"]: r for r in fresh_rows}
     inventory_ids = {r["id"] for r in inventory_rows}
@@ -429,6 +480,7 @@ def reconcile_k1_taxonomy(
     root: Path = ROOT,
     inventory_path: Path | None = None,
     taxonomy_path: Path | None = None,
+    renames=None,
 ) -> int:
     taxonomy_checker = load_script("check-k1-file-authority-taxonomy.py", root=root)
     authority = taxonomy_checker.AUTHORITY_CATEGORIES
@@ -436,6 +488,10 @@ def reconcile_k1_taxonomy(
     tax_path = taxonomy_path or (root / "scripts/migrate/k1-file-authority-callsite-taxonomy.json")
     inventory = json.loads(inv_path.read_text(encoding="utf-8"))
     taxonomy = json.loads(tax_path.read_text(encoding="utf-8"))
+    # k1-file-authority-operation-inventory.json is regenerated wholesale from
+    # the (already moved) source tree by reconcile_k1_inventory earlier in the
+    # pipeline, so only the pinned taxonomy rows still carry pre-move paths.
+    renamed = apply_renames(collect_scan_targets(taxonomy["entries"]), renames or [])
 
     def group(entry: dict) -> tuple:
         return (entry["file"], tuple(entry["categories"]), entry["text"], entry["scope_kind"])
@@ -464,7 +520,7 @@ def reconcile_k1_taxonomy(
                 if old["line"] != new["line"]:
                     old["line"] = new["line"]
                     moved += 1
-        if moved:
+        if moved or renamed:
             taxonomy["entries"].sort(key=lambda e: (e["file"], e["line"]))
             write_json(tax_path, taxonomy)
         return moved
@@ -566,24 +622,91 @@ def reconcile_k1_taxonomy(
             curr["line"] = fr["line"]
             moved += 1
 
-    if moved:
+    if moved or renamed:
         taxonomy["entries"].sort(key=lambda e: (e["file"], e["line"]))
         write_json(tax_path, taxonomy)
     return moved
+
+
+def rename_only(inventory_path: Path, renames: list[str]) -> int:
+    """Apply --rename to one inventory file directly and exit; the test hook.
+
+    Handles the row shapes the reconciler's own inventories use: a bare list
+    of rows (host-authority-transition-inventory.json), or a dict whose
+    value(s) are lists of rows (the `entries` / `rows` wrapped documents).
+    """
+    document = json.loads(inventory_path.read_text(encoding="utf-8"))
+    if isinstance(document, list):
+        row_lists = [document]
+    elif isinstance(document, dict):
+        row_lists = [
+            value
+            for value in document.values()
+            if isinstance(value, list) and value and isinstance(value[0], dict)
+        ]
+        if not row_lists:
+            raise RefusedError(f"--rename-only: no row list found in {inventory_path}")
+    else:
+        raise RefusedError(f"--rename-only: unsupported document shape in {inventory_path}")
+
+    changed = 0
+    for rows in row_lists:
+        changed += apply_renames(collect_scan_targets(rows), renames)
+    write_json(inventory_path, document)
+    print(f"--rename-only: {changed} path(s) rewritten in {inventory_path}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rehome", action="store_true", help="Re-home reviewed rows when functions move files")
+    parser.add_argument(
+        "--rename",
+        action="append",
+        default=[],
+        metavar="OLD=NEW",
+        help="rewrite inventory paths starting with OLD to start with NEW before reconciling",
+    )
+    parser.add_argument(
+        "--rename-only",
+        metavar="INVENTORY_JSON",
+        help="apply --rename to one inventory file and exit (test hook)",
+    )
     args = parser.parse_args(argv)
 
+    if args.rename_only is not None:
+        try:
+            return rename_only(Path(args.rename_only), args.rename)
+        except RefusedError as error:
+            print(f"--rename-only: REFUSED ({error})", file=sys.stderr)
+            return 1
+
+    if args.rename and not args.rehome:
+        print(
+            "--rename requires --rehome: fingerprints cannot be verified at the old path",
+            file=sys.stderr,
+        )
+        return 1
+
     steps = (
-        ("host-authority positions", lambda: reconcile_host_authority(rehome=args.rehome)),
-        ("runtime-aborts fingerprints", lambda: reconcile_runtime_aborts(rehome=args.rehome)),
-        ("dispatch-lock-authority lines", lambda: reconcile_dispatch_locks(rehome=args.rehome)),
+        (
+            "host-authority positions",
+            lambda: reconcile_host_authority(rehome=args.rehome, renames=args.rename),
+        ),
+        (
+            "runtime-aborts fingerprints",
+            lambda: reconcile_runtime_aborts(rehome=args.rehome, renames=args.rename),
+        ),
+        (
+            "dispatch-lock-authority lines",
+            lambda: reconcile_dispatch_locks(rehome=args.rehome, renames=args.rename),
+        ),
         ("k1 operation inventory", lambda: reconcile_k1_inventory(rehome=args.rehome)),
-        ("k1 callsite taxonomy", lambda: reconcile_k1_taxonomy(rehome=args.rehome)),
+        (
+            "k1 callsite taxonomy",
+            lambda: reconcile_k1_taxonomy(rehome=args.rehome, renames=args.rename),
+        ),
     )
     refused: list[str] = []
     for label, step in steps:
