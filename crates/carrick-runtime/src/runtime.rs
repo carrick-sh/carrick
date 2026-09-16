@@ -3078,10 +3078,6 @@ mod tests {
             // `crates/carrick-vfs/src/fs_backend/tests.rs`; this inventory
             // scans `CARGO_MANIFEST_DIR/src`, so it is out of scope here
             // rather than retired.
-            // Task 7's budget-one proof self-spawns this exact unit test in an
-            // isolated process so it can install the process-global vCPU
-            // scheduler before any sibling test initializes the OnceLock.
-            ("kernel/mm_access.rs", [0, 0, 1]),
             ("network/socket_namespace.rs", [7, 0, 0]),
             ("run_state.rs", [1, 0, 0]),
             // One cfg(test)-only helper self-spawns the exact lock-order or
@@ -3092,6 +3088,12 @@ mod tests {
             // boundary while proving pending exec error preservation. It is
             // not production host-process-per-guest architecture.
             ("vcpu_loop/exec.rs", [0, 0, 1]),
+            // Task 7's budget-one proof self-spawns this exact unit test in an
+            // isolated process so it can install the process-global vCPU
+            // scheduler before any sibling test initializes the OnceLock. The
+            // test moved with the carrier foreign-COW projection tests from
+            // `kernel/mm_access.rs` (Task 2.2 of the crate extraction).
+            ("vcpu_loop/memory.rs", [0, 0, 1]),
             // Both are unit tests that fork a child to BE the tracee, because
             // a ptrace stop needs a real host parent/child pair:
             // 1. `ptrace_signal_stop_queued_host_sigkill_remains_terminal`

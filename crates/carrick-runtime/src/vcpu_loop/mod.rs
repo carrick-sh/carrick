@@ -92,9 +92,9 @@ pub(crate) fn vcpu_reclaim_census() -> (u64, u64, u64) {
 
 pub(crate) mod memory;
 pub(crate) use memory::{
-    KernelForeignCowProof, KernelFrameCowAuthority, RefuseAliasInstallSpec,
-    apply_alias_frame_inventory, apply_exec_image_proc_state, apply_image_proc_state,
-    ns_visible_guest_tid, refuse_alias_install, requires_no_unwind_host_exit, stamp_identity_page,
+    KernelFrameCowAuthority, RefuseAliasInstallSpec, apply_alias_frame_inventory,
+    apply_exec_image_proc_state, apply_image_proc_state, ns_visible_guest_tid,
+    refuse_alias_install, requires_no_unwind_host_exit, stamp_identity_page,
     stamp_identity_page_at, stamp_identity_values, stamp_ns_visible_guest_tid,
     syscall_takes_pre_dispatch_pt_pause, with_foreign_mm_mutation_guard, with_sole_mm_stage1,
 };
@@ -1213,7 +1213,6 @@ where
             } else {
                 continuation::RestartClass::Never
             },
-            continuation::ContinuationBackend::Hvpatch,
         )
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let mut continuation = match input {

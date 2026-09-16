@@ -17,7 +17,8 @@ pub mod fd_ceiling;
 pub mod frame_inventory;
 pub mod guest_execution;
 pub mod ids;
-mod mm_access;
+pub(crate) mod mm_access;
+pub(crate) mod mm_proof;
 pub mod mm_transaction;
 pub mod netns;
 pub mod objects;
@@ -56,6 +57,7 @@ pub use mm_access::{
     CowBroken, CurrentMm, ForeignMm, ForeignWriteReceipt, MmAccessError, MmReadRange, MmRelation,
     MmToken, MmWriteRange,
 };
+pub(crate) use mm_proof::KernelForeignCowProof;
 pub use mm_transaction::{MmTransaction, StagedMmOp};
 
 pub(crate) use carrier_process::CarrierProcess;
