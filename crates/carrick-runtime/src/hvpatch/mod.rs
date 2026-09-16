@@ -49,6 +49,9 @@ pub(crate) use stage1_mm::{
 
 /// Installation permission kept private to the HVPatch bootstrap/lifecycle
 /// module. Syscall handlers cannot replace the carrier endpoint on an MM.
+///
+/// The kernel names it only as `<Stage1MmLease as
+/// carrick_hal::stage1_mm::ForeignMmInstaller>::InstallPermit`.
 pub(crate) struct ForeignMmInstallPermit {
     _private: (),
 }
@@ -386,7 +389,10 @@ impl ProcessContext {
         context
             .shared()
             .mm()
-            .install_foreign_mm_endpoint(endpoint.clone(), &ForeignMmInstallPermit::new());
+            .install_foreign_mm_endpoint::<Stage1MmLease>(
+                endpoint.clone(),
+                &ForeignMmInstallPermit::new(),
+            );
         self.foreign_mm_endpoint = Some(endpoint);
         self.mm_access = Some(crate::kernel::MmAccessAuthority::new());
         Ok(self)
@@ -439,7 +445,10 @@ impl ProcessContext {
             context
                 .shared()
                 .mm()
-                .install_foreign_mm_endpoint(endpoint, &ForeignMmInstallPermit::new());
+                .install_foreign_mm_endpoint::<Stage1MmLease>(
+                    endpoint,
+                    &ForeignMmInstallPermit::new(),
+                );
         }
         let mut child = Self::new(
             std::sync::Arc::clone(&self.resources),
@@ -694,7 +703,10 @@ impl ProcessContext {
             context
                 .shared()
                 .mm()
-                .install_foreign_mm_endpoint(endpoint, &ForeignMmInstallPermit::new());
+                .install_foreign_mm_endpoint::<Stage1MmLease>(
+                    endpoint,
+                    &ForeignMmInstallPermit::new(),
+                );
         }
         let old_vmas = match reservation.disposition() {
             mm_resources::ExecMmDispositionKind::RetainOldMm => None,
@@ -933,6 +945,16 @@ impl ProcessContext {
     }
 }
 
+impl ProcessContext {
+    /// This process's exact stage-1 lease. Carrier-only: the kernel reaches
+    /// the same lease type-erased through `CarrierProcess::stage1_mm_projection`.
+    pub(crate) fn stage1_mm_lease(&self) -> Result<std::sync::Arc<Stage1MmLease>, RuntimeError> {
+        self.resources
+            .lease(self.task_key())
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))
+    }
+}
+
 impl crate::kernel::CarrierProcess for ProcessContext {
     fn kernel_graph(&self) -> &std::sync::Arc<crate::kernel::Kernel> {
         self.binding.kernel()
@@ -957,10 +979,11 @@ impl crate::kernel::CarrierProcess for ProcessContext {
         self.mm_access.as_ref()
     }
 
-    fn stage1_mm_lease(&self) -> Result<std::sync::Arc<Stage1MmLease>, RuntimeError> {
-        self.resources
-            .lease(self.task_key())
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))
+    fn stage1_mm_projection(
+        &self,
+    ) -> Result<std::sync::Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>, RuntimeError> {
+        self.stage1_mm_lease()
+            .map(|lease| lease as std::sync::Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>)
     }
 
     fn bind_vma_source(&self, source: crate::kernel::SharedVmaSnapshotSource) {
@@ -983,7 +1006,10 @@ impl crate::kernel::CarrierProcess for ProcessContext {
         context
             .shared()
             .mm()
-            .install_foreign_mm_mutation_authority(authority, &ForeignMmInstallPermit::new());
+            .install_foreign_mm_mutation_authority::<Stage1MmLease>(
+                authority,
+                &ForeignMmInstallPermit::new(),
+            );
     }
 }
 

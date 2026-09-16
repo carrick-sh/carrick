@@ -2341,8 +2341,9 @@ pub(crate) mod tests {
                     .then(|| Arc::clone(&backend.backend_revision)),
             })),
         );
-        let (_stage1_pool, stage1) = crate::hvpatch::Stage1MmPool::new_root_for_tests(0x8000, 4)
-            .expect("foreign mutation test stage-1 lease");
+        let stage1 = Arc::new(crate::kernel::TestStage1MmProjection::new(
+            crate::kernel::test_mm_binding(1, 0x8000),
+        ));
         child
             .shared()
             .mm()

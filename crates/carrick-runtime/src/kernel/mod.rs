@@ -63,7 +63,9 @@ pub use mm_transaction::{MmTransaction, StagedMmOp};
 
 pub(crate) use carrier_process::CarrierProcess;
 #[cfg(test)]
-pub(crate) use carrier_process::{TestCarrierProcess, TestMmBackend};
+pub(crate) use carrier_process::{
+    TestCarrierProcess, TestMmBackend, TestStage1MmProjection, test_mm_binding,
+};
 pub(crate) use core::ReservationChangeSubscription;
 pub use core::{
     Kernel, KernelContext, KernelError, KernelTaskBinding, Registry, RegistryInvariantError,

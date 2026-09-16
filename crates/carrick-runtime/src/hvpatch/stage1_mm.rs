@@ -286,42 +286,6 @@ impl Stage1MmLease {
         self.asid
     }
 
-    pub(crate) fn foreign_stage1_identity(
-        &self,
-        mm: crate::kernel::MmId,
-    ) -> carrick_hal::ForeignStage1Identity {
-        let binding = self.binding();
-        let mm = carrick_hal::ForeignMmId::from_kernel_allocation(
-            std::num::NonZeroU64::new(mm.raw()).unwrap_or_else(|| {
-                carrick_fatal!(
-                    "hvpatch::stage1_mm",
-                    "zero mm id in foreign_stage1_identity"
-                );
-            }),
-        );
-        let asid = carrick_hal::ForeignAsid::from_kernel_allocation(
-            std::num::NonZeroU16::new(binding.asid.raw()).unwrap_or_else(|| {
-                carrick_fatal!("hvpatch::stage1_mm", "zero asid in foreign_stage1_identity");
-            }),
-        );
-        let binding = carrick_hal::ForeignMmBinding::for_aarch64(asid, binding.stage1_root.gpa());
-        let asid_generation = carrick_hal::ForeignAsidGeneration::from_runtime_binding(
-            asid,
-            std::num::NonZeroU64::new(self.asid.generation()).unwrap_or_else(|| {
-                carrick_fatal!(
-                    "hvpatch::stage1_mm",
-                    "zero asid generation in foreign_stage1_identity"
-                );
-            }),
-        );
-        carrick_hal::ForeignStage1Identity::new(mm, binding, asid_generation).unwrap_or_else(|| {
-            carrick_fatal!(
-                "hvpatch::stage1_mm",
-                "failed to construct ForeignStage1Identity"
-            );
-        })
-    }
-
     /// Whether this lease has stopped admitting executor loads, for either
     /// reason: the lease itself is retiring, or its ASID generation is.
     pub(crate) fn is_retiring(&self) -> bool {
@@ -541,6 +505,55 @@ fn carrier_stage1_mm_pool() -> &'static Arc<Mutex<Stage1MmPoolInner>> {
 pub(crate) struct Stage1MmTableArenaSource {
     pool: Stage1MmPool,
     lease: Arc<Stage1MmLease>,
+}
+
+/// The kernel-facing projection of this lease: the three foreign-COW
+/// operations the carrier's exact-MM quiesce performs on the target mm, in
+/// `carrick_hal` domain types. The lease's carrier-private surface (ASID
+/// loads, retirement, the COW publication's pending set) stays inherent.
+impl carrick_hal::stage1_mm::Stage1MmProjection for Stage1MmLease {
+    fn foreign_mm_binding(&self) -> carrick_hal::ForeignMmBinding {
+        let binding = self.binding();
+        let asid = carrick_hal::ForeignAsid::from_kernel_allocation(
+            std::num::NonZeroU16::new(binding.asid.raw()).unwrap_or_else(|| {
+                carrick_fatal!("hvpatch::stage1_mm", "zero asid in foreign_mm_binding");
+            }),
+        );
+        carrick_hal::ForeignMmBinding::for_aarch64(asid, binding.stage1_root.gpa())
+    }
+
+    fn foreign_stage1_identity(
+        &self,
+        mm: carrick_hal::ForeignMmId,
+    ) -> carrick_hal::ForeignStage1Identity {
+        let binding = self.foreign_mm_binding();
+        let asid_generation = carrick_hal::ForeignAsidGeneration::from_runtime_binding(
+            binding.asid(),
+            std::num::NonZeroU64::new(self.asid.generation()).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::stage1_mm",
+                    "zero asid generation in foreign_stage1_identity"
+                );
+            }),
+        );
+        carrick_hal::ForeignStage1Identity::new(mm, binding, asid_generation).unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::stage1_mm",
+                "failed to construct ForeignStage1Identity"
+            );
+        })
+    }
+
+    fn publish_foreign_cow_invalidation(&self) -> carrick_hal::ForeignCowInvalidationGeneration {
+        self.publish_cow_invalidation().ticket().generation()
+    }
+}
+
+/// Only the HVPatch bootstrap/lifecycle module can mint the permit
+/// (`ForeignMmInstallPermit::new` is private to it), so only the carrier can
+/// install a foreign-mm endpoint or mutation authority on a kernel mm.
+impl carrick_hal::stage1_mm::ForeignMmInstaller for Stage1MmLease {
+    type InstallPermit = super::ForeignMmInstallPermit;
 }
 
 impl carrick_mem::page_table::TableArenaSource for Stage1MmTableArenaSource {

@@ -1229,7 +1229,7 @@ impl SyscallDispatcher {
 
     pub(crate) fn foreign_mm_mutation_authority(
         &self,
-        stage1: Arc<crate::hvpatch::Stage1MmLease>,
+        stage1: Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>,
     ) -> mm_mutation::ForeignMmMutationAuthority {
         let authority = self.mm_authority();
         mm_mutation::ForeignMmMutationAuthority::new(

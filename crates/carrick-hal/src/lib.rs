@@ -30,6 +30,7 @@ pub use foreign_mm::{
     ForeignReadableRange, ForeignStage1Identity,
 };
 pub mod stage1_exclusive;
+pub mod stage1_mm;
 
 pub mod trap;
 pub use trap::{

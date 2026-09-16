@@ -6,6 +6,7 @@
 
 use super::*;
 use carrick_fatal::carrick_fatal;
+use carrick_hal::stage1_mm::Stage1MmProjection;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 enum PreparedHvpatchProcessMm {
@@ -735,18 +736,18 @@ pub(crate) enum FrameCowExactMmGuard {
     Nested {
         _lease: std::rc::Rc<ExactMmStage1Lease>,
         mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
-        foreign_stage1: Option<Arc<crate::hvpatch::Stage1MmLease>>,
+        foreign_stage1: Option<Arc<dyn Stage1MmProjection>>,
     },
     Sole {
         _stage1: Stage1Exclusive,
         _census: crate::kernel::ExactMmCensusGuard,
         mm: crate::kernel::MmId,
         mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
-        foreign_stage1: Option<Arc<crate::hvpatch::Stage1MmLease>>,
+        foreign_stage1: Option<Arc<dyn Stage1MmProjection>>,
     },
     Paused {
         _guard: PtPauseGuard<'static>,
-        foreign_stage1: Option<Arc<crate::hvpatch::Stage1MmLease>>,
+        foreign_stage1: Option<Arc<dyn Stage1MmProjection>>,
     },
 }
 
@@ -798,16 +799,15 @@ impl FrameCowExactMmGuard {
                 .as_ref()
                 .ok_or(ForeignCowInvalidationError::MissingStage1Lease)?,
         };
-        let binding = stage1.binding();
-        if binding.asid.raw() != expected_binding.asid().raw_for_probe()
-            || binding.stage1_root.gpa() != expected_binding.stage1_root()
-        {
+        if stage1.foreign_mm_binding() != expected_binding {
             return Err(ForeignCowInvalidationError::BindingMismatch);
         }
-        let publication = stage1.publish_cow_invalidation();
+        let generation = stage1.publish_foreign_cow_invalidation();
         let identity = carrick_hal::ForeignCowInvalidationIdentity::new(
-            stage1.foreign_stage1_identity(exact_mm),
-            publication.ticket().generation(),
+            stage1.foreign_stage1_identity(carrick_hal::ForeignMmId::from_kernel_allocation(
+                exact_mm.nonzero(),
+            )),
+            generation,
         );
         let Self::Paused { _guard, .. } = self else {
             return Ok(());
@@ -859,7 +859,7 @@ pub(super) fn acquire_foreign_mm_mutation_quiesce(
     mm: crate::kernel::MmId,
     census: &crate::kernel::GuestExecutorCensus,
     coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
-    stage1: Arc<crate::hvpatch::Stage1MmLease>,
+    stage1: Arc<dyn Stage1MmProjection>,
     tid: ThreadId,
     budget: PtPauseBudget,
 ) -> Result<FrameCowExactMmGuard, PtPauseError> {
@@ -2617,10 +2617,12 @@ mod pt_pause_tests {
             mm,
             coordinator,
             Arc::clone(&census),
-            Arc::clone(&stage1),
+            Arc::clone(&stage1) as Arc<dyn Stage1MmProjection>,
             Arc::clone(&barrier),
         );
-        let identity = stage1.foreign_stage1_identity(mm);
+        let identity = stage1.foreign_stage1_identity(
+            carrick_hal::ForeignMmId::from_kernel_allocation(mm.nonzero()),
+        );
         let worker_stage1 = Arc::clone(&stage1);
         let worker = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(1);
@@ -2698,10 +2700,12 @@ mod pt_pause_tests {
             mm,
             coordinator,
             census,
-            Arc::clone(&stage1),
+            Arc::clone(&stage1) as Arc<dyn Stage1MmProjection>,
             Arc::clone(pt_barrier()),
         );
-        let identity = stage1.foreign_stage1_identity(mm);
+        let identity = stage1.foreign_stage1_identity(
+            carrick_hal::ForeignMmId::from_kernel_allocation(mm.nonzero()),
+        );
 
         authority
             .with_guard(caller_tid, |mutation| {

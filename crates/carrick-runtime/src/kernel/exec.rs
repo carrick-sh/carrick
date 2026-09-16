@@ -865,28 +865,19 @@ impl From<&ExecPrepareError> for LinuxErrno {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU16;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use carrick_abi::{LinuxCloneFlags, LinuxSigaction, SigSet};
-    use carrick_guest_mem::Gpa;
     use carrick_hal::ThreadId;
 
     use super::*;
     use crate::kernel::{
-        Asid, ClonePlan, FileDescription, FileSlotNumber, LinuxSignal, LinuxWaitStatus, MmBinding,
-        RootBootstrap, SignalDisposition, Stage1Root, TestMmBackend,
+        ClonePlan, FileDescription, FileSlotNumber, LinuxSignal, LinuxWaitStatus, RootBootstrap,
+        SignalDisposition, TestMmBackend, test_mm_binding,
     };
-
-    fn test_binding(asid: u16, stage1_root: u64) -> MmBinding {
-        let asid =
-            Asid::from_registry_allocation(NonZeroU16::new(asid).expect("nonzero test ASID"));
-        let root = Stage1Root::for_aarch64_4k(Gpa(stage1_root)).expect("stage-1 root");
-        MmBinding::for_aarch64(asid, root)
-    }
 
     fn spawn_active_runner(
         thread_ref: &ThreadRef,
@@ -944,7 +935,7 @@ mod tests {
         let parent_mm = parent.shared.mm();
         assert!(Arc::ptr_eq(&parent_mm, &child.shared.mm()));
 
-        let replacement_binding = test_binding(17, 0x44_000);
+        let replacement_binding = test_mm_binding(17, 0x44_000);
         let replacement_backend: Arc<dyn MmBackend> =
             Arc::new(TestMmBackend::new(replacement_binding));
         let prepared = kernel
@@ -990,7 +981,7 @@ mod tests {
             )
             .expect("shared-mm child");
         let shared_mm = parent.shared.mm();
-        let backend = Arc::new(TestMmBackend::new(test_binding(18, 0x48_000)));
+        let backend = Arc::new(TestMmBackend::new(test_mm_binding(18, 0x48_000)));
         let backend_weak = Arc::downgrade(&backend);
 
         assert!(matches!(

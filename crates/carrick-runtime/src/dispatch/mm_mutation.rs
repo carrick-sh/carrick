@@ -209,7 +209,7 @@ pub(crate) struct ForeignMmMutationAuthority {
     mm: MmId,
     coordinator: Arc<MmMutationCoordinator>,
     census: Arc<crate::kernel::GuestExecutorCensus>,
-    stage1: Arc<crate::hvpatch::Stage1MmLease>,
+    stage1: Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>,
     pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
 }
 
@@ -219,7 +219,7 @@ impl ForeignMmMutationAuthority {
         mm: MmId,
         coordinator: Arc<MmMutationCoordinator>,
         census: Arc<crate::kernel::GuestExecutorCensus>,
-        stage1: Arc<crate::hvpatch::Stage1MmLease>,
+        stage1: Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>,
         pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
     ) -> Self {
         assert_eq!(
