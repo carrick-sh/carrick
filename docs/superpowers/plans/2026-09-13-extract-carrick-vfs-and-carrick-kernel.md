@@ -843,7 +843,13 @@ pub trait Stage1MmProjection: Send + Sync {
 - Modify: `crates/carrick-hal/src/stage1_mm.rs`, `kernel/`
 
 - [ ] **Step 1:** The three pure helpers (`ns_visible_guest_tid`, `is_default_ignore_signal`, `upgrade_protection_si_code`) compute from kernel state and ABI tables: move each into the kernel module owning its input; re-point `vcpu_loop` and `dispatch`.
-- [ ] **Step 2:** The quiesce entry points become `Stage1MmProjection` methods:
+- [ ] **Step 2 — RULING 2026-09-16 (Task 2.4 escalation, Option A replaces the text below):** the quiesce machinery is kernel-side code by dependency, not a VM projection: `vcpu_loop/quiesce.rs` L250-512 and L555-930 (`Stage1Exclusive`, `ExactMmStage1Lease`/`Kind`/`Scope`, the `EXACT_MM_STAGE1` thread-local, `borrow_current_exact_mm_stage1`, `SoleMmStage1`, `PtPauseGuard`, `FrameCowExactMmGuard`, `with_sole_mm_stage1`, `with_foreign_mm_mutation_guard`) names `MmMutationCoordinator`, `MmId`, the executor census and dispatch identities, and no HVF type; the sole-executor election runs on `MmExecutorParticipation` with no projection in hand, and `SyscallDispatcher::new()` exercises the whole path with no carrier at all. Therefore:
+  1. `git mv`-style: move that machinery into `crates/carrick-runtime/src/dispatch/mm_quiesce.rs` (sibling of `mm_mutation.rs`/`mm_authority.rs`, in Task 2.9's moving set); `with_sole_mm_stage1` becomes a method on `MmExecutorParticipation` (or a free fn in the new module); `vcpu_loop` imports downward from `crate::dispatch::mm_quiesce`.
+  2. The ~20 carrier-side pause/COW tests in `vcpu_loop/quiesce.rs` (L3397-3808; they use `Stage1MmPool::new_root_for_tests`, ruled carrier-side in Task 2.3) STAY in `quiesce.rs`, importing from the new module.
+  3. `stamp_identity_page`, `stamp_identity_page_at`, `identity_gate_word`, `stamp_identity_values` (`vcpu_loop/memory.rs` L602-718) and the test `identity_page_stamp_surfaces_guest_memory_write_failure` move to the kernel as pure functions over `M: CurrentMmMemory` (`kernel/identity_page.rs`); the carrier calls them with its engine memory.
+  4. Inventories: function moves within/between files are rehomed with `reconcile-line-pinned-inventories.py --rehome` (the `EXACT_MM_STAGE1` global-state row re-homes to the new module); reconcile on the clean tree after the move commit, as its own commit.
+  Option B (hal traits + projection methods) is rejected: it would duplicate the election into the test double or hal-ify the kernel census. `Stage1MmProjection` keeps the three foreign-COW methods Task 2.3 gave it. The pre-ruling text follows for reference only:
+- [ ] **(superseded) Step 2:** The quiesce entry points become `Stage1MmProjection` methods:
 
 ```rust
     /// Run `f` with this mm as the sole runnable stage (page-table pause).
@@ -856,7 +862,7 @@ pub trait Stage1MmProjection: Send + Sync {
 
 `SoleMmStage`, `PtPause`, `FrameCowExactMm` become hal traits with the methods the 12 sites call on the guards (read them). A generic-over-`R` closure becomes `&mut dyn FnMut` with the result written through a captured `Option<R>` at the call site, to keep the trait object-safe.
 - [ ] **Step 3: Verify.** `grep -rn "crate::vcpu_loop" crates/carrick-runtime/src/dispatch crates/carrick-runtime/src/kernel` → no output.
-- [ ] **Step 4: Gate + commit** `refactor(runtime): dispatch reaches page-table quiesce only through Stage1MmProjection`.
+- [ ] **Step 4: Gate + signed smoke + commit** `refactor(runtime): the exact-mm quiesce protocol is kernel code; identity-page stamping is a kernel pure function` (Why: the machinery named no VM type and the election runs with no carrier; What: Option A items 1-4; Verified: gates, `just build` + two-process smoke — Step 1's commit skipped the smoke, run it here).
 
 ### Task 2.5: `HostSignalBridge` and `GuestTimerBridge` — the host-signal and timer seams
 
