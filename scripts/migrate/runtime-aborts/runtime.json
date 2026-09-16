@@ -1009,7 +1009,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "function": "ProcessContext::bind_mm_mutation_authority",
+      "function": "<ProcessContext as crate::kernel::CarrierProcess>::bind_mm_mutation_authority",
       "ordinal_in_function": 1,
       "fingerprint": "bd3edc293bbe7bd4ab626eebcbf8cf0906183d6b2a3392e8120c75de827b88b5",
       "verdict": "carrier_fault",
@@ -1096,10 +1096,10 @@
       "domain": "hvpatch::exec_commit"
     },
     {
-      "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "function": "ProcessContext::wait_result",
+      "file": "crates/carrick-runtime/src/kernel/carrier_process.rs",
+      "function": "wait_result",
       "ordinal_in_function": 1,
-      "fingerprint": "868967b9d72efa148b88640b7739c0793b1296ba1260076831d5be346a064819",
+      "fingerprint": "fa22285edc3b75d92a25d221a951a34bda21dac1a2e985c5c6e51c5eb1a78821",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::wait_identity",
       "rationale": "An exited child carried a namespace PID outside the Linux wait ABI range; continuing would return a status for an unrepresentable or aliased child identity.",
