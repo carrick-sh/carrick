@@ -11,6 +11,11 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "crates/carrick-runtime/src"
+# The filesystem model moved to crates/carrick-vfs (plan
+# 2026-09-13-extract-carrick-vfs-and-carrick-kernel). The K1 file-authority
+# scope follows the CODE, not the crate it used to live in, so both roots are
+# scanned and the inventory keeps every row it had.
+SOURCES = (SOURCE, ROOT / "crates/carrick-vfs/src")
 INVENTORY = ROOT / "scripts/migrate/k1-file-authority-operation-inventory.json"
 FILE_AUTHORITY_MODULE = SOURCE / "file_authority"
 PATTERNS = {
@@ -164,7 +169,7 @@ def is_out_of_line_test_module(path: Path) -> bool:
 
 def generate() -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
-    for path in sorted(SOURCE.rglob("*.rs")):
+    for path in sorted(p for source in SOURCES for p in source.rglob("*.rs")):
         if path.is_relative_to(FILE_AUTHORITY_MODULE):
             # Inventory the legacy authority escapes that production cutover
             # must delete, not the replacement authority's closed internal
@@ -204,7 +209,7 @@ def generate() -> dict[str, Any]:
     }
     return {
         "schema": 1,
-        "scope": "production Rust sources under crates/carrick-runtime/src",
+        "scope": "production Rust sources under crates/carrick-runtime/src and crates/carrick-vfs/src",
         "counts": counts,
         "production_counts": {
             name: sum(

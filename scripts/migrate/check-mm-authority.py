@@ -14,6 +14,7 @@ from typing import Iterable, Sequence
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SCAN_ROOTS = (
     REPO_ROOT / "crates" / "carrick-runtime",
+    REPO_ROOT / "crates" / "carrick-vfs",
     REPO_ROOT / "crates" / "carrick-hal",
     REPO_ROOT / "crates" / "carrick-guest-mem",
     REPO_ROOT / "crates" / "carrick-vmm-hvf",

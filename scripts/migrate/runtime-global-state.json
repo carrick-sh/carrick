@@ -115,7 +115,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/apfs.rs",
+      "file": "crates/carrick-vfs/src/apfs.rs",
       "symbol": "resolve_scratch_root::CARRICK_HOME",
       "fingerprint": "d1720a160950ff9e3f25ca1f7b4cb0dedabb26a79cb7a56c44377a1f0ef275f1",
       "classification": "config_debug",
@@ -123,7 +123,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/apfs.rs",
+      "file": "crates/carrick-vfs/src/apfs.rs",
       "symbol": "resolve_scratch_root::HOME",
       "fingerprint": "acfd587978b264cd239ffe761be7c7c1d9743018e8f0e8e0d5ca0beab221b5d2",
       "classification": "config_debug",
@@ -131,7 +131,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/apfs.rs",
+      "file": "crates/carrick-vfs/src/apfs.rs",
       "symbol": "preferred_scratch_root::CACHE",
       "fingerprint": "deb4a6f3d86dd5d03d3bb79957457973ec2c4b7268e4c98b9f332055b99944a6",
       "classification": "carrier_infra",
@@ -915,7 +915,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "file": "crates/carrick-vfs/src/fs_backend.rs",
       "symbol": "EXCLUSIVE_ARCHIVE_GATES",
       "fingerprint": "f2d82442711502ce92f2b201cce414a32749146c1a91c11fb4843e7483c3a8a4",
       "classification": "carrier_infra",
@@ -923,7 +923,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
       "symbol": "fast_fs_enabled::CARRICK_FAST_FS",
       "fingerprint": "96ca06b880ff8098bca574f0a3b5def3654a1571488e234607b5a7c5407728de",
       "classification": "config_debug",
@@ -931,7 +931,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
       "symbol": "overlay_enabled::CARRICK_FS_OVERLAY",
       "fingerprint": "3ae130f3fa0fc49685d6010a720265b73ebdd58b2faf96171d676b30949c0f40",
       "classification": "config_debug",
@@ -939,7 +939,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
       "symbol": "stat_cache_enabled::CARRICK_FS_STATCACHE",
       "fingerprint": "b16c7c1b5f4416fbfbeb65325342c905d6bb273050817180ef0318d722c2294a",
       "classification": "config_debug",
@@ -947,7 +947,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
       "symbol": "default_scratch_root::HOME",
       "fingerprint": "acfd587978b264cd239ffe761be7c7c1d9743018e8f0e8e0d5ca0beab221b5d2",
       "classification": "config_debug",
@@ -955,7 +955,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
       "symbol": "default_scratch_root::TMPDIR",
       "fingerprint": "394164c8b4a8b59042322562ebc871f687aa9d65310d19e7a33627c7b6f3fe8c",
       "classification": "config_debug",
@@ -963,7 +963,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
       "symbol": "ANON_FD_COUNTER",
       "fingerprint": "265b5d787ac9fe2eaac10f158c9096a6db3f0e2931b862923ba6e07e6df5e9df",
       "classification": "monotonic_allocator",
@@ -971,15 +971,15 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
       "symbol": "HOST_XATTR_READS",
-      "fingerprint": "7c214600b35d2b01f0bc7f2b286479655384d920343399de997e2bad88e5cd0b",
+      "fingerprint": "0a9ebb449763f96dd4584e905b15eaca8937836506e277b4572c516be804a15d",
       "classification": "test_only",
-      "rationale": "cfg(test)-only atomic counter of host xattr reads, backing the fstat dentry cache regression test to verify zero host xattr reads on repeat fstat."
+      "rationale": "Atomic counter of host xattr reads, backing the fstat dentry cache regression test to verify zero host xattr reads on repeat fstat. Compiled out of a normal build: gated on cfg(test) OR carrick-vfs's `test-support` feature, which only carrick-runtime's dev-dependencies enable, because the asserting test now lives in another crate."
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
       "symbol": "SCRATCH_TRASH_COUNTER",
       "fingerprint": "92c5d908834616fd3d825a5e0292fda831ccec7847a2de821006e56cac0003e3",
       "classification": "monotonic_allocator",
@@ -987,7 +987,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
       "symbol": "host_umask::HOST_UMASK",
       "fingerprint": "a3d209ef8cddc394e3f52a16455105d2d8f926d36d2e4619c8062bc332d2925a",
       "classification": "host_kernel_object",
@@ -995,7 +995,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
       "symbol": "scratch_cleanup_sender::SENDER",
       "fingerprint": "5e774260b6700d3db8ed18e8ac5d4651fd2d3e3e1d370a6f5e653f7235b5c507",
       "classification": "carrier_infra",
@@ -1003,23 +1003,23 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
       "symbol": "TEST_HOST_OPENAT_COUNT",
-      "fingerprint": "bfbb245cf83ae24bfa27ce2cad3d832d64ef743d233241f70f9b36cf6377a830",
+      "fingerprint": "8d7c6865ba8c2e7d4b97bda8ff7da7a3de67f5340bbf49b616bdbf943841315c",
       "classification": "test_only",
-      "rationale": "The cfg(test) thread-local counter measures host openat invocations to verify open-amplification budgets under wide directory workloads."
+      "rationale": "Thread-local counter of host openat invocations, verifying open-amplification budgets under wide directory workloads. Compiled out of a normal build: gated on cfg(test) OR carrick-vfs's `test-support` feature, which only carrick-runtime's dev-dependencies enable, because the asserting test now lives in another crate."
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
       "symbol": "TEST_HOST_STAT_COUNT",
-      "fingerprint": "d74ab20f176ff49da181351f96947280462854d47957e5e6021f6d019d31b3c0",
+      "fingerprint": "712d14044c7f4dda953e972e8bb2de6d30b6196075cd683f99162be6cdf21782",
       "classification": "test_only",
-      "rationale": "The cfg(test) thread-local counter measures host stat invocations to verify stat-amplification budgets under wide directory workloads."
+      "rationale": "Thread-local counter of host stat invocations, verifying stat-amplification budgets under wide directory workloads. Compiled out of a normal build: gated on cfg(test) OR carrick-vfs's `test-support` feature, which only carrick-runtime's dev-dependencies enable, because the asserting test now lives in another crate."
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_backend/tests.rs",
+      "file": "crates/carrick-vfs/src/fs_backend/tests.rs",
       "symbol": "FS_RLIMIT_TEST_LOCK",
       "fingerprint": "ff23d140e02e55b39ed7676ed239c438d8d20f84c00c2783b51158d506282509",
       "classification": "test_only",
@@ -1027,7 +1027,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_resolve_cache.rs",
+      "file": "crates/carrick-vfs/src/fs_resolve_cache.rs",
       "symbol": "ATFORK_INIT",
       "fingerprint": "be461cf5872a14fa167336dac2e8c15847b0e5af28bd90a21f34002b483b3420",
       "classification": "carrier_infra",
@@ -1035,7 +1035,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_resolve_cache.rs",
+      "file": "crates/carrick-vfs/src/fs_resolve_cache.rs",
       "symbol": "PROCESS_GENERATION",
       "fingerprint": "69ba843171b39032e4235c32797a4ab0b93a1924839f1fdc7153b99739233e23",
       "classification": "carrier_infra",
@@ -1043,7 +1043,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_resolve_cache.rs",
+      "file": "crates/carrick-vfs/src/fs_resolve_cache.rs",
       "symbol": "generation_word_at::CELL",
       "fingerprint": "5ddd9a26bc50591d368264245d366c2c048ad61c12501d50f2e4b3673c00607c",
       "classification": "carrier_infra",
@@ -1299,7 +1299,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/layer_cache.rs",
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
       "symbol": "reflink_or_copy_file::FALLBACK_FLAGGED",
       "fingerprint": "be74cb5b68663042ef31d41c120e4754c786d129fd9d3a7eafd4dbea60560ea6",
       "classification": "carrier_infra",
@@ -1835,7 +1835,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vfs/dentry.rs",
+      "file": "crates/carrick-vfs/src/vfs/dentry.rs",
       "symbol": "new::CARRICK_DENTRY_CACHE_CAPACITY_BYTES",
       "fingerprint": "fb5398024873873ac5e1eb7fc687366e8c956cbba621890093646e94aa0b1f25",
       "classification": "config_debug",
@@ -1843,7 +1843,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vfs/dentry.rs",
+      "file": "crates/carrick-vfs/src/vfs/dentry.rs",
       "symbol": "new::CARRICK_DENTRY_EVICT",
       "fingerprint": "b5c916c6541e982f549357c4358c60c34a4fb16f0f727a4a0cb900e017fc656a",
       "classification": "config_debug",
@@ -2713,17 +2713,17 @@
       "classification": "test_only",
       "rationale": "Test-only fixture or lock alias_registry_tests::thread_mapping_desc_from_region_and_fork_inheritance_with_offset::TEST_LOCK in crates/carrick-vmm-hvf/src/trap/memory_protection/tests.rs scoped strictly to test harness execution."
     },
-  {
-    "kind": "env_var_os",
-    "file": "crates/carrick-vmm-hvf/src/trap/persistent_executor.rs",
-    "symbol": "new::CARRICK_FD_CEILING",
-    "fingerprint": "6625ba015b01422c31fb2adeea78d36bf8fa5f6bd5a04b7314d3fa6fe401e9f2",
-    "classification": "config_debug",
-    "rationale": "CARRICK_FD_CEILING=0 is a diagnostic same-binary ABBA control read while constructing the carrier-owned publisher. It can only permanently disable the carrier fstat fast path; it cannot enable a policy-disabled gate, lower the monotonic ceiling, select container identity, or change guest-visible syscall semantics."
-  },
-  {
-    "kind": "thread_local",
-    "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap/persistent_executor.rs",
+      "symbol": "new::CARRICK_FD_CEILING",
+      "fingerprint": "6625ba015b01422c31fb2adeea78d36bf8fa5f6bd5a04b7314d3fa6fe401e9f2",
+      "classification": "config_debug",
+      "rationale": "CARRICK_FD_CEILING=0 is a diagnostic same-binary ABBA control read while constructing the carrier-owned publisher. It can only permanently disable the carrier fstat fast path; it cannot enable a policy-disabled gate, lower the monotonic ceiling, select container identity, or change guest-visible syscall semantics."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
       "symbol": "STAGE2_AUDIT_STATE",
       "fingerprint": "f4a8dd5e57f884559783cd3de35e10deac5ea59dfd6c204ad6ecdf6f75b88658",
       "classification": "test_only",
@@ -2787,7 +2787,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "file": "crates/carrick-vfs/src/fs_backend.rs",
       "symbol": "fresh_file_object_id::NEXT",
       "fingerprint": "a9778af5ccd1c6630d44c1e80c649fc3ac982ad5cc21d72bb30a021510749473",
       "classification": "monotonic_allocator",
