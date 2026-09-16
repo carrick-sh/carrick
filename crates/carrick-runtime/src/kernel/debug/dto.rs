@@ -1331,7 +1331,7 @@ impl KernelDebugSnapshot {
 }
 
 fn continuation_row(
-    diagnostic: &crate::vcpu_loop::continuation::ContinuationDiagnostic,
+    diagnostic: &crate::kernel::continuation::ContinuationDiagnostic,
 ) -> DebugContinuationRow {
     DebugContinuationRow {
         id: diagnostic.id,

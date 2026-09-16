@@ -107,7 +107,7 @@ impl crate::kernel::TaskWaker for HvpatchTaskWaker {
 
 pub(crate) struct HvpatchRuntimeDirectory {
     pub(crate) endpoints: Mutex<BTreeMap<crate::kernel::TaskKey, HvpatchRuntimeEndpoint>>,
-    continuation_wait_service: Mutex<Option<Arc<continuation::CarrierWaitService>>>,
+    continuation_wait_service: Mutex<Option<Arc<crate::kernel::continuation::CarrierWaitService>>>,
     pub(crate) scheduler: Mutex<Option<Arc<crate::kernel::scheduler::Scheduler>>>,
     /// The kernel this carrier's jobs live in, for the always-on
     /// `ProcessGraphLiveness` invariant and its post-mortem capture. `Weak`
@@ -278,7 +278,7 @@ enum RuntimeDirectoryShutdown {
 
 pub(crate) struct PreparedPersistentServices {
     pub(crate) scheduler: Arc<crate::kernel::Scheduler>,
-    pub(crate) wait_service: Arc<continuation::CarrierWaitService>,
+    pub(crate) wait_service: Arc<crate::kernel::continuation::CarrierWaitService>,
 }
 
 pub(crate) enum HvpatchProcessJobHandle {
@@ -743,9 +743,9 @@ impl HvpatchRuntimeDirectory {
             };
         }
         let scheduler = self.carrier_scheduler(kernel);
-        let wait_service = Arc::new(continuation::CarrierWaitService::new(Arc::clone(
-            &scheduler,
-        )));
+        let wait_service = Arc::new(crate::kernel::continuation::CarrierWaitService::new(
+            Arc::clone(&scheduler),
+        ));
         PreparedPersistentServices {
             scheduler,
             wait_service,
@@ -815,7 +815,7 @@ impl HvpatchRuntimeDirectory {
         kernel: &Arc<crate::kernel::Kernel>,
     ) -> (
         Arc<crate::kernel::Scheduler>,
-        Arc<continuation::CarrierWaitService>,
+        Arc<crate::kernel::continuation::CarrierWaitService>,
     ) {
         self.bind_liveness_kernel(kernel);
         let scheduler = {
@@ -835,9 +835,9 @@ impl HvpatchRuntimeDirectory {
         let service = {
             let mut slot = self.continuation_wait_service.lock();
             Arc::clone(slot.get_or_insert_with(|| {
-                Arc::new(continuation::CarrierWaitService::new(Arc::clone(
-                    &scheduler,
-                )))
+                Arc::new(crate::kernel::continuation::CarrierWaitService::new(
+                    Arc::clone(&scheduler),
+                ))
             }))
         };
         (scheduler, service)

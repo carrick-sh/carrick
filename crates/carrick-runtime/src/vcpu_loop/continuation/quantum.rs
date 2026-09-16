@@ -14,7 +14,7 @@ use parking_lot::{Condvar, Mutex};
 use crate::kernel::Scheduler;
 use crate::kernel::objects::ThreadKey;
 
-use super::next_nonzero;
+use crate::kernel::continuation::next_nonzero;
 
 static NEXT_RUNNER_JOB_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -934,8 +934,8 @@ mod tests {
 
     use crate::kernel::Scheduler;
 
-    use super::super::tests::bootstrap;
     use super::*;
+    use crate::kernel::continuation::tests::bootstrap;
     #[test]
     fn hvpatch_persistent_quantum_and_binding_exclude_executor_authority() {
         fn assert_send<T: Send>() {}

@@ -1475,19 +1475,19 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "file": "crates/carrick-runtime/src/kernel/continuation.rs",
       "symbol": "NEXT_CONTINUATION_ID",
       "fingerprint": "a5c1115480c325eba5e831a9d9632f83adfbbc9c699168f2dc52bfcd3bb85f23",
       "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator NEXT_CONTINUATION_ID in crates/carrick-runtime/src/vcpu_loop/continuation.rs generating unique IDs across the host process."
+      "rationale": "Carrier-wide monotonic allocator NEXT_CONTINUATION_ID in crates/carrick-runtime/src/kernel/continuation.rs generating unique IDs across the host process."
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "file": "crates/carrick-runtime/src/kernel/continuation.rs",
       "symbol": "NEXT_RESOURCE_GENERATION",
       "fingerprint": "302bfa03219e9cdc7b82cd524c1aa79b535596d7030d7cae596964e5d2e825ec",
       "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator NEXT_RESOURCE_GENERATION in crates/carrick-runtime/src/vcpu_loop/continuation.rs generating unique IDs across the host process."
+      "rationale": "Carrier-wide monotonic allocator NEXT_RESOURCE_GENERATION in crates/carrick-runtime/src/kernel/continuation.rs generating unique IDs across the host process."
     },
     {
       "kind": "static",
@@ -1499,7 +1499,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
       "symbol": "event_future_cancelled_observation_drains_inflight_operation_safely::CHILD_MARKER",
       "fingerprint": "f2196b97922c18c843b5e8b263cc01e6548e67f5c5949e88399767be84c1d622",
       "classification": "test_only",
@@ -1507,7 +1507,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
       "symbol": "lock_ordering_opposing_locks_rendezvous_completes_without_deadlock::CHILD_MARKER",
       "fingerprint": "f2196b97922c18c843b5e8b263cc01e6548e67f5c5949e88399767be84c1d622",
       "classification": "test_only",
@@ -1515,7 +1515,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
       "symbol": "incoming_drain_waker_clone_runs_outside_registration_locks::VTABLE",
       "fingerprint": "01d31cdf861fb3951fb83b9ba4cc3267501e131b3b379559f0f60ddfe5f40a54",
       "classification": "test_only",
@@ -1523,7 +1523,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "file": "crates/carrick-runtime/src/kernel/continuation/tests.rs",
       "symbol": "incoming_task_waker_clone_runs_outside_registration_locks::VTABLE",
       "fingerprint": "01d31cdf861fb3951fb83b9ba4cc3267501e131b3b379559f0f60ddfe5f40a54",
       "classification": "test_only",
@@ -1531,11 +1531,11 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/wait_service.rs",
+      "file": "crates/carrick-runtime/src/kernel/continuation/wait_service.rs",
       "symbol": "NEXT_REGISTRATION_GENERATION",
       "fingerprint": "14cccde4761a985c1c26fff30977d44498b737d1a967212c85f34560e03c014f",
       "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator NEXT_REGISTRATION_GENERATION in crates/carrick-runtime/src/vcpu_loop/continuation/wait_service.rs generating unique IDs across the host process."
+      "rationale": "Carrier-wide monotonic allocator NEXT_REGISTRATION_GENERATION in crates/carrick-runtime/src/kernel/continuation/wait_service.rs generating unique IDs across the host process."
     },
     {
       "kind": "env_var_os",

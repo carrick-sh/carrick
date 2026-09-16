@@ -513,7 +513,7 @@ pub(crate) struct WorkerRuntime<'a> {
 #[derive(Debug)]
 pub(crate) struct PoolControl {
     usable_workers: std::sync::atomic::AtomicUsize,
-    pub(crate) wait_service: crate::vcpu_loop::continuation::CarrierWaitService,
+    pub(crate) wait_service: crate::kernel::continuation::CarrierWaitService,
     scheduler: Arc<Scheduler>,
     workers: Mutex<std::collections::BTreeMap<ExecutorId, WorkerControlHandle>>,
 }
@@ -543,7 +543,7 @@ impl PoolControl {
     fn new(workers: usize, scheduler: Arc<Scheduler>) -> Self {
         Self {
             usable_workers: std::sync::atomic::AtomicUsize::new(workers),
-            wait_service: crate::vcpu_loop::continuation::CarrierWaitService::new(Arc::clone(
+            wait_service: crate::kernel::continuation::CarrierWaitService::new(Arc::clone(
                 &scheduler,
             )),
             scheduler,

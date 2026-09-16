@@ -59,7 +59,7 @@ fn make_control_pipe() -> Result<(OwnedFd, OwnedFd), RuntimeError> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::vcpu_loop) enum RegistrationState {
+pub(crate) enum RegistrationState {
     Prepared,
     Enrolled,
     Ready,
@@ -68,7 +68,7 @@ pub(in crate::vcpu_loop) enum RegistrationState {
 }
 
 #[allow(dead_code)]
-pub(in crate::vcpu_loop) enum ProducerSubscription {
+pub(crate) enum ProducerSubscription {
     Futex(carrick_thread::thread::FutexGenerationSubscription),
     Task(crate::kernel::objects::TaskWakeSubscription),
     Vfork(crate::kernel::core::VforkReleaseSubscription),
@@ -99,21 +99,21 @@ impl std::fmt::Debug for ProducerSubscription {
 }
 
 #[derive(Debug)]
-pub(in crate::vcpu_loop) struct RegistrationOperationGate {
+pub(crate) struct RegistrationOperationGate {
     pub(super) token: ContinuationWakeToken,
-    pub(in crate::vcpu_loop) state: Mutex<OperationGateState>,
+    pub(crate) state: Mutex<OperationGateState>,
     drain_condvar: Condvar,
 }
 
 #[derive(Debug)]
-pub(in crate::vcpu_loop) struct OperationGateState {
+pub(crate) struct OperationGateState {
     cancelled: bool,
     consumed: bool,
     in_flight: usize,
     drain_waker: Option<Waker>,
 }
 
-pub(in crate::vcpu_loop) struct OperationClaimGuard {
+pub(crate) struct OperationClaimGuard {
     gate: Arc<RegistrationOperationGate>,
 }
 
@@ -149,7 +149,7 @@ impl RegistrationOperationGate {
         }
     }
 
-    pub(in crate::vcpu_loop) fn try_claim(
+    pub(crate) fn try_claim(
         self: &Arc<Self>,
         expected_token: ContinuationWakeToken,
     ) -> Option<OperationClaimGuard> {
@@ -166,17 +166,17 @@ impl RegistrationOperationGate {
         })
     }
 
-    pub(in crate::vcpu_loop) fn close_admission_cancelled(&self) {
+    pub(crate) fn close_admission_cancelled(&self) {
         let mut state = self.state.lock();
         state.cancelled = true;
     }
 
-    pub(in crate::vcpu_loop) fn close_admission_consumed(&self) {
+    pub(crate) fn close_admission_consumed(&self) {
         let mut state = self.state.lock();
         state.consumed = true;
     }
 
-    pub(in crate::vcpu_loop) fn drain(&self) {
+    pub(crate) fn drain(&self) {
         let mut state = self.state.lock();
         while state.in_flight > 0 {
             self.drain_condvar.wait(&mut state);
@@ -185,16 +185,16 @@ impl RegistrationOperationGate {
 }
 
 #[derive(Debug)]
-pub(in crate::vcpu_loop) struct RegistrationEntry {
-    pub(in crate::vcpu_loop) token: ContinuationWakeToken,
-    pub(in crate::vcpu_loop) state: RegistrationState,
-    pub(in crate::vcpu_loop) event: Option<ContinuationEvent>,
-    pub(in crate::vcpu_loop) probe: ReadinessProbe,
-    pub(in crate::vcpu_loop) deadline: Option<Instant>,
-    pub(in crate::vcpu_loop) task_waker: Option<Waker>,
-    pub(in crate::vcpu_loop) subscriptions: Vec<ProducerSubscription>,
-    pub(in crate::vcpu_loop) signal_readiness: SignalReadinessProbe,
-    pub(in crate::vcpu_loop) operation_gate: Arc<RegistrationOperationGate>,
+pub(crate) struct RegistrationEntry {
+    pub(crate) token: ContinuationWakeToken,
+    pub(crate) state: RegistrationState,
+    pub(crate) event: Option<ContinuationEvent>,
+    pub(crate) probe: ReadinessProbe,
+    pub(crate) deadline: Option<Instant>,
+    pub(crate) task_waker: Option<Waker>,
+    pub(crate) subscriptions: Vec<ProducerSubscription>,
+    pub(crate) signal_readiness: SignalReadinessProbe,
+    pub(crate) operation_gate: Arc<RegistrationOperationGate>,
 }
 
 /// The reactor's O(1)-per-cycle view of the registration map.
@@ -216,15 +216,15 @@ pub(in crate::vcpu_loop) struct RegistrationEntry {
 /// a state transition desynchronise the index, so the source-shape test in this
 /// module refuses one.
 #[derive(Debug, Default)]
-pub(in crate::vcpu_loop) struct ReactorWorkSet {
+pub(crate) struct ReactorWorkSet {
     /// Enrolled registrations that contribute host pollfds.
-    pub(in crate::vcpu_loop) pollable: BTreeSet<ContinuationId>,
+    pub(crate) pollable: BTreeSet<ContinuationId>,
     /// Enrolled registrations carrying a deadline, ordered BY deadline, so the
     /// nearest is the first key and the expired set is a prefix.
-    pub(in crate::vcpu_loop) deadlines: BTreeSet<(Instant, ContinuationId)>,
+    pub(crate) deadlines: BTreeSet<(Instant, ContinuationId)>,
     /// Enrolled `RecordLock` registrations, each of which asks the cycle for a
     /// 10 ms retry tick and a drive attempt.
-    pub(in crate::vcpu_loop) record_locks: BTreeSet<ContinuationId>,
+    pub(crate) record_locks: BTreeSet<ContinuationId>,
 }
 
 impl ReactorWorkSet {
@@ -262,16 +262,13 @@ impl ReactorWorkSet {
         }
     }
 
-    pub(in crate::vcpu_loop) fn nearest_deadline(&self) -> Option<Instant> {
+    pub(crate) fn nearest_deadline(&self) -> Option<Instant> {
         self.deadlines.first().map(|(deadline, _)| *deadline)
     }
 
     /// Enrolled registrations whose deadline has already passed. The set is
     /// ordered by deadline, so the expired rows are its prefix.
-    pub(in crate::vcpu_loop) fn expired_at(
-        &self,
-        now: Instant,
-    ) -> impl Iterator<Item = ContinuationId> + '_ {
+    pub(crate) fn expired_at(&self, now: Instant) -> impl Iterator<Item = ContinuationId> + '_ {
         self.deadlines
             .iter()
             .take_while(move |(deadline, _)| now >= *deadline)
@@ -282,7 +279,7 @@ impl ReactorWorkSet {
 /// A registration borrowed for mutation together with the index that must be
 /// resynchronised afterwards. `Drop` does the resync, so a caller cannot leave
 /// the reactor's view stale by taking an early return out of the borrow.
-pub(in crate::vcpu_loop) struct IndexedEntryMut<'state> {
+pub(crate) struct IndexedEntryMut<'state> {
     id: ContinuationId,
     /// The two facts membership is derived from, read when the borrow opened.
     /// `Drop` resynchronises only when one of them moved, so the many borrows
@@ -326,7 +323,7 @@ fn membership_inputs(
 }
 
 #[derive(Debug, Default)]
-pub(in crate::vcpu_loop) struct CarrierWaitState {
+pub(crate) struct CarrierWaitState {
     pub(super) entries: BTreeMap<ContinuationId, RegistrationEntry>,
     pub(super) reactor_work: ReactorWorkSet,
     #[cfg(test)]
@@ -352,10 +349,7 @@ impl CarrierWaitState {
     }
 
     /// Retire a registration and every index row derived from it.
-    pub(in crate::vcpu_loop) fn remove_registration(
-        &mut self,
-        id: ContinuationId,
-    ) -> Option<RegistrationEntry> {
+    pub(crate) fn remove_registration(&mut self, id: ContinuationId) -> Option<RegistrationEntry> {
         let removed = self.entries.remove(&id);
         if let Some(entry) = removed.as_ref() {
             self.reactor_work.forget(id, entry);
@@ -365,10 +359,7 @@ impl CarrierWaitState {
 
     /// Borrow a registration for mutation; the index is resynchronised when the
     /// guard drops, on every path.
-    pub(in crate::vcpu_loop) fn registration_mut(
-        &mut self,
-        id: ContinuationId,
-    ) -> Option<IndexedEntryMut<'_>> {
+    pub(crate) fn registration_mut(&mut self, id: ContinuationId) -> Option<IndexedEntryMut<'_>> {
         let Self {
             entries,
             reactor_work,
@@ -384,7 +375,7 @@ impl CarrierWaitState {
 
     /// Cancel every registration still awaiting a wake, returning their wakers.
     /// Bulk form of [`Self::registration_mut`] for service shutdown.
-    pub(in crate::vcpu_loop) fn cancel_all_active(
+    pub(crate) fn cancel_all_active(
         &mut self,
         cause: CancellationCause,
     ) -> (Vec<Waker>, Vec<Arc<RegistrationOperationGate>>) {
@@ -433,7 +424,7 @@ impl std::fmt::Debug for ReactorTestHooks {
 }
 
 #[derive(Debug)]
-pub(in crate::vcpu_loop) struct CarrierWaitServiceInner {
+pub(crate) struct CarrierWaitServiceInner {
     scheduler: Arc<Scheduler>,
     pub(super) state: Mutex<CarrierWaitState>,
     shutdown: AtomicBool,
@@ -561,7 +552,7 @@ impl CarrierWaitServiceInner {
         was_active
     }
 
-    pub(in crate::vcpu_loop) fn consume_ready_exact(
+    pub(crate) fn consume_ready_exact(
         &self,
         token: ContinuationWakeToken,
     ) -> Result<(), ContinuationResumeError> {
@@ -617,7 +608,7 @@ impl CarrierWaitServiceInner {
         published
     }
 
-    pub(in crate::vcpu_loop) fn publish_event(
+    pub(crate) fn publish_event(
         &self,
         token: ContinuationWakeToken,
         event: ContinuationEvent,
@@ -914,7 +905,7 @@ impl Drop for CarrierWaitServiceInner {
 
 #[derive(Debug)]
 pub struct CarrierWaitService {
-    pub(in crate::vcpu_loop) inner: Arc<CarrierWaitServiceInner>,
+    pub(crate) inner: Arc<CarrierWaitServiceInner>,
 }
 
 impl Clone for CarrierWaitService {
@@ -1566,7 +1557,7 @@ impl CarrierWaitService {
     }
 
     #[cfg(test)]
-    pub(in crate::vcpu_loop) fn last_prepared_token(&self) -> ContinuationWakeToken {
+    pub(crate) fn last_prepared_token(&self) -> ContinuationWakeToken {
         self.inner
             .state
             .lock()
@@ -1575,22 +1566,22 @@ impl CarrierWaitService {
     }
 
     #[cfg(test)]
-    pub(in crate::vcpu_loop) fn reactor_poll_calls(&self) -> u64 {
+    pub(crate) fn reactor_poll_calls(&self) -> u64 {
         self.inner.reactor_poll_calls.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
-    pub(in crate::vcpu_loop) fn reactor_cycle_visits(&self) -> u64 {
+    pub(crate) fn reactor_cycle_visits(&self) -> u64 {
         self.inner.reactor_cycle_visits.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
-    pub(in crate::vcpu_loop) fn nudge_reactor_for_test(&self) {
+    pub(crate) fn nudge_reactor_for_test(&self) {
         self.inner.nudge_reactor();
     }
 
     #[cfg(test)]
-    pub(in crate::vcpu_loop) fn observe_next_reactor_poll(&self) -> Arc<std::sync::Barrier> {
+    pub(crate) fn observe_next_reactor_poll(&self) -> Arc<std::sync::Barrier> {
         let observer = Arc::new(std::sync::Barrier::new(2));
         let installed_at = self.inner.reactor_poll_calls.load(Ordering::Acquire);
         *self.inner.reactor_poll_observer.lock() = Some((installed_at, Arc::clone(&observer)));
@@ -1777,7 +1768,7 @@ impl WakePublishReceipt {
     }
 
     #[cfg(test)]
-    pub(in crate::vcpu_loop) fn assert_accepted(self) {
+    pub(crate) fn assert_accepted(self) {
         assert!(self.accepted);
     }
 }

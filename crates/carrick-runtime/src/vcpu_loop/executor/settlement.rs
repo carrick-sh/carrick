@@ -67,7 +67,7 @@ pub(crate) enum ExecutorExit {
     Syscall,
     Blocked(BlockedReason),
     BlockedContinuation {
-        continuation: Box<crate::vcpu_loop::continuation::BlockedContinuation>,
+        continuation: Box<crate::kernel::continuation::BlockedContinuation>,
         vfork_activation: Option<PreparedVforkChildActivation>,
     },
     Yielded,

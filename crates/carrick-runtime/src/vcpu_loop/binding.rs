@@ -2641,7 +2641,7 @@ where
         frame: carrick_hal::RawSyscall,
         outcome: DispatchOutcome,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        if continuation::is_blocking_dispatch_outcome(&outcome) {
+        if crate::kernel::continuation::is_blocking_dispatch_outcome(&outcome) {
             let _ = self.state.stash_parked_registers(engine);
             let request = self
                 .state
@@ -5224,7 +5224,7 @@ pub(crate) struct PreparedInitialRunnerTask {
 pub(crate) struct PreparedInitialHandoff {
     task: Option<PreparedInitialRunnerTask>,
     scheduler: Arc<crate::kernel::Scheduler>,
-    wait_service: Arc<continuation::CarrierWaitService>,
+    wait_service: Arc<crate::kernel::continuation::CarrierWaitService>,
     thread: crate::kernel::ThreadRef,
     generation: crate::kernel::objects::ExecutionGeneration,
     armed: bool,
@@ -7448,12 +7448,12 @@ mod tests {
             .task_binding()
             .capture(root.thread().key().tid)
             .expect("recapture vfork parent");
-        let continuation = continuation::BlockedContinuation::from_vfork_parent(
-            continuation::ContinuationCapture::from_lease(
+        let continuation = crate::kernel::continuation::BlockedContinuation::from_vfork_parent(
+            crate::kernel::continuation::ContinuationCapture::from_lease(
                 &current,
                 &lease,
                 SyscallRequest::new(220, crate::compat::SyscallArgs([0; 6])),
-                continuation::RestartClass::RestartSyscall,
+                crate::kernel::continuation::RestartClass::RestartSyscall,
             )
             .expect("capture vfork parent"),
             vfork_child.task().key(),

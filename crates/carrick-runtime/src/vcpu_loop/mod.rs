@@ -916,7 +916,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     #[cfg(test)]
     pub(super) committed_exec_context_for_test: Option<crate::kernel::KernelContext>,
     pub(super) syscall_completion: SyscallCompletionOwnership,
-    pub(super) continuation_restart: Option<continuation::RestartDecision>,
+    pub(super) continuation_restart: Option<crate::kernel::continuation::RestartDecision>,
     /// Consecutive identical (FAR, ESR) COW faults "successfully" resolved.
     /// A resolution that does not change the faulting translation refaults
     /// forever inside one quantum, starving this executor's command channel
@@ -924,7 +924,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// live on `futexforkrequeue` (core: ffr-livelock-76407). Fail closed
     /// with a named clause instead of spinning.
     pub(super) cow_refault_watch: Option<(u64, u64, Option<u64>, u32)>,
-    pub(super) reserved_signal: Option<continuation::ReservedSignal>,
+    pub(super) reserved_signal: Option<crate::kernel::continuation::ReservedSignal>,
     pub(super) this_tid: ThreadId,
     pub(super) threads: VcpuThreadRegistry,
     /// The object-safe vCPU registry (the kicker). The shared loop never names
@@ -1191,7 +1191,7 @@ where
         lease: &crate::kernel::objects::ThreadExecutionLease,
         request: SyscallRequest,
         input: HvpatchContinuationInput,
-    ) -> Result<continuation::BlockedContinuation, RuntimeError> {
+    ) -> Result<crate::kernel::continuation::BlockedContinuation, RuntimeError> {
         let directory = kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
             RuntimeError::Configuration(
                 "HVPatch blocking continuation has no shared runtime directory".to_owned(),
@@ -1204,23 +1204,27 @@ where
         })?;
         let (_scheduler, _service) = directory.continuation_services(context.kernel());
 
-        let capture = continuation::ContinuationCapture::from_lease(
+        let capture = crate::kernel::continuation::ContinuationCapture::from_lease(
             context,
             lease,
             request,
             if is_restartable_syscall(request.number.raw()) {
-                continuation::RestartClass::RestartSyscall
+                crate::kernel::continuation::RestartClass::RestartSyscall
             } else {
-                continuation::RestartClass::Never
+                crate::kernel::continuation::RestartClass::Never
             },
         )
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let mut continuation = match input {
             HvpatchContinuationInput::Dispatch(outcome) => {
-                continuation::BlockedContinuation::from_dispatch_outcome(outcome, capture)
+                crate::kernel::continuation::BlockedContinuation::from_dispatch_outcome(
+                    outcome, capture,
+                )
             }
             HvpatchContinuationInput::Vfork { child, wait } => {
-                continuation::BlockedContinuation::from_vfork_parent(capture, child, wait)
+                crate::kernel::continuation::BlockedContinuation::from_vfork_parent(
+                    capture, child, wait,
+                )
             }
         }
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
@@ -1301,19 +1305,20 @@ where
             .task_binding()
             .capture(self.linux_tid)
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        let mut result = match continuation::resume_continuation(lease, event, &fresh) {
-            Ok(result) => result,
-            Err(continuation::ContinuationResumeError::StaleFileSlot) => {
-                return Ok(Some(DispatchOutcome::Errno {
-                    errno: crate::linux_abi::LINUX_EBADF,
-                }));
-            }
-            Err(error) => {
-                return Err(RuntimeError::Configuration(format!(
-                    "resume persistent continuation: {error:?}"
-                )));
-            }
-        };
+        let mut result =
+            match crate::kernel::continuation::resume_continuation(lease, event, &fresh) {
+                Ok(result) => result,
+                Err(crate::kernel::continuation::ContinuationResumeError::StaleFileSlot) => {
+                    return Ok(Some(DispatchOutcome::Errno {
+                        errno: crate::linux_abi::LINUX_EBADF,
+                    }));
+                }
+                Err(error) => {
+                    return Err(RuntimeError::Configuration(format!(
+                        "resume persistent continuation: {error:?}"
+                    )));
+                }
+            };
         // A restart decision is only MEANINGFUL when this resume itself
         // evaluated a signal (the Signal/ReservedSignal event path, which
         // weighs SA_RESTART against the continuation's family and progress).
@@ -1325,13 +1330,13 @@ where
         // all-true SA_RESTART predicates, surfacing EINTR to a guest whose
         // handler asked for restart (waitrestart scenario A).
         self.continuation_restart = match result.completion {
-            continuation::ContinuationCompletion::Redispatch
-            | continuation::ContinuationCompletion::RedispatchWithPartial(_) => None,
+            crate::kernel::continuation::ContinuationCompletion::Redispatch
+            | crate::kernel::continuation::ContinuationCompletion::RedispatchWithPartial(_) => None,
             _ => Some(result.restart()),
         };
         self.reserved_signal = result.take_reserved_signal();
 
-        use continuation::ContinuationCompletion as Completion;
+        use crate::kernel::continuation::ContinuationCompletion as Completion;
         Ok(match result.completion {
             Completion::Return(value) => Some(DispatchOutcome::Returned { value }),
             Completion::Errno(errno) => Some(DispatchOutcome::Errno { errno }),
@@ -1355,10 +1360,10 @@ where
             }
             Completion::BlockingWrite { write, outcome } => {
                 let outcome = match outcome {
-                    continuation::BlockingWriteOutcome::Return(value) => {
+                    crate::kernel::continuation::BlockingWriteOutcome::Return(value) => {
                         DispatchOutcome::Returned { value }
                     }
-                    continuation::BlockingWriteOutcome::Errno(errno) => {
+                    crate::kernel::continuation::BlockingWriteOutcome::Errno(errno) => {
                         DispatchOutcome::Errno { errno }
                     }
                 };
@@ -1732,7 +1737,7 @@ where
                             )
                     }
                 })?;
-            if continuation::is_blocking_dispatch_outcome(&outcome) {
+            if crate::kernel::continuation::is_blocking_dispatch_outcome(&outcome) {
                 // The persistent executor converts this exact owned outcome into
                 // a continuation at its quantum boundary. This is the ONLY exit
                 // for a blocking outcome; the arm below only fails closed.
@@ -2164,13 +2169,13 @@ pub(super) fn service_signals_threaded<E: ThreadedEngine>(
     fatal_image_generation: u64,
     last_syscall_retval: Option<i64>,
     interrupted_pc: Option<u64>,
-    continuation_restart: Option<continuation::RestartDecision>,
-    reserved_signal: Option<continuation::ReservedSignal>,
+    continuation_restart: Option<crate::kernel::continuation::RestartDecision>,
+    reserved_signal: Option<crate::kernel::continuation::ReservedSignal>,
     traps: usize,
 ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
     {
-        let restart =
-            continuation_restart.map(|decision| decision == continuation::RestartDecision::Restart);
+        let restart = continuation_restart
+            .map(|decision| decision == crate::kernel::continuation::RestartDecision::Restart);
         let restart_ctx = SignalRestartContext {
             last_syscall_retval,
             interrupted_pc,

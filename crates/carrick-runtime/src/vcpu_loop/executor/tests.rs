@@ -85,7 +85,7 @@ struct FakeBinding {
     load_identity: parking_lot::Mutex<Option<TaskLoadIdentity>>,
     required_continuation_sequence: parking_lot::Mutex<Option<u64>>,
     blocked_continuation:
-        parking_lot::Mutex<Option<crate::vcpu_loop::continuation::BlockedContinuation>>,
+        parking_lot::Mutex<Option<crate::kernel::continuation::BlockedContinuation>>,
     blocked_vfork_activation: parking_lot::Mutex<Option<super::PreparedVforkChildActivation>>,
     terminal_settlement_notification: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     descendant: parking_lot::Mutex<Option<DescendantPublication>>,
@@ -200,14 +200,14 @@ impl FakeBinding {
 
     fn block_with_continuation(
         &self,
-        continuation: crate::vcpu_loop::continuation::BlockedContinuation,
+        continuation: crate::kernel::continuation::BlockedContinuation,
     ) {
         *self.blocked_continuation.lock() = Some(continuation);
     }
 
     fn block_with_vfork_continuation(
         &self,
-        continuation: crate::vcpu_loop::continuation::BlockedContinuation,
+        continuation: crate::kernel::continuation::BlockedContinuation,
         vfork_activation: super::PreparedVforkChildActivation,
     ) {
         *self.blocked_continuation.lock() = Some(continuation);
@@ -4088,7 +4088,7 @@ fn blocked_task_releases_the_only_worker_immediately() {
 
 #[test]
 fn pool_drives_owned_blocked_continuation_into_kernel_state() {
-    use crate::vcpu_loop::continuation::{BlockedContinuation, ContinuationCapture, RestartClass};
+    use crate::kernel::continuation::{BlockedContinuation, ContinuationCapture, RestartClass};
 
     let (kernel, blocked) = bootstrap(14_045);
     let runnable = sibling(&kernel, &blocked, 24_045);
@@ -5335,15 +5335,15 @@ impl VforkTestFixture {
         )
     }
 
-    fn make_continuation(&self) -> crate::vcpu_loop::continuation::BlockedContinuation {
-        let parent_capture = crate::vcpu_loop::continuation::ContinuationCapture::new(
+    fn make_continuation(&self) -> crate::kernel::continuation::BlockedContinuation {
+        let parent_capture = crate::kernel::continuation::ContinuationCapture::new(
             &self.parent,
             self.parent_generation,
             SyscallRequest::new(220, SyscallArgs([0; 6])),
-            crate::vcpu_loop::continuation::RestartClass::Never,
+            crate::kernel::continuation::RestartClass::Never,
         )
         .unwrap();
-        crate::vcpu_loop::continuation::BlockedContinuation::from_vfork_parent(
+        crate::kernel::continuation::BlockedContinuation::from_vfork_parent(
             parent_capture,
             self.child.task().key(),
             self.wait.clone(),

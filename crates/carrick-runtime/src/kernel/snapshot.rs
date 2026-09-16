@@ -109,7 +109,7 @@ pub struct ThreadSnapshotRow {
     /// wait service still holds a registration a producer can publish into.
     /// `execution` says a thread is blocked; this says whether anything can
     /// ever unblock it.
-    pub continuation: Option<crate::vcpu_loop::continuation::ContinuationDiagnostic>,
+    pub continuation: Option<crate::kernel::continuation::ContinuationDiagnostic>,
     pub task: TaskKey,
     pub registry_id: Option<ThreadId>,
     pub class: ObjectSnapshotClass,

@@ -373,7 +373,7 @@ pub enum ThreadExecutionState {
     Blocked {
         generation: ExecutionGeneration,
         reason: BlockedReason,
-        continuation: Option<crate::vcpu_loop::continuation::ContinuationId>,
+        continuation: Option<crate::kernel::continuation::ContinuationId>,
     },
     Exited {
         generation: ExecutionGeneration,
@@ -500,7 +500,7 @@ impl ThreadSchedulerAction {
 struct ThreadExecutionRecord {
     state: ThreadExecutionState,
     task_state: Option<Box<MigratableTaskState>>,
-    blocked_continuation: Option<Box<crate::vcpu_loop::continuation::BlockedContinuation>>,
+    blocked_continuation: Option<Box<crate::kernel::continuation::BlockedContinuation>>,
     next_executor_epoch: u64,
     exec_invalidation_pending: bool,
     control_quantum: Option<SchedulerControlQuantum>,
@@ -513,8 +513,8 @@ pub(crate) struct SchedulerControlQuantum {
 }
 
 fn cancel_continuation_slot(
-    slot: &mut Option<Box<crate::vcpu_loop::continuation::BlockedContinuation>>,
-    cause: crate::vcpu_loop::continuation::CancellationCause,
+    slot: &mut Option<Box<crate::kernel::continuation::BlockedContinuation>>,
+    cause: crate::kernel::continuation::CancellationCause,
 ) {
     if let Some(continuation) = slot.take() {
         let _ = continuation.cancel(cause);
@@ -545,7 +545,7 @@ pub struct ThreadExecutionLease {
     executor: ExecutorId,
     executor_epoch: u64,
     task_state: Option<Box<MigratableTaskState>>,
-    blocked_continuation: Option<Box<crate::vcpu_loop::continuation::BlockedContinuation>>,
+    blocked_continuation: Option<Box<crate::kernel::continuation::BlockedContinuation>>,
     settled: bool,
 }
 
@@ -687,13 +687,13 @@ impl ThreadExecutionLease {
 
     pub fn blocked_continuation(
         &self,
-    ) -> Option<&crate::vcpu_loop::continuation::BlockedContinuation> {
+    ) -> Option<&crate::kernel::continuation::BlockedContinuation> {
         self.blocked_continuation.as_deref()
     }
 
     pub(crate) fn take_blocked_continuation(
         &mut self,
-    ) -> Option<crate::vcpu_loop::continuation::BlockedContinuation> {
+    ) -> Option<crate::kernel::continuation::BlockedContinuation> {
         self.blocked_continuation
             .take()
             .map(|continuation| *continuation)
@@ -706,7 +706,7 @@ enum ExecutionSettlement {
     Blocked(BlockedReason),
     BlockedContinuation(
         BlockedReason,
-        Box<crate::vcpu_loop::continuation::BlockedContinuation>,
+        Box<crate::kernel::continuation::BlockedContinuation>,
     ),
     Exited,
 }
@@ -993,10 +993,10 @@ impl Thread {
     /// probe, and whether the wait service still holds a registration a
     /// producer can publish into — and a watchdog wedge snapshot is normally
     /// the only evidence available. See
-    /// [`BlockedContinuation::diagnostic`](crate::vcpu_loop::continuation::BlockedContinuation::diagnostic).
+    /// [`BlockedContinuation::diagnostic`](crate::kernel::continuation::BlockedContinuation::diagnostic).
     pub fn continuation_diagnostic(
         &self,
-    ) -> Option<crate::vcpu_loop::continuation::ContinuationDiagnostic> {
+    ) -> Option<crate::kernel::continuation::ContinuationDiagnostic> {
         let execution = self.execution.lock();
         let diagnostic = execution
             .blocked_continuation
@@ -1099,7 +1099,7 @@ impl Thread {
                         .ok_or(ThreadExecutionError::GenerationExhausted)?;
                     if let Some(continuation) = execution.blocked_continuation.as_ref() {
                         continuation.publish_ready_event(
-                            crate::vcpu_loop::continuation::ContinuationEvent::Ready,
+                            crate::kernel::continuation::ContinuationEvent::Ready,
                         );
                     }
                     execution.state = ThreadExecutionState::Runnable { generation };
@@ -1120,9 +1120,8 @@ impl Thread {
                     && let Some(continuation) = execution.blocked_continuation.as_ref()
                     && continuation.accepts_scheduler_wake_now()
                 {
-                    continuation.publish_ready_event(
-                        crate::vcpu_loop::continuation::ContinuationEvent::Ready,
-                    );
+                    continuation
+                        .publish_ready_event(crate::kernel::continuation::ContinuationEvent::Ready);
                 }
                 ThreadSchedulerAction::Queue {
                     key: self.key,
@@ -1574,8 +1573,8 @@ impl Thread {
 
     pub(in crate::kernel) fn cancel_kernel_owned_continuation(
         &self,
-        cause: crate::vcpu_loop::continuation::CancellationCause,
-    ) -> Option<crate::vcpu_loop::continuation::CancellationReceipt> {
+        cause: crate::kernel::continuation::CancellationCause,
+    ) -> Option<crate::kernel::continuation::CancellationReceipt> {
         let mut execution = self.execution.lock();
         let continuation = execution.blocked_continuation.take()?;
         let receipt = continuation.cancel(cause);
@@ -1613,7 +1612,7 @@ impl Thread {
         &self,
         lease: ThreadExecutionLease,
         reason: BlockedReason,
-        continuation: crate::vcpu_loop::continuation::BlockedContinuation,
+        continuation: crate::kernel::continuation::BlockedContinuation,
     ) -> Result<ThreadSchedulerAction, (ThreadExecutionError, ThreadExecutionLease)> {
         self.settle_execution_lease(
             lease,
@@ -1642,11 +1641,11 @@ impl Thread {
         let _ = lease.task_state.take();
         cancel_continuation_slot(
             &mut execution.blocked_continuation,
-            crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
+            crate::kernel::continuation::CancellationCause::ServiceShutdown,
         );
         cancel_continuation_slot(
             &mut lease.blocked_continuation,
-            crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
+            crate::kernel::continuation::CancellationCause::ServiceShutdown,
         );
         execution.exec_invalidation_pending = false;
         execution.control_quantum = None;
@@ -1695,7 +1694,7 @@ impl Thread {
         execution.task_state = None;
         cancel_continuation_slot(
             &mut execution.blocked_continuation,
-            crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
+            crate::kernel::continuation::CancellationCause::ServiceShutdown,
         );
         execution.exec_invalidation_pending = false;
         execution.control_quantum = None;
@@ -1748,7 +1747,7 @@ impl Thread {
         execution.task_state = None;
         cancel_continuation_slot(
             &mut execution.blocked_continuation,
-            crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
+            crate::kernel::continuation::CancellationCause::ServiceShutdown,
         );
         execution.exec_invalidation_pending = false;
         execution.control_quantum = None;
@@ -1786,7 +1785,7 @@ impl Thread {
         execution.task_state = None;
         cancel_continuation_slot(
             &mut execution.blocked_continuation,
-            crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
+            crate::kernel::continuation::CancellationCause::ServiceShutdown,
         );
         execution.exec_invalidation_pending = false;
         execution.control_quantum = None;
@@ -1851,11 +1850,11 @@ impl Thread {
             let _ = lease.task_state.take();
             cancel_continuation_slot(
                 &mut execution.blocked_continuation,
-                crate::vcpu_loop::continuation::CancellationCause::Exec,
+                crate::kernel::continuation::CancellationCause::Exec,
             );
             cancel_continuation_slot(
                 &mut lease.blocked_continuation,
-                crate::vcpu_loop::continuation::CancellationCause::Exec,
+                crate::kernel::continuation::CancellationCause::Exec,
             );
             execution.state = ThreadExecutionState::Exited { generation };
             execution.exec_invalidation_pending = false;
@@ -1889,7 +1888,7 @@ impl Thread {
                         if let Some(continuation) = execution.blocked_continuation.as_ref() {
                             if generic_wake_ready {
                                 continuation.publish_ready_event(
-                                    crate::vcpu_loop::continuation::ContinuationEvent::Ready,
+                                    crate::kernel::continuation::ContinuationEvent::Ready,
                                 );
                                 settle_flags |=
                                     crate::probes::HvpatchLeaseSettleFlag::ContinuationReady.raw();
@@ -1909,7 +1908,7 @@ impl Thread {
                             continuation: execution
                                 .blocked_continuation
                                 .as_deref()
-                                .map(crate::vcpu_loop::continuation::BlockedContinuation::id),
+                                .map(crate::kernel::continuation::BlockedContinuation::id),
                         };
                     }
                 }
@@ -1921,7 +1920,7 @@ impl Thread {
                     if generic_wake_ready || control_pending {
                         if generic_wake_ready {
                             continuation.publish_ready_event(
-                                crate::vcpu_loop::continuation::ContinuationEvent::Ready,
+                                crate::kernel::continuation::ContinuationEvent::Ready,
                             );
                             settle_flags |=
                                 crate::probes::HvpatchLeaseSettleFlag::ContinuationReady.raw();
@@ -1948,11 +1947,11 @@ impl Thread {
                     let _ = lease.task_state.take();
                     cancel_continuation_slot(
                         &mut execution.blocked_continuation,
-                        crate::vcpu_loop::continuation::CancellationCause::ThreadExit,
+                        crate::kernel::continuation::CancellationCause::ThreadExit,
                     );
                     cancel_continuation_slot(
                         &mut lease.blocked_continuation,
-                        crate::vcpu_loop::continuation::CancellationCause::ThreadExit,
+                        crate::kernel::continuation::CancellationCause::ThreadExit,
                     );
                     execution.state = ThreadExecutionState::Exited { generation };
                     execution.control_quantum = None;
@@ -1977,7 +1976,7 @@ impl Thread {
     /// checks counts from the lease that actually held it.
     fn carry_continuation_through_lease(
         lease: &mut ThreadExecutionLease,
-    ) -> Option<Box<crate::vcpu_loop::continuation::BlockedContinuation>> {
+    ) -> Option<Box<crate::kernel::continuation::BlockedContinuation>> {
         let mut continuation = lease.blocked_continuation.take()?;
         continuation.carry_through_lease(lease.generation);
         Some(continuation)
@@ -2055,7 +2054,7 @@ impl Thread {
         execution.task_state = None;
         cancel_continuation_slot(
             &mut execution.blocked_continuation,
-            crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
+            crate::kernel::continuation::CancellationCause::ServiceShutdown,
         );
         execution.exec_invalidation_pending = false;
         execution.control_quantum = None;
@@ -2095,7 +2094,7 @@ impl Thread {
         execution.task_state = None;
         cancel_continuation_slot(
             &mut execution.blocked_continuation,
-            crate::vcpu_loop::continuation::CancellationCause::Exec,
+            crate::kernel::continuation::CancellationCause::Exec,
         );
         execution.exec_invalidation_pending = false;
         execution.control_quantum = None;
