@@ -1,4 +1,4 @@
-use carrick_runtime::elf::{
+use carrick_kernel::elf::{
     ElfClass, ElfEndianness, Machine, SegmentPerms, inspect_elf, plan_elf_load,
 };
 

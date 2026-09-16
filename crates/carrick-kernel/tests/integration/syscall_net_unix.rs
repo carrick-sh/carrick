@@ -11,7 +11,7 @@
 mod support;
 
 #[cfg(target_os = "macos")]
-use carrick_runtime::linux_abi::{
+use carrick_kernel::linux_abi::{
     LINUX_AT_FDCWD, LINUX_EADDRINUSE, LINUX_ECONNREFUSED, LINUX_ENOENT, LINUX_ENXIO, LINUX_O_CREAT,
     LINUX_O_RDWR, LINUX_SOCK_STREAM,
 };

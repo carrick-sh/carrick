@@ -94,6 +94,9 @@ carrick-kernel = { path = ".", features = ["test-support"] }
 # path and are compiled out of a normal build; the kernel's fs tests assert on
 # them.
 carrick-vfs = { path = "../carrick-vfs", features = ["test-support"] }
+# The gzip/tar OCI-layer fixture builders the integration suite synthesises
+# rootfs layers from (shared with carrick-cli's and carrick-runtime's suites).
+carrick-test-support = { path = "../carrick-test-support" }
 proptest.workspace = true
 static_assertions = "1"
 tempfile.workspace = true

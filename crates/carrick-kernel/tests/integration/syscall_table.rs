@@ -1,4 +1,4 @@
-use carrick_runtime::syscall::{SupportLevel, SyscallHandler, aarch64_table, lookup_aarch64};
+use carrick_kernel::syscall::{SupportLevel, SyscallHandler, aarch64_table, lookup_aarch64};
 
 #[test]
 fn aarch64_syscall_table_is_sorted_for_binary_search() {
@@ -256,7 +256,7 @@ fn manifest_records_group_handler_and_compatibility_notes() {
 
 #[test]
 fn authority_partition_matches_host_boundary_rules() {
-    use carrick_runtime::syscall::Authority;
+    use carrick_kernel::syscall::Authority;
 
     // Process, signal, credentials, lifecycle, sched (except yield) are Guest authority
     let getpid = lookup_aarch64(172).unwrap();

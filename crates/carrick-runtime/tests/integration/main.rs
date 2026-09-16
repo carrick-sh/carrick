@@ -1,13 +1,21 @@
 //! Consolidated integration-test binary for carrick-runtime.
 //!
 //! These were previously separate `tests/*.rs` files, i.e. one test binary
-//! each, all statically linking the ~41k-line carrick-runtime rlib. Any change
-//! to the runtime's public API forced all of them to recompile and relink,
-//! which dominated `cargo test` wall time. Compiling them as `mod`s of a single
+//! each, all statically linking the carrick-runtime rlib. Any change to the
+//! runtime's public API forced all of them to recompile and relink, which
+//! dominated `cargo test` wall time. Compiling them as `mod`s of a single
 //! binary collapses that to one recompile + one link.
 //!
 //! Only tests safe to run as parallel threads in one process live here: pure
 //! dispatcher/ELF-load/rootfs/io tests that touch no process-global state.
+//!
+//! What is left here after the kernel moved to `carrick-kernel` is exactly the
+//! set that names the CARRIER or the image store: `syscall_signal`
+//! (`carrick_runtime::platform_bridges`), `io_wait` and `syscall_net_epoll`
+//! (`carrick_vmm_hvf::io_wait::ThreadWaiter`), `syscall_thread`
+//! (`carrick_vmm_hvf::host_signal::reset_after_supervisor_fork`) and
+//! `oci_layout` (`carrick_image`). Every other module tested kernel/dispatch
+//! behaviour only and now lives in `carrick-kernel/tests/integration/`.
 //!
 //! Tests that need their own process stay as top-level `tests/*.rs` binaries:
 //! - `trap_hvf`, `runtime_loop` — create the process-global HVF VM
@@ -19,31 +27,16 @@
 //! - `thread_stress_harness` — shells out to a script via a CWD-relative path,
 //!   sensitive to any sibling test that changes the process CWD.
 
-// Each integration submodule includes the shared `support` helper via
-// `#[path = "common/syscall_support.rs"] mod support;` so it stays self-
-// contained; that loads the same file once per submodule in this single binary.
+// The three modules below that need the shared syscall helper include it from
+// the kernel suite that owns it (`#[path = "../../../carrick-kernel/tests/
+// integration/common/syscall_support.rs"]`). There is exactly ONE copy of that
+// file in the tree — duplicating it is the transitional second path this split
+// exists to avoid — and the reach follows the crate dependency, carrier →
+// kernel. It loads once per submodule in this single binary.
 #![allow(clippy::duplicate_mod)]
 
-mod address_space;
-mod compat_report;
-mod concurrency_contracts;
-mod elf_inspector;
 mod io_wait;
 mod oci_layout;
-mod rootfs_overlay;
-mod rootfs_streaming;
-mod syscall_creds;
-mod syscall_fs_dir;
-mod syscall_fs_meta;
-mod syscall_fs_open;
-mod syscall_fs_pty;
-mod syscall_fs_rw;
-mod syscall_fs_stat;
-mod syscall_mem;
 mod syscall_net_epoll;
-mod syscall_net_tcp;
-mod syscall_net_unix;
 mod syscall_signal;
-mod syscall_table;
 mod syscall_thread;
-mod syscall_time;

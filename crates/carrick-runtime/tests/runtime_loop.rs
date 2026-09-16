@@ -8,7 +8,7 @@
 // file so the non-macOS cross-checks (which build --all-targets) skip it.
 #![cfg(feature = "platform-macos")]
 
-#[path = "integration/common/syscall_support.rs"]
+#[path = "../../carrick-kernel/tests/integration/common/syscall_support.rs"]
 mod support;
 
 use std::collections::VecDeque;

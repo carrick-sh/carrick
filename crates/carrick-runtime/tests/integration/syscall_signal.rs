@@ -1,9 +1,10 @@
 //! Signal syscall dispatch tests.
 //!
 //! Split out of the former tests/syscall_dispatch.rs monolith. Shared imports,
-//! constants, and helpers live in tests/common/syscall_support.rs.
+//! constants, and helpers live in the kernel suite's
+//! `tests/integration/common/syscall_support.rs`, included below.
 
-#[path = "common/syscall_support.rs"]
+#[path = "../../../carrick-kernel/tests/integration/common/syscall_support.rs"]
 mod support;
 
 use support::*;
