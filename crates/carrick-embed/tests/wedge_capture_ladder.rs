@@ -74,6 +74,9 @@ impl carrick_embed::SyscallInterceptor for ParkTheExecutor {
 }
 
 #[test]
+#[ignore = "attaches `sudo -n lldb` to THIS process and saves a core; run as a descendant of a \
+            Claude Code session it segfaults Terminal.app (three session losses on 2026-09-15). \
+            Owner-run from a separate terminal: `just test-embed wedge_capture_ladder -- --ignored`"]
 fn a_carrier_that_cannot_consume_its_abort_is_captured_and_named() {
     let _guest = common::guest_lock();
 
