@@ -73,8 +73,7 @@ pub use deferred_anonymous::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// 16 KiB: the host page granule every lane shares today.
-pub const HOST_PAGE_GRANULE: u64 = 0x4000;
+pub const HOST_PAGE_GRANULE: u64 = 0x4000; // 16 KiB: the host page granule every lane shares today.
 
 /// Neutral guest-memory region lookup + the combined PROT_NONE/region access
 /// gate ([`region::find_region_for_gpa`], [`region::safe_guest_access`]) — the
