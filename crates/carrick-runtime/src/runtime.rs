@@ -97,8 +97,8 @@ use std::time::{Duration, Instant};
 use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::{Gpa, GuestVa, HostVa};
 
-use crate::ROSETTA_INTERPRETER;
 use crate::compat::CompatReporter;
+use crate::dispatch::rosetta::ROSETTA_INTERPRETER;
 use crate::dispatch::{
     CurrentMmMemory, DispatchOutcome, FdWaitCompletion, GuestMemory, MemoryError, PreparedDispatch,
     PreparedSyscall, SyscallCompletionToken, SyscallDispatcher, SyscallRequest,
@@ -2248,7 +2248,7 @@ pub(crate) fn maybe_redirect_to_rosetta<A: AsRef<[u8]>>(
 
     crate::probes::execve_argv("rosetta-redirect", &[target_path.as_bytes().to_vec()]);
 
-    let rosetta_bytes = match crate::rosetta_binary_bytes() {
+    let rosetta_bytes = match crate::dispatch::rosetta::rosetta_binary_bytes() {
         Some(b) => b.to_vec(),
         None => return Some(Err(LINUX_ENOENT)),
     };
@@ -3480,7 +3480,7 @@ mod rosetta_tests {
     fn rosetta_license_blob_is_sourced_from_binary_if_present() {
         // When Rosetta is installed, the licence blob is the NUL-terminated
         // verification string read live from its binary (never embedded here).
-        if let Some(blob) = crate::rosetta_license_blob() {
+        if let Some(blob) = crate::dispatch::rosetta::rosetta_license_blob() {
             assert!(blob.starts_with(b"Our hard work"));
             assert_eq!(blob.last(), Some(&0u8), "blob must end at the NUL");
         }

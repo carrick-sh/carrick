@@ -679,6 +679,7 @@ pub(crate) use proc::build_hvpatch_waitid_siginfo;
 mod proctitle;
 pub(crate) mod resources;
 mod retval;
+pub(crate) mod rosetta;
 #[macro_use]
 pub(crate) mod signal;
 mod bpf;
@@ -2352,7 +2353,7 @@ fn write_packed(memory: &mut impl CurrentMmMemory, address: u64, bytes: &[u8]) -
 /// when `request` is one of Rosetta's verification/info ioctls (so the ioctl
 /// handler returns it), else `None` (continue normal ioctl handling).
 ///
-/// See `dispatch::fs::ioctl` and `crate::rosetta_license_blob` for the
+/// See `dispatch::fs::ioctl` and `rosetta::rosetta_license_blob` for the
 /// reverse-engineered details. The expected response bytes are sourced live from
 /// the installed Rosetta binary rather than embedded here.
 pub(super) fn rosetta_handshake_ioctl(
@@ -2374,7 +2375,7 @@ pub(super) fn rosetta_handshake_ioctl(
     // The response length is encoded in the ioctl request's size field [29:16].
     let size = ((request >> 16) & 0x3fff) as usize;
     let mut payload = vec![0u8; size];
-    if is_license && let Some(blob) = crate::rosetta_license_blob() {
+    if is_license && let Some(blob) = rosetta::rosetta_license_blob() {
         let n = blob.len().min(size);
         payload[..n].copy_from_slice(&blob[..n]);
     }
