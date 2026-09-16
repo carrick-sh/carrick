@@ -20,10 +20,10 @@ use std::cell::{Cell, RefCell};
 /// merely ABUTS its neighbours rather than overlapping them.
 #[test]
 fn locked_ranges_insert_keeps_the_set_sorted_and_merged() {
-    fn range(start: u64, end: u64) -> crate::vfs::GuestMemoryRange {
-        crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)).expect("valid range")
+    fn range(start: u64, end: u64) -> carrick_vfs::GuestMemoryRange {
+        carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)).expect("valid range")
     }
-    fn pairs(ranges: &[crate::vfs::GuestMemoryRange]) -> Vec<(u64, u64)> {
+    fn pairs(ranges: &[carrick_vfs::GuestMemoryRange]) -> Vec<(u64, u64)> {
         ranges
             .iter()
             .map(|r| (r.start().raw(), r.end().raw()))
@@ -4741,7 +4741,7 @@ fn core_maps_exclude_carricks_el1_only_kernel_hole() {
         read: true,
         write: true,
         execute: false,
-        sharing: crate::vfs::ProcMapSharing::Private,
+        sharing: carrick_vfs::ProcMapSharing::Private,
         path: String::new(),
     };
     let guest_text = ProcMapsEntry {
@@ -4750,7 +4750,7 @@ fn core_maps_exclude_carricks_el1_only_kernel_hole() {
         read: true,
         write: false,
         execute: true,
-        sharing: crate::vfs::ProcMapSharing::Private,
+        sharing: carrick_vfs::ProcMapSharing::Private,
         path: String::new(),
     };
     mem.address_space_regions = Some(vec![
@@ -4791,7 +4791,7 @@ fn core_maps_keep_guest_visible_neighbours_of_the_kernel_hole() {
         read: true,
         write: false,
         execute: true,
-        sharing: crate::vfs::ProcMapSharing::Private,
+        sharing: carrick_vfs::ProcMapSharing::Private,
         path: String::new(),
     };
     mem.address_space_regions = Some(vec![

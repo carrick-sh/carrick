@@ -538,7 +538,7 @@ impl CarrierRuntime {
             return;
         }
         crate::memory::init_alias_ipa_allocator();
-        crate::fs_resolve_cache::init();
+        carrick_vfs::fs_resolve_cache::init();
     }
 
     /// Boot one container into the carrier's single kernel graph and runtime
@@ -2263,8 +2263,8 @@ mod tests {
             release: Arc<std::sync::Barrier>,
         }
 
-        impl crate::vfs::Vfs for BlockingDropVfs {
-            fn lookup(&self, _path: &str) -> Result<crate::vfs::Metadata, crate::vfs::VfsError> {
+        impl carrick_vfs::Vfs for BlockingDropVfs {
+            fn lookup(&self, _path: &str) -> Result<carrick_vfs::Metadata, carrick_vfs::VfsError> {
                 Err(crate::linux_abi::LINUX_ENOENT)
             }
         }

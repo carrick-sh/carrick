@@ -6,7 +6,7 @@ impl SyscallDispatcher {
     pub fn register_mount(
         &mut self,
         point: impl Into<std::path::PathBuf>,
-        vfs: Box<dyn crate::vfs::Vfs>,
+        vfs: Box<dyn carrick_vfs::Vfs>,
     ) {
         self.fs.vfs_mounts_mut().mount(point, vfs);
     }
@@ -53,7 +53,7 @@ impl<'a> FsView<'a> {
             // The cwd is stored in the VFS layer's reversible escape form;
             // decode to the opaque path BYTES so getcwd is byte-exact for a
             // cwd that contains undecodable (non-UTF-8) components.
-            let mut bytes = crate::pathcodec::decode_to_bytes(&cwd);
+            let mut bytes = carrick_vfs::pathcodec::decode_to_bytes(&cwd);
             bytes.push(0);
             if bytes.len() > size {
                 return Ok(DispatchOutcome::errno(LINUX_ERANGE));

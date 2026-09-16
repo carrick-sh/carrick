@@ -47,11 +47,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use parking_lot::{Mutex, RwLock};
 
 use crate::fs_backend::{FsBackend, RealStat};
-use crate::linux_abi::{
+use crate::rootfs::{RootFs, RootFsEntryKind};
+use carrick_abi::{
     LINUX_EAGAIN, LINUX_EINVAL, LINUX_EISDIR, LINUX_ELOOP, LINUX_ENAMETOOLONG, LINUX_ENOENT,
     LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_EXDEV, LinuxErrno,
 };
-use crate::rootfs::{RootFs, RootFsEntryKind};
 use carrick_abi::{NsGid, NsUid};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

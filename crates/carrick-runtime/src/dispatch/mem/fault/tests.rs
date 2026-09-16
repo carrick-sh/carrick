@@ -408,7 +408,7 @@ fn first_touch_arming_answers_and_splits_exactly_like_a_scan() {
     let page = LINUX_PAGE_SIZE;
     let base = crate::memory::LINUX_HIGH_VA_THRESHOLD;
     let range = |start: u64, end: u64| {
-        crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)).expect("range")
+        carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)).expect("range")
     };
     let mut arming = FirstTouchArming::default();
     arming.arm(range(base, base + 4 * page), LinuxProtFlags::READ);

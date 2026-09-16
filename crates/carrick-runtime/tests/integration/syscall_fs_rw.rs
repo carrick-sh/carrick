@@ -10,9 +10,9 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
-#[cfg(target_os = "macos")]
-use carrick_runtime::fs_backend::HostFsBackend;
 use carrick_runtime::linux_abi::LINUX_AT_FDCWD;
+#[cfg(target_os = "macos")]
+use carrick_vfs::fs_backend::HostFsBackend;
 // `LINUX_EFAULT`/`LINUX_O_CREAT`/`LINUX_O_RDWR` are only referenced by the
 // macOS-only (`--fs host`) tests below, so gate their import to match.
 #[cfg(target_os = "macos")]
@@ -1883,7 +1883,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
 #[cfg(target_os = "macos")]
 #[test]
 fn fsync_family_flushes_host_backed_files() {
-    use carrick_runtime::fs_backend::HostFsBackend;
+    use carrick_vfs::fs_backend::HostFsBackend;
 
     let scratch = tempfile::TempDir::new().unwrap();
     let backend = HostFsBackend::from_path(scratch.path()).unwrap();
@@ -1943,7 +1943,7 @@ fn fsync_family_flushes_host_backed_files() {
 #[cfg(target_os = "macos")]
 #[test]
 fn copy_file_range_uses_darwin_fast_path_for_whole_host_files() {
-    use carrick_runtime::fs_backend::HostFsBackend;
+    use carrick_vfs::fs_backend::HostFsBackend;
 
     let scratch = tempfile::TempDir::new().unwrap();
     let backend = HostFsBackend::from_path(scratch.path()).unwrap();

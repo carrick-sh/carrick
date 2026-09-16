@@ -261,7 +261,7 @@ test *ARGS:
         # is defined as the tests that do NOT need the HVF runtime or Docker;
         # those belong to a guest-capable lane (`just conformance*`,
         # `cargo test -p carrick-cli --test <name>`).
-        cargo test --workspace --exclude carrick-runtime --exclude carrick-cli --exclude carrick-host --exclude carrick-vmm-hvf --lib --bins {{ARGS}}
+        cargo test --workspace --exclude carrick-runtime --exclude carrick-cli --exclude carrick-host --exclude carrick-vfs --exclude carrick-vmm-hvf --lib --bins {{ARGS}}
         # The authenticated jit-shape builders/parsers have measured >1 MiB
         # debug frames. Several tests need two in one body; libtest's ~2 MiB
         # default has repeatedly been tipped over by unrelated additions. Keep
@@ -282,6 +282,19 @@ test *ARGS:
         # completed after a debugger attach resumed it — an indefinite gate
         # hang, not a slow test.
         env RUST_TEST_THREADS=1 cargo test -p carrick-host --lib {{ARGS}}
+        # carrick-vfs is serial because the filesystem layer it was extracted
+        # from always ran inside carrick-runtime's serial slot, and its state is
+        # process-wide by construction: the host backend's marker-directory set,
+        # stat cache and scratch-cleanup queue, `HOST_XATTR_READS`, and the
+        # `fs_resolve_cache` generation words are one process's worth of state
+        # shared by every test in it. The amplification cases assert on exact
+        # host-`openat` counts, so a sibling test's churn on those globals is
+        # directly visible: on parallel harness threads
+        # `dir_cache_survives_a_file_create_and_unlink_storm` measured 47 opens
+        # against an expected 15, and
+        # `fast_readonly_open_uses_the_immutable_lower_when_the_sparse_upper_is_absent`
+        # lost its fast path. Serial: 282/282, same coverage as before the move.
+        env RUST_TEST_THREADS=1 cargo test -p carrick-vfs --lib {{ARGS}}
         env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib {{ARGS}}
         # carrick-vmm-hvf is serial for a THIRD reason, and it is structural
         # rather than a test-hygiene lapse: the carrier is process-global by

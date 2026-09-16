@@ -1229,7 +1229,7 @@ mod tests {
             sparse_addr,
             sparse_len as u64,
             carrick_abi::LinuxProtFlags::READ | carrick_abi::LinuxProtFlags::WRITE,
-            crate::vfs::ProcMapSharing::Private,
+            carrick_vfs::ProcMapSharing::Private,
             String::new(),
         );
 
@@ -1403,7 +1403,7 @@ mod tests {
             target_addr,
             target_len as u64,
             carrick_abi::LinuxProtFlags::READ | carrick_abi::LinuxProtFlags::WRITE,
-            crate::vfs::ProcMapSharing::Private,
+            carrick_vfs::ProcMapSharing::Private,
             String::new(),
         );
 

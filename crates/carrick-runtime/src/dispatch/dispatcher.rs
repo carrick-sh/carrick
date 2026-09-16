@@ -24,8 +24,8 @@ use super::mqueue;
 use super::normalize_abs_path;
 use super::proc;
 use super::sysv;
-use crate::fs_backend::FsBackend;
-use crate::rootfs::{RootFs, RootFsMetadata};
+use carrick_vfs::fs_backend::FsBackend;
+use carrick_vfs::rootfs::{RootFs, RootFsMetadata};
 
 pub struct SyscallDispatcher {
     /// Generation-safe task adapter used to capture the mandatory kernel
@@ -144,7 +144,7 @@ impl SyscallDispatcher {
         Self::new_with_host_resolver(None)
     }
 
-    fn new_with_host_resolver(snapshot: Option<&crate::vfs::HostResolverSnapshot>) -> Self {
+    fn new_with_host_resolver(snapshot: Option<&carrick_vfs::HostResolverSnapshot>) -> Self {
         let (kernel_binding, mm_id) = bootstrap_one_task_binding();
         let mm_authority = Arc::new(DispatchMmAuthority::new(mm_id));
         Self {
@@ -184,7 +184,7 @@ impl SyscallDispatcher {
 
     pub fn with_network_and_host_resolver(
         network: std::sync::Arc<crate::network::RuntimeNetwork>,
-        snapshot: Option<&crate::vfs::HostResolverSnapshot>,
+        snapshot: Option<&carrick_vfs::HostResolverSnapshot>,
     ) -> Self {
         let mut dispatcher = Self::new_with_host_resolver(snapshot);
         // Bare/reference-model callers do not subsequently install the
@@ -200,7 +200,7 @@ impl SyscallDispatcher {
             let contents = resolv_conf_contents_for_network(&network.model);
             dispatcher.fs.vfs_mounts_mut().mount(
                 "/etc/resolv.conf",
-                Box::new(crate::vfs::ResolvConfVfs::from_contents(contents)),
+                Box::new(carrick_vfs::ResolvConfVfs::from_contents(contents)),
             );
         }
         dispatcher.network = network;
@@ -257,10 +257,10 @@ impl SyscallDispatcher {
         self.container().uts_ns().set_nodename(&hostname);
     }
 
-    pub fn set_host_resolver_snapshot(&mut self, snapshot: &crate::vfs::HostResolverSnapshot) {
+    pub fn set_host_resolver_snapshot(&mut self, snapshot: &carrick_vfs::HostResolverSnapshot) {
         self.fs.vfs_mounts_mut().mount(
             "/etc/resolv.conf",
-            Box::new(crate::vfs::ResolvConfVfs::from_host_snapshot(snapshot)),
+            Box::new(carrick_vfs::ResolvConfVfs::from_host_snapshot(snapshot)),
         );
     }
 
@@ -1302,7 +1302,7 @@ pub(in crate::dispatch) trait ProcCrossSubsystem: Send + Sync {
     fn layered_lstat(
         &self,
         path: &str,
-    ) -> Result<crate::rootfs::RootFsMetadata, carrick_abi::LinuxErrno>;
+    ) -> Result<carrick_vfs::rootfs::RootFsMetadata, carrick_abi::LinuxErrno>;
     fn hvpatch_exact_process_signal(
         &self,
         context: &crate::kernel::KernelContext,
@@ -1367,7 +1367,7 @@ impl ProcCrossSubsystem for SyscallDispatcher {
     fn layered_lstat(
         &self,
         path: &str,
-    ) -> Result<crate::rootfs::RootFsMetadata, carrick_abi::LinuxErrno> {
+    ) -> Result<carrick_vfs::rootfs::RootFsMetadata, carrick_abi::LinuxErrno> {
         self.layered_lstat(path)
     }
     fn hvpatch_exact_process_signal(

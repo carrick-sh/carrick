@@ -15,6 +15,12 @@ workspace = true
 # In-memory fs backend selection (default OFF; control point is carrick-cli,
 # forwarded through carrick-runtime exactly as before).
 fs-memory = ["carrick-spec/fs-memory"]
+# The host-open/stat/xattr counters the amplification tests assert on. They live
+# on the host backend's hot path, so they are compiled out of a normal build;
+# carrick-runtime's own tests exercise them from outside this crate, which
+# `#[cfg(test)]` alone cannot reach, so they are gated on `cfg(test)` OR this
+# feature and carrick-runtime enables it in its dev-dependencies only.
+test-support = []
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
@@ -26,6 +32,7 @@ carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-observability = { path = "../carrick-observability" }
 carrick-portable = { path = "../carrick-portable" }
 carrick-spec = { path = "../carrick-spec" }
+fd-lock.workspace = true
 flate2.workspace = true
 libc.workspace = true
 parking_lot.workspace = true

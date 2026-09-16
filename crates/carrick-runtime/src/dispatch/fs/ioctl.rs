@@ -87,7 +87,8 @@ fn fd_is_random_device(this: &FsView<'_>, fd: i32) -> bool {
             }
             Some(OpenDescription::SyntheticDevice { kind, .. }) => matches!(
                 kind,
-                crate::vfs::SyntheticDeviceKind::Random | crate::vfs::SyntheticDeviceKind::Urandom
+                carrick_vfs::SyntheticDeviceKind::Random
+                    | carrick_vfs::SyntheticDeviceKind::Urandom
             ),
             _ => false,
         })
@@ -200,7 +201,10 @@ impl<'a> FsView<'a> {
             })
     }
 
-    pub(super) fn tty0_console(&self, fd: i32) -> Option<Arc<crate::vfs::VirtualConsole>> {
+    pub(super) fn tty0_console(
+        &self,
+        fd: i32,
+    ) -> Option<Arc<dyn carrick_vfs::VirtualConsoleDevice>> {
         let of = self.open_file(fd)?;
         let desc = &of.description;
         match desc.read().as_deref() {

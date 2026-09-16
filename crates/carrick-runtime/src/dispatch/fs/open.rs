@@ -428,7 +428,7 @@ impl<'a> FsView<'a> {
                         host_fd: HostFdRef::new(host_fd),
                         is_read_end: access != LINUX_O_WRONLY,
                         base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC)
-                            .with_fs_identity(crate::vfs::FsIdentity::Overlay),
+                            .with_fs_identity(carrick_vfs::FsIdentity::Overlay),
                         pty: None,
                         bidirectional: access == LINUX_O_RDWR,
                         write_kind: HostWriteKind::PipeLike,
@@ -477,19 +477,21 @@ impl<'a> FsView<'a> {
         // serving for paths like /etc/hosts during the apt-resolver
         // run.
         match &dispatch_result {
-            Ok(crate::vfs::rootfs::OpenDispatchResult::File { contents, .. }) => {
+            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::File { contents, .. }) => {
                 crate::probes::path_open(&path, contents.len() as u64, 0);
             }
-            Ok(crate::vfs::rootfs::OpenDispatchResult::RootFsBackedFile { metadata, .. }) => {
+            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::RootFsBackedFile {
+                metadata, ..
+            }) => {
                 crate::probes::path_open(&path, metadata.size as u64, 0);
             }
-            Ok(crate::vfs::rootfs::OpenDispatchResult::HostFile { metadata, .. }) => {
+            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::HostFile { metadata, .. }) => {
                 crate::probes::path_open(&path, metadata.size as u64, 0);
             }
-            Ok(crate::vfs::rootfs::OpenDispatchResult::Directory { .. }) => {
+            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::Directory { .. }) => {
                 crate::probes::path_open(&path, 0, 0);
             }
-            Ok(crate::vfs::rootfs::OpenDispatchResult::NotFoundCreate) => {
+            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::NotFoundCreate) => {
                 crate::probes::path_open(&path, 0, 0);
             }
             Err(errno) => {
@@ -501,16 +503,16 @@ impl<'a> FsView<'a> {
         // doesn't leak.
         if open_flags.contains(LinuxOpenFlags::DIRECTORY) {
             match &dispatch_result {
-                Ok(crate::vfs::rootfs::OpenDispatchResult::HostFile { host_fd, .. }) => {
+                Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::HostFile { host_fd, .. }) => {
                     unsafe {
                         libc::close(*host_fd);
                     }
                     return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
                 }
-                Ok(crate::vfs::rootfs::OpenDispatchResult::File { .. }) => {
+                Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::File { .. }) => {
                     return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
                 }
-                Ok(crate::vfs::rootfs::OpenDispatchResult::RootFsBackedFile { .. }) => {
+                Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::RootFsBackedFile { .. }) => {
                     return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
                 }
                 _ => {}
@@ -524,10 +526,10 @@ impl<'a> FsView<'a> {
         // existing-file open. Captured before the match consumes `dispatch_result`.
         let inotify_created = matches!(
             &dispatch_result,
-            Ok(crate::vfs::rootfs::OpenDispatchResult::NotFoundCreate)
+            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::NotFoundCreate)
         );
         let description = match dispatch_result {
-            Ok(crate::vfs::rootfs::OpenDispatchResult::File {
+            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::File {
                 metadata,
                 contents,
                 writable,
@@ -539,7 +541,7 @@ impl<'a> FsView<'a> {
                 base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                 writable,
             },
-            Ok(crate::vfs::rootfs::OpenDispatchResult::RootFsBackedFile {
+            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::RootFsBackedFile {
                 metadata,
                 contents,
                 writable,
@@ -551,7 +553,7 @@ impl<'a> FsView<'a> {
                 base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                 writable,
             },
-            Ok(crate::vfs::rootfs::OpenDispatchResult::HostFile {
+            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::HostFile {
                 host_fd,
                 metadata,
                 writable,
@@ -567,7 +569,7 @@ impl<'a> FsView<'a> {
                     writable,
                 }
             }
-            Ok(crate::vfs::rootfs::OpenDispatchResult::Directory { metadata }) => {
+            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::Directory { metadata }) => {
                 // A directory can never be the target of a write-intent open
                 // (O_WRONLY/O_RDWR) nor of an O_CREAT open — Linux returns
                 // EISDIR in both cases (a directory is never "created" by
@@ -588,7 +590,7 @@ impl<'a> FsView<'a> {
                     trusted_host_dir: None,
                 }
             }
-            Ok(crate::vfs::rootfs::OpenDispatchResult::NotFoundCreate) => {
+            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::NotFoundCreate) => {
                 // O_CREAT path: validate the parent directory exists,
                 // create the empty overlay entry, return a writable
                 // File description.
@@ -641,11 +643,11 @@ impl<'a> FsView<'a> {
                     .rootfs_vfs
                     .create_raw_fd(&path, create_mode, want_trunc)
                 {
-                    crate::fs_backend::HostFdOpen::Served(created) => Some(created),
-                    crate::fs_backend::HostFdOpen::Refused(refused) => {
+                    carrick_vfs::fs_backend::HostFdOpen::Served(created) => Some(created),
+                    carrick_vfs::fs_backend::HostFdOpen::Refused(refused) => {
                         return Ok(DispatchOutcome::errno(refused));
                     }
-                    crate::fs_backend::HostFdOpen::Unavailable => None,
+                    carrick_vfs::fs_backend::HostFdOpen::Unavailable => None,
                 };
                 if let Some((host_fd, mode_applied)) = created {
                     if want_trunc {
@@ -678,7 +680,7 @@ impl<'a> FsView<'a> {
                 } else {
                     match self.fs.rootfs_vfs.create_file(&path) {
                         Ok(()) => {}
-                        Err(crate::fs_backend::BackendError::Host(refused)) => {
+                        Err(carrick_vfs::fs_backend::BackendError::Host(refused)) => {
                             return Ok(DispatchOutcome::errno(refused));
                         }
                         Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
@@ -890,11 +892,13 @@ impl<'a> FsView<'a> {
             return None;
         }
         let (file, metadata) = match self.fs.rootfs_vfs.open_immutable_lower_readonly(path) {
-            crate::fs_backend::ImmutableHostFileOpen::Served { file, metadata } => (file, metadata),
-            crate::fs_backend::ImmutableHostFileOpen::Missing => {
+            carrick_vfs::fs_backend::ImmutableHostFileOpen::Served { file, metadata } => {
+                (file, metadata)
+            }
+            carrick_vfs::fs_backend::ImmutableHostFileOpen::Missing => {
                 return Some(DispatchOutcome::errno(LINUX_ENOENT));
             }
-            crate::fs_backend::ImmutableHostFileOpen::Fallback => return None,
+            carrick_vfs::fs_backend::ImmutableHostFileOpen::Fallback => return None,
         };
         let raw = file.into_raw_fd();
         debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(raw));
@@ -988,7 +992,7 @@ impl<'a> FsView<'a> {
                 // merged directory still takes the layered path.
                 if !matches!(
                     rootfs.symlink_metadata(path),
-                    Err(crate::rootfs::RootFsError::NotFound(_))
+                    Err(carrick_vfs::rootfs::RootFsError::NotFound(_))
                 ) {
                     return None;
                 }
@@ -1259,7 +1263,7 @@ impl<'a> FsView<'a> {
             if self.fs.rootfs_vfs.overlay.serves_plain_metadata() {
                 (None, None, None, false)
             } else {
-                crate::fs_backend::fd_carrick_meta(raw)
+                carrick_vfs::fs_backend::fd_carrick_meta(raw)
             };
         if is_socket || override_mode.is_some_and(|m| m & LINUX_S_IFMT != 0) {
             return None;
@@ -1349,7 +1353,7 @@ impl<'a> FsView<'a> {
         let open_fds_provider = || Some(std::borrow::Cow::Owned(self.open_fd_numbers()));
         let network_provider = || Some(std::borrow::Cow::Borrowed(&self.network.spec));
         let network_model_provider = || {
-            Some(Arc::clone(&*context.task().net_ns().view()) as Arc<dyn crate::vfs::FsNetworkView>)
+            Some(Arc::clone(&*context.task().net_ns().view()) as Arc<dyn carrick_vfs::FsNetworkView>)
         };
         let groups_provider = || Some(std::borrow::Cow::Owned(self.current_groups()));
         let signals_provider = || {
@@ -1373,7 +1377,7 @@ impl<'a> FsView<'a> {
             })
         };
         let creds_ns_provider =
-            || Some(Arc::new(context.task().creds_ns()) as Arc<dyn crate::vfs::FsCaller>);
+            || Some(Arc::new(context.task().creds_ns()) as Arc<dyn carrick_vfs::FsCaller>);
         let processes_provider = || {
             Self::synthetic_proc_processes(context, self.hvpatch_process().as_ref())
                 .map(std::borrow::Cow::Owned)
@@ -1396,7 +1400,7 @@ impl<'a> FsView<'a> {
                                     crate::namespace::pid::kernel_to_ns_for(context, raw)
                                 })
                             };
-                            Some(crate::vfs::SyntheticProcZombie {
+                            Some(carrick_vfs::SyntheticProcZombie {
                                 pid: to_ns(zombie.key.id.raw())?,
                                 ppid: zombie
                                     .parent
@@ -1430,7 +1434,7 @@ impl<'a> FsView<'a> {
                     None => address_space_regions = Some(mem.dynamic_maps.clone()),
                 }
             }
-            crate::vfs::OpenContextMemorySnapshot {
+            carrick_vfs::OpenContextMemorySnapshot {
                 auxv: std::borrow::Cow::Owned(mem.linux_auxv_image.clone()),
                 address_space_regions: address_space_regions.map(std::borrow::Cow::Owned),
                 locked_memory: std::borrow::Cow::Owned(mem.locked_ranges.clone()),
@@ -1439,7 +1443,7 @@ impl<'a> FsView<'a> {
                 heap_base: mem.layout.heap_base,
             }
         };
-        let ctx = crate::vfs::OpenContext {
+        let ctx = carrick_vfs::OpenContext {
             timerslack_ns,
             guest_arch,
             native_guest_va,
@@ -1451,28 +1455,28 @@ impl<'a> FsView<'a> {
             sgid: creds.sgid,
             runtime_endpoint_container,
             identity,
-            executable_path: crate::vfs::LazyField::new(&exec_path_provider),
-            argv: crate::vfs::LazyField::new(&argv_provider),
-            task_comm: crate::vfs::LazyField::new(&task_comm_provider),
-            guest_hostname: crate::vfs::LazyField::new(&guest_hostname_provider),
-            environ: crate::vfs::LazyField::new(&environ_provider),
-            open_fds: crate::vfs::LazyField::new(&open_fds_provider),
-            network: crate::vfs::LazyField::new(&network_provider),
-            network_model: crate::vfs::LazyField::new(&network_model_provider),
-            groups: crate::vfs::LazyField::new(&groups_provider),
-            signals: crate::vfs::LazyField::new(&signals_provider),
-            oom_score_adj: crate::vfs::LazyField::new(&oom_score_adj_provider),
-            creds_ns: crate::vfs::LazyField::new(&creds_ns_provider),
-            processes: crate::vfs::LazyField::new(&processes_provider),
-            threads: crate::vfs::LazyField::new(&threads_provider),
-            zombies: crate::vfs::LazyField::new(&zombies_provider),
-            sysvipc_shm: crate::vfs::LazyField::new(&sysvipc_shm_provider),
-            sysvipc_sem: crate::vfs::LazyField::new(&sysvipc_sem_provider),
-            sysvipc_msg: crate::vfs::LazyField::new(&sysvipc_msg_provider),
-            mem: crate::vfs::LazyField::new(&mem_provider),
+            executable_path: carrick_vfs::LazyField::new(&exec_path_provider),
+            argv: carrick_vfs::LazyField::new(&argv_provider),
+            task_comm: carrick_vfs::LazyField::new(&task_comm_provider),
+            guest_hostname: carrick_vfs::LazyField::new(&guest_hostname_provider),
+            environ: carrick_vfs::LazyField::new(&environ_provider),
+            open_fds: carrick_vfs::LazyField::new(&open_fds_provider),
+            network: carrick_vfs::LazyField::new(&network_provider),
+            network_model: carrick_vfs::LazyField::new(&network_model_provider),
+            groups: carrick_vfs::LazyField::new(&groups_provider),
+            signals: carrick_vfs::LazyField::new(&signals_provider),
+            oom_score_adj: carrick_vfs::LazyField::new(&oom_score_adj_provider),
+            creds_ns: carrick_vfs::LazyField::new(&creds_ns_provider),
+            processes: carrick_vfs::LazyField::new(&processes_provider),
+            threads: carrick_vfs::LazyField::new(&threads_provider),
+            zombies: carrick_vfs::LazyField::new(&zombies_provider),
+            sysvipc_shm: carrick_vfs::LazyField::new(&sysvipc_shm_provider),
+            sysvipc_sem: carrick_vfs::LazyField::new(&sysvipc_sem_provider),
+            sysvipc_msg: carrick_vfs::LazyField::new(&sysvipc_msg_provider),
+            mem: carrick_vfs::LazyField::new(&mem_provider),
         };
         let open_flags = LinuxOpenFlags::from_bits_retain(flags);
-        let vfs_flags = crate::vfs::OpenFlags {
+        let vfs_flags = carrick_vfs::OpenFlags {
             read: matches!(access, LINUX_O_RDONLY | LINUX_O_RDWR),
             write: matches!(access, LINUX_O_WRONLY | LINUX_O_RDWR),
             nonblock: open_flags.contains(LinuxOpenFlags::NONBLOCK),
@@ -1496,7 +1500,7 @@ impl<'a> FsView<'a> {
         };
         let mount_fs_id = m.vfs.fs_identity();
         match handle {
-            crate::vfs::VfsHandle::HostFd {
+            carrick_vfs::VfsHandle::HostFd {
                 host_fd,
                 is_read_end,
                 status_flags,
@@ -1519,7 +1523,7 @@ impl<'a> FsView<'a> {
                 let description = if is_regular {
                     OpenDescription::HostFile {
                         host_fd: HostFdRef::new(host_fd),
-                        metadata: crate::rootfs::RootFsMetadata {
+                        metadata: carrick_vfs::rootfs::RootFsMetadata {
                             path: std::path::PathBuf::from(path),
                             kind: RootFsEntryKind::File,
                             mode: (st.st_mode & 0o7777) as u32,
@@ -1562,7 +1566,7 @@ impl<'a> FsView<'a> {
                 };
                 VfsOpenAttempt::Installed(new_fd)
             }
-            crate::vfs::VfsHandle::SyntheticDevice { kind, status_flags } => {
+            carrick_vfs::VfsHandle::SyntheticDevice { kind, status_flags } => {
                 let status = ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC;
                 let open_file = OpenFile::from_open_description_with_status_flags(
                     Arc::new(RwLock::new(OpenDescription::SyntheticDevice {
@@ -1579,7 +1583,7 @@ impl<'a> FsView<'a> {
                 self.record_fd_open_path(new_fd, kind.as_str().to_string());
                 VfsOpenAttempt::Installed(new_fd)
             }
-            crate::vfs::VfsHandle::VirtualConsole {
+            carrick_vfs::VfsHandle::VirtualConsole {
                 console,
                 status_flags,
             } => {
@@ -1599,7 +1603,7 @@ impl<'a> FsView<'a> {
                 self.record_fd_open_path(new_fd, "/dev/tty0".to_string());
                 VfsOpenAttempt::Installed(new_fd)
             }
-            crate::vfs::VfsHandle::Bytes {
+            carrick_vfs::VfsHandle::Bytes {
                 path,
                 contents,
                 status_flags,
@@ -1621,7 +1625,7 @@ impl<'a> FsView<'a> {
                 };
                 VfsOpenAttempt::Installed(new_fd)
             }
-            crate::vfs::VfsHandle::Pty {
+            carrick_vfs::VfsHandle::Pty {
                 host_fd,
                 pts_index,
                 is_master,
@@ -1673,7 +1677,7 @@ impl<'a> FsView<'a> {
                 self.record_fd_open_path(new_fd, path.to_string());
                 VfsOpenAttempt::Installed(new_fd)
             }
-            crate::vfs::VfsHandle::Directory {
+            carrick_vfs::VfsHandle::Directory {
                 path,
                 entries,
                 status_flags,
@@ -1684,12 +1688,12 @@ impl<'a> FsView<'a> {
                     .into_iter()
                     .map(|e| {
                         let kind = match e.kind {
-                            crate::vfs::EntryKind::Directory => RootFsEntryKind::Directory,
-                            crate::vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
-                            crate::vfs::EntryKind::CharDevice => RootFsEntryKind::CharDevice,
-                            crate::vfs::EntryKind::Fifo => RootFsEntryKind::Fifo,
-                            crate::vfs::EntryKind::Socket => RootFsEntryKind::Socket,
-                            crate::vfs::EntryKind::File => RootFsEntryKind::File,
+                            carrick_vfs::EntryKind::Directory => RootFsEntryKind::Directory,
+                            carrick_vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
+                            carrick_vfs::EntryKind::CharDevice => RootFsEntryKind::CharDevice,
+                            carrick_vfs::EntryKind::Fifo => RootFsEntryKind::Fifo,
+                            carrick_vfs::EntryKind::Socket => RootFsEntryKind::Socket,
+                            carrick_vfs::EntryKind::File => RootFsEntryKind::File,
                         };
                         RootFsDirEntry {
                             name: e.name.clone(),
@@ -1740,7 +1744,7 @@ impl<'a> FsView<'a> {
                 };
                 VfsOpenAttempt::Installed(new_fd)
             }
-            crate::vfs::VfsHandle::InMemoryFile {
+            carrick_vfs::VfsHandle::InMemoryFile {
                 path,
                 contents,
                 status_flags,
@@ -2122,7 +2126,7 @@ impl<'a> FsView<'a> {
                 contents: FileContents::host_backed(host_file),
                 offset: 0,
                 base: OpenDescriptionBase::new(0)
-                    .with_fs_identity(crate::vfs::FsIdentity::Tmpfs),
+                    .with_fs_identity(carrick_vfs::FsIdentity::Tmpfs),
                 writable: true,
             };
             let fd_flags = if memfd_flags.contains(LinuxMemfdFlags::CLOEXEC) {
@@ -2173,7 +2177,7 @@ impl<'a> FsView<'a> {
                 contents: FileContents::dense(Vec::new()),
                 offset: 0,
                 base: OpenDescriptionBase::new(0)
-                    .with_fs_identity(crate::vfs::FsIdentity::SecretMem),
+                    .with_fs_identity(carrick_vfs::FsIdentity::SecretMem),
                 writable: true,
             };
             let fd_flags = if flags & LINUX_O_CLOEXEC != 0 {

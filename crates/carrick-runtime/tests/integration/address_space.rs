@@ -15,7 +15,7 @@ use carrick_runtime::linux_abi::{
 use carrick_runtime::memory::{
     AddressSpace, LINUX_HEAP_BASE, LINUX_INTERPRETER_BASE, LINUX_MMAP_BASE,
 };
-use carrick_runtime::rootfs::{LayerSource, RootFs};
+use carrick_vfs::rootfs::{LayerSource, RootFs};
 use zerocopy::{FromBytes, IntoBytes};
 
 use carrick_runtime::compat::{CompatReporter, SyscallArgs};

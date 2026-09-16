@@ -462,7 +462,7 @@ impl<'a> NetView<'a> {
     pub(in crate::dispatch) fn layered_metadata(
         &self,
         path: &str,
-    ) -> Result<crate::rootfs::RootFsMetadata, carrick_abi::LinuxErrno> {
+    ) -> Result<carrick_vfs::rootfs::RootFsMetadata, carrick_abi::LinuxErrno> {
         self.cross.layered_metadata(path)
     }
 
@@ -470,7 +470,7 @@ impl<'a> NetView<'a> {
     pub(in crate::dispatch) fn layered_lstat(
         &self,
         path: &str,
-    ) -> Result<crate::rootfs::RootFsMetadata, carrick_abi::LinuxErrno> {
+    ) -> Result<carrick_vfs::rootfs::RootFsMetadata, carrick_abi::LinuxErrno> {
         self.cross.layered_lstat(path)
     }
 
@@ -1839,9 +1839,9 @@ mod netlink_readiness_tests {
             Arc::new(RwLock::new(OpenDescription::File {
                 base: OpenDescriptionBase::new(0),
                 path: "/fixture/file".to_string(),
-                metadata: crate::rootfs::RootFsMetadata {
+                metadata: carrick_vfs::rootfs::RootFsMetadata {
                     path: std::path::PathBuf::from("/fixture/file"),
-                    kind: crate::rootfs::RootFsEntryKind::File,
+                    kind: carrick_vfs::rootfs::RootFsEntryKind::File,
                     mode: 0o644,
                     size: 12,
                 },
@@ -1858,9 +1858,9 @@ mod netlink_readiness_tests {
             Arc::new(RwLock::new(OpenDescription::Directory {
                 base: OpenDescriptionBase::new(0),
                 path: "/fixture/dir".to_string(),
-                metadata: crate::rootfs::RootFsMetadata {
+                metadata: carrick_vfs::rootfs::RootFsMetadata {
                     path: std::path::PathBuf::from("/fixture/dir"),
-                    kind: crate::rootfs::RootFsEntryKind::Directory,
+                    kind: carrick_vfs::rootfs::RootFsEntryKind::Directory,
                     mode: 0o755,
                     size: 0,
                 },
@@ -1889,7 +1889,7 @@ mod netlink_readiness_tests {
             Arc::new(RwLock::new(OpenDescription::InMemoryFile {
                 base: OpenDescriptionBase::new(0),
                 path: "/fixture/inmem".to_string(),
-                contents: Arc::new(parking_lot::RwLock::new(crate::vfs::SparseBuffer::from(
+                contents: Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
                     b"inmem content".to_vec(),
                 ))),
                 offset: 0,
@@ -1904,7 +1904,7 @@ mod netlink_readiness_tests {
         fixtures.push(OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::SyntheticDevice {
                 base: OpenDescriptionBase::new(0),
-                kind: crate::vfs::SyntheticDeviceKind::Null,
+                kind: carrick_vfs::SyntheticDeviceKind::Null,
             })),
             LINUX_O_RDWR,
             0,
@@ -2102,9 +2102,9 @@ mod netlink_readiness_tests {
                 Arc::new(RwLock::new(OpenDescription::HostFile {
                     base: OpenDescriptionBase::new(LINUX_O_RDWR),
                     host_fd: HostFdRef::new(pair[0]),
-                    metadata: crate::rootfs::RootFsMetadata {
+                    metadata: carrick_vfs::rootfs::RootFsMetadata {
                         path: std::path::PathBuf::from("/fixture/hostfile"),
-                        kind: crate::rootfs::RootFsEntryKind::File,
+                        kind: carrick_vfs::rootfs::RootFsEntryKind::File,
                         mode: 0o644,
                         size: 0,
                     },

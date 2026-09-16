@@ -360,13 +360,13 @@ pub(crate) struct MemState {
     /// `dynamic_maps`: a lazy anonymous `PROT_NONE` reservation owns a Linux VMA
     /// before it owns host/stage-2 backing. Fork clones both inventories;
     /// munmap/MAP_FIXED replacement trims both atomically.
-    host_alias_backed_ranges: Vec<crate::vfs::GuestMemoryRange>,
+    host_alias_backed_ranges: Vec<carrick_vfs::GuestMemoryRange>,
     /// Linux VMAs whose guest VA is implemented by a non-identity host alias.
     /// Unlike `host_alias_backed_ranges`, this also includes lazy PROT_NONE
     /// reservations that have not acquired a physical frame yet. Keeping the
     /// routing identity explicit is required for low `MAP_FIXED` VAs: address
     /// shape alone cannot distinguish a replaced ELF hole from eager RAM.
-    alias_vma_ranges: Vec<crate::vfs::GuestMemoryRange>,
+    alias_vma_ranges: Vec<carrick_vfs::GuestMemoryRange>,
     /// Original bytes for mappings that have used remap_file_pages(2). Carrick's
     /// low fixed MAP_SHARED path is byte-backed guest memory rather than a live
     /// nonlinear VM object, so remap_file_pages copies windows from this stable
@@ -380,13 +380,13 @@ pub(crate) struct MemState {
     /// Page-rounded guest virtual ranges currently counted as mlocked. Stored as
     /// typed guest-VA ranges so `/proc` accounting cannot mix them with host or
     /// physical addresses.
-    pub locked_ranges: Vec<crate::vfs::GuestMemoryRange>,
+    pub locked_ranges: Vec<carrick_vfs::GuestMemoryRange>,
     /// Guest-page resident ranges for Carrick-managed mappings where host
     /// `mincore` is too coarse (notably 4 KiB Linux pages on a 16 KiB Darwin
     /// host page).
-    pub resident_ranges: Vec<crate::vfs::GuestMemoryRange>,
+    pub resident_ranges: Vec<carrick_vfs::GuestMemoryRange>,
     /// Ranges whose `mincore` answer is derived from `resident_ranges`.
-    pub resident_tracked_ranges: Vec<crate::vfs::GuestMemoryRange>,
+    pub resident_tracked_ranges: Vec<carrick_vfs::GuestMemoryRange>,
     /// Shared-anon ranges that should fault once per guest page to become
     /// resident, with the protection to restore after that first touch.
     resident_fault_ranges: FirstTouchArming,
@@ -400,17 +400,17 @@ pub(crate) struct MemState {
     /// then ask mprotect() to mark it PROT_WRITE"; LTP mprotect01 case 3). The
     /// ceiling is a MAP TIME fact — the fd may be closed long before the
     /// mprotect — so it is recorded here rather than re-derived.
-    read_only_shared_file_maps: Vec<crate::vfs::GuestMemoryRange>,
+    read_only_shared_file_maps: Vec<carrick_vfs::GuestMemoryRange>,
     /// VA ranges of MAP_SHARED mappings backed by a memfd sealed F_SEAL_WRITE
     /// (or F_SEAL_FUTURE_WRITE): `mprotect(PROT_WRITE)` on them must fail EPERM,
     /// since the sealed backing can never gain a shared writable view
     /// (memfd_create01 check_mfd_non_writeable's mmap+mprotect case).
-    write_sealed_shared_maps: Vec<crate::vfs::GuestMemoryRange>,
+    write_sealed_shared_maps: Vec<carrick_vfs::GuestMemoryRange>,
     /// Active MAP_SHARED, PROT_WRITE mappings of a (sealable) memfd, paired with
     /// the backing open-file description. While one is live, `F_ADD_SEALS`
     /// F_SEAL_WRITE on that memfd must fail EBUSY (memfd_create01 test_share_mmap).
     writable_memfd_maps: Vec<(
-        crate::vfs::GuestMemoryRange,
+        carrick_vfs::GuestMemoryRange,
         Arc<crate::kernel::FileDescription>,
     )>,
     /// Live `MAP_SHARED` file aliases, paired with the open-file description
@@ -428,7 +428,7 @@ pub(crate) struct MemState {
     /// Secret memory is hidden from the kernel's own view of the process, so
     /// `/proc/<pid>/mem` reads that touch one of these ranges fail EIO
     /// (memfdsecret probe `procmem_hidden`).
-    secretmem_maps: Vec<crate::vfs::GuestMemoryRange>,
+    secretmem_maps: Vec<carrick_vfs::GuestMemoryRange>,
     /// The exact serialized ELF auxiliary vector written to the guest stack at
     /// exec, captured from the `AddressSpace` via
     /// [`SyscallDispatcher::set_auxv_image`]. Mirrored to `/proc/self/auxv`.
@@ -718,7 +718,7 @@ pub(super) fn page_rounded_range(
     address: GuestPtr,
     length: u64,
     page_size: u64,
-) -> Result<Option<crate::vfs::GuestMemoryRange>, LinuxErrno> {
+) -> Result<Option<carrick_vfs::GuestMemoryRange>, LinuxErrno> {
     if length == 0 {
         return Ok(None);
     }
@@ -729,12 +729,12 @@ pub(super) fn page_rounded_range(
         .and_then(|end| page_ceil(end, page_size))
         .map(GuestVa)
         .ok_or(LINUX_ENOMEM)?;
-    crate::vfs::GuestMemoryRange::new(start, end)
+    carrick_vfs::GuestMemoryRange::new(start, end)
         .map(Some)
         .ok_or(LINUX_ENOMEM)
 }
 
-pub(super) fn range_len_usize(range: crate::vfs::GuestMemoryRange) -> Result<usize, LinuxErrno> {
+pub(super) fn range_len_usize(range: carrick_vfs::GuestMemoryRange) -> Result<usize, LinuxErrno> {
     Ok(range.len())
 }
 
@@ -756,8 +756,8 @@ pub(super) fn range_len_usize(range: crate::vfs::GuestMemoryRange) -> Result<usi
 /// is the same shape the 2026-07-07 bless fixed in
 /// `MemoryProtections::RangeSet` and `dynamic_maps`; this set was missed.
 pub(super) fn locked_ranges_insert(
-    ranges: &mut Vec<crate::vfs::GuestMemoryRange>,
-    range: crate::vfs::GuestMemoryRange,
+    ranges: &mut Vec<carrick_vfs::GuestMemoryRange>,
+    range: carrick_vfs::GuestMemoryRange,
 ) {
     let mut start = range.start().raw();
     let mut end = range.end().raw();
@@ -773,15 +773,15 @@ pub(super) fn locked_ranges_insert(
         end = end.max(existing.end().raw());
         remove_end += 1;
     }
-    let Some(merged) = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) else {
+    let Some(merged) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) else {
         return;
     };
     ranges.splice(index..remove_end, [merged]);
 }
 
 pub(super) fn locked_ranges_remove(
-    ranges: &mut Vec<crate::vfs::GuestMemoryRange>,
-    remove: crate::vfs::GuestMemoryRange,
+    ranges: &mut Vec<carrick_vfs::GuestMemoryRange>,
+    remove: carrick_vfs::GuestMemoryRange,
 ) {
     let mut out = Vec::with_capacity(ranges.len());
     for range in ranges.drain(..) {
@@ -790,12 +790,12 @@ pub(super) fn locked_ranges_remove(
             continue;
         }
         if remove.start() > range.start()
-            && let Some(left) = crate::vfs::GuestMemoryRange::new(range.start(), remove.start())
+            && let Some(left) = carrick_vfs::GuestMemoryRange::new(range.start(), remove.start())
         {
             out.push(left);
         }
         if remove.end() < range.end()
-            && let Some(right) = crate::vfs::GuestMemoryRange::new(remove.end(), range.end())
+            && let Some(right) = carrick_vfs::GuestMemoryRange::new(remove.end(), range.end())
         {
             out.push(right);
         }
@@ -803,7 +803,7 @@ pub(super) fn locked_ranges_remove(
     *ranges = out;
 }
 
-pub(super) fn locked_ranges_total(ranges: &[crate::vfs::GuestMemoryRange]) -> u64 {
+pub(super) fn locked_ranges_total(ranges: &[carrick_vfs::GuestMemoryRange]) -> u64 {
     ranges.iter().map(|range| range.len() as u64).sum()
 }
 
@@ -814,7 +814,7 @@ pub(super) fn locked_ranges_total(ranges: &[crate::vfs::GuestMemoryRange]) -> u6
 /// Binary search, not a scan: `fault_requires_mm_mutation` asks this of
 /// `resident_tracked_ranges` on EVERY guest fault, and a memory-hungry guest
 /// holds thousands of live anonymous extents.
-pub(super) fn ranges_contain_page(ranges: &[crate::vfs::GuestMemoryRange], page: u64) -> bool {
+pub(super) fn ranges_contain_page(ranges: &[carrick_vfs::GuestMemoryRange], page: u64) -> bool {
     let index = ranges.partition_point(|range| range.end().raw() <= page);
     ranges
         .get(index)
@@ -1632,7 +1632,7 @@ impl<'a> MemView<'a> {
         };
         let mem_authority_31 = self.mem();
         let mem = mem_authority_31.lock();
-        let overlaps = |range: &crate::vfs::GuestMemoryRange| {
+        let overlaps = |range: &carrick_vfs::GuestMemoryRange| {
             range.start().raw() < end && start < range.end().raw()
         };
         dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len)
@@ -1660,7 +1660,7 @@ impl<'a> MemView<'a> {
         flags: LinuxMmapFlags,
         address: u64,
         length: u64,
-    ) -> Result<Option<crate::vfs::GuestMemoryRange>, LinuxErrno> {
+    ) -> Result<Option<carrick_vfs::GuestMemoryRange>, LinuxErrno> {
         if !flags.contains(LinuxMmapFlags::LOCKED) {
             return Ok(None);
         }
@@ -1752,7 +1752,7 @@ impl<'a> MemView<'a> {
     pub(in crate::dispatch::mem) fn commit_mmap_locked_range(
         &self,
         memory: &mut impl CurrentMmMemory,
-        range: Option<crate::vfs::GuestMemoryRange>,
+        range: Option<carrick_vfs::GuestMemoryRange>,
     ) -> Result<(), LinuxErrno> {
         let Some(range) = range else {
             return Ok(());
@@ -1765,7 +1765,7 @@ impl<'a> MemView<'a> {
     #[cfg(test)]
     pub(in crate::dispatch::mem) fn commit_eager_locked_range(
         &self,
-        range: Option<crate::vfs::GuestMemoryRange>,
+        range: Option<carrick_vfs::GuestMemoryRange>,
     ) {
         let Some(range) = range else {
             return;
@@ -1788,7 +1788,7 @@ impl<'a> MemView<'a> {
                 "shared-anon rollback range overflows at 0x{address:x} for {guest_length} bytes"
             )));
         };
-        let Some(range) = crate::vfs::GuestMemoryRange::new(GuestVa(address), GuestVa(end)) else {
+        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(address), GuestVa(end)) else {
             return Err(MemoryError::HostMap(format!(
                 "shared-anon rollback range is empty at 0x{address:x}"
             )));
@@ -2216,7 +2216,7 @@ impl SyscallDispatcher {
     pub(in crate::dispatch::mem) fn commit_mmap_locked_range(
         &self,
         memory: &mut impl CurrentMmMemory,
-        range: Option<crate::vfs::GuestMemoryRange>,
+        range: Option<carrick_vfs::GuestMemoryRange>,
     ) -> Result<(), LinuxErrno> {
         self.mem_view().commit_mmap_locked_range(memory, range)
     }
@@ -2225,7 +2225,7 @@ impl SyscallDispatcher {
     #[inline]
     pub(in crate::dispatch::mem) fn commit_eager_locked_range(
         &self,
-        range: Option<crate::vfs::GuestMemoryRange>,
+        range: Option<carrick_vfs::GuestMemoryRange>,
     ) {
         self.mem_view().commit_eager_locked_range(range);
     }

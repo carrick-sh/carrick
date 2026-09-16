@@ -42,13 +42,13 @@ use crate::fs_backend::{
     BackendError, FsBackend, ImmutableHostFileOpen, MemoryBackend, OverlayEntry, OverlayEntryKind,
     RealStat, SharedFileContents,
 };
-use crate::linux_abi::LinuxErrno;
-use crate::linux_abi::{
+use crate::rootfs::{RootFs, RootFsEntryKind, RootFsError, RootFsMetadata};
+use carrick_abi::LinuxErrno;
+use carrick_abi::{
     LINUX_E2BIG, LINUX_EACCES, LINUX_EEXIST, LINUX_EFBIG, LINUX_EINVAL, LINUX_EISDIR, LINUX_ELOOP,
     LINUX_ENOENT, LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS, LINUX_EXDEV,
     LINUX_S_IFBLK, LINUX_S_IFCHR, LINUX_S_IFMT,
 };
-use crate::rootfs::{RootFs, RootFsEntryKind, RootFsError, RootFsMetadata};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
@@ -189,7 +189,7 @@ impl RootFsVfs {
             .with_parents(topology_change, resolve_parents, operation)
     }
 
-    pub(crate) fn with_archive_namespace_transaction<R, E>(
+    pub fn with_archive_namespace_transaction<R, E>(
         &self,
         operation: impl FnOnce(
             &crate::vfs::namespace_mutation::NamespaceMutationPermit<'_>,
@@ -198,7 +198,7 @@ impl RootFsVfs {
         self.namespace_mutations.with_archive(operation)
     }
 
-    pub(crate) fn with_paths_topology_admission<R, E>(
+    pub fn with_paths_topology_admission<R, E>(
         &self,
         paths: &[&str],
         operation: impl FnOnce(
@@ -613,11 +613,11 @@ impl RootFsVfs {
         use crate::vfs::errno::HostSyscallResult as _;
 
         if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {
-            return Err(crate::linux_abi::LINUX_ENODATA);
+            return Err(carrick_abi::LINUX_ENODATA);
         }
         let cname = match std::ffi::CString::new(name) {
             Ok(c) => c,
-            Err(_) => return Err(crate::linux_abi::LINUX_EINVAL),
+            Err(_) => return Err(carrick_abi::LINUX_EINVAL),
         };
 
         if self.overlay.serves_dentry_cache() {
@@ -660,13 +660,13 @@ impl RootFsVfs {
         ) -> Result<Vec<String>, LinuxErrno> {
             let needed = match needed.host_syscall_errno() {
                 Ok(needed) => needed,
-                Err(crate::linux_abi::LINUX_ENODATA) => return Ok(Vec::new()),
+                Err(carrick_abi::LINUX_ENODATA) => return Ok(Vec::new()),
                 Err(err) => return Err(err),
             };
             let mut buf = vec![0u8; needed as usize];
             let n = match read(&mut buf).host_syscall_errno() {
                 Ok(n) => n,
-                Err(crate::linux_abi::LINUX_ENODATA) => return Ok(Vec::new()),
+                Err(carrick_abi::LINUX_ENODATA) => return Ok(Vec::new()),
                 Err(err) => return Err(err),
             };
             buf.truncate(n as usize);
@@ -706,7 +706,7 @@ impl RootFsVfs {
         use crate::vfs::errno::HostSyscallResult as _;
 
         if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {
-            return Err(crate::linux_abi::LINUX_ENODATA);
+            return Err(carrick_abi::LINUX_ENODATA);
         }
         let inode = self.path_inode_identity(path);
         let overlay_res = self.overlay.remove_xattr(path, name, follow);
@@ -718,7 +718,7 @@ impl RootFsVfs {
             if let Ok(owned_fd) = self.open_metadata_fd(path, follow) {
                 let cname = match std::ffi::CString::new(name) {
                     Ok(c) => c,
-                    Err(_) => return Err(crate::linux_abi::LINUX_EINVAL),
+                    Err(_) => return Err(carrick_abi::LINUX_EINVAL),
                 };
                 let host_fd = std::os::fd::AsRawFd::as_raw_fd(&*owned_fd);
                 let rc = unsafe { carrick_portable::fremovexattr(host_fd, cname.as_ptr()) };
@@ -900,7 +900,7 @@ impl RootFsVfs {
     /// [`crate::rootfs::RootFsMetadata`] carry neither an inode nor a link
     /// count nor a timestamp) so the path lane can report the SAME host inode
     /// the fd lane's `fstat` and `getdents64`'s `d_ino` already report.
-    pub(crate) fn immutable_lower_real_stat(
+    pub fn immutable_lower_real_stat(
         &self,
         path: &str,
         follow: bool,
@@ -916,7 +916,7 @@ impl RootFsVfs {
     /// around both the upper proof and lower open turns any concurrent
     /// copy-up/create into a failed fast attempt; the caller then takes the
     /// exact resolving path.
-    pub(crate) fn open_immutable_lower_readonly(&self, path: &str) -> ImmutableHostFileOpen {
+    pub fn open_immutable_lower_readonly(&self, path: &str) -> ImmutableHostFileOpen {
         let generation = self.overlay.structural_generation();
         if !self.overlay.fast_nofollow_absent(path) {
             return ImmutableHostFileOpen::Fallback;
@@ -1272,7 +1272,7 @@ impl RootFsVfs {
                 // to open). A socket node only ever lives in the writable
                 // overlay (created by bind), not the immutable rootfs, so this
                 // is reached only via a guest open of a bound socket path.
-                RootFsEntryKind::Socket => Err(crate::linux_abi::LINUX_ENXIO),
+                RootFsEntryKind::Socket => Err(carrick_abi::LINUX_ENXIO),
             },
             None => {
                 if want_create {
@@ -1302,7 +1302,7 @@ impl RootFsVfs {
         self.rename_with_flags_and_publish(from, to, no_replace, || (), |(), outcome| outcome)
     }
 
-    pub(crate) fn rename_with_flags_and_publish<P, R>(
+    pub fn rename_with_flags_and_publish<P, R>(
         &self,
         from: &str,
         to: &str,
@@ -1503,7 +1503,7 @@ impl RootFsVfs {
         Ok(())
     }
 
-    pub(crate) fn exchange_with_flags_and_publish<P, R>(
+    pub fn exchange_with_flags_and_publish<P, R>(
         &self,
         a: &str,
         b: &str,
@@ -1624,7 +1624,7 @@ impl RootFsVfs {
         })
     }
 
-    pub(crate) fn with_mkdir_transaction<R, E>(
+    pub fn with_mkdir_transaction<R, E>(
         &self,
         path: &str,
         operation: impl FnOnce(
@@ -1649,7 +1649,7 @@ impl RootFsVfs {
         Ok(())
     }
 
-    pub(crate) fn mkdir_admitted(
+    pub fn mkdir_admitted(
         &self,
         permit: &crate::vfs::namespace_mutation::NamespaceMutationPermit<'_>,
         path: &str,
@@ -1681,7 +1681,7 @@ impl RootFsVfs {
             }
             self.overlay
                 .make_dir_at(Some(pfd), Some(&parent.leaf), &parent.rel, mode)
-                .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+                .map_err(|_| carrick_abi::LINUX_EINVAL)?;
             self.dentry_cache.entry_created(path, None);
             return Ok(());
         }
@@ -1702,13 +1702,13 @@ impl RootFsVfs {
         }
         self.overlay
             .make_dir_at(None, Some(&parent.leaf), &parent.rel, mode)
-            .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+            .map_err(|_| carrick_abi::LINUX_EINVAL)?;
         self.dentry_cache.entry_created(path, None);
         Ok(())
     }
 }
 
-pub(crate) struct ResolvedParent {
+pub struct ResolvedParent {
     pub parent_fd: Option<Arc<OwnedFd>>,
     pub leaf: CString,
     pub rel: crate::fs_backend::NormalizedRelPath,
@@ -1872,7 +1872,7 @@ impl Vfs for RootFsVfs {
         // the layered view so an existing regular file/dir on the disk
         // overlay yields EINVAL even with the rootfs layer dropped.
         if self.lookup(path).is_ok() {
-            Err(crate::linux_abi::LINUX_EINVAL)
+            Err(carrick_abi::LINUX_EINVAL)
         } else {
             Err(LINUX_ENOENT)
         }
@@ -1902,7 +1902,7 @@ impl Vfs for RootFsVfs {
                                 .set_file_contents(path, contents.clone())
                                 .is_err()
                             {
-                                return Err(crate::linux_abi::LINUX_EINVAL);
+                                return Err(carrick_abi::LINUX_EINVAL);
                             }
                         }
                         return Ok(VfsHandle::Bytes {
@@ -2094,12 +2094,12 @@ impl Vfs for RootFsVfs {
                 if rootfs_has_it {
                     self.overlay
                         .mark_deleted(path)
-                        .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+                        .map_err(|_| carrick_abi::LINUX_EINVAL)?;
                 }
             } else if in_rootfs {
                 self.overlay
                     .mark_deleted(path)
-                    .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+                    .map_err(|_| carrick_abi::LINUX_EINVAL)?;
             }
             self.dentry_cache.entry_removed(path, inode);
             if let Some(parent_id) = parent_inode {
@@ -2163,12 +2163,12 @@ impl Vfs for RootFsVfs {
                 if rootfs_has_it {
                     self.overlay
                         .mark_deleted(path)
-                        .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+                        .map_err(|_| carrick_abi::LINUX_EINVAL)?;
                 }
             } else if in_rootfs {
                 self.overlay
                     .mark_deleted(path)
-                    .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+                    .map_err(|_| carrick_abi::LINUX_EINVAL)?;
             }
             self.dentry_cache.entry_removed(path, inode);
             if let Some(parent_id) = parent_inode {
@@ -3494,11 +3494,11 @@ mod tests {
         let vfs = host_lower_vfs(lower.path(), upper.path());
         assert_eq!(
             vfs.get_xattr("/usr/lib", "user.x", true),
-            Err(crate::linux_abi::LINUX_ENODATA)
+            Err(carrick_abi::LINUX_ENODATA)
         );
         assert_eq!(
             vfs.get_xattr("/usr/lib/libtest.so", "user.x", true),
-            Err(crate::linux_abi::LINUX_ENODATA)
+            Err(carrick_abi::LINUX_ENODATA)
         );
         assert_eq!(
             vfs.list_xattr("/usr/lib", true).unwrap(),

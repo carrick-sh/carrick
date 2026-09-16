@@ -37,8 +37,8 @@ use std::sync::Arc;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::linux_abi::LinuxErrno;
 use crate::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
+use carrick_abi::LinuxErrno;
 use carrick_abi::{NsGid, NsUid};
 
 /// What an [`FsBackend`] knows about a path. `Dir` and `File` are
@@ -63,7 +63,7 @@ pub enum BackendError {
     Unsupported,
     /// The host refused a resource the guest is entitled to (its own
     /// descriptor, disk space, quota), already translated into the guest's
-    /// errno by [`host_open_refusal`]. Authoritative: the dispatcher returns
+    /// errno by `host_open_refusal`. Authoritative: the dispatcher returns
     /// it as-is instead of the generic `EINVAL`/`EIO` it lowers `Io` to.
     Host(LinuxErrno),
     /// A namespace admission or namespace operation failed with this exact
@@ -113,7 +113,7 @@ pub enum HostFdOpen<T> {
     /// host errno is a fact about the HOST's resolution, not the guest's.
     Unavailable,
     /// The host refused a resource the guest is entitled to, already
-    /// translated into the guest's errno by [`host_open_refusal`].
+    /// translated into the guest's errno by `host_open_refusal`.
     /// Authoritative: no further lowering may hide it.
     Refused(LinuxErrno),
 }
@@ -192,7 +192,7 @@ impl<T> HostFdOpen<T> {
 /// and the caller stays `Unavailable`.
 pub(crate) fn host_open_refusal(host_errno: i32) -> Option<LinuxErrno> {
     match host_errno {
-        libc::EMFILE | libc::ENFILE => Some(crate::linux_abi::LINUX_ENFILE),
+        libc::EMFILE | libc::ENFILE => Some(carrick_abi::LINUX_ENFILE),
         libc::ENOSPC | libc::EDQUOT | libc::ENOMEM | libc::EIO => {
             Some(crate::host_to_linux_errno(host_errno))
         }
@@ -200,7 +200,7 @@ pub(crate) fn host_open_refusal(host_errno: i32) -> Option<LinuxErrno> {
     }
 }
 
-/// [`host_open_refusal`] of an `io::Error` (a cap-std/`std` failure).
+/// `host_open_refusal` of an `io::Error` (a cap-std/`std` failure).
 pub(crate) fn io_open_refusal(error: &std::io::Error) -> Option<LinuxErrno> {
     error.raw_os_error().and_then(host_open_refusal)
 }
@@ -432,7 +432,7 @@ mod shared_file_range_tests {
     }
 }
 
-pub(crate) fn fresh_file_object_id() -> u64 {
+pub fn fresh_file_object_id() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
@@ -461,7 +461,7 @@ pub struct ArchiveMutationGate {
     lock: RwLock<()>,
 }
 
-pub(crate) struct ArchiveTransactionGuard<'a> {
+pub struct ArchiveTransactionGuard<'a> {
     gate_id: usize,
     _guard: RwLockWriteGuard<'a, ()>,
 }
@@ -476,7 +476,7 @@ impl ArchiveMutationGate {
         std::ptr::from_ref(self).addr()
     }
 
-    pub(crate) fn archive_transaction(&self) -> ArchiveTransactionGuard<'_> {
+    pub fn archive_transaction(&self) -> ArchiveTransactionGuard<'_> {
         let guard = self.lock.write();
         let gate_id = self.id();
         EXCLUSIVE_ARCHIVE_GATES.with(|held| held.borrow_mut().push(gate_id));
@@ -969,7 +969,7 @@ pub trait FsBackend: Send + Sync {
     /// child names after a kqueue directory-write wakeup. Default:
     /// unsupported for backends with no real host namespace.
     fn watch_fds(&self, _path: &str) -> Result<Vec<crate::vfs::WatchFd>, LinuxErrno> {
-        Err(crate::linux_abi::LINUX_ENOSYS)
+        Err(carrick_abi::LINUX_ENOSYS)
     }
 
     /// Open a REAL host fd for an UNNAMED file (`O_TMPFILE` semantics): a
@@ -1081,26 +1081,26 @@ pub trait FsBackend: Send + Sync {
         _flags: i32,
         _follow: bool,
     ) -> Result<(), LinuxErrno> {
-        Err(crate::linux_abi::LINUX_ENOTSUP)
+        Err(carrick_abi::LINUX_ENOTSUP)
     }
 
     /// Read the extended attribute `name` on `path`. Returns the raw value
     /// bytes. `Err(LINUX_ENODATA)` if absent. Default: unsupported.
     fn get_xattr(&self, _path: &str, _name: &str, _follow: bool) -> Result<Vec<u8>, LinuxErrno> {
-        Err(crate::linux_abi::LINUX_ENOTSUP)
+        Err(carrick_abi::LINUX_ENOTSUP)
     }
 
     /// List the `user.*` extended attribute names on `path` (names only, no
     /// trailing NUL — the caller assembles the NUL-separated list). Default:
     /// unsupported.
     fn list_xattr(&self, _path: &str, _follow: bool) -> Result<Vec<String>, LinuxErrno> {
-        Err(crate::linux_abi::LINUX_ENOTSUP)
+        Err(carrick_abi::LINUX_ENOTSUP)
     }
 
     /// Remove the `user.*` extended attribute `name` from `path`.
     /// `Err(LINUX_ENODATA)` if the attribute is absent. Default: unsupported.
     fn remove_xattr(&self, _path: &str, _name: &str, _follow: bool) -> Result<(), LinuxErrno> {
-        Err(crate::linux_abi::LINUX_ENOTSUP)
+        Err(carrick_abi::LINUX_ENOTSUP)
     }
 
     /// Read the REAL on-disk stat for `path` (type + hard-link count +
@@ -1122,7 +1122,7 @@ pub trait FsBackend: Send + Sync {
     /// cache is disabled or the path is not a plain cached regular file/dir
     /// (symlinks, escapes, cross-mount, /proc, errors) — the caller then takes
     /// the full resolve-and-stat path. Default: `None`. See
-    /// [`HostFsBackend::stat_cache`].
+    /// `HostFsBackend::stat_cache`.
     fn stat_cache_lookup(&self, _path: &str) -> Option<RealStat> {
         None
     }

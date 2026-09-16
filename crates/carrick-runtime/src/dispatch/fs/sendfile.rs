@@ -72,7 +72,11 @@ impl<'a> FsView<'a> {
             return Ok(None);
         }
 
-        match crate::darwin_fs::copyfile_clone_or_data(input.host_fd, output.host_fd, input.size) {
+        match carrick_vfs::darwin_fs::copyfile_clone_or_data(
+            input.host_fd,
+            output.host_fd,
+            input.size,
+        ) {
             Ok(Some(result)) => {
                 let copied = result.bytes();
                 if !set_host_fd_offset(HostFd(input.host_fd), copied)

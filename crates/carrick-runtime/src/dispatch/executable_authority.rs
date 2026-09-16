@@ -30,7 +30,7 @@ enum ExecutableBacking {
         device: u64,
         inode: u64,
     },
-    SharedObject(Arc<crate::fs_backend::SharedFileObject>),
+    SharedObject(Arc<carrick_vfs::fs_backend::SharedFileObject>),
     SharedBytes(Arc<[u8]>),
 }
 
@@ -164,7 +164,8 @@ impl ExecSource {
         if !metadata.is_file() {
             return Err(io::Error::from_raw_os_error(libc::EACCES));
         }
-        let (guest_mode, uid, gid, _) = crate::fs_backend::host::fd_carrick_meta(file.as_raw_fd());
+        let (guest_mode, uid, gid, _) =
+            carrick_vfs::fs_backend::host::fd_carrick_meta(file.as_raw_fd());
         Ok(Self {
             object_id: ExecutableObjectId::Host {
                 device: metadata.dev(),
@@ -201,7 +202,7 @@ impl ExecSource {
     }
 
     pub(crate) fn shared_object(
-        object: Arc<crate::fs_backend::SharedFileObject>,
+        object: Arc<carrick_vfs::fs_backend::SharedFileObject>,
         resolved_path: String,
     ) -> Self {
         let object_id = object.object_id();
@@ -229,7 +230,7 @@ impl ExecSource {
                         .unwrap_or(crate::linux_abi::LINUX_EIO)
                 })?;
                 let (guest_mode, guest_uid, guest_gid, _) =
-                    crate::fs_backend::host::fd_carrick_meta(file.as_raw_fd());
+                    carrick_vfs::fs_backend::host::fd_carrick_meta(file.as_raw_fd());
                 (
                     guest_uid.unwrap_or(carrick_abi::NsUid::ROOT),
                     guest_gid.unwrap_or(carrick_abi::NsGid::ROOT),
@@ -292,7 +293,7 @@ impl ExecSource {
             ExecutableBacking::HostFile { file, inode, .. } => {
                 let metadata = file.metadata()?;
                 let (mode, uid, gid, _) =
-                    crate::fs_backend::host::fd_carrick_meta(file.as_raw_fd());
+                    carrick_vfs::fs_backend::host::fd_carrick_meta(file.as_raw_fd());
                 Ok((
                     *inode,
                     mode.unwrap_or(metadata.mode() as u32 & 0o7777),
@@ -469,7 +470,7 @@ impl CurrentExecutable {
     }
 }
 
-fn materialize_shared(contents: crate::fs_backend::SharedFileContents) -> Arc<[u8]> {
+fn materialize_shared(contents: carrick_vfs::fs_backend::SharedFileContents) -> Arc<[u8]> {
     if contents.dirty.is_empty() && contents.len == contents.base.len() {
         return contents.base;
     }
@@ -490,7 +491,7 @@ fn executable_object_id_at(
     fs: &crate::dispatch::fs::FsState,
     path: &str,
 ) -> Option<ExecutableObjectId> {
-    use crate::fs_backend::OverlayEntryKind;
+    use carrick_vfs::fs_backend::OverlayEntryKind;
     if fs.rootfs_vfs.overlay.lookup_kind(path) == Some(OverlayEntryKind::File)
         && let Some(file) = fs.rootfs_vfs.overlay.open_file_readonly(path)
     {
@@ -600,7 +601,7 @@ impl SyscallDispatcher {
             .map_err(ExecSourceError::Linux)?;
         if self
             .layered_lstat(&resolved)
-            .is_ok_and(|metadata| metadata.kind == crate::rootfs::RootFsEntryKind::Directory)
+            .is_ok_and(|metadata| metadata.kind == carrick_vfs::rootfs::RootFsEntryKind::Directory)
         {
             return Err(ExecSourceError::Linux(crate::linux_abi::LINUX_EACCES));
         }
@@ -609,7 +610,7 @@ impl SyscallDispatcher {
     }
 
     fn acquire_exec_source_at(&self, path: &str) -> io::Result<ExecSource> {
-        use crate::fs_backend::OverlayEntryKind;
+        use carrick_vfs::fs_backend::OverlayEntryKind;
 
         match self.fs.rootfs_vfs.overlay.lookup_kind(path) {
             Some(OverlayEntryKind::File) => {
@@ -653,7 +654,7 @@ impl SyscallDispatcher {
                     .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
                 return Ok(ExecSource::shared(
                     bytes,
-                    crate::fs_backend::fresh_file_object_id(),
+                    carrick_vfs::fs_backend::fresh_file_object_id(),
                     path.to_owned(),
                     metadata.mode,
                     carrick_abi::NsUid::ROOT,
@@ -669,7 +670,7 @@ impl SyscallDispatcher {
         }) {
             return Ok(ExecSource::shared(
                 bytes.into(),
-                crate::fs_backend::fresh_file_object_id(),
+                carrick_vfs::fs_backend::fresh_file_object_id(),
                 path.to_owned(),
                 metadata.mode,
                 carrick_abi::NsUid::new(metadata.uid),
@@ -779,7 +780,7 @@ mod tests {
     fn registry_updates_only_the_affected_hardlink_display() {
         let source = ExecSource::shared(
             Arc::from(&b"elf"[..]),
-            crate::fs_backend::fresh_file_object_id(),
+            carrick_vfs::fs_backend::fresh_file_object_id(),
             "/first".into(),
             0o755,
             carrick_abi::NsUid::ROOT,
@@ -805,7 +806,7 @@ mod tests {
         let registry = ExecutableAuthorityRegistry::default();
         let first = ExecSource::shared(
             Arc::from(&b"one"[..]),
-            crate::fs_backend::fresh_file_object_id(),
+            carrick_vfs::fs_backend::fresh_file_object_id(),
             "/a/bin/app".into(),
             0o755,
             carrick_abi::NsUid::ROOT,
@@ -814,7 +815,7 @@ mod tests {
         .into_current(&registry);
         let second = ExecSource::shared(
             Arc::from(&b"two"[..]),
-            crate::fs_backend::fresh_file_object_id(),
+            carrick_vfs::fs_backend::fresh_file_object_id(),
             "/c/tool".into(),
             0o755,
             carrick_abi::NsUid::ROOT,
@@ -833,7 +834,7 @@ mod tests {
     fn fork_clone_shares_object_but_copies_display_state() {
         let source = ExecSource::shared(
             Arc::from(&b"elf"[..]),
-            crate::fs_backend::fresh_file_object_id(),
+            carrick_vfs::fs_backend::fresh_file_object_id(),
             "/old".into(),
             0o755,
             carrick_abi::NsUid::ROOT,
@@ -857,7 +858,7 @@ mod tests {
     fn deleted_display_does_not_retarget_when_name_is_reused() {
         let current = ExecSource::shared(
             Arc::from(&b"old"[..]),
-            crate::fs_backend::fresh_file_object_id(),
+            carrick_vfs::fs_backend::fresh_file_object_id(),
             "/image".into(),
             0o755,
             carrick_abi::NsUid::ROOT,
@@ -867,7 +868,7 @@ mod tests {
         current.unlink_display(current.source.object_id(), "/image");
         let replacement = ExecSource::shared(
             Arc::from(&b"new"[..]),
-            crate::fs_backend::fresh_file_object_id(),
+            carrick_vfs::fs_backend::fresh_file_object_id(),
             "/image".into(),
             0o755,
             carrick_abi::NsUid::ROOT,
@@ -881,7 +882,7 @@ mod tests {
 
     #[test]
     fn dispatcher_memory_source_retains_live_inode_across_namespace_changes() {
-        use crate::fs_backend::{FsBackend as _, MemoryBackend};
+        use carrick_vfs::fs_backend::{FsBackend as _, MemoryBackend};
 
         let backend = MemoryBackend::new();
         backend
@@ -942,7 +943,7 @@ mod tests {
 
     #[test]
     fn in_memory_rootfs_source_preserves_non_executable_mode() {
-        use crate::rootfs::{LayerSource, RootFs};
+        use carrick_vfs::rootfs::{LayerSource, RootFs};
         use tar::{Builder, Header};
 
         let mut archive = Vec::new();
@@ -974,7 +975,7 @@ mod tests {
         let dispatcher = SyscallDispatcher::new();
         let source_a = ExecSource::shared(
             Arc::from(&b"program-a"[..]),
-            crate::fs_backend::fresh_file_object_id(),
+            carrick_vfs::fs_backend::fresh_file_object_id(),
             "/a".into(),
             0o755,
             carrick_abi::NsUid::ROOT,
@@ -982,7 +983,7 @@ mod tests {
         );
         let source_b = ExecSource::shared(
             Arc::from(&b"program-b"[..]),
-            crate::fs_backend::fresh_file_object_id(),
+            carrick_vfs::fs_backend::fresh_file_object_id(),
             "/b".into(),
             0o755,
             carrick_abi::NsUid::ROOT,

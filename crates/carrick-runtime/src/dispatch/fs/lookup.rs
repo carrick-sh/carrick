@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 
 use super::*;
-use crate::rootfs::RootFsEntryKind;
+use carrick_vfs::rootfs::RootFsEntryKind;
 
 /// Identifies which fast path (if any) fully resolved and answered the lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -659,7 +659,7 @@ impl<'a> FsView<'a> {
                     return Err(LINUX_ENOENT);
                 }
 
-                use crate::vfs::Vfs as _;
+                use carrick_vfs::Vfs as _;
                 if let Some(m) = self.fs.vfs_mounts.resolve(&path) {
                     if let Some(real) = m.vfs.real_stat(&m.full_path, follow) {
                         if requires_dir && real.kind != RootFsEntryKind::Directory {
@@ -676,7 +676,7 @@ impl<'a> FsView<'a> {
                     } else {
                         m.vfs.lookup_nofollow(&m.full_path)
                     } {
-                        if requires_dir && md.kind != crate::vfs::EntryKind::Directory {
+                        if requires_dir && md.kind != carrick_vfs::EntryKind::Directory {
                             return Err(LINUX_ENOTDIR);
                         }
                         return Ok(PathLookup {
@@ -695,7 +695,7 @@ impl<'a> FsView<'a> {
                     self.fs.rootfs_vfs.lookup_nofollow(&path)
                 };
                 lookup.and_then(|md| {
-                    if requires_dir && md.kind != crate::vfs::EntryKind::Directory {
+                    if requires_dir && md.kind != carrick_vfs::EntryKind::Directory {
                         return Err(LINUX_ENOTDIR);
                     }
                     Ok(PathLookup {

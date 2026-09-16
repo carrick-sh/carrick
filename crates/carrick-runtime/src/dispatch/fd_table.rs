@@ -56,7 +56,7 @@ use crate::linux_abi::{
     LINUX_EFBIG, LINUX_EINVAL, LINUX_EOVERFLOW, LINUX_S_IFCHR, LINUX_S_IFIFO, LINUX_S_IFMT,
     LINUX_S_IFREG, LINUX_S_IFSOCK, LinuxEpollEvent, LinuxEpollEvents,
 };
-use crate::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
+use carrick_vfs::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
 
 use super::{EpollKqueue, Fd, GuestPtr, HostFd, inode_for_path, linux_mode};
 
@@ -362,7 +362,7 @@ pub(super) struct TimerFdInner {
 
 #[derive(Debug, Clone)]
 pub(super) struct OpenDescriptionBase {
-    fs_identity: Option<crate::vfs::FsIdentity>,
+    fs_identity: Option<carrick_vfs::FsIdentity>,
     /// SO_RCVTIMEO: bounds a blocking recv on this socket. None = block forever.
     recv_timeout: Option<Duration>,
     /// SO_SNDTIMEO: bounds a blocking send on this socket. None = block forever.
@@ -480,11 +480,11 @@ impl OpenDescriptionBase {
         }
     }
 
-    pub(super) fn fs_identity(&self) -> Option<crate::vfs::FsIdentity> {
+    pub(super) fn fs_identity(&self) -> Option<carrick_vfs::FsIdentity> {
         self.fs_identity
     }
 
-    pub(super) fn with_fs_identity(mut self, id: crate::vfs::FsIdentity) -> Self {
+    pub(super) fn with_fs_identity(mut self, id: carrick_vfs::FsIdentity) -> Self {
         self.fs_identity = Some(id);
         self
     }
@@ -748,12 +748,12 @@ impl FileContents {
     }
 
     /// Whether a file of `len` bytes fits this backing. In-memory variants
-    /// are bounded by [`crate::vfs::MAX_IN_MEMORY_FILE_SIZE`]; a host-backed
+    /// are bounded by [`carrick_vfs::MAX_IN_MEMORY_FILE_SIZE`]; a host-backed
     /// file grows sparsely on the host and carries no such cap.
     pub(super) fn accepts_len(&self, len: u64) -> bool {
         match self {
             Self::HostBacked { .. } => true,
-            Self::Dense(_) | Self::RootFsBacked(_) => len <= crate::vfs::MAX_IN_MEMORY_FILE_SIZE,
+            Self::Dense(_) | Self::RootFsBacked(_) => len <= carrick_vfs::MAX_IN_MEMORY_FILE_SIZE,
         }
     }
 
@@ -1248,18 +1248,18 @@ pub(super) enum OpenDescription {
     InMemoryFile {
         base: OpenDescriptionBase,
         path: String,
-        contents: Arc<parking_lot::RwLock<crate::vfs::SparseBuffer>>,
+        contents: Arc<parking_lot::RwLock<carrick_vfs::SparseBuffer>>,
         offset: usize,
         writable: bool,
         max_size: usize,
     },
     SyntheticDevice {
         base: OpenDescriptionBase,
-        kind: crate::vfs::SyntheticDeviceKind,
+        kind: carrick_vfs::SyntheticDeviceKind,
     },
     VirtualConsole {
         base: OpenDescriptionBase,
-        console: Arc<crate::vfs::VirtualConsole>,
+        console: Arc<dyn carrick_vfs::VirtualConsoleDevice>,
     },
     EventFd {
         base: OpenDescriptionBase,
@@ -2750,7 +2750,7 @@ pub(super) struct StatRecord {
     pub(super) atime: (i64, i64),
     pub(super) mtime: (i64, i64),
     pub(super) ctime: (i64, i64),
-    pub(super) fs_identity: crate::vfs::FsIdentity,
+    pub(super) fs_identity: carrick_vfs::FsIdentity,
 }
 
 impl StatRecord {
@@ -2771,11 +2771,11 @@ impl StatRecord {
             atime: (0, 0),
             mtime: (0, 0),
             ctime: (0, 0),
-            fs_identity: crate::vfs::FsIdentity::Overlay,
+            fs_identity: carrick_vfs::FsIdentity::Overlay,
         }
     }
 
-    pub(super) fn from_real(path: &str, real: &crate::fs_backend::RealStat) -> Self {
+    pub(super) fn from_real(path: &str, real: &carrick_vfs::fs_backend::RealStat) -> Self {
         let metadata = RootFsMetadata {
             path: Path::new(path).to_path_buf(),
             kind: real.kind,
@@ -2795,7 +2795,7 @@ impl StatRecord {
             atime: real.atime,
             mtime: real.mtime,
             ctime: real.ctime,
-            fs_identity: crate::vfs::FsIdentity::Overlay,
+            fs_identity: carrick_vfs::FsIdentity::Overlay,
         }
     }
 
@@ -2813,18 +2813,18 @@ impl StatRecord {
             atime: (0, 0),
             mtime: (0, 0),
             ctime: (0, 0),
-            fs_identity: crate::vfs::FsIdentity::Overlay,
+            fs_identity: carrick_vfs::FsIdentity::Overlay,
         }
     }
 
-    pub(super) fn with_fs_identity(mut self, fs_identity: crate::vfs::FsIdentity) -> Self {
+    pub(super) fn with_fs_identity(mut self, fs_identity: carrick_vfs::FsIdentity) -> Self {
         self.fs_identity = fs_identity;
         self
     }
 
     /// Override the reported file TYPE and `st_rdev` for a `mknod(2)` character/
     /// block device node. `dev` is `(type_bits, rdev)` from
-    /// [`FsBackend::device_node`](crate::fs_backend::FsBackend::device_node), so
+    /// [`FsBackend::device_node`](carrick_vfs::fs_backend::FsBackend::device_node), so
     /// this ONLY fires for a real device marker — `None` leaves a regular file's
     /// record completely unchanged. The permission bits are preserved; only the
     /// `S_IFMT` type field is replaced with the device type.
@@ -2910,29 +2910,29 @@ impl OpenDescription {
         }
     }
 
-    pub(super) fn fs_identity(&self) -> crate::vfs::FsIdentity {
+    pub(super) fn fs_identity(&self) -> carrick_vfs::FsIdentity {
         match self {
-            Self::Closed { .. } => crate::vfs::FsIdentity::Overlay,
+            Self::Closed { .. } => carrick_vfs::FsIdentity::Overlay,
             Self::PipeReader { base, .. } | Self::PipeWriter { base, .. } => {
-                base.fs_identity().unwrap_or(crate::vfs::FsIdentity::Pipe)
+                base.fs_identity().unwrap_or(carrick_vfs::FsIdentity::Pipe)
             }
             Self::HostPipe { base, pty, .. } => {
                 if let Some(id) = base.fs_identity() {
                     id
                 } else if pty.is_some() {
-                    crate::vfs::FsIdentity::DevPts
+                    carrick_vfs::FsIdentity::DevPts
                 } else {
-                    crate::vfs::FsIdentity::Pipe
+                    carrick_vfs::FsIdentity::Pipe
                 }
             }
             Self::HostSocket { base, .. }
             | Self::InMemorySocket { base, .. }
-            | Self::Netlink { base, .. } => {
-                base.fs_identity().unwrap_or(crate::vfs::FsIdentity::Socket)
-            }
+            | Self::Netlink { base, .. } => base
+                .fs_identity()
+                .unwrap_or(carrick_vfs::FsIdentity::Socket),
             Self::SyntheticDevice { base, .. } => base
                 .fs_identity()
-                .unwrap_or(crate::vfs::FsIdentity::Overlay),
+                .unwrap_or(carrick_vfs::FsIdentity::Overlay),
             Self::File { base, path, .. }
             | Self::Directory { base, path, .. }
             | Self::SyntheticFile { base, path, .. }
@@ -2940,20 +2940,20 @@ impl OpenDescription {
                 if let Some(id) = base.fs_identity() {
                     id
                 } else if path.starts_with("/proc") {
-                    crate::vfs::FsIdentity::Proc
+                    carrick_vfs::FsIdentity::Proc
                 } else if path.starts_with("/sys") {
-                    crate::vfs::FsIdentity::Sysfs
+                    carrick_vfs::FsIdentity::Sysfs
                 } else if path.starts_with("/dev/pts") {
-                    crate::vfs::FsIdentity::DevPts
+                    carrick_vfs::FsIdentity::DevPts
                 } else {
-                    crate::vfs::FsIdentity::Overlay
+                    carrick_vfs::FsIdentity::Overlay
                 }
             }
             Self::HostFile { base, .. } => base
                 .fs_identity()
-                .unwrap_or(crate::vfs::FsIdentity::Overlay),
-            Self::ProcExecutable { .. } => crate::vfs::FsIdentity::Overlay,
-            _ => crate::vfs::FsIdentity::AnonInode,
+                .unwrap_or(carrick_vfs::FsIdentity::Overlay),
+            Self::ProcExecutable { .. } => carrick_vfs::FsIdentity::Overlay,
+            _ => carrick_vfs::FsIdentity::AnonInode,
         }
     }
 
@@ -3317,7 +3317,7 @@ mod tests {
         let backing = Arc::new(RwLock::new(OpenDescription::InMemoryFile {
             base: OpenDescriptionBase::new(0),
             path: "/mapped".into(),
-            contents: Arc::new(RwLock::new(crate::vfs::SparseBuffer::from(vec![42]))),
+            contents: Arc::new(RwLock::new(carrick_vfs::SparseBuffer::from(vec![42]))),
             offset: 0,
             writable: true,
             max_size: 4096,

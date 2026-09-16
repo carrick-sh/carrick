@@ -94,7 +94,7 @@ impl<'a> FsView<'a> {
                 mount.vfs.lookup(&mount.full_path).ok().map(|metadata| {
                     matches!(
                         metadata.kind,
-                        crate::vfs::EntryKind::File | crate::vfs::EntryKind::Directory
+                        carrick_vfs::EntryKind::File | carrick_vfs::EntryKind::Directory
                     )
                 })
             } else {

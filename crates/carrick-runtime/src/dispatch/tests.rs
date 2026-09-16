@@ -28,7 +28,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
     assert_eq!(MM_MUTATION_SYSCALLS.len(), 17);
 }
     use crate::compat::CompatReporter;
-    use crate::rootfs::LayerSource;
+    use carrick_vfs::rootfs::LayerSource;
     use tar::{Builder, EntryType, Header};
     const SYS_OPENAT: u64 = 56;
     const SYS_CLOSE: u64 = 57;
@@ -681,7 +681,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let rootfs = RootFs::from_immutable_host_dir(lower).unwrap();
         let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
         dispatcher.set_fs_backend(Box::new(
-            crate::fs_backend::HostFsBackend::from_path(upper).unwrap(),
+            carrick_vfs::fs_backend::HostFsBackend::from_path(upper).unwrap(),
         ));
         dispatcher
     }
@@ -3528,11 +3528,11 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             .vfs
             .open(
                 "/sys/class/net/eth1/ifindex",
-                crate::vfs::OpenFlags::default(),
-                &crate::vfs::OpenContext::default(),
+                carrick_vfs::OpenFlags::default(),
+                &carrick_vfs::OpenContext::default(),
             )
             .unwrap();
-        let crate::vfs::VfsHandle::Bytes { contents, .. } = eth1 else {
+        let carrick_vfs::VfsHandle::Bytes { contents, .. } = eth1 else {
             panic!("model-backed /sys/class/net ifindex should open as bytes");
         };
         assert_eq!(String::from_utf8(contents).unwrap(), "3\n");
@@ -4122,7 +4122,7 @@ mod hvpatch_in_process_fork_tests {
         let parent_context = parent.capture_one_task_context().unwrap();
         let parent_tid = parent_context.thread().registry_id();
 
-        let shared_buf = Arc::new(RwLock::new(crate::vfs::SparseBuffer::from(
+        let shared_buf = Arc::new(RwLock::new(carrick_vfs::SparseBuffer::from(
             b"initial_data".to_vec(),
         )));
         let desc_non_cloexec = kernel_file_description(
@@ -4140,7 +4140,7 @@ mod hvpatch_in_process_fork_tests {
             Arc::new(RwLock::new(OpenDescription::InMemoryFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
                 path: "/in_memory_2.txt".to_string(),
-                contents: Arc::new(RwLock::new(crate::vfs::SparseBuffer::from(
+                contents: Arc::new(RwLock::new(carrick_vfs::SparseBuffer::from(
                     b"secret".to_vec(),
                 ))),
                 offset: 0,
@@ -5459,7 +5459,7 @@ mod container_policy_dispatch_tests {
 
     #[test]
     fn synthetic_device_stat_source_reports_chardev_and_rdev() {
-        use crate::vfs::SyntheticDeviceKind;
+        use carrick_vfs::SyntheticDeviceKind;
 
         let kinds = [
             (SyntheticDeviceKind::Null, "/dev/null"),
@@ -5769,13 +5769,13 @@ mod container_policy_dispatch_tests {
     fn prepared_fork_mm_copied_child_authority_is_independent_of_parent() {
         let dispatcher = SyscallDispatcher::new();
         dispatcher.set_address_space_regions(vec![
-            crate::vfs::ProcMapsEntry {
+            carrick_vfs::ProcMapsEntry {
                 start: 0x10000,
                 end: 0x20000,
                 read: true,
                 write: true,
                 execute: false,
-                sharing: crate::vfs::ProcMapSharing::Private,
+                sharing: carrick_vfs::ProcMapSharing::Private,
                 path: "[anon]".to_string(),
             },
         ]);
@@ -5795,7 +5795,7 @@ mod container_policy_dispatch_tests {
             0x30000,
             0x1000,
             LinuxProtFlags::READ | LinuxProtFlags::WRITE,
-            crate::vfs::ProcMapSharing::Private,
+            carrick_vfs::ProcMapSharing::Private,
             "[parent_only]".to_string(),
         );
 
@@ -5812,7 +5812,7 @@ mod container_policy_dispatch_tests {
             0x10000,
             0x3000,
             LinuxProtFlags::READ | LinuxProtFlags::WRITE,
-            crate::vfs::ProcMapSharing::Private,
+            carrick_vfs::ProcMapSharing::Private,
             "[anon]".to_string(),
         );
         let parent_state = Arc::clone(&dispatcher.mem().lock().deferred_anonymous);
@@ -5842,7 +5842,7 @@ mod container_policy_dispatch_tests {
             0x10000,
             0x3000,
             LinuxProtFlags::READ | LinuxProtFlags::WRITE,
-            crate::vfs::ProcMapSharing::Private,
+            carrick_vfs::ProcMapSharing::Private,
             "[anon]".to_string(),
         );
         let parent_state = Arc::clone(&dispatcher.mem().lock().deferred_anonymous);
@@ -5872,22 +5872,22 @@ mod container_policy_dispatch_tests {
     fn fork_projection_copied_is_total_and_holes_are_absent() {
         let dispatcher = SyscallDispatcher::new();
         dispatcher.set_address_space_regions(vec![
-            crate::vfs::ProcMapsEntry {
+            carrick_vfs::ProcMapsEntry {
                 start: 0x10000,
                 end: 0x14000,
                 read: true,
                 write: true,
                 execute: false,
-                sharing: crate::vfs::ProcMapSharing::Private,
+                sharing: carrick_vfs::ProcMapSharing::Private,
                 path: "[anon1]".to_string(),
             },
-            crate::vfs::ProcMapsEntry {
+            carrick_vfs::ProcMapsEntry {
                 start: 0x20000,
                 end: 0x24000,
                 read: true,
                 write: true,
                 execute: false,
-                sharing: crate::vfs::ProcMapSharing::Private,
+                sharing: carrick_vfs::ProcMapSharing::Private,
                 path: "[anon2]".to_string(),
             },
         ]);
@@ -7561,7 +7561,7 @@ mod scm_rights_tests {
         // (O_RDWR), identical path, writable. Re-wrapping the raw host fd as a
         // fresh read-only description made that mmap EACCES.
         use crate::dispatch::fd_table::{HostFdRef, OpenDescriptionBase, OpenFile};
-        use crate::rootfs::{RootFsEntryKind, RootFsMetadata};
+        use carrick_vfs::rootfs::{RootFsEntryKind, RootFsMetadata};
         use carrick_abi::LINUX_O_RDWR;
         use std::os::fd::IntoRawFd;
         const SYS_FCNTL: u64 = 25;

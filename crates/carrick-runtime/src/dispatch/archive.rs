@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use super::SyscallDispatcher;
-use crate::vfs::{EntryKind, Metadata, Vfs as _};
+use carrick_vfs::{EntryKind, Metadata, Vfs as _};
 
 const MAX_ARCHIVE_ENTRIES: usize = 4_096;
 pub(crate) const MAX_ARCHIVE_BYTES: usize = 16 * 1024 * 1024;
@@ -48,8 +48,8 @@ struct PlannedEntry {
 
 #[derive(Clone)]
 pub(crate) struct ArchiveFsAuthority {
-    mounts: Arc<crate::vfs::VfsMounts>,
-    root: Arc<crate::vfs::RootFsVfs>,
+    mounts: Arc<carrick_vfs::VfsMounts>,
+    root: Arc<carrick_vfs::RootFsVfs>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -271,7 +271,7 @@ impl ArchiveFsAuthority {
         &self,
         path: &str,
         limit: usize,
-    ) -> Result<Vec<crate::vfs::DirEnt>, ArchiveFsError> {
+    ) -> Result<Vec<carrick_vfs::DirEnt>, ArchiveFsError> {
         let map = |display: &str, error| {
             if error == crate::linux_abi::LINUX_E2BIG {
                 ArchiveFsError::TooLarge
@@ -625,7 +625,7 @@ fn apply_archive_plan(
                 }
                 if !matches!(entry.kind, PlannedKind::Symlink(_)) {
                     match backend.set_mode(&full, entry.mode) {
-                        Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {}
+                        Ok(()) | Err(carrick_vfs::fs_backend::BackendError::Unsupported) => {}
                         Err(error) => return Err(ArchiveFsError::Io(format!("{error:?}"))),
                     }
                 }
@@ -693,7 +693,7 @@ fn snapshot_archive_paths(
             let full = destination_path(destination, relative)?;
             let previous = match backend.lookup_kind(&full) {
                 None => PreviousArchiveEntry::AbsentUpper,
-                Some(crate::fs_backend::OverlayEntryKind::Deleted) => {
+                Some(carrick_vfs::fs_backend::OverlayEntryKind::Deleted) => {
                     PreviousArchiveEntry::Tombstone
                 }
                 Some(_) => {
@@ -724,7 +724,7 @@ fn snapshot_archive_paths(
 }
 
 fn rollback_archive_paths(
-    backend: &dyn crate::fs_backend::FsBackend,
+    backend: &dyn carrick_vfs::fs_backend::FsBackend,
     snapshots: &[ArchivePathSnapshot],
 ) -> Result<(), ArchiveFsError> {
     let mut snapshots = snapshots.iter().collect::<Vec<_>>();
@@ -741,7 +741,7 @@ fn rollback_archive_paths(
 }
 
 fn restore_archive_path(
-    backend: &dyn crate::fs_backend::FsBackend,
+    backend: &dyn carrick_vfs::fs_backend::FsBackend,
     full: &str,
     previous: &PreviousArchiveEntry,
 ) -> Result<(), ArchiveFsError> {
@@ -777,7 +777,7 @@ fn restore_archive_path(
 /// Direct backend writes deliberately keep the dentry cache untouched while a
 /// later entry can still fail and force rollback.
 fn publish_applied_archive_paths(
-    cache: &crate::vfs::DentryCache,
+    cache: &carrick_vfs::DentryCache,
     paths: &[PathBuf],
     destination: &str,
 ) -> Result<(), ArchiveFsError> {
@@ -791,7 +791,7 @@ fn publish_applied_archive_paths(
 /// Restore cache visibility to the final post-rollback state, never to the
 /// transient state that existed while the archive plan was being applied.
 fn publish_rolled_back_archive_paths(
-    cache: &crate::vfs::DentryCache,
+    cache: &carrick_vfs::DentryCache,
     snapshots: &[ArchivePathSnapshot],
 ) {
     for snapshot in snapshots {
@@ -818,20 +818,20 @@ fn publish_rolled_back_archive_paths(
 /// A failed rollback has no single known final namespace state. Drop every
 /// affected cache entry so a later lookup rederives the layered view rather
 /// than publishing a plausible but stale archive result.
-fn invalidate_archive_paths(cache: &crate::vfs::DentryCache, snapshots: &[ArchivePathSnapshot]) {
+fn invalidate_archive_paths(cache: &carrick_vfs::DentryCache, snapshots: &[ArchivePathSnapshot]) {
     for snapshot in snapshots {
         cache.inode_changed(&snapshot.full, None);
     }
 }
 
 fn restore_archive_metadata(
-    backend: &dyn crate::fs_backend::FsBackend,
+    backend: &dyn carrick_vfs::fs_backend::FsBackend,
     full: &str,
     metadata: &Metadata,
 ) -> Result<(), ArchiveFsError> {
     let map = |error| ArchiveFsError::Io(format!("rollback metadata {full}: {error:?}"));
     match backend.set_mode(full, metadata.mode) {
-        Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {}
+        Ok(()) | Err(carrick_vfs::fs_backend::BackendError::Unsupported) => {}
         Err(error) => return Err(map(error)),
     }
     backend
@@ -847,7 +847,7 @@ fn restore_archive_metadata(
         Some((metadata.mtime_secs, i64::from(metadata.mtime_nanos))),
         true,
     ) {
-        Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => Ok(()),
+        Ok(()) | Err(carrick_vfs::fs_backend::BackendError::Unsupported) => Ok(()),
         Err(error) => Err(map(error)),
     }
 }
@@ -863,7 +863,7 @@ fn destination_path(destination: &str, relative: &Path) -> Result<String, Archiv
 #[cfg(test)]
 mod tests {
     use super::SyscallDispatcher;
-    use crate::fs_backend::FsBackend as _;
+    use carrick_vfs::fs_backend::FsBackend as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -877,13 +877,13 @@ mod tests {
         visited: Arc<AtomicUsize>,
     }
 
-    impl crate::vfs::Vfs for BoundedLazyDirectoryMount {
-        fn lookup(&self, path: &str) -> Result<crate::vfs::Metadata, crate::vfs::VfsError> {
+    impl carrick_vfs::Vfs for BoundedLazyDirectoryMount {
+        fn lookup(&self, path: &str) -> Result<carrick_vfs::Metadata, carrick_vfs::VfsError> {
             if path != "/wide" {
                 return Err(crate::linux_abi::LINUX_ENOENT);
             }
-            Ok(crate::vfs::Metadata {
-                kind: crate::vfs::EntryKind::Directory,
+            Ok(carrick_vfs::Metadata {
+                kind: carrick_vfs::EntryKind::Directory,
                 mode: 0o755,
                 size: 0,
                 uid: 0,
@@ -897,29 +897,29 @@ mod tests {
             &self,
             path: &str,
             limit: usize,
-        ) -> Result<Vec<crate::vfs::DirEnt>, crate::vfs::VfsError> {
+        ) -> Result<Vec<carrick_vfs::DirEnt>, carrick_vfs::VfsError> {
             if path != "/wide" {
                 return Err(crate::linux_abi::LINUX_ENOTDIR);
             }
             Ok((0..=limit)
                 .map(|index| {
                     self.visited.fetch_add(1, Ordering::Relaxed);
-                    crate::vfs::DirEnt {
+                    carrick_vfs::DirEnt {
                         name: format!("entry-{index}"),
-                        kind: crate::vfs::EntryKind::File,
+                        kind: carrick_vfs::EntryKind::File,
                     }
                 })
                 .collect())
         }
     }
 
-    impl crate::vfs::Vfs for UnboundedOnlyDirectoryMount {
-        fn lookup(&self, path: &str) -> Result<crate::vfs::Metadata, crate::vfs::VfsError> {
+    impl carrick_vfs::Vfs for UnboundedOnlyDirectoryMount {
+        fn lookup(&self, path: &str) -> Result<carrick_vfs::Metadata, carrick_vfs::VfsError> {
             if path != "/wide" {
                 return Err(crate::linux_abi::LINUX_ENOENT);
             }
-            Ok(crate::vfs::Metadata {
-                kind: crate::vfs::EntryKind::Directory,
+            Ok(carrick_vfs::Metadata {
+                kind: carrick_vfs::EntryKind::Directory,
                 mode: 0o755,
                 size: 0,
                 uid: 0,
@@ -929,27 +929,27 @@ mod tests {
             })
         }
 
-        fn readdir(&self, path: &str) -> Result<Vec<crate::vfs::DirEnt>, crate::vfs::VfsError> {
+        fn readdir(&self, path: &str) -> Result<Vec<carrick_vfs::DirEnt>, carrick_vfs::VfsError> {
             if path != "/wide" {
                 return Err(crate::linux_abi::LINUX_ENOTDIR);
             }
             Ok((0..10_000)
                 .map(|index| {
                     self.visited.fetch_add(1, Ordering::Relaxed);
-                    crate::vfs::DirEnt {
+                    carrick_vfs::DirEnt {
                         name: format!("entry-{index}"),
-                        kind: crate::vfs::EntryKind::File,
+                        kind: carrick_vfs::EntryKind::File,
                     }
                 })
                 .collect())
         }
     }
 
-    impl crate::vfs::Vfs for ReadOnlyDirectoryMount {
-        fn lookup(&self, path: &str) -> Result<crate::vfs::Metadata, crate::vfs::VfsError> {
+    impl carrick_vfs::Vfs for ReadOnlyDirectoryMount {
+        fn lookup(&self, path: &str) -> Result<carrick_vfs::Metadata, carrick_vfs::VfsError> {
             if path == "/dest" {
-                Ok(crate::vfs::Metadata {
-                    kind: crate::vfs::EntryKind::Directory,
+                Ok(carrick_vfs::Metadata {
+                    kind: carrick_vfs::EntryKind::Directory,
                     mode: 0o755,
                     size: 0,
                     uid: 0,
@@ -1186,8 +1186,8 @@ mod tests {
     #[test]
     fn archive_import_rolls_back_earlier_entries_after_late_backend_failure() {
         let scratch = tempfile::tempdir().expect("scratch");
-        let backend =
-            crate::fs_backend::HostFsBackend::from_path(scratch.path()).expect("scratch backend");
+        let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path())
+            .expect("scratch backend");
         backend.make_dir("/dest").expect("destination");
         backend
             .set_file_contents("/dest/first", b"original".to_vec())
@@ -1266,8 +1266,8 @@ mod tests {
     #[test]
     fn archive_transaction_blocks_a_concurrent_symlink_pivot() {
         let scratch = tempfile::tempdir().expect("scratch");
-        let backend =
-            crate::fs_backend::HostFsBackend::from_path(scratch.path()).expect("scratch backend");
+        let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path())
+            .expect("scratch backend");
         backend.make_dir("/dest").expect("destination");
         backend.make_dir("/outside").expect("outside");
         let mut dispatcher = SyscallDispatcher::new();

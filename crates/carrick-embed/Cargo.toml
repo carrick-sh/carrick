@@ -45,6 +45,7 @@ carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-hal = { path = "../carrick-hal" }
 carrick-host = { path = "../carrick-host" }
 carrick-runtime = { path = "../carrick-runtime", default-features = false }
+carrick-vfs = { path = "../carrick-vfs" }
 carrick-thread = { path = "../carrick-thread" }
 # The engine re-exports neither PullPolicy nor the spec's StdioMode; take the
 # two leaf crates directly rather than widening the engine's re-export list.

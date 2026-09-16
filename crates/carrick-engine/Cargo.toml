@@ -30,6 +30,7 @@ carrick-abi = { path = "../carrick-abi" }
 carrick-spec = { path = "../carrick-spec" }
 carrick-image = { path = "../carrick-image" }
 carrick-runtime = { path = "../carrick-runtime", default-features = false }
+carrick-vfs = { path = "../carrick-vfs" }
 anyhow = { workspace = true }
 
 [dev-dependencies]

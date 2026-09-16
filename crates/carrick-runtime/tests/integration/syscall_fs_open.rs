@@ -10,12 +10,12 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
+use carrick_runtime::linux_abi::{LINUX_AT_FDCWD, LINUX_O_RDWR};
 #[cfg(target_os = "macos")]
-use carrick_runtime::fs_backend::HostFsBackend;
-use carrick_runtime::fs_backend::{
+use carrick_vfs::fs_backend::HostFsBackend;
+use carrick_vfs::fs_backend::{
     BackendError, FsBackend, MemoryBackend, OverlayEntry, OverlayEntryKind,
 };
-use carrick_runtime::linux_abi::{LINUX_AT_FDCWD, LINUX_O_RDWR};
 use support::*;
 
 #[derive(Default)]
@@ -102,7 +102,7 @@ impl FsBackend for CountingMemoryBackend {
         self.inner.lookup_kind(path)
     }
 
-    fn metadata(&self, path: &str) -> Option<carrick_runtime::rootfs::RootFsMetadata> {
+    fn metadata(&self, path: &str) -> Option<carrick_vfs::rootfs::RootFsMetadata> {
         self.metadata_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.metadata(path)
@@ -115,7 +115,7 @@ impl FsBackend for CountingMemoryBackend {
     fn shared_file_contents(
         &self,
         path: &str,
-    ) -> Option<carrick_runtime::fs_backend::SharedFileContents> {
+    ) -> Option<carrick_vfs::fs_backend::SharedFileContents> {
         self.shared_file_contents_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.shared_file_contents(path)
@@ -125,14 +125,11 @@ impl FsBackend for CountingMemoryBackend {
         &self,
         path: &str,
         trunc: bool,
-    ) -> Option<carrick_runtime::fs_backend::SharedFileEntry> {
+    ) -> Option<carrick_vfs::fs_backend::SharedFileEntry> {
         self.inner.shared_file_entry(path, trunc)
     }
 
-    fn fast_nofollow_metadata(
-        &self,
-        path: &str,
-    ) -> Option<carrick_runtime::rootfs::RootFsMetadata> {
+    fn fast_nofollow_metadata(&self, path: &str) -> Option<carrick_vfs::rootfs::RootFsMetadata> {
         self.inner.fast_nofollow_metadata(path)
     }
 
@@ -184,11 +181,7 @@ impl FsBackend for CountingMemoryBackend {
     fn child_names(
         &self,
         dir: &str,
-    ) -> Vec<(
-        String,
-        carrick_runtime::rootfs::RootFsEntryKind,
-        Option<u64>,
-    )> {
+    ) -> Vec<(String, carrick_vfs::rootfs::RootFsEntryKind, Option<u64>)> {
         self.inner.child_names(dir)
     }
 
@@ -200,7 +193,7 @@ impl FsBackend for CountingMemoryBackend {
         &self,
         from: &str,
         to: &str,
-    ) -> Result<carrick_runtime::fs_backend::OverlayRenameOutcome, BackendError> {
+    ) -> Result<carrick_vfs::fs_backend::OverlayRenameOutcome, BackendError> {
         self.inner.rename_overlay_entry(from, to)
     }
 
@@ -210,7 +203,7 @@ impl FsBackend for CountingMemoryBackend {
         write: bool,
         create: bool,
         trunc: bool,
-    ) -> carrick_runtime::fs_backend::HostFdOpen<i32> {
+    ) -> carrick_vfs::fs_backend::HostFdOpen<i32> {
         self.inner.open_raw_fd(path, write, create, trunc)
     }
 }
@@ -226,7 +219,7 @@ fn memory_overlay_open_uses_single_backend_snapshot_for_shared_file() {
     let metadata_calls = backend.metadata_calls.clone();
     let shared_file_contents_calls = backend.shared_file_contents_calls.clone();
 
-    let mut vfs = carrick_runtime::vfs::RootFsVfs::new();
+    let mut vfs = carrick_vfs::RootFsVfs::new();
     vfs.set_overlay(Box::new(backend));
 
     let result = vfs
@@ -234,7 +227,7 @@ fn memory_overlay_open_uses_single_backend_snapshot_for_shared_file() {
         .unwrap();
     assert!(matches!(
         result,
-        carrick_runtime::vfs::rootfs::OpenDispatchResult::RootFsBackedFile { .. }
+        carrick_vfs::vfs::rootfs::OpenDispatchResult::RootFsBackedFile { .. }
     ));
 
     assert_eq!(

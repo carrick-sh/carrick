@@ -1,10 +1,10 @@
 # Carrick Crate Map
 
-Carrick is a 27-crate Cargo workspace. The product path is:
+Carrick is a 30-crate Cargo workspace. The product path is:
 
 ```text
-carrick-cli   -> carrick-engine -> { carrick-image, carrick-runtime } -> carrick-spec
-carrick-embed -> { carrick-engine, carrick-runtime }                   -> carrick-spec
+carrick-cli   -> carrick-engine -> { carrick-image, carrick-runtime } -> carrick-vfs -> carrick-spec
+carrick-embed -> { carrick-engine, carrick-runtime }                  -> carrick-vfs -> carrick-spec
 ```
 
 `carrick-embed` is the library front door and takes the runtime directly. Its
@@ -25,7 +25,8 @@ Platform code is selected by Cargo features. The default feature is
 | `carrick-engine` | Docker-style request merge layer: image config + CLI flags -> `RunSpec`. |
 | `carrick-embed` | Library embedding surface: `ContainerBuilder` -> `RunRequest` -> `Engine::resolve` -> `Runtime::prepare`/`PreparedRun::execute`, with captured, inherited or piped stdio and the `testing` helpers (`TestContainer`, `run_in_container`, `ResultAssert`). The dog-food consumer for Carrick's own guest tests; guest-running tests need the signed `just test-embed` recipe. |
 | `carrick-image` | OCI reference parsing, pull/cache, config and layer resolution. |
-| `carrick-runtime` | Carrick kernel implementation: ELF execution, syscall dispatch, VFS/rootfs, kernel-owned process and memory models, namespaces, credentials, sockets, IPC, procfs/sysfs, scheduling integration, and platform-selected execution loops. |
+| `carrick-runtime` | Carrick kernel implementation: ELF execution, syscall dispatch, kernel-owned process and memory models, namespaces, credentials, sockets, IPC, the kernel-view filesystems (procfs/sysfs/`/dev`/devpts), scheduling integration, and platform-selected execution loops. |
+| `carrick-vfs` | The filesystem model below the kernel: the `Vfs` trait and mount table, dentry cache, host and in-memory backends, the OCI rootfs with its overlay and layer cache, the path codec, and the bind/resolv.conf/services mounts. Names no kernel, carrier or VMM type. |
 | `carrick-spec` | Shared vocabulary types: `RunSpec`, `ContainerSpec`, `ImageConfig`, mounts, namespace config, platform requests. |
 
 ## ABI, Memory, and Neutral Core

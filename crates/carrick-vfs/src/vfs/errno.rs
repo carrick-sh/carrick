@@ -15,14 +15,14 @@ use carrick_abi::{LINUX_E2BIG, LINUX_EINVAL, LINUX_ENOENT, LinuxErrno};
 use crate::rootfs::RootFsError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HostSyscallError {
+pub struct HostSyscallError {
     /// The HOST errno as read from the host libc — NOT a Linux errno.
     raw_errno: i32,
     linux_errno: LinuxErrno,
 }
 
 impl HostSyscallError {
-    pub(crate) fn last() -> Self {
+    pub fn last() -> Self {
         let raw_errno = carrick_portable::errno();
 
         Self {
@@ -31,17 +31,17 @@ impl HostSyscallError {
         }
     }
 
-    #[cfg(all(test, target_os = "macos"))]
-    pub(crate) fn raw_errno(self) -> i32 {
+    #[cfg(all(any(test, feature = "test-support"), target_os = "macos"))]
+    pub fn raw_errno(self) -> i32 {
         self.raw_errno
     }
 
-    pub(crate) fn linux_errno(self) -> LinuxErrno {
+    pub fn linux_errno(self) -> LinuxErrno {
         self.linux_errno
     }
 }
 
-pub(crate) trait HostSyscallResult: Sized {
+pub trait HostSyscallResult: Sized {
     fn host_syscall_result(self) -> Result<Self, HostSyscallError>;
 
     fn host_syscall_errno(self) -> Result<Self, LinuxErrno> {

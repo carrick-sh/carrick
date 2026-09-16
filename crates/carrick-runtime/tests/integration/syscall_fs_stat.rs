@@ -11,7 +11,7 @@
 mod support;
 
 #[cfg(target_os = "macos")]
-use carrick_runtime::fs_backend::{FsBackend, HostFsBackend};
+use carrick_vfs::fs_backend::{FsBackend, HostFsBackend};
 use support::*;
 
 #[test]

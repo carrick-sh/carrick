@@ -301,7 +301,7 @@ pub fn registry_root() -> PathBuf {
     // The APFS scratch root (a case-sensitive, fast-clone volume) is a macOS
     // host concept; on Linux fall back to a tempdir-based root.
     #[cfg(target_os = "macos")]
-    let base = crate::apfs::preferred_scratch_root()
+    let base = carrick_vfs::apfs::preferred_scratch_root()
         .unwrap_or_else(|_| std::env::temp_dir().join("carrick"));
     #[cfg(not(target_os = "macos"))]
     let base = std::env::temp_dir().join("carrick");

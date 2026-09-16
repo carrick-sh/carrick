@@ -198,7 +198,10 @@ impl<'a> NetView<'a> {
             | OpenDescription::Directory { .. }
             | OpenDescription::SyntheticFile { .. } => false,
             OpenDescription::HostFile { metadata, .. } => {
-                matches!(metadata.kind, crate::rootfs::RootFsEntryKind::CharDevice)
+                matches!(
+                    metadata.kind,
+                    carrick_vfs::rootfs::RootFsEntryKind::CharDevice
+                )
             }
             _ => true,
         }

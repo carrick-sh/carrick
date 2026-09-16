@@ -59,6 +59,7 @@
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -73,124 +74,12 @@ use crate::memory::{
     LINUX_SIGRETURN_TRAMPOLINE_BASE, LINUX_STACK_SIZE, LINUX_STACK_TOP,
 };
 
-use super::{
-    DirEnt, EntryKind, FsNetworkInterface, FsNetworkView, Metadata, OpenContext, OpenFlags, Vfs,
-    VfsError, VfsHandle,
+use carrick_vfs::{
+    DirEnt, EntryKind, FsCaller, FsNetworkInterface, FsNetworkView, GuestMemoryRange,
+    GuestReportedArch, LazyField, Metadata, OpenContext, OpenContextMemorySnapshot, OpenFlags,
+    ProcMapsEntry, SyntheticProcIdentity, SyntheticProcProcess, SyntheticProcThread,
+    SyntheticProcZombie, Vfs, VfsError, VfsHandle,
 };
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProcMapsEntry {
-    pub start: u64,
-    pub end: u64,
-    pub read: bool,
-    pub write: bool,
-    pub execute: bool,
-    pub sharing: ProcMapSharing,
-    pub path: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProcMapSharing {
-    Private,
-    Shared,
-}
-
-impl ProcMapSharing {
-    fn marker(self) -> char {
-        match self {
-            Self::Private => 'p',
-            Self::Shared => 's',
-        }
-    }
-}
-
-/// The ISA a guest reports about *itself* through arch-dependent synthetic
-/// surfaces — `uname(2)`, `/proc/cpuinfo`, and any future arch-keyed file. A
-/// single source (`ProcState::reported_arch`, mirroring `guest_hostname()`)
-/// feeds all of them so they can never contradict each other: the bug this
-/// closes was an x86_64 guest seeing `uname=x86_64` but `/proc/cpuinfo=ARM`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum GuestReportedArch {
-    #[default]
-    Aarch64,
-    X86_64,
-}
-
-pub type GuestMemoryRange = carrick_guest_mem::GuestVaRange;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SyntheticProcIdentity {
-    pub pid: u32,
-    pub tid: u32,
-    pub ppid: u32,
-    pub pgrp: u32,
-    pub session: u32,
-    pub user_cpu_us: u64,
-    pub system_cpu_us: u64,
-}
-
-/// One authoritative Linux thread rendered by the in-process HVPatch `/proc`
-/// view. The Linux TID is distinct from the runtime registry id on this lane;
-/// carrying the resolved state/name snapshot prevents `/proc/self/task/<tid>`
-/// from accidentally consulting another HVPatch process's global registry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyntheticProcThread {
-    pub tid: u32,
-    pub state: char,
-    pub comm: Option<String>,
-    pub user_cpu_us: u64,
-    pub system_cpu_us: u64,
-    /// The guest CPU this thread last ran on — `/proc/<pid>/stat` field 39
-    /// (`processor`) and the same `P` `sched_getcpu` reports. `None` before
-    /// its first claim.
-    pub processor: Option<carrick_hal::GuestCpuId>,
-    /// This thread's `sched_setaffinity` mask, for `/proc/<pid>/status`
-    /// `Cpus_allowed`. The scheduler honours the same value.
-    pub cpus_allowed: carrick_hal::CpuAffinity,
-}
-
-/// One LIVE Linux process other than the reader, rendered by the in-process
-/// HVPatch `/proc` view — the sibling of [`SyntheticProcZombie`], covering the
-/// interval before a process exits.
-///
-/// It exists for the same reason: under HVPatch every Linux process is a thread
-/// of ONE Darwin process, so Darwin's process table cannot describe a peer at
-/// all. Asking it yields the CARRIER's identity — which is how a guest reading
-/// `/proc/<peer>/stat` used to receive five-digit host ppid/pgrp/session values
-/// straight out of macOS. The authoritative Kernel task record must cross the
-/// dispatcher/VFS boundary instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyntheticProcProcess {
-    pub pid: u32,
-    pub ppid: u32,
-    pub pgrp: u32,
-    pub session: u32,
-    pub state: char,
-    /// Every live thread's Linux tid, straight from the kernel graph's per-task
-    /// thread claims. It is what `/proc/<pid>/task/` lists and what `stat`
-    /// field 20 / `status`' `Threads:` count; Darwin's thread table cannot be
-    /// asked, because on HVPatch it describes every process in the carrier at
-    /// once.
-    pub tids: Vec<u32>,
-    pub comm: String,
-    pub user_cpu_us: u64,
-    pub system_cpu_us: u64,
-}
-
-/// One exited-but-unreaped Linux process rendered by the in-process HVPatch
-/// `/proc` view. HVPatch children are host threads, so Darwin's process table
-/// cannot observe their zombie interval; the authoritative Kernel record must
-/// cross the dispatcher/VFS boundary instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyntheticProcZombie {
-    pub pid: u32,
-    pub ppid: u32,
-    pub pgrp: u32,
-    pub session: u32,
-    pub comm: String,
-    pub user_cpu_us: u64,
-    pub system_cpu_us: u64,
-}
 
 /// Minimal live state needed by synthetic `/proc` renderers.
 #[derive(Debug, Clone, Default)]
@@ -225,10 +114,10 @@ pub struct SyntheticProcContext {
     pub brk_current: u64,
     pub mmap_next: u64,
     /// The memory layout's heap (brk arena) base — see
-    /// [`crate::vfs::OpenContext::heap_base`]. 0 = unknown.
+    /// [`carrick_vfs::OpenContext::heap_base`]. 0 = unknown.
     pub heap_base: u64,
     /// Guest VAs are host VAs (native exec backend) — see
-    /// [`crate::vfs::OpenContext::native_guest_va`].
+    /// [`carrick_vfs::OpenContext::native_guest_va`].
     pub native_guest_va: bool,
     pub ruid: NsUid,
     pub euid: NsUid,
@@ -279,6 +168,61 @@ pub struct SyntheticProcContext {
 impl SyntheticProcContext {
     pub fn as_open_context(&self) -> OpenContext<'_> {
         OpenContext::from(self)
+    }
+}
+
+/// Lower the kernel-typed render context to the plain [`OpenContext`] the VFS
+/// trait carries. It lives here, not in `carrick-vfs`, because
+/// [`SyntheticProcContext`] names the kernel's credential and network-namespace
+/// snapshots; the VFS only ever sees the `FsCaller`/`FsNetworkView` views of
+/// them.
+impl<'a> From<&'a SyntheticProcContext> for OpenContext<'a> {
+    fn from(ctx: &'a SyntheticProcContext) -> Self {
+        OpenContext {
+            timerslack_ns: ctx.timerslack_ns,
+            guest_arch: ctx.guest_arch,
+            native_guest_va: ctx.native_guest_va,
+            ruid: ctx.ruid,
+            euid: ctx.euid,
+            suid: ctx.suid,
+            rgid: ctx.rgid,
+            egid: ctx.egid,
+            sgid: ctx.sgid,
+            runtime_endpoint_container: ctx.runtime_endpoint_container,
+            identity: ctx.identity,
+            executable_path: LazyField::from_value(Some(Cow::Borrowed(&ctx.executable_path))),
+            argv: LazyField::from_value(Some(Cow::Borrowed(&ctx.argv))),
+            task_comm: LazyField::from_value(Some(Cow::Borrowed(&ctx.task_comm))),
+            guest_hostname: LazyField::from_value(Some(Cow::Borrowed(&ctx.guest_hostname))),
+            environ: LazyField::from_value(Some(Cow::Borrowed(&ctx.environ))),
+            open_fds: LazyField::from_value(Some(Cow::Borrowed(&ctx.open_fds))),
+            network: LazyField::from_value(Some(Cow::Borrowed(&ctx.network))),
+            network_model: LazyField::from_value(
+                ctx.network_model
+                    .clone()
+                    .map(|model| Arc::new(model) as Arc<dyn FsNetworkView>),
+            ),
+            groups: LazyField::from_value(Some(Cow::Borrowed(&ctx.groups))),
+            signals: LazyField::from_value((ctx.sig_ignored, ctx.sig_caught, ctx.sig_shdpnd)),
+            oom_score_adj: LazyField::from_value(Some(Cow::Borrowed(&ctx.oom_score_adj))),
+            creds_ns: LazyField::from_value(Some(
+                Arc::new(ctx.creds_ns.clone()) as Arc<dyn FsCaller>
+            )),
+            processes: LazyField::from_value(ctx.processes.as_deref().map(Cow::Borrowed)),
+            threads: LazyField::from_value(ctx.threads.as_deref().map(Cow::Borrowed)),
+            zombies: LazyField::from_value(ctx.zombies.as_deref().map(Cow::Borrowed)),
+            sysvipc_shm: LazyField::from_value(Some(Cow::Borrowed(&ctx.sysvipc_shm))),
+            sysvipc_sem: LazyField::from_value(Some(Cow::Borrowed(&ctx.sysvipc_sem))),
+            sysvipc_msg: LazyField::from_value(Some(Cow::Borrowed(&ctx.sysvipc_msg))),
+            mem: LazyField::from_value(OpenContextMemorySnapshot {
+                auxv: Cow::Borrowed(&ctx.auxv),
+                address_space_regions: ctx.address_space_regions.as_deref().map(Cow::Borrowed),
+                locked_memory: Cow::Borrowed(&ctx.locked_memory),
+                brk_current: ctx.brk_current,
+                mmap_next: ctx.mmap_next,
+                heap_base: ctx.heap_base,
+            }),
+        }
     }
 }
 
@@ -2553,7 +2497,7 @@ impl Vfs for ProcVfs {
         }
     }
 
-    fn readdir(&self, path: &str) -> Result<Vec<super::DirEnt>, VfsError> {
+    fn readdir(&self, path: &str) -> Result<Vec<carrick_vfs::DirEnt>, VfsError> {
         if path == "/proc" {
             return Ok(proc_top_level_entries(&OpenContext::default()));
         }
@@ -2675,8 +2619,8 @@ impl Vfs for ProcVfs {
         })
     }
 
-    fn fs_identity(&self) -> super::FsIdentity {
-        super::FsIdentity::Proc
+    fn fs_identity(&self) -> carrick_vfs::FsIdentity {
+        carrick_vfs::FsIdentity::Proc
     }
 
     fn name(&self) -> &'static str {
@@ -4368,6 +4312,7 @@ fn per_thread_comm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carrick_vfs::ProcMapSharing;
 
     fn proc_foreign_live_memory_open_errno(
         path: &str,
@@ -4567,7 +4512,7 @@ mod tests {
                 user_cpu_us: 0,
                 system_cpu_us: 0,
             }),
-            threads: crate::vfs::LazyField::from_slice(&threads),
+            threads: carrick_vfs::LazyField::from_slice(&threads),
             ..OpenContext::default()
         };
         let opened = v
@@ -4775,8 +4720,8 @@ mod tests {
                     ..Default::default()
                 },
                 &OpenContext {
-                    executable_path: crate::vfs::LazyField::from_borrowed_str("/usr/bin/test-exe"),
-                    argv: crate::vfs::LazyField::from_slice(&argv),
+                    executable_path: carrick_vfs::LazyField::from_borrowed_str("/usr/bin/test-exe"),
+                    argv: carrick_vfs::LazyField::from_slice(&argv),
                     ..Default::default()
                 },
             )
@@ -5451,7 +5396,7 @@ mod tests {
         // open() lists one symlink per fd from the context snapshot.
         let fds = [0i32, 1, 2, 7];
         let ctx = OpenContext {
-            open_fds: crate::vfs::LazyField::from_slice(&fds),
+            open_fds: carrick_vfs::LazyField::from_slice(&fds),
             ..Default::default()
         };
         let h = v
@@ -5494,7 +5439,7 @@ mod tests {
         );
         let fds = [0i32, 1, 2, 9];
         let ctx = OpenContext {
-            open_fds: crate::vfs::LazyField::from_slice(&fds),
+            open_fds: carrick_vfs::LazyField::from_slice(&fds),
             ..Default::default()
         };
         let h = v
@@ -5526,7 +5471,7 @@ mod tests {
     fn proc_sys_hostname_uses_open_context_hostname() {
         let v = ProcVfs::new();
         let ctx = OpenContext {
-            guest_hostname: crate::vfs::LazyField::from_borrowed_str("api-host"),
+            guest_hostname: carrick_vfs::LazyField::from_borrowed_str("api-host"),
             ..Default::default()
         };
         let h = v
@@ -6344,7 +6289,7 @@ mod tests {
         };
         let mem_provider = || {
             mem_called.fetch_add(1, Ordering::Relaxed);
-            crate::vfs::OpenContextMemorySnapshot::default()
+            carrick_vfs::OpenContextMemorySnapshot::default()
         };
         let threads_provider = || {
             threads_called.fetch_add(1, Ordering::Relaxed);
@@ -6352,10 +6297,10 @@ mod tests {
         };
 
         let ctx = OpenContext {
-            open_fds: crate::vfs::LazyField::new(&fds_provider),
-            sysvipc_msg: crate::vfs::LazyField::new(&ipc_provider),
-            mem: crate::vfs::LazyField::new(&mem_provider),
-            threads: crate::vfs::LazyField::new(&threads_provider),
+            open_fds: carrick_vfs::LazyField::new(&fds_provider),
+            sysvipc_msg: carrick_vfs::LazyField::new(&ipc_provider),
+            mem: carrick_vfs::LazyField::new(&mem_provider),
+            threads: carrick_vfs::LazyField::new(&threads_provider),
             ..OpenContext::default()
         };
 

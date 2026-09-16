@@ -21,7 +21,7 @@
 //! reflected, which matches container semantics.
 
 use super::{EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
-use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT};
+use carrick_abi::{LINUX_EACCES, LINUX_ENOENT};
 
 pub(crate) const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 

@@ -2,8 +2,8 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
 use super::*;
-use crate::linux_abi::LINUX_ENFILE;
 use crate::rootfs::RootFs;
+use carrick_abi::LINUX_ENFILE;
 
 // -- shared scenarios, run against both backends -----------------
 
@@ -1693,7 +1693,7 @@ fn host_rename_distinguishes_unowned_source_from_operation_error() {
         .unwrap();
     assert_eq!(
         backend.rename_overlay_entry("/file", "/dir"),
-        Err(BackendError::Namespace(crate::linux_abi::LINUX_EISDIR))
+        Err(BackendError::Namespace(carrick_abi::LINUX_EISDIR))
     );
     assert_eq!(
         backend.file_contents("/file").as_deref(),
@@ -2081,12 +2081,12 @@ fn host_guest_xattr_api_hides_all_internal_carrick_names() {
     ] {
         assert_eq!(
             b.get_xattr("/f", name, true),
-            Err(crate::linux_abi::LINUX_ENODATA),
+            Err(carrick_abi::LINUX_ENODATA),
             "{name} must not be guest-readable",
         );
         assert_eq!(
             b.set_xattr("/f", name, b"guest", 0, true),
-            Err(crate::linux_abi::LINUX_ENOTSUP),
+            Err(carrick_abi::LINUX_ENOTSUP),
             "{name} must not be guest-writable",
         );
     }
@@ -2114,7 +2114,7 @@ fn host_lpath_xattrs_do_not_follow_final_symlink() {
     );
     assert_eq!(
         b.get_xattr("/link", "security.target", false),
-        Err(crate::linux_abi::LINUX_ENODATA)
+        Err(carrick_abi::LINUX_ENODATA)
     );
     assert_eq!(
         b.list_xattr("/link", false).unwrap(),

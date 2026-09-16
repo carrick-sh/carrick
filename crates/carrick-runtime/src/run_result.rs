@@ -47,7 +47,7 @@ pub enum RuntimeError {
     // layer now that AddressSpace loading is rootfs-agnostic (closure reader) —
     // this is what decoupled `memory` from `rootfs` (build-graph A2.5).
     #[error("failed to read rootfs-backed ELF: {0}")]
-    RootFs(#[from] crate::rootfs::RootFsError),
+    RootFs(#[from] carrick_vfs::rootfs::RootFsError),
     #[error("trap engine failed: {0}")]
     Trap(#[from] TrapError),
     #[error("syscall dispatch failed: {0}")]

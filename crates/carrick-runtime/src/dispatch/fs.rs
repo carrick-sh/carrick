@@ -193,7 +193,7 @@ mutation_syscall_table! {
 /// namespace — create/remove/rename a directory, symlink, or special node.
 /// These are the only fs syscalls that can change how an UNRELATED path
 /// resolves, so a successful one must invalidate the fork-coherent resolve
-/// cache ([`crate::fs_resolve_cache`]). The numbers mirror the `=> handler` arms
+/// cache ([`carrick_vfs::fs_resolve_cache`]). The numbers mirror the `=> handler` arms
 /// in the `syscall_table!` above; content-only writes (write/pwrite/ftruncate)
 /// are deliberately EXCLUDED so a syscall-bound write loop keeps its cached
 /// resolves. Bumping is unconditional (even on a failed mutation) — a spurious
@@ -246,7 +246,7 @@ use state::*;
 pub(super) use state::{FsState, RuntimeIo, host_fd_offset};
 pub(crate) use state::{LegacyAioContextId, MountRetirement, SplicePushback};
 
-pub(super) fn vfs_md_to_rootfs_md_helper(path: &str, md: &crate::vfs::Metadata) -> RootFsMetadata {
+pub(super) fn vfs_md_to_rootfs_md_helper(path: &str, md: &carrick_vfs::Metadata) -> RootFsMetadata {
     vfs_md_to_rootfs_md(path, md)
 }
 
@@ -789,7 +789,7 @@ impl<'a> FsView<'a> {
     pub(super) fn synthetic_proc_identity(
         &self,
         context: &crate::kernel::KernelContext,
-    ) -> Option<crate::vfs::SyntheticProcIdentity> {
+    ) -> Option<carrick_vfs::SyntheticProcIdentity> {
         Some(()).and_then(|()| {
             let task = context.task();
             let identity = context.kernel().task_identity(task.key().id).ok()?;
@@ -798,7 +798,7 @@ impl<'a> FsView<'a> {
                     .ok()
                     .and_then(|raw| crate::namespace::pid::kernel_to_ns_for(context, raw))
             };
-            Some(crate::vfs::SyntheticProcIdentity {
+            Some(carrick_vfs::SyntheticProcIdentity {
                 pid: to_ns(identity.task.id.raw())?,
                 tid: to_ns(context.thread().key().tid.raw())?,
                 ppid: identity
@@ -819,7 +819,7 @@ impl<'a> FsView<'a> {
     pub(super) fn synthetic_proc_processes(
         context: &crate::kernel::KernelContext,
         hvpatch_process: Option<&crate::hvpatch::ProcessContext>,
-    ) -> Option<Vec<crate::vfs::SyntheticProcProcess>> {
+    ) -> Option<Vec<carrick_vfs::SyntheticProcProcess>> {
         SyscallDispatcher::synthetic_proc_processes(context, hvpatch_process)
     }
 
@@ -827,7 +827,7 @@ impl<'a> FsView<'a> {
         &self,
         context: &crate::kernel::KernelContext,
         registry: Option<&crate::thread::ThreadRegistry>,
-    ) -> Option<Vec<crate::vfs::SyntheticProcThread>> {
+    ) -> Option<Vec<carrick_vfs::SyntheticProcThread>> {
         #[cfg(feature = "platform-macos")]
         let states: Option<std::collections::HashMap<_, _>> = registry.map(|r| {
             r.thread_ports()
@@ -870,7 +870,7 @@ impl<'a> FsView<'a> {
                     .linux_run_state()
                     .or_else(|| states.as_ref().and_then(|m| m.get(&registry_id).copied()))
                     .unwrap_or('R');
-                Some(crate::vfs::SyntheticProcThread {
+                Some(carrick_vfs::SyntheticProcThread {
                     tid: visible_tid,
                     state,
                     comm,
@@ -956,7 +956,7 @@ impl<'a> FsView<'a> {
                             .ok()
                             .and_then(|raw| crate::namespace::pid::kernel_to_ns_for(context, raw))
                     };
-                    Some(crate::vfs::SyntheticProcZombie {
+                    Some(carrick_vfs::SyntheticProcZombie {
                         pid: to_ns(zombie.key.id.raw())?,
                         ppid: zombie
                             .parent
@@ -1031,11 +1031,11 @@ impl<'a> FsView<'a> {
 
     fn read_exec_file_head_at(&self, path: &str, max: usize) -> Option<Vec<u8>> {
         match self.fs.rootfs_vfs.overlay.lookup_kind(path) {
-            Some(crate::fs_backend::OverlayEntryKind::File) => {
+            Some(carrick_vfs::fs_backend::OverlayEntryKind::File) => {
                 return self.fs.rootfs_vfs.overlay.file_head(path, max);
             }
-            Some(crate::fs_backend::OverlayEntryKind::Dir)
-            | Some(crate::fs_backend::OverlayEntryKind::Deleted) => return None,
+            Some(carrick_vfs::fs_backend::OverlayEntryKind::Dir)
+            | Some(carrick_vfs::fs_backend::OverlayEntryKind::Deleted) => return None,
             None => {}
         }
         if let Some(bytes) = self

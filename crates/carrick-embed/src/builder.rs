@@ -9,8 +9,8 @@ use carrick_engine::{Engine, RunRequest};
 use carrick_image::{ImageStore, PullPolicy};
 use carrick_runtime::prepare::{RuntimeExtensions, StdioSink};
 use carrick_runtime::runtime::DEFAULT_MAX_TRAPS;
-use carrick_runtime::vfs::Vfs;
 use carrick_spec::{Mount, Platform, StdioMode};
+use carrick_vfs::Vfs;
 
 use crate::carrier::CarrierBinding;
 use crate::prepared::PreparedCarrierOwnership;

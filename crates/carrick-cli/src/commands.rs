@@ -56,7 +56,7 @@ use carrick_runtime::compat::{CompatReporter, SyscallArgs};
 use carrick_runtime::dispatch::{LinearMemory, SyscallDispatcher, SyscallRequest};
 use carrick_runtime::elf::{inspect_elf, plan_elf_load};
 use carrick_runtime::memory::AddressSpace;
-use carrick_runtime::rootfs::RootFs;
+use carrick_vfs::rootfs::RootFs;
 // HVF-only diagnostics — the `run-elf`, `trap-capabilities`, and full
 // `syscalls`-table subcommands are macOS-only for now (Linux uses `carrick run
 // <oci>` / `carrick-kvm run-elf`; per-number `syscalls <n>` works on both).
@@ -1473,7 +1473,7 @@ fn volume_field(volume: &serde_json::Value, field: &str) -> String {
 #[cfg(target_os = "macos")]
 fn run_scratch_volume_create(quota: Option<u64>) -> anyhow::Result<()> {
     let mut operator = crate::apfs_operator::DiskutilOperator;
-    let v = carrick_runtime::apfs::create_carrick_volume(&mut operator, quota)
+    let v = carrick_vfs::apfs::create_carrick_volume(&mut operator, quota)
         .context("failed to create carrick scratch volume")?;
     println!(
         "{} {} {} case-sensitive={}",
@@ -1496,7 +1496,7 @@ fn run_scratch_volume_create(_quota: Option<u64>) -> anyhow::Result<()> {
 #[cfg(target_os = "macos")]
 fn run_scratch_volume_info() -> anyhow::Result<()> {
     let mut operator = crate::apfs_operator::DiskutilOperator;
-    match carrick_runtime::apfs::find_carrick_volume(&mut operator)
+    match carrick_vfs::apfs::find_carrick_volume(&mut operator)
         .context("failed to query carrick scratch volume")?
     {
         Some(v) => {
@@ -1521,7 +1521,7 @@ fn run_scratch_volume_info() -> anyhow::Result<()> {
 #[cfg(target_os = "macos")]
 fn run_scratch_volume_delete(yes: bool) -> anyhow::Result<()> {
     let mut operator = crate::apfs_operator::DiskutilOperator;
-    let Some(v) = carrick_runtime::apfs::find_carrick_volume(&mut operator)
+    let Some(v) = carrick_vfs::apfs::find_carrick_volume(&mut operator)
         .context("failed to query carrick scratch volume")?
     else {
         println!("no carrick scratch volume to delete");
@@ -1534,7 +1534,7 @@ fn run_scratch_volume_delete(yes: bool) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    carrick_runtime::apfs::delete_carrick_volume(&mut operator)
+    carrick_vfs::apfs::delete_carrick_volume(&mut operator)
         .context("failed to delete carrick scratch volume")?;
     println!("deleted {} ({})", v.device, v.name);
     Ok(())

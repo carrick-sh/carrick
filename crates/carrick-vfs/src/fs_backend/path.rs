@@ -5,7 +5,7 @@
 //! This module provides [`NormalizedRelPath`] and path resolution utilities
 //! used across Carrick's filesystem backends.
 
-use crate::linux_abi::LinuxErrno;
+use carrick_abi::LinuxErrno;
 use std::path::{Component, Path, PathBuf};
 
 /// Strip a leading `/` and collapse `.` / `..` so the backend's
@@ -120,7 +120,7 @@ pub(crate) fn io_error_to_linux_errno(error: std::io::Error) -> LinuxErrno {
 }
 
 pub(crate) fn open_host_watch_fd(path: &Path) -> Result<i32, LinuxErrno> {
-    let cpath = cstring_from_osstr(path.as_os_str()).ok_or(crate::linux_abi::LINUX_EINVAL)?;
+    let cpath = cstring_from_osstr(path.as_os_str()).ok_or(carrick_abi::LINUX_EINVAL)?;
     #[cfg(target_os = "macos")]
     let host_flags = libc::O_EVTONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
     #[cfg(not(target_os = "macos"))]

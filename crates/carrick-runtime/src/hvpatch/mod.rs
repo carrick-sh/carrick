@@ -2449,13 +2449,13 @@ mod tests {
     fn dispatcher_binding_attaches_root_and_fork_child_vma_sources() {
         let (parent, root) = authoritative_root();
         let root_dispatcher = SyscallDispatcher::new();
-        root_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        root_dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x1000,
             end: 0x2000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "root".to_owned(),
         }]);
         root_dispatcher.bind_hvpatch_process(parent.clone());
@@ -2524,13 +2524,13 @@ mod tests {
     fn active_exec_reservation_rejects_later_shared_child_bind() {
         let (parent, root) = authoritative_root();
         let parent_dispatcher = SyscallDispatcher::new();
-        parent_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        parent_dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x1000,
             end: 0x2000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "shared-old-image".to_owned(),
         }]);
         parent_dispatcher.bind_hvpatch_process(parent.clone());
@@ -2550,13 +2550,13 @@ mod tests {
         let mut prepared = exec_child
             .prepare_exec(&exec_context)
             .expect("prepare shared-child exec");
-        exec_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        exec_dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x5000,
             end: 0x6000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "staged-exec-image".to_owned(),
         }]);
         prepared
@@ -2599,13 +2599,13 @@ mod tests {
     fn shared_mm_exec_never_freezes_retained_parent_backend() {
         let (parent, root) = authoritative_root();
         let parent_dispatcher = SyscallDispatcher::new();
-        parent_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        parent_dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x1000,
             end: 0x2000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "shared-parent-before-exec".to_owned(),
         }]);
         parent_dispatcher.bind_hvpatch_process(parent.clone());
@@ -2622,13 +2622,13 @@ mod tests {
             .expect("replacement root slot")
             .base();
         let replacement_dispatcher = SyscallDispatcher::new();
-        replacement_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        replacement_dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x9000,
             end: 0xa000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "exec-replacement".to_owned(),
         }]);
         let committed = exec_child
@@ -2660,13 +2660,13 @@ mod tests {
             }],
         );
 
-        parent_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        parent_dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x7000,
             end: 0x8000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "surviving-parent-after-child-exec".to_owned(),
         }]);
         let replacement_after_parent_mutation = crate::kernel::MmBackend::snapshot(
@@ -2877,13 +2877,13 @@ mod tests {
             .expect("commit shared-child private replacement");
 
         let rebound = SyscallDispatcher::new();
-        rebound.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        rebound.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x9000,
             end: 0xa000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "post-exec-rebind".to_owned(),
         }]);
         rebound.bind_hvpatch_process(child.clone());
@@ -2906,13 +2906,13 @@ mod tests {
     #[test]
     fn clone_vm_dispatchers_share_vma_mutations_bidirectionally_before_exec() {
         let parent = SyscallDispatcher::new();
-        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        parent.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x1000,
             end: 0x2000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "shared-initial".to_owned(),
         }]);
         let child = parent.fork_clone_in_process_with_mm_mode(
@@ -2923,13 +2923,13 @@ mod tests {
             crate::kernel::CloneObjectMode::Share,
         );
 
-        child.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        child.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x3000,
             end: 0x4000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "child-mutation".to_owned(),
         }]);
         let parent_after_child = parent
@@ -2937,13 +2937,13 @@ mod tests {
             .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
             .expect("parent source after child mutation");
 
-        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        parent.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x5000,
             end: 0x6000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "parent-mutation".to_owned(),
         }]);
         let child_after_parent = child
@@ -2971,13 +2971,13 @@ mod tests {
     #[test]
     fn copied_mm_dispatchers_keep_vma_mutations_private() {
         let parent = SyscallDispatcher::new();
-        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        parent.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x1000,
             end: 0x2000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "private-parent".to_owned(),
         }]);
         let child = parent.fork_clone_in_process(
@@ -2986,13 +2986,13 @@ mod tests {
             10_000,
             10_001,
         );
-        child.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        child.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x3000,
             end: 0x4000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "private-child".to_owned(),
         }]);
 
@@ -3024,13 +3024,13 @@ mod tests {
     #[test]
     fn exec_mm_authority_is_private_until_commit_and_drop_abandons_it() {
         let parent = SyscallDispatcher::new();
-        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        parent.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x1000,
             end: 0x2000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "live-shared".to_owned(),
         }]);
         let child = parent.fork_clone_in_process_with_mm_mode(
@@ -3043,13 +3043,13 @@ mod tests {
 
         let abandoned = child.publish_exec_image_state(
             crate::kernel::MmId::from_raw_u64(20_001).expect("replacement MM"),
-            vec![crate::vfs::ProcMapsEntry {
+            vec![carrick_vfs::ProcMapsEntry {
                 start: 0x3000,
                 end: 0x4000,
                 read: true,
                 write: false,
                 execute: true,
-                sharing: crate::vfs::ProcMapSharing::Private,
+                sharing: carrick_vfs::ProcMapSharing::Private,
                 path: "abandoned-replacement".to_owned(),
             }],
             Vec::new(),
@@ -3098,13 +3098,13 @@ mod tests {
     #[test]
     fn exec_mm_authority_commit_promotes_only_calling_dispatcher() {
         let parent = SyscallDispatcher::new();
-        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        parent.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x1000,
             end: 0x2000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "live-shared".to_owned(),
         }]);
         let child = parent.fork_clone_in_process_with_mm_mode(
@@ -3116,13 +3116,13 @@ mod tests {
         );
         let prepared = child.publish_exec_image_state(
             crate::kernel::MmId::from_raw_u64(20_002).expect("replacement MM"),
-            vec![crate::vfs::ProcMapsEntry {
+            vec![carrick_vfs::ProcMapsEntry {
                 start: 0x3000,
                 end: 0x4000,
                 read: true,
                 write: false,
                 execute: true,
-                sharing: crate::vfs::ProcMapSharing::Private,
+                sharing: carrick_vfs::ProcMapSharing::Private,
                 path: "committed-replacement".to_owned(),
             }],
             Vec::new(),
@@ -3131,13 +3131,13 @@ mod tests {
         );
         prepared.commit();
 
-        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        parent.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x5000,
             end: 0x6000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "parent-after-commit".to_owned(),
         }]);
         assert_eq!(
@@ -3169,13 +3169,13 @@ mod tests {
     #[test]
     fn exec_mm_authority_promotion_does_not_wait_for_shared_parent_alias_transaction() {
         let parent = SyscallDispatcher::new();
-        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        parent.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x1000,
             end: 0x2000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "live-shared".to_owned(),
         }]);
         let child = parent.fork_clone_in_process_with_mm_mode(
@@ -3187,13 +3187,13 @@ mod tests {
         );
         let prepared = child.publish_exec_image_state(
             crate::kernel::MmId::from_raw_u64(20_003).expect("replacement MM"),
-            vec![crate::vfs::ProcMapsEntry {
+            vec![carrick_vfs::ProcMapsEntry {
                 start: 0x3000,
                 end: 0x4000,
                 read: true,
                 write: false,
                 execute: true,
-                sharing: crate::vfs::ProcMapSharing::Private,
+                sharing: carrick_vfs::ProcMapSharing::Private,
                 path: "committed-replacement".to_owned(),
             }],
             Vec::new(),
@@ -3251,13 +3251,13 @@ mod tests {
     #[test]
     fn exec_mm_authority_promotion_waits_for_active_predecessor_dispatch() {
         let parent = SyscallDispatcher::new();
-        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        parent.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x1000,
             end: 0x2000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "live-shared".to_owned(),
         }]);
         let child = parent.fork_clone_in_process_with_mm_mode(
@@ -3269,13 +3269,13 @@ mod tests {
         );
         let prepared = child.publish_exec_image_state(
             crate::kernel::MmId::from_raw_u64(20_004).expect("replacement MM"),
-            vec![crate::vfs::ProcMapsEntry {
+            vec![carrick_vfs::ProcMapsEntry {
                 start: 0x3000,
                 end: 0x4000,
                 read: true,
                 write: false,
                 execute: true,
-                sharing: crate::vfs::ProcMapSharing::Private,
+                sharing: carrick_vfs::ProcMapSharing::Private,
                 path: "committed-replacement".to_owned(),
             }],
             Vec::new(),
@@ -3311,13 +3311,13 @@ mod tests {
     fn clone_vm_dispatchers_share_before_exec_and_isolate_after() {
         let (parent, root) = authoritative_root();
         let parent_dispatcher = SyscallDispatcher::new();
-        parent_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        parent_dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x1000,
             end: 0x2000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "shared-initial".to_owned(),
         }]);
         parent_dispatcher.bind_hvpatch_process(parent.clone());
@@ -3334,13 +3334,13 @@ mod tests {
         );
         child_dispatcher.bind_hvpatch_process(child.clone());
 
-        child_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        child_dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x3000,
             end: 0x4000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "child-mutation".to_owned(),
         }]);
         let parent_after_child = parent_dispatcher
@@ -3348,13 +3348,13 @@ mod tests {
             .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
             .expect("parent source after child mutation");
 
-        parent_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        parent_dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x5000,
             end: 0x6000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "parent-mutation".to_owned(),
         }]);
         let child_after_parent = child_dispatcher
@@ -3379,22 +3379,22 @@ mod tests {
             )
             .expect("commit CLONE_VM child private exec");
 
-        parent_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        parent_dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x7000,
             end: 0x8000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "parent-after-child-exec".to_owned(),
         }]);
-        replacement_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        replacement_dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x9000,
             end: 0xa000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "child-after-private-exec".to_owned(),
         }]);
         let retained_parent_after_exec = crate::kernel::MmBackend::snapshot(
@@ -3692,13 +3692,13 @@ mod tests {
         let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(1);
         let before = backend.snapshot(deadline()).expect("initial live snapshot");
 
-        dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x1000,
             end: 0x2000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "foreign-live-authority".to_owned(),
         }]);
         backend.publish_binding(backend.binding());
@@ -3753,13 +3753,13 @@ mod tests {
     fn exec_keeps_old_and_replacement_mm_observers_permanently_distinct() {
         let (process, root) = authoritative_root();
         let old_dispatcher = SyscallDispatcher::new();
-        old_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        old_dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x1000,
             end: 0x2000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "old-image".to_owned(),
         }]);
         process.bind_vma_source(old_dispatcher.vma_snapshot_source());
@@ -3782,13 +3782,13 @@ mod tests {
         // Runtime stages the replacement image in the same dispatcher after
         // capturing the historical image. Acknowledge only that deliberate
         // source revision; the retained snapshot must remain the old image.
-        old_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        old_dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x7000,
             end: 0x8000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "staged-new-image".to_owned(),
         }]);
         prepared
@@ -3796,13 +3796,13 @@ mod tests {
             .expect("acknowledge staged VMA revision");
 
         let replacement_dispatcher = SyscallDispatcher::new();
-        replacement_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        replacement_dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x3000,
             end: 0x4000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "new-image".to_owned(),
         }]);
         process
@@ -3855,26 +3855,26 @@ mod tests {
     fn unacknowledged_exec_vma_change_cannot_detach_the_old_observer() {
         let (process, root) = authoritative_root();
         let dispatcher = SyscallDispatcher::new();
-        dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x1000,
             end: 0x2000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "old-image".to_owned(),
         }]);
         process.bind_vma_source(dispatcher.vma_snapshot_source());
         let backend = std::sync::Arc::clone(&process.mm_backend.read());
         let prepared = process.prepare_exec(&root).expect("prepare exec observer");
 
-        dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x5000,
             end: 0x6000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "unexpected-change".to_owned(),
         }]);
         assert_eq!(
@@ -3904,13 +3904,13 @@ mod tests {
     fn dropped_exec_preparation_keeps_old_vma_observer_live() {
         let (process, root) = authoritative_root();
         let dispatcher = SyscallDispatcher::new();
-        dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x1000,
             end: 0x2000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "old-image".to_owned(),
         }]);
         process.bind_vma_source(dispatcher.vma_snapshot_source());
@@ -3918,13 +3918,13 @@ mod tests {
         let prepared = process.prepare_exec(&root).expect("prepare exec observer");
         drop(prepared);
 
-        dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+        dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
             start: 0x5000,
             end: 0x6000,
             read: true,
             write: false,
             execute: true,
-            sharing: crate::vfs::ProcMapSharing::Private,
+            sharing: carrick_vfs::ProcMapSharing::Private,
             path: "continued-old-image".to_owned(),
         }]);
         let observed = crate::kernel::MmBackend::snapshot(

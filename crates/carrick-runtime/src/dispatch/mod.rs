@@ -153,7 +153,6 @@ use std::time::Duration;
 #[cfg(test)]
 pub(crate) use crate::compat::SyscallArgs;
 use crate::compat::{CompatEvent, CompatReporter};
-use crate::fs_backend::FsBackend;
 #[cfg(test)]
 use crate::linux_abi::LINUX_MAP_ANONYMOUS;
 use crate::linux_abi::{
@@ -544,11 +543,12 @@ use crate::linux_abi::{
 };
 #[cfg(test)]
 use crate::linux_abi::{LINUX_MAP_PRIVATE, LINUX_MAP_SHARED};
-use crate::overlay::OverlayEntry;
-use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
 #[cfg(test)]
 use carrick_abi::{LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLLET};
 use carrick_fatal::carrick_fatal;
+use carrick_vfs::fs_backend::FsBackend;
+use carrick_vfs::overlay::OverlayEntry;
+use carrick_vfs::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
 // Canonical-number lookups: carrick's canonical syscall numbering IS the
 // aarch64 numbering. The dispatcher receives canonical numbers (a per-ISA
 // table remaps raw numbers to canonical at the GuestArch seam — Phase 2 for
@@ -709,8 +709,8 @@ pub use time::{
 pub(crate) use proctitle::carrier_proc_label;
 pub use proctitle::{init as proctitle_init, set_carrier_process_title, set_host_process_name};
 
-pub use crate::vfs::{ProcMapSharing, ProcMapsEntry};
 pub use abi_args::{Fd, GuestLen, GuestPtr, HostFd, HostPid, NsPid, Pid, Signal};
+pub use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 use fd_table::*;
 
 pub mod wait_authority;
@@ -767,7 +767,7 @@ pub(crate) use io_pipe::{
     write_host_pipe, write_host_pipe_owned,
 };
 // Host-errno adaptation lives below the VFS; dispatch is a consumer of it.
-pub(crate) use crate::vfs::errno::{HostSyscallError, HostSyscallResult};
+pub(crate) use carrick_vfs::errno::{HostSyscallError, HostSyscallResult};
 #[allow(unused_imports)]
 pub(crate) use routing::{
     MM_MUTATION_SYSCALLS, MutationDispatchRoute, MutationSyscallHandler, NormalizedDispatchRoute,
@@ -1756,13 +1756,13 @@ impl SyscallDispatcher {
 
     fn read_exec_file_at(&self, path: &str) -> Option<Vec<u8>> {
         match self.fs.rootfs_vfs.overlay.lookup_kind(path) {
-            Some(crate::fs_backend::OverlayEntryKind::File) => {
+            Some(carrick_vfs::fs_backend::OverlayEntryKind::File) => {
                 // An owned upper entry shadows the lower even when it is not a
                 // readable regular file (broken symlink/FIFO/etc.).
                 return self.fs.rootfs_vfs.overlay.file_contents(path);
             }
-            Some(crate::fs_backend::OverlayEntryKind::Dir)
-            | Some(crate::fs_backend::OverlayEntryKind::Deleted) => return None,
+            Some(carrick_vfs::fs_backend::OverlayEntryKind::Dir)
+            | Some(carrick_vfs::fs_backend::OverlayEntryKind::Deleted) => return None,
             None => {}
         }
         if let Some(bytes) = self
@@ -1827,11 +1827,11 @@ impl SyscallDispatcher {
 
     fn read_exec_file_head_at(&self, path: &str, max: usize) -> Option<Vec<u8>> {
         match self.fs.rootfs_vfs.overlay.lookup_kind(path) {
-            Some(crate::fs_backend::OverlayEntryKind::File) => {
+            Some(carrick_vfs::fs_backend::OverlayEntryKind::File) => {
                 return self.fs.rootfs_vfs.overlay.file_head(path, max);
             }
-            Some(crate::fs_backend::OverlayEntryKind::Dir)
-            | Some(crate::fs_backend::OverlayEntryKind::Deleted) => return None,
+            Some(carrick_vfs::fs_backend::OverlayEntryKind::Dir)
+            | Some(carrick_vfs::fs_backend::OverlayEntryKind::Deleted) => return None,
             None => {}
         }
         if let Some(bytes) = self
@@ -1862,11 +1862,11 @@ impl SyscallDispatcher {
     /// and the layered read answer, they answer from the same inode.
     pub fn open_exec_host_file(&self, path: &str) -> Option<std::fs::File> {
         match self.fs.rootfs_vfs.overlay.lookup_kind(path) {
-            Some(crate::fs_backend::OverlayEntryKind::File) => {
+            Some(carrick_vfs::fs_backend::OverlayEntryKind::File) => {
                 self.fs.rootfs_vfs.overlay.open_file_readonly(path)
             }
-            Some(crate::fs_backend::OverlayEntryKind::Dir)
-            | Some(crate::fs_backend::OverlayEntryKind::Deleted) => None,
+            Some(carrick_vfs::fs_backend::OverlayEntryKind::Dir)
+            | Some(carrick_vfs::fs_backend::OverlayEntryKind::Deleted) => None,
             None => self
                 .fs
                 .rootfs_vfs
@@ -2554,7 +2554,7 @@ impl SyscallDispatcher {
     fn synthetic_proc_identity(
         &self,
         context: &crate::kernel::KernelContext,
-    ) -> Option<crate::vfs::SyntheticProcIdentity> {
+    ) -> Option<carrick_vfs::SyntheticProcIdentity> {
         Some(()).and_then(|()| {
             let task = context.task();
             let identity = context.kernel().task_identity(task.key().id).ok()?;
@@ -2563,7 +2563,7 @@ impl SyscallDispatcher {
                     .ok()
                     .and_then(|raw| crate::namespace::pid::kernel_to_ns_for(context, raw))
             };
-            Some(crate::vfs::SyntheticProcIdentity {
+            Some(carrick_vfs::SyntheticProcIdentity {
                 pid: to_ns(identity.task.id.raw())?,
                 tid: to_ns(context.thread().key().tid.raw())?,
                 ppid: identity
@@ -2591,7 +2591,7 @@ impl SyscallDispatcher {
     fn synthetic_proc_processes(
         context: &crate::kernel::KernelContext,
         hvpatch_process: Option<&crate::hvpatch::ProcessContext>,
-    ) -> Option<Vec<crate::vfs::SyntheticProcProcess>> {
+    ) -> Option<Vec<carrick_vfs::SyntheticProcProcess>> {
         let registry = hvpatch_process?.kernel_graph().registry();
         let container = context.container().id();
         let init = context.kernel().container_init(container)?;
@@ -2614,7 +2614,7 @@ impl SyscallDispatcher {
                             task.is_job_control_stopped(),
                         )
                     });
-                Some(crate::vfs::SyntheticProcProcess {
+                Some(carrick_vfs::SyntheticProcProcess {
                     pid,
                     // A parentless task is an orphan reparented to init — except
                     // for init ITSELF, which Linux reports with ppid 0. Without
@@ -2673,7 +2673,7 @@ impl SyscallDispatcher {
         &self,
         context: &crate::kernel::KernelContext,
         registry: Option<&crate::thread::ThreadRegistry>,
-    ) -> Option<Vec<crate::vfs::SyntheticProcThread>> {
+    ) -> Option<Vec<carrick_vfs::SyntheticProcThread>> {
         #[cfg(feature = "platform-macos")]
         let states: Option<std::collections::HashMap<_, _>> = registry.map(|r| {
             r.thread_ports()
@@ -2716,7 +2716,7 @@ impl SyscallDispatcher {
                     .linux_run_state()
                     .or_else(|| states.as_ref().and_then(|m| m.get(&registry_id).copied()))
                     .unwrap_or('R');
-                Some(crate::vfs::SyntheticProcThread {
+                Some(carrick_vfs::SyntheticProcThread {
                     tid: visible_tid,
                     state,
                     comm,
@@ -2864,7 +2864,7 @@ impl SyscallDispatcher {
                             .ok()
                             .and_then(|raw| crate::namespace::pid::kernel_to_ns_for(context, raw))
                     };
-                    Some(crate::vfs::SyntheticProcZombie {
+                    Some(carrick_vfs::SyntheticProcZombie {
                         pid: to_ns(zombie.key.id.raw())?,
                         ppid: zombie
                             .parent

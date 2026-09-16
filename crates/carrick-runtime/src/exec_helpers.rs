@@ -619,9 +619,9 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn host_dispatcher(files: &[(&str, &[u8])]) -> (SyscallDispatcher, tempfile::TempDir) {
-        use crate::fs_backend::FsBackend as _;
+        use carrick_vfs::fs_backend::FsBackend as _;
         let scratch = tempfile::TempDir::new().unwrap();
-        let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+        let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
         for (path, contents) in files {
             backend.create_file(path).unwrap();
             backend.set_file_contents(path, contents.to_vec()).unwrap();

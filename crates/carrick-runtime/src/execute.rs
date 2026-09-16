@@ -2,16 +2,16 @@
 //! dispatcher-backed guest execution.
 
 use crate::dispatch::SyscallDispatcher;
-#[cfg(feature = "fs-memory")]
-use crate::fs_backend::MemoryBackend;
-use crate::fs_backend::{FsBackend, HostFsBackend};
 use crate::network::NetworkHostsEntry;
-use crate::rootfs::RootFs;
 use crate::runtime::{RunResult, RuntimeError};
-use crate::vfs::BindVfs;
 #[cfg(feature = "fs-memory")]
 use carrick_spec::FsBackendKind;
 use carrick_spec::{NetworkNamespaceSpec, RunSpec};
+use carrick_vfs::BindVfs;
+#[cfg(feature = "fs-memory")]
+use carrick_vfs::fs_backend::MemoryBackend;
+use carrick_vfs::fs_backend::{FsBackend, HostFsBackend};
+use carrick_vfs::rootfs::RootFs;
 use std::borrow::Cow;
 use std::path::PathBuf;
 
@@ -113,7 +113,8 @@ pub(crate) fn prepare_host_root(
     cache_root: &std::path::Path,
 ) -> std::io::Result<HostRootLayout> {
     if use_cached_lower
-        && let Some(entry) = crate::layer_cache::acquire_immutable_entry(layer_paths, cache_root)?
+        && let Some(entry) =
+            carrick_vfs::layer_cache::acquire_immutable_entry(layer_paths, cache_root)?
     {
         if !existing_overlay {
             host.enable_sparse_upper_fast_miss();
@@ -386,7 +387,7 @@ pub(crate) fn seed_guest_baseline(
 fn set_baseline_dir_if_missing(backend: &mut dyn FsBackend, rootfs: Option<&RootFs>, path: &str) {
     if let Some(rootfs) = rootfs
         && let Ok(meta) = rootfs.symlink_metadata(path)
-        && meta.kind == crate::rootfs::RootFsEntryKind::Symlink
+        && meta.kind == carrick_vfs::rootfs::RootFsEntryKind::Symlink
     {
         return;
     }
@@ -416,10 +417,10 @@ mod exit_code_tests {
         seed_guest_baseline,
     };
     use crate::elf::ElfInspectError;
-    use crate::fs_backend::{FsBackend, HostFsBackend, MemoryBackend};
     use crate::memory::AddressSpaceError;
     use crate::runtime::RuntimeError;
     use carrick_spec::NetworkNamespaceSpec;
+    use carrick_vfs::fs_backend::{FsBackend, HostFsBackend, MemoryBackend};
     use std::io::{Error as IoError, ErrorKind};
 
     fn rt_io(kind: ErrorKind) -> RuntimeError {
@@ -660,8 +661,10 @@ mod exit_code_tests {
             builder.finish().unwrap();
         }
         let rootfs =
-            crate::rootfs::RootFs::from_layers([crate::rootfs::LayerSource::Tar(tar_bytes)])
-                .unwrap();
+            carrick_vfs::rootfs::RootFs::from_layers([carrick_vfs::rootfs::LayerSource::Tar(
+                tar_bytes,
+            )])
+            .unwrap();
         let mut backend = MemoryBackend::new();
         let network = NetworkNamespaceSpec::default();
         seed_guest_baseline(&mut backend, Some(&rootfs), &network, &[], &[], "api-host");

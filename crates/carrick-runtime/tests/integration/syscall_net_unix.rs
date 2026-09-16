@@ -16,7 +16,7 @@ use carrick_runtime::linux_abi::{
     LINUX_O_RDWR, LINUX_SOCK_STREAM,
 };
 #[cfg(target_os = "macos")]
-use carrick_runtime::vfs::BindVfs;
+use carrick_vfs::BindVfs;
 #[cfg(target_os = "macos")]
 use support::*;
 

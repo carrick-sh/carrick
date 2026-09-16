@@ -22,9 +22,9 @@ use carrick_guest_mem::{
 };
 use carrick_runtime::dispatch::{GuestMemory, LinearMemory, SyscallDispatcher};
 use carrick_runtime::memory::AddressSpace;
-use carrick_runtime::rootfs::{LayerSource, RootFs};
 use carrick_runtime::runtime::{SyscallTrap, run_syscall_loop, run_syscall_loop_with_dispatcher};
 use carrick_runtime::trap::TrapError;
+use carrick_vfs::rootfs::{LayerSource, RootFs};
 use support::gzip_tar;
 
 const HELLO: &[u8] = b"hello from carrick\n";
@@ -245,7 +245,7 @@ fn split_runtime_loop_forwards_private_repoint_and_provenance_publication() {
 
 #[test]
 fn runtime_loop_publishes_shared_file_alias_provenance_after_install() {
-    use carrick_runtime::fs_backend::{FsBackend as _, HostFsBackend};
+    use carrick_vfs::fs_backend::{FsBackend as _, HostFsBackend};
 
     let scratch = std::env::temp_dir().join(format!(
         "carrick-runtime-alias-provenance-{}",

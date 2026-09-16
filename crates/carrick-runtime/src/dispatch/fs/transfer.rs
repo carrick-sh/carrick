@@ -396,8 +396,8 @@ impl<'a> FsView<'a> {
                 if let Some(open) = open_file.description.read()
                     && let OpenDescription::SyntheticDevice {
                         kind:
-                            crate::vfs::SyntheticDeviceKind::Null
-                            | crate::vfs::SyntheticDeviceKind::Zero,
+                            carrick_vfs::SyntheticDeviceKind::Null
+                            | carrick_vfs::SyntheticDeviceKind::Zero,
                         ..
                     } = &*open
                 {
@@ -1471,11 +1471,11 @@ impl<'a> FsView<'a> {
                     let count = count.min(SYNTHETIC_SPLICE_CHUNK);
 
                     let bytes = match kind {
-                        crate::vfs::SyntheticDeviceKind::Null => Vec::new(),
-                        crate::vfs::SyntheticDeviceKind::Zero
-                        | crate::vfs::SyntheticDeviceKind::Full => vec![0u8; count],
-                        crate::vfs::SyntheticDeviceKind::Random
-                        | crate::vfs::SyntheticDeviceKind::Urandom => {
+                        carrick_vfs::SyntheticDeviceKind::Null => Vec::new(),
+                        carrick_vfs::SyntheticDeviceKind::Zero
+                        | carrick_vfs::SyntheticDeviceKind::Full => vec![0u8; count],
+                        carrick_vfs::SyntheticDeviceKind::Random
+                        | carrick_vfs::SyntheticDeviceKind::Urandom => {
                             let mut buf = vec![0u8; count];
                             unsafe {
                                 libc::arc4random_buf(buf.as_mut_ptr().cast(), count);

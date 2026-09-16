@@ -6,8 +6,8 @@ use carrick_runtime::dispatch::{
 };
 use carrick_runtime::linux_abi::LinuxErrno;
 use carrick_runtime::memory::LINUX_HEAP_BASE;
-use carrick_runtime::rootfs::{LayerSource, RootFs};
 use carrick_runtime::thread::{FutexTable, ThreadRegistry};
+use carrick_vfs::rootfs::{LayerSource, RootFs};
 
 /// Synthetic registry keys for these harnesses (`ThreadId`'s named-constructor
 /// discipline: tests fabricate keys explicitly).

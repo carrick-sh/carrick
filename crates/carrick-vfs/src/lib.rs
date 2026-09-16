@@ -1,3 +1,14 @@
+// The filesystem layer was extracted wholesale from carrick-runtime, which
+// allows these three crate-wide: `collapsible_if` over a guarded lock upgrade
+// or a nested `if let` reads better as written, `manual_dangling_ptr` covers
+// deliberate libc sentinel pointers, and `items_after_test_module` is an
+// artifact of the file layout the move preserved byte-for-byte.
+#![allow(
+    clippy::collapsible_if,
+    clippy::manual_dangling_ptr,
+    clippy::items_after_test_module
+)]
+
 //! carrick-vfs: the Carrick filesystem model. The `Vfs` trait and its mount
 //! table, the dentry cache, the host and in-memory backends, the root
 //! filesystem and the layer cache. Names no kernel, carrier or VMM type; the

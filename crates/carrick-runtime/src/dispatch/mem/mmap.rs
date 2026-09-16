@@ -212,11 +212,11 @@ impl<'a> MemView<'a> {
                             }
                             OpenDescription::SyntheticDevice { kind, .. } => {
                                 match kind {
-                                    crate::vfs::SyntheticDeviceKind::Null => "/dev/null".to_string(),
-                                    crate::vfs::SyntheticDeviceKind::Zero => "/dev/zero".to_string(),
-                                    crate::vfs::SyntheticDeviceKind::Full => "/dev/full".to_string(),
-                                    crate::vfs::SyntheticDeviceKind::Random => "/dev/random".to_string(),
-                                    crate::vfs::SyntheticDeviceKind::Urandom => "/dev/urandom".to_string(),
+                                    carrick_vfs::SyntheticDeviceKind::Null => "/dev/null".to_string(),
+                                    carrick_vfs::SyntheticDeviceKind::Zero => "/dev/zero".to_string(),
+                                    carrick_vfs::SyntheticDeviceKind::Full => "/dev/full".to_string(),
+                                    carrick_vfs::SyntheticDeviceKind::Random => "/dev/random".to_string(),
+                                    carrick_vfs::SyntheticDeviceKind::Urandom => "/dev/urandom".to_string(),
                                 }
                             }
                             OpenDescription::Packet { .. } => "[packet_ring]".to_string(),
@@ -582,7 +582,7 @@ impl<'a> MemView<'a> {
             if map_flags.contains(LinuxMmapFlags::FIXED)
                 && requested_raw >> 48 == 0xffff
                 && this.proc.lock().reported_arch()
-                    == crate::vfs::GuestReportedArch::Aarch64
+                    == carrick_vfs::GuestReportedArch::Aarch64
             {
                 return Ok(request.refused(
                     MmapRefusal::Spec("MAP_FIXED at a high-half address on an aarch64 guest"),
@@ -953,7 +953,7 @@ impl<'a> MemView<'a> {
                         + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE);
                     let locked_range = match locked_len {
                         Some(length) => match va.checked_add(length).and_then(|end| {
-                            crate::vfs::GuestMemoryRange::new(GuestVa(va), GuestVa(end))
+                            carrick_vfs::GuestMemoryRange::new(GuestVa(va), GuestVa(end))
                         }) {
                             Some(range) => Some(range),
                             None => {
@@ -1754,7 +1754,7 @@ impl<'a> MemView<'a> {
                         // chardev zero-fill: keep `bytes` zeroed (no read).
                     }
                     OpenDescription::SyntheticDevice { kind, .. } => {
-                        if *kind != crate::vfs::SyntheticDeviceKind::Zero {
+                        if *kind != carrick_vfs::SyntheticDeviceKind::Zero {
                             return Ok(request.refused(
                                 MmapRefusal::Spec("mmap of a non-zero synthetic device"),
                                 linux_errno::ENODEV,
@@ -2753,7 +2753,7 @@ impl<'a> MemView<'a> {
                     carrick_guest_mem::MappingSharing::Shared,
                 );
 
-                let Some(dest_range) = crate::vfs::GuestMemoryRange::new(
+                let Some(dest_range) = carrick_vfs::GuestMemoryRange::new(
                     GuestVa(va),
                     GuestVa(va.saturating_add(new_size)),
                 ) else {

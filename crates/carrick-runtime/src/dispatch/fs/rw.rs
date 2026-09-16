@@ -803,13 +803,13 @@ impl<'a> FsView<'a> {
                 }
                 OpenDescription::SyntheticDevice { kind, .. } => {
                     let (read_len, bytes) = match kind {
-                        crate::vfs::SyntheticDeviceKind::Null => (0, Vec::new()),
-                        crate::vfs::SyntheticDeviceKind::Zero
-                        | crate::vfs::SyntheticDeviceKind::Full => {
+                        carrick_vfs::SyntheticDeviceKind::Null => (0, Vec::new()),
+                        carrick_vfs::SyntheticDeviceKind::Zero
+                        | carrick_vfs::SyntheticDeviceKind::Full => {
                             (length, vec![0u8; length])
                         }
-                        crate::vfs::SyntheticDeviceKind::Random
-                        | crate::vfs::SyntheticDeviceKind::Urandom => {
+                        carrick_vfs::SyntheticDeviceKind::Random
+                        | carrick_vfs::SyntheticDeviceKind::Urandom => {
                             let mut buf = vec![0u8; length];
                             unsafe {
                                 libc::arc4random_buf(buf.as_mut_ptr().cast(), length);
@@ -1500,11 +1500,11 @@ impl<'a> FsView<'a> {
                     .read_range(offset, length),
                 OpenDescription::SyntheticDevice { kind, .. } => {
                     match kind {
-                        crate::vfs::SyntheticDeviceKind::Null => Vec::new(),
-                        crate::vfs::SyntheticDeviceKind::Zero
-                        | crate::vfs::SyntheticDeviceKind::Full => vec![0u8; length],
-                        crate::vfs::SyntheticDeviceKind::Random
-                        | crate::vfs::SyntheticDeviceKind::Urandom => {
+                        carrick_vfs::SyntheticDeviceKind::Null => Vec::new(),
+                        carrick_vfs::SyntheticDeviceKind::Zero
+                        | carrick_vfs::SyntheticDeviceKind::Full => vec![0u8; length],
+                        carrick_vfs::SyntheticDeviceKind::Random
+                        | carrick_vfs::SyntheticDeviceKind::Urandom => {
                             let mut buf = vec![0u8; length];
                             unsafe {
                                 libc::arc4random_buf(buf.as_mut_ptr().cast(), length);
@@ -1777,7 +1777,7 @@ impl<'a> FsView<'a> {
             .contains(LinuxOpenFlags::APPEND);
             if let OpenDescription::SyntheticDevice { kind, .. } = &*open {
                 match kind {
-                    crate::vfs::SyntheticDeviceKind::Full => {
+                    carrick_vfs::SyntheticDeviceKind::Full => {
                         return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
                     }
                     _ => {
@@ -2031,7 +2031,7 @@ impl<'a> FsView<'a> {
             .contains(LinuxOpenFlags::APPEND);
             if let OpenDescription::SyntheticDevice { kind, .. } = &*open {
                 match kind {
-                    crate::vfs::SyntheticDeviceKind::Full => {
+                    carrick_vfs::SyntheticDeviceKind::Full => {
                         return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
                     }
                     _ => {
@@ -2386,7 +2386,7 @@ impl<'a> FsView<'a> {
                     match &mut *open {
                         OpenDescription::SyntheticDevice { kind, .. } => {
                             match kind {
-                                crate::vfs::SyntheticDeviceKind::Full => {
+                                carrick_vfs::SyntheticDeviceKind::Full => {
                                     return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
                                 }
                                 _ => {
@@ -3110,7 +3110,7 @@ impl<'a> FsView<'a> {
                         match &mut *open {
                             OpenDescription::SyntheticDevice { kind, .. } => {
                                 match kind {
-                                    crate::vfs::SyntheticDeviceKind::Full => {
+                                    carrick_vfs::SyntheticDeviceKind::Full => {
                                         return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
                                     }
                                     _ => {
