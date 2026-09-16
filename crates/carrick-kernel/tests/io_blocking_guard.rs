@@ -25,6 +25,15 @@ const DISPATCH_FILES: &[&str] = &[
     "src/dispatch/mod.rs",
 ];
 
+/// The gates that mark test code. `cfg(test)` is per-crate-compilation, so the
+/// fixtures a SIBLING crate's tests consume are gated
+/// `cfg(any(test, feature = "test-support"))` instead; both are test scope and
+/// neither is on the kernel-lock path. Any other `feature = "…"` is production.
+const TEST_GATES: &[&str] = &[
+    "#[cfg(test)]",
+    "#[cfg(any(test, feature = \"test-support\"))]",
+];
+
 /// Raw `libc` calls that can block on a blocking fd.
 const BLOCKING_CALLS: &[&str] = &[
     "libc::recv(",
@@ -52,7 +61,7 @@ const SAFE_TOKENS: &[&str] = &[
 /// lines before the actual call (e.g. the two-branch recvfrom in recvfrom).
 const WINDOW: usize = 24;
 
-/// Line indices that fall inside a `#[cfg(test)]` block. The guard targets the
+/// Line indices that fall inside a test-gated block (see `TEST_GATES`). The guard targets the
 /// production kernel-lock path; inline test modules legitimately open localhost
 /// sockets / blocking pipes and are NOT that path, so they are excluded. Brace
 /// balance is naive (it ignores braces inside strings/chars), which is fine for
@@ -66,7 +75,10 @@ fn cfg_test_line_set(lines: &[&str]) -> std::collections::HashSet<usize> {
         if test_depth.is_some() {
             in_test.insert(i);
         }
-        if line.trim_start().starts_with("#[cfg(test)]") {
+        if TEST_GATES
+            .iter()
+            .any(|gate| line.trim_start().starts_with(gate))
+        {
             pending = true;
         }
         if pending && test_depth.is_none() {

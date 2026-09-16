@@ -2486,8 +2486,15 @@ mod task_only_materializer_tests {
             kernel_core
                 .contains("hvpatch_child_token_issuer: Arc<carrick_hal::HvpatchChildTokenIssuer>")
         );
-        assert!(kernel_core.contains("pub(crate) fn issue_hvpatch_child_token"));
-        assert!(kernel_core.contains("pub(crate) fn hvpatch_child_token_verifier"));
+        // `pub`, not `pub(crate)`, since the kernel left carrick-runtime: the
+        // carrier mints a child token on the fork/COW paths
+        // (`vcpu_loop/{memory,quiesce,binding}.rs`) and reads the verifier in
+        // `vcpu_loop/wait_wake.rs`, which are now out-of-crate callers. The
+        // invariant this pins is unchanged and is the third line: the ISSUER
+        // object itself is never reachable, so a token can only be minted
+        // through the kernel's own checked entry point.
+        assert!(kernel_core.contains("pub fn issue_hvpatch_child_token"));
+        assert!(kernel_core.contains("pub fn hvpatch_child_token_verifier"));
         assert!(!kernel_core.contains("pub fn hvpatch_child_token_issuer"));
 
         fn assert_send<T: Send>() {}
