@@ -2068,8 +2068,8 @@
     "rationale": "At crates/carrick-runtime/src/runtime/exec.rs:114 in `load_execve_image`, `std::fs::File::open` accesses only the selected absolute executable in the explicitly enabled bare RunElf host-filesystem fallback; container execution keeps this fallback disabled.",
     "review_id": "HA-000654",
     "source": {
-      "byte_end": 4619,
-      "byte_start": 4600,
+      "byte_end": 4628,
+      "byte_start": 4609,
       "column": 28,
       "column_end": 47,
       "column_start": 28,
@@ -3483,8 +3483,8 @@
     "rationale": "At crates/carrick-cli/src/debug.rs:1020 in `run_container_gate`, `std::fs::create_dir_all` accesses only the operator-selected container gate rendezvous directory.",
     "review_id": "HA-000151",
     "source": {
-      "byte_end": 38134,
-      "byte_start": 38116,
+      "byte_end": 38138,
+      "byte_start": 38120,
       "column": 5,
       "column_end": 23,
       "column_start": 5,
@@ -5425,18 +5425,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/runtime.rs:228 in `run_static_elf_with_hvf_args_and_dispatcher_debug`, `std::fs::read` accesses only the selected guest executable image used by `run_static_elf_with_hvf_args_and_dispatcher_debug`.",
+    "rationale": "At crates/carrick-runtime/src/runtime.rs:229 in `run_static_elf_with_hvf_args_and_dispatcher_debug`, `std::fs::read` accesses only the selected guest executable image used by `run_static_elf_with_hvf_args_and_dispatcher_debug`.",
     "review_id": "HA-000237",
     "source": {
-      "byte_end": 10363,
-      "byte_start": 10350,
+      "byte_end": 10424,
+      "byte_start": 10411,
       "column": 16,
       "column_end": 29,
       "column_start": 16,
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 228,
-      "line_end": 228,
-      "line_start": 228
+      "line": 229,
+      "line_end": 229,
+      "line_start": 229
     }
   },
   {
@@ -5452,18 +5452,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/runtime.rs:236 in `run_static_elf_with_hvf_args_and_dispatcher_debug`, `std::fs::read` accesses only the selected guest interpreter image used by `run_static_elf_with_hvf_args_and_dispatcher_debug`.",
+    "rationale": "At crates/carrick-runtime/src/runtime.rs:237 in `run_static_elf_with_hvf_args_and_dispatcher_debug`, `std::fs::read` accesses only the selected guest interpreter image used by `run_static_elf_with_hvf_args_and_dispatcher_debug`.",
     "review_id": "HA-000238",
     "source": {
-      "byte_end": 10821,
-      "byte_start": 10808,
+      "byte_end": 10882,
+      "byte_start": 10869,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 236,
-      "line_end": 236,
-      "line_start": 236
+      "line": 237,
+      "line_end": 237,
+      "line_start": 237
     }
   },
   {
@@ -5479,18 +5479,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/runtime.rs:475 in `run_rootfs_elf_with_hvf_args_and_dispatcher_debug`, `std::fs::read` accesses only the selected bare run-elf host executable fallback used by `run_rootfs_elf_with_hvf_args_and_dispatcher_debug`.",
+    "rationale": "At crates/carrick-runtime/src/runtime.rs:476 in `run_rootfs_elf_with_hvf_args_and_dispatcher_debug`, `std::fs::read` accesses only the selected bare run-elf host executable fallback used by `run_rootfs_elf_with_hvf_args_and_dispatcher_debug`.",
     "review_id": "HA-000239",
     "source": {
-      "byte_end": 18654,
-      "byte_start": 18641,
+      "byte_end": 18715,
+      "byte_start": 18702,
       "column": 40,
       "column_end": 53,
       "column_start": 40,
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 475,
-      "line_end": 475,
-      "line_start": 475
+      "line": 476,
+      "line_end": 476,
+      "line_start": 476
     }
   },
   {
@@ -5509,8 +5509,8 @@
     "rationale": "At crates/carrick-runtime/src/runtime/exec.rs:172 in `load_execve_image`, `std::fs::read` accesses only the selected guest exec target used by `load_execve_image`.",
     "review_id": "HA-000241",
     "source": {
-      "byte_end": 7492,
-      "byte_start": 7479,
+      "byte_end": 7501,
+      "byte_start": 7488,
       "column": 13,
       "column_end": 26,
       "column_start": 13,
@@ -6573,8 +6573,8 @@
     "rationale": "At crates/carrick-cli/src/runtime_util.rs:238 in `parse_env_file`, `std::fs::read_to_string` accesses only the user-selected CLI environment file.",
     "review_id": "HA-000288",
     "source": {
-      "byte_end": 10344,
-      "byte_start": 10321,
+      "byte_end": 10346,
+      "byte_start": 10323,
       "column": 19,
       "column_end": 42,
       "column_start": 19,
@@ -6735,8 +6735,8 @@
     "rationale": "At crates/carrick-runtime/src/lib.rs:241 in `rosetta_interpreter_path`, `std::fs::read_to_string` accesses only the fixed binfmt_misc Rosetta registration object at /proc/sys/fs/binfmt_misc/rosetta.",
     "review_id": "HA-000294",
     "source": {
-      "byte_end": 13724,
-      "byte_start": 13701,
+      "byte_end": 13713,
+      "byte_start": 13690,
       "column": 22,
       "column_end": 45,
       "column_start": 22,
@@ -9427,8 +9427,8 @@
     "rationale": "At crates/carrick-cli/src/debug.rs:1097 in `run_container_gate`, `std::fs::write` accesses only the operator-selected container gate receipt artifact.",
     "review_id": "HA-000404",
     "source": {
-      "byte_end": 41686,
-      "byte_start": 41677,
+      "byte_end": 41690,
+      "byte_start": 41681,
       "column": 5,
       "column_end": 14,
       "column_start": 5,
@@ -10090,8 +10090,8 @@
     "rationale": "At crates/carrick-cli/src/debug.rs:1089 in `run_container_gate`, `std::process::id` accesses only the run-scoped carrier identity recorded in the container gate receipt.",
     "review_id": "HA-000429",
     "source": {
-      "byte_end": 41369,
-      "byte_start": 41353,
+      "byte_end": 41373,
+      "byte_start": 41357,
       "column": 24,
       "column_end": 40,
       "column_start": 24,
@@ -10168,8 +10168,8 @@
     "rationale": "At crates/carrick-cli/src/runtime_util.rs:56 in `anon_bridge_namespace_id`, `std::process::id` is sampled once to synthesize an anonymous network namespace ID for bridge containers that do not supply an explicit namespace name; no guest identity selects its host target.",
     "review_id": "HA-000433",
     "source": {
-      "byte_end": 3098,
-      "byte_start": 3082,
+      "byte_end": 3100,
+      "byte_start": 3084,
       "column": 49,
       "column_end": 65,
       "column_start": 49,
@@ -13746,8 +13746,8 @@
     "rationale": "At crates/carrick-cli/src/debug.rs:1055 in `run_container_gate`, `std::thread::Builder::new` acts only on the carrier test runner created by `run_container_gate`; no guest identity selects its host target.",
     "review_id": "HA-000574",
     "source": {
-      "byte_end": 39772,
-      "byte_start": 39752,
+      "byte_end": 39776,
+      "byte_start": 39756,
       "column": 32,
       "column_end": 52,
       "column_start": 32,
@@ -13772,8 +13772,8 @@
     "rationale": "At crates/carrick-cli/src/debug.rs:1063 in `run_container_gate`, `std::thread::Builder::new` acts only on the carrier test runner created by `run_container_gate`; no guest identity selects its host target.",
     "review_id": "HA-000575",
     "source": {
-      "byte_end": 40214,
-      "byte_start": 40194,
+      "byte_end": 40218,
+      "byte_start": 40198,
       "column": 31,
       "column_end": 51,
       "column_start": 31,
@@ -15531,18 +15531,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/runtime.rs:1174 in `run_combined_syscall_loop_with_dispatcher`, `std::thread::yield_now` acts only on the current carrier runtime helper used by `run_combined_syscall_loop_with_dispatcher`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/runtime.rs:1175 in `run_combined_syscall_loop_with_dispatcher`, `std::thread::yield_now` acts only on the current carrier runtime helper used by `run_combined_syscall_loop_with_dispatcher`; no guest identity selects its host target.",
     "review_id": "HA-000637",
     "source": {
-      "byte_end": 47656,
-      "byte_start": 47634,
+      "byte_end": 47717,
+      "byte_start": 47695,
       "column": 17,
       "column_end": 39,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 1174,
-      "line_end": 1174,
-      "line_start": 1174
+      "line": 1175,
+      "line_end": 1175,
+      "line_start": 1175
     }
   },
   {
