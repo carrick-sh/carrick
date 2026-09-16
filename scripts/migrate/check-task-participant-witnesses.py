@@ -680,12 +680,12 @@ def self_test() -> None:
 
         crash_projection = scan_source(
             "fn poll(&self) { for thread in self.task.threads() {} }\n",
-            "crates/carrick-runtime/src/kernel/crash_capture.rs",
+            "crates/carrick-kernel/src/kernel/crash_capture.rs",
         )
         if [
             (finding.category, finding.path, finding.line)
             for finding in crash_projection
-        ] != [(RAW_TASK_PROJECTION, "crates/carrick-runtime/src/kernel/crash_capture.rs", 1)]:
+        ] != [(RAW_TASK_PROJECTION, "crates/carrick-kernel/src/kernel/crash_capture.rs", 1)]:
             raise AssertionError(
                 "crash projection: expected generic task membership finding, "
                 f"got {crash_projection!r}"
