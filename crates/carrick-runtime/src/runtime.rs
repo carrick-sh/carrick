@@ -3041,29 +3041,16 @@ mod tests {
         }
 
         let expected: BTreeMap<&str, [usize; 3]> = BTreeMap::from([
-            ("dispatch/ioring.rs", [1, 0, 0]),
-            ("dispatch/mem/tests.rs", [5, 0, 0]),
-            // SysV deadlock regression test spawns isolated child test processes:
-            // 1. proc_sysvipc rendering races attachment cleanup and paired mutation
-            // 2. watchdog kills and reaps on deadlock timeout
-            // 3. same-shmid remapped shmat deadlock watchdog regression
-            ("dispatch/sysv.rs", [1, 0, 3]),
-            ("dispatch/tests.rs", [2, 0, 0]),
-            ("exec_stamps.rs", [1, 0, 0]),
-            // NOT a row any more: `fs_backend/tests.rs` left this crate with
-            // the filesystem model (carrick-vfs). Its one `Command::new` is a
-            // test helper that still exists at
-            // `crates/carrick-vfs/src/fs_backend/tests.rs`; this inventory
-            // scans `CARGO_MANIFEST_DIR/src`, so it is out of scope here
-            // rather than retired.
-            // One cfg(test)-only helper self-spawns the exact lock-order or
-            // terminal-retirement regression, bounds it, and reaps its child.
-            // No production process creation is added by this test containment.
-            // (Moved with the continuation model from
-            // `vcpu_loop/continuation/tests.rs`; same helper, same count.)
-            ("kernel/continuation/tests.rs", [0, 0, 1]),
-            ("network/socket_namespace.rs", [7, 0, 0]),
-            ("run_state.rs", [1, 0, 0]),
+            // NOT rows any more: `fs_backend/tests.rs` left this crate with the
+            // filesystem model (carrick-vfs), and eight more rows
+            // (`dispatch/ioring.rs`, `dispatch/mem/tests.rs`,
+            // `dispatch/sysv.rs`, `dispatch/tests.rs`, `exec_stamps.rs`,
+            // `kernel/continuation/tests.rs`, `network/socket_namespace.rs`,
+            // `run_state.rs`) left it with the kernel (carrick-kernel). This
+            // inventory scans `CARGO_MANIFEST_DIR/src`, so they are out of
+            // SCOPE here, not retired: every one of them is still gated, by
+            // `scripts/migrate/check-carrier-only-process-invariant.py` in
+            // `just lint-domains`, whose scan roots follow the code.
             // This unit test self-spawns to isolate a process-global abort
             // boundary while proving pending exec error preservation. It is
             // not production host-process-per-guest architecture.
@@ -3159,7 +3146,7 @@ mod tests {
         assert!(
             !std::path::Path::new(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/src/namespace/supervisor.rs"
+                "/../carrick-kernel/src/namespace/supervisor.rs"
             ))
             .exists(),
             "retired namespace supervisor implementation must stay deleted"
