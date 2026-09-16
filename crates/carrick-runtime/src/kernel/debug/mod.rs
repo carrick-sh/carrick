@@ -96,6 +96,7 @@ mod tests {
             carrick_hal::ThreadId::synthetic_for_tests(4242),
             Arc::new(StubMmBackend),
             "root".to_owned(),
+            Arc::new(carrick_hal::NullHostSignalBridge::default()),
         )
         .expect("root bootstrap input");
         let (kernel, _context) = Kernel::bootstrap_root(bootstrap).expect("root kernel");

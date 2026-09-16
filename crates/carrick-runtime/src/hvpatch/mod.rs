@@ -140,6 +140,7 @@ pub(crate) fn process_context_for_tests(
         crate::thread::ThreadId::synthetic_for_tests(pid),
         backend.clone(),
         "hvpatch-test-root".to_owned(),
+        std::sync::Arc::new(carrick_hal::NullHostSignalBridge::default()),
     )
     .expect("test HVPatch bootstrap");
     let (kernel, root) =
@@ -1062,10 +1063,10 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
         root_tid,
         mm_backend.clone(),
         "hvpatch-root".to_owned(),
+        Arc::clone(&dispatcher.host_signal),
     )
     .map_err(|error| RuntimeError::Configuration(error.to_string()))?
-    .with_container(container)
-    .with_host_signal(Arc::clone(&dispatcher.host_signal));
+    .with_container(container);
     let launch_fs_context = dispatcher
         .launch_fs_context_for_hvpatch_bind()
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
@@ -1638,6 +1639,7 @@ mod tests {
             crate::thread::ThreadId::synthetic_for_tests(pid),
             backend.clone(),
             "adapter-root".to_owned(),
+            std::sync::Arc::new(carrick_hal::NullHostSignalBridge::default()),
         )
         .unwrap();
         let (kernel, root) = crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap();

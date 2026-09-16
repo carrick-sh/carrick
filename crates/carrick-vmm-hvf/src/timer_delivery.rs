@@ -5,39 +5,22 @@
 //! wall-clock fallback thread. POSIX per-process timers delegate to the existing
 //! HVF `posix_timer::arm` (its own firing thread). The neutral slot mutation is
 //! the timer-core's; this struct only owns the kqueue glue.
-use std::sync::{Arc, OnceLock};
+//!
+//! The registered-backend handle the dispatch arm reads
+//! (`GuestTimerBridge::delivery`) is the process-global seam in
+//! `carrick_hal::guest_timer_bridge` (`register_delivery` / `delivery`),
+//! shared with every other lane; the run loop registers [`HvfTimerDelivery`]
+//! there.
+use std::sync::Arc;
 
 use carrick_hal::{GuestTimerBridge, PosixTimerSpec, TimerArm, TimerDelivery, TimerSpecNs};
 use carrick_timer_core::{CpuNs, WallNs};
 
 pub struct HvfTimerDelivery;
 
-// The process-global `TimerDelivery` handle for the macOS/HVF backend. HVF has
-// no kicker-based wall-clock `deliver` (it arms EVFILT_TIMER on the pump
-// kqueue), so this is ONLY the `register_delivery`/`delivery` seam the dispatch
-// arm consumes through [`HvfGuestTimers`]. Mirrors the kick+futex lanes'
-// `carrick_hal::guest_timer_bridge::{register_delivery, delivery}`.
-static DELIVERY: OnceLock<Arc<dyn TimerDelivery>> = OnceLock::new();
-
-/// Install the backend `TimerDelivery` ([`HvfTimerDelivery`]). Called once at
-/// run-loop startup. Subsequent calls are ignored.
-pub fn register_delivery(delivery: Arc<dyn TimerDelivery>) {
-    let _ = DELIVERY.set(delivery);
-}
-
-/// The registered backend `TimerDelivery`, or `None` if no run loop has
-/// registered one (e.g. a unit test exercising the dispatcher without a
-/// backing run loop). Every real run-loop entry registers a backend before
-/// the dispatcher can run a `setitimer`/`timer_settime`, so the `None` arm
-/// only matters for tests, where the caller falls back to the shared
-/// wall-clock timer thread (the pre-trait `kq < 0` behavior).
-pub fn delivery() -> Option<Arc<dyn TimerDelivery>> {
-    DELIVERY.get().map(Arc::clone)
-}
-
 /// HVF's [`GuestTimerBridge`]: the neutral timer-core registry plus this
 /// lane's firing glue (`itimer::spawn_fallback_timer`, `posix_timer::arm`) and
-/// the process-global [`delivery`] seam, reached by the dispatcher only
+/// the hal-wide registered-backend seam, reached by the dispatcher only
 /// through the trait.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HvfGuestTimers;
@@ -104,7 +87,7 @@ impl GuestTimerBridge for HvfGuestTimers {
     }
 
     fn delivery(&self) -> Option<Arc<dyn TimerDelivery>> {
-        delivery()
+        carrick_hal::guest_timer_bridge::delivery()
     }
 }
 

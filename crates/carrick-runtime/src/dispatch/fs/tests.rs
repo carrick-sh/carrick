@@ -499,7 +499,7 @@ fn f_setlkw_cycle_reports_edeadlk_instead_of_parking_forever() {
             locks.wait_set_interruptibly(
                 &a_wants_b,
                 crate::thread::ThreadId::synthetic_for_tests(1),
-                &carrick_hal::NullHostSignalBridge,
+                &carrick_hal::NullHostSignalBridge::default(),
             )
         })
     };
@@ -522,7 +522,7 @@ fn f_setlkw_cycle_reports_edeadlk_instead_of_parking_forever() {
         locks.wait_set_interruptibly(
             &b_wants_a,
             crate::thread::ThreadId::synthetic_for_tests(2),
-            &carrick_hal::NullHostSignalBridge,
+            &carrick_hal::NullHostSignalBridge::default(),
         ),
         Err(crate::linux_abi::LINUX_EDEADLK),
         "closing the cycle must be EDEADLK, not an unbounded park"
@@ -641,7 +641,7 @@ fn hvpatch_blocking_classic_record_lock_wakes_after_unlock() {
         let result = worker_locks.wait_set_interruptibly(
             &child,
             crate::thread::ThreadId::synthetic_for_tests(42),
-            &carrick_hal::NullHostSignalBridge,
+            &carrick_hal::NullHostSignalBridge::default(),
         );
         done_tx.send(result).expect("publish waiter result");
     });
@@ -8757,7 +8757,7 @@ struct FsViewFixture {
 impl FsViewFixture {
     fn new() -> Self {
         let (kernel_binding, mm_id) = crate::dispatch::kernel_context::bootstrap_one_task_binding(
-            std::sync::Arc::new(carrick_hal::NullHostSignalBridge),
+            std::sync::Arc::new(carrick_hal::NullHostSignalBridge::default()),
         );
         let task_context = kernel_binding
             .capture(crate::kernel::LinuxTid::for_task_leader(
@@ -8801,7 +8801,11 @@ impl FsViewFixture {
 
 impl FsCrossSubsystem for FsViewFixture {
     fn host_signal(&self) -> &dyn carrick_hal::HostSignalBridge {
-        &carrick_hal::NullHostSignalBridge
+        // A zero-sized `const`, not a `static`: `&CONST` promotes to a
+        // `'static` borrow and there is no process-global state to ledger.
+        const NULL_HOST_SIGNAL: carrick_hal::NullHostSignalBridge =
+            carrick_hal::NullHostSignalBridge::new();
+        &NULL_HOST_SIGNAL
     }
     fn captured_fs_context(&self) -> Arc<crate::kernel::FsContext> {
         self.task_context.resources().fs_context()

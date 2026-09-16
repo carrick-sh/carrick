@@ -125,6 +125,11 @@ mod tests {
 
     #[test]
     fn fallback_posix_timer_publishes_process_signal_and_kicks_all() {
+        // Serialise against the other tests over the same process-global
+        // registry and pending store (`guest_timer_bridge::tests`).
+        let _serial = crate::guest_timer_bridge::TIMER_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         carrick_timer_core::posix::clear();
         carrick_signal_core::clear_proc_pending();
 

@@ -36,18 +36,18 @@ pub(crate) fn try_bootstrap_one_task_binding(
 {
     let observed_pid = i32::try_from(std::process::id()).unwrap_or(1);
     let registry_id = crate::thread::ThreadId::main_from_host_pid();
-    let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+    let bootstrap = crate::kernel::RootBootstrap::for_one_task_adapter(
         observed_pid,
         registry_id,
         "one-task-dispatch-adapter".to_owned(),
+        host_signal,
     )
     .map_err(|error| {
         tracing::error!(%error, "cannot build mandatory one-task kernel adapter");
         crate::run_result::RuntimeError::CarrierFailed(format!(
             "cannot build mandatory one-task kernel adapter: {error}"
         ))
-    })?
-    .with_host_signal(host_signal);
+    })?;
     let (_, context) = crate::kernel::Kernel::bootstrap_root(bootstrap).map_err(|error| {
         tracing::error!(%error, "cannot bootstrap mandatory one-task kernel adapter");
         crate::run_result::RuntimeError::CarrierFailed(format!(
@@ -266,10 +266,14 @@ impl SyscallDispatcher {
         let inherited_files = inherited.resources().files();
         let inherited_mm = inherited.shared().mm();
         let inherited_signal_state = inherited.thread().signal_state();
-        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+        // The rebound kernel keeps consulting the carrier's bridge: a fresh
+        // root is still this dispatcher's, so its continuation readiness must
+        // not degrade to a bridge-less kernel.
+        let bootstrap = crate::kernel::RootBootstrap::for_one_task_adapter(
             observed_pid,
             registry_id,
             "one-task-fork-child-adapter".to_owned(),
+            Arc::clone(&self.host_signal),
         )?;
         let (kernel, context) = crate::kernel::Kernel::bootstrap_root(bootstrap)?;
         let context = kernel.copy_file_table_for_host_fork(&context, &inherited_files)?;
@@ -917,7 +921,8 @@ mod tests {
 
     #[test]
     fn try_bootstrap_one_task_binding_succeeds() {
-        let res = try_bootstrap_one_task_binding(Arc::new(carrick_hal::NullHostSignalBridge));
+        let res =
+            try_bootstrap_one_task_binding(Arc::new(carrick_hal::NullHostSignalBridge::default()));
         assert!(res.is_ok());
     }
 }

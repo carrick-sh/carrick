@@ -14,8 +14,12 @@
 //!   * **Vnode/file events** (`EVFILT_VNODE`) — one lazily-created `inotify`
 //!     instance; each watched fd is resolved to a path via `/proc/self/fd/<fd>`
 //!     and added with the translated `IN_*` mask.
+//!   * **Process exit** (`EVFILT_PROC` + `NOTE_EXITSTATUS`) — a `pidfd` per pid,
+//!     readable on exit; `wait` PEEKs the status with
+//!     `waitid(P_PIDFD, …, WEXITED|WNOWAIT|WNOHANG)` so the guest's own `wait4`
+//!     can still reap the zombie.
 //!
-//! Every helper fd (`eventfd`/`timerfd`/`inotify`) is owned by this
+//! Every helper fd (`eventfd`/`timerfd`/`inotify`/`pidfd`) is owned by this
 //! struct and closed on `Drop`; the epoll fd itself is closed last.
 #![allow(clippy::useless_conversion)] // c_int<->i32 casts read clearer explicit.
 
@@ -42,6 +46,8 @@ pub struct EpollMultiplexer {
     user_eventfds: HashMap<u64, RawFd>,
     /// token → owned timerfd.
     timer_fds: HashMap<u64, RawFd>,
+    /// token → owned pidfd (process-exit watches).
+    pidfds: HashMap<u64, RawFd>,
     /// Lazily-created inotify instance (one for the whole multiplexer).
     inotify_fd: Option<RawFd>,
     /// inotify watch-descriptor → token.
@@ -63,6 +69,7 @@ impl EpollMultiplexer {
             io_fds: HashMap::new(),
             user_eventfds: HashMap::new(),
             timer_fds: HashMap::new(),
+            pidfds: HashMap::new(),
             inotify_fd: None,
             wd_to_token: HashMap::new(),
             fd_to_wd: HashMap::new(),
@@ -141,12 +148,21 @@ impl Drop for EpollMultiplexer {
         for &fd in self.timer_fds.values() {
             unsafe { libc::close(fd) };
         }
+        for &fd in self.pidfds.values() {
+            unsafe { libc::close(fd) };
+        }
         if let Some(fd) = self.inotify_fd {
             unsafe { libc::close(fd) };
         }
         // SAFETY: epoll fd owned by this struct.
         unsafe { libc::close(self.epfd) };
     }
+}
+
+/// `pidfd_open(2)` via raw syscall — libc 0.2.x does not export a wrapper.
+fn pidfd_open(pid: i32) -> RawFd {
+    // SAFETY: SYS_pidfd_open(pid, flags) returns an fd or -1; no pointers.
+    unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0i32) as RawFd }
 }
 
 /// `VnodeEvents` → inotify `IN_*` mask. `extend`/`write` both map to `IN_MODIFY`
@@ -233,6 +249,25 @@ impl EventMultiplexer for EpollMultiplexer {
         }
         self.wd_to_token.insert(wd, token);
         self.fd_to_wd.insert(fd, wd);
+        Ok(())
+    }
+
+    fn watch_process_exit(&mut self, pid: i32, token: u64) -> Result<(), OsError> {
+        let pidfd = pidfd_open(pid);
+        if pidfd < 0 {
+            return Err(OsError::last("pidfd_open"));
+        }
+        if let Err(e) = self.ctl_add_or_mod(pidfd, libc::EPOLLIN as u32, token) {
+            // SAFETY: pidfd just created and owned here.
+            unsafe { libc::close(pidfd) };
+            return Err(e);
+        }
+        // If a token was already watched, close the prior pidfd to avoid a leak.
+        if let Some(old) = self.pidfds.insert(token, pidfd) {
+            self.ctl_del(old);
+            // SAFETY: old pidfd owned by this struct, replaced now.
+            unsafe { libc::close(old) };
+        }
         Ok(())
     }
 
@@ -404,6 +439,7 @@ impl EventMultiplexer for EpollMultiplexer {
                     readiness_count: 0,
                     error: None,
                     eof: false,
+                    exit_status: None,
                     vnode: None,
                 });
                 continue;
@@ -430,6 +466,29 @@ impl EventMultiplexer for EpollMultiplexer {
                     readiness_count: 0,
                     error: None,
                     eof: false,
+                    exit_status: None,
+                    vnode: None,
+                });
+                continue;
+            }
+
+            // A process-exit pidfd: PEEK the status (WNOWAIT leaves the zombie so
+            // the guest's own wait4 still reaps it).
+            if let Some(&pidfd) = self.pidfds.get(&raw_token) {
+                #[cfg(not(test))]
+                let exit_status = {
+                    let _ = pidfd;
+                    None
+                };
+                #[cfg(test)]
+                let exit_status = peek_pidfd_exit(pidfd);
+                out.push(PollEvent {
+                    token: raw_token,
+                    readiness: Readiness::READ,
+                    readiness_count: 0,
+                    error: None,
+                    eof: true,
+                    exit_status,
                     vnode: None,
                 });
                 continue;
@@ -460,6 +519,7 @@ impl EventMultiplexer for EpollMultiplexer {
                 readiness_count: 0,
                 error,
                 eof,
+                exit_status: None,
                 vnode: None,
             });
         }
@@ -531,6 +591,7 @@ impl EpollMultiplexer {
                         readiness_count: 0,
                         error: None,
                         eof: ev.mask & (libc::IN_IGNORED | libc::IN_DELETE_SELF) != 0,
+                        exit_status: None,
                         vnode: None,
                     });
                 }
@@ -557,10 +618,48 @@ fn is_inotify_self(token: u64) -> bool {
         == (USER_TOKEN_FLAG | 0x4000_0000_0000_0000u64)
 }
 
+/// PEEK a pidfd's exit status without reaping (`WNOWAIT`). Returns the bare exit
+/// code on normal exit (`CLD_EXITED`), or `128 + signal` for a signal death
+/// (`CLD_KILLED`/`CLD_DUMPED`) — the shell convention — so the caller always
+/// gets a meaningful small integer. `None` if the process is not yet waitable
+/// (should not happen once the pidfd is EPOLLIN-readable) or `waitid` errors.
+#[cfg(test)]
+fn peek_pidfd_exit(pidfd: RawFd) -> Option<i32> {
+    // SAFETY: zeroed siginfo_t is a valid initial state for waitid to fill.
+    let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waitid(P_PIDFD, pidfd, &si, flags) — si is valid for the call;
+    // WNOWAIT leaves the zombie so the guest can reap it with wait4.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PIDFD,
+            pidfd as libc::id_t,
+            &mut si,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // WNOHANG with no waitable state leaves si_pid == 0.
+    // SAFETY: reading the SIGCHLD union fields of a waitid-populated siginfo.
+    let pid = unsafe { si.si_pid() };
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: same union read; valid after a successful waitid.
+    let code = si.si_code;
+    let status = unsafe { si.si_status() };
+    match code {
+        libc::CLD_EXITED => Some(status),
+        libc::CLD_KILLED | libc::CLD_DUMPED => Some(128 + status),
+        _ => Some(status),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Host-runnable unit tests exercising each event class against the REAL
-    //! Linux primitives (epoll/eventfd/timerfd/inotify). They run on any
+    //! Linux primitives (epoll/eventfd/timerfd/inotify/pidfd). They run on any
     //! aarch64/x86_64 Linux host (the crate is `cfg(target_os = "linux")`), e.g.
     //! the lima L2 lane. No `/dev/kvm` or guest is required.
     use super::*;
@@ -712,6 +811,41 @@ mod tests {
             .wait(&mut out, Some(Duration::from_millis(80)))
             .unwrap_or(0);
         assert_eq!(n, 0, "oneshot timer must not re-fire, got {out:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn watch_process_exit_peeks_status_and_leaves_reapable() -> Result<(), OsError> {
+        // SAFETY: fork creates a child; child immediately _exit(42)s.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // Child: exit with code 42 right away.
+            // SAFETY: _exit never returns; no allocation across the fork.
+            unsafe { libc::_exit(42) };
+        }
+
+        let mut mux = EpollMultiplexer::new()?;
+        let token = 0xDEAD_u64;
+        mux.watch_process_exit(pid, token)?;
+
+        let evs = wait_until(&mut mux, Duration::from_millis(1000));
+        assert_eq!(evs.len(), 1, "expected exit event, got {evs:?}");
+        assert_eq!(evs[0].token, token, "exit token");
+        assert_eq!(
+            evs[0].exit_status,
+            Some(42),
+            "peeked exit status must be 42"
+        );
+
+        // Prove WNOWAIT did NOT consume the zombie: the guest's own wait4 must
+        // still reap it successfully.
+        let mut wstatus = 0i32;
+        // SAFETY: waitpid on our own child; wstatus is a valid out-param.
+        let reaped = unsafe { libc::waitpid(pid, &mut wstatus, 0) };
+        assert_eq!(reaped, pid, "waitpid must still reap the child (WNOWAIT)");
+        assert!(libc::WIFEXITED(wstatus), "child exited normally");
+        assert_eq!(libc::WEXITSTATUS(wstatus), 42, "reaped exit code is 42");
         Ok(())
     }
 

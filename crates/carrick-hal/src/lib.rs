@@ -90,16 +90,18 @@ pub mod timer_delivery;
 pub use timer_delivery::{PosixTimerSpec, TimerArm, TimerDelivery, TimerSpecNs};
 /// The dispatcher's seam onto the backend's timer registry and firing mechanism.
 pub mod guest_timer_bridge;
+pub use guest_timer_bridge::{
+    GuestTimerBridge, KickerGuestTimers, KickerTimerFiring, TimerCoreBridge, TimerFiring,
+};
 #[cfg(any(test, feature = "test-support"))]
-pub use guest_timer_bridge::NullGuestTimerBridge;
-pub use guest_timer_bridge::{GuestTimerBridge, KickerGuestTimers};
+pub use guest_timer_bridge::{NullGuestTimerBridge, NullTimerFiring};
 /// The dispatcher's seam onto the backend's host-signal plumbing.
 pub mod host_signal_bridge;
-#[cfg(any(test, feature = "test-support"))]
-pub use host_signal_bridge::NullHostSignalBridge;
 pub use host_signal_bridge::{
     GenericHostSignalBridge, HostSignalBridge, NO_PENDING_SIGNAL, WaitFd,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use host_signal_bridge::{NullHostSignalBridge, NullHostSignalGlue};
 pub mod guest_arch;
 pub use guest_arch::{GuestArch, PageTableCodec, PtGranule, SyscallRemap, SyscallTable};
 pub mod aarch64_arch;

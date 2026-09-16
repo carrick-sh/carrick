@@ -308,30 +308,65 @@ pub struct RootBootstrap {
     /// The container this kernel boots its root task into.
     container: Arc<Container>,
     /// The execution backend's host-signal bridge this kernel's continuation
-    /// readiness consults. Defaults to the Null bridge (neutral bookkeeping,
-    /// no host glue) for the reference model; product bootstraps override it
-    /// with `with_host_signal`.
+    /// readiness consults. Every constructor takes it: a kernel cannot be
+    /// bootstrapped without naming the bridge behind it, so a product
+    /// bootstrap cannot silently fall back to a bridge-less kernel.
     host_signal: Arc<dyn HostSignalBridge>,
 }
 
 impl RootBootstrap {
-    /// Build an identity-only root for the in-crate reference model.
+    /// Build an identity-only root for the in-crate reference model: the
+    /// test-support constructor, on the Null (bridge-less) host-signal
+    /// bridge. Product code uses [`Self::for_one_task_adapter`] or
+    /// [`Self::with_mm_backend`], both of which take the carrier's bridge.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_reference_model(
         observed_pid: i32,
         registry_id: ThreadId,
         diagnostic_name: String,
     ) -> Result<Self, KernelError> {
-        Self::new(observed_pid, registry_id, None, diagnostic_name)
+        Self::new(
+            observed_pid,
+            registry_id,
+            None,
+            diagnostic_name,
+            Arc::new(carrick_hal::NullHostSignalBridge::default()),
+        )
     }
 
-    /// Build a production root whose mm is backed by the execution adapter.
+    /// Build an identity-only root (no mm backend) for a dispatcher's
+    /// one-task kernel adapter, consulting the carrier's `host_signal`.
+    pub fn for_one_task_adapter(
+        observed_pid: i32,
+        registry_id: ThreadId,
+        diagnostic_name: String,
+        host_signal: Arc<dyn HostSignalBridge>,
+    ) -> Result<Self, KernelError> {
+        Self::new(
+            observed_pid,
+            registry_id,
+            None,
+            diagnostic_name,
+            host_signal,
+        )
+    }
+
+    /// Build a production root whose mm is backed by the execution adapter
+    /// and whose continuation readiness consults the carrier's `host_signal`.
     pub fn with_mm_backend(
         observed_pid: i32,
         registry_id: ThreadId,
         mm_backend: Arc<dyn MmBackend>,
         diagnostic_name: String,
+        host_signal: Arc<dyn HostSignalBridge>,
     ) -> Result<Self, KernelError> {
-        Self::new(observed_pid, registry_id, Some(mm_backend), diagnostic_name)
+        Self::new(
+            observed_pid,
+            registry_id,
+            Some(mm_backend),
+            diagnostic_name,
+            host_signal,
+        )
     }
 
     fn new(
@@ -339,6 +374,7 @@ impl RootBootstrap {
         registry_id: ThreadId,
         mm_backend: Option<Arc<dyn MmBackend>>,
         diagnostic_name: String,
+        host_signal: Arc<dyn HostSignalBridge>,
     ) -> Result<Self, KernelError> {
         // A reference-model kernel boots into the reference-model container.
         // Product bootstraps override this with `with_container`.
@@ -348,7 +384,7 @@ impl RootBootstrap {
             mm_backend,
             diagnostic_name,
             container: Arc::new(Container::for_reference_model()),
-            host_signal: Arc::new(carrick_hal::NullHostSignalBridge),
+            host_signal,
         })
     }
 
@@ -356,13 +392,6 @@ impl RootBootstrap {
     /// built from the CLI's `LaunchContext` and installed on the dispatcher).
     pub fn with_container(mut self, container: Arc<Container>) -> Self {
         self.container = container;
-        self
-    }
-
-    /// Reach the carrier's execution backend for host-signal state (the
-    /// bridge the dispatcher was built with). Every product bootstrap sets it.
-    pub fn with_host_signal(mut self, host_signal: Arc<dyn HostSignalBridge>) -> Self {
-        self.host_signal = host_signal;
         self
     }
 

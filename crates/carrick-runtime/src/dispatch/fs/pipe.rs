@@ -963,7 +963,7 @@ mod tests {
         assert_eq!(first, vec![0x7c; PIPE_BUF]);
         match crate::dispatch::drive_blocking_write(
             &mut blocked,
-            &carrick_hal::NullHostSignalBridge,
+            &carrick_hal::NullHostSignalBridge::default(),
         ) {
             crate::dispatch::BlockingWriteStep::Done(DispatchOutcome::Returned { value }) => {
                 assert_eq!(value, payload.len() as i64);
@@ -1034,7 +1034,7 @@ mod tests {
         assert_eq!(first, vec![0x6b; PIPE_BUF]);
         match crate::dispatch::drive_blocking_write(
             &mut blocked,
-            &carrick_hal::NullHostSignalBridge,
+            &carrick_hal::NullHostSignalBridge::default(),
         ) {
             crate::dispatch::BlockingWriteStep::Done(DispatchOutcome::Returned { value }) => {
                 assert_eq!(value, PIPE_BUF as i64);
@@ -1092,7 +1092,10 @@ mod tests {
             Ok(PIPE_BUF)
         );
         let crate::dispatch::BlockingWriteStep::Done(outcome) =
-            crate::dispatch::drive_blocking_write(&mut blocked, &carrick_hal::NullHostSignalBridge)
+            crate::dispatch::drive_blocking_write(
+                &mut blocked,
+                &carrick_hal::NullHostSignalBridge::default(),
+            )
         else {
             panic!("second pipe progress must complete the admitted aggregate");
         };

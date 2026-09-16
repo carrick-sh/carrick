@@ -2040,6 +2040,7 @@ mod tests {
             ThreadId::synthetic_for_tests(7000),
             backend.clone(),
             "root".to_string(),
+            Arc::new(carrick_hal::NullHostSignalBridge::default()),
         )
         .expect("bootstrap input");
         let (kernel, context) = Kernel::bootstrap_root(input).expect("bootstrap");
