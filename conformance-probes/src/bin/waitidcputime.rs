@@ -3,13 +3,16 @@
 //! user/system CPU into `RUSAGE_CHILDREN` and `times()`'s `tms_cutime`/`tms_cstime`
 //! regardless of WHICH wait syscall consumed the zombie.
 //!
-//! carrick's `wait4` handler drains the reaped child's guest CPU
-//! (`guest_cpu::reap_child_guest_ns` + `add_reaped_child`, `dispatch/proc.rs`),
-//! but the `waitid` handler does NOT — it returns the siginfo and never touches
-//! the child-time accumulators (`dispatch/proc.rs:1166-1268`). So a CPU-burning
-//! child reaped via `waitid` contributes 0 to `RUSAGE_CHILDREN`, while the same
-//! child reaped via `wait4` contributes its CPU. This probe makes that
-//! asymmetry a deterministic boolean.
+//! The finding this probe was written for: carrick's `wait4` handler drained
+//! the reaped child's guest CPU into the parent's child-time accumulators while
+//! the `waitid` handler did not, so a CPU-burning child reaped via `waitid`
+//! contributed 0 to `RUSAGE_CHILDREN` while the same child reaped via `wait4`
+//! contributed its CPU. This probe makes that asymmetry a deterministic
+//! boolean. (Those accumulators were per HOST process and belonged to the
+//! retired 1:1 native lane; under HVPatch the children ledger is per Linux task
+//! in the kernel graph — `task().children_cpu_us()`, read by
+//! `dispatch/time.rs::task_children_cpu_us` — and both wait syscalls settle
+//! into it. The probe's question is unchanged.)
 //!
 //! Deterministic-by-design (mirrors `accounting.rs`): absolute CPU times vary
 //! per machine and are NEVER printed. Each observation is reduced to a boolean
