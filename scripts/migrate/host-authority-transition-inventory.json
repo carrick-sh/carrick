@@ -5255,6 +5255,33 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "fixed installed Rosetta interpreter object used by `rosetta_binary_bytes`"
+    },
+    "expansion": null,
+    "operation": "std::fs::read",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/dispatch/rosetta.rs:25 in `rosetta_binary_bytes`, `std::fs::read` accesses only the fixed installed Rosetta interpreter object used by `rosetta_binary_bytes`.",
+    "review_id": "HA-000240",
+    "source": {
+      "byte_end": 1545,
+      "byte_start": 1532,
+      "column": 25,
+      "column_end": 38,
+      "column_start": 25,
+      "file": "crates/carrick-runtime/src/dispatch/rosetta.rs",
+      "line": 25,
+      "line_end": 25,
+      "line_start": 25
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "selected guest interpreter image used by `run_static_hvpatch`"
     },
     "expansion": null,
@@ -5390,33 +5417,6 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
-      "resource": "fixed installed Rosetta interpreter object used by `rosetta_binary_bytes`"
-    },
-    "expansion": null,
-    "operation": "std::fs::read",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/rosetta.rs:353 in `rosetta_binary_bytes`, `std::fs::read` accesses only the fixed installed Rosetta interpreter object used by `rosetta_binary_bytes`.",
-    "review_id": "HA-000240",
-    "source": {
-      "byte_end": 18386,
-      "byte_start": 18373,
-      "column": 25,
-      "column_end": 38,
-      "column_start": 25,
-      "file": "crates/carrick-runtime/src/dispatch/rosetta.rs",
-      "line": 353,
-      "line_end": 353,
-      "line_start": 353
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-FS-READ",
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
       "resource": "selected guest executable image used by `run_static_elf_with_hvf_args_and_dispatcher_debug`"
     },
     "expansion": null,
@@ -5428,8 +5428,8 @@
     "rationale": "At crates/carrick-runtime/src/runtime.rs:228 in `run_static_elf_with_hvf_args_and_dispatcher_debug`, `std::fs::read` accesses only the selected guest executable image used by `run_static_elf_with_hvf_args_and_dispatcher_debug`.",
     "review_id": "HA-000237",
     "source": {
-      "byte_end": 10281,
-      "byte_start": 10268,
+      "byte_end": 10300,
+      "byte_start": 10287,
       "column": 16,
       "column_end": 29,
       "column_start": 16,
@@ -5455,8 +5455,8 @@
     "rationale": "At crates/carrick-runtime/src/runtime.rs:236 in `run_static_elf_with_hvf_args_and_dispatcher_debug`, `std::fs::read` accesses only the selected guest interpreter image used by `run_static_elf_with_hvf_args_and_dispatcher_debug`.",
     "review_id": "HA-000238",
     "source": {
-      "byte_end": 10739,
-      "byte_start": 10726,
+      "byte_end": 10758,
+      "byte_start": 10745,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
@@ -5482,8 +5482,8 @@
     "rationale": "At crates/carrick-runtime/src/runtime.rs:475 in `run_rootfs_elf_with_hvf_args_and_dispatcher_debug`, `std::fs::read` accesses only the selected bare run-elf host executable fallback used by `run_rootfs_elf_with_hvf_args_and_dispatcher_debug`.",
     "review_id": "HA-000239",
     "source": {
-      "byte_end": 18545,
-      "byte_start": 18532,
+      "byte_end": 18564,
+      "byte_start": 18551,
       "column": 40,
       "column_end": 53,
       "column_start": 40,
@@ -6597,18 +6597,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/lib.rs:308 in `rosetta_interpreter_path`, `std::fs::read_to_string` accesses only the fixed binfmt_misc Rosetta registration object at /proc/sys/fs/binfmt_misc/rosetta.",
+    "rationale": "At crates/carrick-runtime/src/lib.rs:302 in `rosetta_interpreter_path`, `std::fs::read_to_string` accesses only the fixed binfmt_misc Rosetta registration object at /proc/sys/fs/binfmt_misc/rosetta.",
     "review_id": "HA-000294",
     "source": {
-      "byte_end": 16246,
-      "byte_start": 16223,
+      "byte_end": 15800,
+      "byte_start": 15777,
       "column": 22,
       "column_end": 45,
       "column_start": 22,
       "file": "crates/carrick-runtime/src/lib.rs",
-      "line": 308,
-      "line_end": 308,
-      "line_start": 308
+      "line": 302,
+      "line_end": 302,
+      "line_start": 302
     }
   },
   {
@@ -11849,18 +11849,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:2029 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:2030 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
     "review_id": "HA-000498",
     "source": {
-      "byte_end": 81835,
-      "byte_start": 81819,
+      "byte_end": 81859,
+      "byte_start": 81843,
       "column": 39,
       "column_end": 55,
       "column_start": 39,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2029,
-      "line_end": 2029,
-      "line_start": 2029
+      "line": 2030,
+      "line_end": 2030,
+      "line_start": 2030
     }
   },
   {
@@ -11876,18 +11876,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:2244 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:2245 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
     "review_id": "HA-000499",
     "source": {
-      "byte_end": 90446,
-      "byte_start": 90430,
+      "byte_end": 90470,
+      "byte_start": 90454,
       "column": 47,
       "column_end": 63,
       "column_start": 47,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2244,
-      "line_end": 2244,
-      "line_start": 2244
+      "line": 2245,
+      "line_end": 2245,
+      "line_start": 2245
     }
   },
   {
@@ -15534,8 +15534,8 @@
     "rationale": "At crates/carrick-runtime/src/runtime.rs:1167 in `run_combined_syscall_loop_with_dispatcher`, `std::thread::yield_now` acts only on the current carrier runtime helper used by `run_combined_syscall_loop_with_dispatcher`; no guest identity selects its host target.",
     "review_id": "HA-000637",
     "source": {
-      "byte_end": 47332,
-      "byte_start": 47310,
+      "byte_end": 47351,
+      "byte_start": 47329,
       "column": 17,
       "column_end": 39,
       "column_start": 17,
