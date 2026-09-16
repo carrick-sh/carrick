@@ -2817,7 +2817,7 @@ impl<'a> ProcView<'a> {
             {
                 Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
                 Err(error) => Ok(DispatchOutcome::errno(
-                    crate::hvpatch::identity_operation_errno(error),
+                    crate::kernel::identity_operation_errno(error),
                 )),
             }
         }
@@ -2874,7 +2874,7 @@ impl<'a> ProcView<'a> {
                     value: i64::from(ns_visible_session(cx.kernel, sid)),
                 }),
                 Err(error) => Ok(DispatchOutcome::errno(
-                    crate::hvpatch::identity_operation_errno(error),
+                    crate::kernel::identity_operation_errno(error),
                 )),
             }
         }
@@ -2992,15 +2992,15 @@ impl<'a> ProcView<'a> {
                     // ptrace stop (which `waitable_job_control_event` surfaces
                     // regardless of WSTOPPED) could be silently swallowed by an
                     // ordinary waitid(WEXITED).
-                    crate::hvpatch::WaitResult::Exited(exit)
-                    | crate::hvpatch::WaitResult::StateChanged(exit) => {
+                    crate::kernel::WaitResult::Exited(exit)
+                    | crate::kernel::WaitResult::StateChanged(exit) => {
                         if infop_addr.0 != 0 {
                             let bytes = build_hvpatch_waitid_siginfo(exit);
                             (*cx.memory).write_bytes(infop_addr.0, &bytes)?;
                         }
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    crate::hvpatch::WaitResult::StillRunning(precheck) => {
+                    crate::kernel::WaitResult::StillRunning(precheck) => {
                         if guest_nohang {
                             if infop_addr.0 != 0 {
                                 (*cx.memory).write_bytes(
@@ -3037,7 +3037,7 @@ impl<'a> ProcView<'a> {
                             precheck,
                         });
                     }
-                    crate::hvpatch::WaitResult::NoChild => {
+                    crate::kernel::WaitResult::NoChild => {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
                     }
                 }
@@ -3094,7 +3094,7 @@ impl<'a> ProcView<'a> {
                                     include_continued,
                                 )
                             }
-                            None => crate::hvpatch::WaitResult::NoChild,
+                            None => crate::kernel::WaitResult::NoChild,
                         }
                     }
                     0 => match process.process_group() {
@@ -3130,8 +3130,8 @@ impl<'a> ProcView<'a> {
                 };
                 let guest_nohang = options.contains(LinuxWaitOptions::WNOHANG);
                 match waited {
-                    crate::hvpatch::WaitResult::Exited(exit)
-                    | crate::hvpatch::WaitResult::StateChanged(exit) => {
+                    crate::kernel::WaitResult::Exited(exit)
+                    | crate::kernel::WaitResult::StateChanged(exit) => {
                         if wstatus_addr.0 != 0 {
                             memory.write_bytes(wstatus_addr.0, &exit.status().to_ne_bytes())?;
                         }
@@ -3145,7 +3145,7 @@ impl<'a> ProcView<'a> {
                             value: i64::from(exit.visible_pid()),
                         });
                     }
-                    crate::hvpatch::WaitResult::StillRunning(precheck) => {
+                    crate::kernel::WaitResult::StillRunning(precheck) => {
                         if guest_nohang {
                             return Ok(DispatchOutcome::Returned { value: 0 });
                         }
@@ -3176,7 +3176,7 @@ impl<'a> ProcView<'a> {
                             precheck,
                         });
                     }
-                    crate::hvpatch::WaitResult::NoChild => {
+                    crate::kernel::WaitResult::NoChild => {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
                     }
                 }
@@ -4361,7 +4361,7 @@ fn hvpatch_waitid_exit_fields(wait_status: i32) -> (i32, i32) {
 /// from the same Carrick-kernel wait result; host process credentials are not
 /// meaningful for logical guest children sharing the VM carrier.
 pub(crate) fn build_hvpatch_waitid_siginfo(
-    exit: crate::hvpatch::ChildExit,
+    exit: crate::kernel::ChildExit,
 ) -> [u8; crate::linux_abi::LINUX_SIGINFO_SIZE] {
     let (si_code, si_status) = hvpatch_waitid_exit_fields(exit.status());
     build_linux_sigchld_siginfo(exit.visible_pid(), exit.ruid().raw(), si_code, si_status)

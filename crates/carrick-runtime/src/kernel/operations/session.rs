@@ -983,7 +983,7 @@ mod tests {
             .create_session(leader_id, None)
             .expect_err("a group named by the caller's pid still has a member");
         assert_eq!(
-            crate::hvpatch::identity_operation_errno(error),
+            crate::kernel::identity_operation_errno(error),
             crate::linux_abi::LINUX_EPERM
         );
         // Nothing moved: the caller keeps its identity and the group its member.

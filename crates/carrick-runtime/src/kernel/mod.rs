@@ -21,6 +21,7 @@ pub mod mm_transaction;
 pub mod netns;
 pub mod objects;
 pub mod operations;
+pub(crate) mod process_lifecycle;
 pub mod registry;
 pub mod scheduler;
 pub mod snapshot;
@@ -110,6 +111,9 @@ pub use operations::{
 };
 pub(crate) use operations::{
     CloseRangeUnshare, ExactSignalTargetAuthorization, ExactThreadSignalPost, TtyControlError,
+};
+pub(crate) use process_lifecycle::{
+    ChildExit, ProcessThreadExit, RetiredThreadResources, WaitResult, identity_operation_errno,
 };
 pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,

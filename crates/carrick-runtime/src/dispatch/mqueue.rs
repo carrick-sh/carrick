@@ -2425,7 +2425,7 @@ mod tests {
         assert_eq!(netlink.fd_ref_count(), leader_refs + 2);
 
         let receipt = match process.exit_thread(sibling.thread().key().tid).unwrap() {
-            crate::hvpatch::ProcessThreadExit::Retired(receipt) => receipt,
+            crate::kernel::ProcessThreadExit::Retired(receipt) => receipt,
             other => panic!("expected newly retired thread, got {other:?}"),
         };
         let retired_table = receipt.files();
@@ -2453,7 +2453,7 @@ mod tests {
         );
         assert!(matches!(
             process.exit_thread(sibling.thread().key().tid).unwrap(),
-            crate::hvpatch::ProcessThreadExit::AlreadyRetired
+            crate::kernel::ProcessThreadExit::AlreadyRetired
         ));
         dispatcher.close_draining_file_table(
             process.kernel_graph(),
@@ -2493,7 +2493,7 @@ mod tests {
         register_signal_notification(&dispatcher, &sibling, &mut memory, mqd, 34, 18, 0x1100);
 
         let receipt = match process.exit_thread(sibling.thread().key().tid).unwrap() {
-            crate::hvpatch::ProcessThreadExit::Retired(receipt) => receipt,
+            crate::kernel::ProcessThreadExit::Retired(receipt) => receipt,
             other => panic!("expected newly retired thread, got {other:?}"),
         };
         dispatcher.close_draining_file_table(
