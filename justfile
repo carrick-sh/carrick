@@ -386,6 +386,7 @@ ci:
     j lint-domains
     j deny
     j check-matrix
+    j check-layering
     if [ "{{os()}}" = "macos" ]; then
         j check --workspace
     else
@@ -436,6 +437,12 @@ matrix:
 # forgot to re-render. Runs inside `just ci`.
 check-matrix:
     cargo run -p carrick-conformance -- --check-matrix
+
+# Layering gate: carrick-vfs / carrick-kernel never depend upward; no VMM
+# depends on the kernel
+# (docs/superpowers/plans/2026-09-13-extract-carrick-vfs-and-carrick-kernel.md).
+check-layering:
+    ./scripts/closure-assert-layering.sh
 
 # Deterministic, line-exact ABI probe gate vs Docker (the precise gate; self-skips).
 # On the x86_64 fleet the AMD64 probe sets are built NATIVELY here (cheap: host
