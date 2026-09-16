@@ -707,6 +707,22 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-runtime/src/dispatch/rosetta.rs",
+      "symbol": "rosetta_binary_bytes::CACHE",
+      "fingerprint": "3c13ec3261cdbf3ca309bd9fd863023dabca93ee7c6addfd1401bc8a5fe7cd61",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide host infrastructure static rosetta_binary_bytes::CACHE in crates/carrick-runtime/src/dispatch/rosetta.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/dispatch/rosetta.rs",
+      "symbol": "rosetta_license_blob::CACHE",
+      "fingerprint": "3c13ec3261cdbf3ca309bd9fd863023dabca93ee7c6addfd1401bc8a5fe7cd61",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide host infrastructure static rosetta_license_blob::CACHE in crates/carrick-runtime/src/dispatch/rosetta.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-runtime/src/dispatch/signal.rs",
       "symbol": "tests::XSIG_RING_TEST_LOCK",
       "fingerprint": "c4906f78d4cd62cb130f198777f557e1c263d2d3e30323bd04095c2cc840efa2",
@@ -1392,22 +1408,6 @@
       "fingerprint": "3a3cc89abe55008d1ed8ce4e4bfd9baf81b5f71ac099625513aedebb8a7b2036",
       "classification": "config_debug",
       "rationale": "Environment variable CARRICK_DISABLE_TSO read in hardware_tso_for_debug::CARRICK_DISABLE_TSO (crates/carrick-runtime/src/runtime.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/lib.rs",
-      "symbol": "rosetta_binary_bytes::CACHE",
-      "fingerprint": "3c13ec3261cdbf3ca309bd9fd863023dabca93ee7c6addfd1401bc8a5fe7cd61",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static rosetta_binary_bytes::CACHE in crates/carrick-runtime/src/lib.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/lib.rs",
-      "symbol": "rosetta_license_blob::CACHE",
-      "fingerprint": "3c13ec3261cdbf3ca309bd9fd863023dabca93ee7c6addfd1401bc8a5fe7cd61",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static rosetta_license_blob::CACHE in crates/carrick-runtime/src/lib.rs maintaining host process lifecycle or VM resources."
     },
     {
       "kind": "static",
