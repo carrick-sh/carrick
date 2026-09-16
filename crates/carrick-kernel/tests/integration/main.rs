@@ -25,6 +25,7 @@ mod address_space;
 mod compat_report;
 mod concurrency_contracts;
 mod elf_inspector;
+mod public_backend_surface;
 mod rootfs_overlay;
 mod rootfs_streaming;
 mod syscall_creds;
