@@ -713,26 +713,6 @@ pub enum DispatchOutcome {
     /// parsed request and exact ownership; the continuation reactor attempts
     /// acquisition without occupying a guest executor while a conflict remains.
     BlockingRecordLock(BlockingRecordLock),
-    /// A blocking `waitid(P_PID, pid, …)` whose target child hasn't changed
-    /// state yet. The runtime parks the vCPU thread on the child's exit via the
-    /// per-thread kqueue's `EVFILT_PROC`/`NOTE_EXIT` (interruptible by a signal
-    /// or a fork quiesce — unlike a raw `libc::waitid`), then re-dispatches the
-    /// waitid to reap. `sig_mask` is always `Additive` here: waitpid/waitid
-    /// carry no POSIX temp sigmask, only extra temporarily-blocked signals
-    /// (empty for a plain waitid).
-    WaitOnProcExit {
-        pid: i32,
-        sig_mask: WaitSigMask,
-    },
-    /// A Darwin-native wait for a non-terminal child state (`WSTOPPED` or
-    /// `WCONTINUED`). `EVFILT_PROC` only reports exit, so the runtime parks on
-    /// the signal wake path with a bounded retry and re-dispatches the original
-    /// wait syscall. `pid` keeps the concrete host target for diagnostics and a
-    /// future selector-aware kqueue implementation.
-    WaitOnProcState {
-        pid: i32,
-        sig_mask: WaitSigMask,
-    },
     /// An in-process HvPatch child is still running. There is no Darwin child
     /// fd/kqueue event to wait on, so the threaded loop performs a short,
     /// signal/fork-interruptible park and re-dispatches the original wait.

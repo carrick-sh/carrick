@@ -376,7 +376,6 @@ impl GuestOutputRange {
 pub enum ChildSelector {
     Exact(TaskKey),
     AnyChildOf(TaskKey),
-    HostPid(i32),
 }
 
 /// Pointer-free diagnostic view of one parked continuation. See
@@ -503,7 +502,6 @@ fn detail_diagnostic(detail: &ContinuationDetail) -> String {
                     task.serial.raw()
                 )
             }
-            ChildSelector::HostPid(pid) => format!("process host-pid={pid}"),
         },
         ContinuationDetail::Signals { wait_set, .. } => {
             format!("signals wait_set={:#x}", wait_set.raw())
@@ -840,8 +838,6 @@ pub enum BlockedContinuation {
     Mqueue(ContinuationState),
     FdWait(ContinuationState),
     BlockingRecordLock(ContinuationState),
-    WaitOnProcExit(ContinuationState),
-    WaitOnProcState(ContinuationState),
     WaitOnHvpatchChild(ContinuationState),
     WaitOnSignals(ContinuationState),
     WaitOnSleep(ContinuationState),
@@ -864,8 +860,6 @@ pub enum ContinuationFamily {
     Mqueue,
     FdWait,
     BlockingRecordLock,
-    WaitOnProcExit,
-    WaitOnProcState,
     WaitOnHvpatchChild,
     WaitOnSignals,
     WaitOnSleep,
@@ -891,8 +885,6 @@ impl ContinuationFamily {
             Self::Mqueue => 20,
             Self::FdWait => 18,
             Self::BlockingRecordLock => 11,
-            Self::WaitOnProcExit => 12,
-            Self::WaitOnProcState => 13,
             Self::WaitOnHvpatchChild => 14,
             Self::WaitOnSignals => 15,
             Self::WaitOnSleep => 16,
@@ -919,8 +911,6 @@ impl ContinuationFamily {
             Self::Mqueue => "posix-mqueue",
             Self::FdWait => "retained-fd-wait",
             Self::BlockingRecordLock => "blocking-record-lock",
-            Self::WaitOnProcExit => "wait-on-proc-exit",
-            Self::WaitOnProcState => "wait-on-proc-state",
             Self::WaitOnHvpatchChild => "wait-on-hvpatch-child",
             Self::WaitOnSignals => "wait-on-signals",
             Self::WaitOnSleep => "wait-on-sleep",
@@ -958,8 +948,6 @@ pub const fn is_blocking_dispatch_outcome(outcome: &DispatchOutcome) -> bool {
             | DispatchOutcome::BlockingMqueue(_)
             | DispatchOutcome::BlockingFdWait { .. }
             | DispatchOutcome::BlockingRecordLock(_)
-            | DispatchOutcome::WaitOnProcExit { .. }
-            | DispatchOutcome::WaitOnProcState { .. }
             | DispatchOutcome::WaitOnHvpatchChild { .. }
             | DispatchOutcome::WaitOnSignals { .. }
             | DispatchOutcome::WaitOnSleep { .. }
@@ -970,8 +958,6 @@ pub const fn is_blocking_dispatch_outcome(outcome: &DispatchOutcome) -> bool {
 pub enum ContinuationBuildError {
     #[error("continuation execution authority is stale")]
     StaleExecutionAuthority,
-    #[error("host-process wait is prohibited on HVPatch")]
-    HostProcessWaitOnHvpatch,
     #[error("HVPatch child selector is stale or invalid")]
     StaleChildSelector,
     #[error("dispatch outcome is not blocking")]
@@ -1219,36 +1205,6 @@ impl BlockedContinuation {
                 Some(WaitSigMask::NONE),
                 ContinuationDetail::RecordLock(Arc::new(lock)),
             )),
-            DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
-                if backend == ContinuationBackend::Hvpatch {
-                    return Err(ContinuationBuildError::HostProcessWaitOnHvpatch);
-                }
-                Self::WaitOnProcExit(new_state(
-                    None,
-                    Vec::new(),
-                    Some(sig_mask),
-                    ContinuationDetail::Process {
-                        selector: ChildSelector::HostPid(pid),
-                        sig_mask,
-                        precheck: crate::kernel::ChildWaitPrecheck::unsampled(),
-                    },
-                ))
-            }
-            DispatchOutcome::WaitOnProcState { pid, sig_mask } => {
-                if backend == ContinuationBackend::Hvpatch {
-                    return Err(ContinuationBuildError::HostProcessWaitOnHvpatch);
-                }
-                Self::WaitOnProcState(new_state(
-                    None,
-                    Vec::new(),
-                    Some(sig_mask),
-                    ContinuationDetail::Process {
-                        selector: ChildSelector::HostPid(pid),
-                        sig_mask,
-                        precheck: crate::kernel::ChildWaitPrecheck::unsampled(),
-                    },
-                ))
-            }
             DispatchOutcome::WaitOnHvpatchChild {
                 target,
                 sig_mask,
@@ -1403,8 +1359,6 @@ impl BlockedContinuation {
             | Self::Mqueue(state)
             | Self::FdWait(state)
             | Self::BlockingRecordLock(state)
-            | Self::WaitOnProcExit(state)
-            | Self::WaitOnProcState(state)
             | Self::WaitOnHvpatchChild(state)
             | Self::WaitOnSignals(state)
             | Self::WaitOnSleep(state)
@@ -1428,8 +1382,6 @@ impl BlockedContinuation {
             | Self::Mqueue(state)
             | Self::FdWait(state)
             | Self::BlockingRecordLock(state)
-            | Self::WaitOnProcExit(state)
-            | Self::WaitOnProcState(state)
             | Self::WaitOnHvpatchChild(state)
             | Self::WaitOnSignals(state)
             | Self::WaitOnSleep(state)
@@ -1453,8 +1405,6 @@ impl BlockedContinuation {
             Self::Mqueue(_) => ContinuationFamily::Mqueue,
             Self::FdWait(_) => ContinuationFamily::FdWait,
             Self::BlockingRecordLock(_) => ContinuationFamily::BlockingRecordLock,
-            Self::WaitOnProcExit(_) => ContinuationFamily::WaitOnProcExit,
-            Self::WaitOnProcState(_) => ContinuationFamily::WaitOnProcState,
             Self::WaitOnHvpatchChild(_) => ContinuationFamily::WaitOnHvpatchChild,
             Self::WaitOnSignals(_) => ContinuationFamily::WaitOnSignals,
             Self::WaitOnSleep(_) => ContinuationFamily::WaitOnSleep,
@@ -1680,7 +1630,6 @@ impl BlockedContinuation {
                 fingerprint ^= match selector {
                     ChildSelector::Exact(key) => key.serial.raw(),
                     ChildSelector::AnyChildOf(key) => key.serial.raw().rotate_left(7),
-                    ChildSelector::HostPid(pid) => *pid as u64,
                 };
             }
             ContinuationDetail::Signals {

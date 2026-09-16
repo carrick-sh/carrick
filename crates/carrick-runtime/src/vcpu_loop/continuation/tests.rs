@@ -620,7 +620,27 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
             "HVPatch continuation path retains prohibited host-blocking authority: {prohibited}"
         );
     }
-    assert_eq!(DISPATCH_FAMILIES.len() + 1, 20);
+    // 17 dispatch-produced families + `VforkParent`. It was 20 until the
+    // host-pid `WaitOnProcExit`/`WaitOnProcState` families went with the
+    // retired 1:1 native lane; their event codes (12, 13) stay retired rather
+    // than being renumbered, so this census is the family COUNT, not the code
+    // range.
+    assert_eq!(DISPATCH_FAMILIES.len() + 1, 18);
+    // The retired 1:1 native lane's host-pid wait is gone from the
+    // continuation path: no outcome, no family, no selector, and no
+    // "reject a host wait on HVPatch" guard, because the types can no longer
+    // spell a Darwin pid here at all.
+    for deleted in [
+        "WaitOnProcExit",
+        "WaitOnProcState",
+        "HostPid",
+        "HostProcessWaitOnHvpatch",
+    ] {
+        assert!(
+            !continuation_source.contains(deleted),
+            "the retired native lane's host-pid wait is deleted; `{deleted}` must not exist"
+        );
+    }
     // The transitional runner pool and its ambient thread-locals are gone.
     // Nothing on the persistent executor ever published them, so every read
     // already answered None/false; they are deleted rather than left as a
@@ -1042,14 +1062,6 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
             let contention = crate::dispatch::RecordLockContentionFixture::new();
             DispatchOutcome::BlockingRecordLock(contention.waiter(tid, 1))
         }
-        ContinuationFamily::WaitOnProcExit => DispatchOutcome::WaitOnProcExit {
-            pid: 9001,
-            sig_mask: WaitSigMask::NONE,
-        },
-        ContinuationFamily::WaitOnProcState => DispatchOutcome::WaitOnProcState {
-            pid: 9002,
-            sig_mask: WaitSigMask::NONE,
-        },
         ContinuationFamily::WaitOnHvpatchChild => DispatchOutcome::WaitOnHvpatchChild {
             target: None,
             sig_mask: WaitSigMask::NONE,
@@ -1070,7 +1082,7 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
     }
 }
 
-const DISPATCH_FAMILIES: [ContinuationFamily; 19] = [
+const DISPATCH_FAMILIES: [ContinuationFamily; 17] = [
     ContinuationFamily::FutexWait,
     ContinuationFamily::FutexWaitv,
     ContinuationFamily::SharedFutexWait,
@@ -1085,8 +1097,6 @@ const DISPATCH_FAMILIES: [ContinuationFamily; 19] = [
     ContinuationFamily::Mqueue,
     ContinuationFamily::FdWait,
     ContinuationFamily::BlockingRecordLock,
-    ContinuationFamily::WaitOnProcExit,
-    ContinuationFamily::WaitOnProcState,
     ContinuationFamily::WaitOnHvpatchChild,
     ContinuationFamily::WaitOnSignals,
     ContinuationFamily::WaitOnSleep,
@@ -1103,7 +1113,16 @@ fn continuation_family_event_codes_are_stable_unique_and_nonzero() {
     assert!(codes.iter().all(|code| *code != 0));
     codes.sort_unstable();
     codes.dedup();
-    assert_eq!(codes, (1_u8..=20).collect::<Vec<_>>());
+    // 12 and 13 are RETIRED, not reusable: they named the host-pid
+    // `WaitOnProcExit`/`WaitOnProcState` families of the 1:1 native lane. A
+    // core or LLDB snapshot taken before that lane went away still decodes
+    // them, so the range has permanent holes rather than renumbering.
+    assert_eq!(
+        codes,
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20
+        ]
+    );
 }
 
 fn assert_send_static<T: Send + 'static>(_: &T) {}
@@ -1114,17 +1133,9 @@ fn exhaustive_real_dispatch_shapes_become_owned_send_static_continuations() {
     let generation = publish(&context, 0x100);
     let now = Instant::now();
     for family in DISPATCH_FAMILIES {
-        let backend = if matches!(
-            family,
-            ContinuationFamily::WaitOnProcExit | ContinuationFamily::WaitOnProcState
-        ) {
-            ContinuationBackend::HostProcessCompatibility
-        } else {
-            ContinuationBackend::Hvpatch
-        };
         let continuation = BlockedContinuation::from_dispatch_outcome(
             outcome_for(family, context.thread().registry_id()),
-            capture(&context, generation, backend),
+            capture(&context, generation, ContinuationBackend::Hvpatch),
         )
         .expect("blocking outcome must convert");
         assert_eq!(continuation.family(), family);
@@ -1155,8 +1166,6 @@ fn exhaustive_real_dispatch_shapes_become_owned_send_static_continuations() {
                     | ContinuationFamily::Mqueue
                     | ContinuationFamily::FdWait
                     | ContinuationFamily::BlockingRecordLock
-                    | ContinuationFamily::WaitOnProcExit
-                    | ContinuationFamily::WaitOnProcState
                     | ContinuationFamily::WaitOnHvpatchChild
                     | ContinuationFamily::WaitOnSignals
             )
@@ -1250,20 +1259,16 @@ fn vfork_parent_owns_exact_parent_child_relationship_and_release_token() {
     assert_eq!(probe.load(Ordering::SeqCst), 6);
 }
 
+/// A child wait resolves in the kernel-graph domain and nowhere else. The
+/// `DispatchOutcome::WaitOnProcExit`/`WaitOnProcState` shapes that carried a
+/// Darwin pid into this builder (and the `HostProcessWaitOnHvpatch` rejection
+/// that guarded against them) went away with the retired 1:1 native lane, so
+/// the type can no longer spell a host-pid child wait at all; what is left to
+/// pin is that `ChildSelector` only ever names a `TaskKey`.
 #[test]
-fn hvpatch_rejects_host_proc_wait_and_resolves_child_selectors_in_kernel_domain() {
+fn hvpatch_resolves_child_selectors_in_kernel_domain() {
     let (_kernel, context) = bootstrap(15_020);
     let generation = publish(&context, 0x300);
-    let error = BlockedContinuation::from_dispatch_outcome(
-        DispatchOutcome::WaitOnProcExit {
-            pid: 22,
-            sig_mask: WaitSigMask::NONE,
-        },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
-    )
-    .expect_err("HvPatch may never infer a child from a Darwin pid");
-    assert_eq!(error, ContinuationBuildError::HostProcessWaitOnHvpatch);
-
     let continuation = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::WaitOnHvpatchChild {
             target: None,
@@ -2146,19 +2151,11 @@ fn timeout_signal_exec_exit_and_drop_cleanup_are_literal_for_every_family() {
     let (_kernel, context) = bootstrap(15_200);
     let generation = publish(&context, 0x400);
     for family in DISPATCH_FAMILIES {
-        let backend = if matches!(
-            family,
-            ContinuationFamily::WaitOnProcExit | ContinuationFamily::WaitOnProcState
-        ) {
-            ContinuationBackend::HostProcessCompatibility
-        } else {
-            ContinuationBackend::Hvpatch
-        };
         let probe = Arc::new(AtomicUsize::new(0));
         let make = || {
             let mut continuation = BlockedContinuation::from_dispatch_outcome(
                 outcome_for(family, context.thread().registry_id()),
-                capture(&context, generation, backend),
+                capture(&context, generation, ContinuationBackend::Hvpatch),
             )
             .expect("continuation");
             continuation.install_cleanup_probe(Arc::clone(&probe));
@@ -2206,8 +2203,6 @@ fn timeout_signal_exec_exit_and_drop_cleanup_are_literal_for_every_family() {
             (
                 ContinuationFamily::WaitOnSharedWord
                 | ContinuationFamily::BlockingRecordLock
-                | ContinuationFamily::WaitOnProcExit
-                | ContinuationFamily::WaitOnProcState
                 | ContinuationFamily::WaitOnHvpatchChild,
                 ContinuationCompletion::Redispatch,
             ) => {}

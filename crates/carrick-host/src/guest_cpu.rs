@@ -333,8 +333,8 @@ pub fn this_thread_us() -> u64 {
 }
 
 /// Clear per-process state in a freshly `fork`ed child: its vCPU starts a new
-/// exec clock at zero and it has not waited any children of its own. (The
-/// shared child-exit table is process-shared and intentionally NOT cleared.)
+/// exec clock at zero. (The shared child-exit table is process-shared and
+/// intentionally NOT cleared.)
 pub fn reset() {
     for slot in &EXEC_SLOTS {
         slot.store(0, Ordering::Relaxed);
@@ -342,27 +342,21 @@ pub fn reset() {
     for slot in &ACTIVE_START_NS {
         slot.store(0, Ordering::Relaxed);
     }
-    CHILD_USER_US.store(0, Ordering::Relaxed);
-    CHILD_SYS_US.store(0, Ordering::Relaxed);
 }
 
-// ---- Child metadata and CPU accounting (getrusage RUSAGE_CHILDREN, times cutime) ----
+// ---- Child metadata (live-child wait state) ----
 //
-// A guest's child runs as a separate host process, so its guest CPU time lives
-// in the child's own `EXEC_NS` table and dies with it. Linux rolls a reaped
-// child's CPU into the parent's child-time totals; to match, an exiting child
-// publishes its guest CPU into a process-SHARED table (created before any fork
-// so the MAP_SHARED region is inherited), and the parent drains it at `wait4`
-// into its per-process child accumulators below. The same live-child row also
-// carries low-volume wait metadata that the parent must observe before terminal
-// reap, such as pending ptrace signal-delivery stops. The host-side child CPU
-// comes from Darwin's own `wait4` rusage out-param (added by the caller).
-
-/// Per-process accumulated child CPU (microseconds), summed over reaped
-/// children. NOT shared across fork — each process tracks the children IT
-/// reaped, and `reset()` zeroes them in a forked child.
-static CHILD_USER_US: AtomicU64 = AtomicU64::new(0);
-static CHILD_SYS_US: AtomicU64 = AtomicU64::new(0);
+// An exiting child publishes its guest CPU into a process-SHARED table (created
+// before any fork so the MAP_SHARED region is inherited). The same live-child
+// row also carries low-volume wait metadata that the parent must observe before
+// terminal reap, such as pending ptrace signal-delivery stops.
+//
+// The per-process `RUSAGE_CHILDREN`/`times()` accumulators that used to live
+// here belonged to the retired 1:1 native lane, where a guest child WAS a
+// Darwin process. Under HVPatch the children ledger is per Linux task in the
+// kernel graph (`task().children_cpu_us()`), so a carrier-wide host total
+// would be a second, wrong answer; the accumulators were deleted with that
+// lane (e1fbfd32e / the kernel extraction plan) and git remembers them.
 
 const RUN_STATE_KIND_TID: u64 = 1 << 40;
 const REF_NONE: u64 = u64::MAX;
@@ -1410,53 +1404,6 @@ fn reap_child_guest_ns_ref(pid: u32, record_ref: ProcessRecordRef) -> u64 {
     }
 }
 
-/// Accumulate a reaped child's CPU (microseconds) into this process's
-/// child-time totals.
-pub fn add_reaped_child(user_us: u64, system_us: u64) {
-    CHILD_USER_US.fetch_add(user_us, Ordering::Relaxed);
-    CHILD_SYS_US.fetch_add(system_us, Ordering::Relaxed);
-}
-
-/// Combine a reaped child's published guest CPU (`record_child_exit`'s
-/// `guest_ns` channel) with the host `wait4` rusage into the (user_us,
-/// system_us) pair to feed [`add_reaped_child`]. The two sources overlap
-/// differently per provider, so this is the ONE place the split is decided —
-/// wait4, waitid, and the adopted-child reap all route through it:
-///
-/// * VMM backends: guest cycles never accrue to the child host process, so the
-///   published value (guest user time) and the host rusage (carrick's own
-///   syscall work in the child) are DISJOINT and add: `user = published +
-///   host_user`, `system = host_system`.
-/// * Native provider: guest cycles ARE the child host process's CPU, so the
-///   published value measures the SAME quantity as the host rusage (captured
-///   slightly earlier, at the child's exit publish). Adding both would
-///   double-count; the host rusage is the complete, authoritative reading when
-///   the reap path has one (`wait4`). A reap with no host rusage (host
-///   `waitid` returns none; an adopted child was reaped by a different host
-///   parent) uses the published value, which is user+system with no split —
-///   reported as user time.
-pub fn reaped_child_cpu_parts(
-    published_guest_ns: u64,
-    host_rusage_us: Option<(u64, u64)>,
-) -> (u64, u64) {
-    let published_us = published_guest_ns / 1000;
-    match (native_darwin_provider(), host_rusage_us) {
-        (true, Some((host_user_us, host_system_us))) => (host_user_us, host_system_us),
-        (_, None) => (published_us, 0),
-        (false, Some((host_user_us, host_system_us))) => {
-            (published_us + host_user_us, host_system_us)
-        }
-    }
-}
-
-/// This process's accumulated reaped-child user / system CPU (microseconds).
-pub fn child_user_us() -> u64 {
-    CHILD_USER_US.load(Ordering::Relaxed)
-}
-pub fn child_system_us() -> u64 {
-    CHILD_SYS_US.load(Ordering::Relaxed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1530,34 +1477,6 @@ mod tests {
         // empty, proving the values above came from Darwin, not the slots.
         assert_eq!(total_ns(), 0);
         reset();
-    }
-
-    #[test]
-    fn reaped_child_cpu_parts_adds_disjoint_sources_on_vmm_backends() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        clear_native_darwin_provider_for_test();
-        // Published guest ns + host rusage are disjoint under a VMM: they add.
-        assert_eq!(
-            reaped_child_cpu_parts(5_000_000, Some((2_000, 300))),
-            (7_000, 300)
-        );
-        // No host rusage (waitid, adopted reap): published only.
-        assert_eq!(reaped_child_cpu_parts(5_000_000, None), (5_000, 0));
-    }
-
-    #[test]
-    fn reaped_child_cpu_parts_prefers_host_rusage_under_native_provider() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        set_native_darwin_provider();
-        // Native: the published channel and host rusage measure the SAME CPU;
-        // host rusage (complete, split) wins — never added on top.
-        assert_eq!(
-            reaped_child_cpu_parts(5_000_000, Some((4_900, 100))),
-            (4_900, 100)
-        );
-        // No host rusage: the published (user+system) value, reported as user.
-        assert_eq!(reaped_child_cpu_parts(5_000_000, None), (5_000, 0));
-        clear_native_darwin_provider_for_test();
     }
 
     #[test]

@@ -1090,9 +1090,13 @@ impl std::fmt::Debug for PidfdWatch {
 /// Identity carried by a pidfd's open-file description. This is intentionally
 /// typed: treating an HvPatch guest pid as a Darwin pid recreated the 1:1
 /// process model inside the backend whose purpose is to break that mapping.
+///
+/// A `Host(i32)` variant used to sit beside `Hvpatch`, naming a Darwin pid on
+/// the retired 1:1 native lane (e1fbfd32e). It went away with that lane: a
+/// pidfd now always names a task in the kernel graph, so the type can no
+/// longer spell the 1:1 identification it was introduced to prevent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PidfdTarget {
-    Host(i32),
     Hvpatch(crate::kernel::TaskKey),
 }
 

@@ -1125,8 +1125,6 @@ where
             | DispatchOutcome::BlockingMqueue(_)
             | DispatchOutcome::BlockingFdWait { .. }
             | DispatchOutcome::BlockingRecordLock(_)
-            | DispatchOutcome::WaitOnProcExit { .. }
-            | DispatchOutcome::WaitOnProcState { .. }
             | DispatchOutcome::WaitOnHvpatchChild { .. }
             | DispatchOutcome::WaitOnSignals { .. }
             | DispatchOutcome::WaitOnSleep { .. } => {
@@ -1830,39 +1828,6 @@ where
                     }
                 }
             },
-            DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
-                waiter.ensure_full();
-                match waiter.wait_proc_exit(pid, sig_mask.block_mask()) {
-                    // Ready (child exited) -> re-dispatch the waitid to reap.
-                    WaitResult::Ready => continue,
-                    // Interrupted (signal/quiesce) -> EINTR; the guest re-issues.
-                    WaitResult::Interrupted | WaitResult::TimedOut => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_EINTR,
-                        });
-                    }
-                    // wait_proc_exit never builds PinnedWaitFds, so this is
-                    // unreachable in practice; present for exhaustiveness.
-                    WaitResult::Errno(errno) => {
-                        return Ok(DispatchOutcome::Errno { errno });
-                    }
-                }
-            }
-            DispatchOutcome::WaitOnProcState { sig_mask, .. } => {
-                waiter.ensure_full();
-                match waiter.wait_proc_state_with_dispatch_pending(sig_mask.block_mask(), || false)
-                {
-                    WaitResult::Ready | WaitResult::TimedOut => continue,
-                    WaitResult::Interrupted => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_EINTR,
-                        });
-                    }
-                    WaitResult::Errno(errno) => {
-                        return Ok(DispatchOutcome::Errno { errno });
-                    }
-                }
-            }
             DispatchOutcome::WaitOnHvpatchChild { sig_mask, .. } => {
                 waiter.ensure_full();
                 match waiter.wait_with_dispatch_pending(

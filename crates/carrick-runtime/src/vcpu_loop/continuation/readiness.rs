@@ -445,19 +445,14 @@ impl SignalReadinessProbe {
         }
     }
 
-    /// Interpret an actual task-wake edge. Process waits deliberately use a
+    /// Interpret an actual task-wake edge. Child waits deliberately use a
     /// generic task wake as a redispatch hint because the authoritative child
-    /// or host-process state is consumed by the syscall itself. That rule must
+    /// state is consumed by the syscall itself. That rule must
     /// not leak into enrollment's state-only readiness sample: doing so makes
     /// every quiet wait4 continuation immediately runnable and livelocks the
     /// carrier without any producer event.
     pub(in crate::vcpu_loop) fn event_after_task_wake(&self) -> Option<ContinuationEvent> {
-        if matches!(
-            self.family,
-            ContinuationFamily::WaitOnProcExit
-                | ContinuationFamily::WaitOnProcState
-                | ContinuationFamily::WaitOnHvpatchChild
-        ) {
+        if self.family == ContinuationFamily::WaitOnHvpatchChild {
             return Some(ContinuationEvent::Ready);
         }
         self.event()
