@@ -34,5 +34,5 @@ only calls them. The same rule covers the console handed back by a `/dev` mount
 
 Experimental. **No semver**, no stability guarantee, and the API changes
 without notice — this crate exists to split Carrick's build graph, not to be a
-general-purpose VFS library. `publish = false` is inherited from the workspace.
-If you depend on it, pin an exact git rev.
+general-purpose VFS library. It is not published to crates.io (no crate in this
+workspace is). If you depend on it, pin an exact git rev.

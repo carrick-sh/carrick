@@ -11849,18 +11849,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:2041 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:2045 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
     "review_id": "HA-000498",
     "source": {
-      "byte_end": 82012,
-      "byte_start": 81996,
+      "byte_end": 82313,
+      "byte_start": 82297,
       "column": 39,
       "column_end": 55,
       "column_start": 39,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2041,
-      "line_end": 2041,
-      "line_start": 2041
+      "line": 2045,
+      "line_end": 2045,
+      "line_start": 2045
     }
   },
   {
@@ -11876,18 +11876,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:2256 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:2260 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
     "review_id": "HA-000499",
     "source": {
-      "byte_end": 90623,
-      "byte_start": 90607,
+      "byte_end": 90924,
+      "byte_start": 90908,
       "column": 47,
       "column_end": 63,
       "column_start": 47,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2256,
-      "line_end": 2256,
-      "line_start": 2256
+      "line": 2260,
+      "line_end": 2260,
+      "line_start": 2260
     }
   },
   {
