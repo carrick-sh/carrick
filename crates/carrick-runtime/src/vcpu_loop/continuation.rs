@@ -83,12 +83,6 @@ impl ContinuationId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ContinuationBackend {
-    Hvpatch,
-    HostProcessCompatibility,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestartClass {
     Never,
     RestartSyscall,
@@ -125,7 +119,6 @@ pub struct ContinuationCapture {
     execution: ExecutionGeneration,
     syscall: SyscallFrame,
     restart: RestartClass,
-    backend: ContinuationBackend,
 }
 
 impl ContinuationCapture {
@@ -134,7 +127,6 @@ impl ContinuationCapture {
         lease: &crate::kernel::objects::ThreadExecutionLease,
         request: SyscallRequest,
         restart: RestartClass,
-        backend: ContinuationBackend,
     ) -> Result<Self, ContinuationBuildError> {
         if !context.exact_thread_is_live()
             || lease.thread_key() != context.thread().key()
@@ -165,7 +157,6 @@ impl ContinuationCapture {
             execution: lease.generation(),
             syscall: SyscallFrame { request },
             restart,
-            backend,
         })
     }
 
@@ -176,7 +167,6 @@ impl ContinuationCapture {
         execution: ExecutionGeneration,
         request: SyscallRequest,
         restart: RestartClass,
-        backend: ContinuationBackend,
     ) -> Result<Self, ContinuationBuildError> {
         if !context.exact_thread_is_live()
             || context.thread().execution_state().generation() != Some(execution)
@@ -207,7 +197,6 @@ impl ContinuationCapture {
             execution,
             syscall: SyscallFrame { request },
             restart,
-            backend,
         })
     }
 }
@@ -973,7 +962,6 @@ impl BlockedContinuation {
         outcome: DispatchOutcome,
         capture: ContinuationCapture,
     ) -> Result<Self, ContinuationBuildError> {
-        let backend = capture.backend;
         let parent_task = capture.task;
         let persistent_signal_mask = capture.persistent_signal_mask;
         let restore_after_signal = capture.restore_after_signal;
@@ -1210,9 +1198,6 @@ impl BlockedContinuation {
                 sig_mask,
                 precheck,
             } => {
-                if backend != ContinuationBackend::Hvpatch {
-                    return Err(ContinuationBuildError::StaleChildSelector);
-                }
                 let selector = match target {
                     None => ChildSelector::AnyChildOf(parent_task),
                     Some(pid) => {
@@ -1317,8 +1302,7 @@ impl BlockedContinuation {
             .kernel
             .upgrade()
             .ok_or(ContinuationBuildError::StaleChildSelector)?;
-        if capture.backend != ContinuationBackend::Hvpatch
-            || !kernel.task_key_is_live(child)
+        if !kernel.task_key_is_live(child)
             || kernel.task_parent_key(child).ok().flatten() != Some(parent_task)
         {
             return Err(ContinuationBuildError::StaleChildSelector);

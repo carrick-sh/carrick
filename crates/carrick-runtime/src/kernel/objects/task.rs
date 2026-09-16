@@ -1378,7 +1378,7 @@ impl Task {
         self.job_control.lock().stopped_by.is_some()
     }
 
-    pub(in crate::kernel) fn begin_ptrace_memory_access(
+    pub(crate) fn begin_ptrace_memory_access(
         self: &Arc<Self>,
         tracer: TaskKey,
     ) -> Result<PtraceMemoryAccessWitness, carrick_abi::LinuxErrno> {

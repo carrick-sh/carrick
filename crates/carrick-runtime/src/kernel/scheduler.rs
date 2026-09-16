@@ -4348,8 +4348,7 @@ mod tests {
     use crate::kernel::objects::{BlockedReason, MigratableTaskState, ThreadExecutionState};
     use crate::kernel::{ClonePlan, Kernel, KernelContext, LinuxWaitStatus, RootBootstrap};
     use crate::vcpu_loop::continuation::{
-        BlockedContinuation, CarrierWaitService, ContinuationBackend, ContinuationCapture,
-        RestartClass,
+        BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass,
     };
 
     fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
@@ -5361,7 +5360,6 @@ mod tests {
                 running.lease(),
                 SyscallRequest::new(220, SyscallArgs([0; 6])),
                 RestartClass::RestartSyscall,
-                ContinuationBackend::Hvpatch,
             )
             .expect("capture running vfork parent"),
             child.task().key(),
@@ -5473,7 +5471,6 @@ mod tests {
                 running.lease(),
                 SyscallRequest::new(98, SyscallArgs([0; 6])),
                 RestartClass::RestartSyscall,
-                ContinuationBackend::Hvpatch,
             )
             .expect("capture running futex waiter"),
         )

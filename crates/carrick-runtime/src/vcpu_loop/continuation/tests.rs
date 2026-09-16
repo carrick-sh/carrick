@@ -205,7 +205,7 @@ fn complete_timerfd_continuation_after_ready(
             crate::dispatch::format_time::TimerFdReadStep::Wait(read) => {
                 continuation = BlockedContinuation::from_dispatch_outcome(
                     DispatchOutcome::BlockingTimerFdRead(read),
-                    capture(context, generation, ContinuationBackend::Hvpatch),
+                    capture(context, generation),
                 )
                 .expect("re-plan timerfd continuation");
                 let mut registration = service.prepare_registration(&continuation);
@@ -247,11 +247,9 @@ fn timerfd_read_continuation_waits_for_dispatcher_arm_then_completes_read() {
     let (fd, read) = timerfd_continuation_fixture(&context, &mut dispatcher, &mut memory);
     assert!(matches!(read, DispatchOutcome::BlockingTimerFdRead(_)));
 
-    let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        read,
-        capture(&context, generation, ContinuationBackend::Hvpatch),
-    )
-    .expect("timerfd continuation");
+    let mut continuation =
+        BlockedContinuation::from_dispatch_outcome(read, capture(&context, generation))
+            .expect("timerfd continuation");
     let service = CarrierWaitService::new(Arc::new(Scheduler::new(Arc::clone(&kernel))));
     let mut registration = service.prepare_registration(&continuation);
     let token = registration.wake_token();
@@ -368,11 +366,9 @@ fn timerfd_rearm_wakes_retained_read_before_old_deadline() {
         .expect("dispatch timerfd read");
     assert!(matches!(read, DispatchOutcome::BlockingTimerFdRead(_)));
 
-    let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        read,
-        capture(&context, generation, ContinuationBackend::Hvpatch),
-    )
-    .expect("timerfd continuation");
+    let mut continuation =
+        BlockedContinuation::from_dispatch_outcome(read, capture(&context, generation))
+            .expect("timerfd continuation");
     let service = CarrierWaitService::new(Arc::new(Scheduler::new(Arc::clone(&kernel))));
     let mut registration = service.prepare_registration(&continuation);
     let token = registration.wake_token();
@@ -462,7 +458,7 @@ fn enrollment_samples_signal_pending_before_continuation_capture() {
             sig_mask: WaitSigMask::NONE,
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("pause-shaped continuation");
     let scheduler = Arc::new(Scheduler::new(kernel));
@@ -911,17 +907,12 @@ pub(crate) fn request(number: u64) -> SyscallRequest {
     )
 }
 
-fn capture(
-    context: &KernelContext,
-    generation: ExecutionGeneration,
-    backend: ContinuationBackend,
-) -> ContinuationCapture {
+fn capture(context: &KernelContext, generation: ExecutionGeneration) -> ContinuationCapture {
     ContinuationCapture::new(
         context,
         generation,
         request(73),
         RestartClass::RestartSyscall,
-        backend,
     )
     .expect("capture exact continuation authority")
 }
@@ -1135,7 +1126,7 @@ fn exhaustive_real_dispatch_shapes_become_owned_send_static_continuations() {
     for family in DISPATCH_FAMILIES {
         let continuation = BlockedContinuation::from_dispatch_outcome(
             outcome_for(family, context.thread().registry_id()),
-            capture(&context, generation, ContinuationBackend::Hvpatch),
+            capture(&context, generation),
         )
         .expect("blocking outcome must convert");
         assert_eq!(continuation.family(), family);
@@ -1202,7 +1193,7 @@ fn vfork_parent_owns_exact_parent_child_relationship_and_release_token() {
         .capture(context.thread().key().tid)
         .expect("recapture parent after vfork publication");
     let continuation = BlockedContinuation::from_vfork_parent(
-        capture(&current, generation, ContinuationBackend::Hvpatch),
+        capture(&current, generation),
         child.task().key(),
         wait.clone(),
     )
@@ -1218,7 +1209,7 @@ fn vfork_parent_owns_exact_parent_child_relationship_and_release_token() {
     let probe = Arc::new(AtomicUsize::new(0));
     let make = || {
         let mut continuation = BlockedContinuation::from_vfork_parent(
-            capture(&current, generation, ContinuationBackend::Hvpatch),
+            capture(&current, generation),
             child.task().key(),
             wait.clone(),
         )
@@ -1275,7 +1266,7 @@ fn hvpatch_resolves_child_selectors_in_kernel_domain() {
             sig_mask: WaitSigMask::NONE,
             precheck: crate::kernel::ChildWaitPrecheck::unsampled(),
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("kernel child selector");
     assert_eq!(
@@ -1294,7 +1285,7 @@ fn hvpatch_child_enrollment_requires_a_real_task_event() {
             sig_mask: WaitSigMask::NONE,
             precheck: crate::kernel::ChildWaitPrecheck::unsampled(),
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("kernel child continuation");
     let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
@@ -1343,7 +1334,7 @@ fn diagnostic_names_the_wait_and_whether_a_producer_can_still_reach_it() {
             sig_mask: WaitSigMask::NONE,
             precheck: crate::kernel::ChildWaitPrecheck::unsampled(),
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("kernel child continuation");
     let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
@@ -1453,7 +1444,7 @@ fn child_wait_enrolled_after_the_exit_edge_still_sees_it() {
             sig_mask: WaitSigMask::NONE,
             precheck,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("kernel child continuation");
     let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
@@ -1490,7 +1481,7 @@ fn futex_wait_ignores_unrelated_task_event_until_generation_changes() {
             wait: futex.prepare_wait(address),
             timeout: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("futex continuation");
     continuation.bind_product_futex(&futex);
@@ -1563,11 +1554,9 @@ fn logical_group_wait_dispatch_builds_an_any_child_continuation() {
         &outcome,
         DispatchOutcome::WaitOnHvpatchChild { target: None, .. }
     ));
-    let continuation = BlockedContinuation::from_dispatch_outcome(
-        outcome,
-        capture(&root, generation, ContinuationBackend::Hvpatch),
-    )
-    .expect("group wait must build without StaleChildSelector");
+    let continuation =
+        BlockedContinuation::from_dispatch_outcome(outcome, capture(&root, generation))
+            .expect("group wait must build without StaleChildSelector");
     assert_eq!(
         continuation.child_selector(),
         Some(ChildSelector::AnyChildOf(root.task().key()))
@@ -1592,7 +1581,7 @@ fn race_fixture(pid: i32) -> RaceFixture {
             duration: Duration::from_secs(30),
             remaining: Some(crate::dispatch::GuestPtr(0xa000)),
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("continuation");
     let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
@@ -1645,11 +1634,9 @@ fn control_quantum_fixture(
         }
         other => panic!("unsupported control-quantum fixture {other:?}"),
     };
-    let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        outcome,
-        capture(&context, generation, ContinuationBackend::Hvpatch),
-    )
-    .expect("control-quantum continuation");
+    let mut continuation =
+        BlockedContinuation::from_dispatch_outcome(outcome, capture(&context, generation))
+            .expect("control-quantum continuation");
     if let Some(table) = futex.as_ref() {
         continuation.bind_product_futex(table);
     }
@@ -2155,7 +2142,7 @@ fn timeout_signal_exec_exit_and_drop_cleanup_are_literal_for_every_family() {
         let make = || {
             let mut continuation = BlockedContinuation::from_dispatch_outcome(
                 outcome_for(family, context.thread().registry_id()),
-                capture(&context, generation, ContinuationBackend::Hvpatch),
+                capture(&context, generation),
             )
             .expect("continuation");
             continuation.install_cleanup_probe(Arc::clone(&probe));
@@ -2293,7 +2280,7 @@ fn select_and_sleep_guest_writes_revalidate_exact_mm_before_any_access() {
     ] {
         let continuation = BlockedContinuation::from_dispatch_outcome(
             outcome_for(family, context.thread().registry_id()),
-            capture(&context, generation, ContinuationBackend::Hvpatch),
+            capture(&context, generation),
         )
         .unwrap();
         assert_eq!(continuation.guest_outputs(), expected);
@@ -2374,7 +2361,7 @@ fn fd_wait_pins_exact_open_description_until_cleanup_and_rejects_reuse() {
             sig_mask: WaitSigMask::NONE,
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("pin exact open description");
     let pinned = continuation.pinned_fds_for_test();
@@ -2412,7 +2399,7 @@ fn fd_wait_subscription_rejects_close_reuse_before_redispatch() {
             sig_mask: WaitSigMask::NONE,
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("fd-authorized continuation");
     let mut registration = service.prepare_registration(&continuation);
@@ -2472,7 +2459,7 @@ fn retained_fd_wait_rejects_close_reuse_before_sampling_its_pinned_target() {
             wait,
             sig_mask: WaitSigMask::NONE,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("retained fd wait continuation");
     let mut registration = service.prepare_registration(&continuation);
@@ -2520,7 +2507,7 @@ fn epoll_strict_owner_and_watched_source_authority_have_distinct_resume_results(
                 sig_mask: WaitSigMask::NONE,
                 completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
-            capture(&context, generation, ContinuationBackend::Hvpatch),
+            capture(&context, generation),
         )
         .expect("epoll continuation");
         let scheduler = Arc::new(Scheduler::new(kernel));
@@ -2569,7 +2556,7 @@ fn hvpatch_fd_wait_without_explicit_slot_authority_fails_closed() {
             sig_mask: WaitSigMask::NONE,
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     );
     assert!(matches!(result, Err(ContinuationBuildError::FdPinFailed)));
     close_pair(fds);
@@ -2591,7 +2578,7 @@ fn hvpatch_fd_less_wait_authorizes_empty_slot_authority() {
                 sig_mask: WaitSigMask::NONE,
                 completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
-            capture(&context, generation, ContinuationBackend::Hvpatch),
+            capture(&context, generation),
         );
         assert!(result.is_ok(), "fd-less wait should accept empty authority");
     }
@@ -2612,7 +2599,7 @@ fn hvpatch_synthetic_negative_fd_wait_accepts_slot_authority_and_task_event_wake
             sig_mask: WaitSigMask::NONE,
             completion: FdWaitCompletion::Poll { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("synthetic fd continuation");
     let mut registration = service.prepare_registration(&continuation);
@@ -2656,7 +2643,6 @@ fn shared_wait_service_is_bounded_and_blocked_tasks_own_no_executor() {
                 fixture.running.lease(),
                 request(73),
                 RestartClass::RestartSyscall,
-                ContinuationBackend::Hvpatch,
             )
             .expect("running lease capture"),
         )
@@ -2705,7 +2691,7 @@ fn cancelled_contended_record_locks_do_not_consume_shared_worker_capacity() {
             DispatchOutcome::BlockingRecordLock(
                 contention.waiter(ThreadId::synthetic_for_tests(15_231), serial),
             ),
-            capture(&context, generation, ContinuationBackend::Hvpatch),
+            capture(&context, generation),
         )
         .expect("contended record-lock continuation");
         let mut registration = service.prepare_registration(&continuation);
@@ -2723,7 +2709,7 @@ fn cancelled_contended_record_locks_do_not_consume_shared_worker_capacity() {
         DispatchOutcome::BlockingRecordLock(
             contention.waiter(ThreadId::synthetic_for_tests(15_231), 4),
         ),
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("third record-lock continuation");
     let mut registration = service.prepare_registration(&successful);
@@ -2764,7 +2750,7 @@ fn shared_reactor_observes_real_fd_and_timer_readiness_without_private_waiters()
             sig_mask: WaitSigMask::NONE,
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("fd continuation");
     let mut fd_registration = service.prepare_registration(&fd_continuation);
@@ -2784,7 +2770,7 @@ fn shared_reactor_observes_real_fd_and_timer_readiness_without_private_waiters()
             duration: Duration::from_millis(5),
             remaining: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("timer continuation");
     let mut timer_registration = service.prepare_registration(&timer);
@@ -2815,7 +2801,7 @@ fn shared_reactor_rechecks_private_futex_and_shared_word_producer_state() {
             wait,
             timeout: Some(Duration::from_secs(1)),
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("private futex continuation");
     private.bind_product_futex(&futex);
@@ -2842,7 +2828,7 @@ fn shared_reactor_rechecks_private_futex_and_shared_word_producer_state() {
             value: 7,
             sysv: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("shared-word continuation");
     let mut registration = service.prepare_registration(&shared);
@@ -2875,7 +2861,7 @@ fn shared_reactor_drives_write_record_signal_and_vfork_sources() {
     .expect("write state");
     let mut continuation = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::BlockingWrite(write),
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("write continuation");
     let mut registration = service.prepare_registration(&continuation);
@@ -2908,7 +2894,7 @@ fn shared_reactor_drives_write_record_signal_and_vfork_sources() {
     let lock = record_contention.waiter(ThreadId::synthetic_for_tests(15_241), 7);
     let lock_continuation = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::BlockingRecordLock(lock),
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("record continuation");
     let mut registration = service.prepare_registration(&lock_continuation);
@@ -2928,7 +2914,7 @@ fn shared_reactor_drives_write_record_signal_and_vfork_sources() {
             block_mask: SigBlockMask::NONE,
             timeout: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("signal continuation");
     let mut registration = service.prepare_registration(&signal_continuation);
@@ -2960,7 +2946,7 @@ fn shared_reactor_drives_write_record_signal_and_vfork_sources() {
         .capture(context.thread().key().tid)
         .expect("current parent");
     let mut vfork = BlockedContinuation::from_vfork_parent(
-        capture(&current, generation, ContinuationBackend::Hvpatch),
+        capture(&current, generation),
         child.task().key(),
         wait,
     )
@@ -3039,7 +3025,7 @@ fn shared_reactor_drives_write_record_signal_and_vfork_sources() {
         .capture(fresh.thread().key().tid)
         .expect("current killable vfork parent");
     let mut killable_vfork = BlockedContinuation::from_vfork_parent(
-        capture(&kill_context, generation, ContinuationBackend::Hvpatch),
+        capture(&kill_context, generation),
         kill_child.task().key(),
         kill_wait.clone(),
     )
@@ -3215,7 +3201,6 @@ fn capture_uses_live_lease_mm_and_independent_asid_authority() {
         &lease,
         request(73),
         RestartClass::RestartSyscall,
-        ContinuationBackend::Hvpatch,
     )
     .expect("lease-derived capture");
     let continuation = BlockedContinuation::from_dispatch_outcome(
@@ -3241,7 +3226,7 @@ fn same_task_same_mm_revision_drift_reauthorizes_variant_resources() {
             duration: Duration::from_secs(1),
             remaining: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("continuation");
     let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
@@ -3288,7 +3273,7 @@ fn signal_restart_is_derived_from_captured_kernel_action_not_event_input() {
             sig_mask: WaitSigMask::Replace(SigSet::EMPTY),
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("restartable continuation");
     continuation.install_temporary_signal_mask(&context);
@@ -3332,7 +3317,7 @@ fn reserved_signal_keeps_exact_action_when_opposite_restart_signal_arrives_befor
             sig_mask: WaitSigMask::NONE,
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("continuation");
     let event = SignalReadinessProbe::from_continuation(&continuation)
@@ -3371,7 +3356,7 @@ fn host_slot_signal_is_reserved_and_cancelled_into_exact_kernel_ownership() {
             sig_mask: WaitSigMask::Replace(SigSet::EMPTY),
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("continuation");
     let tid = context.thread().key().tid.raw();
@@ -3434,7 +3419,7 @@ fn realtime_host_slot_import_preserves_fifo_multiplicity_and_exact_cancellation_
             sig_mask: WaitSigMask::NONE,
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("suspended RT continuation");
     let event = SignalReadinessProbe::from_continuation(&continuation)
@@ -3473,7 +3458,7 @@ fn realtime_host_slot_import_preserves_fifo_multiplicity_and_exact_cancellation_
             sig_mask: WaitSigMask::NONE,
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("next suspended RT continuation");
     let next_event = SignalReadinessProbe::from_continuation(&next)
@@ -3502,7 +3487,7 @@ fn kernel_native_guest_signal_continuation_cancels_and_delivers_without_host_sid
             sig_mask: WaitSigMask::NONE,
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("guest-signal continuation");
     let mut registration = service.prepare_registration(&continuation);
@@ -3558,7 +3543,7 @@ fn kernel_native_guest_signal_continuation_cancels_and_delivers_without_host_sid
             sig_mask: WaitSigMask::NONE,
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("replay continuation");
     let replay_event = SignalReadinessProbe::from_continuation(&replay)
@@ -3594,7 +3579,7 @@ fn ignored_lower_signal_does_not_hide_next_exact_deliverable_reservation() {
             sig_mask: WaitSigMask::NONE,
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("continuation");
     let event = SignalReadinessProbe::from_continuation(&continuation)
@@ -3746,7 +3731,7 @@ fn partial_blocking_write_never_restarts_after_caught_sa_restart_signal() {
     close_pair(fds);
     let continuation = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::BlockingWrite(write),
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("partial write continuation");
     let result = continuation
@@ -3773,7 +3758,7 @@ fn signal_readiness_honors_replace_additive_ignore_and_live_restart_action() {
             sig_mask: WaitSigMask::Replace(SigSet::EMPTY),
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("replacement-mask continuation");
     let mut replacement_registration = service.prepare_registration(&replacement);
@@ -3816,7 +3801,7 @@ fn signal_readiness_honors_replace_additive_ignore_and_live_restart_action() {
             sig_mask: WaitSigMask::Additive(usr1_set),
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("additive-mask continuation");
     let mut additive_registration = service.prepare_registration(&additive);
@@ -3897,7 +3882,7 @@ fn indefinite_registration_has_no_synthetic_timeout_or_periodic_probe_deadline()
             sig_mask: WaitSigMask::NONE,
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("indefinite continuation");
     let scheduler = Arc::new(Scheduler::new(kernel));
@@ -3994,7 +3979,7 @@ fn the_reactor_work_set_answers_exactly_what_a_full_scan_would() {
                     duration: Duration::from_millis(10 * (index + 1)),
                     remaining: None,
                 },
-                capture(&context, generation, ContinuationBackend::Hvpatch),
+                capture(&context, generation),
             )
         } else {
             BlockedContinuation::from_dispatch_outcome(
@@ -4004,7 +3989,7 @@ fn the_reactor_work_set_answers_exactly_what_a_full_scan_would() {
                     sig_mask: WaitSigMask::NONE,
                     completion: FdWaitCompletion::Fd { on_timeout: 0 },
                 },
-                capture(&context, generation, ContinuationBackend::Hvpatch),
+                capture(&context, generation),
             )
         }
         .expect("continuation");
@@ -4091,7 +4076,7 @@ fn a_reactor_cycle_visits_only_its_pollable_registrations() {
                 duration: Duration::from_secs(3_600),
                 remaining: None,
             },
-            capture(&context, generation, ContinuationBackend::Hvpatch),
+            capture(&context, generation),
         )
         .expect("timer continuation");
         let mut registration = service.prepare_registration(&continuation);
@@ -4106,7 +4091,7 @@ fn a_reactor_cycle_visits_only_its_pollable_registrations() {
             sig_mask: WaitSigMask::NONE,
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("pollable continuation");
     let mut pollable_registration = service.prepare_registration(&pollable);
@@ -4149,7 +4134,7 @@ fn idle_256_indefinite_waits_use_one_blocking_poll_without_probe_storm() {
                 sig_mask: WaitSigMask::NONE,
                 completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
-            capture(&context, generation, ContinuationBackend::Hvpatch),
+            capture(&context, generation),
         )
         .expect("indefinite continuation");
         let mut registration = service.prepare_registration(&continuation);
@@ -4229,7 +4214,7 @@ fn deterministic_rendezvous_enrollment_vs_reactor_host_write_interleaving() {
     .expect("write state");
     let mut continuation = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::BlockingWrite(write),
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("write continuation");
     let mut registration = service.prepare_registration(&continuation);
@@ -4313,7 +4298,7 @@ fn cancellation_during_inflight_host_write_competing_with_ready_event_drains_saf
     .expect("write state");
     let mut continuation = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::BlockingWrite(write),
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("write continuation");
     let mut registration = service.prepare_registration(&continuation);
@@ -4456,7 +4441,7 @@ fn incoming_drain_waker_clone_runs_outside_registration_locks() {
             duration: Duration::from_secs(60),
             remaining: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("sleep continuation");
     let registration = service.prepare_registration(&continuation);
@@ -4534,7 +4519,7 @@ fn incoming_task_waker_clone_runs_outside_registration_locks() {
             duration: Duration::from_secs(60),
             remaining: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("sleep continuation");
     let registration = service.prepare_registration(&continuation);
@@ -4580,7 +4565,7 @@ fn drain_waker_runs_outside_operation_gate_lock() {
             duration: Duration::from_secs(60),
             remaining: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("sleep continuation");
     let registration = service.prepare_registration(&continuation);
@@ -4666,7 +4651,7 @@ fn replaced_drain_waker_drops_outside_registration_locks() {
             duration: Duration::from_secs(60),
             remaining: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("sleep continuation");
     let registration = service.prepare_registration(&continuation);
@@ -4758,7 +4743,7 @@ fn replaced_task_waker_drops_outside_registration_locks() {
             duration: Duration::from_secs(60),
             remaining: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("sleep continuation");
     let registration = service.prepare_registration(&continuation);
@@ -4844,7 +4829,7 @@ fn event_future_cancelled_observation_drains_inflight_operation_safely() {
     .expect("write state");
     let mut continuation = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::BlockingWrite(write),
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("write continuation");
     let mut registration = service.prepare_registration(&continuation);
@@ -4924,7 +4909,7 @@ fn event_future_cancelled_observation_drains_inflight_operation_safely() {
             duration: Duration::from_millis(1),
             remaining: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("sleep continuation");
     let mut unrelated_reg = service.prepare_registration(&unrelated_continuation);
@@ -4995,7 +4980,7 @@ fn cancellation_before_drive_prevents_fresh_host_work() {
     .expect("write state");
     let continuation = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::BlockingWrite(write),
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("write continuation");
     let mut registration = service.prepare_registration(&continuation);
@@ -5048,7 +5033,7 @@ fn shared_word_lifetime_and_safety_through_cancellation_retirement() {
             value: 42,
             sysv: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("shared word continuation");
     let mut registration = service.prepare_registration(&continuation);
@@ -5137,7 +5122,7 @@ fn recheck_registration_race_rejects_late_publication_and_requeues_reserved_sign
             block_mask: SigBlockMask::NONE,
             timeout: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("signals continuation");
     let mut registration = service.prepare_registration(&continuation);
@@ -5230,7 +5215,7 @@ fn stale_and_reused_token_rejection_prevents_cross_wait_resurrection() {
             duration: Duration::from_secs(60),
             remaining: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("continuation1");
     let mut registration1 = service.prepare_registration(&continuation1);
@@ -5248,7 +5233,7 @@ fn stale_and_reused_token_rejection_prevents_cross_wait_resurrection() {
             duration: Duration::from_secs(60),
             remaining: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("continuation2");
     let mut registration2 = service.prepare_registration(&continuation2);
@@ -5319,7 +5304,7 @@ fn unrelated_waiter_progress_during_concurrent_host_write() {
     .expect("write state");
     let write_cont = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::BlockingWrite(write),
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("write continuation");
     let mut write_reg = service.prepare_registration(&write_cont);
@@ -5352,7 +5337,7 @@ fn unrelated_waiter_progress_during_concurrent_host_write() {
             duration: Duration::from_millis(1),
             remaining: None,
         },
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("sleep continuation");
     let mut sleep_reg = service.prepare_registration(&sleep_cont);
@@ -5423,7 +5408,7 @@ fn lock_ordering_opposing_locks_rendezvous_completes_without_deadlock() {
     .expect("write state");
     let mut continuation = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::BlockingWrite(write),
-        capture(&context, generation, ContinuationBackend::Hvpatch),
+        capture(&context, generation),
     )
     .expect("write continuation");
     let mut registration = service.prepare_registration(&continuation);
@@ -5535,11 +5520,9 @@ fn syslog_read_continuation_real_fd_event_and_redispatch() {
 
     // 2. Convert to BlockedContinuation and enroll in CarrierWaitService
     let generation = publish(&context, 0x981);
-    let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        outcome,
-        capture(&context, generation, ContinuationBackend::Hvpatch),
-    )
-    .expect("syslog blocked continuation");
+    let mut continuation =
+        BlockedContinuation::from_dispatch_outcome(outcome, capture(&context, generation))
+            .expect("syslog blocked continuation");
 
     let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
     let service = CarrierWaitService::new(scheduler);
@@ -5621,11 +5604,9 @@ fn syslog_read_continuation_cancellation_and_retirement() {
     assert!(matches!(&outcome, DispatchOutcome::WaitOnFds { .. }));
 
     let generation = publish(&context, 0x982);
-    let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        outcome,
-        capture(&context, generation, ContinuationBackend::Hvpatch),
-    )
-    .expect("syslog blocked continuation");
+    let mut continuation =
+        BlockedContinuation::from_dispatch_outcome(outcome, capture(&context, generation))
+            .expect("syslog blocked continuation");
 
     let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
     let service = CarrierWaitService::new(scheduler);
@@ -5787,11 +5768,9 @@ fn controller_mixed_ppoll_netlink_real_service_wake() {
         "mixed ppoll must yield: {outcome:?}"
     );
     let generation = publish(&context, 0x982);
-    let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        outcome,
-        capture(&context, generation, ContinuationBackend::Hvpatch),
-    )
-    .expect("actual mixed ppoll continuation");
+    let mut continuation =
+        BlockedContinuation::from_dispatch_outcome(outcome, capture(&context, generation))
+            .expect("actual mixed ppoll continuation");
     let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
     let mut registration = service.prepare_registration(&continuation);
     service
@@ -5981,11 +5960,9 @@ fn controller_nested_epoll_real_service_wake() {
         "nested epoll wait must yield: {outcome:?}"
     );
     let generation = publish(&context, 0x983);
-    let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        outcome,
-        capture(&context, generation, ContinuationBackend::Hvpatch),
-    )
-    .expect("actual nested epoll continuation");
+    let mut continuation =
+        BlockedContinuation::from_dispatch_outcome(outcome, capture(&context, generation))
+            .expect("actual nested epoll continuation");
     let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
     let mut registration = service.prepare_registration(&continuation);
     service
@@ -6098,11 +6075,9 @@ fn controller_carrier_wait_service_cancellation_and_retirement() {
     assert!(matches!(&outcome, DispatchOutcome::WaitOnFds { .. }));
 
     let generation = publish(&context, 0x984);
-    let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        outcome,
-        capture(&context, generation, ContinuationBackend::Hvpatch),
-    )
-    .expect("continuation");
+    let mut continuation =
+        BlockedContinuation::from_dispatch_outcome(outcome, capture(&context, generation))
+            .expect("continuation");
     let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
     let mut registration = service.prepare_registration(&continuation);
     service.enroll(&mut registration).expect("enroll");
@@ -6214,11 +6189,9 @@ fn controller_in_flight_callback_rejected_on_retired_or_recycled_registration() 
         .unwrap();
 
     let generation = publish(&context, 0x985);
-    let mut continuation1 = BlockedContinuation::from_dispatch_outcome(
-        outcome,
-        capture(&context, generation, ContinuationBackend::Hvpatch),
-    )
-    .expect("continuation1");
+    let mut continuation1 =
+        BlockedContinuation::from_dispatch_outcome(outcome, capture(&context, generation))
+            .expect("continuation1");
     let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
     let mut registration1 = service.prepare_registration(&continuation1);
     service.enroll(&mut registration1).expect("enroll1");
@@ -6261,11 +6234,9 @@ fn controller_in_flight_callback_rejected_on_retired_or_recycled_registration() 
     let outcome_fresh = dispatcher
         .dispatch(&context, req, &mut memory, &reporter)
         .unwrap();
-    let mut continuation2 = BlockedContinuation::from_dispatch_outcome(
-        outcome_fresh,
-        capture(&context, generation, ContinuationBackend::Hvpatch),
-    )
-    .expect("continuation2");
+    let mut continuation2 =
+        BlockedContinuation::from_dispatch_outcome(outcome_fresh, capture(&context, generation))
+            .expect("continuation2");
     let mut registration2 = service.prepare_registration(&continuation2);
     service.enroll(&mut registration2).expect("enroll2");
     let token2 = registration2.wake_token();
@@ -6472,11 +6443,9 @@ fn controller_nested_epoll_5_levels_deep_real_service_wake() {
         "nested 5-level epoll wait must yield: {outcome:?}"
     );
     let generation = publish(&context, 0x986);
-    let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        outcome,
-        capture(&context, generation, ContinuationBackend::Hvpatch),
-    )
-    .expect("actual 5-level nested epoll continuation");
+    let mut continuation =
+        BlockedContinuation::from_dispatch_outcome(outcome, capture(&context, generation))
+            .expect("actual 5-level nested epoll continuation");
     let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
     let mut registration = service.prepare_registration(&continuation);
     service

@@ -7454,7 +7454,6 @@ mod tests {
                 &lease,
                 SyscallRequest::new(220, crate::compat::SyscallArgs([0; 6])),
                 continuation::RestartClass::RestartSyscall,
-                continuation::ContinuationBackend::Hvpatch,
             )
             .expect("capture vfork parent"),
             vfork_child.task().key(),

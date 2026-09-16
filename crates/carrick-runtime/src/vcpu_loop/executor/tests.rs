@@ -4088,9 +4088,7 @@ fn blocked_task_releases_the_only_worker_immediately() {
 
 #[test]
 fn pool_drives_owned_blocked_continuation_into_kernel_state() {
-    use crate::vcpu_loop::continuation::{
-        BlockedContinuation, ContinuationBackend, ContinuationCapture, RestartClass,
-    };
+    use crate::vcpu_loop::continuation::{BlockedContinuation, ContinuationCapture, RestartClass};
 
     let (kernel, blocked) = bootstrap(14_045);
     let runnable = sibling(&kernel, &blocked, 24_045);
@@ -4107,7 +4105,6 @@ fn pool_drives_owned_blocked_continuation_into_kernel_state() {
             blocked_generation,
             SyscallRequest::new(101, SyscallArgs([0; 6])),
             RestartClass::Never,
-            ContinuationBackend::Hvpatch,
         )
         .expect("capture continuation"),
     )
@@ -5344,7 +5341,6 @@ impl VforkTestFixture {
             self.parent_generation,
             SyscallRequest::new(220, SyscallArgs([0; 6])),
             crate::vcpu_loop::continuation::RestartClass::Never,
-            crate::vcpu_loop::continuation::ContinuationBackend::Hvpatch,
         )
         .unwrap();
         crate::vcpu_loop::continuation::BlockedContinuation::from_vfork_parent(
