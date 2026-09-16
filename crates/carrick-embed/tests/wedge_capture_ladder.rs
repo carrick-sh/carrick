@@ -154,7 +154,8 @@ fn a_carrier_that_cannot_consume_its_abort_is_captured_and_named() {
 /// This arms the reaper, which ends this process minutes from now. That is the
 /// shipped behaviour and the reason this file holds exactly one test.
 fn capture_this_carrier_for_real() {
-    let pid = i32::try_from(std::process::id()).expect("host pid");
+    let pid = i32::try_from(std::process::id()).unwrap_or(-1);
+    assert!(pid > 0, "host pid must fit an i32 carrier pid");
     let started = Instant::now();
     let capture = carrick_runtime::wedge_capture::capture_wedged_carrier(
         carrick_runtime::wedge_capture::WedgeCaptureRequest {
@@ -166,13 +167,15 @@ fn capture_this_carrier_for_real() {
             out_root: std::path::PathBuf::from("target/postmortem"),
         },
     );
-    let capture = match capture {
-        Ok(capture) => capture,
-        Err(error) => panic!(
-            "the capture rung produced no evidence ({error}); on this box that means \
-             `sudo -n lldb` is unavailable — fix the debugger access, do not relax this \
-             assertion, because an absent debugger is a failed capture and never a pass"
-        ),
+    assert!(
+        capture.is_ok(),
+        "the capture rung produced no evidence ({:?}); on this box that means \
+         `sudo -n lldb` is unavailable — fix the debugger access, do not relax this \
+         assertion, because an absent debugger is a failed capture and never a pass",
+        capture.as_ref().err()
+    );
+    let Ok(capture) = capture else {
+        return;
     };
     eprintln!(
         "WEDGE CAPTURE LIVE: {} in {:?}",
@@ -188,18 +191,37 @@ fn capture_this_carrier_for_real() {
         "artifacts must be filed under the label and pid: {}",
         capture.dir.display()
     );
-    let core = capture.core.clone().expect("a complete capture has a core");
+    assert!(capture.core.is_some(), "a complete capture has a core");
+    let Some(core) = capture.core.clone() else {
+        return;
+    };
     for (name, artifact) in [
         ("manifest", capture.dir.join("manifest.json")),
         ("backtrace", capture.backtrace.clone()),
         ("core", core),
     ] {
-        let bytes = std::fs::metadata(&artifact)
-            .unwrap_or_else(|error| panic!("{name} {} is missing: {error}", artifact.display()))
-            .len();
+        let metadata = std::fs::metadata(&artifact);
+        assert!(
+            metadata.is_ok(),
+            "{name} {} is missing: {:?}",
+            artifact.display(),
+            metadata.as_ref().err()
+        );
+        let Ok(metadata) = metadata else {
+            return;
+        };
+        let bytes = metadata.len();
         assert!(bytes > 0, "{name} {} is empty", artifact.display());
     }
-    let backtrace = std::fs::read_to_string(&capture.backtrace).expect("read backtrace");
+    let backtrace = std::fs::read_to_string(&capture.backtrace);
+    assert!(
+        backtrace.is_ok(),
+        "read backtrace: {:?}",
+        backtrace.as_ref().err()
+    );
+    let Ok(backtrace) = backtrace else {
+        return;
+    };
     assert!(
         backtrace.contains("thread #"),
         "the backtrace must carry real host threads: {}",
