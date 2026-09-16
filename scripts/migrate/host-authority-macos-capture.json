@@ -3967,6 +3967,26 @@
         "macos-runtime-default"
       ],
       "source": {
+        "byte_end": 1545,
+        "byte_start": 1532,
+        "column": 25,
+        "column_end": 38,
+        "column_start": 25,
+        "file": "crates/carrick-runtime/src/dispatch/rosetta.rs",
+        "line": 25,
+        "line_end": 25,
+        "line_start": 25
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-READ",
+      "expansion": null,
+      "operation": "std::fs::read",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
         "byte_end": 54333,
         "byte_start": 54320,
         "column": 16,
@@ -4067,28 +4087,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 18386,
-        "byte_start": 18373,
-        "column": 25,
-        "column_end": 38,
-        "column_start": 25,
-        "file": "crates/carrick-runtime/src/lib.rs",
-        "line": 353,
-        "line_end": 353,
-        "line_start": 353
-      }
-    },
-    {
-      "catalog_id": "HA-CATALOG-FS-READ",
-      "expansion": null,
-      "operation": "std::fs::read",
-      "profiles": [
-        "macos-cli-default",
-        "macos-runtime-default"
-      ],
-      "source": {
-        "byte_end": 10281,
-        "byte_start": 10268,
+        "byte_end": 10300,
+        "byte_start": 10287,
         "column": 16,
         "column_end": 29,
         "column_start": 16,
@@ -4107,8 +4107,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 10739,
-        "byte_start": 10726,
+        "byte_end": 10758,
+        "byte_start": 10745,
         "column": 29,
         "column_end": 42,
         "column_start": 29,
@@ -4127,8 +4127,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 18545,
-        "byte_start": 18532,
+        "byte_end": 18564,
+        "byte_start": 18551,
         "column": 40,
         "column_end": 53,
         "column_start": 40,
@@ -4951,15 +4951,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 16246,
-        "byte_start": 16223,
+        "byte_end": 15800,
+        "byte_start": 15777,
         "column": 22,
         "column_end": 45,
         "column_start": 22,
         "file": "crates/carrick-runtime/src/lib.rs",
-        "line": 308,
-        "line_end": 308,
-        "line_start": 308
+        "line": 302,
+        "line_end": 302,
+        "line_start": 302
       }
     },
     {
@@ -8845,15 +8845,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 81835,
-        "byte_start": 81819,
+        "byte_end": 81859,
+        "byte_start": 81843,
         "column": 39,
         "column_end": 55,
         "column_start": 39,
         "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-        "line": 2029,
-        "line_end": 2029,
-        "line_start": 2029
+        "line": 2030,
+        "line_end": 2030,
+        "line_start": 2030
       }
     },
     {
@@ -8865,15 +8865,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 90446,
-        "byte_start": 90430,
+        "byte_end": 90470,
+        "byte_start": 90454,
         "column": 47,
         "column_end": 63,
         "column_start": 47,
         "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-        "line": 2244,
-        "line_end": 2244,
-        "line_start": 2244
+        "line": 2245,
+        "line_end": 2245,
+        "line_start": 2245
       }
     },
     {
@@ -11575,8 +11575,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 47332,
-        "byte_start": 47310,
+        "byte_end": 47351,
+        "byte_start": 47329,
         "column": 17,
         "column_end": 39,
         "column_start": 17,
@@ -11627,9 +11627,9 @@
       }
     }
   ],
-  "rows_sha256": "23dc697b9501f0fe0cdd04ab78642f04de2a1e03c1596d7b705e8da6736e777b",
+  "rows_sha256": "d0950e9d686977a2b929adf34949961256203ac162437910f04699691d267be0",
   "schema": 1,
-  "source_head": "6e77674aa362103622cb7a0adbda2a3ebcdb5ba5",
+  "source_head": "ac919770326311d59302ecdf0be5a32271f1250a",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
