@@ -85,7 +85,9 @@
 //! helper routines and the AF_UNIX registry live in the `support` submodule.
 pub(crate) use super::dispatcher::NetView;
 use super::*;
-use crate::dispatch::wait_plan::{ParkSampling, WaitAssembly, WaitRequestFd};
+use crate::dispatch::wait_plan::{
+    InvalidFdPolicy, ParkSampling, WaitAssembly, WaitRequest, WaitRequestFd,
+};
 use crate::dispatch::wait_source::{
     HostProxyCoverage, HostWaitTarget, WaitInterest, WaitRegistration, WaitSource,
 };
@@ -2928,7 +2930,15 @@ impl<'a> NetView<'a> {
             // registers an fd with an empty mask and rejects an invalid fd
             // with EBADF above, so "some revents" and "some SELECT-ready
             // revents" name the same set here.
-            let revents: Vec<i16> = match this.assemble_wait(&files, &request, timeout_ms != 0, &[]) {
+            let select_wait = WaitRequest {
+                fds: &request,
+                // select(2) rejects an invalid fd in any set with EBADF for the
+                // whole call, which the `fd_is_valid` screen above already did.
+                invalid_fd: InvalidFdPolicy::FailEbadf,
+                may_block: timeout_ms != 0,
+                watched: &[],
+            };
+            let revents: Vec<i16> = match this.assemble_wait(&files, &select_wait) {
                 WaitAssembly::Errno(errno) => return Ok(DispatchOutcome::errno(errno)),
                 WaitAssembly::Ready { revents } | WaitAssembly::NotReady { revents } => {
                     revents.iter().map(|revents| revents.bits()).collect()
@@ -3238,8 +3248,16 @@ impl<'a> NetView<'a> {
                     requested: LinuxPollEvents::from_bits_retain(pollfd.events),
                 })
                 .collect();
+            let poll_wait = WaitRequest {
+                fds: &request,
+                // poll(2)/ppoll(2) report an invalid fd >= 0 per entry as
+                // POLLNVAL — a ready entry — and return normally.
+                invalid_fd: InvalidFdPolicy::ReportPollNval,
+                may_block: timeout_ms != 0,
+                watched: &[],
+            };
             let (revents, park) =
-                match this.assemble_wait(&files, &request, timeout_ms != 0, &[]) {
+                match this.assemble_wait(&files, &poll_wait) {
                     WaitAssembly::Errno(errno) => return Ok(DispatchOutcome::errno(errno)),
                     WaitAssembly::Ready { revents } | WaitAssembly::NotReady { revents } => {
                         (revents, None)

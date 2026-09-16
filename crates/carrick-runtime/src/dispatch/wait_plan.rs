@@ -14,8 +14,12 @@
 //! cannot answer, and hands back per-fd revents in REQUEST order plus the
 //! typed park. What is left in the syscalls is ABI marshalling: `fd_set`
 //! bitmaps and `clear_on_timeout` for select, `pollfd` writeback for poll.
+//!
+//! Where the two ABIs genuinely disagree, the disagreement is an INPUT to the
+//! one assembly rather than a second body: [`InvalidFdPolicy`] carries what
+//! the caller owes the guest for an fd naming no open description.
 
-use carrick_abi::{LinuxErrno, LinuxPollEvents};
+use carrick_abi::{LINUX_EBADF, LinuxErrno, LinuxPollEvents};
 
 use crate::dispatch::WaitFds;
 use crate::dispatch::abi_args::Fd;
@@ -28,6 +32,42 @@ use crate::dispatch::wait_source::{HostProxyCoverage, WaitRegistration, WaitSour
 pub(in crate::dispatch) struct WaitRequestFd {
     pub fd: Fd,
     pub requested: LinuxPollEvents,
+}
+
+/// What a wait names when one of its guest fds has no open description.
+///
+/// The answer is a property of the CALLING ABI, not of the fd, so it is an
+/// input to the ONE assembly rather than a second code path: `poll(2)` and
+/// `ppoll(2)` report an invalid fd `>= 0` per entry as `POLLNVAL` and return
+/// normally, while `select(2)`/`pselect6(2)` fail the whole call with `EBADF`.
+/// A NEGATIVE pollfd is ignored under either policy — `wait_source_for`
+/// answers `Ok(None)` for it before any policy applies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::dispatch) enum InvalidFdPolicy {
+    /// `poll`/`ppoll`: `POLLNVAL` in that entry's revents. The fd is never
+    /// registered as a wait source, and the entry counts toward the ready
+    /// total, so a set mixing ready fds with a closed one still returns a
+    /// count rather than an error.
+    ReportPollNval,
+    /// `select`/`pselect6`: `EBADF` for the whole call.
+    FailEbadf,
+}
+
+/// One wait-shaped syscall's whole question: which fds, what the ABI does with
+/// an invalid one, whether the caller may park, and which slots are advisory.
+pub(in crate::dispatch) struct WaitRequest<'a> {
+    /// The guest fds and their requested events, in REQUEST order — the order
+    /// [`WaitAssembly`]'s revents come back in.
+    pub fds: &'a [WaitRequestFd],
+    /// What this ABI does with an fd naming no open description.
+    pub invalid_fd: InvalidFdPolicy,
+    /// Whether the caller may block; `false` turns an otherwise-park into
+    /// [`WaitAssembly::NotReady`].
+    pub may_block: bool,
+    /// Advisory fds: they force a re-dispatch when their slot is replaced and
+    /// are never probed, which is what `epoll_pwait`'s interest targets are
+    /// for.
+    pub watched: &'a [Fd],
 }
 
 /// How a park must be re-evaluated when it wakes.
@@ -66,23 +106,41 @@ pub(in crate::dispatch) enum WaitAssembly {
     Errno(LinuxErrno),
 }
 
+/// What one requested fd turned out to be.
+#[derive(Clone, Copy, Debug)]
+enum RequestedSource {
+    /// The fd names a live description. `None` inside means it takes no part
+    /// in the wait: a negative pollfd, or a description asked for no events.
+    Live(Option<WaitRegistration>),
+    /// The fd names no open description and the calling ABI reports that in
+    /// the entry ([`InvalidFdPolicy::ReportPollNval`]) instead of failing.
+    Invalid,
+}
+
 impl<'a> NetView<'a> {
     /// Classify, probe and (if nothing is ready) park every fd of one wait.
-    ///
-    /// `watched` fds are advisory: they force a re-dispatch when their slot is
-    /// replaced and are never probed, which is what `epoll_pwait`'s interest
-    /// targets are for.
     pub(in crate::dispatch) fn assemble_wait(
         &self,
         files: &crate::kernel::FileTable,
-        request: &[WaitRequestFd],
-        may_block: bool,
-        watched: &[Fd],
+        request: &WaitRequest<'_>,
     ) -> WaitAssembly {
-        let mut registrations: Vec<Option<WaitRegistration>> = Vec::with_capacity(request.len());
-        for entry in request {
+        let WaitRequest {
+            fds: requested_fds,
+            invalid_fd,
+            may_block,
+            watched,
+        } = *request;
+        let mut registrations: Vec<RequestedSource> = Vec::with_capacity(requested_fds.len());
+        for entry in requested_fds {
             match self.wait_source_for(files, entry.fd, entry.requested) {
-                Ok(registration) => registrations.push(registration),
+                Ok(registration) => registrations.push(RequestedSource::Live(registration)),
+                // An fd with no open description. `poll` owes the guest a
+                // per-entry POLLNVAL; `select` owes it EBADF for the call.
+                Err(errno)
+                    if errno == LINUX_EBADF && invalid_fd == InvalidFdPolicy::ReportPollNval =>
+                {
+                    registrations.push(RequestedSource::Invalid);
+                }
                 Err(errno) => return WaitAssembly::Errno(errno),
             }
         }
@@ -90,10 +148,18 @@ impl<'a> NetView<'a> {
         // ONE non-blocking host poll for the whole wait. The array is
         // COMPACTED — a description-backed fd contributes no entry — so each
         // request position remembers where its host half landed.
-        let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(request.len());
-        let mut host_slot: Vec<Option<usize>> = Vec::with_capacity(request.len());
+        let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(requested_fds.len());
+        let mut host_slot: Vec<Option<usize>> = Vec::with_capacity(requested_fds.len());
         for registration in &registrations {
-            match registration.and_then(|registration| registration.source().host()) {
+            let host = match registration {
+                RequestedSource::Live(registration) => {
+                    registration.and_then(|registration| registration.source().host())
+                }
+                // An invalid fd is never registered as a wait source: there is
+                // no description to probe and no host half to poll.
+                RequestedSource::Invalid => None,
+            };
+            match host {
                 Some(host) => {
                     host_slot.push(Some(pollfds.len()));
                     pollfds.push(libc::pollfd {
@@ -122,11 +188,21 @@ impl<'a> NetView<'a> {
                 self.poll_ready_events(entry.fd.0, entry.requested.bits()),
             )
         };
-        let revents: Vec<LinuxPollEvents> = request
+        let live_source = |index: usize| match registrations[index] {
+            RequestedSource::Live(registration) => registration.map(|r| r.source()),
+            RequestedSource::Invalid => None,
+        };
+        let revents: Vec<LinuxPollEvents> = requested_fds
             .iter()
             .enumerate()
-            .map(
-                |(index, entry)| match registrations[index].map(|r| r.source()) {
+            .map(|(index, entry)| {
+                // An fd naming no open description: the ABI already said this
+                // is reported per entry, and POLLNVAL COUNTS as ready, so the
+                // call returns a count rather than an error.
+                if matches!(registrations[index], RequestedSource::Invalid) {
+                    return LinuxPollEvents::NVAL;
+                }
+                match live_source(index) {
                     // A host descriptor's revents ARE the guest's answer.
                     Some(WaitSource::Host { .. }) => host_revents(index),
                     // No host object, or a host descriptor that only observes host
@@ -154,8 +230,8 @@ impl<'a> NetView<'a> {
                     // description the guest asked no events of.
                     None if entry.fd.0 < 0 => LinuxPollEvents::empty(),
                     None => sample(entry),
-                },
-            )
+                }
+            })
             .collect();
 
         if revents.iter().any(|revents| !revents.is_empty()) {
@@ -167,25 +243,36 @@ impl<'a> NetView<'a> {
 
         // Only a source the reactor's own pollfd array can see may be
         // re-evaluated by re-dispatching; a negative fd has nothing to see.
-        let sampling = if request
-            .iter()
-            .zip(registrations.iter())
-            .all(|(entry, registration)| match registration {
-                Some(registration) => registration.source().host().is_some(),
-                None => entry.fd.0 < 0,
-            }) {
-            ParkSampling::HostDescriptors
-        } else {
-            ParkSampling::RetainedDescriptions
-        };
+        // An invalid fd never reaches here — its POLLNVAL is ready above.
+        let sampling =
+            if requested_fds
+                .iter()
+                .zip(registrations.iter())
+                .all(|(entry, registration)| match registration {
+                    RequestedSource::Live(Some(registration)) => {
+                        registration.source().host().is_some()
+                    }
+                    RequestedSource::Live(None) => entry.fd.0 < 0,
+                    RequestedSource::Invalid => false,
+                })
+            {
+                ParkSampling::HostDescriptors
+            } else {
+                ParkSampling::RetainedDescriptions
+            };
         let watched: Vec<WatchedSlot> = watched
             .iter()
             .filter_map(|fd| crate::kernel::FileSlotNumber::for_open_fd(fd.0).ok())
             .filter_map(|number| files.capture_slot_or_stdio_authority(number))
             .map(WatchedSlot::new)
             .collect();
-        let registrations: Vec<WaitRegistration> =
-            registrations.iter().flatten().copied().collect();
+        let registrations: Vec<WaitRegistration> = registrations
+            .iter()
+            .filter_map(|registration| match registration {
+                RequestedSource::Live(registration) => *registration,
+                RequestedSource::Invalid => None,
+            })
+            .collect();
         // A wait that named no source at all is a pure timeout wait.
         let wait = if registrations.is_empty() && watched.is_empty() {
             WaitFds::empty()
@@ -267,14 +354,37 @@ mod tests {
             .collect()
     }
 
+    fn assemble_with_policy(
+        dispatcher: &SyscallDispatcher,
+        request: &[WaitRequestFd],
+        may_block: bool,
+        invalid_fd: InvalidFdPolicy,
+    ) -> WaitAssembly {
+        let view = dispatcher.net_view();
+        let files = view.captured_file_table();
+        view.assemble_wait(
+            &files,
+            &WaitRequest {
+                fds: request,
+                invalid_fd,
+                may_block,
+                watched: &[],
+            },
+        )
+    }
+
+    /// The `poll`/`ppoll` ABI.
     fn assemble(
         dispatcher: &SyscallDispatcher,
         request: &[WaitRequestFd],
         may_block: bool,
     ) -> WaitAssembly {
-        let view = dispatcher.net_view();
-        let files = view.captured_file_table();
-        view.assemble_wait(&files, request, may_block, &[])
+        assemble_with_policy(
+            dispatcher,
+            request,
+            may_block,
+            InvalidFdPolicy::ReportPollNval,
+        )
     }
 
     fn revents_of(assembly: &WaitAssembly) -> &[LinuxPollEvents] {
@@ -438,6 +548,63 @@ mod tests {
             ],
             "the host pipe is the only host entry, yet it must report at index 2"
         );
+    }
+
+    /// `poll(2)`: a pollfd naming a CLOSED fd is not an error. The entry
+    /// reports `POLLNVAL`, the entry COUNTS toward the ready total, and the
+    /// call returns normally — the `pollevent` probe's `poll_invalid_nval` and
+    /// `poll_multi_ready_count=3` / `poll_multi_bad_nval` lines.
+    #[test]
+    fn poll_reports_pollnval_for_a_closed_fd_and_counts_it_ready() {
+        let dispatcher = SyscallDispatcher::new();
+        let (ready_fd, ready_writer) = host_pipe(&dispatcher);
+        let (closed_fd, _closed_writer) = host_pipe(&dispatcher);
+        assert_eq!(
+            unsafe { libc::write(ready_writer, c"x".as_ptr().cast(), 1) },
+            1
+        );
+        dispatcher.close_fd_for_internal_rollback(closed_fd);
+
+        let request = pollin(&[ready_fd, closed_fd]);
+        let assembly = assemble(&dispatcher, &request, true);
+        assert!(
+            matches!(assembly, WaitAssembly::Ready { .. }),
+            "a closed fd is reported per entry, never as a failed poll, got \
+             {assembly:?}"
+        );
+        assert_eq!(
+            revents_of(&assembly),
+            [LinuxPollEvents::IN, LinuxPollEvents::NVAL]
+        );
+        assert_eq!(
+            revents_of(&assembly)
+                .iter()
+                .filter(|revents| !revents.is_empty())
+                .count(),
+            2,
+            "POLLNVAL counts toward poll's ready total"
+        );
+    }
+
+    /// `select(2)`: the SAME closed fd fails the whole call with `EBADF`. The
+    /// invalid-fd answer is a property of the calling ABI, so one assembly
+    /// gives two answers from one classification.
+    #[test]
+    fn select_fails_with_ebadf_for_a_closed_fd() {
+        let dispatcher = SyscallDispatcher::new();
+        let (ready_fd, ready_writer) = host_pipe(&dispatcher);
+        let (closed_fd, _closed_writer) = host_pipe(&dispatcher);
+        assert_eq!(
+            unsafe { libc::write(ready_writer, c"x".as_ptr().cast(), 1) },
+            1
+        );
+        dispatcher.close_fd_for_internal_rollback(closed_fd);
+
+        let request = pollin(&[ready_fd, closed_fd]);
+        match assemble_with_policy(&dispatcher, &request, true, InvalidFdPolicy::FailEbadf) {
+            WaitAssembly::Errno(errno) => assert_eq!(errno, LINUX_EBADF),
+            other => panic!("select must reject a closed fd with EBADF, got {other:?}"),
+        }
     }
 
     /// A mixed set cannot be re-evaluated from the reactor's pollfd array
