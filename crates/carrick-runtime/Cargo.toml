@@ -59,7 +59,7 @@ test-support = ["carrick-hal/test-support", "carrick-kernel/test-support"]
 # The `dep:` syntax keeps the optional crates from auto-becoming implicit
 # features, so the only way to pull in carrick-vmm-hvf is via `platform-macos`.
 platform-macos = ["dep:carrick-vmm-hvf", "dep:carrick-host-bsd"]
-platform-linux = ["dep:carrick-vmm-kvm", "dep:carrick-host-linux"]
+platform-linux = ["dep:carrick-vmm-kvm"]
 # FreeBSD/bhyve backend (scaffolding; aarch64 FreeBSD host needed for L2).
 # Mirrors platform-linux.
 # Pulls in carrick-host-bsd for the FreeBSD kqueue EventMultiplexer (shared with macOS).
@@ -86,11 +86,11 @@ carrick-thread = { path = "../carrick-thread" }
 carrick-vmm-hvf = { path = "../carrick-vmm-hvf", optional = true }
 carrick-host-bsd = { path = "../carrick-host-bsd", optional = true }
 carrick-vmm-kvm = { path = "../carrick-vmm-kvm", optional = true }
-# The Linux host-OS layer (epoll EventMultiplexer + errno identity), split out
-# of the KVM backend. Pulled in alongside carrick-vmm-kvm by platform-linux.
-carrick-host-linux = { path = "../carrick-host-linux", optional = true }
 # carrick-vmm-bhyve / carrick-vmm-nvmm are NOT declared here: they are
-# x86_64-only and live in arch-scoped target tables below.
+# x86_64-only and live in arch-scoped target tables below. carrick-host-linux
+# is not declared either — the Linux host-OS layer (epoll EventMultiplexer,
+# errno identity) is below the kernel, so carrick-kernel depends on it under
+# `cfg(target_os = "linux")` and the carrier names it nowhere.
 carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-host = { path = "../carrick-host" }
 carrick-kernel-arena = { path = "../carrick-kernel-arena" }

@@ -219,7 +219,7 @@ pub mod prepare;
 #[cfg(feature = "platform-macos")]
 pub mod runtime;
 pub use prepare::{
-    ExecutionPlan, PreparedRun, Runtime, RuntimeExtensions, StdioSink, prepare_on, resolve_plan,
+    ExecutionPlan, PreparedRun, Runtime, RuntimeExtensions, prepare_on, resolve_plan,
 };
 
 /// Absolute host path to Apple's Rosetta 2 Linux interpreter that carrick probes
@@ -284,27 +284,16 @@ pub fn rosetta_available() -> bool {
 ))]
 pub mod runtime {
     pub use crate::debug_state::{DebugRegionSnapshot, DebugStateSnapshot, maybe_dump_debug_state};
-    pub use carrick_kernel::run_result::{RunResult, RuntimeError};
+    // Private: `RunResult`/`RuntimeError` are kernel types and the carrier does
+    // not re-export them. The `run_oci` signature below names them; callers name
+    // `carrick_kernel::run_result::…`.
+    use carrick_kernel::run_result::{RunResult, RuntimeError};
 
     pub fn run_oci(_spec: &carrick_spec::RunSpec) -> Result<RunResult, RuntimeError> {
         Err(RuntimeError::Unsupported(
             "Pending port to hvpatch VM carrier model".to_string(),
         ))
     }
-}
-
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
-pub use carrick_host_bsd::bsd_to_linux_errno as host_to_linux_errno;
-
-#[cfg(feature = "platform-linux")]
-pub fn host_to_linux_errno(host: i32) -> carrick_abi::LinuxErrno {
-    // On a Linux host the host errno space already IS the Linux errno space —
-    // the identity translation just enters the typed domain.
-    carrick_abi::LinuxErrno::new(host)
 }
 
 #[cfg(test)]

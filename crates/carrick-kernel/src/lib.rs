@@ -152,12 +152,11 @@ pub fn container_thread_states(
 
 // The host→Linux errno translation the whole kernel speaks. On
 // macOS/FreeBSD/NetBSD that is carrick-host-bsd's table; on Linux the host
-// errno space already IS the Linux one, so the identity translation just
-// enters the typed domain.
+// errno space already IS the Linux one, so carrick-host-linux's identity hook
+// is the translation. Both are leaf-crate functions — this is the name the
+// kernel calls them by, not a second implementation (same spelling as
+// carrick-vfs, which speaks the same edge).
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 pub use carrick_host_bsd::bsd_to_linux_errno as host_to_linux_errno;
-
 #[cfg(target_os = "linux")]
-pub fn host_to_linux_errno(host: i32) -> carrick_abi::LinuxErrno {
-    carrick_abi::LinuxErrno::new(host)
-}
+pub use carrick_host_linux::host_to_linux_errno;

@@ -5176,7 +5176,7 @@ fn pre_exit_executor_failure_publishes_an_error_instead_of_thread_done() {
     assert!(completion.is_finished());
     assert!(matches!(
         result.wait(),
-        Err(crate::runtime::RuntimeError::CarrierFailed(_))
+        Err(carrick_kernel::run_result::RuntimeError::CarrierFailed(_))
     ));
 
     scheduler

@@ -37,11 +37,10 @@ use crate::execute::{
 use crate::interactive_supervisor::InteractiveSession;
 #[cfg(feature = "platform-macos")]
 use crate::runtime::{RunElfExecutionOptions, run_elf_from_dispatcher_debug_on};
-use crate::runtime::{RunResult, RuntimeError};
-pub use carrick_kernel::dispatch::StdioSink;
-use carrick_kernel::dispatch::SyscallDispatcher;
+use carrick_kernel::dispatch::{StdioSink, SyscallDispatcher};
 use carrick_kernel::kernel::container::LaunchContext;
 use carrick_kernel::network::RuntimeNetwork;
+use carrick_kernel::run_result::{RunResult, RuntimeError};
 use carrick_vfs::fs_backend::{FsBackend, HostFsBackend};
 use carrick_vfs::{BindVfs, HostResolverSnapshot, Vfs};
 

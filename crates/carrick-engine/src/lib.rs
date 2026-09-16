@@ -74,7 +74,7 @@ use camino::Utf8PathBuf;
 use std::collections::HashMap;
 
 pub use carrick_image::{ImageStore, ResolvedImage};
-pub use carrick_runtime::runtime::RunResult;
+pub use carrick_kernel::run_result::RunResult;
 pub use carrick_spec::{
     BridgeId, FsBackendKind, ImageConfig, InitialIdentity, Mount, MountSpec, NetworkAttachmentSpec,
     NetworkMode, NetworkNamespaceId, NetworkNamespaceSpec, NetworkSpec, PidMode, Platform,

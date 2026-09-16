@@ -640,7 +640,6 @@ dependencies = [
  "carrick-hal",
  "carrick-host",
  "carrick-host-bsd",
- "carrick-host-linux",
  "carrick-image",
  "carrick-kernel",
  "carrick-kernel-arena",

@@ -217,7 +217,7 @@ mod tests {
                 .inner
                 .runtime
                 .reserve(LaunchContext::unmanaged(RunId::new("rejected-after-close"))),
-            Err(carrick_runtime::runtime::RuntimeError::CarrierClosing)
+            Err(carrick_kernel::run_result::RuntimeError::CarrierClosing)
         ));
         drop(lease);
         shutdown

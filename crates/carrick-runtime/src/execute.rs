@@ -1,9 +1,9 @@
 //! Runtime execution entry points that bridge shared run specs to
 //! dispatcher-backed guest execution.
 
-use crate::runtime::{RunResult, RuntimeError};
 use carrick_kernel::dispatch::SyscallDispatcher;
 use carrick_kernel::network::NetworkHostsEntry;
+use carrick_kernel::run_result::{RunResult, RuntimeError};
 #[cfg(feature = "fs-memory")]
 use carrick_spec::FsBackendKind;
 use carrick_spec::{NetworkNamespaceSpec, RunSpec};
@@ -411,7 +411,7 @@ mod exit_code_tests {
     };
     use crate::elf::ElfInspectError;
     use crate::memory::AddressSpaceError;
-    use crate::runtime::RuntimeError;
+    use carrick_kernel::run_result::RuntimeError;
     use carrick_spec::NetworkNamespaceSpec;
     use carrick_vfs::fs_backend::{FsBackend, HostFsBackend, MemoryBackend};
     use std::io::{Error as IoError, ErrorKind};

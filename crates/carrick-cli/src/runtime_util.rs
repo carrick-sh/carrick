@@ -33,7 +33,7 @@
 /// process's fd 1 / fd 2 (the default `run` path and `run-elf --raw`) instead
 /// of wrapping them in JSON, so `carrick run alpine /bin/busybox echo hi`
 /// prints just `hi`.
-pub(crate) fn emit_raw(result: &carrick_runtime::runtime::RunResult) {
+pub(crate) fn emit_raw(result: &carrick_kernel::run_result::RunResult) {
     use std::io::Write;
     let _ = std::io::stdout().write_all(&result.stdout);
     let _ = std::io::stderr().write_all(&result.stderr);

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use camino::Utf8PathBuf;
 use carrick_kernel::dispatch::DispatchError;
 use carrick_kernel::kernel::debug::PostMortem;
-use carrick_runtime::runtime::RuntimeError;
+use carrick_kernel::run_result::RuntimeError;
 use carrick_runtime::trap::TrapError;
 
 use crate::{ContainerId, Signal};
@@ -165,7 +165,7 @@ impl EmbedError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carrick_runtime::runtime::RuntimeError;
+    use carrick_kernel::run_result::RuntimeError;
     use carrick_runtime::trap::TrapError;
 
     #[test]

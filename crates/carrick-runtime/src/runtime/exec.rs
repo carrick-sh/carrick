@@ -16,7 +16,7 @@ pub(crate) struct LoadedExecImage {
 fn host_io_errno(error: std::io::Error) -> LinuxErrno {
     error
         .raw_os_error()
-        .map(crate::host_to_linux_errno)
+        .map(carrick_kernel::host_to_linux_errno)
         .unwrap_or(crate::linux_abi::LINUX_EIO)
 }
 
