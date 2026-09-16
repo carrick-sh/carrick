@@ -3,6 +3,7 @@
 mod archive;
 mod endpoint;
 mod exec;
+mod teardown;
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -22,6 +23,7 @@ pub use exec::{
     ExecAttach, ExecCapability, ExecEnvVar, ExecRequest, ExecResult, ExecRuntime, ExecStatus,
     ExecUser, ExecWakerInstallError, ExecWork, ExecWorkError,
 };
+pub use teardown::ContainerTeardown;
 
 const REQUEST_SCHEMA: &str = "carrick.carrier-control-request.v1";
 const RESPONSE_SCHEMA: &str = "carrick.carrier-control-response.v1";

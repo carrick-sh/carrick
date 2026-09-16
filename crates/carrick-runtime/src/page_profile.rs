@@ -1,6 +1,6 @@
 //! Backend selection + page-geometry plumbing for a run.
 
-use crate::runtime::RuntimeError;
+use crate::run_result::RuntimeError;
 use carrick_spec::{BackendCapabilities, ExecBackendRequest, HostOs, Platform, RunSpec};
 
 pub(crate) use carrick_mem::page_geometry::DEFAULT_LINUX_PAGE_SIZE;

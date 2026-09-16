@@ -231,7 +231,7 @@ pub struct RunConfig {
 }
 
 fn default_max_traps() -> usize {
-    crate::runtime::DEFAULT_MAX_TRAPS
+    crate::run_state::DEFAULT_MAX_TRAPS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1010,7 +1010,7 @@ mod tests {
         );
         // Load-bearing: a legacy entry with NO config object must default
         // max_traps to DEFAULT_MAX_TRAPS, not 0 (0 trips the trap limit at once).
-        assert_eq!(s.config.max_traps, crate::runtime::DEFAULT_MAX_TRAPS);
+        assert_eq!(s.config.max_traps, crate::run_state::DEFAULT_MAX_TRAPS);
         assert_eq!(s.config.stop_signal_abi, StopSignalAbi::Linux);
 
         // A config object present but WITHOUT max_traps also defaults correctly
@@ -1019,7 +1019,7 @@ mod tests {
             "status":"created","supervisor_pid":0,"init_pid":0,"created_secs":0,
             "exit_code":null,"auto_remove":false,"config":{"env":["A=1"]}}"#;
         let s_nt: ContainerState = serde_json::from_str(no_traps).expect("loads");
-        assert_eq!(s_nt.config.max_traps, crate::runtime::DEFAULT_MAX_TRAPS);
+        assert_eq!(s_nt.config.max_traps, crate::run_state::DEFAULT_MAX_TRAPS);
         assert_eq!(s_nt.config.stop_signal_abi, StopSignalAbi::LegacyHost);
         assert_eq!(
             s_nt.config.exec_backend,

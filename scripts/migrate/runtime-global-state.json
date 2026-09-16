@@ -1395,19 +1395,19 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/runtime.rs",
+      "file": "crates/carrick-runtime/src/lib.rs",
       "symbol": "rosetta_binary_bytes::CACHE",
       "fingerprint": "3c13ec3261cdbf3ca309bd9fd863023dabca93ee7c6addfd1401bc8a5fe7cd61",
       "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static rosetta_binary_bytes::CACHE in crates/carrick-runtime/src/runtime.rs maintaining host process lifecycle or VM resources."
+      "rationale": "Carrier-wide host infrastructure static rosetta_binary_bytes::CACHE in crates/carrick-runtime/src/lib.rs maintaining host process lifecycle or VM resources."
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/runtime.rs",
+      "file": "crates/carrick-runtime/src/lib.rs",
       "symbol": "rosetta_license_blob::CACHE",
       "fingerprint": "3c13ec3261cdbf3ca309bd9fd863023dabca93ee7c6addfd1401bc8a5fe7cd61",
       "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static rosetta_license_blob::CACHE in crates/carrick-runtime/src/runtime.rs maintaining host process lifecycle or VM resources."
+      "rationale": "Carrier-wide host infrastructure static rosetta_license_blob::CACHE in crates/carrick-runtime/src/lib.rs maintaining host process lifecycle or VM resources."
     },
     {
       "kind": "static",

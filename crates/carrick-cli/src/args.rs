@@ -31,7 +31,7 @@
 
 use std::path::PathBuf;
 
-use carrick_runtime::runtime::DEFAULT_MAX_TRAPS;
+use carrick_runtime::run_state::DEFAULT_MAX_TRAPS;
 use carrick_spec::{ExecBackendRequest, FsBackendKind, PidMode};
 use clap::{Parser, Subcommand};
 

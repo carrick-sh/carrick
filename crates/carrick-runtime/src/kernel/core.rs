@@ -1645,7 +1645,7 @@ impl Kernel {
         self: &Arc<Self>,
         container_id: ContainerId,
         failpoint: Option<super::operations::KernelFailpoint>,
-    ) -> Result<crate::carrier::ContainerTeardown, KernelError> {
+    ) -> Result<super::control::ContainerTeardown, KernelError> {
         fail_container_root(failpoint, super::operations::KernelFailpoint::AfterReserve)?;
         let (container, init, mut live_tasks) = {
             let state = self.registry.state.write_unpublished();
@@ -1822,7 +1822,7 @@ impl Kernel {
             state.publish_epoch();
             tasks_reaped
         };
-        Ok(crate::carrier::ContainerTeardown {
+        Ok(super::control::ContainerTeardown {
             id: container_id,
             carrier_scope_id: container.launch().carrier_scope_id.clone(),
             run_id: container.run_id().clone(),

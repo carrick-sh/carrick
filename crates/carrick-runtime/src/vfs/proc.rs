@@ -428,7 +428,7 @@ fn sysctl_boot_id() -> Vec<u8> {
 /// lookups. Real opens receive a dispatcher snapshot and use the per-container
 /// UTS hostname when one is configured.
 fn sysctl_hostname() -> Vec<u8> {
-    format!("{}\n", crate::execute::guest_hostname()).into_bytes()
+    format!("{}\n", crate::kernel::netns::default_nodename()).into_bytes()
 }
 
 /// `/proc/sys/kernel/osrelease`, `version` and `domainname` all render from the
@@ -555,7 +555,7 @@ fn context_guest_hostname(ctx: &OpenContext<'_>) -> String {
             return hostname.to_string();
         }
     }
-    crate::execute::guest_hostname()
+    crate::kernel::netns::default_nodename()
 }
 
 /// A sysctl leaf value: a fixed byte string or a per-read generator.

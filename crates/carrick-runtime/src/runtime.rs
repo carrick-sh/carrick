@@ -97,6 +97,7 @@ use std::time::{Duration, Instant};
 use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::{Gpa, GuestVa, HostVa};
 
+use crate::ROSETTA_INTERPRETER;
 use crate::compat::CompatReporter;
 use crate::dispatch::{
     CurrentMmMemory, DispatchOutcome, FdWaitCompletion, GuestMemory, MemoryError, PreparedDispatch,
@@ -147,24 +148,6 @@ pub(crate) fn hardware_tso_for_debug(requested: bool) -> bool {
 fn hardware_tso_for_debug_from_env(requested: bool, disable: Option<&str>) -> bool {
     requested && !debug_env_flag_enabled(disable)
 }
-
-/// Default guest trap budget: **unlimited**.
-///
-/// This was `1_000_000` — a bring-up-era watchdog for a guest wedged in a loop
-/// carrick could not service. It outlived its usefulness and became a source of
-/// false failures on real workloads: a legitimate CPython `unittest` run blows
-/// through a million traps, and the conformance harness had to pass
-/// `--max-traps 18446744073709551615` on **every** invocation to get a true
-/// verdict. A limit that every real caller must override is not a safety net —
-/// it is a trap for anyone who forgets, because the resulting kill looks like a
-/// guest failure rather than a harness artifact. (It had also already been seen
-/// killing a legitimate `SIGALRM` busy-wait in `cpython-io`.)
-///
-/// `--max-traps N` remains available as an opt-in debugging bound — e.g. to
-/// stop a runaway guest while tracing — but nothing imposes one by default.
-/// Detecting a genuinely stuck guest is the job of a progress-aware check, not
-/// a fixed count of successfully-serviced syscalls.
-pub const DEFAULT_MAX_TRAPS: usize = usize::MAX;
 
 // `SyscallTrap` (the trap-engine contract the loops drive) moved into
 // carrick-vmm-hvf alongside `TrapError`/`HvfTrapEngine`. Re-exported
@@ -2208,10 +2191,6 @@ fn trace_shared_futex_requeue(
     });
 }
 
-/// Absolute host path to Apple's Rosetta 2 Linux ELF interpreter. This is an
-/// AArch64 binary that JIT-translates an x86_64 Linux guest in user space.
-pub(crate) const ROSETTA_INTERPRETER: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta";
-
 /// Placeholder `AT_BASE` value for a Rosetta-redirected *dynamic* x86_64 target.
 /// carrick loads the static `rosetta` interpreter as the image, so the auxv it
 /// builds has no AT_BASE. A *dynamic* x86 target needs one present so Apple's
@@ -2221,37 +2200,6 @@ pub(crate) const ROSETTA_INTERPRETER: &str = "/Library/Apple/usr/libexec/oah/Ros
 /// non-zero, page-aligned slot. Without it, musl's dynamic linker null-derefs at
 /// startup (glibc's self-locates, so glibc-dynamic tolerated the gap).
 pub(crate) const ROSETTA_AT_BASE_PLACEHOLDER: u64 = 0x10_0000_0000;
-
-/// The installed Rosetta interpreter's bytes, read once and cached. `None` when
-/// Rosetta isn't installed for Linux. Both the ELF-load redirect and the ioctl
-/// handshake source data from this single read.
-pub(crate) fn rosetta_binary_bytes() -> Option<&'static [u8]> {
-    static CACHE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| std::fs::read(ROSETTA_INTERPRETER).ok())
-        .as_deref()
-}
-
-/// The verification blob Apple's Rosetta `memcmp`s the licensing-ioctl result
-/// against. Rosetta keeps its own copy embedded at a fixed offset and compares
-/// the kernel's answer against it, so we echo back *exactly that* — sourced
-/// live from the installed binary rather than embedded in carrick's source.
-/// This keeps Apple's string out of our tree and stays correct if Apple
-/// revises it. Returns the bytes through (and including) the NUL terminator.
-pub(crate) fn rosetta_license_blob() -> Option<&'static [u8]> {
-    static CACHE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            let bytes = rosetta_binary_bytes()?;
-            // Anchor on a short distinctive prefix; the full response is taken
-            // from the binary, not encoded here.
-            const ANCHOR: &[u8] = b"Our hard work";
-            let start = bytes.windows(ANCHOR.len()).position(|w| w == ANCHOR)?;
-            let nul = bytes[start..].iter().position(|&b| b == 0)?;
-            Some(bytes[start..=start + nul].to_vec())
-        })
-        .as_deref()
-}
 
 /// Inspect raw ELF bytes about to be loaded into the guest. If they describe an
 /// x86_64 binary, rewrite the load to run Apple's Rosetta 2 interpreter instead
@@ -2300,7 +2248,7 @@ pub(crate) fn maybe_redirect_to_rosetta<A: AsRef<[u8]>>(
 
     crate::probes::execve_argv("rosetta-redirect", &[target_path.as_bytes().to_vec()]);
 
-    let rosetta_bytes = match rosetta_binary_bytes() {
+    let rosetta_bytes = match crate::rosetta_binary_bytes() {
         Some(b) => b.to_vec(),
         None => return Some(Err(LINUX_ENOENT)),
     };
@@ -3532,7 +3480,7 @@ mod rosetta_tests {
     fn rosetta_license_blob_is_sourced_from_binary_if_present() {
         // When Rosetta is installed, the licence blob is the NUL-terminated
         // verification string read live from its binary (never embedded here).
-        if let Some(blob) = rosetta_license_blob() {
+        if let Some(blob) = crate::rosetta_license_blob() {
             assert!(blob.starts_with(b"Our hard work"));
             assert_eq!(blob.last(), Some(&0u8), "blob must end at the NUL");
         }

@@ -86,7 +86,7 @@ fn main() {
                     hostname: None,
                 },
                 resources: carrick_spec::ResourceSpec {
-                    max_traps: carrick_runtime::runtime::DEFAULT_MAX_TRAPS,
+                    max_traps: carrick_runtime::run_state::DEFAULT_MAX_TRAPS,
                     debug_state_path: None,
                 },
                 security: carrick_spec::SecuritySpec {

@@ -12,7 +12,7 @@ use crate::compat::CompatReport;
 use crate::dispatch::DispatchError;
 use crate::memory::AddressSpaceError;
 use crate::observe::BudgetResource;
-use crate::trap::TrapError;
+use carrick_hal::TrapError;
 
 /// Why a guest run reached a terminal non-exit state short of regular guest exit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

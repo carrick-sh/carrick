@@ -46,10 +46,10 @@
 //! `seed_guest_baseline` pre-populates *either* backend with a minimal Linux
 //! skeleton (`/tmp` sticky, passwd/group/nsswitch, an `/etc/hosts` whose entries
 //! are resolved on the macOS host, and an `/etc/hostname`/`127.0.1.1` line in
-//! lockstep with `carrick_runtime::execute::guest_hostname` — the single UTS
-//! nodename source that also feeds `uname(2)` and `/proc`). Raw static binaries
-//! arrive with no OCI rootfs, yet enough real software assumes these paths exist
-//! that carrick seeds them unconditionally.
+//! lockstep with `carrick_runtime::kernel::netns::default_nodename` — the
+//! single UTS nodename source that also feeds `uname(2)` and `/proc`). Raw
+//! static binaries arrive with no OCI rootfs, yet enough real software assumes
+//! these paths exist that carrick seeds them unconditionally.
 
 use anyhow::Result;
 use carrick_runtime::dispatch::SyscallDispatcher;
@@ -199,7 +199,7 @@ fn seed_guest_baseline(backend: &mut dyn FsBackend) {
     // /proc/sys/kernel/hostname. --net=host: one global hostname on loopback.
     hosts_content.push_str(&format!(
         "127.0.1.1\t{}\n",
-        carrick_runtime::execute::guest_hostname()
+        carrick_runtime::kernel::netns::default_nodename()
     ));
     for hostname in HOSTNAMES {
         if let Ok(addrs) = (*hostname, 80u16).to_socket_addrs() {
@@ -220,6 +220,6 @@ fn seed_guest_baseline(backend: &mut dyn FsBackend) {
     // hostname, like Docker writes the container hostname at create.
     let _ = backend.set_file_contents(
         "/etc/hostname",
-        format!("{}\n", carrick_runtime::execute::guest_hostname()).into_bytes(),
+        format!("{}\n", carrick_runtime::kernel::netns::default_nodename()).into_bytes(),
     );
 }

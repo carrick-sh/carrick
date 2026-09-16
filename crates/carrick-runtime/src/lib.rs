@@ -283,6 +283,13 @@ pub use prepare::{
     ExecutionPlan, PreparedRun, Runtime, RuntimeExtensions, StdioSink, prepare_on, resolve_plan,
 };
 
+/// Apple's FIXED macOS location for the Rosetta 2 Linux ELF interpreter — an
+/// AArch64 binary that JIT-translates an x86_64 Linux guest in user space. This
+/// is the literal path: the `binfmt_misc` registration carrick publishes names
+/// it, and the cached reads below source their bytes from it. Probing a host
+/// that may have put it elsewhere goes through [`rosetta_interpreter_path`].
+pub(crate) const ROSETTA_INTERPRETER: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta";
+
 /// Absolute host path to Apple's Rosetta 2 Linux interpreter that carrick probes
 /// (and, on macOS, redirects x86_64 ELF loads to). Resolution order, so the same
 /// probe is correct on every Apple-Silicon host regardless of OS:
@@ -295,7 +302,6 @@ pub use prepare::{
 ///      skipped) on macOS and on hosts without Rosetta.
 ///   3. Apple's fixed macOS location.
 pub fn rosetta_interpreter_path() -> String {
-    const APPLE_DEFAULT: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta";
     if let Some(p) = std::env::var_os("CARRICK_ROSETTA_PATH") {
         return p.to_string_lossy().into_owned();
     }
@@ -304,7 +310,7 @@ pub fn rosetta_interpreter_path() -> String {
             return path.to_string();
         }
     }
-    APPLE_DEFAULT.to_string()
+    ROSETTA_INTERPRETER.to_string()
 }
 
 /// Extract the `interpreter <path>` value from a binfmt_misc registration dump
@@ -338,19 +344,35 @@ pub fn rosetta_available() -> bool {
     }
 }
 
-#[cfg(any(
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
-pub mod execute {
-    // Construction-time default only. Guest-facing reads resolve the calling
-    // task's container-owned UTS namespace on every backend.
-    pub fn guest_hostname() -> String {
-        carrick_host::host_facts::host_short_hostname()
-            .unwrap_or(crate::linux_abi::CARRICK_HOSTNAME)
-            .to_owned()
-    }
+/// The installed Rosetta interpreter's bytes, read once and cached. `None` when
+/// Rosetta isn't installed for Linux. Both the ELF-load redirect and the ioctl
+/// handshake source data from this single read.
+pub(crate) fn rosetta_binary_bytes() -> Option<&'static [u8]> {
+    static CACHE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| std::fs::read(ROSETTA_INTERPRETER).ok())
+        .as_deref()
+}
+
+/// The verification blob Apple's Rosetta `memcmp`s the licensing-ioctl result
+/// against. Rosetta keeps its own copy embedded at a fixed offset and compares
+/// the kernel's answer against it, so we echo back *exactly that* — sourced
+/// live from the installed binary rather than embedded in carrick's source.
+/// This keeps Apple's string out of our tree and stays correct if Apple
+/// revises it. Returns the bytes through (and including) the NUL terminator.
+pub(crate) fn rosetta_license_blob() -> Option<&'static [u8]> {
+    static CACHE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let bytes = rosetta_binary_bytes()?;
+            // Anchor on a short distinctive prefix; the full response is taken
+            // from the binary, not encoded here.
+            const ANCHOR: &[u8] = b"Our hard work";
+            let start = bytes.windows(ANCHOR.len()).position(|w| w == ANCHOR)?;
+            let nul = bytes[start..].iter().position(|&b| b == 0)?;
+            Some(bytes[start..=start + nul].to_vec())
+        })
+        .as_deref()
 }
 
 #[cfg(any(
@@ -361,13 +383,6 @@ pub mod execute {
 pub mod runtime {
     pub use crate::debug_state::{DebugRegionSnapshot, DebugStateSnapshot, maybe_dump_debug_state};
     pub use crate::run_result::{RunResult, RuntimeError};
-
-    pub const DEFAULT_MAX_TRAPS: usize = usize::MAX;
-    pub(crate) const ROSETTA_INTERPRETER: &str =
-        "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta";
-    pub(crate) fn rosetta_license_blob() -> Option<&'static [u8]> {
-        None
-    }
 
     pub fn run_oci(_spec: &carrick_spec::RunSpec) -> Result<RunResult, RuntimeError> {
         Err(RuntimeError::Unsupported(

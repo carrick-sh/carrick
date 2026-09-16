@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use crate::kernel::container::{CarrierScopeId, Container, ContainerId, LaunchContext, RunId};
+use crate::kernel::control::ContainerTeardown;
 use crate::run_result::RuntimeError;
 use crate::vm_lifecycle::VmRunTerminalOutcome;
 use carrick_fatal::carrick_fatal;
@@ -1343,17 +1344,6 @@ pub fn live_container_count() -> usize {
         .flatten()
         .and_then(|carrier| carrier.snapshot().ok())
         .map_or(0, |snapshot| snapshot.live_containers)
-}
-
-/// Receipt of one container's teardown.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContainerTeardown {
-    pub id: ContainerId,
-    pub carrier_scope_id: CarrierScopeId,
-    pub run_id: RunId,
-    pub tasks_reaped: usize,
-    pub mounts_dropped: usize,
-    pub pid_region_released: bool,
 }
 
 /// Retire a container through the exact explicit carrier lease that admitted

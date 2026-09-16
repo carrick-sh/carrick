@@ -8,7 +8,7 @@ use camino::Utf8PathBuf;
 use carrick_engine::{Engine, RunRequest};
 use carrick_image::{ImageStore, PullPolicy};
 use carrick_runtime::prepare::{RuntimeExtensions, StdioSink};
-use carrick_runtime::runtime::DEFAULT_MAX_TRAPS;
+use carrick_runtime::run_state::DEFAULT_MAX_TRAPS;
 use carrick_spec::{Mount, Platform, StdioMode};
 use carrick_vfs::Vfs;
 
