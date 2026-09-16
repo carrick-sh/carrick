@@ -7,7 +7,7 @@ rules:
       Prefer a `#[repr(C, packed)]` struct deriving `IntoBytes` (zerocopy)
       and call `.write_to(buf)` — it is checked at compile time (size,
       layout) and cannot drift the moment a field changes width.
-      Worked example: `crates/carrick-runtime/src/dispatch/sysv.rs`'s
+      Worked example: `crates/carrick-kernel/src/dispatch/sysv.rs`'s
       `LinuxShmidDs`. Pattern caught: `<slice>[<int>..<int>].copy_from_slice(&<expr>.to_le_bytes())`
       where both offsets are integer literals (the struct-build smell).
       Loop-parameterized writes (`bytes[off..off+8]` where `off = base + i*8`)

@@ -131,6 +131,16 @@ lint-domains:
     python3 scripts/conformance/check-next-strategy.py
     python3 scripts/conformance/regen-next-shards.py --check
     ./scripts/lint-domains.sh
+    # The self-tests run FIRST and in the same gate as --check: every one of
+    # these scanners keys at least one rule on an exact source PATH, so a crate
+    # move can leave a rule matching nothing while --check still exits 0. The
+    # self-test fixtures are the only thing that notices (Task 2.9 moved
+    # `kernel/crash_capture.rs` into carrick-kernel and the CrashQuorum rule
+    # went vacuous under a green `just ci`).
+    python3 scripts/migrate/check-task-participant-witnesses.py --self-test
+    python3 scripts/migrate/check-mm-authority.py --self-test
+    python3 scripts/migrate/check-dispatch-lock-authority.py --self-test
+    python3 scripts/migrate/check-k1-burndown.py --self-test
     python3 scripts/migrate/check-runtime-global-state.py --check
     python3 scripts/migrate/check-runtime-aborts.py --check
     python3 scripts/migrate/check-task-participant-witnesses.py --check
