@@ -1748,8 +1748,6 @@ where
                 blocking @ (DispatchOutcome::BlockingWrite(_)
                 | DispatchOutcome::BlockingRecordLock(_)
                 | DispatchOutcome::WaitOnFds { .. }
-                | DispatchOutcome::WaitOnProcExit { .. }
-                | DispatchOutcome::WaitOnProcState { .. }
                 | DispatchOutcome::WaitOnHvpatchChild { .. }
                 | DispatchOutcome::WaitOnSignals { .. }
                 | DispatchOutcome::WaitOnSleep { .. }

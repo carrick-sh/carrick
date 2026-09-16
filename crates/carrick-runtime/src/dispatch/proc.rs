@@ -374,26 +374,6 @@ fn ptrace_user_addr_is_invalid(addr: GuestPtr) -> bool {
     signed_addr < 0 || addr.0 > 4096
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PtraceTransport {
-    Host,
-    VirtualNative,
-    VirtualHvpatch,
-}
-
-fn select_ptrace_transport(
-    page_geometry: crate::page_profile::PageGeometry,
-    hvpatch_lane: bool,
-) -> PtraceTransport {
-    if hvpatch_lane {
-        PtraceTransport::VirtualHvpatch
-    } else if page_geometry.native_profile.is_some() {
-        PtraceTransport::VirtualNative
-    } else {
-        PtraceTransport::Host
-    }
-}
-
 fn hvpatch_reported_tid(kernel_tid: i32) -> Option<u32> {
     u32::try_from(kernel_tid).ok()
 }
@@ -829,11 +809,6 @@ impl<'a> ProcView<'a> {
     }
 
     #[inline]
-    pub(super) fn page_geometry(&self) -> crate::page_profile::PageGeometry {
-        self.page_geometry
-    }
-
-    #[inline]
     pub(crate) fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext> {
         self.proc.lock().hvpatch_process.clone()
     }
@@ -995,42 +970,6 @@ impl<'a> ProcView<'a> {
         DispatchOutcome::Returned { value: 0 }
     }
 
-    /// Allocate a pidfd for `host_pid`. Shared by `pidfd_open` and the
-    /// `CLONE_PIDFD` fork path. Registers `EVFILT_PROC`/`NOTE_EXIT` so the fd
-    /// becomes readable when the process exits.
-    pub(super) fn open_pidfd(&self, host_pid: i32, status_flags: u64) -> DispatchOutcome {
-        // Watch the real host process for exit through the platform
-        // `EventMultiplexer` (macOS: kqueue `NOTE_EXIT|NOTE_EXITSTATUS`; Linux:
-        // a real `pidfd_open(2)` added to the epoll set). The exit-readiness fd
-        // becomes pollable when the process exits, so the guest reads its exit
-        // code. The token is the host pid (no consumer reads it back today, but
-        // it keeps the registration self-describing).
-        let kqueue = {
-            let mut mux = match crate::event_mux::make_event_multiplexer() {
-                Ok(m) => m,
-                Err(_) => return DispatchOutcome::errno(crate::linux_abi::LINUX_EMFILE),
-            };
-            if mux.watch_process_exit(host_pid, host_pid as u64).is_err() {
-                // No such process (already reaped, or never existed).
-                return DispatchOutcome::errno(crate::linux_abi::LINUX_ESRCH);
-            }
-            std::sync::Arc::new(PidfdWatch::new(mux))
-        };
-        let description = OpenDescription::Pidfd {
-            target: PidfdTarget::Host(host_pid),
-            kqueue,
-            base: OpenDescriptionBase::new(status_flags),
-        };
-        // Linux creates the pidfd with O_CLOEXEC unconditionally (the flags arg
-        // only carries PIDFD_NONBLOCK), so the returned fd must have FD_CLOEXEC
-        // set — pidfd_open01 asserts F_GETFD & FD_CLOEXEC.
-        self.install_fd_with_status_flags(
-            description,
-            LINUX_O_RDWR | status_flags,
-            LINUX_FD_CLOEXEC,
-        )
-    }
-
     /// Allocate a pidfd for one Linux process multiplexed inside the shared
     /// HvPatch VM. Its readiness is a user event published by the guest process
     /// table, never an `EVFILT_PROC` watch on the common Carrick host pid.
@@ -1063,34 +1002,6 @@ impl<'a> ProcView<'a> {
             LINUX_O_RDWR | status_flags,
             LINUX_FD_CLOEXEC,
         )
-    }
-
-    /// Allocate a pidfd referring to freshly-forked `child_pid`. Called by the
-    /// runtime's `CLONE_PIDFD` parent setup before releasing the child. Preserve
-    /// the allocation/watch errno so clone can fail atomically rather than
-    /// returning a child with an invalid pidfd output.
-    /// Install a CLONE_PIDFD descriptor for a freshly forked host child.
-    ///
-    /// The pidfd lands in the FORKING PARENT's table, so the caller passes the
-    /// exact parent `KernelContext` it already captured and this establishes
-    /// the resource scope. Several fork paths (the VMM quiesce path among
-    /// them) run on the vCPU loop OUTSIDE any dispatch boundary, where the fd
-    /// helpers' ambient `captured_file_table()` has nothing installed and
-    /// aborts rather than guess a table. Re-establishing a scope that is
-    /// already active is free — `with_captured_resources` short-circuits on
-    /// pointer identity.
-    pub fn install_child_pidfd(
-        &self,
-        context: &crate::kernel::KernelContext,
-        child_pid: i32,
-    ) -> Result<i32, crate::linux_abi::LinuxErrno> {
-        match super::resources::with_captured_resources(context, || self.open_pidfd(child_pid, 0)) {
-            DispatchOutcome::Returned { value } => {
-                i32::try_from(value).map_err(|_| crate::linux_abi::LINUX_EMFILE)
-            }
-            DispatchOutcome::Errno { errno } => Err(errno),
-            _ => Err(crate::linux_abi::LINUX_EMFILE),
-        }
     }
 
     /// Reserve and install a pidfd while its HVPatch child is still
@@ -1132,16 +1043,6 @@ impl<'a> ProcView<'a> {
             DispatchOutcome::Errno { errno } => Err(errno),
             _ => Err(crate::linux_abi::LINUX_EMFILE),
         }
-    }
-
-    /// Roll back one freshly installed CLONE_PIDFD descriptor before its gated
-    /// child is released. The native fork path retains exact thread exclusion,
-    /// so this fd cannot have been observed, closed, or reused by guest code.
-    pub fn remove_installed_child_pidfd(&self, fd: i32, child_pid: i32) -> bool {
-        if self.pidfd_target(None, fd) != Some(PidfdTarget::Host(child_pid)) {
-            return false;
-        }
-        self.remove_pidfd(fd)
     }
 
     /// Roll back a pidfd installed before an HvPatch child was materialized.
@@ -1186,7 +1087,11 @@ impl<'a> ProcView<'a> {
             let internal = i32::try_from(internal).ok()?;
             return process.live_process_key(internal).map(PidfdTarget::Hvpatch);
         }
-        crate::vfs::proc::proc_pid_dir_host_pid(path).map(|pid| PidfdTarget::Host(pid as i32))
+        // With no HVPatch process binding there is no process table to resolve
+        // `/proc/<pid>` against. The retired 1:1 native lane answered this with
+        // the Darwin pid behind the directory (e1fbfd32e); that lane is gone, so
+        // the fd is not a pidfd → the caller reports EBADF.
+        None
     }
 
     fn pidfd_target(
@@ -1216,7 +1121,6 @@ impl<'a> ProcView<'a> {
     ) -> Option<crate::kernel::TaskKey> {
         match self.pidfd_target(Some(context), fd)? {
             PidfdTarget::Hvpatch(task) => Some(task),
-            PidfdTarget::Host(_) => None,
         }
     }
 
@@ -2531,12 +2435,12 @@ impl<'a> ProcView<'a> {
         fn ptrace(this, cx, request: u64, pid: Pid, addr: GuestPtr, data: u64) {
             // Stop carrier fast returns before any tracing relationship changes.
             cx.kernel.kernel().fd_ceiling().disable();
-            let transport =
-                select_ptrace_transport(this.page_geometry(), this.hvpatch_process().is_some());
-            if transport == PtraceTransport::VirtualHvpatch {
-                let Some(process) = this.hvpatch_process() else {
-                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-                };
+            // One transport. A `select_ptrace_transport` classifier used to
+            // pick between a host `ptrace(2)`, the native lane's virtualized
+            // control plane and this one; the first two went with the retired
+            // 1:1 native lane (e1fbfd32e), so the three-way enum was a long
+            // way of writing `hvpatch_process().is_some()`.
+            if let Some(process) = this.hvpatch_process() {
                 let kernel = process.kernel_graph();
                 let target = || {
                     guest_pid_to_task_id(cx.kernel, pid)
@@ -3468,18 +3372,12 @@ impl<'a> ProcView<'a> {
                 };
                 return Ok(this.open_hvpatch_pidfd(&process, host, status_flags));
             }
-            // PID namespace (§5.3): the guest names the target by its ns-pid;
-            // the pidfd must watch the underlying host pid. A foreign ns-pid is
-            // ESRCH. Identity when namespaces are off.
-            let host_pid = if crate::namespace::pid::enabled() {
-                match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
-                    Some(h) => h as i32,
-                    None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
-                }
-            } else {
-                pid.0
-            };
-            Ok(this.open_pidfd(host_pid, status_flags))
+            // A task with no HVPatch process binding has no process table to
+            // name: the retired 1:1 native lane's `EVFILT_PROC` watch on a
+            // Darwin pid lived here (e1fbfd32e) and was deleted with the
+            // kernel extraction plan, so no such process can be alive → ESRCH.
+            // git remembers it.
+            Ok(DispatchOutcome::errno(LINUX_ESRCH))
         }
 
         fn pidfd_getfd(this, cx, _pidfd: Fd, _targetfd: u64, _flags: u64) {
@@ -3499,57 +3397,53 @@ impl<'a> ProcView<'a> {
             if flags != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if let PidfdTarget::Hvpatch(guest_pid) = target {
-                let Some(process) = this.hvpatch_process() else {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            // A pidfd always names a task in the kernel graph. The retired
+            // 1:1 native lane's `PidfdTarget::Host` arm (an xsig enqueue, else
+            // `bootstrap_signal_send_as` against a Darwin pid) went away with
+            // that lane in e1fbfd32e; git remembers it.
+            let PidfdTarget::Hvpatch(guest_pid) = target;
+            let Some(process) = this.hvpatch_process() else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            if !process.process_is_live(guest_pid) {
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+            }
+            if signum == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            if !crate::dispatch::signal::is_valid_signum(signum) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let siginfo = if info.0 != 0 {
+                let bytes = match cx.memory.read_bytes(
+                    info.0,
+                    core::mem::size_of::<crate::linux_abi::LinuxSiginfo>(),
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                 };
-                if !process.process_is_live(guest_pid) {
-                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-                }
-                if signum == 0 {
-                    return Ok(DispatchOutcome::Returned { value: 0 });
-                }
-                if !crate::dispatch::signal::is_valid_signum(signum) {
+                let user_info = match crate::linux_abi::LinuxSiginfo::read_from_bytes(&bytes) {
+                    Ok(info) => info,
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                };
+                if user_info.si_signo != signum as i32 {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                let siginfo = if info.0 != 0 {
-                    let bytes = match cx.memory.read_bytes(
-                        info.0,
-                        core::mem::size_of::<crate::linux_abi::LinuxSiginfo>(),
-                    ) {
-                        Ok(bytes) => bytes,
-                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-                    };
-                    let user_info = match crate::linux_abi::LinuxSiginfo::read_from_bytes(&bytes) {
-                        Ok(info) => info,
-                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-                    };
-                    if user_info.si_signo != signum as i32 {
-                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                    }
-                    Some(user_info)
-                } else {
-                    Some(crate::linux_abi::LinuxSiginfo::kill(
-                        signum as i32,
-                        crate::linux_abi::LINUX_SI_USER,
-                        crate::dispatch::signal::ns_visible_sender_pid(cx.kernel),
-                        this.cred_snapshot().ruid.raw(),
-                    ))
-                };
-                return Ok(this.hvpatch_exact_process_signal(
-                    cx.kernel,
-                    guest_pid,
-                    signum,
-                    siginfo,
-                ));
-            }
-            // A pidfd that names a HOST process names the retired 1:1
-            // native lane, where each guest process was a Darwin process.
-            // That lane went away in e1fbfd32e, so no such process can be
-            // alive: ESRCH. The host-pid send that used to live here (an
-            // xsig enqueue, else `bootstrap_signal_send_as`) went with it;
-            // git remembers it.
-            Ok(DispatchOutcome::errno(LINUX_ESRCH))
+                Some(user_info)
+            } else {
+                Some(crate::linux_abi::LinuxSiginfo::kill(
+                    signum as i32,
+                    crate::linux_abi::LINUX_SI_USER,
+                    crate::dispatch::signal::ns_visible_sender_pid(cx.kernel),
+                    this.cred_snapshot().ruid.raw(),
+                ))
+            };
+            Ok(this.hvpatch_exact_process_signal(
+                cx.kernel,
+                guest_pid,
+                signum,
+                siginfo,
+            ))
         }
 
         fn getrandom(this, cx, address: GuestPtr, length: u64, flags: u64) {
@@ -4407,15 +4301,6 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub fn install_child_pidfd(
-        &self,
-        context: &crate::kernel::KernelContext,
-        child_pid: i32,
-    ) -> Result<i32, crate::linux_abi::LinuxErrno> {
-        self.proc_view().install_child_pidfd(context, child_pid)
-    }
-
-    #[inline]
     pub(crate) fn install_reserved_hvpatch_child_pidfd(
         &self,
         context: &crate::kernel::KernelContext,
@@ -4423,11 +4308,6 @@ impl SyscallDispatcher {
     ) -> Result<i32, crate::linux_abi::LinuxErrno> {
         self.proc_view()
             .install_reserved_hvpatch_child_pidfd(context, prepared)
-    }
-
-    #[inline]
-    pub fn remove_installed_child_pidfd(&self, fd: i32, child_pid: i32) -> bool {
-        self.proc_view().remove_installed_child_pidfd(fd, child_pid)
     }
 
     #[inline]
@@ -4439,12 +4319,6 @@ impl SyscallDispatcher {
     ) -> bool {
         self.proc_view()
             .remove_installed_hvpatch_child_pidfd(context, fd, child)
-    }
-
-    #[cfg(test)]
-    #[inline]
-    pub(super) fn open_pidfd(&self, host_pid: i32, status_flags: u64) -> DispatchOutcome {
-        self.proc_view().open_pidfd(host_pid, status_flags)
     }
 
     #[cfg(test)]
@@ -4563,6 +4437,7 @@ mod kernel_process_dispatch_tests {
     const SYS_PROCESS_VM_READV: u64 = 270;
     const SYS_PROCESS_VM_WRITEV: u64 = 271;
     const SYS_WAIT4: u64 = 260;
+    const SYS_PIDFD_OPEN: u64 = 434;
     const LINUX_P_ALL: u64 = 0;
     const LINUX_P_PID: u64 = 1;
     const LINUX_P_PGID: u64 = 2;
@@ -7065,50 +6940,70 @@ mod kernel_process_dispatch_tests {
             "an already-traced task rejects a second attach",
         );
     }
+
+    /// `pidfd_open` status-flag semantics on the only lane that can produce a
+    /// pidfd: the HVPatch kernel graph. Linux always creates the fd O_RDWR and
+    /// puts PIDFD_NONBLOCK (and nothing else) into the description's status
+    /// flags, and `F_SETFL` may toggle O_NONBLOCK afterwards.
+    #[test]
+    fn hvpatch_pidfd_open_status_flags_and_nonblock_toggle() {
+        const PIDFD_NONBLOCK: u64 = 0o4000;
+        let (_lane, mut dispatcher, _process, root, _lease) = bound_dispatcher(61_434);
+        let mut memory = LinearMemory::new(INFO_ADDR, vec![0; 0x100]);
+        let self_pid = u64::try_from(root.task().key().id.raw()).expect("positive root pid");
+
+        let open = |dispatcher: &mut SyscallDispatcher, memory: &mut LinearMemory, flags: u64| {
+            match dispatch(
+                dispatcher,
+                &root,
+                memory,
+                SYS_PIDFD_OPEN,
+                [self_pid, flags, 0, 0, 0, 0],
+            ) {
+                DispatchOutcome::Returned { value } => value as i32,
+                other => panic!("expected a pidfd, got {other:?}"),
+            }
+        };
+
+        // 1. flags=0 -> O_RDWR, no O_NONBLOCK.
+        let fd_def = open(&mut dispatcher, &mut memory, 0);
+        assert!(fd_def >= 0);
+        let open_def = dispatcher.open_file(fd_def).expect("open file");
+        let fl = open_def.description.common().status_flags();
+        assert_eq!(fl & LINUX_O_NONBLOCK, 0, "default pidfd has no O_NONBLOCK");
+        assert_eq!(fl & LINUX_O_ACCMODE, LINUX_O_RDWR, "pidfd has O_RDWR");
+        assert!(!dispatcher.pidfd_is_nonblocking(fd_def));
+
+        // 2. PIDFD_NONBLOCK -> O_NONBLOCK on the description.
+        let fd_nb = open(&mut dispatcher, &mut memory, PIDFD_NONBLOCK);
+        assert!(fd_nb >= 0);
+        let open_nb = dispatcher.open_file(fd_nb).expect("open file");
+        let fl_nb = open_nb.description.common().status_flags();
+        assert_ne!(
+            fl_nb & LINUX_O_NONBLOCK,
+            0,
+            "nonblocking pidfd has O_NONBLOCK"
+        );
+        assert_eq!(fl_nb & LINUX_O_ACCMODE, LINUX_O_RDWR, "pidfd has O_RDWR");
+        assert!(dispatcher.pidfd_is_nonblocking(fd_nb));
+
+        // 3. F_SETFL logic can toggle O_NONBLOCK on the pidfd description.
+        let mutable_flags = LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_ASYNC;
+        let next_flags = (fl & LINUX_O_ACCMODE) | ((fl | LINUX_O_NONBLOCK) & mutable_flags);
+        open_def.description.common().set_status_flags(next_flags);
+        assert!(dispatcher.pidfd_is_nonblocking(fd_def));
+        let next_flags_clear = (fl & LINUX_O_ACCMODE) | (fl & mutable_flags);
+        open_def
+            .description
+            .common()
+            .set_status_flags(next_flags_clear);
+        assert!(!dispatcher.pidfd_is_nonblocking(fd_def));
+    }
 }
 
 #[cfg(test)]
-mod native_virtual_ptrace_tests {
+mod hvpatch_wait_status_tests {
     use super::*;
-
-    fn geometry(
-        native_profile: Option<carrick_spec::NativePageProfile>,
-    ) -> crate::page_profile::PageGeometry {
-        crate::page_profile::PageGeometry {
-            host_page_size: 16 * 1024,
-            linux_page_size: native_profile.map_or(4096, |profile| match profile {
-                carrick_spec::NativePageProfile::Native16k => 16 * 1024,
-                carrick_spec::NativePageProfile::Linux4kOn16k => 4096,
-            }),
-            native_profile,
-        }
-    }
-
-    #[test]
-    fn native_profiles_select_virtual_ptrace_transport() {
-        assert_eq!(
-            select_ptrace_transport(
-                geometry(Some(carrick_spec::NativePageProfile::Native16k)),
-                false,
-            ),
-            PtraceTransport::VirtualNative
-        );
-        assert_eq!(
-            select_ptrace_transport(
-                geometry(Some(carrick_spec::NativePageProfile::Linux4kOn16k)),
-                false,
-            ),
-            PtraceTransport::VirtualNative
-        );
-        assert_eq!(
-            select_ptrace_transport(geometry(None), false),
-            PtraceTransport::Host
-        );
-        assert_eq!(
-            select_ptrace_transport(geometry(None), true),
-            PtraceTransport::VirtualHvpatch
-        );
-    }
 
     #[test]
     fn hvpatch_waitid_decodes_linux_terminal_wait_status() {
@@ -7699,54 +7594,5 @@ mod process_identity_dispatch_tests {
             leader_pid,
             "a zombie keeps the retired session's namespace identity",
         );
-    }
-
-    #[test]
-    fn pidfd_open_status_flags_and_nonblock_wait() {
-        let dispatcher = SyscallDispatcher::new();
-        let my_pid = unsafe { libc::getpid() };
-        const PIDFD_NONBLOCK: u64 = 0o4000;
-
-        // 1. open_pidfd with 0 -> default is LINUX_O_RDWR, no O_NONBLOCK
-        let outcome_def = dispatcher.open_pidfd(my_pid, 0);
-        let fd_def = match outcome_def {
-            DispatchOutcome::Returned { value } => value as i32,
-            other => panic!("expected fd, got {other:?}"),
-        };
-        assert!(fd_def >= 0);
-        let open_def = dispatcher.open_file(fd_def).expect("open file");
-        let fl = open_def.description.common().status_flags();
-        assert_eq!(fl & LINUX_O_NONBLOCK, 0, "default pidfd has no O_NONBLOCK");
-        assert_eq!(fl & LINUX_O_ACCMODE, LINUX_O_RDWR, "pidfd has O_RDWR");
-        assert!(!dispatcher.pidfd_is_nonblocking(fd_def));
-
-        // 2. open_pidfd with PIDFD_NONBLOCK -> has O_NONBLOCK
-        let outcome_nb = dispatcher.open_pidfd(my_pid, PIDFD_NONBLOCK);
-        let fd_nb = match outcome_nb {
-            DispatchOutcome::Returned { value } => value as i32,
-            other => panic!("expected fd, got {other:?}"),
-        };
-        assert!(fd_nb >= 0);
-        let open_nb = dispatcher.open_file(fd_nb).expect("open file");
-        let fl_nb = open_nb.description.common().status_flags();
-        assert_ne!(
-            fl_nb & LINUX_O_NONBLOCK,
-            0,
-            "nonblocking pidfd has O_NONBLOCK"
-        );
-        assert_eq!(fl_nb & LINUX_O_ACCMODE, LINUX_O_RDWR, "pidfd has O_RDWR");
-        assert!(dispatcher.pidfd_is_nonblocking(fd_nb));
-
-        // 3. F_SETFL logic can toggle O_NONBLOCK on the pidfd description
-        let mutable_flags = LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_ASYNC;
-        let next_flags = (fl & LINUX_O_ACCMODE) | ((fl | LINUX_O_NONBLOCK) & mutable_flags);
-        open_def.description.common().set_status_flags(next_flags);
-        assert!(dispatcher.pidfd_is_nonblocking(fd_def));
-        let next_flags_clear = (fl & LINUX_O_ACCMODE) | (fl & mutable_flags);
-        open_def
-            .description
-            .common()
-            .set_status_flags(next_flags_clear);
-        assert!(!dispatcher.pidfd_is_nonblocking(fd_def));
     }
 }

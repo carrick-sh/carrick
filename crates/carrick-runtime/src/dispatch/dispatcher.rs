@@ -1407,7 +1407,6 @@ impl ProcCrossSubsystem for SyscallDispatcher {
 pub struct ProcView<'a> {
     pub(in crate::dispatch) proc: &'a Mutex<proc::ProcState>,
     pub(in crate::dispatch) seccomp: &'a crate::seccomp::SeccompState,
-    pub(in crate::dispatch) page_geometry: crate::page_profile::PageGeometry,
     pub(in crate::dispatch) cross: &'a (dyn ProcCrossSubsystem + 'a),
 }
 
@@ -2032,7 +2031,6 @@ impl SyscallDispatcher {
         ProcView {
             proc: &self.proc,
             seccomp: &self.seccomp,
-            page_geometry: self.page_geometry,
             cross: self,
         }
     }

@@ -1339,7 +1339,7 @@ pub mod io_wait {
         // `kvm_signal_pump`'s `kick_all` after publishing a process-directed
         // signal): there is no fd in the set to ready it and no self-pipe in the
         // pollfds. If that single wake EDGE is LOST — the kick fired in the
-        // window between this thread publishing `WaitOnFds`/`WaitOnProcExit` and
+        // window between this thread publishing `WaitOnFds`/`WaitOnHvpatchChild` and
         // actually entering `ppoll`, or the pump's poke landed on a stale pipe
         // mid fork-reinit — a NULL-timeout ppoll would wedge the thread FOREVER:
         // PROC_PENDING already holds the signal, but the recheck below only runs

@@ -994,6 +994,18 @@ impl<'a> NetView<'a> {
 mod netlink_readiness_tests {
     use super::*;
 
+    /// A stand-in kernel-graph task for a pidfd description fixture. A pidfd
+    /// names a task in the graph, never a Darwin pid, so the fixture has to
+    /// spell one even when the test only exercises readiness.
+    fn fixture_pidfd_task() -> crate::kernel::TaskKey {
+        crate::kernel::TaskKey {
+            id: crate::kernel::TaskId::for_root_bootstrap(1234).expect("fixture task id"),
+            serial: crate::kernel::TaskSerial::from_registry_allocation(
+                std::num::NonZeroU64::new(1).expect("nonzero fixture serial"),
+            ),
+        }
+    }
+
     fn poll_fd_readable(fd: i32) -> bool {
         let mut pfd = libc::pollfd {
             fd,
@@ -1463,7 +1475,7 @@ mod netlink_readiness_tests {
         let pidfd = OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::Pidfd {
                 base: OpenDescriptionBase::new(0),
-                target: PidfdTarget::Host(1234),
+                target: PidfdTarget::Hvpatch(fixture_pidfd_task()),
                 kqueue: Arc::clone(&watch),
             })),
             0,
@@ -1950,7 +1962,7 @@ mod netlink_readiness_tests {
             fixtures.push(OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::Pidfd {
                     base: OpenDescriptionBase::new(0),
-                    target: PidfdTarget::Host(1234),
+                    target: PidfdTarget::Hvpatch(fixture_pidfd_task()),
                     kqueue: Arc::new(PidfdWatch::new(mux)),
                 })),
                 0,

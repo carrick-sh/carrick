@@ -104,8 +104,9 @@
 //!   parking-lot token or, for `MAP_SHARED` inter-process futexes, the host
 //!   `__ulock`), [`DispatchOutcome::WaitOnFds`] with its [`FdWaitCompletion`]
 //!   (poll/select/epoll-style fd readiness,
-//!   serviced by the per-thread kqueue or `poll(2)`), [`DispatchOutcome::WaitOnProcExit`]
-//!   (a blocking `waitid` parks on `EVFILT_PROC`/`NOTE_EXIT`),
+//!   serviced by the per-thread kqueue or `poll(2)`),
+//!   [`DispatchOutcome::WaitOnHvpatchChild`] (a blocking `wait4`/`waitid` parks
+//!   on the kernel graph's child-state wake, never on a Darwin process),
 //!   [`DispatchOutcome::WaitOnSignals`] (`rt_sigtimedwait` / `rt_sigsuspend`), and
 //!   [`DispatchOutcome::WaitOnSleep`] (`nanosleep` via the per-thread waiter, so
 //!   the sleep is interruptible AND can park for a fork-quiesce — a sibling stuck
