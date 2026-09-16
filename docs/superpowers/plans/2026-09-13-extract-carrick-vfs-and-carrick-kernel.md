@@ -348,7 +348,7 @@ def apply_renames(rows, renames):
 
 - [ ] **Step 4: Run the test; it passes.** Run: `python3 -m pytest scripts/migrate/tests/test_reconcile_rename.py -q` → `1 passed`.
 
-- [ ] **Step 5: Prove the unrenamed path is a no-op.** Run: `python3 scripts/migrate/reconcile-line-pinned-inventories.py --check && git status --porcelain scripts/migrate` → clean.
+- [ ] **Step 5: Prove the unrenamed path is a no-op.** Run: `python3 scripts/migrate/reconcile-line-pinned-inventories.py && git status --porcelain scripts/migrate` → clean (the reconciler has no `--check`; the `--check` flag belongs to `check-host-authority-transitions.py`).
 
 - [ ] **Step 6: Commit**
 
@@ -1040,7 +1040,7 @@ section present."
 - Create: `crates/carrick-kernel/README.md`
 - Modify: `crates/carrick-kernel/src/lib.rs` (crate doc), `crates/carrick-kernel/src/dispatch/outcome.rs` (every `DispatchOutcome` variant has a doc line saying what the backend must do)
 
-- [ ] **Step 1: README** with these sections, in this order: *What this is* (the Carrick kernel; no guest Linux kernel; experimental, partial coverage, not a trust boundary); *Stability* ("Experimental. No semver. The API changes without notice; pin a git rev. `publish = false`."); *What a backend supplies* (implement `carrick_hal::{Stage1MmProjection, HostSignalBridge, GuestTimerBridge}`, a `GuestMemory + CurrentMmMemory` over your guest's address space, a trap source producing `SyscallRequest`); *What a backend interprets* (the `DispatchOutcome` table: variant → backend obligation, generated from the enum docs; `Fork`, `Execve`, `CloneThread`, `ThreadExit`, `Exit`, `SignalThread`, `WaitOn*`, `FutexWait*`, `SigReturn`, `SetMemoryModel`, `MapHostAlias`); *Bootstrap* (`Kernel::bootstrap_root(RootBootstrap)` → `KernelContext`; `SyscallDispatcher::with_bridges(CarrierBridges)`; `dispatcher.dispatch(&ctx, request, &mut memory, &reporter)`); *The example* (`crates/carrick-kernel-example`, "start here"); *What is deliberately not public* (the HVPatch carrier, vCPU executors, stage-1 tables: `carrick-runtime`).
+- [ ] **Step 1: README** with these sections, in this order: *What this is* (the Carrick kernel; no guest Linux kernel; experimental, partial coverage, not a trust boundary); *Stability* ("Experimental. No semver. The API changes without notice; pin a git rev. `publish = false`."); *What a backend supplies* (implement `carrick_hal::{Stage1MmProjection, HostSignalBridge, GuestTimerBridge}`, a `GuestMemory + CurrentMmMemory` over your guest's address space, a trap source producing `SyscallRequest`); *What a backend interprets* (the `DispatchOutcome` table: variant → backend obligation, generated from the enum docs; `Fork`, `Execve`, `CloneThread`, `ThreadExit`, `Exit`, `SignalThread`, `WaitOnHvpatchChild`, `WaitOnFds`, `WaitOnSignals`, `WaitOnSleep`, `WaitOnSharedWord`, `FutexWait*`, `SigReturn`, `SetMemoryModel`, `MapHostAlias` — the retired-lane `WaitOnProcExit`/`WaitOnProcState` no longer exist after Task 0.3); *Bootstrap* (`Kernel::bootstrap_root(RootBootstrap)` → `KernelContext`; `SyscallDispatcher::with_bridges(CarrierBridges)`; `dispatcher.dispatch(&ctx, request, &mut memory, &reporter)`); *The example* (`crates/carrick-kernel-example`, "start here"); *What is deliberately not public* (the HVPatch carrier, vCPU executors, stage-1 tables: `carrick-runtime`).
 - [ ] **Step 2: Crate doc** in `lib.rs`: the README's first two sections verbatim as `//!`, plus "Modules a backend uses: `dispatch`, `kernel`, `observe`. Modules a backend may ignore: everything else (they are `pub` because dispatch is one crate, not because they are stable)."
 - [ ] **Step 3: `DispatchOutcome` docs**: each variant gets `/// Backend: <one sentence obligation>` (e.g. `Fork`: "Backend: publish the prepared fork through `kernel::operations::PreparedFork::commit`, then start executing the child task at the returned frame; see `carrick-kernel-example/src/scripted.rs::on_fork`"). `just doc` (`-D warnings`) gates it.
 - [ ] **Step 4:** `just doc && just check`; commit `docs(kernel): README, crate doc and per-outcome backend obligations for carrick-kernel`.
@@ -1053,7 +1053,7 @@ section present."
 
 **Interfaces:**
 - Consumes (all `pub`): `carrick_kernel::dispatch::{SyscallDispatcher, SyscallRequest, SyscallArgs, DispatchOutcome, CarrierBridges}`, `carrick_kernel::kernel::{Kernel, RootBootstrap, KernelContext, TaskKey, operations::PreparedFork}`, `carrick_hal::{NullHostSignalBridge, NullGuestTimerBridge, Stage1MmProjection}`, `carrick_guest_mem::{GuestMemory, CurrentMmMemory, LinearMemory}`, `carrick_abi::syscall` numbers.
-- Produces: `carrick_kernel_example::ScriptedBackend` — one host thread per Linux task, each running a `Vec<Step>` of syscalls against the shared dispatcher; interprets `Returned`, `Errno`, `Exit`, `Fork`, `WaitOnProcExit`/`WaitOnHvpatchChild`, `WaitOnFds`, `SchedulerYield`. Anything else → `Err(Unsupported(outcome))`.
+- Produces: `carrick_kernel_example::ScriptedBackend` — one host thread per Linux task, each running a `Vec<Step>` of syscalls against the shared dispatcher; interprets `Returned`, `Errno`, `Exit`, `Fork`, `WaitOnHvpatchChild`, `WaitOnFds`, `SchedulerYield` (`WaitOnProcExit`/`WaitOnProcState` were deleted in Task 0.3 as zero-producer retired-lane residue). Anything else → `Err(Unsupported(outcome))`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1140,7 +1140,7 @@ impl ScriptedBackend {
                 DispatchOutcome::Errno(e) => return Err(ExampleError::Errno(step.name(), e)),
                 DispatchOutcome::Exit { code, .. } => { report.exited(ctx.task().key(), code); return Ok(()); }
                 DispatchOutcome::Fork { .. } => self.on_fork(&ctx, outcome, memory, step.child_script(), report)?,
-                DispatchOutcome::WaitOnProcExit { .. } | DispatchOutcome::WaitOnHvpatchChild { .. } => self.on_wait(&ctx, outcome, step, memory, report)?,
+                DispatchOutcome::WaitOnHvpatchChild { .. } => self.on_wait(&ctx, outcome, step, memory, report)?,
                 DispatchOutcome::WaitOnFds { .. } => self.on_wait_fds(&ctx, outcome, step, memory, report)?,
                 DispatchOutcome::SchedulerYield => std::thread::yield_now(),
                 other => return Err(ExampleError::Unsupported(format!("{other:?}"))),
@@ -1171,7 +1171,7 @@ the only honest proof is a second backend built from pub items alone.
 
 What: crates/carrick-kernel-example runs scripted Linux tasks on host
 threads with Vec-backed guest memory and Null hal bridges, interpreting
-Returned/Errno/Exit/Fork/WaitOnProcExit/WaitOnFds/SchedulerYield. The
+Returned/Errno/Exit/Fork/WaitOnHvpatchChild/WaitOnFds/SchedulerYield. The
 fork_pipe_wait test runs pipe2 -> fork -> child write+exit -> read -> wait4
 through SyscallDispatcher with no VM. <N> kernel items became pub with docs
 to make that possible: <list>. It does not fork host processes or run guest
