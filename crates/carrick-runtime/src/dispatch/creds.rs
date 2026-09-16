@@ -1580,7 +1580,7 @@ mod identity_snapshot_tests {
         if crate::syscall_shim_enabled() {
             let mut id_mem1 =
                 LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 0x4000]);
-            crate::vcpu_loop::stamp_identity_page(&mut id_mem1, &d1, &context1)
+            crate::kernel::identity_page::stamp_identity_page(&mut id_mem1, &d1, &context1)
                 .expect("stamp identity page for container 1 root");
             let bytes1 = id_mem1
                 .read_bytes(
@@ -1596,7 +1596,7 @@ mod identity_snapshot_tests {
 
             let mut id_mem2 =
                 LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 0x4000]);
-            crate::vcpu_loop::stamp_identity_page(&mut id_mem2, &d2, &context2)
+            crate::kernel::identity_page::stamp_identity_page(&mut id_mem2, &d2, &context2)
                 .expect("stamp identity page for container 2 root");
             let bytes2 = id_mem2
                 .read_bytes(

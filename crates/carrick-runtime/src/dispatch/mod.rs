@@ -790,6 +790,7 @@ pub(crate) use rootfs_helpers::*;
 pub mod io_buffers;
 pub(in crate::dispatch) use io_buffers::*;
 pub mod mm_authority;
+pub mod mm_quiesce;
 #[cfg(test)]
 pub(crate) use carrick_abi::LINUX_FUTEX_PRIVATE_FLAG;
 #[allow(unused_imports)]

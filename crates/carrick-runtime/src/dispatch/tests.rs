@@ -5613,7 +5613,7 @@ mod container_policy_dispatch_tests {
             admitted_tx.send(()).expect("announce peer admitted");
             peer
         });
-        crate::vcpu_loop::with_sole_mm_stage1(&mut sole_executor, |_authority| {
+        crate::dispatch::mm_quiesce::with_sole_mm_stage1(&mut sole_executor, |_authority| {
             attempted_rx.recv().expect("peer attempts exact-MM admission");
             assert_eq!(
                 admitted_rx.recv_timeout(std::time::Duration::from_millis(25)),

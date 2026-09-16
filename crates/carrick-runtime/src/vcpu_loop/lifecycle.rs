@@ -16,9 +16,10 @@ use carrick_hal::VcpuRegistry;
 use super::terminal::CloneAdmissionChangeSubscription;
 use super::threads;
 use super::{
-    Kernel, RuntimeError, SyscallDispatcher, ThreadRuntimeState, executor, stamp_identity_values,
+    Kernel, RuntimeError, SyscallDispatcher, ThreadRuntimeState, executor,
     stamp_ns_visible_guest_tid,
 };
+use crate::kernel::identity_page::stamp_identity_values;
 
 pub(crate) enum ProcessChildBootstrap {
     GuestFork {

@@ -113,7 +113,7 @@ pub struct MmMutationGuard<'authority> {
     coordinator: Arc<MmMutationCoordinator>,
     mm: MmId,
     operation: carrick_observability::probes::HvpatchTopologyOperation,
-    foreign_authority: Option<&'authority mut crate::vcpu_loop::quiesce::FrameCowExactMmGuard>,
+    foreign_authority: Option<&'authority mut super::mm_quiesce::FrameCowExactMmGuard>,
     _authority: PhantomData<&'authority mut ()>,
 }
 
@@ -244,15 +244,23 @@ impl ForeignMmMutationAuthority {
         tid: carrick_hal::ThreadId,
         operation: impl FnOnce(&mut MmMutationGuard<'_>) -> T,
     ) -> Result<T, ForeignMmMutationError> {
-        crate::vcpu_loop::with_foreign_mm_mutation_guard(
+        let mut authority = super::mm_quiesce::acquire_foreign_mm_mutation_quiesce(
             &self.pt_quiesce,
             self.mm,
-            Arc::clone(&self.coordinator),
             &self.census,
+            Arc::clone(&self.coordinator),
             Arc::clone(&self.stage1),
             tid,
-            operation,
+            super::mm_quiesce::PtPauseBudget::DEFAULT,
         )
+        .map_err(|error| match error {
+            super::mm_quiesce::PtPauseError::TimedOut => ForeignMmMutationError::TimedOut,
+            super::mm_quiesce::PtPauseError::UnkickableExecutor => {
+                ForeignMmMutationError::UnkickableExecutor
+            }
+        })?;
+        let mut mutation = from_frame_cow(&mut authority);
+        Ok(operation(&mut mutation))
     }
 }
 
@@ -266,7 +274,7 @@ pub(crate) enum ForeignMmMutationError {
 }
 
 pub(crate) fn from_pt_pause<'authority>(
-    authority: &'authority mut crate::vcpu_loop::quiesce::PtPauseGuard,
+    authority: &'authority mut super::mm_quiesce::PtPauseGuard,
 ) -> MmMutationGuard<'authority> {
     let (coordinator, mm) = authority.mutation_identity().unwrap_or_else(|| {
         carrick_fatal!(
@@ -284,7 +292,7 @@ pub(crate) fn from_pt_pause<'authority>(
 }
 
 pub(crate) fn from_sole_executor<'authority>(
-    authority: &'authority mut crate::vcpu_loop::quiesce::SoleMmStage1<'_>,
+    authority: &'authority mut super::mm_quiesce::SoleMmStage1<'_>,
     coordinator: Arc<MmMutationCoordinator>,
     mm: MmId,
 ) -> MmMutationGuard<'authority> {
@@ -303,7 +311,7 @@ pub(crate) fn from_sole_executor<'authority>(
 
 #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
 pub(crate) fn from_frame_cow<'authority>(
-    authority: &'authority mut crate::vcpu_loop::quiesce::FrameCowExactMmGuard,
+    authority: &'authority mut super::mm_quiesce::FrameCowExactMmGuard,
 ) -> MmMutationGuard<'authority> {
     let (coordinator, mm) = authority.mutation_identity().unwrap_or_else(|| {
         carrick_fatal!(
@@ -423,7 +431,7 @@ pub(crate) mod test_support {
         coordinator: Arc<MmMutationCoordinator>,
         use_guard: impl FnOnce(&mut MmMutationGuard<'_>) -> T,
     ) -> T {
-        crate::vcpu_loop::with_real_pt_pause_for_test(coordinator, |authority| {
+        crate::dispatch::mm_quiesce::with_real_pt_pause_for_test(coordinator, |authority| {
             let mut guard = from_pt_pause(authority);
             use_guard(&mut guard)
         })

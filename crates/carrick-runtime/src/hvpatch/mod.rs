@@ -1105,13 +1105,12 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
                 binding.ttbr0.raw(),
                 engine.get_sys_reg(SysReg::Ttbr0).unwrap_or(0)
             );
-            crate::vcpu_loop::stamp_identity_page(engine, dispatcher, root_context).map_err(
-                |error| {
+            crate::kernel::identity_page::stamp_identity_page(engine, dispatcher, root_context)
+                .map_err(|error| {
                     RuntimeError::Configuration(format!(
                         "stamp HVPatch root identity page: {error}"
                     ))
-                },
-            )?;
+                })?;
             let lifecycle = prepared.prepare_root_lifecycle(
                 root_context,
                 crate::thread::ThreadId::from_guest_supplied_tid(

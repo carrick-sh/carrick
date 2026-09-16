@@ -3637,13 +3637,16 @@ where
                                 "vfork parent identity restore lost Kernel context".to_owned(),
                             )
                         })?;
-                    stamp_identity_page(engine, &self.kernel.dispatcher, parent_context).map_err(
-                        |error| {
-                            RuntimeError::Trap(TrapError::Hypervisor(format!(
-                                "restore vfork parent identity page: {error}"
-                            )))
-                        },
-                    )?;
+                    crate::kernel::identity_page::stamp_identity_page(
+                        engine,
+                        &self.kernel.dispatcher,
+                        parent_context,
+                    )
+                    .map_err(|error| {
+                        RuntimeError::Trap(TrapError::Hypervisor(format!(
+                            "restore vfork parent identity page: {error}"
+                        )))
+                    })?;
                 }
                 let outcome = match (vfork_child_pid, resumed) {
                     (Some(child_pid), Some(DispatchOutcome::Returned { .. })) => {

@@ -302,7 +302,7 @@ mod tests {
         let context = dispatcher
             .capture_one_task_context()
             .expect("exec task context");
-        crate::vcpu_loop::stamp_identity_page(&mut image, &dispatcher, &context)
+        crate::kernel::identity_page::stamp_identity_page(&mut image, &dispatcher, &context)
             .expect("closed exec identity page remains stampable");
 
         let identity = image_region(&image, carrick_mem::memory::LINUX_IDENTITY_PAGE_BASE);

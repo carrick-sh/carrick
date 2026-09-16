@@ -17,6 +17,7 @@ pub mod exec;
 pub mod fd_ceiling;
 pub mod frame_inventory;
 pub mod guest_execution;
+pub mod identity_page;
 pub mod ids;
 pub(crate) mod mm_access;
 pub(crate) mod mm_proof;

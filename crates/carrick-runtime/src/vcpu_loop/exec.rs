@@ -1766,10 +1766,10 @@ where
                 },
             };
             let coordinator = kernel.dispatcher.mm_mutation_coordinator();
-            let authority = match super::quiesce::acquire_mm_stage1_authority(
+            let authority = match crate::dispatch::mm_quiesce::acquire_mm_stage1_authority(
                 mm_executor,
                 self.this_tid,
-                super::quiesce::PtPauseBudget::DEFAULT,
+                crate::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
             ) {
                 Ok(auth) => auth,
                 Err(error) => {
@@ -1789,7 +1789,7 @@ where
             mm_authority
                 .as_mut()
                 .map(|(authority, coordinator, mm_id)| match authority {
-                    super::quiesce::MmStage1Authority::Sole(sole) => {
+                    crate::dispatch::mm_quiesce::MmStage1Authority::Sole(sole) => {
                         crate::dispatch::mm_mutation::from_sole_executor(
                             sole,
                             std::sync::Arc::clone(coordinator),
@@ -1799,7 +1799,7 @@ where
                             carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
                         )
                     }
-                    super::quiesce::MmStage1Authority::Paused(pause) => {
+                    crate::dispatch::mm_quiesce::MmStage1Authority::Paused(pause) => {
                         crate::dispatch::mm_mutation::from_pt_pause(pause).with_operation(
                             carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
                         )
@@ -2276,7 +2276,7 @@ where
         self.fail_exec_terminal_context_for_test(
             ExecTerminalContextFailpoint::IdentityPublication,
         )?;
-        if let Err(error) = super::stamp_identity_page_at(
+        if let Err(error) = crate::kernel::identity_page::stamp_identity_page_at(
             engine,
             &kernel.dispatcher,
             &committed_context,

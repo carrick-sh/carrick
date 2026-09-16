@@ -55,6 +55,15 @@ CRASH_MUTATION_OWNERS = frozenset(
         "crates/carrick-runtime/src/kernel/objects.rs",
     }
 )
+# The exact-mm stage-1 quiesce protocol (`dispatch/mm_quiesce.rs`) and the
+# carrier fork path that consumes it: a scalar `census.live()` read there is
+# a census witness bypass, not a diagnostic.
+EXACT_MM_QUIESCE_OWNERS = frozenset(
+    {
+        "crates/carrick-runtime/src/dispatch/mm_quiesce.rs",
+        "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -437,7 +446,7 @@ def scan_source(source: str, relative_path: str) -> list[Finding]:
         if token.kind == "ident" and token.text == "live_thread_count":
             add(index, RAW_TASK_CARDINALITY, "live_thread_count")
         if (
-            relative_path == "crates/carrick-runtime/src/vcpu_loop/quiesce.rs"
+            relative_path in EXACT_MM_QUIESCE_OWNERS
             and _sequence_at(tokens, index, [".", "live", "(", ")"])
         ):
             add(index, SCALAR_CENSUS_API, "GuestExecutorCensus::live() call")
