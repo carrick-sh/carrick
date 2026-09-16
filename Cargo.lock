@@ -585,6 +585,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-kernel-example"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-guest-mem",
+ "carrick-hal",
+ "carrick-kernel",
+ "parking_lot",
+ "thiserror",
+]
+
+[[package]]
 name = "carrick-mem"
 version = "0.1.0"
 dependencies = [
