@@ -1763,7 +1763,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "file": "crates/carrick-runtime/src/dispatch/mm_quiesce.rs",
       "symbol": "EXACT_MM_STAGE1",
       "fingerprint": "1831bf5d7c756e3b61f4c1029d96d250a26dae7fcad2141c09e88c86e8db501e",
       "classification": "carrier_infra",

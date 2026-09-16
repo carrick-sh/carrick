@@ -15494,7 +15494,7 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
-      "resource": "current carrier fork-quiesce worker used by `acquire_pt_pause`"
+      "resource": "current carrier fork-quiesce worker used by `begin_pt_pause`"
     },
     "expansion": null,
     "operation": "std::thread::yield_now",
@@ -15502,7 +15502,7 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/quiesce.rs:638 in `acquire_pt_pause`, `std::thread::yield_now` acts only on the current carrier fork-quiesce worker used by `acquire_pt_pause`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/quiesce.rs:638 in `begin_pt_pause`, `std::thread::yield_now` acts only on the current carrier fork-quiesce worker used by `begin_pt_pause`; no guest identity selects its host target.",
     "review_id": "HA-000640",
     "source": {
       "byte_end": 23963,
@@ -15521,7 +15521,7 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
-      "resource": "current carrier fork-quiesce worker used by `acquire_pt_pause`"
+      "resource": "current carrier fork-quiesce worker used by `drain_exact_mm`"
     },
     "expansion": null,
     "operation": "std::thread::yield_now",
@@ -15529,7 +15529,7 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/quiesce.rs:678 in `acquire_pt_pause`, `std::thread::yield_now` acts only on the current carrier fork-quiesce worker used by `acquire_pt_pause`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/quiesce.rs:678 in `drain_exact_mm`, `std::thread::yield_now` acts only on the current carrier fork-quiesce worker used by `drain_exact_mm`; no guest identity selects its host target.",
     "review_id": "HA-000641",
     "source": {
       "byte_end": 25409,
