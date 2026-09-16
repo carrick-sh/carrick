@@ -9045,15 +9045,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 71681,
-        "byte_start": 71665,
+        "byte_end": 71708,
+        "byte_start": 71692,
         "column": 51,
         "column_end": 67,
         "column_start": 51,
         "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-        "line": 1712,
-        "line_end": 1712,
-        "line_start": 1712
+        "line": 1714,
+        "line_end": 1714,
+        "line_start": 1714
       }
     },
     {
@@ -9065,15 +9065,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 111583,
-        "byte_start": 111567,
+        "byte_end": 111610,
+        "byte_start": 111594,
         "column": 24,
         "column_end": 40,
         "column_start": 24,
         "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-        "line": 2511,
-        "line_end": 2511,
-        "line_start": 2511
+        "line": 2513,
+        "line_end": 2513,
+        "line_start": 2513
       }
     },
     {
@@ -9085,15 +9085,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 144106,
-        "byte_start": 144090,
+        "byte_end": 143627,
+        "byte_start": 143611,
         "column": 20,
         "column_end": 36,
         "column_start": 20,
         "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-        "line": 3437,
-        "line_end": 3437,
-        "line_start": 3437
+        "line": 3426,
+        "line_end": 3426,
+        "line_start": 3426
       }
     },
     {
@@ -9525,15 +9525,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 37028,
-        "byte_start": 37012,
+        "byte_end": 37912,
+        "byte_start": 37896,
         "column": 43,
         "column_end": 59,
         "column_start": 43,
         "file": "crates/carrick-runtime/src/namespace/pid.rs",
-        "line": 917,
-        "line_end": 917,
-        "line_start": 917
+        "line": 934,
+        "line_end": 934,
+        "line_start": 934
       }
     },
     {
@@ -10529,15 +10529,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 185268,
-        "byte_start": 185243,
+        "byte_end": 185354,
+        "byte_start": 185329,
         "column": 35,
         "column_end": 60,
         "column_start": 35,
         "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-        "line": 4370,
-        "line_end": 4370,
-        "line_start": 4370
+        "line": 4372,
+        "line_end": 4372,
+        "line_start": 4372
       }
     },
     {
@@ -11433,15 +11433,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 41053,
-        "byte_start": 41031,
+        "byte_end": 41937,
+        "byte_start": 41915,
         "column": 13,
         "column_end": 35,
         "column_start": 13,
         "file": "crates/carrick-runtime/src/namespace/pid.rs",
-        "line": 1038,
-        "line_end": 1038,
-        "line_start": 1038
+        "line": 1055,
+        "line_end": 1055,
+        "line_start": 1055
       }
     },
     {
@@ -11453,15 +11453,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 51644,
-        "byte_start": 51622,
+        "byte_end": 52528,
+        "byte_start": 52506,
         "column": 21,
         "column_end": 43,
         "column_start": 21,
         "file": "crates/carrick-runtime/src/namespace/pid.rs",
-        "line": 1329,
-        "line_end": 1329,
-        "line_start": 1329
+        "line": 1346,
+        "line_end": 1346,
+        "line_start": 1346
       }
     },
     {
@@ -11585,9 +11585,9 @@
       }
     }
   ],
-  "rows_sha256": "178b8a18c63af378ee8778a1e9bef854cd6d0f833fc9948ec4e24be25e45f1ec",
+  "rows_sha256": "664bc23d6d0165f3d1414f2ce798eaa6fe8403a3bf438a42972d56f9c48e3203",
   "schema": 1,
-  "source_head": "630ba3015d770b4a5b58e940d9b6eec8a7fa37b4",
+  "source_head": "92959424b074818c7aa4f8a8c2056b0b993de3c8",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",

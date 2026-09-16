@@ -25,7 +25,7 @@
     "description_backing": 7,
     "epoll": 39,
     "stream": 19,
-    "mapping": 90,
+    "mapping": 91,
     "lifecycle": 9
   },
   "entries": [
@@ -10523,7 +10523,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-      "line": 631,
+      "line": 633,
       "categories": [
         "lifecycle"
       ],
@@ -10532,7 +10532,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-      "line": 1140,
+      "line": 1142,
       "categories": [
         "epoll"
       ],
@@ -10541,7 +10541,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-      "line": 1529,
+      "line": 1531,
       "categories": [
         "mapping"
       ],
@@ -10550,7 +10550,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-      "line": 1831,
+      "line": 1833,
       "categories": [
         "description_guard"
       ],
@@ -15024,7 +15024,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
-      "line": 49,
+      "line": 50,
       "categories": [
         "lifecycle"
       ],
@@ -15033,7 +15033,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
-      "line": 57,
+      "line": 58,
       "categories": [
         "lifecycle"
       ],
@@ -15042,7 +15042,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
-      "line": 489,
+      "line": 490,
       "categories": [
         "lifecycle"
       ],
@@ -15051,7 +15051,25 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
-      "line": 1198,
+      "line": 702,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// says the faulting VA belongs to a live mapping that denies the access.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
+      "line": 705,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// when Darwin reports an initial read-only host mapping as a translation-style",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
+      "line": 1313,
       "categories": [
         "lifecycle"
       ],
@@ -15060,7 +15078,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
-      "line": 1202,
+      "line": 1317,
       "categories": [
         "lifecycle"
       ],
@@ -15069,7 +15087,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
-      "line": 1303,
+      "line": 1418,
       "categories": [
         "lifecycle"
       ],
@@ -16816,7 +16834,16 @@
     },
     {
       "file": "crates/carrick-runtime/src/namespace/pid.rs",
-      "line": 1583,
+      "line": 826,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// mapping is an invariant failure; returning zero would publish a TID Linux",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/namespace/pid.rs",
+      "line": 1600,
       "categories": [
         "mapping"
       ],
@@ -17518,7 +17545,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5516,
+      "line": 5518,
       "categories": [
         "mapping"
       ],
@@ -17527,7 +17554,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5524,
+      "line": 5526,
       "categories": [
         "mapping"
       ],
@@ -17536,7 +17563,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5540,
+      "line": 5542,
       "categories": [
         "mapping"
       ],
@@ -17779,16 +17806,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 730,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// mapping is an invariant failure; returning zero would publish a TID Linux",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 783,
+      "line": 761,
       "categories": [
         "mapping"
       ],
@@ -17797,7 +17815,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 834,
+      "line": 812,
       "categories": [
         "mapping"
       ],
@@ -17806,7 +17824,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 988,
+      "line": 965,
       "categories": [
         "mapping"
       ],
@@ -17815,7 +17833,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 1073,
+      "line": 1050,
       "categories": [
         "mapping"
       ],
@@ -17824,7 +17842,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 1084,
+      "line": 1061,
       "categories": [
         "mapping"
       ],
@@ -17833,7 +17851,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 1128,
+      "line": 1105,
       "categories": [
         "mapping"
       ],
@@ -17842,7 +17860,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 1143,
+      "line": 1120,
       "categories": [
         "mapping"
       ],
@@ -17851,7 +17869,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 1194,
+      "line": 1171,
       "categories": [
         "mapping"
       ],
@@ -17860,7 +17878,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 1204,
+      "line": 1181,
       "categories": [
         "mapping"
       ],
@@ -17869,7 +17887,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 1218,
+      "line": 1195,
       "categories": [
         "mapping"
       ],
@@ -17878,7 +17896,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 2009,
+      "line": 1986,
       "categories": [
         "mapping"
       ],
@@ -17887,7 +17905,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 2019,
+      "line": 1996,
       "categories": [
         "mapping"
       ],
@@ -17896,7 +17914,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 2033,
+      "line": 2010,
       "categories": [
         "mapping"
       ],
@@ -17905,7 +17923,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 2055,
+      "line": 2032,
       "categories": [
         "mapping"
       ],
@@ -17914,7 +17932,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 2076,
+      "line": 2053,
       "categories": [
         "mapping"
       ],
@@ -17923,7 +17941,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 2091,
+      "line": 2068,
       "categories": [
         "mapping"
       ],
@@ -17932,7 +17950,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 2118,
+      "line": 2095,
       "categories": [
         "mapping"
       ],
@@ -17941,7 +17959,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 2128,
+      "line": 2105,
       "categories": [
         "mapping"
       ],
@@ -17950,7 +17968,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 2142,
+      "line": 2119,
       "categories": [
         "mapping"
       ],
@@ -17959,7 +17977,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 2159,
+      "line": 2136,
       "categories": [
         "mapping"
       ],
@@ -17977,7 +17995,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1569,
+      "line": 1560,
       "categories": [
         "mapping"
       ],
@@ -17986,7 +18004,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1627,
+      "line": 1618,
       "categories": [
         "mapping"
       ],
@@ -17995,7 +18013,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1817,
+      "line": 1808,
       "categories": [
         "mapping"
       ],
@@ -18004,7 +18022,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1820,
+      "line": 1811,
       "categories": [
         "mapping"
       ],
@@ -18013,7 +18031,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1827,
+      "line": 1818,
       "categories": [
         "mapping"
       ],
@@ -18022,7 +18040,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1831,
+      "line": 1822,
       "categories": [
         "mapping"
       ],
@@ -18031,7 +18049,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1845,
+      "line": 1836,
       "categories": [
         "mapping"
       ],
@@ -18040,7 +18058,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3103,
+      "line": 3063,
       "categories": [
         "mapping"
       ],
@@ -18049,7 +18067,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3105,
+      "line": 3065,
       "categories": [
         "mapping"
       ],
@@ -18058,7 +18076,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3113,
+      "line": 3073,
       "categories": [
         "mapping"
       ],
@@ -18067,7 +18085,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3125,
+      "line": 3085,
       "categories": [
         "mapping"
       ],
@@ -18076,7 +18094,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3129,
+      "line": 3089,
       "categories": [
         "mapping"
       ],
@@ -18085,7 +18103,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3132,
+      "line": 3092,
       "categories": [
         "mapping"
       ],
@@ -18148,25 +18166,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 125,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// says the faulting VA belongs to a live mapping that denies the access.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 128,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// when Darwin reports an initial read-only host mapping as a translation-style",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 161,
+      "line": 133,
       "categories": [
         "mapping"
       ],
