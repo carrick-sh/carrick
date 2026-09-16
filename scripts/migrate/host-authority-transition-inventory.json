@@ -5479,7 +5479,7 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/runtime.rs:2231 in `rosetta_binary_bytes`, `std::fs::read` accesses only the fixed installed Rosetta interpreter object used by `rosetta_binary_bytes`.",
+    "rationale": "At crates/carrick-runtime/src/lib.rs:2231 in `rosetta_binary_bytes`, `std::fs::read` accesses only the fixed installed Rosetta interpreter object used by `rosetta_binary_bytes`.",
     "review_id": "HA-000240",
     "source": {
       "byte_end": 96674,
@@ -5487,7 +5487,7 @@
       "column": 25,
       "column_end": 38,
       "column_start": 25,
-      "file": "crates/carrick-runtime/src/runtime.rs",
+      "file": "crates/carrick-runtime/src/lib.rs",
       "line": 2231,
       "line_end": 2231,
       "line_start": 2231
