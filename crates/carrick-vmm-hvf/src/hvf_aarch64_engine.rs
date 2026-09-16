@@ -2481,7 +2481,7 @@ mod task_only_materializer_tests {
         assert!(include_str!("trap.rs").contains(
             "#[cfg(test)]\n#[cfg(all(target_os = \"macos\", target_arch = \"aarch64\"))]\nimpl Default for HvpatchCarrierTaskStateDirectory"
         ));
-        let kernel_core = include_str!("../../carrick-runtime/src/kernel/core.rs");
+        let kernel_core = include_str!("../../carrick-kernel/src/kernel/core.rs");
         assert!(
             kernel_core
                 .contains("hvpatch_child_token_issuer: Arc<carrick_hal::HvpatchChildTokenIssuer>")

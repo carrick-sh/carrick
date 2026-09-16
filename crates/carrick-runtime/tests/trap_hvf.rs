@@ -309,7 +309,7 @@ fn shim_engine_or_skip(image: &AddressSpace) -> Option<HvfTrapEngine> {
 
 #[test]
 fn el1_shim_services_getpid_at_el1_without_a_host_trap() {
-    use carrick_runtime::dispatch::GuestMemory;
+    use carrick_kernel::dispatch::GuestMemory;
     use carrick_runtime::memory::{IDENTITY_OFF_PID, LINUX_IDENTITY_PAGE_BASE};
     use carrick_runtime::trap::SyscallTrap;
 

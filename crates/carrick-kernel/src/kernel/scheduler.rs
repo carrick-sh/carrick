@@ -23,7 +23,7 @@ use super::objects::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct QueueKey {
+pub struct QueueKey {
     pub(crate) thread: ThreadKey,
     pub(crate) generation: ExecutionGeneration,
 }
@@ -129,7 +129,7 @@ pub trait ExecutorKick: Send + Sync + std::fmt::Debug {
     fn current_binding(&self) -> Option<ExecutorBinding>;
 }
 
-pub(crate) trait DiscardRecorder: Send + Sync {
+pub trait DiscardRecorder: Send + Sync {
     fn record_discard(
         &self,
         executor: ExecutorId,
@@ -140,7 +140,7 @@ pub(crate) trait DiscardRecorder: Send + Sync {
     );
 }
 
-pub(crate) trait SchedulerGenerationObserver: Send + Sync {
+pub trait SchedulerGenerationObserver: Send + Sync {
     fn transition(
         &self,
         thread: ThreadKey,
@@ -164,7 +164,7 @@ pub(crate) trait SchedulerGenerationObserver: Send + Sync {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SchedulerGenerationTransition {
+pub enum SchedulerGenerationTransition {
     Runnable,
     Blocked,
     Terminal,
@@ -183,7 +183,7 @@ pub(crate) enum SchedulerGenerationTransition {
 /// goes through lane B's post-mortem sink and the transaction that observed it
 /// still has to finish.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GenerationTransitionOutcome {
+pub enum GenerationTransitionOutcome {
     /// The observer recorded the successor. It is reachable and publishable.
     Recorded,
     /// The observer rejected the transition while the kernel graph still calls
@@ -205,7 +205,7 @@ pub(crate) enum GenerationTransitionOutcome {
 /// The two meanings of one observer REJECTION, before the fatal one is acted
 /// on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TransitionRejection {
+pub enum TransitionRejection {
     /// Benign: the target left the kernel graph under the transition.
     TargetReaped,
     /// Fatal: the thread IS still live, so the observer and the Kernel
@@ -304,7 +304,7 @@ impl ExecutorKickToken {
         self.generation
     }
 
-    pub(crate) const fn binding(self) -> ExecutorBinding {
+    pub const fn binding(self) -> ExecutorBinding {
         ExecutorBinding {
             executor: self.executor,
             executor_epoch: self.executor_epoch,
@@ -651,7 +651,7 @@ impl QueueLifecycle {
 }
 
 #[derive(Debug)]
-pub(crate) struct QueueRow {
+pub struct QueueRow {
     pub(crate) key: QueueKey,
     pub(crate) thread: Arc<Thread>,
     pub(crate) closing_authorized: bool,
@@ -958,17 +958,17 @@ struct RunQueueInner {
     /// CPU, so an executor that retires never strands its queue.
     online: Vec<AtomicUsize>,
     policy: Arc<dyn SchedulingPolicy>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     close_census_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     post_unpark_epoch_gate: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
     close_observation_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
     root_admission_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     close_started_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pre_park_gate: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
 }
 
@@ -1594,7 +1594,7 @@ impl Drop for WakeAdmission {
 /// admitted only while open; descendants of this retained authority may be
 /// admitted while closing so recursive fork publication cannot be stranded.
 #[derive(Debug)]
-pub(crate) struct SubmissionAuthority {
+pub struct SubmissionAuthority {
     queue: Weak<RunQueueInner>,
     kernel: Weak<Kernel>,
     key: QueueKey,
@@ -1602,19 +1602,19 @@ pub(crate) struct SubmissionAuthority {
 }
 
 impl SubmissionAuthority {
-    pub(crate) const fn thread_key(&self) -> ThreadKey {
+    pub const fn thread_key(&self) -> ThreadKey {
         self.key.thread
     }
 
-    pub(crate) const fn generation(&self) -> ExecutionGeneration {
+    pub const fn generation(&self) -> ExecutionGeneration {
         self.key.generation
     }
 
-    pub(crate) const fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.active
     }
 
-    pub(crate) fn rollover_exact(
+    pub fn rollover_exact(
         mut self,
         scheduler: &Scheduler,
         predecessor_thread: ThreadKey,
@@ -1669,7 +1669,7 @@ impl SubmissionAuthority {
         queue.retarget_unpublished_gate(self.key, QueueKey { thread, generation });
     }
 
-    pub(crate) fn park_exact(
+    pub fn park_exact(
         self,
         scheduler: &Scheduler,
         predecessor: ExecutionGeneration,
@@ -1685,7 +1685,7 @@ impl SubmissionAuthority {
         Ok(authority)
     }
 
-    pub(crate) fn replace_exec_exact(
+    pub fn replace_exec_exact(
         mut self,
         scheduler: &Scheduler,
         predecessor_thread: ThreadKey,
@@ -1721,7 +1721,7 @@ impl SubmissionAuthority {
         Ok(self)
     }
 
-    pub(crate) fn reactivate_exact(
+    pub fn reactivate_exact(
         mut self,
         scheduler: &Scheduler,
         predecessor: ExecutionGeneration,
@@ -1755,7 +1755,7 @@ impl SubmissionAuthority {
         Ok(self)
     }
 
-    pub(crate) fn admit_descendant(
+    pub fn admit_descendant(
         &self,
         thread: ThreadKey,
         generation: ExecutionGeneration,
@@ -1785,7 +1785,7 @@ impl SubmissionAuthority {
             .unwrap_or(Err(RunQueueError::AuthorityMismatch))
     }
 
-    pub(crate) fn admit_same_task_sibling(
+    pub fn admit_same_task_sibling(
         &self,
         thread: ThreadKey,
         generation: ExecutionGeneration,
@@ -1801,7 +1801,7 @@ impl SubmissionAuthority {
         })
     }
 
-    pub(crate) fn admit_peer_root(
+    pub fn admit_peer_root(
         &self,
         thread: ThreadKey,
         generation: ExecutionGeneration,
@@ -1844,8 +1844,8 @@ impl SubmissionAuthority {
         validate(&kernel, &mut commit).unwrap_or(Err(RunQueueError::AuthorityMismatch))
     }
 
-    #[cfg(test)]
-    pub(crate) fn publish(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn publish(
         &self,
         scheduler: &Scheduler,
         thread: Arc<Thread>,
@@ -1853,7 +1853,7 @@ impl SubmissionAuthority {
         self.publish_row(scheduler, thread).map(|_| ())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn publish_row(
         &self,
         scheduler: &Scheduler,
@@ -1868,7 +1868,7 @@ impl SubmissionAuthority {
     /// the scheduler. Publication takes the run-queue lock and consults every
     /// executor kick, which nest INSIDE the exec-retarget lock order; the
     /// handle exists so no caller has to publish from under an outer lock.
-    pub(crate) fn publication_handle(&self) -> SubmissionPublication {
+    pub fn publication_handle(&self) -> SubmissionPublication {
         SubmissionPublication {
             queue: Weak::clone(&self.queue),
             key: self.key,
@@ -1877,7 +1877,7 @@ impl SubmissionAuthority {
 }
 
 /// See [`SubmissionAuthority::publication_handle`].
-pub(crate) struct SubmissionPublication {
+pub struct SubmissionPublication {
     queue: Weak<RunQueueInner>,
     key: QueueKey,
 }
@@ -1899,7 +1899,7 @@ impl SubmissionPublication {
     /// and every production caller lowers an activation failure into a
     /// guest-fatal `TrapError`. That killed a live `cpython-importlib`
     /// guest process mid-run with exit `127`.
-    pub(crate) fn publish(
+    pub fn publish(
         &self,
         scheduler: &Scheduler,
         thread: Arc<Thread>,
@@ -1983,7 +1983,7 @@ pub fn default_guest_cpu_count() -> usize {
 /// its own CPU count. Idempotent for the same answer; aborts on a second,
 /// different one, because a guest cannot be told two different truths about
 /// how many CPUs it has and there is no correct value to continue from.
-pub(crate) fn publish_guest_cpu_count(ncpu: usize) {
+pub fn publish_guest_cpu_count(ncpu: usize) {
     let ncpu = ncpu.clamp(1, carrick_hal::MAX_GUEST_CPUS);
     match EXPOSED_GUEST_CPUS.compare_exchange(0, ncpu, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {}
@@ -2030,17 +2030,17 @@ impl RunQueue {
                 online: (0..ncpu).map(|_| AtomicUsize::new(0)).collect(),
                 cpus,
                 policy,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 close_census_gate: Mutex::new(None),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 post_unpark_epoch_gate: Mutex::new(None),
                 #[cfg(test)]
                 close_observation_gate: Mutex::new(None),
                 #[cfg(test)]
                 root_admission_gate: Mutex::new(None),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 close_started_gate: Mutex::new(None),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 pre_park_gate: Mutex::new(None),
             }),
         }
@@ -2188,7 +2188,7 @@ impl RunQueue {
                 return Ok(self.claim_taken(&mut idle, cpu.id, row));
             }
 
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some((arrived, resume)) = self.inner.pre_park_gate.lock().take() {
                 arrived.wait();
                 resume.wait();
@@ -2233,7 +2233,7 @@ impl RunQueue {
             if flush_requested {
                 return Err(RunQueueError::FlushRequested);
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(gate) = self.inner.post_unpark_epoch_gate.lock().clone() {
                 let _ = gate.send(());
             }
@@ -2457,22 +2457,22 @@ impl RunQueue {
                 expected += local.waiters;
                 local.close_epoch = epoch;
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             let close_census_gate = self.inner.close_census_gate.lock().take();
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some((arrived, resume)) = close_census_gate {
                 let _ = arrived.send(());
                 let _ = resume.recv_timeout(std::time::Duration::from_secs(5));
             }
             state.close_waiters_expected = expected;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let close_started_gate = self.inner.close_started_gate.lock().clone();
         self.inner.maybe_finish_close(&mut state);
         self.inner.changed.notify_all();
         drop(state);
         self.inner.nudge_all_cpus();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(gate) = close_started_gate {
             gate.wait();
         }
@@ -2518,7 +2518,7 @@ impl RunQueue {
     /// entering a non-reentrant `parking_lot::Mutex` and deadlocking its own
     /// thread while holding the lock the whole carrier drains through. Taking
     /// `&RunQueueState` makes that call unwritable.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn waiter_count_locked(&self, state: &RunQueueState) -> usize {
         let cpu_waiters: usize = self
             .inner
@@ -2552,7 +2552,7 @@ impl RunQueue {
         WaiterCensus::Exact(total + state.spare_waiters)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn closed_waiter_observations(&self) -> usize {
         self.inner.state.lock().closed_waiter_observations
     }
@@ -2567,7 +2567,7 @@ impl RunQueue {
         self.inner.drain_ready()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn install_pre_park_gate(
         &self,
         arrived: Arc<std::sync::Barrier>,
@@ -2586,7 +2586,7 @@ impl RunQueue {
         *self.inner.root_admission_gate.lock() = Some(gate);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn install_close_census_gate(
         &self,
         arrived: std::sync::mpsc::Sender<()>,
@@ -2595,18 +2595,18 @@ impl RunQueue {
         *self.inner.close_census_gate.lock() = Some((arrived, resume));
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn install_post_unpark_epoch_gate(&self, gate: std::sync::mpsc::Sender<()>) {
         *self.inner.post_unpark_epoch_gate.lock() = Some(gate);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn install_close_started_gate(&self, gate: Arc<std::sync::Barrier>) {
         *self.inner.close_started_gate.lock() = Some(gate);
     }
 }
 
-pub(crate) struct QueueClaim {
+pub struct QueueClaim {
     row: QueueRow,
     lease: ThreadExecutionLease,
 }
@@ -2685,11 +2685,11 @@ impl RunnableThread {
         )
     }
 
-    pub(crate) fn thread(&self) -> &Arc<Thread> {
+    pub fn thread(&self) -> &Arc<Thread> {
         &self.thread
     }
 
-    pub(crate) fn take_lease(&mut self) -> ThreadExecutionLease {
+    pub fn take_lease(&mut self) -> ThreadExecutionLease {
         self.lease.take().unwrap_or_else(|| {
             carrick_fatal!(
                 "kernel::runnable_thread",
@@ -2698,7 +2698,7 @@ impl RunnableThread {
         })
     }
 
-    pub(crate) fn restore_lease(
+    pub fn restore_lease(
         &mut self,
         lease: ThreadExecutionLease,
     ) -> Result<(), (ThreadExecutionError, ThreadExecutionLease)> {
@@ -2844,11 +2844,11 @@ impl Scheduler {
         self.queue.inner.cpus.get(id.as_usize()).cloned()
     }
 
-    pub(crate) fn install_discard_recorder(&self, recorder: Arc<dyn DiscardRecorder>) {
+    pub fn install_discard_recorder(&self, recorder: Arc<dyn DiscardRecorder>) {
         *self.discard_recorder.lock() = Some(recorder);
     }
 
-    pub(crate) fn install_generation_observer(
+    pub fn install_generation_observer(
         &self,
         observer: Arc<dyn SchedulerGenerationObserver>,
     ) -> Result<(), RunQueueError> {
@@ -2959,7 +2959,7 @@ impl Scheduler {
         Ok(registration)
     }
 
-    pub(crate) fn unregister_executor(
+    pub fn unregister_executor(
         &self,
         registration: &ExecutorRegistration,
     ) -> Result<(), RunQueueError> {
@@ -2982,15 +2982,15 @@ impl Scheduler {
         self.executors.state.lock().entries.len()
     }
 
-    pub(crate) fn clear_executor_binding(
+    pub fn clear_executor_binding(
         &self,
         registration: &ExecutorRegistration,
     ) -> Result<(), RunQueueError> {
         self.executors.clear_binding(registration)
     }
 
-    #[cfg(test)]
-    pub(crate) fn admit_root(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn admit_root(
         &self,
         thread: ThreadKey,
         generation: ExecutionGeneration,
@@ -3004,7 +3004,7 @@ impl Scheduler {
             .map_err(Into::into)
     }
 
-    pub(crate) fn admit_process_root(
+    pub fn admit_process_root(
         &self,
         thread: ThreadKey,
         generation: ExecutionGeneration,
@@ -3045,7 +3045,7 @@ impl Scheduler {
     /// clone-rollback arm performs. A failed publication takes its reservation
     /// with it, since nothing can ever be woken for a generation that does not
     /// exist.
-    pub(crate) fn publish_initial_task_state_gated(
+    pub fn publish_initial_task_state_gated(
         &self,
         thread: &Arc<Thread>,
         state: super::objects::MigratableTaskState,
@@ -3068,7 +3068,7 @@ impl Scheduler {
         }
     }
 
-    pub(crate) fn fail_runnable_exact(
+    pub fn fail_runnable_exact(
         &self,
         key: ThreadKey,
         generation: ExecutionGeneration,
@@ -3092,7 +3092,7 @@ impl Scheduler {
     /// Cancel one exact dormant blocked generation without manufacturing a
     /// lease. The combined binding/authority observer is retired in the same
     /// serialized generation transaction before callers publish completion.
-    pub(crate) fn fail_blocked_exact(
+    pub fn fail_blocked_exact(
         &self,
         key: ThreadKey,
         generation: ExecutionGeneration,
@@ -3265,10 +3265,7 @@ impl Scheduler {
     /// thread's guest-visible blocked continuation. This is intentionally a
     /// separate authority from `wake`: sleep, poll, and futex readiness may
     /// only be published by their real producers.
-    pub(crate) fn wake_control(
-        &self,
-        thread: ThreadKey,
-    ) -> Result<WakeDisposition, SchedulerError> {
+    pub fn wake_control(&self, thread: ThreadKey) -> Result<WakeDisposition, SchedulerError> {
         let _transition = self.generation_transition.lock();
         let admission = self.queue.inner.try_admit_wake()?;
         let action = self.decide_control_wake(thread)?;
@@ -3548,11 +3545,11 @@ impl Scheduler {
         })
     }
 
-    pub(crate) fn poke_executor_control(&self) {
+    pub fn poke_executor_control(&self) {
         self.queue.inner.poke_control();
     }
 
-    pub(crate) fn request_residency_flush(&self, executor: ExecutorId) {
+    pub fn request_residency_flush(&self, executor: ExecutorId) {
         let (bound_cpu, flush_requested) = {
             let state = self.executors.state.lock();
             match state.entries.get(&executor) {
@@ -3714,12 +3711,12 @@ impl Scheduler {
         Ok(SettlementDisposition::from_outcome(observed))
     }
 
-    pub(crate) fn begin_switch_out(&self, running: &RunnableThread) -> Result<(), SchedulerError> {
+    pub fn begin_switch_out(&self, running: &RunnableThread) -> Result<(), SchedulerError> {
         running.thread.begin_switch_out(running.lease())?;
         Ok(())
     }
 
-    pub(crate) fn restore_saved_lease(
+    pub fn restore_saved_lease(
         &self,
         running: &mut RunnableThread,
         lease: ThreadExecutionLease,
@@ -3733,7 +3730,7 @@ impl Scheduler {
     /// exec replacement. The caller's publication closure swaps the combined
     /// binding/submission-authority record while this generation mutex is
     /// held; only then does the exact kick token become the successor.
-    pub(crate) fn retarget_running_exec<T>(
+    pub fn retarget_running_exec<T>(
         &self,
         running: &mut RunnableThread,
         committed: super::exec::CommittedExecTransition,
@@ -3817,7 +3814,7 @@ impl Scheduler {
         Ok(published)
     }
 
-    pub(crate) fn settle_failed(
+    pub fn settle_failed(
         &self,
         mut running: RunnableThread,
         reason: super::objects::ExecutionFailure,
@@ -3894,7 +3891,7 @@ impl Scheduler {
         self.settle_runnable_successor(running).map(|_| ())
     }
 
-    pub(crate) fn settle_runnable_successor(
+    pub fn settle_runnable_successor(
         &self,
         mut running: RunnableThread,
     ) -> Result<SettlementDisposition, SchedulerError> {
@@ -4208,8 +4205,8 @@ impl Scheduler {
         self.queue.wait_closed();
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_close_census_gate(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_close_census_gate(
         &self,
         arrived: std::sync::mpsc::Sender<()>,
         resume: std::sync::mpsc::Receiver<()>,
@@ -4217,13 +4214,13 @@ impl Scheduler {
         self.queue.install_close_census_gate(arrived, resume);
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_post_unpark_epoch_gate(&self, gate: std::sync::mpsc::Sender<()>) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_post_unpark_epoch_gate(&self, gate: std::sync::mpsc::Sender<()>) {
         self.queue.install_post_unpark_epoch_gate(gate);
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_close_started_gate(&self, gate: Arc<std::sync::Barrier>) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_close_started_gate(&self, gate: Arc<std::sync::Barrier>) {
         self.queue.install_close_started_gate(gate);
     }
 
@@ -4241,14 +4238,14 @@ impl Scheduler {
         self.queue.inner.wake_admissions.load(Ordering::Acquire) & RunQueueInner::CLOSING_BIT != 0
     }
 
-    #[cfg(test)]
-    pub(crate) fn waiter_count(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn waiter_count(&self) -> usize {
         let state = self.queue.inner.state.lock();
         self.queue.waiter_count_locked(&state)
     }
 
-    #[cfg(test)]
-    pub(crate) fn closed_waiter_observations(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn closed_waiter_observations(&self) -> usize {
         self.queue.closed_waiter_observations()
     }
 
@@ -4262,8 +4259,8 @@ impl Scheduler {
         self.queue.install_root_admission_gate(gate);
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_pre_park_gate(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_pre_park_gate(
         &self,
         arrived: Arc<std::sync::Barrier>,
         resume: Arc<std::sync::Barrier>,
@@ -4271,13 +4268,13 @@ impl Scheduler {
         self.queue.install_pre_park_gate(arrived, resume);
     }
 
-    #[cfg(test)]
-    pub(crate) fn cpu_wake_ticket(&self, cpu_id: usize) -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cpu_wake_ticket(&self, cpu_id: usize) -> u64 {
         self.queue.inner.cpus[cpu_id].state.lock().wake_ticket
     }
 
-    #[cfg(test)]
-    pub(crate) fn cpu_waiters(&self, cpu_id: usize) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cpu_waiters(&self, cpu_id: usize) -> usize {
         self.queue.inner.cpus[cpu_id].state.lock().waiters
     }
 

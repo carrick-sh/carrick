@@ -35,16 +35,15 @@ pub use self::signal::{
     SignalDisposition, SignalPendingOwner, SignalReservationOrigin, SignalWaitReservation,
     TaskPendingSignals, ThreadSignalState,
 };
+pub use self::task::JobControlStopInvalidationGeneration;
 pub(in crate::kernel) use self::task::PreparedThreadSet;
 pub use self::task::{
     DumpableMode, ProcessKeyrings, RlimitSet, Task, TaskIdentity, TaskLifecycle,
     TaskParticipantError, TaskRef, TaskWakeEnrollment, TaskWakeSubscription, TaskWaker,
     ThreadResources,
 };
-pub(crate) use self::task::{
-    JobControlStopInvalidationGeneration, PtraceMemoryAccessWitness, PtraceStopSettlement,
-    PtraceSynchronousFault, PtraceTextAccess, TaskJobControlEvent,
-};
+pub(crate) use self::task::{PtraceMemoryAccessWitness, PtraceTextAccess, TaskJobControlEvent};
+pub use self::task::{PtraceStopSettlement, PtraceSynchronousFault};
 pub(in crate::kernel) use self::thread::ExecDrain;
 pub use self::thread::{
     BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState,
@@ -53,13 +52,13 @@ pub use self::thread::{
     ThreadRef, ThreadRunner,
 };
 pub(crate) use self::thread::{
-    CrashSafePointParticipation, CrashSafePointParticipationError, OpenedStartGate,
-    SchedulerControlQuantum, ThreadSchedulerAction,
+    CrashSafePointParticipation, CrashSafePointParticipationError, ThreadSchedulerAction,
 };
+pub use self::thread::{OpenedStartGate, SchedulerControlQuantum};
 
 impl Thread {
     /// Mint the exact generation owned by this live executor quantum.
-    pub(crate) fn enter_crash_safe_point_participation(
+    pub fn enter_crash_safe_point_participation(
         self: &Arc<Self>,
     ) -> Result<CrashSafePointParticipation, CrashSafePointParticipationError> {
         self.enter_crash_safe_point_participation_raw()
@@ -191,7 +190,7 @@ impl FileDescriptionBackingSnapshot {
 /// external readiness state (such as staged splice pushback buffers and nested
 /// synthetic epoll child interests) without coupling backings directly to the
 /// full dispatcher.
-pub(crate) trait ReadinessContext {
+pub trait ReadinessContext {
     fn staged_splice_bytes(&self, id: FileDescriptionId) -> usize;
 
     fn host_pipe_write_room(
@@ -214,7 +213,7 @@ pub(crate) trait ReadinessContext {
 }
 
 #[allow(dead_code)]
-pub(crate) struct NoReadinessContext;
+pub struct NoReadinessContext;
 impl ReadinessContext for NoReadinessContext {
     fn staged_splice_bytes(&self, _id: FileDescriptionId) -> usize {
         0
@@ -244,13 +243,13 @@ pub(crate) const NO_READINESS_CONTEXT: &NoReadinessContext = &NoReadinessContext
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PipeCapacityAccounting {
+pub enum PipeCapacityAccounting {
     InMemory,
     Host { queued_bytes: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PipeCapacityMutationError {
+pub enum PipeCapacityMutationError {
     NotPipe,
     Semantic(carrick_abi::LinuxErrno),
     AccountingMismatch,
@@ -258,13 +257,13 @@ pub(crate) enum PipeCapacityMutationError {
 
 /// Owned readiness facts sampled by a listening socket's backing authority.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ListenerReadinessSample {
+pub struct ListenerReadinessSample {
     pub(crate) ready: LinuxEpollEvents,
     pub(crate) host_ready: LinuxEpollEvents,
     pub(crate) inzone: Option<crate::network::inzone::ListenerReadinessSnapshot>,
 }
 
-pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
+pub trait FileDescriptionBacking: Any + Send + Sync {
     fn is_epoll(&self) -> bool;
 
     /// Snapshot the description identities registered by an epoll backing.
@@ -330,7 +329,7 @@ pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
 /// Registration is serialized with `retain_fd_lease` and final reference
 /// release.  Implementations must not retain the description itself: terminal
 /// retirement must be able to drain this list without an ownership cycle.
-pub(crate) trait FileDescriptionFinalizer: std::fmt::Debug + Send + Sync {
+pub trait FileDescriptionFinalizer: std::fmt::Debug + Send + Sync {
     /// A description-local key used to avoid retaining the same finalizer for
     /// every operation on one open-file description.
     fn key(&self) -> FileDescriptionFinalizerKey;
@@ -342,7 +341,7 @@ pub(crate) trait FileDescriptionFinalizer: std::fmt::Debug + Send + Sync {
 
 /// Opaque identity for one terminal description finalizer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FileDescriptionFinalizerKey {
+pub struct FileDescriptionFinalizerKey {
     finalizer_type: std::any::TypeId,
     primary: usize,
     secondary: usize,
@@ -405,13 +404,13 @@ type FileDescriptionObservation = (
 /// target. `(0, 0)` — the `Default` — means no owner. `owner_type` is
 /// `F_OWNER_TID`/`F_OWNER_PID`/`F_OWNER_PGRP`; `owner_pid` is the positive id.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct AsyncIoOwner {
+pub struct AsyncIoOwner {
     pub(crate) owner_type: i32,
     pub(crate) owner_pid: i32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct AsyncIoTarget {
+pub struct AsyncIoTarget {
     pub(crate) container_id: u64,
     pub(crate) target_id: i32,
     pub(crate) target_generation: u64,
@@ -420,7 +419,7 @@ pub(crate) struct AsyncIoTarget {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct CapturedAsyncIoOwner {
+pub struct CapturedAsyncIoOwner {
     pub(crate) visible: AsyncIoOwner,
     pub(crate) target: AsyncIoTarget,
 }
@@ -656,7 +655,7 @@ impl SocketCork {
 }
 
 #[derive(Debug)]
-pub(crate) struct DescriptionCommon {
+pub struct DescriptionCommon {
     status_flags: AtomicU64,
     /// Number of Linux fd-table entries naming this description across every
     /// process namespace. Deliberately excludes transient Rust `Arc` clones
@@ -827,7 +826,7 @@ struct DescriptionLifecycle {
 /// Keeps a mapped file's backing alive without retaining a logical fd slot.
 /// Fragments and forked mappings may share this reference through an Arc.
 #[derive(Debug)]
-pub(crate) struct MappedFileReference {
+pub struct MappedFileReference {
     description: Arc<FileDescription>,
 }
 
@@ -1308,7 +1307,7 @@ impl FileDescription {
 /// A functional descriptor reference retained for a syscall that may complete
 /// after its numeric fd has been closed or reused.
 #[derive(Debug)]
-pub(crate) struct FileDescriptionFdLease {
+pub struct FileDescriptionFdLease {
     description: Arc<FileDescription>,
 }
 
@@ -1561,7 +1560,7 @@ impl FileTableFunctionalGate {
     }
 }
 
-pub(crate) struct FileTableFunctionalLease {
+pub struct FileTableFunctionalLease {
     gate: Arc<FileTableFunctionalGate>,
 }
 
@@ -1619,7 +1618,7 @@ impl Drop for FileTableExecFreeze {
 /// otherwise dominated fd-fill workloads. Keep this private to the typed fd
 /// table; arbitrary byte keys must continue using a keyed hasher.
 #[derive(Default)]
-pub(crate) struct FileSlotHasher(u64);
+pub struct FileSlotHasher(u64);
 
 impl Hasher for FileSlotHasher {
     fn finish(&self) -> u64 {
@@ -1639,7 +1638,7 @@ impl Hasher for FileSlotHasher {
     }
 }
 
-pub(crate) type FileSlotMap = HashMap<i32, FileSlot, BuildHasherDefault<FileSlotHasher>>;
+pub type FileSlotMap = HashMap<i32, FileSlot, BuildHasherDefault<FileSlotHasher>>;
 
 #[derive(Debug)]
 pub struct FileTable {
@@ -2167,7 +2166,7 @@ impl Drop for FileTable {
 /// size of the table. (The previous design snapshotted every slot on acquire
 /// and re-walked every slot on release to discover changes, which made an
 /// fd-fill loop quadratic — `dup` at 20k open fds cost ~1 ms, 6000x Linux.)
-pub(crate) struct FileTableWriteGuard<'a> {
+pub struct FileTableWriteGuard<'a> {
     guard: RwLockWriteGuard<'a, FileSlotMap>,
     _mutation: FileTableMutationLease,
     fd_ceiling: &'a FdCeilingAuthority,
@@ -2255,7 +2254,7 @@ impl Drop for FileTableWriteGuard<'_> {
     }
 }
 
-pub(crate) struct FileTableMutexGuard<'a, T> {
+pub struct FileTableMutexGuard<'a, T> {
     guard: MutexGuard<'a, T>,
     _mutation: FileTableMutationLease,
     revision: &'a ObjectRevision,
@@ -2281,7 +2280,7 @@ impl<T> Drop for FileTableMutexGuard<'_, T> {
     }
 }
 
-pub(crate) struct FileTableRwWriteGuard<'a, T> {
+pub struct FileTableRwWriteGuard<'a, T> {
     guard: RwLockWriteGuard<'a, T>,
     _mutation: FileTableMutationLease,
     revision: &'a ObjectRevision,
@@ -2495,7 +2494,7 @@ thread_local! {
 /// The executor calls this when it stops running the loaded logical thread —
 /// at a residency boundary, and again in the boundary audit so no error path
 /// can leave a window open for a different logical thread to inherit.
-pub(crate) fn close_system_charge_window() {
+pub fn close_system_charge_window() {
     let closed = SYSTEM_CHARGE_WINDOW.with(|window| window.borrow_mut().take());
     if let Some(window) = closed
         && let Some(thread) = window.live()
@@ -2508,7 +2507,7 @@ pub(crate) fn close_system_charge_window() {
 /// Is this host thread free of any logical thread's charge window? Part of the
 /// executor boundary audit: an executor about to load a different logical task
 /// must not still be charging the previous one.
-pub(crate) fn system_charge_window_is_closed() -> bool {
+pub fn system_charge_window_is_closed() -> bool {
     SYSTEM_CHARGE_WINDOW.with(|window| window.borrow().is_none())
 }
 

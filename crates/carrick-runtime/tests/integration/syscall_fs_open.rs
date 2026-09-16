@@ -344,7 +344,7 @@ fn ioctl_writes_packed_winsize_and_reports_unknown_requests() {
             &reporter,
         )
         .unwrap();
-    if carrick_runtime::host_tty::host_isatty(1) {
+    if carrick_kernel::host_tty::host_isatty(1) {
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
         let winsize = read_winsize(&memory, 0x4000);
         // rows/cols come from the live terminal; just confirm they are non-zero.
@@ -388,7 +388,7 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
-    let stdin_is_tty = carrick_runtime::host_tty::host_isatty(0);
+    let stdin_is_tty = carrick_kernel::host_tty::host_isatty(0);
     let outcome = dispatcher
         .dispatch(
             &dispatcher.capture_one_task_context().unwrap(),
@@ -529,7 +529,7 @@ fn ioctl_tcgets2_is_recognized_and_mirrors_tcgets() {
     // 1. TCGETS2 on fd 0 mirrors TCGETS: a real backing tty → success, a
     //    pipe/file (e.g. `cargo test` under CI) → ENOTTY. Either way it is a
     //    *recognized* request.
-    let stdin_is_tty = carrick_runtime::host_tty::host_isatty(0);
+    let stdin_is_tty = carrick_kernel::host_tty::host_isatty(0);
     let outcome = dispatcher
         .dispatch(
             &dispatcher.capture_one_task_context().unwrap(),
@@ -856,7 +856,7 @@ fn tiocgpgrp_on_real_tty_uses_host_value_not_bootstrap() {
 
     // The slave is a real tty.
     assert!(
-        carrick_runtime::host_tty::host_isatty(slave),
+        carrick_kernel::host_tty::host_isatty(slave),
         "pty slave must be a tty"
     );
 
@@ -865,7 +865,7 @@ fn tiocgpgrp_on_real_tty_uses_host_value_not_bootstrap() {
     let direct = unsafe { libc::tcgetpgrp(slave) };
 
     // Our helper must agree with the direct call.
-    let via_helper = carrick_runtime::host_tty::host_tty_tcgetpgrp(slave);
+    let via_helper = carrick_kernel::host_tty::host_tty_tcgetpgrp(slave);
     match via_helper {
         Ok(pgrp) => {
             assert_eq!(
@@ -920,13 +920,13 @@ fn tiocgsid_on_real_tty_uses_host_value_not_bootstrap() {
     };
 
     assert!(
-        carrick_runtime::host_tty::host_isatty(slave),
+        carrick_kernel::host_tty::host_isatty(slave),
         "pty slave must be a tty"
     );
 
     // SAFETY: slave is a valid open fd.
     let direct = unsafe { libc::tcgetsid(slave) };
-    let via_helper = carrick_runtime::host_tty::host_tty_tcgetsid(slave);
+    let via_helper = carrick_kernel::host_tty::host_tty_tcgetsid(slave);
     match via_helper {
         Ok(sid) => {
             assert_eq!(sid, direct, "host_tty_tcgetsid must match tcgetsid");
@@ -978,7 +978,7 @@ fn tiocspgrp_on_real_tty_calls_host_not_fake() {
     let our_pgrp = unsafe { libc::getpgrp() };
     // Call our helper — it may succeed or fail (EPERM/ENOTTY in harness), but
     // it must not panic.  Verify it returns the same outcome as a direct call.
-    let result_helper = carrick_runtime::host_tty::host_tty_tcsetpgrp(slave, our_pgrp);
+    let result_helper = carrick_kernel::host_tty::host_tty_tcsetpgrp(slave, our_pgrp);
     // SAFETY: same fd, same call.
     let direct_r = unsafe { libc::tcsetpgrp(slave, our_pgrp) };
     match result_helper {

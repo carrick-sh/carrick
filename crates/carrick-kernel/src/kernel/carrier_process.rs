@@ -29,7 +29,7 @@ use crate::kernel::{
 /// bind time. The stage-1 address space is reached only as a
 /// [`carrick_hal::stage1_mm::Stage1MmProjection`]; the carrier's lease type
 /// never crosses into the kernel.
-pub(crate) trait CarrierProcess: Send + Sync {
+pub trait CarrierProcess: Send + Sync {
     fn kernel_graph(&self) -> &Arc<crate::kernel::Kernel>;
 
     fn task_key(&self) -> crate::kernel::TaskKey;
@@ -434,7 +434,7 @@ impl ProcessItimerSlot {
     }
 }
 
-pub(crate) struct ProcessTimerDelivery {
+pub struct ProcessTimerDelivery {
     target: ProcessTimerTarget,
     slots: [std::sync::Arc<ProcessItimerSlot>; carrick_timer_core::itimer::ITIMER_COUNT],
 }
@@ -633,12 +633,25 @@ impl carrick_hal::TimerDelivery for ProcessTimerDelivery {
     }
 }
 
-/// Kernel-only test doubles for the carrier handle. An inline `cfg(test)`
-/// module rather than `cfg(test)` items so every tool that classifies
-/// source by test scope (the K1 callsite census among them) sees them as
-/// the test code they are.
-#[cfg(test)]
-pub(crate) mod test_support {
+/// Test doubles for the carrier handle. An inline module rather than loose
+/// `cfg`-gated items so every tool that classifies source by test scope (the
+/// K1 callsite census among them) sees them as the test code they are.
+///
+/// Reachable through the `test-support` feature as well as `cfg(test)`,
+/// because the consumers are a SIBLING crate's tests: carrick-runtime's own
+/// suites and `carrick-kernel-example`'s backend both build a kernel-side
+/// process without a VM from these.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    // Test-only code that a sibling crate compiles through `test-support`,
+    // so `cfg(test)` is not set for it and clippy's
+    // `allow-{unwrap,expect,panic}-in-tests` does not apply. The doubles are
+    // still test code: an invariant they cannot satisfy is a broken fixture,
+    // not a runtime condition. The one place a caller can meaningfully
+    // recover -- booting the kernel graph -- returns `Result` instead
+    // (`TestCarrierProcess::new`).
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
     use std::num::{NonZeroU16, NonZeroU64};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -650,7 +663,7 @@ pub(crate) mod test_support {
 
     /// A fixed `(ASID, stage-1 root)` binding for kernel-side tests that need
     /// an mm backend or a stage-1 projection without a carrier.
-    pub(crate) fn test_mm_binding(asid: u16, stage1_root: u64) -> crate::kernel::MmBinding {
+    pub fn test_mm_binding(asid: u16, stage1_root: u64) -> crate::kernel::MmBinding {
         let asid = crate::kernel::Asid::from_registry_allocation(
             NonZeroU16::new(asid).expect("nonzero test ASID"),
         );
@@ -665,20 +678,23 @@ pub(crate) mod test_support {
     /// page tables, so a dispatcher or kernel fixture bound over it never
     /// touches the carrier's ASID pool.
     #[derive(Debug)]
-    pub(crate) struct TestStage1MmProjection {
+    pub struct TestStage1MmProjection {
         binding: crate::kernel::MmBinding,
         cow_invalidation_generation: AtomicU64,
     }
 
     impl TestStage1MmProjection {
-        pub(crate) fn new(binding: crate::kernel::MmBinding) -> Self {
+        /// A projection over one fixed `(ASID, stage-1 root)` binding.
+        pub fn new(binding: crate::kernel::MmBinding) -> Self {
             Self {
                 binding,
                 cow_invalidation_generation: AtomicU64::new(0),
             }
         }
 
-        pub(crate) fn binding(&self) -> crate::kernel::MmBinding {
+        /// The binding this projection publishes, so a fixture can bind an
+        /// `MmBackend` over the same one.
+        pub fn binding(&self) -> crate::kernel::MmBinding {
             self.binding
         }
     }
@@ -723,7 +739,7 @@ pub(crate) mod test_support {
     /// does (same three tables, same changed-during-observation check). Unbound
     /// it reports an empty address space at revision 1, which is what
     /// `kernel/exec.rs`'s tests relied on before it was promoted here.
-    pub(crate) struct TestMmBackend {
+    pub struct TestMmBackend {
         binding: crate::kernel::MmBinding,
         vma_source: parking_lot::RwLock<Option<crate::kernel::SharedVmaSnapshotSource>>,
         inventory: parking_lot::RwLock<
@@ -733,7 +749,8 @@ pub(crate) mod test_support {
     }
 
     impl TestMmBackend {
-        pub(crate) fn new(binding: crate::kernel::MmBinding) -> Self {
+        /// An unbound backend over `binding`: empty address space, revision 1.
+        pub fn new(binding: crate::kernel::MmBinding) -> Self {
             Self {
                 binding,
                 vma_source: parking_lot::RwLock::new(None),
@@ -742,17 +759,16 @@ pub(crate) mod test_support {
             }
         }
 
-        pub(crate) fn bind_inventory(
-            &self,
-            kernel: &Arc<crate::kernel::Kernel>,
-            mm: crate::kernel::MmId,
-        ) {
+        /// Attach the frame inventory of `mm` on `kernel`, the way a carrier
+        /// bind does, so a snapshot reports this mm's mappings.
+        pub fn bind_inventory(&self, kernel: &Arc<crate::kernel::Kernel>, mm: crate::kernel::MmId) {
             *self.inventory.write() = Some((Arc::downgrade(kernel), mm));
             self.revision
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
 
-        pub(crate) fn bind_vma_source(&self, source: crate::kernel::SharedVmaSnapshotSource) {
+        /// Attach the VMA snapshot source a carrier bind publishes.
+        pub fn bind_vma_source(&self, source: crate::kernel::SharedVmaSnapshotSource) {
             *self.vma_source.write() = Some(source);
             self.revision
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -760,7 +776,7 @@ pub(crate) mod test_support {
 
         /// Whether a carrier bind attached a VMA source, for tests of the bind
         /// path itself.
-        pub(crate) fn vma_source_bound(&self) -> bool {
+        pub fn vma_source_bound(&self) -> bool {
             self.vma_source.read().is_some()
         }
     }
@@ -863,7 +879,7 @@ pub(crate) mod test_support {
     /// projection: `bind_hvpatch_process_exact` builds the foreign-mm mutation
     /// authority from it and fail-stops otherwise, so the double answers with
     /// a [`TestStage1MmProjection`] over the same binding its backend publishes.
-    pub(crate) struct TestCarrierProcess {
+    pub struct TestCarrierProcess {
         binding: crate::kernel::KernelTaskBinding,
         backend: Arc<TestMmBackend>,
         stage1: Arc<TestStage1MmProjection>,
@@ -873,7 +889,14 @@ pub(crate) mod test_support {
     impl TestCarrierProcess {
         /// Boot a root task `pid` on its own kernel graph and return the handle
         /// together with the root's exact context.
-        pub(crate) fn new(pid: i32) -> (Self, crate::kernel::KernelContext) {
+        ///
+        /// Fallible rather than panicking: booting a kernel graph is the one
+        /// step here a caller can meaningfully report on (a duplicate root pid
+        /// or an exhausted id registry), and an out-of-crate caller compiling
+        /// this through `test-support` is not under `cfg(test)`.
+        pub fn new(
+            pid: i32,
+        ) -> Result<(Self, crate::kernel::KernelContext), crate::kernel::KernelError> {
             let stage1 = Arc::new(TestStage1MmProjection::new(test_mm_binding(1, 0x4000)));
             let backend = Arc::new(TestMmBackend::new(stage1.binding()));
             let bootstrap = crate::kernel::RootBootstrap::with_mm_backend(
@@ -882,12 +905,10 @@ pub(crate) mod test_support {
                 Arc::clone(&backend) as Arc<dyn crate::kernel::MmBackend>,
                 "hvpatch-test-root".to_owned(),
                 Arc::new(carrick_hal::NullHostSignalBridge::default()),
-            )
-            .expect("test kernel bootstrap");
-            let (kernel, root) =
-                crate::kernel::Kernel::bootstrap_root(bootstrap).expect("test kernel root");
+            )?;
+            let (kernel, root) = crate::kernel::Kernel::bootstrap_root(bootstrap)?;
             backend.bind_inventory(&kernel, root.shared().mm().id());
-            (
+            Ok((
                 Self {
                     binding: root.task_binding(),
                     backend,
@@ -895,22 +916,24 @@ pub(crate) mod test_support {
                     mm_access: None,
                 },
                 root,
-            )
+            ))
         }
 
         /// Enable the foreign-MM access facade the carrier installs when its
         /// engine exposes a foreign-MM endpoint, without a production authority
         /// constructor on the dispatcher.
-        pub(crate) fn enable_mm_access_for_tests(&mut self) {
+        pub fn enable_mm_access_for_tests(&mut self) {
             self.mm_access = Some(crate::kernel::MmAccessAuthority::new());
         }
 
-        pub(crate) fn backend(&self) -> &Arc<TestMmBackend> {
+        /// The `MmBackend` double this process publishes, for a fixture that
+        /// needs to bind a VMA source or read the snapshot revision.
+        pub fn backend(&self) -> &Arc<TestMmBackend> {
             &self.backend
         }
 
         /// The binding the double's projection and backend both publish.
-        pub(crate) fn stage1_binding(&self) -> crate::kernel::MmBinding {
+        pub fn stage1_binding(&self) -> crate::kernel::MmBinding {
             self.stage1.binding()
         }
     }
@@ -964,8 +987,8 @@ pub(crate) mod test_support {
     }
 }
 
-#[cfg(test)]
-pub(crate) use test_support::{
+#[cfg(any(test, feature = "test-support"))]
+pub use test_support::{
     TestCarrierProcess, TestMmBackend, TestStage1MmProjection, test_mm_binding,
 };
 
@@ -982,7 +1005,7 @@ mod tests {
     /// land, or a test process would snapshot differently from a carrier one.
     #[test]
     fn dispatcher_bind_attaches_both_snapshot_tables_to_the_test_backend() {
-        let (process, root) = TestCarrierProcess::new(83_900);
+        let (process, root) = TestCarrierProcess::new(83_900).expect("test carrier process");
         assert!(!process.backend().vma_source_bound());
         let process = Arc::new(process);
         let dispatcher = SyscallDispatcher::new();

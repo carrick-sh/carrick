@@ -27,6 +27,10 @@ DEFAULT_SCAN_ROOTS = (
     # 2026-09-13-extract-carrick-vfs-and-carrick-kernel); its reviewed global
     # state moved with it and is still reviewed.
     "crates/carrick-vfs/src",
+    # Same plan, second move: the kernel graph, dispatch and the in-zone
+    # subsystems moved to crates/carrick-kernel. Their reviewed global state
+    # moved with them and is still reviewed.
+    "crates/carrick-kernel/src",
     "crates/carrick-kernel-arena/src",
     "crates/carrick-vmm-hvf/src",
     "crates/carrick-thread/src",

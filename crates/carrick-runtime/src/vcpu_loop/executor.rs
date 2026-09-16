@@ -4,13 +4,13 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, mpsc};
 
-use crate::kernel::objects::{
-    BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, ThreadKey,
-};
-use crate::kernel::{ExecutorKick, Scheduler, SettlementDisposition};
 #[cfg(test)]
 use crate::trap::TrapError;
 use carrick_fatal::carrick_fatal;
+use carrick_kernel::kernel::objects::{
+    BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, ThreadKey,
+};
+use carrick_kernel::kernel::{ExecutorKick, Scheduler, SettlementDisposition};
 
 pub mod binding;
 pub use binding::*;
@@ -262,15 +262,15 @@ where
         }
         let mut running = match scheduler.take(registration) {
             Ok(running) => running,
-            Err(crate::kernel::RunQueueError::FlushRequested) => {
+            Err(carrick_kernel::kernel::RunQueueError::FlushRequested) => {
                 backend
                     .flush_resident_task()
                     .map_err(|error| error.to_string())?;
                 registration.clear_flush_request();
                 continue;
             }
-            Err(crate::kernel::RunQueueError::ControlPoked) => continue,
-            Err(crate::kernel::RunQueueError::Closed) => return Ok(()),
+            Err(carrick_kernel::kernel::RunQueueError::ControlPoked) => continue,
+            Err(carrick_kernel::kernel::RunQueueError::Closed) => return Ok(()),
             Err(error) => return Err(error.to_string()),
         };
         let executor_id = running.executor();
@@ -286,7 +286,11 @@ where
             .as_ref()
             .and_then(|task| process_leader_event_identity(task.key().id.raw(), thread.tid.raw()));
         if let Some((pid, tid)) = event_ring_identity {
-            crate::event_ring::rec_hvpatch_executor_claim(pid, tid, executor_id.raw_for_probe());
+            carrick_kernel::event_ring::rec_hvpatch_executor_claim(
+                pid,
+                tid,
+                executor_id.raw_for_probe(),
+            );
         }
         if let Some(task) = kernel_task.as_ref() {
             scheduler
@@ -404,7 +408,11 @@ where
             ExecutorPoolEvent::Loaded { thread, generation },
         );
         if let Some((pid, tid)) = event_ring_identity {
-            crate::event_ring::rec_hvpatch_executor_load(pid, tid, executor_id.raw_for_probe());
+            carrick_kernel::event_ring::rec_hvpatch_executor_load(
+                pid,
+                tid,
+                executor_id.raw_for_probe(),
+            );
         }
         probe_executor_lifecycle(
             executor_id,
@@ -588,12 +596,12 @@ where
         // observe that thread's accounting. A thread that exited here is about
         // to be retired and folded into its task's ledger, and its parent's
         // `wait4` rusage must not miss the residency that ran it.
-        crate::kernel::close_system_charge_window();
+        carrick_kernel::kernel::close_system_charge_window();
         let post_run_event_identity = running.thread().task().as_ref().and_then(|task| {
             process_leader_event_identity(task.key().id.raw(), running.thread_key().tid.raw())
         });
         if let Some((pid, tid)) = post_run_event_identity {
-            crate::event_ring::rec_hvpatch_executor_boundary(
+            carrick_kernel::event_ring::rec_hvpatch_executor_boundary(
                 pid,
                 tid,
                 executor_boundary_event_code(&exit),
@@ -1044,7 +1052,7 @@ where
                     binding.after_reaped_settlement();
                 }
                 if let Some((pid, tid)) = post_run_event_identity {
-                    crate::event_ring::rec_hvpatch_executor_settlement(
+                    carrick_kernel::event_ring::rec_hvpatch_executor_settlement(
                         pid,
                         tid,
                         thread_settlement_event_code(settlement_thread.execution_state()),
@@ -1057,12 +1065,12 @@ where
                         if let Some(zombie) = scheduler.kernel().registry().zombie(task_key.id) {
                             (
                                 zombie.status,
-                                crate::observe::ExitOwner::from(zombie.parent),
+                                carrick_kernel::observe::ExitOwner::from(zombie.parent),
                             )
                         } else {
                             (
-                                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
-                                crate::observe::ExitOwner::Nobody,
+                                carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                                carrick_kernel::observe::ExitOwner::Nobody,
                             )
                         };
                     scheduler

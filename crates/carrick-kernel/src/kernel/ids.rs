@@ -38,7 +38,7 @@ macro_rules! serial_id {
         pub struct $name(NonZeroU64);
 
         impl $name {
-            pub(crate) const fn from_registry_allocation(raw: NonZeroU64) -> Self {
+            pub const fn from_registry_allocation(raw: NonZeroU64) -> Self {
                 Self(raw)
             }
 
@@ -47,7 +47,7 @@ macro_rules! serial_id {
             }
 
             #[allow(dead_code)]
-            pub(crate) const fn from_raw_u64(raw: u64) -> Option<Self> {
+            pub const fn from_raw_u64(raw: u64) -> Option<Self> {
                 match NonZeroU64::new(raw) {
                     Some(nz) => Some(Self(nz)),
                     None => None,
@@ -169,7 +169,7 @@ serial_id!(CredentialsId);
 serial_id!(SighandId);
 
 impl MmId {
-    pub(crate) const fn nonzero(self) -> NonZeroU64 {
+    pub const fn nonzero(self) -> NonZeroU64 {
         self.0
     }
 }

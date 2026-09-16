@@ -28,8 +28,8 @@ pub(crate) fn signal_wait_expired(deadline: Option<Instant>) -> bool {
 
 pub(crate) fn raise_sigpipe_for_blocking_write(
     dispatcher: &SyscallDispatcher,
-    context: &crate::kernel::KernelContext,
-    write: &crate::dispatch::BlockingWrite,
+    context: &carrick_kernel::kernel::KernelContext,
+    write: &carrick_kernel::dispatch::BlockingWrite,
     outcome: DispatchOutcome,
 ) -> DispatchOutcome {
     if write.sigpipe_on_epipe()
@@ -47,7 +47,7 @@ pub(crate) fn raise_sigpipe_for_blocking_write(
 }
 
 pub(crate) fn partial_write_interrupt_outcome(
-    write: &crate::dispatch::BlockingWrite,
+    write: &carrick_kernel::dispatch::BlockingWrite,
 ) -> DispatchOutcome {
     if write.offset() > 0 {
         DispatchOutcome::Returned {
@@ -154,8 +154,8 @@ pub(crate) struct FaultSignal {
     pub interrupted_pc: Option<u64>,
 }
 
-impl From<crate::kernel::objects::PtraceSynchronousFault> for FaultSignal {
-    fn from(fault: crate::kernel::objects::PtraceSynchronousFault) -> Self {
+impl From<carrick_kernel::kernel::objects::PtraceSynchronousFault> for FaultSignal {
+    fn from(fault: carrick_kernel::kernel::objects::PtraceSynchronousFault) -> Self {
         Self {
             signum: fault.signal.raw(),
             si_code: fault.si_code,
@@ -171,15 +171,15 @@ impl From<crate::kernel::objects::PtraceSynchronousFault> for FaultSignal {
 pub(crate) fn inject_fault_signal<T: SyscallTrap>(
     trap: &mut T,
     dispatcher: &SyscallDispatcher,
-    context: &crate::kernel::KernelContext,
+    context: &carrick_kernel::kernel::KernelContext,
     this_tid: ThreadId,
     fault: FaultSignal,
 ) -> Result<FaultSignalDisposition, RuntimeError> {
     crate::probes::signal_deliver(this_tid.raw(), fault.signum);
-    if let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(fault.signum)
-        && crate::exec_helpers::stop_for_ptrace_fault(
+    if let Ok(signal) = carrick_kernel::kernel::LinuxSignal::for_signal_number(fault.signum)
+        && carrick_kernel::exec_helpers::stop_for_ptrace_fault(
             dispatcher,
-            crate::kernel::objects::PtraceSynchronousFault {
+            carrick_kernel::kernel::objects::PtraceSynchronousFault {
                 signal,
                 si_code: fault.si_code,
                 si_addr: fault.si_addr,
@@ -189,7 +189,7 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
     {
         return Ok(FaultSignalDisposition::Stopped);
     }
-    crate::exec_helpers::stop_for_debug_signal(fault.signum);
+    carrick_kernel::exec_helpers::stop_for_debug_signal(fault.signum);
 
     let action = dispatcher.registered_signal_handler(context, fault.signum);
     if dispatcher.signal_blocked(context, this_tid, fault.signum) || action.is_none() {
@@ -242,7 +242,7 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
 /// `fault_addr`).
 pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     kernel: &Kernel,
-    context: &crate::kernel::KernelContext,
+    context: &carrick_kernel::kernel::KernelContext,
     engine: &mut E,
     this_tid: ThreadId,
     fatal_image_generation: u64,
@@ -327,12 +327,12 @@ fn apply_first_touch(
 /// the syndrome decoded; a fault whose access class the caller could not
 /// decode is delivered as before.
 pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
-    dispatcher: &crate::dispatch::SyscallDispatcher,
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
     engine: &mut E,
     address: u64,
     access: Option<carrick_mem::page_table::LeafAccess>,
-    tid: crate::kernel::LinuxTid,
-    mutation: &mut crate::dispatch::mm_mutation::MmMutationGuard<'_>,
+    tid: carrick_kernel::kernel::LinuxTid,
+    mutation: &mut carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>,
 ) -> Result<bool, TrapError> {
     use carrick_observability::probes::HvpatchFirstTouchDeliverReason as DeliverReason;
     let notify_first_touch_deliver = |reason: DeliverReason| {
@@ -414,7 +414,7 @@ where
         engine: &mut E,
         target: ThreadId,
         signum: i32,
-        kernel_target: Option<crate::kernel::ThreadKey>,
+        kernel_target: Option<carrick_kernel::kernel::ThreadKey>,
     ) -> Result<i64, RuntimeError> {
         let retval: i64 = if let Some(exact) = kernel_target {
             if exact.tid.raw() != target.raw() {
@@ -490,7 +490,7 @@ pub(crate) struct SignalRestartContext {
 pub(crate) fn deliver_pending_signal<T>(
     trap: &mut T,
     dispatcher: &SyscallDispatcher,
-    context: &crate::kernel::KernelContext,
+    context: &carrick_kernel::kernel::KernelContext,
     last_syscall_retval: Option<i64>,
     tid: ThreadId,
     interrupted_pc: Option<u64>,
@@ -514,7 +514,7 @@ where
 pub(crate) fn deliver_pending_signal_with_restart<T>(
     trap: &mut T,
     dispatcher: &SyscallDispatcher,
-    context: &crate::kernel::KernelContext,
+    context: &carrick_kernel::kernel::KernelContext,
     restart: SignalRestartContext,
     tid: ThreadId,
 ) -> Result<Option<PendingSignalAction>, RuntimeError>
@@ -527,10 +527,10 @@ where
 pub(crate) fn deliver_reserved_signal_with_restart<T>(
     trap: &mut T,
     dispatcher: &SyscallDispatcher,
-    context: &crate::kernel::KernelContext,
+    context: &carrick_kernel::kernel::KernelContext,
     restart: SignalRestartContext,
     tid: ThreadId,
-    reserved: crate::kernel::continuation::ReservedSignal,
+    reserved: carrick_kernel::kernel::continuation::ReservedSignal,
 ) -> Result<Option<PendingSignalAction>, RuntimeError>
 where
     T: SyscallTrap,
@@ -556,10 +556,10 @@ where
 fn deliver_signal_with_restart<T>(
     trap: &mut T,
     dispatcher: &SyscallDispatcher,
-    context: &crate::kernel::KernelContext,
+    context: &carrick_kernel::kernel::KernelContext,
     restart: SignalRestartContext,
     tid: ThreadId,
-    reserved: Option<&crate::kernel::continuation::ReservedSignal>,
+    reserved: Option<&carrick_kernel::kernel::continuation::ReservedSignal>,
 ) -> Result<Option<PendingSignalAction>, RuntimeError>
 where
     T: SyscallTrap,
@@ -577,7 +577,7 @@ where
 
     let pending = reserved.map_or_else(
         || dispatcher.host_signal.take_pending_for(tid.raw()),
-        crate::kernel::continuation::ReservedSignal::signum,
+        carrick_kernel::kernel::continuation::ReservedSignal::signum,
     );
     // A dispatcher dequeue returns owner and payload atomically. A host-slot
     // signal remains thread-directed and consumes its per-thread payload below.
@@ -609,10 +609,10 @@ where
         dispatcher.mark_signal_pending(context, tid, pending);
         return Ok(Some(PendingSignalAction::ignored()));
     }
-    if crate::exec_helpers::stop_for_ptrace_signal(dispatcher, pending) {
+    if carrick_kernel::exec_helpers::stop_for_ptrace_signal(dispatcher, pending) {
         return Ok(Some(PendingSignalAction::ignored()));
     }
-    crate::exec_helpers::stop_for_debug_signal(pending);
+    carrick_kernel::exec_helpers::stop_for_debug_signal(pending);
     let (action, is_ignored) = if let Some(reserved) = reserved {
         let action = reserved.action();
         if action.sa_handler == carrick_abi::LINUX_SIG_IGN {
@@ -694,7 +694,7 @@ where
                 syscall_retval,
                 restart_predicates,
             );
-            crate::event_ring::rec_signal_restart_decision(
+            carrick_kernel::event_ring::rec_signal_restart_decision(
                 tid.raw(),
                 pending,
                 syscall_nr,
@@ -723,7 +723,7 @@ where
                         carrick_signal_core::child_watch::take_siginfo(tid.raw(), pending).map(
                             |info| {
                                 const CLD_EXITED: i32 = 1;
-                                let ns_pid = crate::namespace::pid::host_to_ns_or_self_for(
+                                let ns_pid = carrick_kernel::namespace::pid::host_to_ns_or_self_for(
                                     context,
                                     info.host_pid as u32,
                                 ) as i32;
@@ -748,11 +748,11 @@ where
                 let queued_siginfo = queued_siginfo.or_else(|| {
                     let sender_host = dispatcher.host_signal.last_sender_for(pending);
                     (sender_host > 0).then(|| {
-                        let ns_pid = crate::namespace::pid::host_to_ns_or_self_for(
+                        let ns_pid = carrick_kernel::namespace::pid::host_to_ns_or_self_for(
                             context,
                             sender_host as u32,
                         ) as i32;
-                        let uid = crate::cred_ipc::read_target(sender_host)
+                        let uid = carrick_kernel::cred_ipc::read_target(sender_host)
                             .unwrap_or(carrick_abi::NsUid::ROOT);
                         crate::linux_abi::LinuxSiginfo::kill(
                             pending,
@@ -777,7 +777,11 @@ where
                 restart_syscall,
             }) {
                 Ok(()) => {
-                    crate::event_ring::rec_signal_inject(tid.raw(), pending, restart_syscall);
+                    carrick_kernel::event_ring::rec_signal_inject(
+                        tid.raw(),
+                        pending,
+                        restart_syscall,
+                    );
                     Ok(Some(PendingSignalAction::ignored()))
                 }
                 // Linux force_sigsegv: the signal frame couldn't be written to the
@@ -796,7 +800,7 @@ where
         None if pending == crate::linux_abi::LINUX_SIGCONT => {
             Ok(Some(PendingSignalAction::ignored()))
         }
-        None if crate::kernel::objects::signal::is_default_ignore_signal(pending) => {
+        None if carrick_kernel::kernel::objects::signal::is_default_ignore_signal(pending) => {
             Ok(Some(PendingSignalAction::ignored()))
         }
         None if is_default_stop_signal(pending) => Ok(Some(PendingSignalAction::stop(
@@ -861,8 +865,8 @@ mod tests {
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().expect("context");
         let authority = context.signal_authority();
-        let first = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
-        let second = crate::kernel::LinuxSignal::for_signal_number(12).expect("SIGUSR2");
+        let first = carrick_kernel::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        let second = carrick_kernel::kernel::LinuxSignal::for_signal_number(12).expect("SIGUSR2");
         let mut restart = carrick_abi::LinuxSigaction::empty();
         restart.sa_handler = 0x1110;
         restart.sa_flags = carrick_abi::LINUX_SA_RESTART;
@@ -875,7 +879,7 @@ mod tests {
             .take_lowest_in(carrick_abi::SigSet::EMPTY.with(10))
             .expect("first reservation");
         let (action_generation, action) = authority.action_with_generation(first);
-        let reserved = crate::kernel::continuation::ReservedSignal::kernel(
+        let reserved = carrick_kernel::kernel::continuation::ReservedSignal::kernel(
             authority.clone(),
             dequeued,
             action_generation,
@@ -917,17 +921,18 @@ mod tests {
     #[test]
     fn reserved_ppoll_pselect_default_terminate_and_stop_ignore_restored_persistent_block() {
         for (pid, signum, expect_terminate) in [(15_466, 10, true), (15_467, 20, false)] {
-            let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
                 pid,
                 ThreadId::synthetic_for_tests(pid),
                 "reserved default action".to_owned(),
             )
             .expect("bootstrap input");
-            let (_kernel, context) =
-                crate::kernel::Kernel::bootstrap_root(bootstrap).expect("reserved default kernel");
+            let (_kernel, context) = carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap)
+                .expect("reserved default kernel");
             let dispatcher = SyscallDispatcher::new();
             let authority = context.signal_authority();
-            let signal = crate::kernel::LinuxSignal::for_signal_number(signum).expect("signal");
+            let signal =
+                carrick_kernel::kernel::LinuxSignal::for_signal_number(signum).expect("signal");
             let persistent = carrick_abi::SigSet::EMPTY.with(signum);
             authority.set_blocked(carrick_abi::SigSet::EMPTY);
             authority.enqueue_thread_standard(signal, None);
@@ -935,7 +940,7 @@ mod tests {
                 .take_lowest_in(carrick_abi::SigSet::EMPTY.with(signum))
                 .expect("temporary mask reserves default signal");
             let (action_generation, action) = authority.action_with_generation(signal);
-            let reserved = crate::kernel::continuation::ReservedSignal::kernel(
+            let reserved = carrick_kernel::kernel::continuation::ReservedSignal::kernel(
                 authority.clone(),
                 dequeued,
                 action_generation,
@@ -975,13 +980,14 @@ mod tests {
         let context = dispatcher.capture_one_task_context().expect("context");
         let authority = context.signal_authority();
         let signum = 10;
-        let signal = crate::kernel::LinuxSignal::for_signal_number(signum).expect("SIGUSR1");
+        let signal =
+            carrick_kernel::kernel::LinuxSignal::for_signal_number(signum).expect("SIGUSR1");
         authority.enqueue_thread_standard(signal, None);
         let dequeued = authority
             .take_lowest_in(carrick_abi::SigSet::EMPTY.with(signum))
             .expect("reserve default SIGUSR1");
         let (action_generation, action) = authority.action_with_generation(signal);
-        let reserved = crate::kernel::continuation::ReservedSignal::kernel(
+        let reserved = carrick_kernel::kernel::continuation::ReservedSignal::kernel(
             authority.clone(),
             dequeued,
             action_generation,
@@ -1118,8 +1124,9 @@ mod tests {
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.exact_signal_context_for_test();
         let tid = ThreadId::main_from_host_pid();
-        let signal = crate::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGSEGV)
-            .expect("SIGSEGV");
+        let signal =
+            carrick_kernel::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGSEGV)
+                .expect("SIGSEGV");
         let mut caught = carrick_abi::LinuxSigaction::empty();
         caught.sa_handler = 0x7000;
         caught.sa_flags = carrick_abi::LINUX_SA_SIGINFO;
@@ -1236,15 +1243,16 @@ mod tests {
                 break;
             }
         }
-        let mut write = crate::dispatch::BlockingWrite::for_tests(fds[1], vec![0x5a], 0, tid, true)
-            .expect("pin blocked pipe writer");
+        let mut write =
+            carrick_kernel::dispatch::BlockingWrite::for_tests(fds[1], vec![0x5a], 0, tid, true)
+                .expect("pin blocked pipe writer");
         assert!(matches!(
-            crate::dispatch::drive_blocking_write(&mut write, &*dispatcher.host_signal),
-            crate::dispatch::BlockingWriteStep::Wait
+            carrick_kernel::dispatch::drive_blocking_write(&mut write, &*dispatcher.host_signal),
+            carrick_kernel::dispatch::BlockingWriteStep::Wait
         ));
         assert_eq!(unsafe { libc::close(fds[0]) }, 0);
-        let crate::dispatch::BlockingWriteStep::Done(outcome) =
-            crate::dispatch::drive_blocking_write(&mut write, &*dispatcher.host_signal)
+        let carrick_kernel::dispatch::BlockingWriteStep::Done(outcome) =
+            carrick_kernel::dispatch::drive_blocking_write(&mut write, &*dispatcher.host_signal)
         else {
             panic!("closed reader must complete the blocked write");
         };
@@ -1270,9 +1278,10 @@ mod tests {
             let dispatcher = SyscallDispatcher::new();
             let context = dispatcher.exact_signal_context_for_test();
             let tid = ThreadId::main_from_host_pid();
-            let signal =
-                crate::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGUSR1)
-                    .expect("SIGUSR1");
+            let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(
+                crate::linux_abi::LINUX_SIGUSR1,
+            )
+            .expect("SIGUSR1");
             let mut action = carrick_abi::LinuxSigaction::empty();
             action.sa_handler = 0x1234;
             context.signal_authority().install_action(signal, action);

@@ -15,9 +15,11 @@ SOURCE = ROOT / "crates/carrick-runtime/src"
 # 2026-09-13-extract-carrick-vfs-and-carrick-kernel). The K1 file-authority
 # scope follows the CODE, not the crate it used to live in, so both roots are
 # scanned and the inventory keeps every row it had.
-SOURCES = (SOURCE, ROOT / "crates/carrick-vfs/src")
+# Same plan, second move: the kernel graph, dispatch and the file authority
+# moved to crates/carrick-kernel. The scope follows the CODE.
+SOURCES = (SOURCE, ROOT / "crates/carrick-kernel/src", ROOT / "crates/carrick-vfs/src")
 INVENTORY = ROOT / "scripts/migrate/k1-file-authority-operation-inventory.json"
-FILE_AUTHORITY_MODULE = SOURCE / "file_authority"
+FILE_AUTHORITY_MODULE = ROOT / "crates/carrick-kernel/src/file_authority"
 PATTERNS = {
     "table_guard": re.compile(
         r"\b(read_open_files|write_open_files|lock_next_fd|lock_stdio_cloexec|"
@@ -117,6 +119,21 @@ def brace_deltas(source: str) -> list[int]:
     return deltas
 
 
+# `feature = "test-support"` is test scope, exactly like `cfg(test)`. Splitting
+# the runtime into carrick-kernel + carrick-runtime moved test fixtures out of
+# the crate whose tests consume them, and `cfg(test)` is per-crate-compilation,
+# so those fixtures (and two whole test modules) are gated
+# `cfg(any(test, feature = "test-support"))`. No product target enables
+# `test-support`, so the gate still means "test code" in every shipped build.
+TEST_GATE_TEXTS = (
+    "#[cfg(test)]",
+    '#[cfg(any(test, feature = "test-support"))]',
+)
+TEST_GATE_PATTERN = (
+    r"#\[cfg\((?:test|any\(test,\s*feature\s*=\s*\"test-support\"\))\)\]"
+)
+
+
 def cfg_test_module_lines(lines: list[str]) -> set[int]:
     """1-based line numbers inside every `#[cfg(test)] mod … { … }` block.
 
@@ -129,7 +146,7 @@ def cfg_test_module_lines(lines: list[str]) -> set[int]:
     inside: set[int] = set()
     index = 0
     while index < len(lines):
-        if lines[index].strip() == "#[cfg(test)]":
+        if lines[index].strip() in TEST_GATE_TEXTS:
             probe = index + 1
             while probe < len(lines) and lines[probe].strip().startswith("#["):
                 probe += 1
@@ -157,7 +174,7 @@ def is_out_of_line_test_module(path: Path) -> bool:
     """
     parents = [path.parent.with_suffix(".rs"), path.parent / "mod.rs"]
     declaration = re.compile(
-        r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:"
+        TEST_GATE_PATTERN + r"\s*(?:#\[[^\]]*\]\s*)*(?:"
         r"(?:pub(?:\([^)]*\))?\s+)?mod\s+" + re.escape(path.stem) + r"\s*;"
         r"|include!\(\"(?:[^\"]*/)?" + re.escape(path.name) + r"\"\))"
     )
@@ -194,7 +211,7 @@ def generate() -> dict[str, Any]:
                         "text": text,
                         "scope_kind": (
                             "test_or_definition"
-                            if "#[cfg(test)]" in text
+                            if any(gate in text for gate in TEST_GATE_TEXTS)
                             or number in test_lines
                             or whole_file_test
                             or relative.endswith("/kernel/objects.rs")
@@ -209,7 +226,7 @@ def generate() -> dict[str, Any]:
     }
     return {
         "schema": 1,
-        "scope": "production Rust sources under crates/carrick-runtime/src and crates/carrick-vfs/src",
+        "scope": "production Rust sources under crates/carrick-runtime/src, crates/carrick-kernel/src and crates/carrick-vfs/src",
         "counts": counts,
         "production_counts": {
             name: sum(

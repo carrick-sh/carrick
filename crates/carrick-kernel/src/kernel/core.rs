@@ -52,7 +52,7 @@ pub struct KernelContext {
 }
 
 impl KernelContext {
-    pub(crate) fn issue_hvpatch_child_token(
+    pub fn issue_hvpatch_child_token(
         &self,
         cow_authority: Arc<dyn carrick_hal::FrameCowAuthority>,
         cow_identity: carrick_hal::FrameCowIdentity,
@@ -130,7 +130,7 @@ impl KernelContext {
     /// Retain this exact captured generation for a lifecycle handoff. This is
     /// deliberately distinct from registry capture: every Arc and revision is
     /// preserved byte-for-byte, so no newer association can be substituted.
-    pub(crate) fn retain_exact(&self) -> Self {
+    pub fn retain_exact(&self) -> Self {
         Self {
             kernel: Arc::clone(&self.kernel),
             task: Arc::clone(&self.task),
@@ -211,17 +211,17 @@ pub struct KernelTaskBinding {
 /// One coherent task-level signal observation selected under the registry read
 /// lock. The context's Sighand/pending set and the live-thread roster all belong
 /// to the same pre- or post-exec task revision.
-pub(crate) struct KernelTaskSignalSnapshot {
+pub struct KernelTaskSignalSnapshot {
     context: KernelContext,
     threads: Vec<ThreadRef>,
 }
 
 impl KernelTaskSignalSnapshot {
-    pub(crate) fn context(&self) -> &KernelContext {
+    pub fn context(&self) -> &KernelContext {
         &self.context
     }
 
-    pub(crate) fn threads(&self) -> &[ThreadRef] {
+    pub fn threads(&self) -> &[ThreadRef] {
         &self.threads
     }
 }
@@ -254,7 +254,7 @@ impl KernelTaskBinding {
     /// makes the result coherently pre- or post-exec; it can never mix the old
     /// Sighand with the replacement thread set. Selecting any live thread also
     /// handles a valid process whose original leader has retired.
-    pub(crate) fn capture_signal_snapshot(&self) -> Result<KernelTaskSignalSnapshot, KernelError> {
+    pub fn capture_signal_snapshot(&self) -> Result<KernelTaskSignalSnapshot, KernelError> {
         let state = self.kernel.registry.state.read();
         let record = state
             .tasks
@@ -395,7 +395,7 @@ impl RootBootstrap {
         self
     }
 
-    pub(crate) fn into_container_root_parts(
+    pub fn into_container_root_parts(
         self,
     ) -> (ThreadId, Option<Arc<dyn MmBackend>>, String, Arc<Container>) {
         (
@@ -586,7 +586,7 @@ impl std::fmt::Debug for PreparedContainerRoot {
 }
 
 impl PreparedContainerRoot {
-    pub(crate) fn context(&self) -> KernelContext {
+    pub fn context(&self) -> KernelContext {
         let mut context = KernelContext::capture(
             Arc::clone(&self.kernel),
             Arc::clone(&self.task),
@@ -725,13 +725,13 @@ pub(super) struct ControllingTtyState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FileCloseDisposition {
+pub enum FileCloseDisposition {
     Closed,
     Transferred,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct FileCloseEvent {
+pub struct FileCloseEvent {
     pub(crate) table: FileTableId,
     pub(crate) fd: i32,
     pub(crate) slot: FileSlot,
@@ -961,7 +961,7 @@ impl std::fmt::Debug for ReservationGate {
     }
 }
 
-pub(crate) struct ReservationChangeSubscription {
+pub struct ReservationChangeSubscription {
     subscribers: std::sync::Weak<Mutex<ReservationSubscribers>>,
     id: u64,
 }
@@ -1518,7 +1518,7 @@ impl Kernel {
         }
     }
 
-    pub(crate) fn container_ids(&self) -> Vec<ContainerId> {
+    pub fn container_ids(&self) -> Vec<ContainerId> {
         self.containers.lock().keys().copied().collect()
     }
 
@@ -2001,9 +2001,7 @@ impl Kernel {
     }
 
     #[allow(dead_code)] // consumed by the HVPatch carrier-directory publication slice
-    pub(crate) fn hvpatch_child_token_verifier(
-        &self,
-    ) -> Arc<carrick_hal::HvpatchChildTokenVerifier> {
+    pub fn hvpatch_child_token_verifier(&self) -> Arc<carrick_hal::HvpatchChildTokenVerifier> {
         Arc::clone(&self.hvpatch_child_token_verifier)
     }
 
@@ -2023,7 +2021,7 @@ impl Kernel {
         )
     }
 
-    pub(crate) fn reservation_epoch(&self) -> u64 {
+    pub fn reservation_epoch(&self) -> u64 {
         self.reservation_gate.snapshot()
     }
 
@@ -2031,7 +2029,7 @@ impl Kernel {
         self.reservation_gate.publish_change();
     }
 
-    pub(crate) fn subscribe_reservation_change(
+    pub fn subscribe_reservation_change(
         &self,
         observed: u64,
         callback: Arc<dyn Fn() + Send + Sync + 'static>,
@@ -2280,7 +2278,7 @@ impl RegistryLock {
 /// [`super::objects::Zombie`]'s identity, because the three describe the same
 /// process at three points in its life and `/proc` must render them alike.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LiveProcess {
+pub struct LiveProcess {
     pub key: TaskKey,
     pub container: ContainerId,
     pub parent: Option<TaskKey>,

@@ -42,26 +42,32 @@ impl Drop for DotdotDepthGuard {
     }
 }
 
-#[cfg(test)]
-pub(crate) struct ExecutorBoundaryPathTestGuard(DotdotDepthGuard);
+#[cfg(any(test, feature = "test-support"))]
+pub struct ExecutorBoundaryPathTestGuard(DotdotDepthGuard);
 
 impl SyscallDispatcher {
     /// True only after every recursive path-resolution guard on the current
     /// executor pthread has unwound.
-    pub(crate) fn executor_boundary_path_resolution_is_clear() -> bool {
+    pub fn executor_boundary_path_resolution_is_clear() -> bool {
         DOTDOT_RESOLVE_DEPTH.with(|depth| depth.get() == 0)
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_dirty_executor_boundary_path_resolution_for_test<R>(
+    // Test fixture reachable through `test-support`, so `cfg(test)` is not set
+    // for it and clippy's `allow-{unwrap,expect}-in-tests` does not apply.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
+    pub fn with_dirty_executor_boundary_path_resolution_for_test<R>(
         operation: impl FnOnce() -> R,
     ) -> R {
         let _guard = DotdotDepthGuard::enter().expect("enter test path-resolution depth");
         operation()
     }
 
-    #[cfg(test)]
-    pub(crate) fn dirty_executor_boundary_path_guard_for_test() -> ExecutorBoundaryPathTestGuard {
+    // Test fixture reachable through `test-support`, so `cfg(test)` is not set
+    // for it and clippy's `allow-{unwrap,expect}-in-tests` does not apply.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
+    pub fn dirty_executor_boundary_path_guard_for_test() -> ExecutorBoundaryPathTestGuard {
         ExecutorBoundaryPathTestGuard(
             DotdotDepthGuard::enter().expect("enter persistent test path-resolution depth"),
         )

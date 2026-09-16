@@ -7,7 +7,7 @@ use carrick_vfs::ProcMapsEntry;
 use super::{SyscallDispatcher, linux_task_name_to_string, mem};
 
 #[derive(Clone, Debug)]
-pub(crate) struct CoreProcessSnapshot {
+pub struct CoreProcessSnapshot {
     pub identity: crate::core_dump::ProcessIdentity,
     pub auxv: Vec<(u64, u64)>,
     pub maps: Vec<ProcMapsEntry>,
@@ -20,14 +20,14 @@ pub(crate) struct CoreProcessSnapshot {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct CorePublication {
+pub struct CorePublication {
     pub path: String,
     pub bytes: usize,
     pub generation: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum CorePublicationError {
+pub enum CorePublicationError {
     #[error("core snapshot lacks authoritative Kernel identity: {0}")]
     KernelIdentity(String),
     #[error("core snapshot auxv is not a sequence of 16-byte entries")]
@@ -83,7 +83,7 @@ fn pwrite_all_host_fd(
 }
 
 impl SyscallDispatcher {
-    pub(crate) fn core_process_snapshot(
+    pub fn core_process_snapshot(
         &self,
         context: &crate::kernel::KernelContext,
     ) -> Result<CoreProcessSnapshot, CorePublicationError> {
@@ -176,7 +176,7 @@ impl SyscallDispatcher {
     /// Publish an already-bounded core in the guest filesystem namespace.
     /// The same-directory temporary is never a valid final artifact: every
     /// error removes it, and the only success edge is one atomic rename.
-    pub(crate) fn publish_core_atomic(
+    pub fn publish_core_atomic(
         &self,
         snapshot: &CoreProcessSnapshot,
         generation: u64,
@@ -664,7 +664,7 @@ impl SyscallDispatcher {
 
     /// Remove a renamed core whose matching authoritative wait status did not
     /// commit. Publication ownership is not released by rename alone.
-    pub(crate) fn rollback_core_publication(
+    pub fn rollback_core_publication(
         &self,
         publication: &CorePublication,
     ) -> Result<(), CorePublicationError> {
@@ -682,7 +682,8 @@ mod tests {
 
     #[test]
     fn core_snapshot_reads_rlimit_from_supplied_task_outside_dispatch_scope() {
-        let (_process, supplied) = crate::kernel::TestCarrierProcess::new(41_202);
+        let (_process, supplied) =
+            crate::kernel::TestCarrierProcess::new(41_202).expect("test carrier process");
         supplied
             .task()
             .replace_rlimit(carrick_abi::LinuxResource::Core, |current| {
@@ -690,7 +691,8 @@ mod tests {
             })
             .expect("lower supplied task core limit");
 
-        let (_other_process, other) = crate::kernel::TestCarrierProcess::new(41_203);
+        let (_other_process, other) =
+            crate::kernel::TestCarrierProcess::new(41_203).expect("test carrier process");
         other
             .task()
             .replace_rlimit(carrick_abi::LinuxResource::Core, |current| {
@@ -720,7 +722,8 @@ mod tests {
         let dispatcher = SyscallDispatcher::new();
         let prepared = dispatcher.mm_binding.current.load_full();
         let prepared_mem = Arc::clone(&prepared.mem);
-        let (process, context) = crate::kernel::TestCarrierProcess::new(41_201);
+        let (process, context) =
+            crate::kernel::TestCarrierProcess::new(41_201).expect("test carrier process");
         let committed_mm = context.shared().mm().id();
         let wrong_raw = committed_mm.raw().checked_add(1).expect("test MM id");
         let wrong_mm = crate::kernel::MmId::from_registry_allocation(

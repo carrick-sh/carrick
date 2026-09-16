@@ -12,7 +12,7 @@ use super::asid::{
     AsidRetirement, InvalidationAck, PreparedAsidAllocatorRetirement,
     PreparedAsidResidencyRetirement, RetiredAsid,
 };
-use crate::kernel::{
+use carrick_kernel::kernel::{
     MmBackend, MmBackendSnapshot, MmBinding, SharedVmaSnapshotSource, SnapshotError, SnapshotTable,
     Stage1Root, Stage1RootError, Ttbr0, VmaRevision,
 };
@@ -136,8 +136,9 @@ pub(crate) struct Stage1MmLease {
 #[derive(Debug, Default)]
 struct CowInvalidationState {
     generation: u64,
-    pending: BTreeSet<crate::kernel::objects::ExecutorId>,
-    observed: std::collections::BTreeMap<crate::kernel::objects::ExecutorId, Arc<AtomicU64>>,
+    pending: BTreeSet<carrick_kernel::kernel::objects::ExecutorId>,
+    observed:
+        std::collections::BTreeMap<carrick_kernel::kernel::objects::ExecutorId, Arc<AtomicU64>>,
 }
 
 /// Per-resident fast-path observation retained by the loaded owner executor.
@@ -145,7 +146,7 @@ struct CowInvalidationState {
 /// after a published generation differs.
 #[derive(Clone, Debug)]
 pub(crate) struct CowInvalidationObserver {
-    executor: crate::kernel::objects::ExecutorId,
+    executor: carrick_kernel::kernel::objects::ExecutorId,
     asid: AsidGeneration,
     published: Arc<AtomicU64>,
     observed: Arc<AtomicU64>,
@@ -166,7 +167,7 @@ pub(crate) struct CowInvalidationTicket {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CowInvalidationPublication {
     ticket: CowInvalidationTicket,
-    pending: Vec<crate::kernel::objects::ExecutorId>,
+    pending: Vec<carrick_kernel::kernel::objects::ExecutorId>,
 }
 
 impl CowInvalidationPublication {
@@ -176,7 +177,7 @@ impl CowInvalidationPublication {
     }
 
     #[cfg(test)]
-    pub(crate) fn pending(&self) -> Vec<crate::kernel::objects::ExecutorId> {
+    pub(crate) fn pending(&self) -> Vec<carrick_kernel::kernel::objects::ExecutorId> {
         self.pending.clone()
     }
 
@@ -294,7 +295,7 @@ impl Stage1MmLease {
 
     pub(crate) fn begin_asid_load(
         &self,
-        executor: crate::kernel::objects::ExecutorId,
+        executor: carrick_kernel::kernel::objects::ExecutorId,
     ) -> Result<AsidLoad, AsidResidencyError> {
         let lifecycle = self.lifecycle.lock();
         if *lifecycle != Stage1MmLeaseLifecycle::Live {
@@ -316,7 +317,7 @@ impl Stage1MmLease {
 
     pub(crate) fn cow_invalidation_observer(
         &self,
-        executor: crate::kernel::objects::ExecutorId,
+        executor: carrick_kernel::kernel::objects::ExecutorId,
     ) -> CowInvalidationObserver {
         let observed = self
             .cow_invalidation
@@ -376,7 +377,7 @@ impl Stage1MmLease {
 
     pub(crate) fn pending_cow_invalidation(
         &self,
-        executor: crate::kernel::objects::ExecutorId,
+        executor: carrick_kernel::kernel::objects::ExecutorId,
     ) -> Option<CowInvalidationTicket> {
         let state = self.cow_invalidation.lock();
         state
@@ -402,7 +403,7 @@ impl Stage1MmLease {
 
     pub(crate) fn acknowledge_cow_invalidation(
         &self,
-        executor: crate::kernel::objects::ExecutorId,
+        executor: carrick_kernel::kernel::objects::ExecutorId,
         ticket: CowInvalidationTicket,
     ) -> Result<(), CowInvalidationError> {
         let mut state = self.cow_invalidation.lock();
@@ -785,7 +786,7 @@ impl PreparedStage1MmRetirement {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn pending(&self) -> Vec<crate::kernel::objects::ExecutorId> {
+    pub(crate) fn pending(&self) -> Vec<carrick_kernel::kernel::objects::ExecutorId> {
         let Some(residency) = self.residency.as_ref() else {
             carrick_fatal!(
                 "hvpatch::stage1_retirement",
@@ -955,7 +956,7 @@ impl PreparedStage1Mm {
 
     pub(crate) fn begin_asid_load(
         &self,
-        executor: crate::kernel::objects::ExecutorId,
+        executor: carrick_kernel::kernel::objects::ExecutorId,
     ) -> Result<AsidLoad, AsidResidencyError> {
         self.lease.begin_asid_load(executor)
     }
@@ -1036,7 +1037,7 @@ impl Stage1MmRetirement {
         self.residency.generation()
     }
 
-    pub(crate) fn pending(&self) -> Vec<crate::kernel::objects::ExecutorId> {
+    pub(crate) fn pending(&self) -> Vec<carrick_kernel::kernel::objects::ExecutorId> {
         self.residency.pending()
     }
 
@@ -1162,8 +1163,8 @@ pub(crate) struct Stage1MmBackend {
 
 #[derive(Debug)]
 struct InventoryBinding {
-    kernel: std::sync::Weak<crate::kernel::Kernel>,
-    mm: crate::kernel::MmId,
+    kernel: std::sync::Weak<carrick_kernel::kernel::Kernel>,
+    mm: carrick_kernel::kernel::MmId,
 }
 
 impl Stage1MmBackend {
@@ -1193,8 +1194,8 @@ impl Stage1MmBackend {
 
     pub(crate) fn bind_inventory(
         &self,
-        kernel: &Arc<crate::kernel::Kernel>,
-        mm: crate::kernel::MmId,
+        kernel: &Arc<carrick_kernel::kernel::Kernel>,
+        mm: carrick_kernel::kernel::MmId,
     ) {
         let mut inventory = self.inventory.write();
         *inventory = Some(InventoryBinding {
@@ -1235,7 +1236,7 @@ impl Stage1MmBackend {
     }
 
     #[cfg(test)]
-    pub(crate) fn inventory_mm_for_tests(&self) -> Option<crate::kernel::MmId> {
+    pub(crate) fn inventory_mm_for_tests(&self) -> Option<carrick_kernel::kernel::MmId> {
         self.inventory.read().as_ref().map(|binding| binding.mm)
     }
 
@@ -1256,8 +1257,8 @@ impl Stage1MmBackend {
 #[derive(Debug)]
 pub(crate) struct PreparedVmaFreeze {
     source: SharedVmaSnapshotSource,
-    snapshot: crate::kernel::OwnedVmaSnapshot,
-    expected_revision: crate::kernel::VmaRevision,
+    snapshot: carrick_kernel::kernel::OwnedVmaSnapshot,
+    expected_revision: carrick_kernel::kernel::VmaRevision,
 }
 
 impl PreparedVmaFreeze {
@@ -1353,13 +1354,13 @@ impl MmBackend for Stage1MmBackend {
                 return Err(deadline_error(deadline));
             };
             let inventory = guard.as_ref().ok_or(SnapshotError::AuthorityUnavailable(
-                crate::kernel::SnapshotTable::Mappings,
+                carrick_kernel::kernel::SnapshotTable::Mappings,
             ))?;
             let kernel = inventory
                 .kernel
                 .upgrade()
                 .ok_or(SnapshotError::AuthorityUnavailable(
-                    crate::kernel::SnapshotTable::Mappings,
+                    carrick_kernel::kernel::SnapshotTable::Mappings,
                 ))?;
             (kernel, inventory.mm)
         };
@@ -1415,17 +1416,17 @@ mod tests {
     use super::super::mm_resources::MmResources;
     use super::*;
 
-    fn root_key() -> crate::kernel::TaskKey {
-        crate::kernel::TaskKey {
-            id: crate::kernel::TaskId::for_root_bootstrap(40).unwrap(),
-            serial: crate::kernel::TaskSerial::from_registry_allocation(
+    fn root_key() -> carrick_kernel::kernel::TaskKey {
+        carrick_kernel::kernel::TaskKey {
+            id: carrick_kernel::kernel::TaskId::for_root_bootstrap(40).unwrap(),
+            serial: carrick_kernel::kernel::TaskSerial::from_registry_allocation(
                 NonZeroU64::new(1).unwrap(),
             ),
         }
     }
 
-    fn executor(raw: i32) -> crate::kernel::objects::ExecutorId {
-        crate::kernel::objects::ExecutorId::for_transitional_thread(
+    fn executor(raw: i32) -> carrick_kernel::kernel::objects::ExecutorId {
+        carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(
             crate::thread::ThreadId::synthetic_for_tests(raw),
         )
         .expect("test executor id")
@@ -1447,7 +1448,7 @@ mod tests {
         assert_ne!(replacement.binding().stage1_root, initial.stage1_root);
         assert_eq!(
             replacement.binding().ttbr0,
-            crate::kernel::Ttbr0::for_aarch64(
+            carrick_kernel::kernel::Ttbr0::for_aarch64(
                 replacement.binding().asid,
                 replacement.binding().stage1_root,
             )
@@ -2051,7 +2052,9 @@ mod tests {
             crate::vcpu_loop::executor::TaskLoadIdentity {
                 abi: carrick_abi::LinuxGuestAbi::Aarch64,
                 version: 1,
-                mm: crate::kernel::MmId::from_registry_allocation(NonZeroU64::new(91).unwrap()),
+                mm: carrick_kernel::kernel::MmId::from_registry_allocation(
+                    NonZeroU64::new(91).unwrap(),
+                ),
                 asid_generation: generation.generation(),
             },
             Arc::new(crate::vcpu_loop::continuation::HvpatchTaskQuantum::new(
@@ -2198,7 +2201,7 @@ mod tests {
         assert_eq!(
             backend.snapshot(Instant::now() + std::time::Duration::from_secs(1)),
             Err(SnapshotError::AuthorityUnavailable(
-                crate::kernel::SnapshotTable::Vmas
+                carrick_kernel::kernel::SnapshotTable::Vmas
             ))
         );
     }

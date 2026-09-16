@@ -35,8 +35,8 @@
 //! ring-0 code. carrick is simultaneously the VMM *and* the kernel the guest
 //! thinks it is talking to.
 //!
-//! This crate is the union of those two roles. The split between them is
-//! reflected in the module layout:
+//! This crate is now the **execution lane** of that pair, not the union of
+//! both:
 //!
 //! - **The exec engine** (the leaf crate `carrick-vmm-hvf`, re-exported below under
 //!   `crate::trap`, `crate::thread`, `crate::vcpu_kick`, …): the HVF trap engine
@@ -44,31 +44,35 @@
 //!   restore shim, cross-thread vCPU coordination (the kicker and page-table
 //!   quiesce barriers), the Darwin `kqueue` wrapper, and host-signal capture.
 //!   This is the "VMM half".
-//! - **The kernel half** (this crate proper): [`dispatch`] — the syscall
-//!   dispatcher and its subsystems — plus the kernel-view filesystems in
-//!   [`vfs`] over the `carrick-vfs` filesystem model (`rootfs`, `overlay`,
-//!   `fs_backend` — the filesystem the guest sees), [`namespace`] (UID/GID +
-//!   PID namespace emulation), [`container`] (docker-style run state), and the
-//!   `/proc` and signal machinery. None of these touch HVF directly; they
-//!   answer syscalls.
-//! - **The lifecycle** ([`runtime`], [`execute`]): the glue that wires the two
-//!   halves together. It loads the image, installs the EL0 trampoline / EL1
-//!   vectors / stage-1 page tables, then drives the trap → dispatch → complete
-//!   loop until the guest exits. It also owns the fork/clone model
-//!   (logical Carrick-kernel tasks for guest processes, one host thread per
-//!   guest thread), fault-to-signal translation, and the interactive pty bridge
-//!   ([`pty_relay`]/[`interactive_supervisor`]). Start reading at [`runtime`].
+//! - **The kernel half is `carrick-kernel`**: the kernel object graph, the
+//!   syscall dispatcher and its subsystems, the namespaces, the in-zone
+//!   network, the kernel-view filesystems and the container/run state. It
+//!   names no carrier and no VMM module, so an execution backend other than
+//!   this carrier can reuse it. Consumers import `carrick_kernel::…` directly;
+//!   this crate re-exports none of it.
+//! - **The lifecycle and the carrier** (this crate proper — [`runtime`],
+//!   [`execute`], [`prepare`], `carrier`, `hvpatch`, `vcpu_loop`,
+//!   `threaded_loop`): the glue that wires the two halves together. It loads
+//!   the image, installs the EL0 trampoline / EL1 vectors / stage-1 page
+//!   tables, then drives the trap → dispatch → complete loop until the guest
+//!   exits. It also owns the fork/clone model (logical Carrick-kernel tasks for
+//!   guest processes, one host thread per guest thread), fault-to-signal
+//!   translation, and the interactive pty bridge
+//!   ([`interactive_supervisor`]). It implements the `carrick-hal` bridges the
+//!   kernel consumes ([`bridges`]). Start reading at [`runtime`].
 //!
 //! # The leaf-crate re-exports
 //!
 //! Several subsystems were lifted out of this crate into leaf crates to cut the
 //! build-graph fan-out (a ~40k-line monolith re-linking on every edit). They are
 //! re-exported below under their *original* `crate::<module>` paths, so every
-//! call site across the runtime — and every `carrick_runtime::<module>` path the
+//! call site across the carrier — and every `carrick_runtime::<module>` path the
 //! CLI/engine crates use — is unchanged. When you see `crate::trap::…` or
 //! `crate::memory::…` in this crate, the code physically lives in `carrick-vmm-hvf`
 //! / `carrick-mem` / `carrick-host` / `carrick-abi`; the boundary is a build
-//! optimisation, not a semantic one.
+//! optimisation, not a semantic one. `carrick-kernel` is the one split that is
+//! NOT re-exported: it is a semantic boundary, so its paths are spelled
+//! `carrick_kernel::…` at every call site.
 //!
 //! # Sharp edges (read before touching the lifecycle)
 //!
@@ -165,23 +169,6 @@ pub use carrick_mem::shared_aperture;
 // thread (ThreadRegistry/FutexTable) + fork_quiesce barriers are
 // hypervisor-agnostic; both backends use the real carrick-thread impls.
 pub use carrick_thread::{fork_quiesce, thread};
-// `container_thread_states` queries the kernel for per-thread run-state via the
-// Mach port recorded by each vCPU thread. On macOS the real implementation
-// (in carrick-vmm-hvf::thread) issues `thread_info`; on Linux there are no Mach
-// ports, so we return every registered thread with state 'R' (running).
-#[cfg(feature = "platform-macos")]
-pub use carrick_vmm_hvf::thread::container_thread_states;
-#[cfg(any(
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
-pub fn container_thread_states(
-    container: carrick_hal::ContainerId,
-) -> Vec<(thread::ThreadId, char)> {
-    thread::container_thread_state_chars(container)
-}
-
 // Under platform-linux there is no carrick-vmm-hvf to re-export `trap` from; the
 // SyscallTrap/TrapError contract lives in carrick-hal (section
 // HAL). Re-export a `trap` shim so `crate::trap::{SyscallTrap, …}` resolves on
@@ -256,7 +243,7 @@ pub fn rosetta_interpreter_path() -> String {
             return path.to_string();
         }
     }
-    crate::dispatch::rosetta::ROSETTA_INTERPRETER.to_string()
+    carrick_kernel::dispatch::rosetta::ROSETTA_INTERPRETER.to_string()
 }
 
 /// Extract the `interpreter <path>` value from a binfmt_misc registration dump
@@ -297,21 +284,13 @@ pub fn rosetta_available() -> bool {
 ))]
 pub mod runtime {
     pub use crate::debug_state::{DebugRegionSnapshot, DebugStateSnapshot, maybe_dump_debug_state};
-    pub use crate::run_result::{RunResult, RuntimeError};
+    pub use carrick_kernel::run_result::{RunResult, RuntimeError};
 
     pub fn run_oci(_spec: &carrick_spec::RunSpec) -> Result<RunResult, RuntimeError> {
         Err(RuntimeError::Unsupported(
             "Pending port to hvpatch VM carrier model".to_string(),
         ))
     }
-}
-
-/// Whether the EL1 guest-side syscall shim (the register-only identity fast
-/// path: getpid/get*id/gettid) is compiled in. Gated by the `syscall-shim`
-/// Cargo feature. carrick-cli enables it by default; build the binary with
-/// `--no-default-features` for the legacy trap-only path.
-pub(crate) const fn syscall_shim_enabled() -> bool {
-    cfg!(feature = "syscall-shim")
 }
 
 #[cfg(any(

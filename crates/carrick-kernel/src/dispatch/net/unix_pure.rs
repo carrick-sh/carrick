@@ -37,7 +37,7 @@ pub const DEFAULT_DGRAM_QUEUE_LIMIT: usize = 256;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LinuxUcred {
+pub struct LinuxUcred {
     pub pid: i32,
     pub uid: u32,
     pub gid: u32,
@@ -54,7 +54,7 @@ impl Default for LinuxUcred {
 }
 
 #[derive(Debug)]
-pub(crate) struct UnixDatagram {
+pub struct UnixDatagram {
     pub payload: Vec<u8>,
     pub sender_addr: Option<Vec<u8>>,
     pub sender_creds: Option<LinuxUcred>,
@@ -68,7 +68,7 @@ enum TcpPeerTerminal {
     Reset,
 }
 
-pub(crate) struct PureSocketState {
+pub struct PureSocketState {
     pub bound_addr: Option<Vec<u8>>,
     pub local_sockaddr: Option<SocketAddr>,
     pub peer_sockaddr: Option<SocketAddr>,
@@ -115,7 +115,7 @@ pub(crate) struct PureSocketState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PureSocketPhase {
+pub enum PureSocketPhase {
     Unbound,
     Bound,
     Connected,
@@ -142,8 +142,8 @@ impl std::fmt::Debug for PureSocketInner {
     }
 }
 
-pub(crate) type UnixSocketState = PureSocketState;
-pub(crate) type UnixSocketInner = PureSocketInner;
+pub type UnixSocketState = PureSocketState;
+pub type UnixSocketInner = PureSocketInner;
 
 impl PureSocketInner {
     pub(crate) fn family(&self) -> i32 {
@@ -1349,7 +1349,7 @@ impl Drop for PureSocketInner {
 }
 
 #[derive(Default, Debug)]
-pub(crate) struct UnixSocketRegistry {
+pub struct UnixSocketRegistry {
     pub(crate) abstract_sockets: Mutex<HashMap<Vec<u8>, Arc<PureSocketInner>>>,
     pub(crate) pathname_sockets: Mutex<HashMap<String, Arc<PureSocketInner>>>,
     pub(crate) autobind_counter: AtomicU32,

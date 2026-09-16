@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::kernel::Asid;
-use crate::kernel::objects::ExecutorId;
+use carrick_kernel::kernel::Asid;
+use carrick_kernel::kernel::objects::ExecutorId;
 
 const FIRST_GUEST_ASID: u16 = 1;
 const LAST_GUEST_ASID: u16 = u16::MAX;
@@ -505,8 +505,8 @@ impl Drop for PreparedAsidAllocatorRetirement {
 #[cfg(test)]
 mod tests {
     use super::{AsidAllocator, AsidError, AsidResidency, InvalidationAck};
-    use crate::kernel::objects::ExecutorId;
     use crate::thread::ThreadId;
+    use carrick_kernel::kernel::objects::ExecutorId;
 
     fn executor(raw: i32) -> ExecutorId {
         ExecutorId::for_transitional_thread(ThreadId::synthetic_for_tests(raw))

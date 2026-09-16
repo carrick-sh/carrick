@@ -30,7 +30,7 @@ use crate::linux_abi::LinuxErrno;
 /// script path are UTF-8 (from the shebang line and the resolved path) and are
 /// pushed as bytes. `#!/i x` on argv `[script, a, b]` becomes path `/i`, argv
 /// `[/i, x, /script, a, b]`.
-pub(crate) fn resolve_shebang(
+pub fn resolve_shebang(
     dispatcher: &SyscallDispatcher,
     mut path: String,
     mut argv: Vec<Vec<u8>>,
@@ -71,11 +71,8 @@ pub(crate) fn resolve_shebang(
 // The OCI/entrypoint run path is live on macOS (HVF) and aarch64-KVM (`run_oci`)
 // but not yet wired on x86_64-KVM, where `run_oci` is a stub until OCI-x86 lands
 // — so this is legitimately unused ONLY on the x86_64 platform-linux build.
-#[cfg_attr(
-    all(feature = "platform-linux", target_arch = "x86_64"),
-    allow(dead_code)
-)]
-pub(crate) fn resolve_entrypoint_path(
+#[cfg_attr(all(target_os = "linux", target_arch = "x86_64"), allow(dead_code))]
+pub fn resolve_entrypoint_path(
     path: &str,
     env: &[String],
     dispatcher: &SyscallDispatcher,
@@ -106,11 +103,8 @@ pub(crate) fn resolve_entrypoint_path(
 /// command, then resolve any `#!` shebang to its interpreter, so a script
 /// entrypoint runs like Docker/`execve(2)`. Returns the final (program path,
 /// argv as opaque Linux-ABI bytes). Shared by both backends.
-#[cfg_attr(
-    all(feature = "platform-linux", target_arch = "x86_64"),
-    allow(dead_code)
-)]
-pub(crate) fn resolve_entrypoint_program(
+#[cfg_attr(all(target_os = "linux", target_arch = "x86_64"), allow(dead_code))]
+pub fn resolve_entrypoint_program(
     path: &str,
     env: &[String],
     argv: Vec<Vec<u8>>,
@@ -128,14 +122,10 @@ pub(crate) fn resolve_entrypoint_program(
 /// is the run-loop entry that consumes the returned image (HVF `finish_and_run_
 /// image` vs KVM `KvmTrapEngine::new` + `run_threaded_kvm_loop`).
 #[cfg_attr(
-    any(
-        feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ),
+    any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"),
     allow(dead_code)
 )]
-pub(crate) fn build_run_image(
+pub fn build_run_image(
     bytes: &[u8],
     argv: Vec<Vec<u8>>,
     env: &[String],
@@ -159,17 +149,14 @@ pub(crate) fn build_run_image(
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RunImageBuildOptions {
+pub struct RunImageBuildOptions {
     pub(crate) vdso_enabled: bool,
     pub(crate) at_base: Option<u64>,
     pub(crate) linux_page_size: u64,
     pub(crate) machine: u16,
 }
 
-#[cfg_attr(
-    any(feature = "platform-freebsd", feature = "platform-netbsd"),
-    allow(dead_code)
-)]
+#[cfg_attr(any(target_os = "freebsd", target_os = "netbsd"), allow(dead_code))]
 pub(crate) fn build_run_image_for(
     bytes: &[u8],
     argv: Vec<Vec<u8>>,
@@ -193,11 +180,7 @@ pub(crate) fn build_run_image_for(
     )
 }
 
-#[cfg(any(
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 pub(crate) fn build_run_image_for_execfn(
     bytes: &[u8],
     argv: Vec<Vec<u8>>,
@@ -228,7 +211,7 @@ pub(crate) fn build_run_image_for_execfn(
 /// to the next whitespace, then the remainder of the line (trimmed) as ONE
 /// argument. Only the first line is consulted. Linux caps the shebang line at
 /// BINPRM_BUF_SIZE (256).
-pub(crate) fn parse_shebang(head: &[u8]) -> Option<(String, Option<String>)> {
+pub fn parse_shebang(head: &[u8]) -> Option<(String, Option<String>)> {
     let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
     let line = &head[2..line_end.min(256)];
     let line = std::str::from_utf8(line).ok()?;
@@ -297,7 +280,7 @@ fn sigdeath_marker_path(host_pid: u32) -> std::path::PathBuf {
 /// `signum` is a Linux signal number; `linux_to_host_signum` maps it to the
 /// host number (identity on Linux, Darwin mapping on macOS) so the host wait
 /// status carries the right value.
-pub(crate) fn forked_child_die_by_signal(
+pub fn forked_child_die_by_signal(
     host_signal: &dyn carrick_hal::HostSignalBridge,
     signum: i32,
     stdout_buf: impl AsRef<[u8]>,
@@ -356,7 +339,7 @@ pub(crate) fn forked_child_die_by_signal(
     }
 }
 
-pub(crate) fn stop_for_debug_signal(signum: i32) {
+pub fn stop_for_debug_signal(signum: i32) {
     let Ok(raw) = std::env::var("CARRICK_DEBUG_STOP_ON_SIGNAL") else {
         return;
     };
@@ -379,7 +362,7 @@ fn debug_stop_matches_signal(raw: &str, signum: i32) -> bool {
 ///
 /// `signum` is a Linux signal number; translated to the host signal via
 /// `linux_to_host_signum` (identity on Linux, Darwin mapping on macOS).
-pub(crate) fn stop_by_signal(host_signal: &dyn carrick_hal::HostSignalBridge, signum: i32) {
+pub fn stop_by_signal(host_signal: &dyn carrick_hal::HostSignalBridge, signum: i32) {
     let host_signum = host_signal.linux_to_host_signum(signum);
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
@@ -443,7 +426,7 @@ where
 /// Other backends retain the legacy marker path. `false` means the tracee is
 /// not currently owned (including after native detach), so normal delivery
 /// must continue.
-pub(crate) fn stop_for_ptrace_signal(dispatcher: &SyscallDispatcher, signum: i32) -> bool {
+pub fn stop_for_ptrace_signal(dispatcher: &SyscallDispatcher, signum: i32) -> bool {
     if let Some(process) = dispatcher.hvpatch_process() {
         // The kernel graph's `ptrace_tracer` is the only authority on whether
         // this task is traced: a `PTRACE_ATTACH`ed tracee never set the
@@ -494,7 +477,7 @@ pub(crate) fn stop_for_ptrace_signal(dispatcher: &SyscallDispatcher, signum: i32
     }
 }
 
-pub(crate) fn stop_for_ptrace_fault(
+pub fn stop_for_ptrace_fault(
     dispatcher: &SyscallDispatcher,
     fault: crate::kernel::objects::PtraceSynchronousFault,
 ) -> bool {
@@ -512,7 +495,7 @@ pub(crate) fn stop_for_ptrace_fault(
 
 /// After a `PTRACE_TRACEME`d exec, stop with SIGTRAP so a tracer sees the
 /// exec stop.
-pub(crate) fn stop_after_traced_exec(dispatcher: &SyscallDispatcher) {
+pub fn stop_after_traced_exec(dispatcher: &SyscallDispatcher) {
     if dispatcher.page_geometry().native_profile.is_some() || dispatcher.hvpatch_process().is_some()
     {
         let _ = stop_for_ptrace_signal(dispatcher, crate::linux_abi::LINUX_SIGTRAP);

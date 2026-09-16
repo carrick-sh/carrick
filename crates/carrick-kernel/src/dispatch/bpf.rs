@@ -75,7 +75,7 @@ const MAX_TOTAL_BYTES: u64 = 256 << 20; // 256 MiB per map
 /// A live eBPF map: immutable geometry plus mutex-guarded contents. Shared
 /// (`Arc`) by every fd slot that refers to the map object.
 #[derive(Debug)]
-pub(crate) struct BpfMap {
+pub struct BpfMap {
     key_size: u32,
     value_size: u32,
     max_entries: u32,
@@ -253,7 +253,7 @@ impl BpfMap {
 /// the object exists so the fd lifecycle (`dup`/`close`/proc introspection)
 /// behaves; attachment surfaces reject it honestly.
 #[derive(Debug)]
-pub(crate) struct BpfProg {
+pub struct BpfProg {
     #[allow(dead_code)]
     prog_type: BpfProgType,
     #[allow(dead_code)]

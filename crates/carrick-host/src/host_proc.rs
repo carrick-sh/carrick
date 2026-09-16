@@ -393,7 +393,7 @@ mod imp {
 
     /// Extract the guest task name carrick stamped into a process's proctitle
     /// (`argv[0]`): `carrick:<run-id>: <name>` or `carrick: <name>` (see
-    /// `carrick_runtime::dispatch::proctitle::proc_label`). Returns `<name>` —
+    /// `carrick_kernel::dispatch::proctitle::proc_label`). Returns `<name>` —
     /// the part after the last `": "` — truncated to Linux's 15-byte comm, or
     /// `None` when the title carries no guest name. carrick does not host-exec,
     /// so the macOS `pbi_comm` is always "carrick"; the proctitle is the only

@@ -32,16 +32,16 @@ default = ["platform-macos"]
 # purpose: the binary (carrick-cli) is the single control point. carrick-cli's
 # default enables it for normal builds; dependents that use carrick-runtime as a
 # library do not re-enable it through feature unification.
-syscall-shim = []
+syscall-shim = ["carrick-kernel/syscall-shim"]
 # In-memory fs backend selection (default OFF; control point is carrick-cli).
-fs-memory = ["carrick-vfs/fs-memory", "carrick-spec/fs-memory"]
+fs-memory = ["carrick-kernel/fs-memory", "carrick-vfs/fs-memory", "carrick-spec/fs-memory"]
 # Debug-only tracing (compile-gated, default OFF). Own gates plus passthroughs
 # to the leaf crates, so carrick-cli can enable any of them through this crate.
-trace-tty = []
-trace-io = []
+trace-tty = ["carrick-kernel/trace-tty"]
+trace-io = ["carrick-kernel/trace-io"]
 trace-traps = []
-watchpoint = []
-event-ring-dump = []
+watchpoint = ["carrick-kernel/watchpoint"]
+event-ring-dump = ["carrick-kernel/event-ring-dump"]
 trace-hvf = ["carrick-vmm-hvf/trace-hvf"]
 trace-syscalls = ["carrick-vmm-hvf?/trace-syscalls", "carrick-observability/trace-syscalls"]
 debug-stats = ["carrick-vmm-hvf/debug-stats"]
@@ -52,7 +52,7 @@ trace-elf = ["carrick-mem/trace-elf"]
 # this crate's own test targets through the self dev-dependency below (a unit
 # test sees `cfg(test)`, an integration test does not); a product build never
 # compiles it.
-test-support = ["carrick-hal/test-support"]
+test-support = ["carrick-hal/test-support", "carrick-kernel/test-support"]
 
 # Platform backend selection (exactly one active at a time). carrick-cli's
 # `default` enables `platform-macos`; a `platform-linux` build links NO HVF.
@@ -79,6 +79,7 @@ platform-netbsd = ["dep:carrick-vmm-nvmm", "dep:carrick-host-bsd"]
 carrick-fatal.workspace = true
 carrick-abi = { path = "../carrick-abi" }
 carrick-hal = { path = "../carrick-hal" }
+carrick-kernel = { path = "../carrick-kernel" }
 carrick-portable = { path = "../carrick-portable" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-thread = { path = "../carrick-thread" }

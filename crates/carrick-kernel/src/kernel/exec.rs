@@ -110,7 +110,7 @@ pub struct PreparedExec {
 /// Kernel-minted proof of one committed exec cutover. It is deliberately not
 /// `Clone`; the scheduler consumes it exactly once when transferring the live
 /// worker claim and combined binding/authority record to the replacement.
-pub(crate) struct CommittedExecTransition {
+pub struct CommittedExecTransition {
     context: KernelContext,
     task: TaskKey,
     predecessor_thread: ThreadKey,
@@ -122,21 +122,21 @@ pub(crate) struct CommittedExecTransition {
 }
 
 impl CommittedExecTransition {
-    pub(crate) fn context(&self) -> &KernelContext {
+    pub fn context(&self) -> &KernelContext {
         &self.context
     }
 
-    #[cfg(test)]
-    pub(crate) fn thread(&self) -> &ThreadRef {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn thread(&self) -> &ThreadRef {
         self.context.thread()
     }
 
-    #[cfg(test)]
-    pub(crate) fn shared(&self) -> &Arc<TaskShared> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn shared(&self) -> &Arc<TaskShared> {
         self.context.shared()
     }
 
-    pub(crate) fn attach_successor_asid_generation(
+    pub fn attach_successor_asid_generation(
         mut self,
         mm: MmId,
         generation: u64,
@@ -171,7 +171,7 @@ impl CommittedExecTransition {
 
 /// Non-cloneable proof of the exact Kernel exec publication whose HVPatch
 /// successor still needs to become runnable before a vfork parent may resume.
-pub(crate) struct ExecPublicationReceipt {
+pub struct ExecPublicationReceipt {
     domain: Arc<super::core::KernelDomain>,
     task: TaskKey,
     revision: TaskRevision,
@@ -179,14 +179,14 @@ pub(crate) struct ExecPublicationReceipt {
     successor_mm: MmId,
 }
 
-pub(crate) struct CommittedExecSchedulerParts {
+pub struct CommittedExecSchedulerParts {
     pub(crate) context: KernelContext,
     pub(crate) task: TaskKey,
     pub(crate) predecessor_thread: ThreadKey,
     pub(crate) predecessor_mm: MmId,
-    pub(crate) successor_thread: ThreadKey,
-    pub(crate) successor_mm: MmId,
-    pub(crate) successor_asid_generation: u64,
+    pub successor_thread: ThreadKey,
+    pub successor_mm: MmId,
+    pub successor_asid_generation: u64,
     pub(crate) publication_receipt: ExecPublicationReceipt,
 }
 
@@ -197,14 +197,14 @@ impl PreparedExec {
         self.old_mm.id()
     }
 
-    pub(crate) fn old_file_table(&self) -> Arc<FileTable> {
+    pub fn old_file_table(&self) -> Arc<FileTable> {
         self.old_caller.resources().files()
     }
 
     /// Cross the external backend's no-return cut. Dropping this preparation
     /// after this point terminates predecessor siblings instead of resuming
     /// them into an authority graph that has already moved forward.
-    pub(crate) fn enter_no_return(&mut self) {
+    pub fn enter_no_return(&mut self) {
         self.guard.enter_no_return();
     }
 
@@ -459,7 +459,7 @@ impl Kernel {
         Ok(context)
     }
 
-    pub(crate) fn commit_exec_transition(
+    pub fn commit_exec_transition(
         self: &Arc<Self>,
         mut prepared: PreparedExec,
         failpoint: Option<KernelFailpoint>,

@@ -18,6 +18,7 @@ pub(crate) use root::FileAuthorityRun;
 pub(crate) use transport::DirectFileAuthority;
 pub(crate) use transport::FileAuthorityTransport;
 pub(crate) use types::*;
+pub use types::{AuthorityFatal, FileAuthorityBinding};
 
 #[cfg(test)]
 mod tests;

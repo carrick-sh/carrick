@@ -94,6 +94,36 @@ def apply_renames(rows, renames):
     return changed
 
 
+def apply_dispatch_lock_renames(rows, renames):
+    """Rewrite `file` on dispatch-lock rows AND the path prefix inside `id`.
+
+    A dispatch-lock row's identity is `f"{file}::{item}::{category}#{ordinal}"`,
+    so the generic `apply_renames` (which only touches `PATH_KEYS`) leaves the
+    `id` pointing at the old path. The reconciler then finds no id match, falls
+    into the rehome matcher, and keys on `(item, category, expression,
+    ordinal)` -- which is 1:N the moment two files hold a same-named item (it
+    is: `SyntheticProcContext::synthetic_proc_context_observed` exists in both
+    `dispatch/fs.rs` and `dispatch/mod.rs`). Rebinding the id prefix here keeps
+    the move a 1:1 id match, which is the whole point of `--rename`.
+    """
+    pairs = [r.split("=", 1) for r in renames]
+    changed = 0
+    for row in rows:
+        old_file = row.get("file")
+        if not isinstance(old_file, str):
+            continue
+        for old, new in pairs:
+            if old_file.startswith(old):
+                new_file = new + old_file[len(old) :]
+                row["file"] = new_file
+                row_id = row.get("id")
+                if isinstance(row_id, str) and row_id.startswith(old_file + "::"):
+                    row["id"] = new_file + row_id[len(old_file) :]
+                changed += 1
+                break
+    return changed
+
+
 def collect_scan_targets(rows):
     """`rows` plus any nested `source` sub-object each row carries.
 
@@ -421,7 +451,7 @@ def reconcile_dispatch_locks(
 
     fresh_rows = rows(fresh)
     inventory_rows = rows(inventory)
-    apply_renames(collect_scan_targets(inventory_rows), renames or [])
+    apply_dispatch_lock_renames(inventory_rows, renames or [])
 
     fresh_by_id = {r["id"]: r for r in fresh_rows}
     inventory_ids = {r["id"] for r in inventory_rows}

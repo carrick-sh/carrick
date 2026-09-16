@@ -71,6 +71,7 @@ debug-all = [
 
 [dependencies]
 carrick-runtime = { path = "../carrick-runtime", default-features = false }
+carrick-kernel = { path = "../carrick-kernel" }
 carrick-vfs = { path = "../carrick-vfs" }
 carrick-fatal.workspace = true
 dhat = { version = "0.3", optional = true }

@@ -97,7 +97,7 @@ fn fd_is_random_device(this: &FsView<'_>, fd: i32) -> bool {
 /// One Linux-visible interface with an IPv4 address. Flags and MTU stay in
 /// their Linux model domain; translating them through host constants would
 /// discard namespace state and can contradict rtnetlink and sysfs.
-pub(crate) struct HostInet4Iface {
+pub struct HostInet4Iface {
     pub(crate) name: String,
     pub(crate) flags_linux: u16,
     pub(crate) mtu: i32,

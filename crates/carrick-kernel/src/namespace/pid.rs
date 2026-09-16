@@ -85,7 +85,7 @@ pub struct NsSharedRegion {
 }
 
 #[derive(Debug)]
-pub(crate) struct PreparedNamespaceIdentity {
+pub struct PreparedNamespaceIdentity {
     region: Arc<NsSharedRegion>,
     internal_id: u32,
     visible_id: u32,
@@ -94,7 +94,7 @@ pub(crate) struct PreparedNamespaceIdentity {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PreparedNamespaceIdentityView {
+pub struct PreparedNamespaceIdentityView {
     internal_id: u32,
     visible_id: u32,
     active: Weak<AtomicBool>,
@@ -325,7 +325,7 @@ impl NsSharedRegion {
     /// reaped task's `Container` handle may outlive the teardown by a beat).
     /// `true` if this call released the slot; `false` if it was already
     /// released. Consumed by `carrier::retire_container` (Task 23).
-    pub(crate) fn retire(self: Arc<Self>) -> bool {
+    pub fn retire(self: Arc<Self>) -> bool {
         self.release_slot()
     }
 
@@ -804,10 +804,7 @@ pub fn host_to_ns_or_self_for(context: &crate::kernel::KernelContext, host_pid: 
 /// Translate one carrier-global kernel identity through the exact caller's
 /// container PID namespace. A missing member stays invisible rather than
 /// falling back to a raw ID that may name another container's task.
-pub(crate) fn kernel_to_ns_for(
-    context: &crate::kernel::KernelContext,
-    internal_id: u32,
-) -> Option<u32> {
+pub fn kernel_to_ns_for(context: &crate::kernel::KernelContext, internal_id: u32) -> Option<u32> {
     match region_for(context) {
         Some(region) => region.host_to_ns(internal_id),
         None => Some(internal_id),
@@ -825,7 +822,7 @@ pub(crate) fn kernel_to_ns_for(
 /// Every task and secondary thread owns an exact namespace identity. A missing
 /// mapping is an invariant failure; returning zero would publish a TID Linux
 /// can never assign and could be mistaken for a successful fast-path stamp.
-pub(crate) fn ns_visible_guest_tid(context: &crate::kernel::KernelContext) -> Option<u32> {
+pub fn ns_visible_guest_tid(context: &crate::kernel::KernelContext) -> Option<u32> {
     u32::try_from(context.thread().key().tid.raw())
         .ok()
         .and_then(|tid| kernel_to_ns_for(context, tid))
@@ -910,10 +907,7 @@ pub fn ns_self_pid_for(context: &crate::kernel::KernelContext, host_pid: u32) ->
     })
 }
 
-pub(crate) fn try_ns_self_pid_for(
-    context: &crate::kernel::KernelContext,
-    host_pid: u32,
-) -> Option<u32> {
+pub fn try_ns_self_pid_for(context: &crate::kernel::KernelContext, host_pid: u32) -> Option<u32> {
     if let Some(pid) = context.provisional_namespace_pid_for(host_pid) {
         return Some(pid);
     }

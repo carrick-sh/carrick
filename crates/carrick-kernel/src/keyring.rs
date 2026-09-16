@@ -64,7 +64,7 @@ use parking_lot::Mutex;
 /// The key types carrick implements. Anything else is genuinely absent and
 /// `add_key(2)` answers `ENODEV`, exactly as a kernel without that type does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum KeyKind {
+pub enum KeyKind {
     /// `keyring`: holds links to other keys, carries no payload of its own.
     Keyring,
     /// `user`: an opaque blob the owner can read back and update.
@@ -171,7 +171,7 @@ impl Key {
 /// `KEYCTL_JOIN_SESSION_KEYRING` between two calls must be visible to the
 /// second one.
 #[derive(Clone, Debug)]
-pub(crate) struct KeyringCaller {
+pub struct KeyringCaller {
     pub(crate) uid: NsUid,
     pub(crate) gid: NsGid,
     /// Thread, process and session keyrings, in Linux's search order. Absent
@@ -222,7 +222,7 @@ impl Default for KeyStore {
 /// What `KEYCTL_READ` produced: the bytes to copy out, which the caller
 /// truncates to the guest buffer, and whose FULL length is the return value.
 #[derive(Debug)]
-pub(crate) struct KeyReadOutput(pub(crate) Vec<u8>);
+pub struct KeyReadOutput(pub(crate) Vec<u8>);
 
 impl KeyringService {
     pub fn new() -> Self {

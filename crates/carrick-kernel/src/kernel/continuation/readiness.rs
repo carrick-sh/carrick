@@ -149,8 +149,8 @@ impl std::fmt::Debug for ReservedSignal {
 }
 
 impl ReservedSignal {
-    #[cfg(test)]
-    pub(crate) fn kernel(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn kernel(
         authority: crate::kernel::objects::SignalAuthority,
         dequeued: crate::kernel::objects::SignalDequeue,
         action_generation: u64,
@@ -175,7 +175,7 @@ impl ReservedSignal {
         }))
     }
 
-    pub(crate) fn from_kernel_reservation(
+    pub fn from_kernel_reservation(
         authority: crate::kernel::objects::SignalAuthority,
         reservation: crate::kernel::objects::SignalWaitReservation,
     ) -> Self {
@@ -246,12 +246,12 @@ impl ReservedSignal {
         }
     }
 
-    pub(crate) fn restore_persistent_after_default_action(&self) {
+    pub fn restore_persistent_after_default_action(&self) {
         self.0.authority.set_blocked(self.0.persistent_restore);
         self.0.authority.arm_restore_mask(None);
     }
 
-    pub(crate) fn job_control_generation(
+    pub fn job_control_generation(
         &self,
     ) -> Option<crate::kernel::objects::JobControlStopInvalidationGeneration> {
         self.0.job_control_generation
@@ -323,7 +323,7 @@ impl ContinuationWakeToken {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum ReadinessProbe {
+pub enum ReadinessProbe {
     Futex {
         table: FutexSource,
         wait: FutexWait,
@@ -388,7 +388,7 @@ pub(crate) enum ReadinessProbe {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SignalReadinessProbe {
+pub struct SignalReadinessProbe {
     pub(crate) kernel: Weak<Kernel>,
     pub(crate) host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
     pub(crate) task_ref: Weak<Task>,
@@ -403,7 +403,7 @@ pub(crate) struct SignalReadinessProbe {
 }
 
 impl SignalReadinessProbe {
-    pub(crate) fn from_continuation(continuation: &BlockedContinuation) -> Self {
+    pub fn from_continuation(continuation: &BlockedContinuation) -> Self {
         let state = continuation.state();
         let (wait_set, signal_wait_block) = match state.detail {
             ContinuationDetail::Signals {
@@ -451,7 +451,7 @@ impl SignalReadinessProbe {
 
     /// Sample authoritative signal state without assuming that a producer
     /// edge occurred. This is safe to call during continuation enrollment.
-    pub(crate) fn event(&self) -> Option<ContinuationEvent> {
+    pub fn event(&self) -> Option<ContinuationEvent> {
         let kernel = self.kernel.upgrade()?;
         let context = kernel.context(self.task.id, self.thread.tid).ok()?;
         if context.task().key() != self.task || context.thread().key() != self.thread {

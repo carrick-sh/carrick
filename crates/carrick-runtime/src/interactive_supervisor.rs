@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use carrick_fatal::carrick_fatal;
 
-use crate::dispatch::SyscallDispatcher;
-use crate::pty_relay::{PtyPair, PtyRelay};
+use carrick_kernel::dispatch::SyscallDispatcher;
+use carrick_kernel::pty_relay::{PtyPair, PtyRelay};
 
 /// Run-lifetime carrier-local PTY guard. It restores the carrier's original
 /// stdio before stopping the relay, including unwinding/error paths.
@@ -32,7 +32,7 @@ impl std::fmt::Debug for InteractiveSession {
 impl InteractiveSession {
     pub fn start(dispatcher: &mut SyscallDispatcher) -> io::Result<Self> {
         let admission = InteractiveSessionAdmission::acquire()?;
-        crate::kernel::tty::prepare();
+        carrick_kernel::kernel::tty::prepare();
         let mut setup = SessionSetupGuard {
             admission: Some(admission),
             saved_stdio: [-1; 3],
@@ -60,7 +60,7 @@ impl InteractiveSession {
                 return Err(io::Error::last_os_error());
             }
         }
-        dispatcher.set_stdio_sink(crate::dispatch::StdioSink::Inherit);
+        dispatcher.set_stdio_sink(carrick_kernel::dispatch::StdioSink::Inherit);
         dispatcher.register_controlling_pty(slave_name);
         setup.committed = true;
         Ok(Self {

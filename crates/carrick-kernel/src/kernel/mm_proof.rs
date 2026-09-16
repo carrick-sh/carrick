@@ -13,7 +13,7 @@ use std::sync::Arc;
 /// an internally consistent transport-owned tuple has the wrong `TypeId` and
 /// cannot authorize `CowBroken`.
 #[derive(Clone, Debug)]
-pub(crate) struct KernelForeignCowProof {
+pub struct KernelForeignCowProof {
     kernel: Arc<crate::kernel::Kernel>,
     mm: crate::kernel::MmId,
     semantic_start: carrick_guest_mem::GuestVa,
@@ -28,7 +28,7 @@ pub(crate) struct KernelForeignCowProof {
 
 impl KernelForeignCowProof {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         kernel: Arc<crate::kernel::Kernel>,
         mm: crate::kernel::MmId,
         semantic_start: carrick_guest_mem::GuestVa,
@@ -55,7 +55,7 @@ impl KernelForeignCowProof {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn authenticates(
+    pub fn authenticates(
         &self,
         kernel: &Arc<crate::kernel::Kernel>,
         mm: crate::kernel::MmId,

@@ -388,7 +388,7 @@ pub enum StdioMode {
 /// entrypoint runs; syscalls the profile lists fail with a configured errno
 /// (EPERM) without ever reaching a kernel handler. carrick models that as a
 /// launch-time deny table consulted at the dispatch-entry seam (see
-/// `carrick_runtime::container_policy`) — never by editing individual syscall
+/// `carrick_kernel::container_policy`) — never by editing individual syscall
 /// handlers to fabricate policy-shaped errnos (recorded maintainer ruling,
 /// 2026-07-10). `ContainerDefault` is the serde default so a persisted
 /// container spec is docker-shaped; bare-ELF drivers (`run-elf`,

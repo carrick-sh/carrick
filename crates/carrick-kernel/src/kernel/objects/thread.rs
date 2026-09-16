@@ -280,7 +280,7 @@ impl ExecutorId {
         self.0
     }
 
-    pub(crate) const fn raw_for_probe(self) -> u32 {
+    pub const fn raw_for_probe(self) -> u32 {
         self.0
     }
 
@@ -296,7 +296,7 @@ impl ExecutorId {
         Ok(Self(raw))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn synthetic_for_tests(raw: u32) -> Self {
         Self(raw)
     }
@@ -469,7 +469,7 @@ pub enum ThreadExecutionError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ThreadSchedulerAction {
+pub enum ThreadSchedulerAction {
     Queue {
         key: ThreadKey,
         predecessor: Option<ExecutionGeneration>,
@@ -507,8 +507,8 @@ struct ThreadExecutionRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SchedulerControlQuantum {
-    pub(crate) blocked_reason: Option<BlockedReason>,
+pub struct SchedulerControlQuantum {
+    pub blocked_reason: Option<BlockedReason>,
     requeue_pending: bool,
 }
 
@@ -590,7 +590,7 @@ impl ThreadExecutionLease {
     /// Continuations must derive MM and ASID generations from this non-cloneable
     /// lease, not from a caller-supplied context or from the accidental numeric
     /// equality some backends currently use for their initial ASID.
-    pub(crate) fn task_state_authority(&self) -> Result<(MmId, u64), ThreadExecutionError> {
+    pub fn task_state_authority(&self) -> Result<(MmId, u64), ThreadExecutionError> {
         let state = self
             .task_state
             .as_ref()
@@ -723,10 +723,10 @@ impl Drop for ThreadExecutionLease {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CrashSafePointParticipationId(NonZeroU64);
+pub struct CrashSafePointParticipationId(NonZeroU64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub(crate) enum CrashSafePointParticipationError {
+pub enum CrashSafePointParticipationError {
     #[error("thread {thread:?} already participates in a crash safe point")]
     AlreadyActive { thread: ThreadKey },
     #[error("thread {thread:?} exhausted crash safe-point participation identities")]
@@ -740,7 +740,7 @@ enum CrashSafePointRelease {
     Superseded,
 }
 
-pub(crate) struct CrashSafePointParticipation {
+pub struct CrashSafePointParticipation {
     thread: Arc<Thread>,
     id: CrashSafePointParticipationId,
 }
@@ -874,17 +874,17 @@ fn guest_run_clock_ns() -> u64 {
 }
 
 #[derive(Debug)]
-pub(crate) struct OpenedStartGate {
+pub struct OpenedStartGate {
     thread: ThreadKey,
     generation: ExecutionGeneration,
 }
 
 impl OpenedStartGate {
-    pub(crate) const fn thread(&self) -> ThreadKey {
+    pub const fn thread(&self) -> ThreadKey {
         self.thread
     }
 
-    pub(crate) const fn generation(&self) -> ExecutionGeneration {
+    pub const fn generation(&self) -> ExecutionGeneration {
         self.generation
     }
 }
@@ -921,7 +921,7 @@ impl Thread {
         self.start_gate_open.store(true, Ordering::Release);
     }
 
-    pub(crate) fn take_opened_start_gate(
+    pub fn take_opened_start_gate(
         &self,
         generation: ExecutionGeneration,
     ) -> Option<OpenedStartGate> {
@@ -1278,7 +1278,7 @@ impl Thread {
         Ok(action)
     }
 
-    pub(crate) fn finish_scheduler_control_quantum(
+    pub fn finish_scheduler_control_quantum(
         &self,
         expected: ThreadKey,
     ) -> Result<SchedulerControlQuantum, ThreadExecutionError> {
@@ -1302,7 +1302,7 @@ impl Thread {
         Ok(quantum)
     }
 
-    pub(crate) fn scheduler_control_quantum(
+    pub fn scheduler_control_quantum(
         &self,
         expected: ThreadKey,
     ) -> Result<Option<SchedulerControlQuantum>, ThreadExecutionError> {
@@ -1315,7 +1315,7 @@ impl Thread {
         Ok(self.execution.lock().control_quantum)
     }
 
-    pub(crate) fn restore_scheduler_control_quantum(
+    pub fn restore_scheduler_control_quantum(
         &self,
         expected: ThreadKey,
         quantum: SchedulerControlQuantum,
@@ -1608,7 +1608,7 @@ impl Thread {
         self.settle_execution_lease(lease, ExecutionSettlement::Blocked(reason), true)
     }
 
-    pub(crate) fn scheduler_park_continuation_from_executor(
+    pub fn scheduler_park_continuation_from_executor(
         &self,
         lease: ThreadExecutionLease,
         reason: BlockedReason,
@@ -2121,7 +2121,7 @@ impl Thread {
     /// Answer `generation` with this thread's exact architectural state. Only
     /// the thread itself may call this, from a safe point where its register
     /// file is readable.
-    pub(crate) fn publish_crash_registers(
+    pub fn publish_crash_registers(
         &self,
         generation: CrashCaptureGeneration,
         registers: carrick_hal::Aarch64CoreRegisters,
@@ -2142,7 +2142,7 @@ impl Thread {
     /// collector that kept waiting for it would time out and publish no core
     /// at all. An already-published vote wins: publishing then parking must
     /// not retract the register file.
-    pub(crate) fn withdraw_from_crash_capture(&self, generation: CrashCaptureGeneration) {
+    pub fn withdraw_from_crash_capture(&self, generation: CrashCaptureGeneration) {
         let mut vote = self.crash_vote.lock();
         if matches!(vote.as_ref(), Some((published, _)) if *published == generation) {
             return;
@@ -2164,7 +2164,7 @@ impl Thread {
     }
 
     /// Stash exact architectural registers when parking/suspending.
-    pub(crate) fn stash_parked_registers(&self, registers: carrick_hal::Aarch64CoreRegisters) {
+    pub fn stash_parked_registers(&self, registers: carrick_hal::Aarch64CoreRegisters) {
         *self.parked_registers.lock() = Some(registers);
     }
 
@@ -2221,7 +2221,7 @@ impl Thread {
     }
 
     /// Can this thread still reach a crash safe point?
-    pub(crate) fn is_crash_safe_point_participant(&self) -> bool {
+    pub fn is_crash_safe_point_participant(&self) -> bool {
         self.crash_safe_point_participant.load(Ordering::Acquire) != 0
     }
 
@@ -2397,10 +2397,7 @@ impl Thread {
         self.revision.publish();
     }
 
-    pub(crate) fn update_signal_state<R>(
-        &self,
-        operation: impl FnOnce(&mut ThreadSignalState) -> R,
-    ) -> R {
+    pub fn update_signal_state<R>(&self, operation: impl FnOnce(&mut ThreadSignalState) -> R) -> R {
         let mut state = self.signal_state.lock();
         let result = operation(&mut state);
         self.publish_signal_state(&state);

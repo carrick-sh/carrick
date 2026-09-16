@@ -45,18 +45,18 @@ use parking_lot::{Condvar, Mutex};
 use carrick_hal::{PlatformFutex, SignalPumpControl, ThreadedEngine, VcpuRegistry};
 
 use crate::compat::CompatReporter;
-use crate::dispatch::mm_quiesce;
-use crate::dispatch::routing::{MutationDispatchRoute, OrdinaryDispatchRoute};
-use crate::dispatch::{
+use crate::linux_abi::LinuxErrno;
+use crate::memory::AddressSpace;
+use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
+use crate::trap::{SyscallTrap, TrapError};
+use carrick_kernel::dispatch::mm_quiesce;
+use carrick_kernel::dispatch::routing::{MutationDispatchRoute, OrdinaryDispatchRoute};
+use carrick_kernel::dispatch::{
     CurrentMmMemory, DispatchError, DispatchOutcome, PreparedDispatch, PreparedSyscall,
     SyscallCompletionToken, SyscallDispatcher, SyscallRequest, ThreadCtx,
 };
-use crate::kernel::CarrierProcess;
-use crate::linux_abi::LinuxErrno;
-use crate::memory::AddressSpace;
-use crate::run_result::{RunResult, RuntimeError};
-use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
-use crate::trap::{SyscallTrap, TrapError};
+use carrick_kernel::kernel::CarrierProcess;
+use carrick_kernel::run_result::{RunResult, RuntimeError};
 
 pub mod continuation;
 pub mod executor;
@@ -142,7 +142,7 @@ fn with_vmm_vdso_for_dispatcher<A: carrick_hal::GuestArch>(
     if requires_syscall_traps && A::linux_guest_abi() == carrick_abi::LinuxGuestAbi::X86_64 {
         return Ok(image.with_vdso_auxv(false));
     }
-    crate::vdso_policy::with_optional_vdso_for_clock_with_visibility::<A>(
+    carrick_kernel::vdso_policy::with_optional_vdso_for_clock_with_visibility::<A>(
         image,
         dispatcher.container().clock(),
         requires_syscall_traps,
@@ -234,7 +234,7 @@ mod macos_helper_stubs {
         // precedes validation here; a load failure below still aborts the exec.)
         dispatcher.fanotify_notify_exec(&named_target);
         let (path, argv) =
-            crate::exec_helpers::resolve_shebang(dispatcher, named_target.clone(), argv)?;
+            carrick_kernel::exec_helpers::resolve_shebang(dispatcher, named_target.clone(), argv)?;
         if path != named_target {
             dispatcher.fanotify_notify_exec(&path);
         }
@@ -359,7 +359,7 @@ mod macos_helper_stubs {
     // cross-platform `exec_helpers` module. Re-export them here under `pub(super)`
     // so the `use macos_helper_stubs::{…}` import at the bottom of this module
     // (line ~281) continues to resolve without change.
-    pub(super) use crate::exec_helpers::{
+    pub(super) use carrick_kernel::exec_helpers::{
         forked_child_die_by_signal, stop_after_traced_exec, stop_by_signal,
     };
 
@@ -485,7 +485,7 @@ pub(crate) struct KernelState {
     process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
     /// Issues crash-capture generations and broadcasts the one currently
     /// collecting. Sibling loops read it at their quiesce safe point.
-    crash_capture: Option<Arc<crate::kernel::CrashCaptureAuthority>>,
+    crash_capture: Option<Arc<carrick_kernel::kernel::CrashCaptureAuthority>>,
     /// Cross-layer thread-clone admission spans Kernel reservation through
     /// runtime registration, handle visibility, and child start.
     clone_admission: Arc<CloneAdmissionGate>,
@@ -504,8 +504,8 @@ pub(crate) struct KernelState {
     /// after logical publication, never from a persistent executor worker.
     process_physical_retirement: ProcessPhysicalRetirement,
     fatal_signal: FatalSignalAuthority,
-    control_exec: Mutex<Option<crate::kernel::control::ExecRuntime>>,
-    external_exec: Mutex<Option<crate::kernel::control::ExecWork>>,
+    control_exec: Mutex<Option<carrick_kernel::kernel::control::ExecRuntime>>,
+    external_exec: Mutex<Option<carrick_kernel::kernel::control::ExecWork>>,
 }
 
 impl KernelState {
@@ -520,7 +520,7 @@ impl KernelState {
         let process_fork_barrier = hvpatch_process.as_ref().map(|_| dispatcher.fork_quiesce());
         let crash_capture = hvpatch_process
             .as_ref()
-            .map(|_| Arc::new(crate::kernel::CrashCaptureAuthority::default()));
+            .map(|_| Arc::new(carrick_kernel::kernel::CrashCaptureAuthority::default()));
         let hvpatch_runtime = hvpatch_process.as_ref().map(|_| {
             inherited_hvpatch_runtime
                 .unwrap_or_else(|| Arc::new(HvpatchRuntimeDirectory::default()))
@@ -556,7 +556,7 @@ impl KernelState {
 
     pub(crate) fn install_control_exec_runtime(
         &self,
-        runtime: crate::kernel::control::ExecRuntime,
+        runtime: carrick_kernel::kernel::control::ExecRuntime,
     ) -> Result<(), RuntimeError> {
         let mut installed = self.control_exec.lock();
         if installed.is_some() {
@@ -570,8 +570,8 @@ impl KernelState {
 
     pub(crate) fn install_control_exec_waker(
         &self,
-        runtime: &crate::kernel::control::ExecRuntime,
-        linux_tid: crate::kernel::LinuxTid,
+        runtime: &carrick_kernel::kernel::control::ExecRuntime,
+        linux_tid: carrick_kernel::kernel::LinuxTid,
     ) -> Result<(), RuntimeError> {
         let process = self.hvpatch_process.as_ref().ok_or_else(|| {
             RuntimeError::Configuration(
@@ -604,13 +604,13 @@ impl KernelState {
             })
     }
 
-    fn try_take_control_exec(&self) -> Option<crate::kernel::control::ExecWork> {
+    fn try_take_control_exec(&self) -> Option<carrick_kernel::kernel::control::ExecWork> {
         self.control_exec.lock().as_ref()?.try_take()
     }
 
     fn install_external_exec_work(
         &self,
-        work: crate::kernel::control::ExecWork,
+        work: carrick_kernel::kernel::control::ExecWork,
     ) -> Result<(), RuntimeError> {
         let mut installed = self.external_exec.lock();
         if installed.is_some() {
@@ -622,11 +622,14 @@ impl KernelState {
         Ok(())
     }
 
-    fn take_external_exec_work(&self) -> Option<crate::kernel::control::ExecWork> {
+    fn take_external_exec_work(&self) -> Option<carrick_kernel::kernel::control::ExecWork> {
         self.external_exec.lock().take()
     }
 
-    fn admit_external_exec(&self, task: crate::kernel::TaskKey) -> Result<(), RuntimeError> {
+    fn admit_external_exec(
+        &self,
+        task: carrick_kernel::kernel::TaskKey,
+    ) -> Result<(), RuntimeError> {
         let mut external = self.external_exec.lock();
         let Some(work) = external.as_mut() else {
             return Ok(());
@@ -656,7 +659,7 @@ impl KernelState {
             return;
         };
         let binding = process.task_binding();
-        let leader = crate::kernel::LinuxTid::for_task_leader(binding.task_id());
+        let leader = carrick_kernel::kernel::LinuxTid::for_task_leader(binding.task_id());
         let signal_context = binding.capture(leader).unwrap_or_else(|error| {
             tracing::error!(%error, "cannot retain HVPatch runtime endpoint context");
             carrick_fatal!(
@@ -719,7 +722,7 @@ impl KernelState {
             .map(|_| ())
     }
 
-    fn notify_hvpatch_parent_exit(&self, parent: Option<crate::kernel::TaskKey>) {
+    fn notify_hvpatch_parent_exit(&self, parent: Option<carrick_kernel::kernel::TaskKey>) {
         match (parent, self.hvpatch_runtime.as_ref()) {
             (Some(parent), Some(directory)) => {
                 directory.notify_child_exit(parent, self.child_exit_signal);
@@ -807,7 +810,7 @@ fn thread_should_finish_for_exec_replacement(registry: &ThreadRegistry, tid: Thr
 
 fn trace_hvpatch_thread_teardown(kernel: &Kernel, tid: ThreadId, phase: i32) {
     if let Some(process) = kernel.hvpatch_process.as_ref() {
-        crate::event_ring::rec_hvpatch_thread_teardown(process.pid(), tid.raw(), phase);
+        carrick_kernel::event_ring::rec_hvpatch_thread_teardown(process.pid(), tid.raw(), phase);
     }
 }
 
@@ -878,11 +881,11 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     pub(super) platform_futex_factory: PlatformFutexFactory,
     /// `Some` only for a process multiplexed in the shared HvPatch VM.
     pub(super) process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
-    pub(super) crash_capture: Option<Arc<crate::kernel::CrashCaptureAuthority>>,
+    pub(super) crash_capture: Option<Arc<carrick_kernel::kernel::CrashCaptureAuthority>>,
     #[cfg(test)]
     pub(super) crash_lease_drain_budget: CrashLeaseDrainBudget,
-    pub(super) kernel_thread: Option<crate::kernel::ThreadRef>,
-    pub(super) guest_execution: Option<crate::dispatch::MmExecutorParticipation>,
+    pub(super) kernel_thread: Option<carrick_kernel::kernel::ThreadRef>,
+    pub(super) guest_execution: Option<carrick_kernel::dispatch::MmExecutorParticipation>,
     /// Exact Task 1 execution authority while this logical thread is running.
     /// Empty only before its first reclaim snapshot and while blocked.
     pub(super) execution_lease: ExecutionLeaseCell,
@@ -892,20 +895,20 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     pub(super) hvpatch_task_pid: Option<i32>,
     /// Guest-visible identity allocated in the kernel namespace. It is never
     /// inferred from the backend-local thread registry key.
-    pub(super) linux_tid: crate::kernel::LinuxTid,
+    pub(super) linux_tid: carrick_kernel::kernel::LinuxTid,
     /// Image generation that owns fatal-signal publication for this loop. It
     /// changes only after a successful exec has crossed every fallible edge.
     pub(super) fatal_image_generation: u64,
     /// Exact authority captured at the current syscall boundary. Lifecycle
     /// outcomes consume it rather than recapturing a newer registry generation.
-    pub(super) service_kernel_context: Option<crate::kernel::KernelContext>,
+    pub(super) service_kernel_context: Option<carrick_kernel::kernel::KernelContext>,
     #[cfg(test)]
     pub(in crate::vcpu_loop) exec_terminal_context_failpoint:
         Option<exec::ExecTerminalContextFailpoint>,
     #[cfg(test)]
-    pub(super) committed_exec_context_for_test: Option<crate::kernel::KernelContext>,
+    pub(super) committed_exec_context_for_test: Option<carrick_kernel::kernel::KernelContext>,
     pub(super) syscall_completion: SyscallCompletionOwnership,
-    pub(super) continuation_restart: Option<crate::kernel::continuation::RestartDecision>,
+    pub(super) continuation_restart: Option<carrick_kernel::kernel::continuation::RestartDecision>,
     /// Consecutive identical (FAR, ESR) COW faults "successfully" resolved.
     /// A resolution that does not change the faulting translation refaults
     /// forever inside one quantum, starving this executor's command channel
@@ -913,7 +916,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// live on `futexforkrequeue` (core: ffr-livelock-76407). Fail closed
     /// with a named clause instead of spinning.
     pub(super) cow_refault_watch: Option<(u64, u64, Option<u64>, u32)>,
-    pub(super) reserved_signal: Option<crate::kernel::continuation::ReservedSignal>,
+    pub(super) reserved_signal: Option<carrick_kernel::kernel::continuation::ReservedSignal>,
     pub(super) this_tid: ThreadId,
     pub(super) threads: VcpuThreadRegistry,
     /// The object-safe vCPU registry (the kicker). The shared loop never names
@@ -940,7 +943,8 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// Live reservation-change subscription while a thread exit is parked
     /// on `PersistentThreadExitDisposition::Busy`; dropped when the retry
     /// runs.
-    pub(super) thread_exit_retry_subscription: Option<crate::kernel::ReservationChangeSubscription>,
+    pub(super) thread_exit_retry_subscription:
+        Option<carrick_kernel::kernel::ReservationChangeSubscription>,
     /// The engine is passed as `&mut E` to each method, so no field owns it; this
     /// pins the generic parameter to the struct.
     pub(super) _engine: std::marker::PhantomData<fn() -> E>,
@@ -957,10 +961,10 @@ where
         platform_futex: Arc<dyn PlatformFutex>,
         platform_futex_factory: PlatformFutexFactory,
         process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
-        crash_capture: Option<Arc<crate::kernel::CrashCaptureAuthority>>,
-        kernel_thread: Option<crate::kernel::ThreadRef>,
+        crash_capture: Option<Arc<carrick_kernel::kernel::CrashCaptureAuthority>>,
+        kernel_thread: Option<carrick_kernel::kernel::ThreadRef>,
         hvpatch_task_pid: Option<i32>,
-        linux_tid: crate::kernel::LinuxTid,
+        linux_tid: carrick_kernel::kernel::LinuxTid,
         fatal_image_generation: u64,
         this_tid: ThreadId,
         threads: impl Into<VcpuThreadRegistry>,
@@ -1030,11 +1034,11 @@ where
 
     /// Publish this runtime thread's process-visible state without confusing
     /// HVPatch's shared Darwin pid for the Linux task id.
-    fn publish_process_run_state(&self, state: crate::run_state::RunState) {
+    fn publish_process_run_state(&self, state: carrick_kernel::run_state::RunState) {
         if let Some(task_pid) = self.hvpatch_task_pid {
-            crate::run_state::publish_task_thread(task_pid, self.linux_tid.raw(), state);
+            carrick_kernel::run_state::publish_task_thread(task_pid, self.linux_tid.raw(), state);
         } else {
-            crate::run_state::publish(state);
+            carrick_kernel::run_state::publish(state);
         }
     }
 
@@ -1101,14 +1105,14 @@ where
         Ok(())
     }
 
-    fn publish_thread_run_state(&self, state: crate::run_state::RunState, stat: char) {
+    fn publish_thread_run_state(&self, state: carrick_kernel::run_state::RunState, stat: char) {
         self.publish_process_run_state(state);
         // This hot path already owns the exact per-process registry. Using it
         // directly avoids a carrier endpoint-directory lock on every
         // block/wake transition.
         self.registry.set_thread_state(self.this_tid, stat);
         if self.hvpatch_task_pid.is_none() {
-            crate::run_state::publish_guest_tid(self.this_tid.raw(), state);
+            carrick_kernel::run_state::publish_guest_tid(self.this_tid.raw(), state);
         }
     }
 
@@ -1177,10 +1181,10 @@ where
     fn prepare_hvpatch_continuation(
         &self,
         kernel: &Kernel,
-        lease: &crate::kernel::objects::ThreadExecutionLease,
+        lease: &carrick_kernel::kernel::objects::ThreadExecutionLease,
         request: SyscallRequest,
         input: HvpatchContinuationInput,
-    ) -> Result<crate::kernel::continuation::BlockedContinuation, RuntimeError> {
+    ) -> Result<carrick_kernel::kernel::continuation::BlockedContinuation, RuntimeError> {
         let directory = kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
             RuntimeError::Configuration(
                 "HVPatch blocking continuation has no shared runtime directory".to_owned(),
@@ -1193,25 +1197,25 @@ where
         })?;
         let (_scheduler, _service) = directory.continuation_services(context.kernel());
 
-        let capture = crate::kernel::continuation::ContinuationCapture::from_lease(
+        let capture = carrick_kernel::kernel::continuation::ContinuationCapture::from_lease(
             context,
             lease,
             request,
             if is_restartable_syscall(request.number.raw()) {
-                crate::kernel::continuation::RestartClass::RestartSyscall
+                carrick_kernel::kernel::continuation::RestartClass::RestartSyscall
             } else {
-                crate::kernel::continuation::RestartClass::Never
+                carrick_kernel::kernel::continuation::RestartClass::Never
             },
         )
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let mut continuation = match input {
             HvpatchContinuationInput::Dispatch(outcome) => {
-                crate::kernel::continuation::BlockedContinuation::from_dispatch_outcome(
+                carrick_kernel::kernel::continuation::BlockedContinuation::from_dispatch_outcome(
                     outcome, capture,
                 )
             }
             HvpatchContinuationInput::Vfork { child, wait } => {
-                crate::kernel::continuation::BlockedContinuation::from_vfork_parent(
+                carrick_kernel::kernel::continuation::BlockedContinuation::from_vfork_parent(
                     capture, child, wait,
                 )
             }
@@ -1225,7 +1229,7 @@ where
     pub(super) fn persistent_block_exit(
         &self,
         kernel: &Kernel,
-        lease: &crate::kernel::objects::ThreadExecutionLease,
+        lease: &carrick_kernel::kernel::objects::ThreadExecutionLease,
         request: SyscallRequest,
         input: HvpatchBlockInput,
     ) -> Result<executor::ExecutorExit, RuntimeError> {
@@ -1254,7 +1258,7 @@ where
         if let Some(pid) = self.hvpatch_task_pid
             && pid == self.linux_tid.raw()
         {
-            crate::event_ring::rec_hvpatch_blocked_continuation(
+            carrick_kernel::event_ring::rec_hvpatch_blocked_continuation(
                 pid,
                 self.linux_tid.raw(),
                 native_syscall_number,
@@ -1272,7 +1276,7 @@ where
         &mut self,
         kernel: &Kernel,
         engine: &mut E,
-        lease: &mut crate::kernel::objects::ThreadExecutionLease,
+        lease: &mut carrick_kernel::kernel::objects::ThreadExecutionLease,
     ) -> Result<Option<DispatchOutcome>, RuntimeError> {
         let event = lease
             .blocked_continuation()
@@ -1295,9 +1299,11 @@ where
             .capture(self.linux_tid)
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let mut result =
-            match crate::kernel::continuation::resume_continuation(lease, event, &fresh) {
+            match carrick_kernel::kernel::continuation::resume_continuation(lease, event, &fresh) {
                 Ok(result) => result,
-                Err(crate::kernel::continuation::ContinuationResumeError::StaleFileSlot) => {
+                Err(
+                    carrick_kernel::kernel::continuation::ContinuationResumeError::StaleFileSlot,
+                ) => {
                     return Ok(Some(DispatchOutcome::Errno {
                         errno: crate::linux_abi::LINUX_EBADF,
                     }));
@@ -1319,13 +1325,15 @@ where
         // all-true SA_RESTART predicates, surfacing EINTR to a guest whose
         // handler asked for restart (waitrestart scenario A).
         self.continuation_restart = match result.completion {
-            crate::kernel::continuation::ContinuationCompletion::Redispatch
-            | crate::kernel::continuation::ContinuationCompletion::RedispatchWithPartial(_) => None,
+            carrick_kernel::kernel::continuation::ContinuationCompletion::Redispatch
+            | carrick_kernel::kernel::continuation::ContinuationCompletion::RedispatchWithPartial(
+                _,
+            ) => None,
             _ => Some(result.restart()),
         };
         self.reserved_signal = result.take_reserved_signal();
 
-        use crate::kernel::continuation::ContinuationCompletion as Completion;
+        use carrick_kernel::kernel::continuation::ContinuationCompletion as Completion;
         Ok(match result.completion {
             Completion::Return(value) => Some(DispatchOutcome::Returned { value }),
             Completion::Errno(errno) => Some(DispatchOutcome::Errno { errno }),
@@ -1349,10 +1357,10 @@ where
             }
             Completion::BlockingWrite { write, outcome } => {
                 let outcome = match outcome {
-                    crate::kernel::continuation::BlockingWriteOutcome::Return(value) => {
+                    carrick_kernel::kernel::continuation::BlockingWriteOutcome::Return(value) => {
                         DispatchOutcome::Returned { value }
                     }
-                    crate::kernel::continuation::BlockingWriteOutcome::Errno(errno) => {
+                    carrick_kernel::kernel::continuation::BlockingWriteOutcome::Errno(errno) => {
                         DispatchOutcome::Errno { errno }
                     }
                 };
@@ -1364,37 +1372,42 @@ where
                 ))
             }
             Completion::TimerFdRead(read) => match read.complete(engine) {
-                crate::dispatch::format_time::TimerFdReadStep::Done(outcome) => Some(outcome),
-                crate::dispatch::format_time::TimerFdReadStep::Wait(read) => {
+                carrick_kernel::dispatch::format_time::TimerFdReadStep::Done(outcome) => {
+                    Some(outcome)
+                }
+                carrick_kernel::dispatch::format_time::TimerFdReadStep::Wait(read) => {
                     Some(DispatchOutcome::BlockingTimerFdRead(read))
                 }
             },
             Completion::Semop(semop) => match semop.complete() {
-                crate::dispatch::BlockingSemopStep::Done(outcome) => Some(outcome),
-                crate::dispatch::BlockingSemopStep::Wait(semop) => {
+                carrick_kernel::dispatch::BlockingSemopStep::Done(outcome) => Some(outcome),
+                carrick_kernel::dispatch::BlockingSemopStep::Wait(semop) => {
                     Some(DispatchOutcome::BlockingSemop(semop))
                 }
             },
             Completion::Mqueue(mqueue) => {
                 match mqueue.complete(&kernel.dispatcher, context, engine) {
-                    crate::dispatch::BlockingMqueueStep::Done(outcome) => Some(outcome),
-                    crate::dispatch::BlockingMqueueStep::Wait(mqueue) => {
+                    carrick_kernel::dispatch::BlockingMqueueStep::Done(outcome) => Some(outcome),
+                    carrick_kernel::dispatch::BlockingMqueueStep::Wait(mqueue) => {
                         Some(DispatchOutcome::BlockingMqueue(mqueue))
                     }
                 }
             }
             Completion::FdWait { wait, sig_mask } => {
                 match wait.complete(engine, &kernel.dispatcher) {
-                    crate::dispatch::fd_wait::BlockingFdWaitStep::Done(outcome) => Some(outcome),
-                    crate::dispatch::fd_wait::BlockingFdWaitStep::Wait(wait) => {
+                    carrick_kernel::dispatch::fd_wait::BlockingFdWaitStep::Done(outcome) => {
+                        Some(outcome)
+                    }
+                    carrick_kernel::dispatch::fd_wait::BlockingFdWaitStep::Wait(wait) => {
                         Some(DispatchOutcome::BlockingFdWait { wait, sig_mask })
                     }
                 }
             }
             Completion::InterruptedSleep { remaining } => {
-                Some(crate::dispatch::complete_interrupted_sleep(
+                Some(carrick_kernel::dispatch::complete_interrupted_sleep(
                     engine,
-                    remaining.map(|(range, _)| crate::dispatch::GuestPtr(range.start().raw())),
+                    remaining
+                        .map(|(range, _)| carrick_kernel::dispatch::GuestPtr(range.start().raw())),
                     remaining.map_or(Duration::ZERO, |(_, duration)| duration),
                 ))
             }
@@ -1404,7 +1417,7 @@ where
     fn with_mm_mutation_authority<T>(
         &mut self,
         kernel: &Kernel,
-        run: impl FnOnce(&mut crate::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
+        run: impl FnOnce(&mut carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
     ) -> Result<T, RuntimeError> {
         let mut executor = self.guest_execution.take().ok_or_else(|| {
             RuntimeError::Configuration("MM mutation lacks executor participation".to_owned())
@@ -1417,8 +1430,8 @@ where
     fn with_mm_mutation_authority_for_executor<T>(
         &mut self,
         kernel: &Kernel,
-        executor: &mut crate::dispatch::MmExecutorParticipation,
-        run: impl FnOnce(&mut crate::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
+        executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
+        run: impl FnOnce(&mut carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
     ) -> Result<T, RuntimeError> {
         let context = kernel
             .dispatcher
@@ -1438,10 +1451,10 @@ where
         })?;
         let mut mutation = match &mut authority {
             mm_quiesce::MmStage1Authority::Sole(sole) => {
-                crate::dispatch::mm_mutation::from_sole_executor(sole, coordinator, mm)
+                carrick_kernel::dispatch::mm_mutation::from_sole_executor(sole, coordinator, mm)
             }
             mm_quiesce::MmStage1Authority::Paused(pause) => {
-                crate::dispatch::mm_mutation::from_pt_pause(pause)
+                carrick_kernel::dispatch::mm_mutation::from_pt_pause(pause)
             }
         };
         Ok(run(&mut mutation))
@@ -1469,7 +1482,7 @@ where
         kernel: &Kernel,
         engine: &mut E,
         frame: carrick_hal::RawSyscall,
-        mm_executor: &mut crate::dispatch::MmExecutorParticipation,
+        mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
     ) -> Result<DispatchOutcome, RuntimeError> {
         self.service_kernel_context = None;
         if !self.syscall_completion.is_idle() {
@@ -1533,7 +1546,7 @@ where
         kernel: &Kernel,
         engine: &mut E,
         syscall: PreparedSyscall,
-        mm_executor: &mut crate::dispatch::MmExecutorParticipation,
+        mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
     ) -> Result<DispatchOutcome, RuntimeError> {
         let kernel_context = self
             .service_kernel_context
@@ -1597,7 +1610,7 @@ where
         // that so it can reclaim the spare sub-tables an alias teardown empties
         // (`carrick_hal::stage1_exclusive` documents what leaks when it cannot).
         enum SyscallMmPhase<'executor> {
-            Ordinary(&'executor mut crate::dispatch::MmExecutorParticipation),
+            Ordinary(&'executor mut carrick_kernel::dispatch::MmExecutorParticipation),
             Mutation(mm_quiesce::MmStage1Authority<'executor>),
         }
 
@@ -1636,7 +1649,7 @@ where
             }
             let outcome =
                 dispatch_with_panic_backstop(request.number.raw(), self.this_tid, || {
-                    let lease_guard = if crate::dispatch::syscall_requires_execution_lease(
+                    let lease_guard = if carrick_kernel::dispatch::syscall_requires_execution_lease(
                         request.number.raw(),
                         request.args,
                     ) {
@@ -1645,7 +1658,7 @@ where
                         None
                     };
                     let lease = lease_guard.as_deref().and_then(|g| g.as_ref());
-                    if crate::dispatch::syscall_requires_mm_mutation(
+                    if carrick_kernel::dispatch::syscall_requires_mm_mutation(
                         request.number.raw(),
                         request.args,
                     ) {
@@ -1662,11 +1675,12 @@ where
                         };
                         match stage1_authority {
                             mm_quiesce::MmStage1Authority::Sole(authority) => {
-                                let mut mutation = crate::dispatch::mm_mutation::from_sole_executor(
-                                    authority,
-                                    coordinator,
-                                    kernel_context.shared().mm().id(),
-                                );
+                                let mut mutation =
+                                    carrick_kernel::dispatch::mm_mutation::from_sole_executor(
+                                        authority,
+                                        coordinator,
+                                        kernel_context.shared().mm().id(),
+                                    );
                                 kernel
                                     .dispatcher
                                     .dispatch_threaded_prepared_mutation_with_lease(
@@ -1683,7 +1697,7 @@ where
                             }
                             mm_quiesce::MmStage1Authority::Paused(authority) => {
                                 let mut mutation =
-                                    crate::dispatch::mm_mutation::from_pt_pause(authority);
+                                    carrick_kernel::dispatch::mm_mutation::from_pt_pause(authority);
                                 kernel
                                     .dispatcher
                                     .dispatch_threaded_prepared_mutation_with_lease(
@@ -1727,7 +1741,7 @@ where
                             )
                     }
                 })?;
-            if crate::kernel::continuation::is_blocking_dispatch_outcome(&outcome) {
+            if carrick_kernel::kernel::continuation::is_blocking_dispatch_outcome(&outcome) {
                 // The persistent executor converts this exact owned outcome into
                 // a continuation at its quantum boundary. This is the ONLY exit
                 // for a blocking outcome; the arm below only fails closed.
@@ -1764,184 +1778,194 @@ where
                 } if kernel.hvpatch_process.is_some() => {
                     let shared = backing.is_shared();
                     let coordinator = kernel.dispatcher.mm_mutation_coordinator();
-                    let install_alias = |permit: &crate::dispatch::mm_mutation::HostAliasPermit<
-                        '_,
-                    >| {
-                        let Some(install) = transaction.claim(permit) else {
-                            drop(backing);
-                            return Ok(DispatchOutcome::Returned {
-                                value: crate::linux_abi::LINUX_ENOMEM.guest_retval(),
-                            });
-                        };
+                    let install_alias =
+                        |permit: &carrick_kernel::dispatch::mm_mutation::HostAliasPermit<'_>| {
+                            let Some(install) = transaction.claim(permit) else {
+                                drop(backing);
+                                return Ok(DispatchOutcome::Returned {
+                                    value: crate::linux_abi::LINUX_ENOMEM.guest_retval(),
+                                });
+                            };
 
-                        // The dispatch transaction is exclusively claimed, but no
-                        // backend mutation has started. Allocate every ID and event
-                        // slot before arming the backend's topology-locked staging.
-                        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2)
-                            .map_err(crate::kernel::FrameInventoryReserveError::from)?;
-                        let reservation = kernel_context
-                            .kernel()
-                            .reserve_frame_inventory(1, 1, capacity)?;
-                        let inventory_transaction = reservation.transaction();
-                        let process = kernel.hvpatch_process.as_ref().ok_or_else(|| {
-                            RuntimeError::Configuration(
-                                "HVPatch alias inventory has no process context".to_owned(),
-                            )
-                        })?;
-                        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
-                            carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
-                            process.pid(),
-                            kernel_context.task().key().id.raw(),
-                        );
-                        if let Err(error) = engine.begin_alias_inventory(reservation) {
-                            let abandoned = kernel_context
+                            // The dispatch transaction is exclusively claimed, but no
+                            // backend mutation has started. Allocate every ID and event
+                            // slot before arming the backend's topology-locked staging.
+                            let capacity = carrick_hal::FrameEventCapacity::for_event_count(2)
+                                .map_err(
+                                    carrick_kernel::kernel::FrameInventoryReserveError::from,
+                                )?;
+                            let reservation = kernel_context
                                 .kernel()
-                                .frame_inventory()
-                                .abandon(inventory_transaction);
-                            debug_assert!(abandoned);
-                            return Err(error.into());
-                        }
-
-                        if let Err(error) = engine.map_host_alias(va, ipa, len, &payload, backing) {
-                            // A failed alias install is guest-argument-reachable
-                            // (an oversized/awkwardly-placed mmap can exhaust the
-                            // global frame IPA arena or fail hv_vm_map), so it must
-                            // lower to a guest errno, never abort the VM carrier —
-                            // one Linux process's bad mmap would otherwise kill
-                            // EVERY process multiplexed into this carrier.
-                            //
-                            // Stage-1/stage-2 unwind is the backend's own (RAII host
-                            // mappings and global-frame IPA leases); this arm rolls
-                            // back the two publications it armed itself: the
-                            // backend's alias staging — without which the NEXT guest
-                            // mmap fails as an "overlapping HVPatch alias inventory
-                            // transaction" — and the kernel's frame-inventory
-                            // transaction. `install` is dropped unclaimed, which
-                            // aborts the dispatcher's pending VMA commit and wakes
-                            // blocked sibling mapping syscalls.
-                            engine.abandon_alias_inventory();
-                            let abandoned = kernel_context
-                                .kernel()
-                                .frame_inventory()
-                                .abandon(inventory_transaction);
-                            debug_assert!(abandoned);
-                            drop(registry);
-                            drop(install);
-                            tracing::error!(
-                                va = format_args!("{:#x}", va.raw()),
-                                len = format_args!("{len:#x}"),
-                                shared,
-                                %error,
-                                "HVPatch alias install failed; guest mmap lowered to ENOMEM"
+                                .reserve_frame_inventory(1, 1, capacity)?;
+                            let inventory_transaction = reservation.transaction();
+                            let process = kernel.hvpatch_process.as_ref().ok_or_else(|| {
+                                RuntimeError::Configuration(
+                                    "HVPatch alias inventory has no process context".to_owned(),
+                                )
+                            })?;
+                            let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+                                carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
+                                process.pid(),
+                                kernel_context.task().key().id.raw(),
                             );
-                            return Ok(DispatchOutcome::Returned {
-                                value: crate::linux_abi::LINUX_ENOMEM.guest_retval(),
-                            });
-                        }
-                        use crate::kernel::debug::HvpatchAliasInstallSite as Site;
-                        let guest_pid = process.pid();
-                        let guest_tid = self.this_tid.raw();
-                        let refuse = |site: Site, error: String, frame| {
-                            refuse_alias_install(
-                                kernel,
-                                &kernel_context,
-                                RefuseAliasInstallSpec {
-                                    site,
-                                    guest_pid,
-                                    guest_tid,
-                                    va: va.raw(),
-                                    len,
-                                    prot,
-                                    shared,
-                                    prot_none,
-                                    error,
-                                    frame,
-                                },
-                            )
-                        };
-                        let Some(commit) = engine.take_alias_inventory() else {
-                            return Err(refuse(
-                                Site::InventoryCommitMissing,
-                                "backend staged no alias inventory commit".to_owned(),
-                                None,
-                            ));
-                        };
-                        // Publish to the kernel frame-inventory authority BEFORE
-                        // releasing the registry guard. Staging above made a fresh
-                        // shared-file frame visible to every later installer of the
-                        // same file through the backend's shared-frame registry
-                        // (`stage_mapping_in`: `frames.shared.entry(backing)`), and
-                        // a reuser's batch names that frame WITHOUT reserving it —
-                        // the authority accepts it only if the frame is already
-                        // live. Publishing after the release (d913972c2) let a
-                        // sibling stage its reuse and publish first, and its apply
-                        // was refused with `UnreservedFrame`: the silent rc=134
-                        // carrier abort of 2026-09-08 (go-build reducer, and the
-                        // MAP_SHARED two-process reducer 4/4). Holding the
-                        // guard across the apply makes publication order equal to
-                        // staging order, as the registry reuse relies on. Lock order
-                        // is unchanged: the authority mutex is a leaf
-                        // (`frame_inventory.rs` never calls out while holding it).
-                        let published = apply_alias_frame_inventory(&kernel_context, commit);
-                        drop(registry);
-                        if let Err(error) = published {
-                            return Err(refuse(
-                                Site::InventoryPublish,
-                                error.to_string(),
-                                error.frame(),
-                            ));
-                        }
+                            if let Err(error) = engine.begin_alias_inventory(reservation) {
+                                let abandoned = kernel_context
+                                    .kernel()
+                                    .frame_inventory()
+                                    .abandon(inventory_transaction);
+                                debug_assert!(abandoned);
+                                return Err(error.into());
+                            }
 
-                        let Ok(len_bytes) = usize::try_from(len) else {
-                            return Err(refuse(
-                                Site::LenOverflow,
-                                "range length does not fit usize".to_owned(),
-                                None,
-                            ));
-                        };
-                        if prot_none
-                            && let Err(error) = engine.protect_range(va.raw(), len_bytes, 0)
-                        {
-                            return Err(refuse(Site::ProtectNone, error.to_string(), None));
-                        }
-                        engine.set_mapping_protection_and_sharing(
-                            va.raw(),
-                            len_bytes,
-                            prot_none,
-                            !carrick_abi::LinuxProtFlags::from_bits_truncate(prot)
-                                .contains(carrick_abi::LinuxProtFlags::WRITE),
-                            if shared {
-                                carrick_guest_mem::MappingSharing::Shared
-                            } else {
-                                carrick_guest_mem::MappingSharing::Private
-                            },
-                        );
-                        if let Some((bus_start, bus_len)) = install.bus_fault_range() {
-                            let Ok(bus_len) = usize::try_from(bus_len) else {
+                            if let Err(error) =
+                                engine.map_host_alias(va, ipa, len, &payload, backing)
+                            {
+                                // A failed alias install is guest-argument-reachable
+                                // (an oversized/awkwardly-placed mmap can exhaust the
+                                // global frame IPA arena or fail hv_vm_map), so it must
+                                // lower to a guest errno, never abort the VM carrier —
+                                // one Linux process's bad mmap would otherwise kill
+                                // EVERY process multiplexed into this carrier.
+                                //
+                                // Stage-1/stage-2 unwind is the backend's own (RAII host
+                                // mappings and global-frame IPA leases); this arm rolls
+                                // back the two publications it armed itself: the
+                                // backend's alias staging — without which the NEXT guest
+                                // mmap fails as an "overlapping HVPatch alias inventory
+                                // transaction" — and the kernel's frame-inventory
+                                // transaction. `install` is dropped unclaimed, which
+                                // aborts the dispatcher's pending VMA commit and wakes
+                                // blocked sibling mapping syscalls.
+                                engine.abandon_alias_inventory();
+                                let abandoned = kernel_context
+                                    .kernel()
+                                    .frame_inventory()
+                                    .abandon(inventory_transaction);
+                                debug_assert!(abandoned);
+                                drop(registry);
+                                drop(install);
+                                tracing::error!(
+                                    va = format_args!("{:#x}", va.raw()),
+                                    len = format_args!("{len:#x}"),
+                                    shared,
+                                    %error,
+                                    "HVPatch alias install failed; guest mmap lowered to ENOMEM"
+                                );
+                                return Ok(DispatchOutcome::Returned {
+                                    value: crate::linux_abi::LINUX_ENOMEM.guest_retval(),
+                                });
+                            }
+                            use carrick_kernel::kernel::debug::HvpatchAliasInstallSite as Site;
+                            let guest_pid = process.pid();
+                            let guest_tid = self.this_tid.raw();
+                            let refuse = |site: Site, error: String, frame| {
+                                refuse_alias_install(
+                                    kernel,
+                                    &kernel_context,
+                                    RefuseAliasInstallSpec {
+                                        site,
+                                        guest_pid,
+                                        guest_tid,
+                                        va: va.raw(),
+                                        len,
+                                        prot,
+                                        shared,
+                                        prot_none,
+                                        error,
+                                        frame,
+                                    },
+                                )
+                            };
+                            let Some(commit) = engine.take_alias_inventory() else {
                                 return Err(refuse(
-                                    Site::BusFaultLenOverflow,
-                                    format!(
-                                        "bus-fault tail length {bus_len:#x} does not fit usize"
-                                    ),
+                                    Site::InventoryCommitMissing,
+                                    "backend staged no alias inventory commit".to_owned(),
                                     None,
                                 ));
                             };
-                            if let Err(error) = engine.protect_range(bus_start, bus_len, 0) {
+                            // Publish to the kernel frame-inventory authority BEFORE
+                            // releasing the registry guard. Staging above made a fresh
+                            // shared-file frame visible to every later installer of the
+                            // same file through the backend's shared-frame registry
+                            // (`stage_mapping_in`: `frames.shared.entry(backing)`), and
+                            // a reuser's batch names that frame WITHOUT reserving it —
+                            // the authority accepts it only if the frame is already
+                            // live. Publishing after the release (d913972c2) let a
+                            // sibling stage its reuse and publish first, and its apply
+                            // was refused with `UnreservedFrame`: the silent rc=134
+                            // carrier abort of 2026-09-08 (go-build reducer, and the
+                            // MAP_SHARED two-process reducer 4/4). Holding the
+                            // guard across the apply makes publication order equal to
+                            // staging order, as the registry reuse relies on. Lock order
+                            // is unchanged: the authority mutex is a leaf
+                            // (`frame_inventory.rs` never calls out while holding it).
+                            let published = apply_alias_frame_inventory(&kernel_context, commit);
+                            drop(registry);
+                            if let Err(error) = published {
                                 return Err(refuse(
-                                    Site::BusFaultProtect,
-                                    format!("bus-fault tail {bus_start:#x}+{bus_len:#x}: {error}"),
+                                    Site::InventoryPublish,
+                                    error.to_string(),
+                                    error.frame(),
+                                ));
+                            }
+
+                            let Ok(len_bytes) = usize::try_from(len) else {
+                                return Err(refuse(
+                                    Site::LenOverflow,
+                                    "range length does not fit usize".to_owned(),
+                                    None,
+                                ));
+                            };
+                            if prot_none
+                                && let Err(error) = engine.protect_range(va.raw(), len_bytes, 0)
+                            {
+                                return Err(refuse(Site::ProtectNone, error.to_string(), None));
+                            }
+                            engine.set_mapping_protection_and_sharing(
+                                va.raw(),
+                                len_bytes,
+                                prot_none,
+                                !carrick_abi::LinuxProtFlags::from_bits_truncate(prot)
+                                    .contains(carrick_abi::LinuxProtFlags::WRITE),
+                                if shared {
+                                    carrick_guest_mem::MappingSharing::Shared
+                                } else {
+                                    carrick_guest_mem::MappingSharing::Private
+                                },
+                            );
+                            if let Some((bus_start, bus_len)) = install.bus_fault_range() {
+                                let Ok(bus_len) = usize::try_from(bus_len) else {
+                                    return Err(refuse(
+                                        Site::BusFaultLenOverflow,
+                                        format!(
+                                            "bus-fault tail length {bus_len:#x} does not fit usize"
+                                        ),
+                                        None,
+                                    ));
+                                };
+                                if let Err(error) = engine.protect_range(bus_start, bus_len, 0) {
+                                    return Err(refuse(
+                                        Site::BusFaultProtect,
+                                        format!(
+                                            "bus-fault tail {bus_start:#x}+{bus_len:#x}: {error}"
+                                        ),
+                                        None,
+                                    ));
+                                }
+                                engine.set_no_access(bus_start, bus_len, true);
+                            }
+                            if let Err(error) = kernel.dispatcher.commit_host_alias_install(install)
+                            {
+                                return Err(refuse(
+                                    Site::DispatcherCommit,
+                                    format!("{error:?}"),
                                     None,
                                 ));
                             }
-                            engine.set_no_access(bus_start, bus_len, true);
-                        }
-                        if let Err(error) = kernel.dispatcher.commit_host_alias_install(install) {
-                            return Err(refuse(Site::DispatcherCommit, format!("{error:?}"), None));
-                        }
-                        Ok(DispatchOutcome::Returned {
-                            value: success_retval,
-                        })
-                    };
+                            Ok(DispatchOutcome::Returned {
+                                value: success_retval,
+                            })
+                        };
                     let stage1_authority = match &mut mm_phase {
                         SyscallMmPhase::Mutation(authority) => authority,
                         SyscallMmPhase::Ordinary(_) => {
@@ -1954,16 +1978,18 @@ where
                     };
                     let installed = match stage1_authority {
                         mm_quiesce::MmStage1Authority::Sole(authority) => {
-                            let mutation = crate::dispatch::mm_mutation::from_sole_executor(
-                                authority,
-                                coordinator,
-                                kernel_context.shared().mm().id(),
-                            );
+                            let mutation =
+                                carrick_kernel::dispatch::mm_mutation::from_sole_executor(
+                                    authority,
+                                    coordinator,
+                                    kernel_context.shared().mm().id(),
+                                );
                             let permit = mutation.host_alias_permit();
                             install_alias(&permit)
                         }
                         mm_quiesce::MmStage1Authority::Paused(authority) => {
-                            let mutation = crate::dispatch::mm_mutation::from_pt_pause(authority);
+                            let mutation =
+                                carrick_kernel::dispatch::mm_mutation::from_pt_pause(authority);
                             let permit = mutation.host_alias_permit();
                             install_alias(&permit)
                         }
@@ -2049,7 +2075,8 @@ where
 pub(crate) struct PendingSignalAction {
     pub(crate) term_signal: Option<i32>,
     pub(crate) stop_signal: Option<i32>,
-    pub(crate) stop_generation: Option<crate::kernel::JobControlStopInvalidationGeneration>,
+    pub(crate) stop_generation:
+        Option<carrick_kernel::kernel::JobControlStopInvalidationGeneration>,
 }
 
 impl PendingSignalAction {
@@ -2071,7 +2098,7 @@ impl PendingSignalAction {
 
     pub(super) fn stop(
         signum: i32,
-        generation: Option<crate::kernel::JobControlStopInvalidationGeneration>,
+        generation: Option<carrick_kernel::kernel::JobControlStopInvalidationGeneration>,
     ) -> Self {
         Self {
             term_signal: None,
@@ -2153,19 +2180,20 @@ pub(super) fn is_default_stop_signal(signum: i32) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn service_signals_threaded<E: ThreadedEngine>(
     kernel: &Kernel,
-    context: &crate::kernel::KernelContext,
+    context: &carrick_kernel::kernel::KernelContext,
     engine: &mut E,
     this_tid: ThreadId,
     fatal_image_generation: u64,
     last_syscall_retval: Option<i64>,
     interrupted_pc: Option<u64>,
-    continuation_restart: Option<crate::kernel::continuation::RestartDecision>,
-    reserved_signal: Option<crate::kernel::continuation::ReservedSignal>,
+    continuation_restart: Option<carrick_kernel::kernel::continuation::RestartDecision>,
+    reserved_signal: Option<carrick_kernel::kernel::continuation::ReservedSignal>,
     traps: usize,
 ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
     {
-        let restart = continuation_restart
-            .map(|decision| decision == crate::kernel::continuation::RestartDecision::Restart);
+        let restart = continuation_restart.map(|decision| {
+            decision == carrick_kernel::kernel::continuation::RestartDecision::Restart
+        });
         let restart_ctx = SignalRestartContext {
             last_syscall_retval,
             interrupted_pc,
@@ -2191,7 +2219,7 @@ pub(super) fn service_signals_threaded<E: ThreadedEngine>(
         if let Some(action) = action {
             if let Some(signum) = action.stop_signal {
                 if kernel.hvpatch_process.is_some() {
-                    let signal = crate::kernel::LinuxSignal::for_signal_number(signum)
+                    let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(signum)
                         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
                     if !context.kernel().stop_task_for_job_control(
                         context.task().key().id,
@@ -2243,13 +2271,13 @@ pub(crate) mod tests {
 
     struct ContinueInterceptor;
 
-    impl crate::observe::SyscallInterceptor for ContinueInterceptor {
+    impl carrick_kernel::observe::SyscallInterceptor for ContinueInterceptor {
         fn intercept(
             &self,
-            _process: &crate::observe::ProcessInfo<'_>,
-            _call: &crate::observe::InterceptedSyscall<'_>,
-        ) -> crate::observe::InterceptAction {
-            crate::observe::InterceptAction::Continue
+            _process: &carrick_kernel::observe::ProcessInfo<'_>,
+            _call: &carrick_kernel::observe::InterceptedSyscall<'_>,
+        ) -> carrick_kernel::observe::InterceptAction {
+            carrick_kernel::observe::InterceptAction::Continue
         }
     }
 
@@ -2291,7 +2319,7 @@ pub(crate) mod tests {
             .with_linux_initial_stack_page_size(
                 [b"/fixture".as_slice()],
                 std::iter::empty::<&[u8]>(),
-                crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+                carrick_kernel::page_profile::DEFAULT_LINUX_PAGE_SIZE,
             )
             .expect("serialize production-shaped auxv")
     }
@@ -2321,13 +2349,15 @@ pub(crate) mod tests {
         dispatcher.install_interceptor(Arc::new(ContinueInterceptor));
 
         let aarch64_disabled =
-            crate::vdso_policy::with_optional_vdso_for_clock_at_with_mode::<Aarch64GuestArch>(
+            carrick_kernel::vdso_policy::with_optional_vdso_for_clock_at_with_mode::<
+                Aarch64GuestArch,
+            >(
                 production_shaped_image(Aarch64GuestArch::elf_machine()),
                 dispatcher.container().clock(),
                 carrick_mem::vdso::LINUX_VVAR_BASE,
                 carrick_mem::vdso::LINUX_VDSO_BASE,
                 false,
-                crate::vdso_policy::VdsoDebugMode::Disabled,
+                carrick_kernel::vdso_policy::VdsoDebugMode::Disabled,
             )
             .expect("disabled aarch64 VMM image");
         let aarch64_disabled = serialize_auxv(aarch64_disabled);
@@ -2470,7 +2500,7 @@ pub(crate) mod tests {
     #[derive(Debug, Default)]
     pub(crate) struct EndpointRecordingWaker(pub(crate) std::sync::atomic::AtomicUsize);
 
-    impl crate::kernel::TaskWaker for EndpointRecordingWaker {
+    impl carrick_kernel::kernel::TaskWaker for EndpointRecordingWaker {
         fn wake_task(&self) {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -2753,8 +2783,8 @@ pub(crate) mod tests {
         fn apply_inventory(
             &mut self,
             _backend: &Self::Backend,
-            _kernel: &Arc<crate::kernel::Kernel>,
-            _mm: crate::kernel::MmId,
+            _kernel: &Arc<carrick_kernel::kernel::Kernel>,
+            _mm: carrick_kernel::kernel::MmId,
         ) -> Result<(), RuntimeError> {
             assert!(
                 self.child_kernel_bound,
@@ -2857,10 +2887,12 @@ pub(crate) mod tests {
     }
 
     #[derive(Debug, Default)]
-    pub(crate) struct RuntimeTestExecutorKick(Mutex<Option<crate::kernel::ExecutorBinding>>);
+    pub(crate) struct RuntimeTestExecutorKick(
+        Mutex<Option<carrick_kernel::kernel::ExecutorBinding>>,
+    );
 
-    impl crate::kernel::ExecutorKick for RuntimeTestExecutorKick {
-        fn try_bind(&self, binding: crate::kernel::ExecutorBinding) -> bool {
+    impl carrick_kernel::kernel::ExecutorKick for RuntimeTestExecutorKick {
+        fn try_bind(&self, binding: carrick_kernel::kernel::ExecutorBinding) -> bool {
             let mut current = self.0.lock();
             if current.is_some() {
                 return false;
@@ -2869,7 +2901,7 @@ pub(crate) mod tests {
             true
         }
 
-        fn unbind(&self, binding: crate::kernel::ExecutorBinding) {
+        fn unbind(&self, binding: carrick_kernel::kernel::ExecutorBinding) {
             let mut current = self.0.lock();
             if *current == Some(binding) {
                 *current = None;
@@ -2878,8 +2910,8 @@ pub(crate) mod tests {
 
         fn rebind_exact_with(
             &self,
-            predecessor: crate::kernel::ExecutorBinding,
-            successor: crate::kernel::ExecutorBinding,
+            predecessor: carrick_kernel::kernel::ExecutorBinding,
+            successor: carrick_kernel::kernel::ExecutorBinding,
             publish: &mut dyn FnMut() -> bool,
         ) -> bool {
             let mut current = self.0.lock();
@@ -2890,7 +2922,7 @@ pub(crate) mod tests {
             true
         }
 
-        fn deliver_exact(&self, token: crate::kernel::ExecutorKickToken) -> bool {
+        fn deliver_exact(&self, token: carrick_kernel::kernel::ExecutorKickToken) -> bool {
             self.0.lock().is_some_and(|binding| {
                 binding.executor() == token.executor()
                     && binding.executor_epoch() == token.executor_epoch()
@@ -2899,7 +2931,7 @@ pub(crate) mod tests {
             })
         }
 
-        fn current_binding(&self) -> Option<crate::kernel::ExecutorBinding> {
+        fn current_binding(&self) -> Option<carrick_kernel::kernel::ExecutorBinding> {
             *self.0.lock()
         }
     }
@@ -3238,7 +3270,7 @@ pub(crate) mod tests {
         kernel: &Kernel,
         state: ThreadRuntimeState<CrashCaptureTestEngine>,
         phase: HvpatchProductionPhase,
-        external_exec: Option<crate::kernel::control::ExecWork>,
+        external_exec: Option<carrick_kernel::kernel::control::ExecWork>,
     ) -> ProductionHvpatchLoopJob<CrashCaptureTestEngine> {
         let result = HvpatchLoopResult::pending();
         let completion = continuation::LogicalJobCompletion::pending();

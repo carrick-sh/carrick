@@ -16,7 +16,7 @@ use crate::dispatch::SyscallDispatcher;
 /// the shim is enabled). Must run before the guest issues any intercepted
 /// syscall: at boot, and again in a forked child / after execve, since the
 /// child's pid and the new image's identity differ.
-pub(crate) fn stamp_identity_page<M: CurrentMmMemory>(
+pub fn stamp_identity_page<M: CurrentMmMemory>(
     memory: &mut M,
     dispatcher: &SyscallDispatcher,
     kernel_context: &crate::kernel::KernelContext,
@@ -29,7 +29,7 @@ pub(crate) fn stamp_identity_page<M: CurrentMmMemory>(
     )
 }
 
-pub(crate) fn stamp_identity_page_at<M: CurrentMmMemory>(
+pub fn stamp_identity_page_at<M: CurrentMmMemory>(
     memory: &mut M,
     dispatcher: &SyscallDispatcher,
     kernel_context: &crate::kernel::KernelContext,
@@ -71,7 +71,7 @@ pub(crate) fn identity_gate_word(fast_path_enabled: bool, pid: u32) -> u32 {
     u32::from(fast_path_enabled && pid != 0)
 }
 
-pub(crate) fn stamp_identity_values<M: CurrentMmMemory>(
+pub fn stamp_identity_values<M: CurrentMmMemory>(
     memory: &mut M,
     base: u64,
     pid: u32,

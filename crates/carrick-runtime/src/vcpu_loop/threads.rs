@@ -16,13 +16,13 @@ pub(super) fn clear_persistent_child_tid_and_wake<M: carrick_guest_mem::CurrentM
     {
         let _ = memory.write_bytes(address, &0_i32.to_le_bytes());
         let woken = futex.wake(address, 1);
-        crate::event_ring::rec_futex_wake(address, woken);
+        carrick_kernel::event_ring::rec_futex_wake(address, woken);
     }
 }
 
 pub(super) enum CloneThreadSpawn {
     Started {
-        internal: crate::kernel::LinuxTid,
+        internal: carrick_kernel::kernel::LinuxTid,
         visible: i32,
     },
     Errno(crate::linux_abi::LinuxErrno),
@@ -668,7 +668,7 @@ pub(super) struct PersistentSiblingStopAuthority {
     kicker: Arc<dyn VcpuRegistry>,
     futex: Arc<FutexTable>,
     platform_futex: Arc<dyn PlatformFutex>,
-    context: crate::kernel::KernelContext,
+    context: carrick_kernel::kernel::KernelContext,
 }
 
 impl PersistentSiblingStopAuthority {
@@ -691,7 +691,7 @@ fn publish_persistent_sibling_stop_with(
     kicker: &dyn VcpuRegistry,
     futex: &FutexTable,
     platform_futex: &dyn PlatformFutex,
-    context: &crate::kernel::KernelContext,
+    context: &carrick_kernel::kernel::KernelContext,
     kernel: &Kernel,
 ) -> Result<(), RuntimeError> {
     let removed = registry.remove_all_except(keeper);
@@ -762,7 +762,7 @@ where
         clear_persistent_child_tid_and_wake(engine, &self.registry, &self.futex, self.this_tid);
         let last = self.registry.exit(self.this_tid);
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 2);
-        crate::run_state::clear_guest_tid(self.this_tid.raw());
+        carrick_kernel::run_state::clear_guest_tid(self.this_tid.raw());
         self.kicker.unregister(self.this_tid);
         self.kicker.retire_kernel_wake_debt(self.this_tid);
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 3);
@@ -793,7 +793,7 @@ where
         let mut last = false;
         if let Some(process) = kernel.hvpatch_process.as_ref() {
             match process.exit_thread(self.linux_tid) {
-                Ok(crate::kernel::ProcessThreadExit::Retired(retired)) => {
+                Ok(carrick_kernel::kernel::ProcessThreadExit::Retired(retired)) => {
                     kernel.dispatcher.close_draining_file_table(
                         process.kernel_graph(),
                         &retired.files(),
@@ -801,11 +801,11 @@ where
                         None,
                     );
                 }
-                Ok(crate::kernel::ProcessThreadExit::AlreadyRetired) => {}
-                Ok(crate::kernel::ProcessThreadExit::Busy { observed_epoch }) => {
+                Ok(carrick_kernel::kernel::ProcessThreadExit::AlreadyRetired) => {}
+                Ok(carrick_kernel::kernel::ProcessThreadExit::Busy { observed_epoch }) => {
                     return PersistentThreadExitDisposition::Busy { observed_epoch };
                 }
-                Ok(crate::kernel::ProcessThreadExit::LastThread) | Err(_) => last = true,
+                Ok(carrick_kernel::kernel::ProcessThreadExit::LastThread) | Err(_) => last = true,
             }
         }
         // Runtime withdrawal (registry exit, kick unregister, host-signal
@@ -846,8 +846,8 @@ pub(super) enum PersistentThreadExitDisposition {
 }
 
 pub(super) fn wake_removed_persistent_sibling_threads(
-    context: &crate::kernel::KernelContext,
-    scheduler: &Arc<crate::kernel::Scheduler>,
+    context: &carrick_kernel::kernel::KernelContext,
+    scheduler: &Arc<carrick_kernel::kernel::Scheduler>,
     removed: &[ThreadId],
 ) -> Result<(), RuntimeError> {
     for thread in context.task().threads() {
@@ -858,11 +858,11 @@ pub(super) fn wake_removed_persistent_sibling_threads(
             continue;
         }
         if let Err(error) = scheduler.wake_control(thread.key())
-            && !matches!(error, crate::kernel::SchedulerError::UnknownThread)
+            && !matches!(error, carrick_kernel::kernel::SchedulerError::UnknownThread)
             && !matches!(
                 thread.execution_state(),
-                crate::kernel::objects::ThreadExecutionState::Exited { .. }
-                    | crate::kernel::objects::ThreadExecutionState::Failed { .. }
+                carrick_kernel::kernel::objects::ThreadExecutionState::Exited { .. }
+                    | carrick_kernel::kernel::objects::ThreadExecutionState::Failed { .. }
             )
         {
             return Err(RuntimeError::Configuration(format!(

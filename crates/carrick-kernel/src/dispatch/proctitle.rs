@@ -57,7 +57,7 @@ use std::sync::OnceLock;
 /// The one process-level title for a carrier. The scope is immutable and is
 /// the exact token `scripts/sudo/kill.sh` matches; container lifecycle changes
 /// only the count suffix.
-pub(crate) fn carrier_proc_label(scope: &str, live_containers: usize) -> String {
+pub fn carrier_proc_label(scope: &str, live_containers: usize) -> String {
     format!("carrick:{scope}: {live_containers} containers")
 }
 

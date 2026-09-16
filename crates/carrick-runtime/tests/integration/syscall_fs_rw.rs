@@ -1024,17 +1024,17 @@ impl HostPtrPayloadMemory {
         &self,
         address: u64,
         length: usize,
-    ) -> Result<usize, carrick_runtime::dispatch::MemoryError> {
+    ) -> Result<usize, carrick_kernel::dispatch::MemoryError> {
         let offset = address
             .checked_sub(self.base)
-            .ok_or(carrick_runtime::dispatch::MemoryError::OutOfBounds { address, length })?;
+            .ok_or(carrick_kernel::dispatch::MemoryError::OutOfBounds { address, length })?;
         let offset = usize::try_from(offset)
-            .map_err(|_| carrick_runtime::dispatch::MemoryError::OutOfBounds { address, length })?;
+            .map_err(|_| carrick_kernel::dispatch::MemoryError::OutOfBounds { address, length })?;
         let end = offset
             .checked_add(length)
-            .ok_or(carrick_runtime::dispatch::MemoryError::OutOfBounds { address, length })?;
+            .ok_or(carrick_kernel::dispatch::MemoryError::OutOfBounds { address, length })?;
         if end > self.bytes.len() {
-            return Err(carrick_runtime::dispatch::MemoryError::OutOfBounds { address, length });
+            return Err(carrick_kernel::dispatch::MemoryError::OutOfBounds { address, length });
         }
         Ok(offset)
     }
@@ -1089,13 +1089,13 @@ impl GuestMemory for HostPtrPayloadMemory {
         &self,
         address: u64,
         length: usize,
-    ) -> Result<Vec<u8>, carrick_runtime::dispatch::MemoryError> {
+    ) -> Result<Vec<u8>, carrick_kernel::dispatch::MemoryError> {
         if self
             .unreadable_ranges
             .iter()
             .any(|(base, len)| address == *base && length == *len)
         {
-            return Err(carrick_runtime::dispatch::MemoryError::OutOfBounds { address, length });
+            return Err(carrick_kernel::dispatch::MemoryError::OutOfBounds { address, length });
         }
         if self
             .watched_ranges
@@ -1112,7 +1112,7 @@ impl GuestMemory for HostPtrPayloadMemory {
         &mut self,
         address: u64,
         bytes: &[u8],
-    ) -> Result<(), carrick_runtime::dispatch::MemoryError> {
+    ) -> Result<(), carrick_kernel::dispatch::MemoryError> {
         if self
             .watched_write_ranges
             .iter()
@@ -1129,7 +1129,7 @@ impl GuestMemory for HostPtrPayloadMemory {
         &self,
         address: u64,
         dst: &mut [u8],
-    ) -> Result<(), carrick_runtime::dispatch::MemoryError> {
+    ) -> Result<(), carrick_kernel::dispatch::MemoryError> {
         let offset = self.offset(address, dst.len())?;
         dst.copy_from_slice(&self.bytes[offset..offset + dst.len()]);
         Ok(())
@@ -1507,7 +1507,7 @@ fn pwritev_host_file_reports_efault_when_fallback_payload_is_unreadable() {
 #[cfg(target_os = "macos")]
 #[test]
 fn pwritev_host_file_reads_each_guest_iovec_once() {
-    use carrick_runtime::dispatch::MemoryError;
+    use carrick_kernel::dispatch::MemoryError;
     use std::cell::Cell;
 
     struct CountingPayloadMemory {

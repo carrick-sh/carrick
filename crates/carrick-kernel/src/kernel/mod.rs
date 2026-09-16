@@ -19,17 +19,17 @@ pub mod frame_inventory;
 pub mod guest_execution;
 pub mod identity_page;
 pub mod ids;
-pub(crate) mod mm_access;
+pub mod mm_access;
 pub(crate) mod mm_proof;
 pub mod mm_transaction;
 pub mod netns;
 pub mod objects;
 pub mod operations;
-pub(crate) mod process_lifecycle;
+pub mod process_lifecycle;
 pub mod registry;
 pub mod scheduler;
 pub mod snapshot;
-pub(crate) mod tty;
+pub mod tty;
 pub mod wait_set;
 
 #[cfg(test)]
@@ -52,22 +52,22 @@ pub use crash_capture::{
     CrashCaptureAuthority, CrashCaptureGeneration, CrashGenerationExhausted, CrashQuorum,
     CrashQuorumPoll, CrashRegisterFile, CrashRegisterVote,
 };
-pub(crate) use mm_access::MmAccessAuthority;
+pub use mm_access::MmAccessAuthority;
 #[cfg(test)]
 pub(crate) use mm_access::tests::consumer_cow_fixture;
 pub use mm_access::{
     CowBroken, CurrentMm, ForeignMm, ForeignWriteReceipt, MmAccessError, MmReadRange, MmRelation,
     MmToken, MmWriteRange,
 };
-pub(crate) use mm_proof::KernelForeignCowProof;
+pub use mm_proof::KernelForeignCowProof;
 pub use mm_transaction::{MmTransaction, StagedMmOp};
 
-pub(crate) use carrier_process::CarrierProcess;
-#[cfg(test)]
-pub(crate) use carrier_process::{
+pub use carrier_process::CarrierProcess;
+#[cfg(any(test, feature = "test-support"))]
+pub use carrier_process::{
     TestCarrierProcess, TestMmBackend, TestStage1MmProjection, test_mm_binding,
 };
-pub(crate) use core::ReservationChangeSubscription;
+pub use core::ReservationChangeSubscription;
 pub use core::{
     Kernel, KernelContext, KernelError, KernelTaskBinding, Registry, RegistryInvariantError,
     RootBootstrap, TaskExitSubscriber, TaskRevision, VforkParentWait, VforkReleaseReason,
@@ -107,8 +107,12 @@ pub use objects::{
 };
 #[allow(unused_imports)]
 pub(crate) use objects::{
-    DescriptionCommon, FileDescriptionBacking, JobControlStopInvalidationGeneration,
-    NO_READINESS_CONTEXT, NoReadinessContext, ReadinessContext, close_system_charge_window,
+    DescriptionCommon, FileDescriptionBacking, NO_READINESS_CONTEXT, NoReadinessContext,
+    ReadinessContext,
+};
+#[allow(unused_imports)]
+pub use objects::{
+    JobControlStopInvalidationGeneration, close_system_charge_window,
     system_charge_window_is_closed,
 };
 pub use operations::{
@@ -119,17 +123,16 @@ pub use operations::{
     TaskOperationReservation, ThreadCloneReservation, ThreadPublicationReservationAttempt,
     WaitChildClass, WaitMode, WaitOutcome,
 };
-pub(crate) use operations::{
-    CloseRangeUnshare, ExactSignalTargetAuthorization, ExactThreadSignalPost, TtyControlError,
-};
-pub(crate) use process_lifecycle::{
-    ChildExit, ProcessThreadExit, RetiredThreadResources, WaitResult, identity_operation_errno,
-};
+pub(crate) use operations::{CloseRangeUnshare, TtyControlError};
+pub use operations::{ExactSignalTargetAuthorization, ExactThreadSignalPost};
+pub use process_lifecycle::ProcessThreadExit;
+pub(crate) use process_lifecycle::RetiredThreadResources;
+pub use process_lifecycle::{ChildExit, WaitResult, identity_operation_errno};
 pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,
     TaskReservation, ThreadClaim, ThreadReservation,
 };
-pub(crate) use scheduler::SubmissionAuthority;
+pub use scheduler::SubmissionAuthority;
 pub use scheduler::{
     ExecutorBinding, ExecutorKick, ExecutorKickToken, ExecutorRegistration, RunQueue,
     RunQueueError, RunnableThread, Scheduler, SchedulerError, SchedulerRetargetError,

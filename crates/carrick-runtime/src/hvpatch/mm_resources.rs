@@ -11,8 +11,8 @@ use super::stage1_mm::{
     Stage1MmPool, Stage1MmRetirement, Stage1RootRetirementReceipt, Stage1RootRetirementTicket,
 };
 #[cfg(test)]
-use crate::kernel::ThreadKey;
-use crate::kernel::{Stage1RootError, TaskKey};
+use carrick_kernel::kernel::ThreadKey;
+use carrick_kernel::kernel::{Stage1RootError, TaskKey};
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -309,7 +309,7 @@ impl ExecMmReservation {
 
     pub(crate) fn begin_replacement_asid_load(
         &self,
-        executor: crate::kernel::objects::ExecutorId,
+        executor: carrick_kernel::kernel::objects::ExecutorId,
     ) -> Result<AsidLoad, AsidResidencyError> {
         self.active().0.begin_asid_load(executor)
     }
@@ -589,7 +589,7 @@ impl From<Stage1MmError> for MmResourcesError {
 /// Backend-only ownership for HVPatch ASIDs and stage-1 root slots.
 ///
 /// Linux task identity, parentage, groups, sessions, exits, waits, and pidfd
-/// readiness live exclusively in [`crate::kernel::Kernel`]. This table retains
+/// readiness live exclusively in [`carrick_kernel::kernel::Kernel`]. This table retains
 /// only the prototype root-slot/ASID leases that K2 will replace.
 #[derive(Debug, Default)]
 struct MmResourceState {
@@ -1455,7 +1455,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use super::*;
-    use crate::kernel::{LinuxTid, TaskId, TaskSerial, ThreadKey, ThreadSerial};
+    use carrick_kernel::kernel::{LinuxTid, TaskId, TaskSerial, ThreadKey, ThreadSerial};
 
     fn task(raw: i32, serial: u64) -> TaskKey {
         TaskKey {
@@ -1471,8 +1471,8 @@ mod tests {
         }
     }
 
-    fn executor(raw: i32) -> crate::kernel::objects::ExecutorId {
-        crate::kernel::objects::ExecutorId::for_transitional_thread(
+    fn executor(raw: i32) -> carrick_kernel::kernel::objects::ExecutorId {
+        carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(
             crate::thread::ThreadId::synthetic_for_tests(raw),
         )
         .unwrap()

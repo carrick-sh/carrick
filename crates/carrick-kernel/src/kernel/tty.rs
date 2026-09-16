@@ -54,12 +54,12 @@ fn slot() -> &'static Mutex<TtyRegistry> {
 
 /// Begin a new interactive carrier session before the relay thread can observe
 /// input. This removes any route or pending signals left by a prior run.
-pub(crate) fn prepare() {
+pub fn prepare() {
     let mut reg = slot().lock();
     reg.launch = TtyState::default();
 }
 
-pub(crate) fn install(kernel: &Arc<Kernel>) {
+pub fn install(kernel: &Arc<Kernel>) {
     let mut reg = slot().lock();
     reg.launch.kernel = Some(Arc::downgrade(kernel));
     reg.launch.container = None;
@@ -286,7 +286,7 @@ fn deliver_signal_to_group(
 }
 
 #[derive(Default, Clone, Debug)]
-pub(crate) struct LineDiscipline {
+pub struct LineDiscipline {
     pub(crate) literal_next: bool,
 }
 

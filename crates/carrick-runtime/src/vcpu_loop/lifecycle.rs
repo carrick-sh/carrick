@@ -19,7 +19,7 @@ use super::{
     Kernel, RuntimeError, SyscallDispatcher, ThreadRuntimeState, executor,
     stamp_ns_visible_guest_tid,
 };
-use crate::kernel::identity_page::stamp_identity_values;
+use carrick_kernel::kernel::identity_page::stamp_identity_values;
 
 pub(crate) enum ProcessChildBootstrap {
     GuestFork {
@@ -49,7 +49,7 @@ pub(crate) struct HvpatchCloneThreadRequest {
 pub(super) enum PersistentHvpatchCloneAttempt {
     Complete(threads::CloneThreadSpawn),
     Wait {
-        prepared: Option<crate::kernel::PreparedThreadClone>,
+        prepared: Option<carrick_kernel::kernel::PreparedThreadClone>,
         subscription: CloneRetrySubscription,
     },
 }
@@ -59,7 +59,7 @@ pub(super) enum PersistentHvpatchCloneAttempt {
 pub(super) enum CloneRetrySubscription {
     /// The kernel task reservation (parent busy in another transaction).
     Reservation {
-        _subscription: Option<crate::kernel::ReservationChangeSubscription>,
+        _subscription: Option<carrick_kernel::kernel::ReservationChangeSubscription>,
     },
     /// A sibling process fork's transient clone-admission close.
     Admission {
@@ -236,8 +236,8 @@ pub(crate) trait HvpatchProcessBackendOps<E: ThreadedEngine, M: CurrentMmMemory>
     fn apply_inventory(
         &mut self,
         backend: &Self::Backend,
-        kernel: &Arc<crate::kernel::Kernel>,
-        mm: crate::kernel::MmId,
+        kernel: &Arc<carrick_kernel::kernel::Kernel>,
+        mm: carrick_kernel::kernel::MmId,
     ) -> Result<(), RuntimeError>;
     fn bind_child_kernel(
         &mut self,
@@ -388,8 +388,8 @@ where
     fn apply_inventory(
         &mut self,
         backend: &Self::Backend,
-        kernel: &Arc<crate::kernel::Kernel>,
-        mm: crate::kernel::MmId,
+        kernel: &Arc<carrick_kernel::kernel::Kernel>,
+        mm: carrick_kernel::kernel::MmId,
     ) -> Result<(), RuntimeError> {
         backend
             .apply_inventory(|commit| {
@@ -643,7 +643,7 @@ where
 pub(crate) fn bootstrap_hvpatch_process_child_identity(
     memory: &mut impl CurrentMmMemory,
     dispatcher: &SyscallDispatcher,
-    kernel_context: &crate::kernel::KernelContext,
+    kernel_context: &carrick_kernel::kernel::KernelContext,
     shares_mm: bool,
 ) -> Result<(), RuntimeError> {
     bootstrap_hvpatch_process_child_identity_with(
@@ -651,14 +651,14 @@ pub(crate) fn bootstrap_hvpatch_process_child_identity(
         dispatcher,
         kernel_context,
         shares_mm,
-        crate::syscall_shim_enabled(),
+        carrick_kernel::syscall_shim_enabled(),
     )
 }
 
 pub(crate) fn bootstrap_hvpatch_process_child_identity_with(
     memory: &mut impl CurrentMmMemory,
     dispatcher: &SyscallDispatcher,
-    kernel_context: &crate::kernel::KernelContext,
+    kernel_context: &carrick_kernel::kernel::KernelContext,
     shares_mm: bool,
     shim_enabled: bool,
 ) -> Result<(), RuntimeError> {
@@ -853,7 +853,7 @@ pub(crate) mod tests {
     #[test]
     fn hvpatch_process_child_identity_bootstrap_handles_shared_and_copied_mm() {
         let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
-        let read_state = |m: &crate::dispatch::LinearMemory| {
+        let read_state = |m: &carrick_kernel::dispatch::LinearMemory| {
             let pid = u32::from_le_bytes(
                 m.read_bytes_raw(base + crate::memory::IDENTITY_OFF_PID, 4)
                     .unwrap()
@@ -875,7 +875,7 @@ pub(crate) mod tests {
             (pid, enabled, syscalls)
         };
 
-        let mut memory = crate::dispatch::LinearMemory::new(base, vec![0; 4096]);
+        let mut memory = carrick_kernel::dispatch::LinearMemory::new(base, vec![0; 4096]);
         let (parent_pid, parent_counter): (u32, u64) = (70_301, 127);
         stamp_identity_values(&mut memory, base, parent_pid, 1).unwrap();
         memory
@@ -902,7 +902,7 @@ pub(crate) mod tests {
         assert_eq!(read_state(&memory), (parent_pid, 0, parent_counter));
 
         // 2. Copied-MM: stamps child PID and enabled state, resets counter.
-        let mut child_memory = crate::dispatch::LinearMemory::new(base, vec![0; 4096]);
+        let mut child_memory = carrick_kernel::dispatch::LinearMemory::new(base, vec![0; 4096]);
         stamp_identity_values(&mut child_memory, base, parent_pid, 1).unwrap();
         child_memory
             .write_bytes(
@@ -1450,8 +1450,8 @@ pub(crate) mod tests {
         fn apply_inventory(
             &mut self,
             _backend: &Self::Backend,
-            _kernel: &Arc<crate::kernel::Kernel>,
-            _mm: crate::kernel::MmId,
+            _kernel: &Arc<carrick_kernel::kernel::Kernel>,
+            _mm: carrick_kernel::kernel::MmId,
         ) -> Result<(), RuntimeError> {
             assert!(
                 self.child_kernel_bound,
@@ -1917,8 +1917,8 @@ pub(crate) mod tests {
             on_prepare: Some(Arc::new(move || {
                 // Simulate an authority swap / revision change during prepare
                 let replacement = Arc::new(
-                    crate::dispatch::DispatchMmAuthority::new_for_test_with_revision(
-                        crate::kernel::VmaRevision::from_authority_raw(999),
+                    carrick_kernel::dispatch::DispatchMmAuthority::new_for_test_with_revision(
+                        carrick_kernel::kernel::VmaRevision::from_authority_raw(999),
                     ),
                 );
                 kernel_clone

@@ -226,6 +226,20 @@ def cfg_possible_values(tokens: list[Token]) -> set[bool]:
         name = tokens[index].text
         index += 1
         if index < len(tokens) and tokens[index].text == "=":
+            # `feature = "test-support"` is test scope, exactly like `test`.
+            # Splitting the runtime into carrick-kernel + carrick-runtime moved
+            # test fixtures out of the crate whose tests consume them, and
+            # `cfg(test)` is per-crate-compilation, so those fixtures are gated
+            # `cfg(any(test, feature = "test-support"))`. No product target
+            # enables `test-support`, so the gate still means "test code" in
+            # every shipped build. Matching the exact feature NAME keeps this
+            # narrow: every other `feature = "..."` stays unknown, which is
+            # what makes a debug-feature abort still inventoried.
+            value = (
+                tokens[index + 1].text if index + 1 < len(tokens) else ""
+            )
+            if name == "feature" and value == '"test-support"':
+                return {False}, min(index + 2, len(tokens))
             return {False, True}, min(index + 2, len(tokens))
         if index >= len(tokens) or tokens[index].text != "(":
             return ({False} if name == "test" else {False, True}), index
@@ -1442,6 +1456,14 @@ def route_shard(file_path: str) -> str:
         raise LedgerError(f"file is in excluded crate: {file_path}")
     if "crates/carrick-runtime/src/vcpu_loop" in posix_str:
         return "vcpu-loop.json"
+    # The kernel graph, dispatch and the in-zone subsystems moved to
+    # crates/carrick-kernel (plan
+    # 2026-09-13-extract-carrick-vfs-and-carrick-kernel). Their reviewed abort
+    # rows stay in the shard that already holds them: the shards partition a
+    # review ledger, and re-sharding every row would turn a pure code move into
+    # an unreviewable rewrite of `runtime.json` and `other.json`.
+    if "crates/carrick-kernel/src" in posix_str:
+        return "runtime.json"
     if "crates/carrick-runtime/src" in posix_str:
         return "runtime.json"
     if "crates/carrick-vmm-hvf/src" in posix_str:

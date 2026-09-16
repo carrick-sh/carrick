@@ -111,7 +111,7 @@ pub(crate) fn run_debug(
             run_hvpatch_kernel_snapshot(run_id.as_deref(), &tables, list_tables)?;
         }
         DebugCommand::Abort { run_id } => {
-            let ack = carrick_runtime::kernel::kernel_debug_abort(&run_id)
+            let ack = carrick_kernel::kernel::kernel_debug_abort(&run_id)
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
             println!(
                 "{}",
@@ -628,7 +628,7 @@ fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
 }
 
 fn capture_hvpatch_kernel_snapshot(ctx: &LldbDumpContext<'_>) -> anyhow::Result<PathBuf> {
-    let snapshot = carrick_runtime::kernel::kernel_debug_fetch(ctx.run_id, None)
+    let snapshot = carrick_kernel::kernel::kernel_debug_fetch(ctx.run_id, None)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let path = ctx
         .out_dir
@@ -920,7 +920,7 @@ fn run_hvpatch_kernel_snapshot(
     tables: &[String],
     list_tables: bool,
 ) -> anyhow::Result<()> {
-    use carrick_runtime::kernel::KernelDebugTable;
+    use carrick_kernel::kernel::KernelDebugTable;
 
     if list_tables {
         for table in KernelDebugTable::ALL {
@@ -945,7 +945,7 @@ fn run_hvpatch_kernel_snapshot(
         Some(parsed)
     };
 
-    let snapshot = carrick_runtime::kernel::kernel_debug_fetch(run_id, selected)
+    let snapshot = carrick_kernel::kernel::kernel_debug_fetch(run_id, selected)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     println!("{}", serde_json::to_string_pretty(&snapshot)?);
     Ok(())
@@ -1042,12 +1042,12 @@ fn run_container_gate(
             carrick_runtime::Runtime::execute_on(
                 &carrier,
                 &alpha.spec,
-                carrick_runtime::kernel::LaunchContext::from_process_env()?,
+                carrick_kernel::kernel::LaunchContext::from_process_env()?,
             ),
             carrick_runtime::Runtime::execute_on(
                 &carrier,
                 &beta.spec,
-                carrick_runtime::kernel::LaunchContext::from_process_env()?,
+                carrick_kernel::kernel::LaunchContext::from_process_env()?,
             ),
         ),
         ContainerGateMode::Concurrent => {
@@ -1055,7 +1055,7 @@ fn run_container_gate(
             let alpha_thread = thread::Builder::new()
                 .name("gate-alpha".into())
                 .spawn(move || {
-                    let launch = carrick_runtime::kernel::LaunchContext::from_process_env()?;
+                    let launch = carrick_kernel::kernel::LaunchContext::from_process_env()?;
                     carrick_runtime::Runtime::execute_on(&alpha_carrier, &alpha.spec, launch)
                 })
                 .context("spawn alpha container thread")?;
@@ -1063,7 +1063,7 @@ fn run_container_gate(
             let beta_thread = thread::Builder::new()
                 .name("gate-beta".into())
                 .spawn(move || {
-                    let launch = carrick_runtime::kernel::LaunchContext::from_process_env()?;
+                    let launch = carrick_kernel::kernel::LaunchContext::from_process_env()?;
                     carrick_runtime::Runtime::execute_on(&beta_carrier, &beta.spec, launch)
                 })
                 .context("spawn beta container thread")?;

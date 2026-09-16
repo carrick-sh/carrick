@@ -1,4 +1,4 @@
-//! OS-family `cfg` emitter for `carrick-runtime`.
+//! OS-family `cfg` emitter for `carrick-kernel`.
 //!
 //! Residual ABI-shape branches that don't (yet) live behind `carrick-portable`
 //! key on these instead of the banned macOS-negation feature gate (a

@@ -8,13 +8,6 @@ use parking_lot::Mutex;
 use carrick_abi::LinuxGuestAbi;
 use carrick_fatal::carrick_fatal;
 
-#[cfg(test)]
-use crate::kernel::SchedulerError;
-use crate::kernel::objects::{
-    ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState, ThreadExecutionLease,
-    ThreadKey,
-};
-use crate::kernel::{MmId, Scheduler, SubmissionAuthority};
 use crate::trap::TrapError;
 use crate::vcpu_loop::{
     ContainerJobReservation, HvpatchLoopResult, PersistentProcessMemberPublication,
@@ -22,6 +15,13 @@ use crate::vcpu_loop::{
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::vcpu_loop::{HvpatchProcessFailpoint, check_hvpatch_process_failpoint};
+#[cfg(test)]
+use carrick_kernel::kernel::SchedulerError;
+use carrick_kernel::kernel::objects::{
+    ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState, ThreadExecutionLease,
+    ThreadKey,
+};
+use carrick_kernel::kernel::{MmId, Scheduler, SubmissionAuthority};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskLoadIdentity {
@@ -215,8 +215,10 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
 pub struct ExecutorSubmissionContext<'a> {
     pub(crate) scheduler: &'a Scheduler,
     #[cfg(test)]
-    pub(crate) publish_test_descendant:
-        &'a dyn Fn(Arc<crate::kernel::Thread>, ExecutionGeneration) -> Result<(), TrapError>,
+    pub(crate) publish_test_descendant: &'a dyn Fn(
+        Arc<carrick_kernel::kernel::Thread>,
+        ExecutionGeneration,
+    ) -> Result<(), TrapError>,
     pub(crate) current: Option<&'a SubmissionAuthority>,
     // The worker lends ownership, not an alias, for exactly one resident poll.
     // This lets the HVPatch logical state machine consume and replace exec
@@ -228,7 +230,7 @@ pub struct ExecutorSubmissionContext<'a> {
 }
 
 pub(crate) struct PendingExecReplacement {
-    pub(crate) transition: crate::kernel::exec::CommittedExecTransition,
+    pub(crate) transition: carrick_kernel::kernel::exec::CommittedExecTransition,
     pub(crate) replacement_mm: Arc<crate::hvpatch::Stage1MmLease>,
     pub(crate) retired_mm: Option<crate::hvpatch::Stage1MmRetirement>,
 }
@@ -320,7 +322,7 @@ impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
         &self,
         directory: &Arc<HvpatchTaskBindingDirectory>,
         shape: HvpatchSubmissionShape,
-        thread: Arc<crate::kernel::Thread>,
+        thread: Arc<carrick_kernel::kernel::Thread>,
         generation: ExecutionGeneration,
         binding: Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
     ) -> Result<PreparedHvpatchSubmission, TrapError> {
@@ -351,7 +353,7 @@ impl ExecutorSubmissionContext<'_> {
         &self,
         directory: &Arc<HvpatchTaskBindingDirectory>,
         shape: HvpatchSubmissionShape,
-        thread: Arc<crate::kernel::Thread>,
+        thread: Arc<carrick_kernel::kernel::Thread>,
         generation: ExecutionGeneration,
         binding: Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
     ) -> Result<PreparedHvpatchSubmission, TrapError> {
@@ -373,7 +375,7 @@ impl ExecutorSubmissionContext<'_> {
     #[cfg(test)]
     pub fn publish_test_descendant(
         &self,
-        thread: Arc<crate::kernel::Thread>,
+        thread: Arc<carrick_kernel::kernel::Thread>,
         generation: ExecutionGeneration,
     ) -> Result<(), TrapError> {
         (self.publish_test_descendant)(thread, generation)
@@ -423,10 +425,10 @@ pub trait TaskBindingResolver<B>: Send + Sync + 'static {
     fn publish_test_root(
         &self,
         _scheduler: &Scheduler,
-        _thread: Arc<crate::kernel::Thread>,
+        _thread: Arc<carrick_kernel::kernel::Thread>,
         _authority: SubmissionAuthority,
     ) -> Result<(), SchedulerError> {
-        Err(crate::kernel::RunQueueError::SubmissionRejected.into())
+        Err(carrick_kernel::kernel::RunQueueError::SubmissionRejected.into())
     }
 
     #[cfg(test)]
@@ -435,7 +437,7 @@ pub trait TaskBindingResolver<B>: Send + Sync + 'static {
         &self,
         _scheduler: &Scheduler,
         _parent: &SubmissionAuthority,
-        _thread: Arc<crate::kernel::Thread>,
+        _thread: Arc<carrick_kernel::kernel::Thread>,
         _generation: ExecutionGeneration,
     ) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
@@ -495,9 +497,8 @@ impl HvpatchTaskBindingDirectory {
         *installed = Arc::downgrade(scheduler);
         drop(installed);
         scheduler
-            .install_generation_observer(
-                Arc::clone(self) as Arc<dyn crate::kernel::scheduler::SchedulerGenerationObserver>
-            )
+            .install_generation_observer(Arc::clone(self)
+                as Arc<dyn carrick_kernel::kernel::scheduler::SchedulerGenerationObserver>)
             .map_err(|error| TrapError::Hypervisor(error.to_string()))
     }
 
@@ -537,7 +538,7 @@ impl HvpatchTaskBindingDirectory {
         scheduler: &Scheduler,
         shape: HvpatchSubmissionShape,
         grant_authority: Option<&SubmissionAuthority>,
-        thread: Arc<crate::kernel::Thread>,
+        thread: Arc<carrick_kernel::kernel::Thread>,
         generation: ExecutionGeneration,
         binding: Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
     ) -> Result<PreparedHvpatchSubmission, TrapError> {
@@ -598,16 +599,16 @@ impl HvpatchTaskBindingDirectory {
     pub(crate) fn install_root_authority(
         &self,
         scheduler: &Scheduler,
-        thread: Arc<crate::kernel::Thread>,
+        thread: Arc<carrick_kernel::kernel::Thread>,
         authority: SubmissionAuthority,
     ) -> Result<(), SchedulerError> {
         let key = (authority.thread_key(), authority.generation());
         let mut bindings = self.bindings.lock();
         let record = bindings
             .get_mut(&key)
-            .ok_or(crate::kernel::RunQueueError::AuthorityMismatch)?;
+            .ok_or(carrick_kernel::kernel::RunQueueError::AuthorityMismatch)?;
         if record.authority.is_some() {
-            return Err(crate::kernel::RunQueueError::SubmissionRejected.into());
+            return Err(carrick_kernel::kernel::RunQueueError::SubmissionRejected.into());
         }
         record.authority = Some(authority);
         match record
@@ -690,11 +691,11 @@ pub(crate) struct HvpatchActivationProof {
 
 impl HvpatchActivationProof {
     pub(crate) fn validate(
-        context: &crate::kernel::KernelContext,
+        context: &carrick_kernel::kernel::KernelContext,
         state: &MigratableTaskState,
         generation: ExecutionGeneration,
         identity: TaskLoadIdentity,
-        start_gate: crate::kernel::objects::OpenedStartGate,
+        start_gate: carrick_kernel::kernel::objects::OpenedStartGate,
     ) -> Result<Self, TrapError> {
         if start_gate.thread() != context.thread().key()
             || start_gate.generation() != generation
@@ -728,7 +729,7 @@ impl PreparedHvpatchSubmission {
     pub(crate) fn activate(
         mut self,
         scheduler: &Scheduler,
-        thread: Arc<crate::kernel::Thread>,
+        thread: Arc<carrick_kernel::kernel::Thread>,
         proof: HvpatchActivationProof,
     ) -> Result<(), TrapError> {
         if self.key != (proof.thread, proof.generation) || thread.key() != proof.thread {
@@ -811,7 +812,7 @@ impl Drop for TestHookGuard {
 pub(crate) struct PreparedVforkChildActivation {
     dormant: PreparedHvpatchSubmission,
     scheduler: Arc<Scheduler>,
-    child_thread: Arc<crate::kernel::Thread>,
+    child_thread: Arc<carrick_kernel::kernel::Thread>,
     proof: HvpatchActivationProof,
     member_publication: PersistentProcessMemberPublication,
     job_reservation: ContainerJobReservation,
@@ -828,7 +829,7 @@ impl PreparedVforkChildActivation {
     pub(crate) fn new(
         dormant: PreparedHvpatchSubmission,
         scheduler: Arc<Scheduler>,
-        child_thread: Arc<crate::kernel::Thread>,
+        child_thread: Arc<carrick_kernel::kernel::Thread>,
         proof: HvpatchActivationProof,
         member_publication: PersistentProcessMemberPublication,
         job_reservation: ContainerJobReservation,
@@ -921,43 +922,45 @@ impl std::fmt::Debug for PreparedVforkChildActivation {
     }
 }
 
-impl crate::kernel::scheduler::SchedulerGenerationObserver for HvpatchTaskBindingDirectory {
+impl carrick_kernel::kernel::scheduler::SchedulerGenerationObserver
+    for HvpatchTaskBindingDirectory
+{
     fn transition(
         &self,
         thread: ThreadKey,
         predecessor: ExecutionGeneration,
         successor: ExecutionGeneration,
-        kind: crate::kernel::scheduler::SchedulerGenerationTransition,
-    ) -> Result<(), crate::kernel::RunQueueError> {
+        kind: carrick_kernel::kernel::scheduler::SchedulerGenerationTransition,
+    ) -> Result<(), carrick_kernel::kernel::RunQueueError> {
         let scheduler = self
             .scheduler
             .lock()
             .upgrade()
-            .ok_or(crate::kernel::RunQueueError::ObserverSchedulerGone)?;
+            .ok_or(carrick_kernel::kernel::RunQueueError::ObserverSchedulerGone)?;
         let mut bindings = self.bindings.lock();
         let mut record = bindings
             .remove(&(thread, predecessor))
-            .ok_or(crate::kernel::RunQueueError::ObserverBindingMissing)?;
-        if kind == crate::kernel::scheduler::SchedulerGenerationTransition::Terminal {
+            .ok_or(carrick_kernel::kernel::RunQueueError::ObserverBindingMissing)?;
+        if kind == carrick_kernel::kernel::scheduler::SchedulerGenerationTransition::Terminal {
             return Ok(());
         }
         if bindings.contains_key(&(thread, successor)) {
             bindings.insert((thread, predecessor), record);
-            return Err(crate::kernel::RunQueueError::DuplicateObserverBinding);
+            return Err(carrick_kernel::kernel::RunQueueError::DuplicateObserverBinding);
         }
         if let Some(authority) = record.authority.take() {
             let transition = match kind {
-                crate::kernel::scheduler::SchedulerGenerationTransition::Runnable => {
+                carrick_kernel::kernel::scheduler::SchedulerGenerationTransition::Runnable => {
                     if authority.is_active() {
                         authority.rollover_exact(&scheduler, thread, predecessor, thread, successor)
                     } else {
                         authority.reactivate_exact(&scheduler, predecessor, successor)
                     }
                 }
-                crate::kernel::scheduler::SchedulerGenerationTransition::Blocked => {
+                carrick_kernel::kernel::scheduler::SchedulerGenerationTransition::Blocked => {
                     authority.park_exact(&scheduler, predecessor, successor)
                 }
-                crate::kernel::scheduler::SchedulerGenerationTransition::Terminal => {
+                carrick_kernel::kernel::scheduler::SchedulerGenerationTransition::Terminal => {
                     unreachable!()
                 }
             };

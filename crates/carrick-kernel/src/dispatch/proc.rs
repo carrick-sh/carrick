@@ -862,7 +862,7 @@ impl<'a> ProcView<'a> {
         self.proc.lock().ptrace_traceme
     }
 
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(any(test, feature = "test-support"), target_os = "macos"))]
     pub(crate) fn set_ptrace_traceme_for_test(&self) {
         self.proc.lock().ptrace_traceme = true;
     }
@@ -888,7 +888,7 @@ impl<'a> ProcView<'a> {
             .filter(|adopter| process.kernel_graph().task_key_is_live(*adopter))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn mark_child_subreaper_for_test(&self) {
         let mut proc = self.proc.lock();
         proc.child_subreaper = 1;
@@ -4272,9 +4272,9 @@ impl SyscallDispatcher {
         self.proc_view().is_ptrace_traceme()
     }
 
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(any(test, feature = "test-support"), target_os = "macos"))]
     #[inline]
-    pub(crate) fn set_ptrace_traceme_for_test(&self) {
+    pub fn set_ptrace_traceme_for_test(&self) {
         self.proc_view().set_ptrace_traceme_for_test();
     }
 
@@ -4290,18 +4290,18 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn hvpatch_orphan_adopter(&self) -> Option<crate::kernel::TaskKey> {
+    pub fn hvpatch_orphan_adopter(&self) -> Option<crate::kernel::TaskKey> {
         self.proc_view().hvpatch_orphan_adopter()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[inline]
-    pub(crate) fn mark_child_subreaper_for_test(&self) {
+    pub fn mark_child_subreaper_for_test(&self) {
         self.proc_view().mark_child_subreaper_for_test();
     }
 
     #[inline]
-    pub(crate) fn install_reserved_hvpatch_child_pidfd(
+    pub fn install_reserved_hvpatch_child_pidfd(
         &self,
         context: &crate::kernel::KernelContext,
         prepared: &mut crate::kernel::PreparedFork,
@@ -4311,7 +4311,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn remove_installed_hvpatch_child_pidfd(
+    pub fn remove_installed_hvpatch_child_pidfd(
         &self,
         context: &crate::kernel::KernelContext,
         fd: i32,
@@ -4360,7 +4360,7 @@ fn hvpatch_waitid_exit_fields(wait_status: i32) -> (i32, i32) {
 /// `siginfo_t` layout. The child pid, real uid, and wait status all come
 /// from the same Carrick-kernel wait result; host process credentials are not
 /// meaningful for logical guest children sharing the VM carrier.
-pub(crate) fn build_hvpatch_waitid_siginfo(
+pub fn build_hvpatch_waitid_siginfo(
     exit: crate::kernel::ChildExit,
 ) -> [u8; crate::linux_abi::LINUX_SIGINFO_SIZE] {
     let (si_code, si_status) = hvpatch_waitid_exit_fields(exit.status());
@@ -4588,7 +4588,8 @@ mod kernel_process_dispatch_tests {
         crate::kernel::objects::ThreadExecutionLease,
     ) {
         let lane = HvpatchLaneScope::force(false);
-        let (mut process, root) = crate::kernel::TestCarrierProcess::new(root_pid);
+        let (mut process, root) =
+            crate::kernel::TestCarrierProcess::new(root_pid).expect("test carrier process");
         let state = crate::kernel::objects::MigratableTaskState {
             cpu: carrick_hal::threaded::GuestCpuState::from_aarch64_v1(
                 carrick_hal::threaded::Aarch64TaskCpuStateV1 {

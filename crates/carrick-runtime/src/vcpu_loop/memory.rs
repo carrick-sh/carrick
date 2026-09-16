@@ -6,9 +6,10 @@ use carrick_mem::memory::AddressSpace;
 use std::sync::Arc;
 
 use super::Kernel;
-use crate::dispatch::{DispatchError, ProcMapSharing, ProcMapsEntry, SyscallDispatcher};
-use crate::kernel::KernelForeignCowProof;
-use crate::run_result::RuntimeError;
+use carrick_kernel::dispatch::{DispatchError, SyscallDispatcher};
+use carrick_kernel::kernel::KernelForeignCowProof;
+use carrick_kernel::run_result::RuntimeError;
+use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 
 /// Whether this syscall must take the process-wide page-table pause BEFORE the
 /// dispatcher runs — see the call site in `service_threaded_syscall` for the
@@ -32,7 +33,7 @@ pub(crate) fn syscall_takes_pre_dispatch_pt_pause(
 /// should claim stage-1 EXCLUSIVITY for the dispatch — which it holds either
 /// way, since with no peer executor there is nobody to be exclusive against.
 pub(crate) fn syscall_edits_stage1(number: u64, arg2: u64) -> bool {
-    crate::dispatch::syscall_requires_mm_mutation(
+    carrick_kernel::dispatch::syscall_requires_mm_mutation(
         number,
         crate::compat::SyscallArgs::from([0, 0, arg2, 0, 0, 0]),
     )
@@ -45,9 +46,9 @@ pub(crate) fn syscall_edits_stage1(number: u64, arg2: u64) -> bool {
 /// holding `&self` could not coexist with them. It carries the identity it
 /// publishes under instead, which is fixed for the life of the thread.
 pub(crate) fn apply_alias_frame_inventory(
-    context: &crate::kernel::KernelContext,
+    context: &carrick_kernel::kernel::KernelContext,
     commit: carrick_hal::FrameInventoryCommit<()>,
-) -> Result<(), crate::kernel::FrameInventoryError> {
+) -> Result<(), carrick_kernel::kernel::FrameInventoryError> {
     context
         .kernel()
         .frame_inventory()
@@ -70,7 +71,7 @@ pub(crate) fn apply_alias_frame_inventory(
 /// Returns the carrier-terminal error the arm completes with; every later job
 /// wait in this carrier is answered by the same recorded abort.
 pub(crate) struct RefuseAliasInstallSpec {
-    pub(crate) site: crate::kernel::debug::HvpatchAliasInstallSite,
+    pub(crate) site: carrick_kernel::kernel::debug::HvpatchAliasInstallSite,
     pub(crate) guest_pid: i32,
     pub(crate) guest_tid: i32,
     pub(crate) va: u64,
@@ -84,7 +85,7 @@ pub(crate) struct RefuseAliasInstallSpec {
 
 pub(crate) fn refuse_alias_install(
     kernel: &Kernel,
-    context: &crate::kernel::KernelContext,
+    context: &carrick_kernel::kernel::KernelContext,
     spec: RefuseAliasInstallSpec,
 ) -> RuntimeError {
     let RefuseAliasInstallSpec {
@@ -107,7 +108,7 @@ pub(crate) fn refuse_alias_install(
                 .pending_reservation_for_frame(frame)
         })
         .map(|transaction| transaction.raw());
-    let reason = crate::kernel::debug::AbortReason::HvpatchAliasInstall {
+    let reason = carrick_kernel::kernel::debug::AbortReason::HvpatchAliasInstall {
         site,
         guest_pid,
         guest_tid,
@@ -137,11 +138,11 @@ pub(crate) fn refuse_alias_install(
 
 pub(crate) struct KernelFrameCowAuthority {
     pub(crate) deferred_anonymous: Option<Arc<carrick_guest_mem::DeferredAnonymousState>>,
-    pub(crate) kernel: Arc<crate::kernel::Kernel>,
-    pub(crate) mm: crate::kernel::MmId,
+    pub(crate) kernel: Arc<carrick_kernel::kernel::Kernel>,
+    pub(crate) mm: carrick_kernel::kernel::MmId,
     pub(crate) owner_inventory: Arc<dyn carrick_hal::FrameCowOwnerInventory>,
     /// Exact-MM admission plus every participant's opaque pause endpoint.
-    pub(crate) guest_executors: Arc<crate::kernel::GuestExecutorCensus>,
+    pub(crate) guest_executors: Arc<carrick_kernel::kernel::GuestExecutorCensus>,
     pub(crate) tid: carrick_hal::ThreadId,
     pub(crate) identity: carrick_hal::FrameCowIdentity,
     pub(crate) pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
@@ -151,7 +152,7 @@ impl KernelFrameCowAuthority {
     #[allow(dead_code)] // consumed by the HVPatch child publication slice
     pub(crate) fn issue_hvpatch_child_token(
         self: Arc<Self>,
-        context: &crate::kernel::KernelContext,
+        context: &carrick_kernel::kernel::KernelContext,
     ) -> Result<carrick_hal::HvpatchChildKernelToken, String> {
         if self.identity.linux_tid != self.tid.raw()
             || self.identity.mm != self.mm.raw()
@@ -224,9 +225,9 @@ pub(crate) fn fixed_frame_cow_owner_inventory_for_test(
 
 #[cfg(test)]
 pub(crate) fn kernel_frame_cow_authority_for_test(
-    kernel: Arc<crate::kernel::Kernel>,
-    mm: crate::kernel::MmId,
-    guest_executors: Arc<crate::kernel::GuestExecutorCensus>,
+    kernel: Arc<carrick_kernel::kernel::Kernel>,
+    mm: carrick_kernel::kernel::MmId,
+    guest_executors: Arc<carrick_kernel::kernel::GuestExecutorCensus>,
     tid: carrick_hal::ThreadId,
     asid: u16,
     owner_inventory: Arc<dyn carrick_hal::FrameCowOwnerInventory>,
@@ -257,12 +258,12 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         &self,
     ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
     {
-        crate::dispatch::mm_quiesce::acquire_frame_cow_quiesce(
+        carrick_kernel::dispatch::mm_quiesce::acquire_frame_cow_quiesce(
             &self.pt_quiesce,
             self.mm,
             &self.guest_executors,
             self.tid,
-            crate::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
+            carrick_kernel::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
         )
         .map(|guard| Box::new(guard) as Box<dyn carrick_hal::FrameCowQuiesce>)
         .map_err(|error| {
@@ -514,33 +515,33 @@ pub(crate) fn apply_image_proc_state(
         proc_maps_from_address_space(image),
         image.linux_auxv_image().to_vec(),
         core_file_mappings_from_address_space(image),
-        crate::dispatch::boot_private_file_backings(image),
+        carrick_kernel::dispatch::boot_private_file_backings(image),
     )
 }
 
 /// Publish a successful exec image as one dispatcher VMA generation.
 pub(crate) fn apply_exec_image_proc_state(
     dispatcher: &SyscallDispatcher,
-    replacement_mm_id: crate::kernel::MmId,
+    replacement_mm_id: carrick_kernel::kernel::MmId,
     image: &AddressSpace,
-) -> crate::dispatch::PreparedDispatchMmExec {
+) -> carrick_kernel::dispatch::PreparedDispatchMmExec {
     dispatcher.publish_exec_image_state(
         replacement_mm_id,
         proc_maps_from_address_space(image),
         image.linux_auxv_image().to_vec(),
         core_file_mappings_from_address_space(image),
-        crate::dispatch::boot_private_file_backings(image),
+        carrick_kernel::dispatch::boot_private_file_backings(image),
     )
 }
 
 pub(crate) fn core_file_mappings_from_address_space(
     image: &AddressSpace,
-) -> Vec<crate::core_dump::FileMapping> {
+) -> Vec<carrick_kernel::core_dump::FileMapping> {
     image
         .file_mappings()
         .iter()
         .filter(|mapping| !mapping.path.is_empty())
-        .map(|mapping| crate::core_dump::FileMapping {
+        .map(|mapping| carrick_kernel::core_dump::FileMapping {
             start: mapping.start,
             end: mapping.end,
             file_page_offset: mapping.file_page_offset,
@@ -554,12 +555,12 @@ pub(crate) fn core_file_mappings_from_address_space(
 /// The guest reads this register in userspace with no vm exit and compares it
 /// against a namespace-translated `getpid`, so publishing the raw kernel-graph
 /// tid here is what let a leader observe `gettid() != getpid()`. See
-/// [`crate::namespace::pid::ns_visible_guest_tid`].
+/// [`carrick_kernel::namespace::pid::ns_visible_guest_tid`].
 pub(crate) fn stamp_ns_visible_guest_tid<E: ThreadedEngine>(
     engine: &E,
-    context: &crate::kernel::KernelContext,
+    context: &carrick_kernel::kernel::KernelContext,
 ) -> Result<(), TrapError> {
-    stamp_ns_visible_guest_tid_with(crate::syscall_shim_enabled(), context, |tid| {
+    stamp_ns_visible_guest_tid_with(carrick_kernel::syscall_shim_enabled(), context, |tid| {
         engine.set_guest_thread_id(tid)
     })
 }
@@ -569,13 +570,13 @@ pub(crate) fn stamp_ns_visible_guest_tid<E: ThreadedEngine>(
 /// published answers `gettid` from whatever the previous lease left there.
 pub(crate) fn stamp_ns_visible_guest_tid_with(
     shim_enabled: bool,
-    context: &crate::kernel::KernelContext,
+    context: &carrick_kernel::kernel::KernelContext,
     set: impl FnOnce(u64) -> Result<(), TrapError>,
 ) -> Result<(), TrapError> {
     if !shim_enabled {
         return Ok(());
     }
-    let tid = crate::namespace::pid::ns_visible_guest_tid(context).ok_or_else(|| {
+    let tid = carrick_kernel::namespace::pid::ns_visible_guest_tid(context).ok_or_else(|| {
         TrapError::Hypervisor(format!(
             "live thread {} is missing its container-visible TID",
             context.thread().key().tid.raw()
@@ -673,7 +674,7 @@ mod tests {
     /// `mmap(MAP_SHARED, fd)` until the pool hit `OutOfTables`.
     #[test]
     fn stage1_editors_are_claimed_regardless_of_peers() {
-        for &editor in crate::dispatch::MM_MUTATION_SYSCALLS {
+        for &editor in carrick_kernel::dispatch::MM_MUTATION_SYSCALLS {
             assert!(
                 syscall_edits_stage1(editor, 0),
                 "{editor} edits stage-1 whether or not a peer exists"
@@ -693,7 +694,7 @@ mod tests {
     /// crossed and deadlocked a whole guest at ~0% CPU.
     #[test]
     fn pre_dispatch_pt_pause_covers_madvise_dontneed() {
-        for &editor in crate::dispatch::MM_MUTATION_SYSCALLS {
+        for &editor in carrick_kernel::dispatch::MM_MUTATION_SYSCALLS {
             assert!(syscall_takes_pre_dispatch_pt_pause(editor, 0, true));
             assert!(
                 !syscall_takes_pre_dispatch_pt_pause(editor, 0, false),
@@ -720,14 +721,14 @@ mod tests {
         ForeignMmTransport, ForeignMmTransportError, ThreadId, VcpuKickDyn, VcpuRegistry,
     };
 
-    use crate::kernel::mm_access::ProjectedForeignMmSnapshot;
-    use crate::kernel::mm_access::tests::{
+    use carrick_kernel::kernel::mm_access::ProjectedForeignMmSnapshot;
+    use carrick_kernel::kernel::mm_access::tests::{
         MockCowCounters, MockCowFault, MockCowReceipt, MockCowTransport, bootstrap, cow_fixture,
         execution_lease, fixture_backend, foreign_mm, fork_with_backend, publish_cow_mapping,
         with_foreign_mutation,
     };
-    use crate::kernel::objects::ExecutorId;
-    use crate::kernel::{
+    use carrick_kernel::kernel::objects::ExecutorId;
+    use carrick_kernel::kernel::{
         ClonePlan, Kernel, KernelContext, LinuxWaitStatus, MmAccessError, MmBackend, MmId,
         MmRelation, SnapshotError, VmaAccess,
     };
@@ -866,7 +867,7 @@ mod tests {
         );
         let mm = child.shared().mm().id();
         let (dispatch_mm, mutation) =
-            crate::dispatch::DispatchMmAuthority::foreign_cow_composition_for_test(
+            carrick_kernel::dispatch::DispatchMmAuthority::foreign_cow_composition_for_test(
                 mm,
                 Arc::clone(&stage1) as Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>,
                 0x3000,
@@ -880,7 +881,7 @@ mod tests {
             publish_cow_mapping(kernel, mm, physical_base, physical_len);
         let owner =
             carrick_hal::ForeignOwnerGeneration::from_backend_counter(NonZeroU64::new(61).unwrap());
-        let proof = crate::kernel::KernelForeignCowProof::new(
+        let proof = carrick_kernel::kernel::KernelForeignCowProof::new(
             Arc::clone(kernel),
             mm,
             GuestVa(0x3000),
@@ -917,7 +918,7 @@ mod tests {
     struct RealProductionCowFixture {
         child: KernelContext,
         stage1: Arc<crate::hvpatch::Stage1MmLease>,
-        dispatch_mm: Arc<crate::dispatch::DispatchMmAuthority>,
+        dispatch_mm: Arc<carrick_kernel::dispatch::DispatchMmAuthority>,
         carrier:
             carrick_vmm_hvf::trap::foreign_cow_test_support::ProductionCarrierForeignCowHarness,
     }
@@ -950,14 +951,14 @@ mod tests {
         let shape = FixtureShape::new(Gpa(stage1_root), Gpa(data_ipa))
             .expect("real production carrier fixture shape");
         let (dispatch_mm, mutation) =
-            crate::dispatch::DispatchMmAuthority::foreign_cow_composition_for_test(
+            carrick_kernel::dispatch::DispatchMmAuthority::foreign_cow_composition_for_test(
                 mm,
                 Arc::clone(&stage1) as Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>,
                 TEST_VA,
                 TEST_VA + shape.data_len,
             );
         backend.bind_inventory(kernel, mm);
-        let vma_source: crate::kernel::SharedVmaSnapshotSource = dispatch_mm.clone();
+        let vma_source: carrick_kernel::kernel::SharedVmaSnapshotSource = dispatch_mm.clone();
         backend.bind_vma_source(vma_source);
         let (root_mapping, root_frame, _) =
             publish_cow_mapping(kernel, mm, shape.stage1_root, shape.page_table_len);
@@ -1020,11 +1021,12 @@ mod tests {
 
     fn with_mm_mutation<T>(
         mm: MmId,
-        run: impl FnOnce(&mut crate::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
+        run: impl FnOnce(&mut carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
     ) -> T {
-        let coordinator = Arc::new(crate::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
-        crate::dispatch::mm_quiesce::with_real_pt_pause_for_test(coordinator, |pause| {
-            let mut mutation = crate::dispatch::mm_mutation::from_pt_pause(pause);
+        let coordinator =
+            Arc::new(carrick_kernel::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
+        carrick_kernel::dispatch::mm_quiesce::with_real_pt_pause_for_test(coordinator, |pause| {
+            let mut mutation = carrick_kernel::dispatch::mm_mutation::from_pt_pause(pause);
             run(&mut mutation)
         })
     }
@@ -1038,7 +1040,7 @@ mod tests {
         let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
 
         let result = with_foreign_mutation(&foreign, |mutation| {
-            crate::kernel::MmAccessAuthority::new()
+            carrick_kernel::kernel::MmAccessAuthority::new()
                 .break_foreign_cow(mutation, &foreign, range)
                 .map(|_| ())
         });
@@ -1055,7 +1057,7 @@ mod tests {
         let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
 
         let result = with_foreign_mutation(&foreign, |mutation| {
-            crate::kernel::MmAccessAuthority::new()
+            carrick_kernel::kernel::MmAccessAuthority::new()
                 .break_foreign_cow_with_final_snapshot_contended_for_test(mutation, &foreign, range)
                 .map(|_| ())
         });
@@ -1084,13 +1086,13 @@ mod tests {
         let range = foreign.write_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
 
         let write = with_foreign_mutation(&foreign, |mutation| {
-            let mut cow = crate::kernel::MmAccessAuthority::new()
+            let mut cow = carrick_kernel::kernel::MmAccessAuthority::new()
                 .break_foreign_cow(mutation, &foreign, range)
                 .expect("production carrier COW transaction");
-            let prepared = crate::kernel::MmAccessAuthority::new()
+            let prepared = carrick_kernel::kernel::MmAccessAuthority::new()
                 .prepare_foreign_write(&mut cow, b"edit")
                 .expect("production carrier authenticated write");
-            crate::kernel::MmAccessAuthority::new().commit_foreign_write(prepared)
+            carrick_kernel::kernel::MmAccessAuthority::new().commit_foreign_write(prepared)
         });
 
         assert_eq!(write.bytes_written(), 4);
@@ -1125,11 +1127,11 @@ mod tests {
                 kernel_visible: true,
             });
         assert!(kernel.claim_ptrace_traceme(&fixture.child));
-        let stop = crate::kernel::LinuxSignal::for_signal_number(12).unwrap();
+        let stop = carrick_kernel::kernel::LinuxSignal::for_signal_number(12).unwrap();
         assert!(kernel.stop_task_for_ptrace(fixture.child.task().key().id, stop));
         assert_eq!(
             kernel.settle_task_ptrace_stop(fixture.child.task().key().id),
-            crate::kernel::objects::PtraceStopSettlement::Stopped,
+            carrick_kernel::kernel::objects::PtraceStopSettlement::Stopped,
         );
         let witness = fixture
             .child
@@ -1141,13 +1143,14 @@ mod tests {
         let write = with_foreign_mutation(&foreign, |mutation| {
             witness
                 .with_revalidated_text(foreign.mm_id(), |access| {
-                    crate::kernel::MmAccessAuthority::new().write_ptrace_text_under_witness(
-                        mutation,
-                        &foreign,
-                        &access,
-                        GuestVa(TEST_VA),
-                        b"edit",
-                    )
+                    carrick_kernel::kernel::MmAccessAuthority::new()
+                        .write_ptrace_text_under_witness(
+                            mutation,
+                            &foreign,
+                            &access,
+                            GuestVa(TEST_VA),
+                            b"edit",
+                        )
                 })
                 .expect("revalidate exact ptrace text stop")
         });
@@ -1199,11 +1202,11 @@ mod tests {
             "fixture must model the live writable preimage / exact RX alias disagreement"
         );
         assert!(kernel.claim_ptrace_traceme(&fixture.child));
-        let stop = crate::kernel::LinuxSignal::for_signal_number(12).unwrap();
+        let stop = carrick_kernel::kernel::LinuxSignal::for_signal_number(12).unwrap();
         assert!(kernel.stop_task_for_ptrace(fixture.child.task().key().id, stop));
         assert_eq!(
             kernel.settle_task_ptrace_stop(fixture.child.task().key().id),
-            crate::kernel::objects::PtraceStopSettlement::Stopped,
+            carrick_kernel::kernel::objects::PtraceStopSettlement::Stopped,
         );
         let witness = fixture
             .child
@@ -1215,13 +1218,14 @@ mod tests {
         let write = with_foreign_mutation(&foreign, |mutation| {
             witness
                 .with_revalidated_text(foreign.mm_id(), |access| {
-                    crate::kernel::MmAccessAuthority::new().write_ptrace_text_under_witness(
-                        mutation,
-                        &foreign,
-                        &access,
-                        GuestVa(TEST_VA),
-                        b"edit",
-                    )
+                    carrick_kernel::kernel::MmAccessAuthority::new()
+                        .write_ptrace_text_under_witness(
+                            mutation,
+                            &foreign,
+                            &access,
+                            GuestVa(TEST_VA),
+                            b"edit",
+                        )
                 })
                 .expect("revalidate exact ptrace text stop")
         });
@@ -1309,7 +1313,7 @@ mod tests {
         let range = foreign.write_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
 
         with_foreign_mutation(&foreign, |mutation| {
-            crate::kernel::MmAccessAuthority::new()
+            carrick_kernel::kernel::MmAccessAuthority::new()
                 .break_foreign_cow(mutation, &foreign, range)
                 .expect("full-occupancy carrier COW must not acquire a maintenance vCPU");
         });
@@ -1444,7 +1448,7 @@ mod tests {
         let range = foreign.write_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
 
         let result = with_foreign_mutation(&foreign, |mutation| {
-            crate::kernel::MmAccessAuthority::new()
+            carrick_kernel::kernel::MmAccessAuthority::new()
                 .break_foreign_cow(mutation, &foreign, range)
                 .map(|_| ())
         });
@@ -1503,7 +1507,7 @@ mod tests {
         let range = foreign.write_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
 
         let result = with_foreign_mutation(&foreign, |mutation| {
-            crate::kernel::MmAccessAuthority::new()
+            carrick_kernel::kernel::MmAccessAuthority::new()
                 .break_foreign_cow(mutation, &foreign, range)
                 .map(|_| ())
         });
@@ -1526,15 +1530,16 @@ mod tests {
                         .write_range(GuestVa(TEST_VA), 4)
                         .expect("race target range validation")
                         .expect("race target has writable production VMA");
-                    let result = crate::kernel::MmAccessAuthority::new().with_foreign_mutation(
-                        &foreign,
-                        ThreadId::synthetic_for_tests(31_079),
-                        |mutation| {
-                            crate::kernel::MmAccessAuthority::new()
-                                .break_foreign_cow(mutation, &foreign, range)
-                                .map(|_| ())
-                        },
-                    );
+                    let result = carrick_kernel::kernel::MmAccessAuthority::new()
+                        .with_foreign_mutation(
+                            &foreign,
+                            ThreadId::synthetic_for_tests(31_079),
+                            |mutation| {
+                                carrick_kernel::kernel::MmAccessAuthority::new()
+                                    .break_foreign_cow(mutation, &foreign, range)
+                                    .map(|_| ())
+                            },
+                        );
                     assert!(
                         result.is_ok(),
                         "retained race winner failed COW: {result:?}"
@@ -1640,7 +1645,7 @@ mod tests {
             MmId::from_registry_allocation(NonZeroU64::new(foreign.mm_id().raw() + 1).unwrap());
         with_mm_mutation(wrong_mm, |mutation| {
             assert!(matches!(
-                crate::kernel::MmAccessAuthority::new()
+                carrick_kernel::kernel::MmAccessAuthority::new()
                     .break_foreign_cow(mutation, &foreign, range),
                 Err(MmAccessError::ForeignMutationAuthorityMismatch)
             ));
@@ -1655,7 +1660,7 @@ mod tests {
             .unwrap();
         with_foreign_mutation(&foreign, |mutation| {
             assert!(matches!(
-                crate::kernel::MmAccessAuthority::new().break_foreign_cow(
+                carrick_kernel::kernel::MmAccessAuthority::new().break_foreign_cow(
                     mutation,
                     &foreign,
                     other_range,
@@ -1671,7 +1676,7 @@ mod tests {
             let target_range = target.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
             with_foreign_mutation(&target, |mutation| {
                 assert!(matches!(
-                    crate::kernel::MmAccessAuthority::new().break_foreign_cow(
+                    carrick_kernel::kernel::MmAccessAuthority::new().break_foreign_cow(
                         mutation,
                         &target,
                         target_range,
@@ -1726,7 +1731,7 @@ mod tests {
         let authority = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
             Arc::clone(&kernel),
             mm,
-            Arc::new(crate::kernel::GuestExecutorCensus::default()),
+            Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default()),
             tid,
             7,
             crate::vcpu_loop::fixed_frame_cow_owner_inventory_for_test(current_owner),
@@ -1744,7 +1749,7 @@ mod tests {
             )
             .expect("apply foreign COW inventory transaction");
         let proof = proof
-            .downcast_ref::<crate::kernel::KernelForeignCowProof>()
+            .downcast_ref::<carrick_kernel::kernel::KernelForeignCowProof>()
             .expect("runtime-private kernel proof");
 
         assert!(
@@ -1831,7 +1836,7 @@ mod tests {
         let proof_issuer = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
             Arc::clone(&kernel),
             mm,
-            Arc::new(crate::kernel::GuestExecutorCensus::default()),
+            Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default()),
             ThreadId::synthetic_for_tests(31_130),
             9,
             crate::vcpu_loop::fixed_frame_cow_owner_inventory_for_test(current_owner),
@@ -1854,7 +1859,7 @@ mod tests {
 
         with_foreign_mutation(&foreign, |mutation| {
             assert!(matches!(
-                crate::kernel::MmAccessAuthority::new()
+                carrick_kernel::kernel::MmAccessAuthority::new()
                     .break_foreign_cow(mutation, &foreign, range,),
                 Err(MmAccessError::ForeignCowReceiptMismatch)
             ));

@@ -9,7 +9,7 @@
 use carrick_mem::memory::{AddressSpace, AddressSpaceError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum VdsoDebugMode {
+pub enum VdsoDebugMode {
     Full,
     Disabled,
     NoGetrandom,
@@ -17,12 +17,9 @@ pub(crate) enum VdsoDebugMode {
     ClockSyscalls,
 }
 
-// Callers: `runtime.rs` (`cfg(feature = "platform-macos")`).
-#[cfg(any(
-    feature = "platform-macos",
-    all(target_os = "macos", target_arch = "aarch64")
-))]
-pub(crate) fn vdso_enabled_for_debug() -> bool {
+// Caller: the carrier's `runtime.rs`, which is itself macOS-only.
+#[cfg(target_os = "macos")]
+pub fn vdso_enabled_for_debug() -> bool {
     vdso_debug_mode() != VdsoDebugMode::Disabled
 }
 
@@ -47,7 +44,7 @@ fn vdso_debug_mode_from_env(disable: Option<&str>, mode: Option<&str>) -> VdsoDe
 
 /// Shared truthy-string parse for the `CARRICK_DISABLE_*` debug env flags
 /// (also used by the macOS arm's `hardware_tso_for_debug`).
-pub(crate) fn debug_env_flag_enabled(value: Option<&str>) -> bool {
+pub fn debug_env_flag_enabled(value: Option<&str>) -> bool {
     matches!(
         value,
         Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
@@ -68,7 +65,7 @@ pub(crate) fn with_optional_vdso_for_clock<A: carrick_hal::GuestArch>(
     with_optional_vdso_for_clock_with_visibility::<A>(image, clock, false)
 }
 
-pub(crate) fn with_optional_vdso_for_clock_with_visibility<A: carrick_hal::GuestArch>(
+pub fn with_optional_vdso_for_clock_with_visibility<A: carrick_hal::GuestArch>(
     image: AddressSpace,
     clock: &crate::kernel::container::ClockDomain,
     requires_syscall_traps: bool,
@@ -123,7 +120,7 @@ pub(crate) fn with_optional_vdso_for_clock_at<A: carrick_hal::GuestArch>(
     )
 }
 
-pub(crate) fn with_optional_vdso_for_clock_at_with_mode<A: carrick_hal::GuestArch>(
+pub fn with_optional_vdso_for_clock_at_with_mode<A: carrick_hal::GuestArch>(
     image: AddressSpace,
     clock: &crate::kernel::container::ClockDomain,
     vvar_base: u64,

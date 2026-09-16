@@ -284,7 +284,7 @@ fn proc_tunable_name(path: &str) -> Option<(&str, Option<u32>)> {
 /// process IS a host process). Keeping the choice at that one seam is what
 /// stops the two models from being silently conflated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TunableWrite {
+pub enum TunableWrite {
     /// Set `oom_score_adj` on `pid` (`None` = the calling process).
     OomScoreAdj { pid: Option<u32>, value: i32 },
     /// Accepted and dropped — carrick models no state behind it.

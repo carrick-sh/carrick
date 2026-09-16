@@ -22,9 +22,9 @@ use crate::compat::{CompatReporter, SyscallArgs};
 /// over the numbers IT implements; `dispatch_normalized` chains them. Adding a
 /// syscall is then a one-module edit — no shared routing table to contend on
 /// (Task A1). See [[plan-concurrent-fanout-lanes]] Part A.
-pub(crate) type SyscallHandler<M> =
+pub type SyscallHandler<M> =
     fn(&SyscallDispatcher, &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError>;
-pub(crate) type MutationSyscallHandler<M> =
+pub type MutationSyscallHandler<M> =
     fn(&SyscallDispatcher, &mut MutationSyscallCtx<M>) -> Result<DispatchOutcome, DispatchError>;
 
 /// Resolve a syscall number to its handler by chaining every dispatch module's
@@ -59,15 +59,15 @@ pub(crate) fn resolve_mutation_handler<M: CurrentMmMemory>(
         .or_else(|| sysv::dispatch_sysv_mutation(number))
 }
 
-pub(crate) const MM_MUTATION_SYSCALLS: &[u64] = &[
+pub const MM_MUTATION_SYSCALLS: &[u64] = &[
     25, 196, 197, 214, 215, 216, 222, 226, 227, 228, 229, 230, 231, 232, 233, 234, 284,
 ];
 
-pub(crate) fn syscall_requires_mm_mutation(number: u64, _args: SyscallArgs) -> bool {
+pub fn syscall_requires_mm_mutation(number: u64, _args: SyscallArgs) -> bool {
     MM_MUTATION_SYSCALLS.contains(&number)
 }
 
-pub(crate) trait NormalizedDispatchRoute {
+pub trait NormalizedDispatchRoute {
     fn dispatch<M: CurrentMmMemory>(
         &mut self,
         dispatcher: &SyscallDispatcher,
@@ -79,9 +79,9 @@ pub(crate) trait NormalizedDispatchRoute {
     ) -> Option<Result<DispatchOutcome, DispatchError>>;
 }
 
-pub(crate) struct OrdinaryDispatchRoute<'lease, 'executor> {
-    pub(crate) lease: Option<&'lease crate::kernel::objects::ThreadExecutionLease>,
-    pub(crate) mm_executor: Option<&'executor mut MmExecutorParticipation>,
+pub struct OrdinaryDispatchRoute<'lease, 'executor> {
+    pub lease: Option<&'lease crate::kernel::objects::ThreadExecutionLease>,
+    pub mm_executor: Option<&'executor mut MmExecutorParticipation>,
 }
 
 impl NormalizedDispatchRoute for OrdinaryDispatchRoute<'_, '_> {
@@ -106,9 +106,9 @@ impl NormalizedDispatchRoute for OrdinaryDispatchRoute<'_, '_> {
     }
 }
 
-pub(crate) struct MutationDispatchRoute<'guard, 'authority, 'lease> {
-    pub(crate) guard: &'guard mut mm_mutation::MmMutationGuard<'authority>,
-    pub(crate) lease: Option<&'lease crate::kernel::objects::ThreadExecutionLease>,
+pub struct MutationDispatchRoute<'guard, 'authority, 'lease> {
+    pub guard: &'guard mut mm_mutation::MmMutationGuard<'authority>,
+    pub lease: Option<&'lease crate::kernel::objects::ThreadExecutionLease>,
 }
 
 impl<'guard, 'authority, 'lease> NormalizedDispatchRoute

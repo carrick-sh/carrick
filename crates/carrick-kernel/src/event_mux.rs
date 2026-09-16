@@ -20,46 +20,42 @@ use std::os::fd::RawFd;
 /// [`make_event_multiplexer`] so the host event-backend choice lives in exactly
 /// one place; the dispatch-layer caller stays host-agnostic.
 pub fn trigger_user_wake_fd(wake_fd: RawFd) {
-    #[cfg(any(
-        feature = "platform-macos",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ))]
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
     let _ = carrick_host_bsd::kqueue::trigger_user(wake_fd, 0);
-    #[cfg(feature = "platform-linux")]
+    #[cfg(target_os = "linux")]
     carrick_host_linux::epoll_mux::trigger_user_eventfd(wake_fd);
     #[cfg(not(any(
-        feature = "platform-macos",
-        feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd"
     )))]
     let _ = wake_fd;
 }
 
 /// Construct the platform readiness multiplexer.
 pub fn make_event_multiplexer() -> Result<Box<dyn EventMultiplexer>, OsError> {
-    #[cfg(feature = "platform-macos")]
+    #[cfg(target_os = "macos")]
     {
         Ok(Box::new(carrick_host_bsd::KqueueMultiplexer::new()?))
     }
-    #[cfg(feature = "platform-linux")]
+    #[cfg(target_os = "linux")]
     {
         Ok(Box::new(carrick_host_linux::EpollMultiplexer::new()?))
     }
     // BSD VMM hosts share the macOS kqueue multiplexer: `carrick_bsd` includes
     // FreeBSD and NetBSD, so the same `KqueueMultiplexer` compiles and runs here.
-    // The `platform-*` features are mutually exclusive, so positive predicates
-    // suffice (no `not(platform-macos)` disambiguation needed).
-    #[cfg(any(feature = "platform-freebsd", feature = "platform-netbsd"))]
+    // The `target_os` predicates are mutually exclusive by construction, so
+    // positive predicates suffice (no `not(target_os = "macos")` disambiguation).
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     {
         Ok(Box::new(carrick_host_bsd::KqueueMultiplexer::new()?))
     }
     #[cfg(not(any(
-        feature = "platform-macos",
-        feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd"
     )))]
     {
         Err(OsError::from_raw(libc::ENOSYS))

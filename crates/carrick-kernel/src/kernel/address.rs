@@ -15,7 +15,7 @@ const AARCH64_TTBR0_ROOT_MASK: u64 = (1_u64 << 48) - 1;
 pub struct Asid(NonZeroU16);
 
 impl Asid {
-    pub(crate) const fn from_registry_allocation(raw: NonZeroU16) -> Self {
+    pub const fn from_registry_allocation(raw: NonZeroU16) -> Self {
         Self(raw)
     }
 
@@ -89,7 +89,7 @@ pub struct VmaRevision(u64);
 impl VmaRevision {
     pub const INITIAL: Self = Self(1);
 
-    pub(crate) const fn from_authority_raw(raw: u64) -> Self {
+    pub const fn from_authority_raw(raw: u64) -> Self {
         Self(raw)
     }
 

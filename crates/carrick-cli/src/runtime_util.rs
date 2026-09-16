@@ -199,9 +199,9 @@ pub(crate) fn resolve_volumes_from_specs(
     let mut mounts = Vec::new();
     for spec in specs {
         let (target, readonly_override) = parse_volumes_from_spec(spec)?;
-        let id = carrick_runtime::container::resolve(target)
+        let id = carrick_kernel::container::resolve(target)
             .map_err(|_| anyhow::anyhow!("No such container: {target}"))?;
-        let state = carrick_runtime::container::ContainerState::load(&id)?;
+        let state = carrick_kernel::container::ContainerState::load(&id)?;
         for mount in &state.config.mounts {
             let mut inherited = mount.clone();
             if readonly_override == Some(true) {

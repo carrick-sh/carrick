@@ -83,9 +83,9 @@ impl SyscallRequest {
 /// One immutable syscall identity plus the effective scalar arguments selected
 /// by the one-time preflight pipeline.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PreparedSyscall {
-    pub(crate) original_args: SyscallArgs,
-    pub(crate) request: SyscallRequest,
+pub struct PreparedSyscall {
+    pub original_args: SyscallArgs,
+    pub request: SyscallRequest,
 }
 
 impl PreparedSyscall {
@@ -98,7 +98,7 @@ impl PreparedSyscall {
 ///
 /// Deliberately not `Clone`/`Copy`: terminal dispatch outcomes own continuation
 /// and descriptor state that must retain a single run-loop owner.
-pub(crate) enum PreparedDispatch {
+pub enum PreparedDispatch {
     Invoke(PreparedSyscall),
     Complete {
         syscall: PreparedSyscall,
@@ -132,7 +132,7 @@ pub(crate) fn merge_policy_terminal(
 }
 
 /// Single owner for terminal syscall publication across deferred run-loop work.
-pub(crate) struct SyscallCompletionToken {
+pub struct SyscallCompletionToken {
     syscall: PreparedSyscall,
     context: crate::kernel::KernelContext,
     container_id: crate::kernel::container::ContainerId,
@@ -140,7 +140,7 @@ pub(crate) struct SyscallCompletionToken {
 }
 
 impl SyscallCompletionToken {
-    pub(crate) fn new(
+    pub fn new(
         syscall: PreparedSyscall,
         context: crate::kernel::KernelContext,
         observers: Option<Arc<crate::observe::ObserverChain>>,
@@ -154,13 +154,13 @@ impl SyscallCompletionToken {
         }
     }
 
-    pub(crate) const fn syscall(&self) -> PreparedSyscall {
+    pub const fn syscall(&self) -> PreparedSyscall {
         self.syscall
     }
 
     /// Publish a return only after the engine has accepted the actual guest
     /// completion. Ownership of `self` makes duplicate publication impossible.
-    pub(crate) fn publish_return(self, reporter: &CompatReporter, value: i64) {
+    pub fn publish_return(self, reporter: &CompatReporter, value: i64) {
         debug_assert_eq!(self.context.task().container().id(), self.container_id);
         let info = self.syscall.effective_info();
         let outcome = crate::observe::SyscallOutcome::from_retval(value);
@@ -284,7 +284,7 @@ impl<M: CurrentMmMemory> SyscallCtx<'_, M> {
 /// non-memory ptrace requests return false and execute without acquiring or
 /// consulting the execution lease lock.
 #[inline]
-pub(crate) const fn syscall_requires_execution_lease(nr: u64, args: SyscallArgs) -> bool {
+pub const fn syscall_requires_execution_lease(nr: u64, args: SyscallArgs) -> bool {
     match nr {
         270 | 271 => true,
         117 => matches!(

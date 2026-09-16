@@ -59,11 +59,15 @@ pub(super) use brk::update_semantic_heap_pages;
 pub(crate) mod madvise;
 pub(crate) mod vma;
 pub use self::vma::*;
-pub(crate) mod fault;
+pub mod fault;
 pub(crate) use self::fault::*;
 pub(crate) use madvise::MadviseCoveredSegment;
-pub(crate) mod backing;
+pub mod backing;
 pub(crate) use self::backing::*;
+// The carrier's boot path installs the private file backings before the
+// first guest instruction, so this one item is `pub` where the rest of the
+// backing glob stays crate-internal.
+pub use self::backing::boot_private_file_backings;
 pub(crate) mod mmap;
 #[cfg(test)]
 pub(crate) use madvise::MadviseRangeMeta;
@@ -108,7 +112,7 @@ mutation_syscall_table! {
 /// Dispatcher-owned, revisioned wrapper around the sole production memory/VMA
 /// authority. Ordinary syscall and `/proc` access keeps using this same
 /// `MemState` mutex; the K1 observer only derives owned occupancy rows from it.
-pub(crate) struct MemAuthority {
+pub struct MemAuthority {
     state: parking_lot::Mutex<MemState>,
     revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -289,7 +293,7 @@ impl MemAuthority {
 
 /// Owned memory-subsystem state. Split out of `SyscallDispatcher`.
 #[derive(Clone)]
-pub(crate) struct MemState {
+pub struct MemState {
     pub(super) deferred_anonymous: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,
     pub layout: MemoryLayout,
     /// Canonical semantic VMAs owned by this address space.
@@ -1985,9 +1989,9 @@ impl SyscallDispatcher {
         self.mem_view().memfd_has_writable_shared_map(description)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[inline]
-    pub(crate) fn record_dynamic_mapping(
+    pub fn record_dynamic_mapping(
         &self,
         start: u64,
         len: u64,
@@ -2015,17 +2019,17 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn mmap_fault_is_sigbus(&self, addr: u64) -> bool {
+    pub fn mmap_fault_is_sigbus(&self, addr: u64) -> bool {
         self.mem_view().mmap_fault_is_sigbus(addr)
     }
 
     #[inline]
-    pub(crate) fn fault_requires_mm_mutation(&self, addr: u64) -> bool {
+    pub fn fault_requires_mm_mutation(&self, addr: u64) -> bool {
         self.mem_view().fault_requires_mm_mutation(addr)
     }
 
     #[inline]
-    pub(crate) fn mmap_growdown_fault_plan<'permit>(
+    pub fn mmap_growdown_fault_plan<'permit>(
         &self,
         permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
         addr: u64,
@@ -2045,7 +2049,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn commit_mmap_growdown(&self, plan: MmapGrowdownFaultPlan) {
+    pub fn commit_mmap_growdown(&self, plan: MmapGrowdownFaultPlan) {
         self.mem_view().commit_mmap_growdown(plan);
     }
 
@@ -2083,7 +2087,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn resident_fault_plan<'permit>(
+    pub fn resident_fault_plan<'permit>(
         &self,
         permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
         address: u64,
@@ -2091,15 +2095,15 @@ impl SyscallDispatcher {
         self.mem_view().resident_fault_plan(permit, address)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[inline]
-    pub(crate) fn seed_resident_fault_for_test(&self, page: u64, prot: u64) {
+    pub fn seed_resident_fault_for_test(&self, page: u64, prot: u64) {
         self.mem_view().seed_resident_fault_for_test(page, prot);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[inline]
-    pub(crate) fn with_resident_fault_plan_for_test<T>(
+    pub fn with_resident_fault_plan_for_test<T>(
         &self,
         page: u64,
         use_plan: impl FnOnce(ResidentFaultPlan<'_>) -> T,
@@ -2109,7 +2113,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn commit_resident_fault(&self, plan: ResidentFaultPlan) {
+    pub fn commit_resident_fault(&self, plan: ResidentFaultPlan) {
         self.mem_view().commit_resident_fault(plan);
     }
 

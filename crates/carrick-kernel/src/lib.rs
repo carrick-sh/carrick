@@ -57,6 +57,12 @@ pub mod exec_helpers;
 pub mod exec_stamps;
 pub mod fanotify;
 pub(crate) mod file_authority;
+// The kernel's file authority is internal, but one binding type crosses the
+// crate boundary: the carrier activates the authority on the root file table
+// (`SyscallDispatcher::activate_file_authority`) and names what comes back.
+// Re-exported here so exactly those two types are publicly reachable and the
+// rest of the authority's command/outcome vocabulary stays crate-internal.
+pub use file_authority::{AuthorityFatal, FileAuthorityBinding};
 pub mod host_tty;
 pub(crate) mod inotify;
 /// Typed object identities and reservation contracts for the backend-neutral

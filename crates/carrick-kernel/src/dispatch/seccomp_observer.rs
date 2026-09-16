@@ -213,8 +213,8 @@ impl SyscallDispatcher {
         self.interceptors = Some(Arc::new(chain));
     }
 
-    #[cfg(test)]
-    pub(crate) fn interceptors(&self) -> Option<&Arc<crate::observe::intercept::InterceptorChain>> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn interceptors(&self) -> Option<&Arc<crate::observe::intercept::InterceptorChain>> {
         self.interceptors.as_ref()
     }
 
@@ -283,7 +283,7 @@ impl SyscallDispatcher {
 
     /// Apply every one-time syscall transform and policy layer in the single
     /// authoritative order, then publish the effective entry exactly once.
-    pub(crate) fn prepare_syscall(
+    pub fn prepare_syscall(
         &self,
         kernel: &crate::kernel::KernelContext,
         original: SyscallRequest,
@@ -413,13 +413,13 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(crate) fn identity_fast_path_enabled(&self) -> bool {
+    pub fn identity_fast_path_enabled(&self) -> bool {
         // The EL1 shim answers identity syscalls without a dispatch, so it must
         // be off whenever a guest filter is active OR an observer requests full visibility.
         !self.requires_syscall_traps()
     }
 
-    pub(crate) fn requires_syscall_traps(&self) -> bool {
+    pub fn requires_syscall_traps(&self) -> bool {
         self.interceptors.is_some()
             || self.seccomp.is_active()
             || self.observers.as_ref().is_some_and(|chain| {

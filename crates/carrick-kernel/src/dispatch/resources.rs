@@ -68,34 +68,34 @@ thread_local! {
 
 /// Exhaustive current-thread resource-scope audit used before an executor is
 /// allowed to load another logical task.
-pub(crate) fn executor_boundary_is_clear() -> bool {
+pub fn executor_boundary_is_clear() -> bool {
     ACTIVE_CONTEXT.with(|active| active.get().is_null())
         && CAPTURED_RESOURCES.with(|stack| stack.borrow().is_empty())
         && RETIRING_FILE_TABLES.with(|stack| stack.borrow().is_empty())
 }
 
-#[cfg(test)]
-pub(crate) fn with_dirty_captured_resources_for_executor_test<R>(
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_dirty_captured_resources_for_executor_test<R>(
     context: &crate::kernel::KernelContext,
     operation: impl FnOnce() -> R,
 ) -> R {
     with_captured_resources(context, operation)
 }
 
-#[cfg(test)]
-pub(crate) fn with_dirty_retiring_resources_for_executor_test<R>(
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_dirty_retiring_resources_for_executor_test<R>(
     files: Arc<crate::kernel::FileTable>,
     operation: impl FnOnce() -> R,
 ) -> R {
     with_retiring_file_table(files, operation)
 }
 
-#[cfg(test)]
-pub(crate) struct ExecutorBoundaryResourcesTestGuard {
+#[cfg(any(test, feature = "test-support"))]
+pub struct ExecutorBoundaryResourcesTestGuard {
     context: Box<crate::kernel::KernelContext>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for ExecutorBoundaryResourcesTestGuard {
     fn drop(&mut self) {
         RETIRING_FILE_TABLES.with(|stack| {
@@ -111,9 +111,11 @@ impl Drop for ExecutorBoundaryResourcesTestGuard {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn dirty_executor_boundary_resources_guard_for_test()
--> ExecutorBoundaryResourcesTestGuard {
+// Test fixture reachable through `test-support`, so `cfg(test)` is not set
+// for it and clippy's `allow-{unwrap,expect}-in-tests` does not apply.
+#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+pub fn dirty_executor_boundary_resources_guard_for_test() -> ExecutorBoundaryResourcesTestGuard {
     let dispatcher = crate::dispatch::SyscallDispatcher::new();
     let context = Box::new(
         dispatcher

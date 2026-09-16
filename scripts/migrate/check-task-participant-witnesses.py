@@ -23,7 +23,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SCAN_ROOT = REPO_ROOT / "crates" / "carrick-runtime" / "src"
 # The filesystem model moved to crates/carrick-vfs; keep it in scope so a
 # task-participant witness cannot be lost by relocating a file.
-DEFAULT_SCAN_ROOTS = (DEFAULT_SCAN_ROOT, REPO_ROOT / "crates" / "carrick-vfs" / "src")
+DEFAULT_SCAN_ROOTS = (
+    DEFAULT_SCAN_ROOT,
+    REPO_ROOT / "crates" / "carrick-kernel" / "src",
+    REPO_ROOT / "crates" / "carrick-vfs" / "src",
+)
 
 RAW_TASK_MEMBERSHIP = "raw task membership arithmetic"
 RAW_TASK_PROJECTION = "generic task membership projection"
@@ -51,8 +55,8 @@ ALLOWED_NUMERIC_METHOD_SUFFIX = "_for_probe"
 
 CRASH_MUTATION_OWNERS = frozenset(
     {
-        "crates/carrick-runtime/src/kernel/guest_execution.rs",
-        "crates/carrick-runtime/src/kernel/objects.rs",
+        "crates/carrick-kernel/src/kernel/guest_execution.rs",
+        "crates/carrick-kernel/src/kernel/objects.rs",
     }
 )
 # The exact-mm stage-1 quiesce protocol (`dispatch/mm_quiesce.rs`) and the
@@ -60,7 +64,7 @@ CRASH_MUTATION_OWNERS = frozenset(
 # a census witness bypass, not a diagnostic.
 EXACT_MM_QUIESCE_OWNERS = frozenset(
     {
-        "crates/carrick-runtime/src/dispatch/mm_quiesce.rs",
+        "crates/carrick-kernel/src/dispatch/mm_quiesce.rs",
         "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
     }
 )
@@ -439,7 +443,7 @@ def scan_source(source: str, relative_path: str) -> list[Finding]:
                     f"threads() scalar method {method}()",
                 )
         if (
-            relative_path == "crates/carrick-runtime/src/kernel/crash_capture.rs"
+            relative_path == "crates/carrick-kernel/src/kernel/crash_capture.rs"
             and _sequence_at(tokens, index, [".", "threads", "(", ")"])
         ):
             add(index, RAW_TASK_PROJECTION, "CrashQuorum generic Task::threads()")

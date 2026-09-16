@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use carrick_runtime::kernel::objects::{ExecutionGeneration, ExecutorId, TaskKey};
-use carrick_runtime::observe::{
+use carrick_kernel::kernel::objects::{ExecutionGeneration, ExecutorId, TaskKey};
+use carrick_kernel::observe::{
     AuditReason, AuditVerdict, ExitOwner, FirstTouchDeliverReason, ForkKind, GuestCpuId,
     KernelAuditor, WakeRejectionReason, ZombieReaper,
 };
@@ -194,7 +194,7 @@ impl KernelAuditor for EveryChildRuns {
     fn exit_settled(
         &self,
         child: TaskKey,
-        _status: carrick_runtime::kernel::LinuxWaitStatus,
+        _status: carrick_kernel::kernel::LinuxWaitStatus,
         _owner: ExitOwner,
     ) -> AuditVerdict {
         if let Some(tx) = self.pending.lock().remove(&child) {
@@ -323,7 +323,7 @@ impl KernelAuditor for ExitBudget {
     fn exit_settled(
         &self,
         task: TaskKey,
-        _status: carrick_runtime::kernel::LinuxWaitStatus,
+        _status: carrick_kernel::kernel::LinuxWaitStatus,
         _owner: ExitOwner,
     ) -> AuditVerdict {
         if let Some(tx) = self.pending.lock().remove(&task) {
@@ -341,8 +341,8 @@ impl KernelAuditor for ExitBudget {
 mod tests {
     use super::*;
     use carrick_hal::ThreadId;
-    use carrick_runtime::kernel::ids::TaskId;
-    use carrick_runtime::kernel::{LinuxWaitStatus, ObjectIdRegistry};
+    use carrick_kernel::kernel::ids::TaskId;
+    use carrick_kernel::kernel::{LinuxWaitStatus, ObjectIdRegistry};
 
     fn sample_task_key(pid: i32) -> TaskKey {
         let registry = ObjectIdRegistry::new();

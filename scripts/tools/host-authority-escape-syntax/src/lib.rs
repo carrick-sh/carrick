@@ -248,7 +248,9 @@ impl CarrierProcessFinding {
 
 /// Find host process creation/control calls in production Rust syntax.
 ///
-/// Items guarded by `cfg(test)` are deliberately omitted. File-level fixtures,
+/// Items guarded by `cfg(test)` (or the equivalent `feature = "test-support"`
+/// gate the crate split needs for a sibling crate's tests) are deliberately
+/// omitted. File-level fixtures,
 /// integration tests, and explicit probe binaries are classified by the caller,
 /// which has the repository path needed to do that without guessing.
 pub fn scan_carrier_process_source(source: &str) -> Result<Vec<CarrierProcessFinding>, ScanError> {
@@ -326,10 +328,34 @@ impl CarrierProcessScanner {
 }
 
 fn cfg_test(attributes: &[syn::Attribute]) -> bool {
+    /// `feature = "test-support"` is test scope, exactly like `cfg(test)`.
+    ///
+    /// Splitting the runtime into carrick-kernel + carrick-runtime moved test
+    /// fixtures out of the crate whose tests consume them, and `cfg(test)` is
+    /// per-crate-compilation: a sibling crate's tests cannot see it. Those
+    /// fixtures are therefore gated `cfg(any(test, feature = "test-support"))`.
+    /// No product target enables `test-support` (carrick-cli forwards only the
+    /// product features; the feature is reached solely through a crate's own
+    /// dev-dependencies and `carrick-kernel-example`), so the gate still means
+    /// "test code" in every shipped build. Recognising the exact feature NAME
+    /// keeps that narrow: any other `feature = "..."` term is still production.
+    fn is_test_support_feature(meta: &syn::MetaNameValue) -> bool {
+        if !meta.path.is_ident("feature") {
+            return false;
+        }
+        matches!(
+            &meta.value,
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(name),
+                ..
+            }) if name.value() == "test-support"
+        )
+    }
+
     fn test_only(meta: &syn::Meta) -> bool {
         match meta {
             syn::Meta::Path(path) => path.is_ident("test"),
-            syn::Meta::NameValue(_) => false,
+            syn::Meta::NameValue(name_value) => is_test_support_feature(name_value),
             syn::Meta::List(list) if list.path.is_ident("all") => list
                 .parse_args_with(
                     syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,

@@ -261,7 +261,7 @@ test *ARGS:
         # is defined as the tests that do NOT need the HVF runtime or Docker;
         # those belong to a guest-capable lane (`just conformance*`,
         # `cargo test -p carrick-cli --test <name>`).
-        cargo test --workspace --exclude carrick-runtime --exclude carrick-cli --exclude carrick-host --exclude carrick-vfs --exclude carrick-vmm-hvf --lib --bins {{ARGS}}
+        cargo test --workspace --exclude carrick-runtime --exclude carrick-kernel --exclude carrick-cli --exclude carrick-host --exclude carrick-vfs --exclude carrick-vmm-hvf --lib --bins {{ARGS}}
         # The authenticated jit-shape builders/parsers have measured >1 MiB
         # debug frames. Several tests need two in one body; libtest's ~2 MiB
         # default has repeatedly been tipped over by unrelated additions. Keep
@@ -295,6 +295,15 @@ test *ARGS:
         # `fast_readonly_open_uses_the_immutable_lower_when_the_sparse_upper_is_absent`
         # lost its fast path. Serial: 282/282, same coverage as before the move.
         env RUST_TEST_THREADS=1 cargo test -p carrick-vfs --lib {{ARGS}}
+        # carrick-kernel forks from the harness for the same reason
+        # carrick-runtime does: `dispatch/tests.rs` and the process/wait
+        # suites it inherited from the runtime `libc::fork()` and drive a
+        # real stop/exit handshake with the child. Child reaping is
+        # PROCESS-wide, so a fork test on a sibling harness thread can
+        # consume a stop another module is mid-handshake with and the
+        # rightful parent blocks forever. `test-support` is on because the
+        # kernel's own unit tests are the consumers of its test doubles.
+        env RUST_TEST_THREADS=1 cargo test -p carrick-kernel --lib --features test-support {{ARGS}}
         env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib {{ARGS}}
         # carrick-vmm-hvf is serial for a THIRD reason, and it is structural
         # rather than a test-hygiene lapse: the carrier is process-global by

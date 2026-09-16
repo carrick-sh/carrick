@@ -506,7 +506,7 @@ fn tgkill_to_sibling_emits_signalthread() {
         | carrick_abi::LinuxCloneFlags::FILES
         | carrick_abi::LinuxCloneFlags::SIGHAND
         | carrick_abi::LinuxCloneFlags::THREAD;
-    let plan = carrick_runtime::kernel::ClonePlan::from_flags(flags).unwrap();
+    let plan = carrick_kernel::kernel::ClonePlan::from_flags(flags).unwrap();
     let sibling_context = initial
         .kernel()
         .reserve_thread_clone(&initial, plan, None)
@@ -557,7 +557,7 @@ fn tgkill_to_sibling_uses_kernel_pending_without_siginfo_sidecar() {
         | carrick_abi::LinuxCloneFlags::FILES
         | carrick_abi::LinuxCloneFlags::SIGHAND
         | carrick_abi::LinuxCloneFlags::THREAD;
-    let plan = carrick_runtime::kernel::ClonePlan::from_flags(flags).unwrap();
+    let plan = carrick_kernel::kernel::ClonePlan::from_flags(flags).unwrap();
     let sibling_context = initial
         .kernel()
         .reserve_thread_clone(&initial, plan, None)
@@ -658,7 +658,7 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
         | carrick_abi::LinuxCloneFlags::FILES
         | carrick_abi::LinuxCloneFlags::SIGHAND
         | carrick_abi::LinuxCloneFlags::THREAD;
-    let plan = carrick_runtime::kernel::ClonePlan::from_flags(flags).unwrap();
+    let plan = carrick_kernel::kernel::ClonePlan::from_flags(flags).unwrap();
     let sibling_context = initial
         .kernel()
         .reserve_thread_clone(&initial, plan, None)
@@ -775,7 +775,7 @@ fn tgkill_to_retired_sibling_returns_esrch_before_runtime_withdrawal() {
         | carrick_abi::LinuxCloneFlags::FILES
         | carrick_abi::LinuxCloneFlags::SIGHAND
         | carrick_abi::LinuxCloneFlags::THREAD;
-    let plan = carrick_runtime::kernel::ClonePlan::from_flags(flags).unwrap();
+    let plan = carrick_kernel::kernel::ClonePlan::from_flags(flags).unwrap();
     let sibling_context = initial
         .kernel()
         .reserve_thread_clone(&initial, plan, None)

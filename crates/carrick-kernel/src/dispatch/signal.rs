@@ -83,11 +83,11 @@ use crate::linux_abi::LinuxSiginfo;
 use carrick_abi::{SigBlockMask, SigSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DispatchPendingSignal {
-    pub(crate) signum: i32,
+pub struct DispatchPendingSignal {
+    pub signum: i32,
     pub(crate) owner: crate::kernel::SignalPendingOwner,
-    pub(crate) siginfo: Option<LinuxSiginfo>,
-    pub(crate) job_control_generation: Option<crate::kernel::JobControlStopInvalidationGeneration>,
+    pub siginfo: Option<LinuxSiginfo>,
+    pub job_control_generation: Option<crate::kernel::JobControlStopInvalidationGeneration>,
 }
 
 /// Real-time signals (`SIGRTMIN`..=`SIGRTMAX`, kernel numbers 32..=64) queue
@@ -328,7 +328,7 @@ impl<'a> SignalView<'a> {
         self.cross.identity_pid()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[inline]
     pub(in crate::dispatch) fn capture_one_task_context(
         &self,
@@ -362,7 +362,10 @@ impl<'a> SignalView<'a> {
         self.cross.request_signal_pump();
     }
 
-    #[cfg(test)]
+    // Test fixture reachable through `test-support`, so `cfg(test)` is not set
+    // for it and clippy's `allow-{unwrap,expect}-in-tests` does not apply.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
     pub(crate) fn exact_signal_context_for_test(&self) -> crate::kernel::KernelContext {
         self.capture_one_task_context()
             .expect("capture exact test signal context")
@@ -2701,9 +2704,9 @@ impl SyscallDispatcher {
         context.shared().sighand().install_action(signal, action);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[inline]
-    pub(crate) fn exact_signal_context_for_test(&self) -> crate::kernel::KernelContext {
+    pub fn exact_signal_context_for_test(&self) -> crate::kernel::KernelContext {
         self.signal_view().exact_signal_context_for_test()
     }
 
@@ -2770,7 +2773,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn child_exit_signal_snapshot_needs_pump(
+    pub fn child_exit_signal_snapshot_needs_pump(
         &self,
         snapshot: &crate::kernel::core::KernelTaskSignalSnapshot,
         exit_signal: u32,
@@ -2912,7 +2915,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn drain_xsignals_process_directed(&self, context: &crate::kernel::KernelContext) {
+    pub fn drain_xsignals_process_directed(&self, context: &crate::kernel::KernelContext) {
         self.signal_view().drain_xsignals_process_directed(context)
     }
 
@@ -2936,7 +2939,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn take_deliverable_pending_from(
+    pub fn take_deliverable_pending_from(
         &self,
         context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
@@ -2946,7 +2949,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn has_deliverable_dispatch_pending_for_wait(
+    pub fn has_deliverable_dispatch_pending_for_wait(
         &self,
         context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
@@ -2965,7 +2968,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn signal_wait_should_eintr(
+    pub fn signal_wait_should_eintr(
         &self,
         context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
@@ -3020,7 +3023,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn mark_in_process_signal_pending(
+    pub fn mark_in_process_signal_pending(
         &self,
         context: &crate::kernel::KernelContext,
         signum: i32,
@@ -3274,7 +3277,7 @@ fn names_self_pid(x: i64) -> bool {
 /// domain its payload actually lives in; [`Self::host_kill_encoding`] is the
 /// ONE raw escape back to the kill(2) wire value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SignalTarget {
+pub enum SignalTarget {
     /// One process named by its HOST pid: `kill(pid > 0)` after ns→host
     /// translation or `pidfd_send_signal`'s registered host pid.
     HostProcess(HostPid),

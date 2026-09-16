@@ -6,11 +6,11 @@
 //! is the difference between "we wrote a file" and "the file is a core".
 //!
 //! Layout facts (note sizes, note types, the `CORE` owner, header sizes) come
-//! from [`carrick_runtime::core_dump`], including the architecture-note owner
+//! from [`carrick_kernel::core_dump`], including the architecture-note owner
 //! whose ABI definition the writer re-exports, so writer and validator cannot
 //! drift.
 
-use carrick_runtime::core_dump::{
+use carrick_kernel::core_dump::{
     AARCH64_FPREGSET_SIZE, AARCH64_TLS_SIZE, ELF_CLASS64, ELF_DATA_LSB, ELF_VERSION_CURRENT,
     EM_AARCH64, ET_CORE, LINUX_ELF_NOTE_OWNER, NOTE_ALIGN, NOTE_OWNER, NT_ARM_TLS, NT_AUXV,
     NT_FILE, NT_FPREGSET, NT_PRPSINFO, NT_PRSTATUS, NT_SIGINFO, ORACLE_PRPSINFO_SIZE,
@@ -657,9 +657,9 @@ mod tests {
     use super::*;
 
     fn core_with_regions(
-        regions: Vec<carrick_runtime::core_dump::MemoryRegion<'static>>,
+        regions: Vec<carrick_kernel::core_dump::MemoryRegion<'static>>,
     ) -> Vec<u8> {
-        use carrick_runtime::core_dump::{
+        use carrick_kernel::core_dump::{
             AARCH64_GREGS, CoreDump, ProcessIdentity, SignalInfo, ThreadRegisters, ThreadState,
         };
         let mut gregs = [0_u64; AARCH64_GREGS];
@@ -702,7 +702,7 @@ mod tests {
     }
 
     fn complete_core() -> Vec<u8> {
-        use carrick_runtime::core_dump::MemoryRegion;
+        use carrick_kernel::core_dump::MemoryRegion;
         core_with_regions(vec![MemoryRegion {
             start: 0x1_0000,
             flags: 5,
@@ -872,7 +872,7 @@ mod tests {
         note[note_offset + 4..note_offset + 8].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(validate_bytes(&note, "bad-note").is_err());
 
-        use carrick_runtime::core_dump::MemoryRegion;
+        use carrick_kernel::core_dump::MemoryRegion;
         let mut overlapping_loads = core_with_regions(vec![
             MemoryRegion {
                 start: 0x1_0000,

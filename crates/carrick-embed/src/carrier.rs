@@ -169,7 +169,7 @@ impl Carrier {
 #[cfg(test)]
 mod tests {
     use super::Carrier;
-    use carrick_runtime::kernel::{LaunchContext, RunId};
+    use carrick_kernel::kernel::{LaunchContext, RunId};
 
     fn assert_send_sync_clone<T: Send + Sync + Clone>() {}
 

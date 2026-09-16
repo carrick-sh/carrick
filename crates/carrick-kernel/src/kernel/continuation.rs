@@ -36,7 +36,7 @@ static NEXT_CONTINUATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_RESOURCE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
-pub(crate) struct FutexSource(pub(crate) Arc<FutexTable>);
+pub struct FutexSource(pub(crate) Arc<FutexTable>);
 
 impl std::fmt::Debug for FutexSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -44,7 +44,7 @@ impl std::fmt::Debug for FutexSource {
     }
 }
 
-pub(crate) fn next_nonzero(source: &AtomicU64) -> u64 {
+pub fn next_nonzero(source: &AtomicU64) -> u64 {
     let value = source.fetch_add(1, Ordering::Relaxed);
     if value == 0 || value == u64::MAX {
         carrick_fatal!(
@@ -58,8 +58,9 @@ pub(crate) fn next_nonzero(source: &AtomicU64) -> u64 {
 pub mod readiness;
 pub mod wait_service;
 
+pub(crate) use self::readiness::ReadinessProbe;
+pub use self::readiness::SignalReadinessProbe;
 pub use self::readiness::{ContinuationWakeToken, ReservedSignal, ResumeContext, StaleThreadCause};
-pub(crate) use self::readiness::{ReadinessProbe, SignalReadinessProbe};
 pub use self::wait_service::{
     CarrierWaitService, ContinuationEventFuture, WaitServiceError, WaitServiceTopology,
     WakePublishReceipt,
@@ -638,7 +639,7 @@ fn registration_diagnostic(binding: &RegistrationBinding) -> ContinuationRegistr
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct OwnedFdRegistration {
+pub struct OwnedFdRegistration {
     #[allow(dead_code)]
     pub(crate) fd: Arc<OwnedFd>,
     #[allow(dead_code)]
@@ -684,7 +685,7 @@ fn fd_wait_deadline(
 }
 
 #[derive(Debug)]
-pub(crate) enum ContinuationDetail {
+pub enum ContinuationDetail {
     Futex {
         wait: FutexWait,
         index: Option<i64>,
@@ -860,7 +861,7 @@ pub enum ContinuationFamily {
 impl ContinuationFamily {
     /// Stable event-ring representation. Keep this explicit rather than
     /// depending on Rust's enum layout: cores and LLDB scripts outlive builds.
-    pub(crate) const fn event_code(self) -> u8 {
+    pub const fn event_code(self) -> u8 {
         match self {
             Self::FutexWait => 1,
             Self::FutexWaitv => 2,
@@ -1514,7 +1515,7 @@ impl BlockedContinuation {
         }
     }
 
-    pub(crate) fn bind_product_futex(&mut self, futex: &Arc<FutexTable>) {
+    pub fn bind_product_futex(&mut self, futex: &Arc<FutexTable>) {
         self.state_mut().private_futex = Some(FutexSource(Arc::clone(futex)));
     }
 
@@ -1634,7 +1635,7 @@ impl BlockedContinuation {
         fingerprint
     }
 
-    pub(crate) fn attach_registration(
+    pub fn attach_registration(
         &mut self,
         mut registration: ContinuationRegistration,
     ) -> Result<(), WaitServiceError> {
@@ -1701,7 +1702,7 @@ impl BlockedContinuation {
         Ok(())
     }
 
-    pub(crate) fn install_temporary_signal_mask(&self, context: &KernelContext) {
+    pub fn install_temporary_signal_mask(&self, context: &KernelContext) {
         let masks = self.state().signal_masks;
         let Some(temporary) = masks.temporary else {
             return;
@@ -1747,7 +1748,7 @@ impl BlockedContinuation {
         won
     }
 
-    pub(crate) fn ready_event(&self) -> Result<ContinuationEvent, ContinuationResumeError> {
+    pub fn ready_event(&self) -> Result<ContinuationEvent, ContinuationResumeError> {
         let binding = self
             .state()
             .registration
@@ -2350,5 +2351,5 @@ pub async fn yield_runner_quantum() {
     YieldOnce(false).await;
 }
 
-#[cfg(test)]
-pub(crate) mod tests;
+#[cfg(any(test, feature = "test-support"))]
+pub mod tests;

@@ -278,7 +278,7 @@ pub struct ConnectionRecord {
 }
 
 #[derive(Debug)]
-pub(crate) struct ConnectionRecordState {
+pub struct ConnectionRecordState {
     pub id: u64,
     pub timestamp: std::time::SystemTime,
     pub peer_addr: SocketAddr,
@@ -354,7 +354,7 @@ impl IntoTargetSpec for (String, u16) {
 }
 
 #[derive(Clone)]
-pub(crate) enum InterceptRule {
+pub enum InterceptRule {
     Mock(Arc<dyn MockService>),
     Refuse(LinuxErrno),
 }

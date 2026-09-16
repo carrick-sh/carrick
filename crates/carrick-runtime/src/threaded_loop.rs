@@ -3,10 +3,10 @@
 //! kick+futex backends (KVM/bhyve/NVMM) and the macOS/HVF backend drive the SAME
 //! loop — each plugs in a `HostBackend` impl, never a copied loop.
 
-use crate::dispatch::SyscallDispatcher;
-use crate::kernel::CarrierProcess;
-use crate::run_result::{RunResult, RuntimeError};
 use carrick_fatal::carrick_fatal;
+use carrick_kernel::dispatch::SyscallDispatcher;
+use carrick_kernel::kernel::CarrierProcess;
+use carrick_kernel::run_result::{RunResult, RuntimeError};
 
 /// The host-OS seam for the shared threaded vCPU loop ([`run_threaded_loop`]).
 ///
@@ -93,7 +93,7 @@ pub trait HostBackend: Send + Sync + 'static {
         &self,
         kicker: &std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
         main_tid: crate::thread::ThreadId,
-        container: crate::kernel::ContainerId,
+        container: carrick_kernel::kernel::ContainerId,
     ) {
         #[cfg(any(
             feature = "platform-linux",
@@ -118,7 +118,7 @@ pub trait HostBackend: Send + Sync + 'static {
 #[must_use = "initial frame inventory must commit with its container root"]
 #[derive(Debug)]
 pub(crate) struct PreparedInitialFrameInventory {
-    kernel: std::sync::Arc<crate::kernel::Kernel>,
+    kernel: std::sync::Arc<carrick_kernel::kernel::Kernel>,
     receipt: Option<carrick_hal::FrameInventoryApplyReceipt>,
 }
 
@@ -151,7 +151,7 @@ impl Drop for PreparedInitialFrameInventory {
 /// The returned guard keeps the shared publication rollback-capable until the
 /// container-root transaction commits.
 pub(crate) fn prepare_initial_frame_inventory<Inventory>(
-    context: Option<&crate::kernel::KernelContext>,
+    context: Option<&carrick_kernel::kernel::KernelContext>,
     extent_count: usize,
     inventory: Inventory,
 ) -> Result<Option<PreparedInitialFrameInventory>, RuntimeError>
@@ -165,9 +165,9 @@ where
     };
     let event_count = extent_count
         .checked_mul(2)
-        .ok_or(crate::kernel::FrameInventoryReserveError::CandidateCountExceedsEvents)?;
+        .ok_or(carrick_kernel::kernel::FrameInventoryReserveError::CandidateCountExceedsEvents)?;
     let capacity = carrick_hal::FrameEventCapacity::for_event_count(event_count)
-        .map_err(crate::kernel::FrameInventoryReserveError::from)?;
+        .map_err(carrick_kernel::kernel::FrameInventoryReserveError::from)?;
     let reservation =
         context
             .kernel()
@@ -224,7 +224,7 @@ fn main_registry_id() -> crate::thread::ThreadId {
 
 pub(crate) struct ThreadedLoopCompletion {
     pub(crate) run: Result<RunResult, RuntimeError>,
-    pub(crate) carrier_control: Option<crate::kernel::control::ManagedCarrierControl>,
+    pub(crate) carrier_control: Option<carrick_kernel::kernel::control::ManagedCarrierControl>,
 }
 
 /// The ONE threaded vCPU run loop, parameterized over the host seam
@@ -266,7 +266,7 @@ fn run_threaded_loop_inner<E, H>(
     host: H,
     max_traps: usize,
     carrier: &crate::carrier::CarrierRuntime,
-    carrier_control: &mut Option<crate::kernel::control::ManagedCarrierControl>,
+    carrier_control: &mut Option<carrick_kernel::kernel::control::ManagedCarrierControl>,
 ) -> Result<RunResult, RuntimeError>
 where
     E: carrick_hal::ThreadedEngine + 'static,
@@ -294,8 +294,8 @@ where
     // the host vCPU-thread scheduler state (a booting child parked in the host's
     // internal boot ppoll is `R`, not `S`). Publish this (root) process as
     // Booting until its vCPU first resumes guest code.
-    crate::run_state::init_table();
-    crate::run_state::publish(crate::run_state::RunState::Booting);
+    carrick_kernel::run_state::init_table();
+    carrick_kernel::run_state::publish(carrick_kernel::run_state::RunState::Booting);
 
     // Install the M:N admission scheduler for this backend's concurrent-vCPU
     // budget: a bounded HostCondvarScheduler for the finite-cap reclaiming
@@ -395,7 +395,7 @@ where
             })?;
     }
     let root_linux_tid = if let Some(process) = hvpatch_process.as_ref() {
-        crate::kernel::LinuxTid::for_task_leader(process.task_id())
+        carrick_kernel::kernel::LinuxTid::for_task_leader(process.task_id())
     } else {
         // Read the root's leader tid from the kernel binding rather than
         // recomputing it from the host pid: the two agree today only because
@@ -443,13 +443,13 @@ where
                 "managed container has no HVPatch root for carrier control".to_owned(),
             )
         })?;
-        let runtime = crate::kernel::control::ExecRuntime::new(64);
-        let archive_runtime = Arc::new(crate::kernel::control::ArchiveRuntime::new(
+        let runtime = carrick_kernel::kernel::control::ExecRuntime::new(64);
+        let archive_runtime = Arc::new(carrick_kernel::kernel::control::ArchiveRuntime::new(
             kernel.dispatcher.archive_authority(),
             8,
         ));
         kernel.install_control_exec_runtime(runtime.clone())?;
-        let guard = crate::kernel::control::ManagedCarrierControl::start(
+        let guard = carrick_kernel::kernel::control::ManagedCarrierControl::start(
             Arc::clone(process.kernel_graph()),
             process.task_key(),
             &container_id,
@@ -560,7 +560,7 @@ where
             // that the carrier still reports as provisional. TTY authority
             // is initialized only after the route exists so its ready
             // acknowledgement cannot be lost.
-            crate::kernel::tty::install(runtime.kernel());
+            carrick_kernel::kernel::tty::install(runtime.kernel());
             kernel
                 .dispatcher
                 .initialize_controlling_tty_for(
@@ -575,7 +575,7 @@ where
                             );
                         }),
                 );
-            crate::kernel::KernelDebugServer::install(
+            carrick_kernel::kernel::KernelDebugServer::install(
                 Arc::clone(runtime.kernel()),
                 kernel
                     .dispatcher
@@ -654,14 +654,14 @@ mod tests {
         );
     }
 
-    fn root_context(pid: i32) -> crate::kernel::KernelContext {
-        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+    fn root_context(pid: i32) -> carrick_kernel::kernel::KernelContext {
+        let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             pid,
             crate::thread::ThreadId::synthetic_for_tests(pid),
             "inventory-root".to_owned(),
         )
         .expect("root bootstrap");
-        crate::kernel::Kernel::bootstrap_root(bootstrap)
+        carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap)
             .expect("root kernel")
             .1
     }

@@ -124,7 +124,7 @@ enum HostWritePayload<'a> {
 }
 
 #[derive(Clone)]
-pub(crate) struct HostPipeWriteTarget<'a> {
+pub struct HostPipeWriteTarget<'a> {
     pub(crate) host_fd: i32,
     pub(crate) host_fd_owner: Option<HostFdRef>,
     pub(crate) nonblocking: bool,

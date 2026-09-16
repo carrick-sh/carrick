@@ -3,27 +3,23 @@
 use crate::run_result::RuntimeError;
 use carrick_spec::{BackendCapabilities, ExecBackendRequest, HostOs, Platform, RunSpec};
 
-pub(crate) use carrick_mem::page_geometry::DEFAULT_LINUX_PAGE_SIZE;
+pub use carrick_mem::page_geometry::DEFAULT_LINUX_PAGE_SIZE;
 pub use carrick_mem::page_geometry::{
     HostPageState, MappingPolicyDecision, MixedPageReason, PageBacking, PageGeometry, PagePerms,
     SubpageState, classify_host_page_state, decide_linux4k_on_16k_mapping,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExecutionPlan {
+pub struct ExecutionPlan {
     pub page_geometry: PageGeometry,
     pub diagnostics: Vec<String>,
 }
 
 #[cfg_attr(
-    any(
-        feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ),
+    any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"),
     allow(dead_code)
 )]
-pub(crate) fn resolve_execution_plan(spec: &RunSpec) -> Result<ExecutionPlan, RuntimeError> {
+pub fn resolve_execution_plan(spec: &RunSpec) -> Result<ExecutionPlan, RuntimeError> {
     resolve_execution_plan_for_request_for_host(
         spec.platform,
         spec.exec_backend,
@@ -32,7 +28,7 @@ pub(crate) fn resolve_execution_plan(spec: &RunSpec) -> Result<ExecutionPlan, Ru
     )
 }
 
-pub(crate) fn resolve_execution_plan_for_request(
+pub fn resolve_execution_plan_for_request(
     platform: Platform,
     exec_backend: ExecBackendRequest,
 ) -> Result<ExecutionPlan, RuntimeError> {

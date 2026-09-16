@@ -1,9 +1,9 @@
 //! Runtime execution entry points that bridge shared run specs to
 //! dispatcher-backed guest execution.
 
-use crate::dispatch::SyscallDispatcher;
-use crate::network::NetworkHostsEntry;
 use crate::runtime::{RunResult, RuntimeError};
+use carrick_kernel::dispatch::SyscallDispatcher;
+use carrick_kernel::network::NetworkHostsEntry;
 #[cfg(feature = "fs-memory")]
 use carrick_spec::FsBackendKind;
 use carrick_spec::{NetworkNamespaceSpec, RunSpec};
@@ -79,10 +79,10 @@ pub(crate) fn entrypoint_not_executable_result() -> RunResult {
 /// key. A foreground run never calls this (it uses an ephemeral per-run
 /// scratch).
 pub(crate) fn detached_stable_scratch_path(id: &str) -> Option<PathBuf> {
-    if !crate::container::is_safe_id(id) {
+    if !carrick_kernel::container::is_safe_id(id) {
         return None;
     }
-    Some(crate::container::container_dir(id).join("scratch"))
+    Some(carrick_kernel::container::container_dir(id).join("scratch"))
 }
 
 /// Record a managed container's overlay path into its registry record so
@@ -91,7 +91,7 @@ pub(crate) fn detached_stable_scratch_path(id: &str) -> Option<PathBuf> {
 /// publishes nothing. Best-effort — a failed write means `exec` cannot find
 /// the overlay later, not a run failure.
 pub(crate) fn record_detached_scratch(id: &str, scratch: &std::path::Path) {
-    if let Ok(mut state) = crate::container::ContainerState::load(id) {
+    if let Ok(mut state) = carrick_kernel::container::ContainerState::load(id) {
         state.config.scratch_path = Some(scratch.to_string_lossy().into_owned());
         let _ = state.persist();
     }
@@ -129,7 +129,9 @@ pub(crate) fn prepare_host_root(
     Ok(HostRootLayout::Materialized)
 }
 
-pub(crate) fn cached_lower_enabled(execution_plan: &crate::page_profile::ExecutionPlan) -> bool {
+pub(crate) fn cached_lower_enabled(
+    execution_plan: &carrick_kernel::page_profile::ExecutionPlan,
+) -> bool {
     #[cfg(target_os = "macos")]
     {
         let _ = execution_plan;
@@ -247,7 +249,7 @@ pub(crate) fn effective_guest_hostname(spec: &RunSpec) -> Cow<'_, str> {
         .as_deref()
         .filter(|hostname| !hostname.is_empty())
         .map(Cow::Borrowed)
-        .unwrap_or_else(|| Cow::Owned(crate::kernel::netns::default_nodename()))
+        .unwrap_or_else(|| Cow::Owned(carrick_kernel::kernel::netns::default_nodename()))
 }
 
 pub(crate) fn seed_guest_baseline(
@@ -305,7 +307,7 @@ pub(crate) fn seed_guest_baseline(
     // find their IP. Docker images typically ship an EMPTY /etc/hosts and rely on
     // the runtime to populate it, so an existence guard here would (wrongly) leave
     // the guest unable to resolve itself (Go os Test...; CPython test_socket).
-    let network_model = crate::network::model::LinuxNetworkModel::from_spec(network);
+    let network_model = carrick_kernel::network::model::LinuxNetworkModel::from_spec(network);
     let mut hosts_content = network_model
         .hosts_config(
             network,

@@ -148,20 +148,12 @@ pub(super) fn epoll_trigger_mode(events: LinuxEpollEvents) -> carrick_hal::event
 /// `EV_CLEAR` spends a host edge exactly once; Carrick re-arms registrations
 /// after guest I/O/backpressure transitions instead of polling a permanently
 /// readable kqueue fd for latch-masked `EPOLLET` readiness.
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 pub(super) fn epoll_host_trigger_mode(events: LinuxEpollEvents) -> carrick_hal::event::TriggerMode {
     epoll_trigger_mode(events)
 }
 
-#[cfg(not(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-)))]
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
 pub(super) fn epoll_host_trigger_mode(events: LinuxEpollEvents) -> carrick_hal::event::TriggerMode {
     epoll_trigger_mode(events)
 }
@@ -3283,7 +3275,7 @@ mod tests {
     // HUP/ERR-observability read-fallback (a mask with neither IN nor OUT still
     // arms read) and routes RDHUP/PRI onto read; the actual kqueue filter
     // selection now lives in (and is tested by) `carrick-host-bsd`'s multiplexer.
-    #[cfg(feature = "platform-macos")]
+    #[cfg(target_os = "macos")]
     #[test]
     fn epoll_interest_selection_preserves_hup_err_observability() {
         use carrick_hal::event::{Interest, TriggerMode};
@@ -3351,7 +3343,7 @@ mod tests {
 
     // `pollevent_to_epoll` must reproduce the direction-sensitive RDHUP/HUP/ERR
     // bits the old `kevent_to_epoll` produced from a single returned kevent.
-    #[cfg(feature = "platform-macos")]
+    #[cfg(target_os = "macos")]
     #[test]
     fn pollevent_translation_preserves_rdhup_hup_err_and_pri() {
         use carrick_hal::event::{PollEvent, Readiness};

@@ -161,7 +161,7 @@ const FD_CEILING_FAST_PATH_SYSCALLS: &[u64] = &[80];
 /// consulted at the dispatch-entry seam before any handler. See the module
 /// docs for provenance and inheritance semantics.
 #[derive(Debug, Clone)]
-pub(crate) struct ContainerPolicy {
+pub struct ContainerPolicy {
     /// Sorted by syscall number (binary-searchable; the table is tiny today
     /// but the invariant keeps growth cheap).
     deny: Vec<(u64, LinuxErrno)>,

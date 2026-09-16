@@ -8,13 +8,13 @@ use crate::linux_abi::LINUX_EBADF;
 use carrick_hal::WaitFd;
 
 #[derive(Debug, Clone)]
-pub(crate) enum WaitFdGuard {
+pub enum WaitFdGuard {
     HostFd(#[allow(dead_code)] HostFdRef),
     ParkedOpener(#[allow(dead_code)] ParkedOpenerToken),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum InternalWaitKind {
+pub enum InternalWaitKind {
     CarrierControl,
     /// A blocking FIFO `open` parked on the peer-presence pipe owned by
     /// `fifo_beacon`. The guest has no fd for the FIFO yet, so there is no
@@ -24,13 +24,13 @@ pub(crate) enum InternalWaitKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct InternalWaitAuthority {
+pub struct InternalWaitAuthority {
     kind: InternalWaitKind,
     generation: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum WaitFdAuthority {
+pub enum WaitFdAuthority {
     Empty,
     Missing,
     Logical {

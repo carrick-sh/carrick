@@ -261,13 +261,13 @@ fn validate_flock_arg<M: CurrentMmMemory>(memory: &M, arg: u64) -> Result<(), Li
 /// conflict for lease purposes iff they name the same underlying file: the host
 /// inode under `--fs host`, or the guest open-path for the in-memory backing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum LeaseFileId {
+pub enum LeaseFileId {
     Inode { dev: u64, ino: u64 },
     Path(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum LogicalRecordLockOwner {
+pub enum LogicalRecordLockOwner {
     Process { pid: i32, serial: u64 },
     Ofd(usize),
 }
@@ -312,7 +312,7 @@ impl From<crate::kernel::TaskKey> for LogicalRecordLockOwner {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LogicalRecordLockRange {
+pub struct LogicalRecordLockRange {
     pub(crate) start: u64,
     pub(crate) end: u64,
 }
@@ -324,7 +324,7 @@ impl LogicalRecordLockRange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LogicalRecordLock {
+pub struct LogicalRecordLock {
     pub(crate) file: LeaseFileId,
     pub(crate) owner: LogicalRecordLockOwner,
     pub(crate) range: LogicalRecordLockRange,
@@ -332,14 +332,14 @@ pub(crate) struct LogicalRecordLock {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LogicalFlock {
+pub struct LogicalFlock {
     pub(crate) file: LeaseFileId,
     pub(crate) owner: usize,
     pub(crate) write: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LogicalRecordLockRequest {
+pub struct LogicalRecordLockRequest {
     pub(crate) file: LeaseFileId,
     pub(crate) owner: LogicalRecordLockOwner,
     pub(crate) range: LogicalRecordLockRange,
@@ -349,10 +349,10 @@ pub(crate) struct LogicalRecordLockRequest {
 /// Token identifying one waiting `LogicalRecordLockRequest` in the wait-for
 /// graph, minted by [`LogicalRecordLocks::mint_wait_id`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct RecordLockWaitId(pub(crate) u64);
+pub struct RecordLockWaitId(pub(crate) u64);
 
 #[derive(Default)]
-pub(crate) struct LogicalRecordLockState {
+pub struct LogicalRecordLockState {
     pub(crate) locks: Vec<LogicalRecordLock>,
     pub(crate) flocks: Vec<LogicalFlock>,
     /// `wait → (waiting owner, owner it is blocked on)` for every request
@@ -380,7 +380,7 @@ impl LogicalRecordLockState {
 }
 
 #[derive(Default)]
-pub(crate) struct LogicalRecordLocks {
+pub struct LogicalRecordLocks {
     pub(crate) state: parking_lot::Mutex<LogicalRecordLockState>,
     changed: parking_lot::Condvar,
     next_wait_id: std::sync::atomic::AtomicU64,
@@ -406,7 +406,7 @@ pub(crate) struct LogicalRecordLocks {
 /// [`LogicalRecordLocks::occupancy`] true. Never hand out the inner
 /// `MutexGuard`: releasing the mutex without republishing is exactly the drift
 /// this type exists to make unrepresentable.
-pub(crate) struct LockedRecordLockState<'a> {
+pub struct LockedRecordLockState<'a> {
     state: parking_lot::MutexGuard<'a, LogicalRecordLockState>,
     occupancy: &'a std::sync::atomic::AtomicUsize,
 }
@@ -776,7 +776,7 @@ impl Drop for RecordLockWaitEdge {
 }
 
 #[derive(Clone)]
-pub(crate) struct LogicalRecordLockWait {
+pub struct LogicalRecordLockWait {
     locks: Arc<LogicalRecordLocks>,
     request: LogicalRecordLockRequest,
     tid: crate::thread::ThreadId,
@@ -822,17 +822,27 @@ impl LogicalRecordLockWait {
     }
 }
 
-#[cfg(test)]
-pub(crate) struct RecordLockContentionFixture {
+#[cfg(any(test, feature = "test-support"))]
+pub struct RecordLockContentionFixture {
     locks: Arc<LogicalRecordLocks>,
     file: LeaseFileId,
     range: LogicalRecordLockRange,
     blocker: LogicalRecordLockOwner,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+impl Default for RecordLockContentionFixture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Test fixture reachable through `test-support`, so `cfg(test)` is not set
+// for it and clippy's `allow-{unwrap,expect}-in-tests` does not apply.
+#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::expect_used)]
 impl RecordLockContentionFixture {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let locks = Arc::new(LogicalRecordLocks::default());
         let file = LeaseFileId::Path("task5-record-lock".to_owned());
         let range = LogicalRecordLockRange { start: 0, end: 1 };
@@ -853,7 +863,7 @@ impl RecordLockContentionFixture {
         }
     }
 
-    pub(crate) fn waiter(
+    pub fn waiter(
         &self,
         tid: crate::thread::ThreadId,
         serial: u64,
@@ -873,7 +883,7 @@ impl RecordLockContentionFixture {
         ))
     }
 
-    pub(crate) fn release_blocker(&self) {
+    pub fn release_blocker(&self) {
         self.locks.unlock(&self.file, self.blocker, self.range);
     }
 }
@@ -902,7 +912,7 @@ impl std::fmt::Debug for LogicalRecordLockWait {
 /// flock locking. Both use the same continuation family, but only record locks
 /// participate in the POSIX wait-for graph.
 #[derive(Clone)]
-pub(crate) enum LogicalLockWait {
+pub enum LogicalLockWait {
     Record {
         wait: LogicalRecordLockWait,
         _lease: Option<FileDescriptionFdLease>,
@@ -933,7 +943,7 @@ impl LogicalLockWait {
 /// admission. Its owner is that description's stable `Arc` identity, never a
 /// process identity or a guest fd number that may be reused while parked.
 #[derive(Clone)]
-pub(crate) struct LogicalFlockWait {
+pub struct LogicalFlockWait {
     locks: Arc<LogicalRecordLocks>,
     file: LeaseFileId,
     owner: usize,

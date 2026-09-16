@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use carrick_guest_mem::{HostVa, SharedFutexLocation};
-use carrick_runtime::kernel::container::{Container, ContainerId, RunId};
+use carrick_kernel::kernel::container::{Container, ContainerId, RunId};
 
 /// Errors encountered during [`SharedBuffer`] or [`SharedBufferLease`] operations.
 #[derive(Debug, thiserror::Error)]

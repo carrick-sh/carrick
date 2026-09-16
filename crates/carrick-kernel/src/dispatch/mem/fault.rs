@@ -4,7 +4,7 @@ use super::*;
 use carrick_fatal::carrick_fatal;
 
 #[derive(Clone, Copy)]
-pub(crate) struct ResidentFaultRange {
+pub struct ResidentFaultRange {
     pub(crate) range: carrick_vfs::GuestMemoryRange,
     pub(crate) prot: LinuxProtFlags,
 }
@@ -30,7 +30,7 @@ pub(crate) struct ResidentFaultRange {
 /// what it covers before inserting — which is also what makes the "last entry
 /// at or below" lookup exact.
 #[derive(Clone, Default)]
-pub(crate) struct FirstTouchArming {
+pub struct FirstTouchArming {
     /// `start -> (end, prot)`, non-overlapping, ordered by `start`.
     extents: std::collections::BTreeMap<u64, FirstTouchArm>,
 }
@@ -178,36 +178,40 @@ pub(crate) fn tracked_nonresident_subranges(
 
 /// Owns alias exclusion from grow-down fault lookup through backend protection
 /// and dispatcher metadata publication.
-pub(crate) struct MmapGrowdownFaultPlan<'permit> {
+pub struct MmapGrowdownFaultPlan<'permit> {
     pub(crate) start: u64,
     pub(crate) len: usize,
     pub(crate) exclusion: super::HostAliasDispatchGuard<'permit>,
 }
 
 impl MmapGrowdownFaultPlan<'_> {
-    pub(crate) fn start(&self) -> u64 {
+    pub fn start(&self) -> u64 {
         self.start
     }
 
-    pub(crate) fn len(&self) -> usize {
+    /// Byte length of the grow-down extent this plan protects and publishes.
+    /// No `is_empty`: a plan is only minted for a non-empty extent, so the
+    /// question the lint asks cannot be true for a live plan.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
         self.len
     }
 }
 
 /// Owns alias exclusion from resident-fault lookup through backend protection
 /// and residency publication.
-pub(crate) struct ResidentFaultPlan<'permit> {
+pub struct ResidentFaultPlan<'permit> {
     pub(crate) page: u64,
     pub(crate) prot: u64,
     pub(crate) exclusion: super::HostAliasDispatchGuard<'permit>,
 }
 
 impl ResidentFaultPlan<'_> {
-    pub(crate) fn page(&self) -> u64 {
+    pub fn page(&self) -> u64 {
         self.page
     }
 
-    pub(crate) fn prot(&self) -> u64 {
+    pub fn prot(&self) -> u64 {
         self.prot
     }
 }
@@ -440,7 +444,7 @@ impl<'a> MemView<'a> {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn seed_resident_fault_for_test(&self, page: u64, prot: u64) {
         self.track_resident_fault_range(
             page,
@@ -449,7 +453,7 @@ impl<'a> MemView<'a> {
         );
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_resident_fault_plan_for_test<T>(
         &self,
         addr: u64,

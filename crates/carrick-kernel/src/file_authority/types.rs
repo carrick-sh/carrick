@@ -116,7 +116,7 @@ pub(crate) struct ClientIdentity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FileAuthorityBinding {
+pub struct FileAuthorityBinding {
     pub(crate) epoch: AuthorityEpoch,
     pub(crate) client: ClientIdentity,
     pub(crate) table: FileTableId,
@@ -1478,7 +1478,7 @@ pub(crate) enum AuthorityError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub(crate) enum AuthorityFatal {
+pub enum AuthorityFatal {
     #[error("request id was reused with a different request body")]
     RequestConflict,
     #[error("request id precedes the client's last terminal request")]

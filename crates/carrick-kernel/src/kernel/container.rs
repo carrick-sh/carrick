@@ -56,7 +56,7 @@ impl CarrierScopeId {
     /// An operator-supplied id remains byte-for-byte compatible with the
     /// scoped reaper; otherwise cryptographic host entropy prevents two
     /// embedders from accidentally sharing a cleanup target.
-    pub(crate) fn from_process_env_or_random() -> Result<Self, RuntimeError> {
+    pub fn from_process_env_or_random() -> Result<Self, RuntimeError> {
         if let Some(scope) = std::env::var("CARRICK_RUN_ID")
             .ok()
             .filter(|scope| !scope.is_empty())
@@ -390,7 +390,7 @@ impl std::fmt::Debug for DeterministicWaiter {
     }
 }
 
-pub(crate) type ClockChangeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
+pub type ClockChangeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[derive(Default)]
 struct ClockChangeState {
@@ -415,7 +415,7 @@ impl std::fmt::Debug for ClockChangeState {
 /// already cloned by an in-flight publication remains possible; consumers use
 /// their continuation token to make that late delivery harmless.
 #[derive(Debug)]
-pub(crate) struct ClockChangeSubscription {
+pub struct ClockChangeSubscription {
     id: u64,
     state: Weak<Mutex<ClockChangeState>>,
 }
@@ -433,7 +433,7 @@ impl Drop for ClockChangeSubscription {
 }
 
 /// The result of atomically checking a clock-change generation and enrolling.
-pub(crate) enum ClockChangeEnrollment {
+pub enum ClockChangeEnrollment {
     Ready(u64),
     Subscribed(ClockChangeSubscription),
 }
@@ -452,7 +452,7 @@ impl std::fmt::Debug for ClockChangeEnrollment {
 /// Drop removes its exact waiter, so closing/rearming/cancelling a timer cannot
 /// leave an obsolete deadline eligible for virtual-time auto-advance.
 #[derive(Debug)]
-pub(crate) struct DeterministicWaiterSubscription {
+pub struct DeterministicWaiterSubscription {
     id: u64,
     clock: Weak<ClockDomain>,
 }
@@ -1195,7 +1195,7 @@ impl Container {
     /// Build a container from its launch identity. `pub(crate)`: the
     /// runtime's entry points (`execute.rs`, `hvpatch::initialize_root_process`,
     /// later `prepare.rs`) construct it; embedders go through `LaunchContext`.
-    pub(crate) fn new(launch: LaunchContext) -> Self {
+    pub fn new(launch: LaunchContext) -> Self {
         let hostname = super::netns::default_nodename();
         Self::new_with_namespaces(
             launch,
@@ -1207,7 +1207,7 @@ impl Container {
     /// Build directly from already-resolved launch namespaces. Preparation
     /// uses this path so a bridge/none container does not probe and allocate a
     /// discarded host-mirror model before installing its final model.
-    pub(crate) fn new_with_namespaces(
+    pub fn new_with_namespaces(
         launch: LaunchContext,
         network: LinuxNetworkModel,
         hostname: impl Into<String>,
@@ -1249,7 +1249,7 @@ impl Container {
         &self.net_ns
     }
 
-    pub(crate) fn uts_ns(&self) -> &Arc<UtsNs> {
+    pub fn uts_ns(&self) -> &Arc<UtsNs> {
         &self.uts_ns
     }
 
@@ -1316,7 +1316,7 @@ impl Container {
     /// Install the container's PID namespace region. Exactly once, before any
     /// task of the container runs; a second install is refused and hands the
     /// region back so the caller cannot silently leak a claimed slot.
-    pub(crate) fn install_pid_ns(
+    pub fn install_pid_ns(
         &self,
         region: Arc<crate::namespace::pid::NsSharedRegion>,
     ) -> Result<(), Arc<crate::namespace::pid::NsSharedRegion>> {
@@ -1337,7 +1337,7 @@ impl Container {
     }
 
     /// The container's PID namespace region, `None` under `PidMode::Host`.
-    pub(crate) fn pid_region(&self) -> Option<Arc<crate::namespace::pid::NsSharedRegion>> {
+    pub fn pid_region(&self) -> Option<Arc<crate::namespace::pid::NsSharedRegion>> {
         self.pid_ns.get().cloned()
     }
 
@@ -1412,7 +1412,7 @@ impl Container {
         Ok(())
     }
 
-    pub(crate) fn rollback_pid_root(&self, key: TaskKey) {
+    pub fn rollback_pid_root(&self, key: TaskKey) {
         let mut root = self
             .pid_root
             .lock()
@@ -1471,7 +1471,7 @@ impl Container {
     /// and `take_process_terminal` in `threaded_loop::run_threaded_loop_inner`),
     /// so no task of this pid namespace can still be running. Releases the pid
     /// region back to the carrier arena.
-    pub(crate) fn retire(
+    pub fn retire(
         self: std::sync::Arc<Self>,
     ) -> Result<super::control::ContainerTeardown, crate::run_result::RuntimeError> {
         let kernel = self

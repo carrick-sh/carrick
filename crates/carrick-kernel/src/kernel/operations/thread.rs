@@ -164,7 +164,7 @@ impl PreparedThreadClone {
         self.reservation.visible_tid()
     }
 
-    pub(crate) fn prepared_execution_identity(
+    pub fn prepared_execution_identity(
         &self,
     ) -> (
         TaskKey,
@@ -422,8 +422,8 @@ impl Kernel {
     /// scheduler transition that is already in flight, which is the shape
     /// behind the captured `lost exact transition ... kernel_view=thread
     /// absent from registry` carrier abort.
-    #[cfg(test)]
-    pub(crate) fn reap_task_record_for_test(&self, task: TaskId) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reap_task_record_for_test(&self, task: TaskId) -> bool {
         let mut state = self.registry().state.write();
         let Some(record) = state.tasks.remove(&task) else {
             return false;

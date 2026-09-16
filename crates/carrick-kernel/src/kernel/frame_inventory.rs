@@ -353,7 +353,7 @@ impl FrameInventoryAuthority {
     /// object never became visible. Mapping IDs are monotonic and the receipt
     /// names the exact `(mapping, frame, mm)` set, so this removes no sibling
     /// publication even if other address spaces advanced the global revision.
-    pub(crate) fn rollback_unpublished_apply(
+    pub fn rollback_unpublished_apply(
         &self,
         receipt: &FrameInventoryApplyReceipt,
     ) -> Result<(), FrameInventoryError> {
@@ -578,7 +578,7 @@ impl FrameInventoryAuthority {
     /// Exact point query tied to the same global inventory revision carried by
     /// a kernel-issued foreign-COW proof. Any intervening inventory publication
     /// makes the proof stale even if the mapping row itself is unchanged.
-    pub(crate) fn mapping_is_live_exact_at_revision(
+    pub fn mapping_is_live_exact_at_revision(
         &self,
         mm: MmId,
         revision: u64,
@@ -660,7 +660,7 @@ impl FrameInventoryAuthority {
             .map(|state| snapshot_state(&state, None))
     }
 
-    pub(crate) fn snapshot_for_mm_until(
+    pub fn snapshot_for_mm_until(
         &self,
         mm: MmId,
         deadline: Instant,

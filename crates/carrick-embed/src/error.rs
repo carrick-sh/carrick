@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use camino::Utf8PathBuf;
-use carrick_runtime::dispatch::DispatchError;
-use carrick_runtime::kernel::debug::PostMortem;
+use carrick_kernel::dispatch::DispatchError;
+use carrick_kernel::kernel::debug::PostMortem;
 use carrick_runtime::runtime::RuntimeError;
 use carrick_runtime::trap::TrapError;
 
@@ -184,7 +184,7 @@ mod tests {
         for phase in [Phase::Prepare, Phase::Execute] {
             let expected = crate::ContainerId::allocate();
             let error = RuntimeError::Dispatch(
-                carrick_runtime::dispatch::DispatchError::InterceptorPanicked {
+                carrick_kernel::dispatch::DispatchError::InterceptorPanicked {
                     container_id: expected,
                 },
             );

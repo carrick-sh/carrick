@@ -311,18 +311,14 @@ impl<'a> NetView<'a> {
         // it from the host registration only; the guest's requested EPOLLPRI
         // interest is unaffected (readiness still keys off `event.events`).
         // (probe `epollpri`.)
-        #[cfg(any(feature = "platform-freebsd", feature = "platform-netbsd"))]
+        #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
         {
             interest.oob = false;
         }
         interest
     }
 
-    #[cfg(any(
-        feature = "platform-macos",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ))]
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
     fn rebind_epoll_host_registration(
         &self,
         kqueue: &Arc<EpollKqueue>,
@@ -474,10 +470,10 @@ impl<'a> NetView<'a> {
     /// reports them regardless of the requested set, and a guest that just
     /// touched the fd must see a still-standing terminal condition again.
     #[cfg(any(
-        feature = "platform-macos",
-        feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd"
     ))]
     pub(crate) fn epoll_rearm_after_io(&self, request: &SyscallRequest, outcome: &DispatchOutcome) {
         const READ_CLEAR: u32 =
@@ -567,9 +563,9 @@ impl<'a> NetView<'a> {
                     {
                         let mut snapshot_changed = false;
                         #[cfg(any(
-                            feature = "platform-macos",
-                            feature = "platform-freebsd",
-                            feature = "platform-netbsd"
+                            target_os = "macos",
+                            target_os = "freebsd",
+                            target_os = "netbsd"
                         ))]
                         let mut host_rearms: Vec<i32> = Vec::new();
                         for (fd, clear) in targets.iter().flatten() {
@@ -631,9 +627,9 @@ impl<'a> NetView<'a> {
                                 {
                                     snapshot_changed = true;
                                     #[cfg(any(
-                                        feature = "platform-macos",
-                                        feature = "platform-freebsd",
-                                        feature = "platform-netbsd"
+                                        target_os = "macos",
+                                        target_os = "freebsd",
+                                        target_os = "netbsd"
                                     ))]
                                     if let Some(host_fd) = self.host_fd_for_poll(matching_fd) {
                                         host_rearms.push(host_fd.get());
@@ -674,9 +670,9 @@ impl<'a> NetView<'a> {
                                     slot.write_backpressured = true;
                                 }
                                 #[cfg(any(
-                                    feature = "platform-macos",
-                                    feature = "platform-freebsd",
-                                    feature = "platform-netbsd"
+                                    target_os = "macos",
+                                    target_os = "freebsd",
+                                    target_os = "netbsd"
                                 ))]
                                 if let Some(host_fd) = self.host_fd_for_poll(matching_fd) {
                                     host_rearms.push(host_fd.get());
@@ -684,9 +680,9 @@ impl<'a> NetView<'a> {
                             }
                         }
                         #[cfg(any(
-                            feature = "platform-macos",
-                            feature = "platform-freebsd",
-                            feature = "platform-netbsd"
+                            target_os = "macos",
+                            target_os = "freebsd",
+                            target_os = "netbsd"
                         ))]
                         {
                             host_rearms.sort_unstable();
@@ -854,11 +850,7 @@ impl<'a> NetView<'a> {
                     if !should_auto_detach && !has_local_registered_survivor {
                         continue;
                     }
-                    #[cfg(any(
-                        feature = "platform-macos",
-                        feature = "platform-freebsd",
-                        feature = "platform-netbsd"
-                    ))]
+                    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
                     self.rebind_epoll_host_registration(
                         kqueue,
                         interest,
@@ -867,9 +859,9 @@ impl<'a> NetView<'a> {
                         Some(fd),
                     );
                     #[cfg(not(any(
-                        feature = "platform-macos",
-                        feature = "platform-freebsd",
-                        feature = "platform-netbsd"
+                        target_os = "macos",
+                        target_os = "freebsd",
+                        target_os = "netbsd"
                     )))]
                     {
                         let mut survivor: Option<(i32, u32)> = None;
@@ -1572,9 +1564,9 @@ impl<'a> NetView<'a> {
                     } = &mut *open
                     {
                         #[cfg(any(
-                            feature = "platform-macos",
-                            feature = "platform-freebsd",
-                            feature = "platform-netbsd"
+                            target_os = "macos",
+                            target_os = "freebsd",
+                            target_os = "netbsd"
                         ))]
                         let mut host_rearms: Vec<i32> = Vec::new();
                         for (
@@ -1614,9 +1606,9 @@ impl<'a> NetView<'a> {
                                     slot.write_backpressured = false;
                                 }
                                 #[cfg(any(
-                                    feature = "platform-macos",
-                                    feature = "platform-freebsd",
-                                    feature = "platform-netbsd"
+                                    target_os = "macos",
+                                    target_os = "freebsd",
+                                    target_os = "netbsd"
                                 ))]
                                 if slot.event.events & LINUX_EPOLLET != 0
                                     && epoll_wait_sample_needs_host_rebind(
@@ -1631,9 +1623,9 @@ impl<'a> NetView<'a> {
                             }
                         }
                         #[cfg(any(
-                            feature = "platform-macos",
-                            feature = "platform-freebsd",
-                            feature = "platform-netbsd"
+                            target_os = "macos",
+                            target_os = "freebsd",
+                            target_os = "netbsd"
                         ))]
                         {
                             host_rearms.sort_unstable();
@@ -1959,11 +1951,7 @@ mod dns_gateway_wake_tests {
 mod epoll_interest_tests {
     use super::*;
 
-    #[cfg(any(
-        feature = "platform-macos",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ))]
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
     #[test]
     fn et_write_latch_temporarily_disarms_host_write_filter() {
         let dispatcher = SyscallDispatcher::new();
@@ -1992,11 +1980,7 @@ mod epoll_interest_tests {
         assert!(level.write);
     }
 
-    #[cfg(any(
-        feature = "platform-macos",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ))]
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
     #[test]
     fn et_terminal_latch_disarms_host_filters() {
         let dispatcher = SyscallDispatcher::new();
@@ -3371,9 +3355,9 @@ impl<'a> NetView<'a> {
                         // wants), re-using one surviving fd's generational handle.
                         // With none: drop the host registration entirely.
                         #[cfg(any(
-                            feature = "platform-macos",
-                            feature = "platform-freebsd",
-                            feature = "platform-netbsd"
+                            target_os = "macos",
+                            target_os = "freebsd",
+                            target_os = "netbsd"
                         ))]
                         this.rebind_epoll_host_registration(
                             kqueue,
@@ -3383,9 +3367,9 @@ impl<'a> NetView<'a> {
                             None,
                         );
                         #[cfg(not(any(
-                            feature = "platform-macos",
-                            feature = "platform-freebsd",
-                            feature = "platform-netbsd"
+                            target_os = "macos",
+                            target_os = "freebsd",
+                            target_os = "netbsd"
                         )))]
                         {
                             let mut survivor: Option<(i32, u32)> = None;

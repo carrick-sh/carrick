@@ -14,7 +14,7 @@
 /// wait time: the internal [`crate::kernel::TaskId`] is the carrier-wide key
 /// and is not what a guest sees.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ChildExit {
+pub struct ChildExit {
     pid: crate::kernel::TaskId,
     visible_pid: i32,
     ruid: carrick_abi::NsUid,
@@ -22,7 +22,10 @@ pub(crate) struct ChildExit {
 }
 
 impl ChildExit {
-    pub(crate) const fn new(
+    /// Record one reaped child: its kernel task id, the pid its parent's pid
+    /// namespace sees, the child's real uid (what `si_uid` reports) and the
+    /// encoded Linux wait status.
+    pub const fn new(
         pid: crate::kernel::TaskId,
         visible_pid: i32,
         ruid: carrick_abi::NsUid,
@@ -36,20 +39,25 @@ impl ChildExit {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) const fn pid(self) -> crate::kernel::TaskId {
+    /// The reaped child's kernel task id — the graph identity, not the
+    /// namespace-visible number.
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn pid(self) -> crate::kernel::TaskId {
         self.pid
     }
 
-    pub(crate) const fn visible_pid(self) -> i32 {
+    /// The pid the waiting parent's pid namespace sees for this child.
+    pub const fn visible_pid(self) -> i32 {
         self.visible_pid
     }
 
-    pub(crate) const fn status(self) -> i32 {
+    /// The encoded Linux wait status (`WIFEXITED`/`WIFSIGNALED` layout).
+    pub const fn status(self) -> i32 {
         self.status
     }
 
-    pub(crate) const fn ruid(self) -> carrick_abi::NsUid {
+    /// The child's real uid, which `waitid`'s `siginfo_t` reports as `si_uid`.
+    pub const fn ruid(self) -> carrick_abi::NsUid {
         self.ruid
     }
 }
@@ -57,7 +65,7 @@ impl ChildExit {
 /// A retiring thread's exact owner and file table, captured as one receipt so a
 /// caller draining it names that generation rather than re-reading the graph.
 #[derive(Clone, Debug)]
-pub(crate) struct RetiredThreadResources {
+pub struct RetiredThreadResources {
     owner: crate::kernel::TaskKey,
     files: std::sync::Arc<crate::kernel::FileTable>,
 }
@@ -70,17 +78,17 @@ impl RetiredThreadResources {
         Self { owner, files }
     }
 
-    pub(crate) const fn owner(&self) -> crate::kernel::TaskKey {
+    pub const fn owner(&self) -> crate::kernel::TaskKey {
         self.owner
     }
 
-    pub(crate) fn files(&self) -> std::sync::Arc<crate::kernel::FileTable> {
+    pub fn files(&self) -> std::sync::Arc<crate::kernel::FileTable> {
         std::sync::Arc::clone(&self.files)
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum ProcessThreadExit {
+pub enum ProcessThreadExit {
     Retired(RetiredThreadResources),
     AlreadyRetired,
     LastThread,
@@ -99,7 +107,7 @@ pub(crate) enum ProcessThreadExit {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WaitResult {
+pub enum WaitResult {
     Exited(ChildExit),
     StateChanged(ChildExit),
     StillRunning(crate::kernel::ChildWaitPrecheck),
@@ -112,7 +120,7 @@ pub(crate) enum WaitResult {
 /// ONE spelling: those used to reach this through per-call wrappers on
 /// `ProcessContext`, which existed only because the dispatch side could not see
 /// the graph directly. It can, so the wrappers are gone.
-pub(crate) fn identity_operation_errno(
+pub fn identity_operation_errno(
     error: crate::kernel::KernelOperationError,
 ) -> crate::linux_abi::LinuxErrno {
     match error {

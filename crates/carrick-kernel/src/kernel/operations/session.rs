@@ -19,7 +19,7 @@ use crate::kernel::objects::{ProcessGroup, Session, TaskKey, TaskLifecycle};
 use crate::kernel::registry::IdError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TtyControlError {
+pub enum TtyControlError {
     NotControlling,
     Permission,
 }

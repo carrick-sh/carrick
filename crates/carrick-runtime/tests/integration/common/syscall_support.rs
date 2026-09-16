@@ -11,11 +11,11 @@
 // them. Allow unwrap/expect here explicitly — the no-panic gate targets production code.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-pub use carrick_runtime::compat::{CompatReporter, SyscallArgs};
-pub use carrick_runtime::dispatch::{
+pub use carrick_kernel::dispatch::{
     CurrentMmMemory, DispatchOutcome, GuestMemory, LinearMemory, SyscallDispatcher, SyscallRequest,
     ThreadCtx,
 };
+pub use carrick_runtime::compat::{CompatReporter, SyscallArgs};
 pub use carrick_runtime::elf::SegmentPerms;
 pub use carrick_runtime::linux_abi::{
     CARRICK_PRIVATE_X86_FSTAT, CARRICK_PRIVATE_X86_LSTAT, CARRICK_PRIVATE_X86_NEWFSTATAT,
@@ -51,9 +51,9 @@ pub fn tc<'a>(
 
 /// Install a caught disposition so namespace-init signal protection does not
 /// swallow a delivery test before it reaches the exact thread queue.
-pub fn install_guest_signal_handler(context: &carrick_runtime::kernel::KernelContext, signal: i32) {
+pub fn install_guest_signal_handler(context: &carrick_kernel::kernel::KernelContext, signal: i32) {
     let signal =
-        carrick_runtime::kernel::LinuxSignal::for_signal_number(signal).expect("valid test signal");
+        carrick_kernel::kernel::LinuxSignal::for_signal_number(signal).expect("valid test signal");
     let mut action = LinuxSigaction::empty();
     action.sa_handler = 0x4000;
     context.shared().sighand().install_action(signal, action);

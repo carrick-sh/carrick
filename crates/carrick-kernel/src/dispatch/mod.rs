@@ -643,13 +643,13 @@ macro_rules! mutation_syscall_table {
 }
 
 mod abi_args;
-mod archive;
+pub mod archive;
 pub(crate) use archive::{
     ArchiveEntryMetadata, ArchiveFsAuthority, ArchiveFsError, MAX_ARCHIVE_BYTES,
 };
 mod pty_registry;
 #[macro_use]
-mod creds;
+pub mod creds;
 mod epoll_shim;
 pub(crate) use epoll_shim::{
     EpollWakeHandle, EpollWakeRegistry, new_epoll_wake_registry, notify_inmem_epoll,
@@ -659,61 +659,64 @@ pub(crate) mod fd_table;
 mod fifo_beacon;
 pub(crate) mod ioring;
 #[macro_use]
-mod fs;
-#[cfg(test)]
-pub(crate) use fs::RecordLockContentionFixture;
+pub mod fs;
+#[cfg(any(test, feature = "test-support"))]
+pub use fs::RecordLockContentionFixture;
 pub use fs::StdioSink;
 mod keys;
-pub(crate) use fs::{LegacyAioContextId, MountRetirement, SplicePushback};
+pub use fs::MountRetirement;
+pub(crate) use fs::{LegacyAioContextId, SplicePushback};
 #[macro_use]
-mod mem;
-pub(crate) use mem::boot_private_file_backings;
+pub mod mem;
+pub use mem::boot_private_file_backings;
 #[macro_use]
 pub(crate) mod net;
 #[macro_use]
 mod perf;
-pub(crate) mod executable_authority;
+pub mod executable_authority;
 mod proc;
-#[cfg(test)]
-pub(crate) use proc::build_hvpatch_waitid_siginfo;
+#[cfg(any(test, feature = "test-support"))]
+pub use proc::build_hvpatch_waitid_siginfo;
 mod proctitle;
-pub(crate) mod resources;
+pub mod resources;
 mod retval;
-pub(crate) mod rosetta;
+pub mod rosetta;
 #[macro_use]
-pub(crate) mod signal;
+pub mod signal;
 mod bpf;
 pub mod mm_mutation;
 mod mount_api;
 mod mqueue;
 pub use mqueue::BlockingMqueue;
-#[cfg(test)]
+pub use mqueue::BlockingMqueueStep;
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use mqueue::blocking_mqueue_for_continuation_test;
-pub(crate) use mqueue::{BlockingMqueueStep, MqueueChangeEnrollment, MqueueChangeSubscription};
+pub(crate) use mqueue::{MqueueChangeEnrollment, MqueueChangeSubscription};
 mod syslog;
 #[cfg(not(doctest))]
 mod sysv;
 #[cfg(doctest)]
 pub mod sysv;
 pub use sysv::BlockingSemop;
+pub use sysv::BlockingSemopStep;
 pub use sysv::SysvWaitState;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use sysv::blocking_semop_for_continuation_test;
-pub(crate) use sysv::{BlockingSemopStep, SemopChangeEnrollment, SemopChangeSubscription};
+pub(crate) use sysv::{SemopChangeEnrollment, SemopChangeSubscription};
 #[macro_use]
 mod time;
 pub use time::{
     HOST_FD_HEADROOM, guest_file_table_max, host_open_descriptor_count, raise_host_nofile_backing,
 };
 
-#[cfg(test)]
-pub(crate) use proctitle::carrier_proc_label;
+#[cfg(any(test, feature = "test-support"))]
+pub use proctitle::carrier_proc_label;
 pub use proctitle::{init as proctitle_init, set_carrier_process_title, set_host_process_name};
 
 pub use abi_args::{Fd, GuestLen, GuestPtr, HostFd, HostPid, NsPid, Pid, Signal};
 // Imported at the dispatch root so the submodules can name them bare, as
 // they did when the types lived in `crate::vfs`. `pub(crate)`, not `pub`:
-// carrick-runtime must not re-export a carrick-vfs type on its own public
+// carrick-kernel must not re-export a carrick-vfs type on its own public
 // surface -- a consumer names `carrick_vfs::ProcMapsEntry` directly.
 pub(crate) use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 use fd_table::*;
@@ -729,26 +732,29 @@ pub use outcome::{
 };
 #[allow(unused_imports)]
 pub(crate) use outcome::{
-    BlockingRecordLockStep, BlockingWriteStep, drive_blocking_record_lock, drive_blocking_write,
-    lower_handler_result, try_drive_blocking_record_lock,
+    BlockingRecordLockStep, lower_handler_result, try_drive_blocking_record_lock,
 };
+#[allow(unused_imports)]
+pub use outcome::{BlockingWriteStep, drive_blocking_record_lock, drive_blocking_write};
 
 pub mod request;
 pub use request::{MutationSyscallCtx, SyscallCtx, SyscallRequest, ThreadCtx};
 #[allow(unused_imports)]
-pub(crate) use request::{
-    PreparedDispatch, PreparedSyscall, SyscallCompletionToken, merge_policy_terminal,
-    syscall_requires_execution_lease, threaded_independent_dispatch_supports,
+pub use request::{
+    PreparedDispatch, PreparedSyscall, SyscallCompletionToken, syscall_requires_execution_lease,
 };
+#[allow(unused_imports)]
+pub(crate) use request::{merge_policy_terminal, threaded_independent_dispatch_supports};
 
 pub mod host_alias;
+pub use host_alias::HostAliasCommit;
+pub(crate) use host_alias::HostAliasDispatchGuard;
 pub use host_alias::HostAliasTransaction;
 #[allow(unused_imports)]
 pub(crate) use host_alias::HostAliasTransactions;
-pub(crate) use host_alias::{HostAliasCommit, HostAliasDispatchGuard};
 
 pub mod core_publication;
-pub(crate) use core_publication::CoreProcessSnapshot;
+pub use core_publication::CoreProcessSnapshot;
 #[allow(unused_imports)]
 pub(crate) use core_publication::{CorePublication, CorePublicationError};
 
@@ -775,18 +781,20 @@ pub(crate) use io_pipe::{
 };
 // Host-errno adaptation lives below the VFS; dispatch is a consumer of it.
 pub(crate) use carrick_vfs::errno::{HostSyscallError, HostSyscallResult};
+pub use routing::MM_MUTATION_SYSCALLS;
+#[allow(unused_imports)]
+pub use routing::syscall_requires_mm_mutation;
 #[allow(unused_imports)]
 pub(crate) use routing::{
-    MM_MUTATION_SYSCALLS, MutationDispatchRoute, MutationSyscallHandler, NormalizedDispatchRoute,
-    OrdinaryDispatchRoute, SyscallHandler, resolve_handler, resolve_mutation_handler,
-    syscall_requires_mm_mutation,
+    MutationDispatchRoute, MutationSyscallHandler, NormalizedDispatchRoute, OrdinaryDispatchRoute,
+    SyscallHandler, resolve_handler, resolve_mutation_handler,
 };
 pub use seccomp_observer::check_syscall_flags;
 pub mod format_stat;
 pub(in crate::dispatch) use format_stat::*;
-pub(crate) mod fd_wait;
+pub mod fd_wait;
 pub mod format_time;
-pub(crate) use format_time::*;
+pub use format_time::*;
 pub mod rootfs_helpers;
 pub use rootfs_helpers::linux_errno;
 pub(crate) use rootfs_helpers::*;
@@ -801,11 +809,12 @@ pub(crate) use futex::{
     dispatch_futex_pi, dispatch_futex_waitv_args, dispatch_threaded_futex,
     linux_futex_command_is_known, read_futex_word,
 };
+pub use mm_authority::DispatchMmAuthority;
 pub(in crate::dispatch) use mm_authority::MmExecutorAdmissionRecipe;
 pub use mm_authority::MmExecutorParticipation;
+pub use mm_authority::PreparedDispatchMmExec;
 pub(crate) use mm_authority::{
-    DispatchMmAuthority, DispatchMmBinding, PrepareDispatchMmForkError, PreparedDispatchMmExec,
-    PreparedDispatchMmFork,
+    DispatchMmBinding, PrepareDispatchMmForkError, PreparedDispatchMmFork,
 };
 
 // `GuestMemory` and `MemoryError` were lifted into the leaf crate
@@ -829,7 +838,7 @@ enum VfsOpenAttempt {
 /// process-global presence heuristic: macOS can execute the same container via
 /// native translation or HVF, and only the selected backend knows who kicks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AsyncSignalWakeOwner {
+pub enum AsyncSignalWakeOwner {
     SignalPump,
 }
 
@@ -869,7 +878,7 @@ pub(crate) enum AuthorityCallError {
 /// happens on the `poll_fd` via the runtime's poll park, never under this lock).
 /// `poll_fd` is cached so `Drop`/the wake registry/`host_fd_for_poll` read it
 /// lock-free.
-pub(crate) struct EpollKqueue {
+pub struct EpollKqueue {
     mux: std::sync::Mutex<Box<dyn carrick_hal::event::EventMultiplexer>>,
     /// Cached `mux.poll_fd()` (the kqueue/epoll fd) — stable for the instance's
     /// life, read lock-free by `Drop` and `host_fd_for_poll`.
@@ -929,10 +938,10 @@ impl EpollKqueue {
     /// changes, and in-memory readiness broadcasts. Best-effort — a saturated
     /// user-wake is already a pending wake.
     #[cfg(any(
-        feature = "platform-macos",
-        feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd"
     ))]
     pub(crate) fn wake_parked(&self) {
         self.with_mux(|mux| {
@@ -1024,17 +1033,18 @@ pub(crate) fn hvpatch_lane_active() -> bool {
 /// hazard `docs/identity-and-scope-domains.md` names: a `static` carrying no
 /// mark saying what it describes. A test that asserts either side of the flag
 /// takes this guard and gets a deterministic answer regardless of run order.
-#[cfg(test)]
-pub(crate) struct HvpatchLaneScope(bool);
+#[cfg(any(test, feature = "test-support"))]
+pub struct HvpatchLaneScope(bool);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl HvpatchLaneScope {
-    pub(crate) fn force(active: bool) -> Self {
+    /// Pin the HVPatch-lane flag to `active` for the life of the guard.
+    pub fn force(active: bool) -> Self {
         Self(HVPATCH_LANE.swap(active, std::sync::atomic::Ordering::AcqRel))
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for HvpatchLaneScope {
     fn drop(&mut self) {
         HVPATCH_LANE.store(self.0, std::sync::atomic::Ordering::Release);
@@ -1065,11 +1075,11 @@ impl SyscallDispatcher {
         self.mm_authority()
     }
 
-    pub(crate) fn pt_quiesce(&self) -> Arc<carrick_thread::fork_quiesce::PtQuiesce> {
+    pub fn pt_quiesce(&self) -> Arc<carrick_thread::fork_quiesce::PtQuiesce> {
         Arc::clone(self.mm_authority().pt_quiesce())
     }
 
-    pub(crate) fn fork_quiesce(&self) -> Arc<carrick_thread::fork_quiesce::ForkQuiesce> {
+    pub fn fork_quiesce(&self) -> Arc<carrick_thread::fork_quiesce::ForkQuiesce> {
         Arc::clone(self.mm_authority().fork_quiesce())
     }
 
@@ -1078,7 +1088,7 @@ impl SyscallDispatcher {
         Arc::clone(&self.mm_authority().host_alias_transactions)
     }
 
-    pub(crate) fn vma_snapshot_source(&self) -> crate::kernel::SharedVmaSnapshotSource {
+    pub fn vma_snapshot_source(&self) -> crate::kernel::SharedVmaSnapshotSource {
         self.mm_binding.current.load_full()
     }
 
@@ -1115,7 +1125,7 @@ impl SyscallDispatcher {
     /// vvar) has nothing to keep coherent: `OutOfBounds` at that fixed VA means
     /// exactly that (the aarch64 engine's `syscall_buffer_chunk` reports an
     /// unmapped VA as `OutOfBounds`) and is not an error. Any other failure is.
-    pub(crate) fn sync_vvar_realtime_offset(
+    pub fn sync_vvar_realtime_offset(
         &self,
         clock: &crate::kernel::container::ClockDomain,
         memory: &mut impl CurrentMmMemory,
@@ -1186,7 +1196,7 @@ impl SyscallDispatcher {
         Ok(())
     }
 
-    pub(crate) fn deferred_anonymous_state(
+    pub fn deferred_anonymous_state(
         &self,
         mm: crate::kernel::MmId,
     ) -> Option<Arc<carrick_guest_mem::DeferredAnonymousState>> {
@@ -1194,7 +1204,7 @@ impl SyscallDispatcher {
         (authority.mm_id == mm).then(|| Arc::clone(&authority.lock().deferred_anonymous))
     }
 
-    pub(crate) fn bind_deferred_anonymous_state(
+    pub fn bind_deferred_anonymous_state(
         &self,
         memory: &mut impl carrick_guest_mem::CurrentMmMemory,
         mm: crate::kernel::MmId,
@@ -1208,7 +1218,7 @@ impl SyscallDispatcher {
         true
     }
 
-    pub(crate) fn mm_mutation_coordinator(&self) -> Arc<mm_mutation::MmMutationCoordinator> {
+    pub fn mm_mutation_coordinator(&self) -> Arc<mm_mutation::MmMutationCoordinator> {
         Arc::clone(&self.mm_authority().mutation_coordinator)
     }
 
@@ -1226,7 +1236,7 @@ impl SyscallDispatcher {
         )
     }
 
-    pub(crate) fn mm_executor_census(&self) -> Arc<crate::kernel::GuestExecutorCensus> {
+    pub fn mm_executor_census(&self) -> Arc<crate::kernel::GuestExecutorCensus> {
         Arc::clone(&self.mm_authority().guest_executors)
     }
 
@@ -1242,7 +1252,7 @@ impl SyscallDispatcher {
         self.enter_mm_executor_inner(None, None)
     }
 
-    pub(crate) fn enter_mm_executor_for_thread(
+    pub fn enter_mm_executor_for_thread(
         &self,
         thread: Option<crate::kernel::ThreadRef>,
         registry: Arc<dyn carrick_hal::VcpuRegistry>,
@@ -1385,7 +1395,7 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(crate) fn activate_file_authority(
+    pub fn activate_file_authority(
         &self,
         root_table: Arc<crate::kernel::FileTable>,
     ) -> Result<crate::file_authority::FileAuthorityBinding, crate::file_authority::AuthorityFatal>
@@ -1456,7 +1466,7 @@ impl SyscallDispatcher {
     /// Test-only publication boundary for synthetic boot layouts. Production
     /// publishes the complete initial image through
     /// `publish_initial_image_state`, under exact-MM mutation authority.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_address_space_regions(&self, regions: Vec<ProcMapsEntry>) {
         mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
             let _vma_dispatch = self.begin_vma_dispatch(permit);
@@ -1504,7 +1514,7 @@ impl SyscallDispatcher {
     /// guest executor starts. The non-threaded outer boundary admits the exact
     /// MM into its executor census, mints real sole-stage-1 authority, and only
     /// then permits the host-alias/VMA transaction.
-    pub(crate) fn publish_initial_image_state(
+    pub fn publish_initial_image_state(
         &mut self,
         regions: Vec<ProcMapsEntry>,
         auxv: Vec<u8>,
@@ -1524,7 +1534,7 @@ impl SyscallDispatcher {
     /// Publish a replacement image's complete dispatcher memory generation.
     /// Reset, boot-region metadata and auxv become visible under one authority
     /// write, so K1 observers cannot see the destructive exec midpoint.
-    pub(crate) fn publish_exec_image_state(
+    pub fn publish_exec_image_state(
         &self,
         replacement_mm_id: crate::kernel::MmId,
         regions: Vec<ProcMapsEntry>,
@@ -1605,7 +1615,7 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(crate) fn configure_logical_exec_context(
+    pub fn configure_logical_exec_context(
         &self,
         context: &crate::kernel::KernelContext,
         workdir: Option<&str>,
@@ -1673,7 +1683,7 @@ impl SyscallDispatcher {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(crate) fn resolve_execvp_path(
+    pub fn resolve_execvp_path(
         &self,
         command: &str,
         search: &str,
@@ -1778,7 +1788,7 @@ impl SyscallDispatcher {
     /// launches otherwise stampede into four identical ELF reads and patch
     /// passes. The cache is bounded because retaining prepared binaries also
     /// retains their immutable region payloads.
-    pub(crate) fn with_hvpatch_exec_cache<E>(
+    pub fn with_hvpatch_exec_cache<E>(
         &self,
         key: Option<String>,
         build: impl FnOnce() -> Result<crate::memory::AddressSpace, E>,
@@ -1878,7 +1888,7 @@ impl SyscallDispatcher {
         self.io.set_sink(sink);
     }
 
-    pub(crate) fn init_external_exec_stdio(&mut self) {
+    pub fn init_external_exec_stdio(&mut self) {
         self.io = fs::RuntimeIo::new();
     }
 
@@ -2245,7 +2255,7 @@ impl SyscallDispatcher {
             .set_controlling(host_slave_name, std::process::id())
     }
 
-    pub(crate) fn initialize_controlling_tty_for(&self, context: &crate::kernel::KernelContext) {
+    pub fn initialize_controlling_tty_for(&self, context: &crate::kernel::KernelContext) {
         if self.fs.pty_table.lock().controlling().is_some() {
             context.kernel().initialize_launch_controlling_tty(context);
         }
@@ -2663,7 +2673,7 @@ impl SyscallDispatcher {
         context: &crate::kernel::KernelContext,
         registry: Option<&crate::thread::ThreadRegistry>,
     ) -> Option<Vec<carrick_vfs::SyntheticProcThread>> {
-        #[cfg(feature = "platform-macos")]
+        #[cfg(target_os = "macos")]
         let states: Option<std::collections::HashMap<_, _>> = registry.map(|r| {
             r.thread_ports()
                 .into_iter()
@@ -2671,11 +2681,7 @@ impl SyscallDispatcher {
                 .map(|(id, port)| (id, crate::host_proc::thread_run_state_char(port)))
                 .collect()
         });
-        #[cfg(any(
-            feature = "platform-linux",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        ))]
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
         let states: Option<std::collections::HashMap<_, _>> =
             registry.map(|r| r.thread_state_chars().into_iter().collect());
         let mut threads: Vec<_> = context

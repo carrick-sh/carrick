@@ -539,7 +539,7 @@ fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
 
 #[test]
 fn synthetic_proc_surface_serves_common_process_and_system_files() {
-    let root_nodename = carrick_runtime::kernel::netns::default_nodename();
+    let root_nodename = carrick_kernel::kernel::netns::default_nodename();
     let paths: [(&str, &[u8]); 20] = [
         ("/proc/cmdline", b"BOOT_IMAGE="),
         ("/proc/diskstats", b""),

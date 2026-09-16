@@ -232,9 +232,9 @@ fn guest_unix_pathname(memory: &impl CurrentMmMemory, addr: u64, addrlen: u32) -
 }
 
 #[cfg(not(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
     target_os = "linux"
 )))]
 fn host_stream_socket_read_eof(host_fd: i32) -> bool {
@@ -251,11 +251,7 @@ fn host_stream_socket_read_eof(host_fd: i32) -> bool {
     rc == 0
 }
 
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 pub(in crate::dispatch) fn host_stream_socket_rdhup(host_fd: i32) -> bool {
     use carrick_host_bsd::Kqueue;
     use carrick_host_bsd::kqueue::Kevent;
@@ -294,9 +290,9 @@ pub(in crate::dispatch) fn host_stream_socket_rdhup(host_fd: i32) -> bool {
 }
 
 #[cfg(not(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
     target_os = "linux"
 )))]
 pub(in crate::dispatch) fn host_stream_socket_rdhup(host_fd: i32) -> bool {
