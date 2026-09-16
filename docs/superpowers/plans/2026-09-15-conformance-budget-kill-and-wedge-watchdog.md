@@ -230,3 +230,9 @@ pub enum EmbedError { /* existing */
    plan only makes the wedge visible and fatal.
 6. `CARRICK_DEADLOCK_WATCHDOG_MS` is deleted; the window becomes a typed parameter everywhere. One
    spelling, no second path.
+7. (2026-09-15, after three session losses) The live lldb capture proof
+   (`capture_this_carrier_for_real`) is `#[ignore]` and OWNER-RUN from a separate terminal: a
+   `sudo lldb` attach + core save against a process descended from the Claude Code session
+   segfaults Terminal.app and takes the session and every subagent with it. Task 7's
+   armed-watchdog probe gate is likewise owner-run; in-session gates use
+   `CARRICK_PROBE_CARRIER_BUDGET_MS=0`.
