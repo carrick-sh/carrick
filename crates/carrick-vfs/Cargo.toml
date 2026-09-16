@@ -1,0 +1,50 @@
+[package]
+name = "carrick-vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_vfs"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[features]
+# In-memory fs backend selection (default OFF; control point is carrick-cli,
+# forwarded through carrick-runtime exactly as before).
+fs-memory = ["carrick-spec/fs-memory"]
+
+[dependencies]
+carrick-abi = { path = "../carrick-abi" }
+# `OpenContext::runtime_endpoint_container` carries the neutral `ContainerId`
+# the kernel stamps on a task; carrick-hal owns that id domain.
+carrick-hal = { path = "../carrick-hal" }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
+# The USDT `fs_op` probe the host backend and the layer cache fire.
+carrick-observability = { path = "../carrick-observability" }
+carrick-portable = { path = "../carrick-portable" }
+carrick-spec = { path = "../carrick-spec" }
+flate2.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+sha2.workspace = true
+tar.workspace = true
+# NOT dev-only: `HostFsBackend` owns an `Option<tempfile::TempDir>` scratch dir.
+tempfile.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# `host_to_linux_errno` is the one host-OS edge below the VFS: the BSD table on
+# macOS/FreeBSD/NetBSD, the identity hook on Linux. Gated on `target_os` rather
+# than a `platform-*` feature because this crate has no backend selection — the
+# host errno space is a property of the host it is compiled for.
+[target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))'.dependencies]
+carrick-host-bsd = { path = "../carrick-host-bsd" }
+[target.'cfg(target_os = "linux")'.dependencies]
+carrick-host-linux = { path = "../carrick-host-linux" }
+
+[dev-dependencies]
+tempfile.workspace = true

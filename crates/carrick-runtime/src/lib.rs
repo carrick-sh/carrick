@@ -89,23 +89,6 @@
 // rather than widen the public surface just to satisfy rustdoc.
 #![allow(rustdoc::private_intra_doc_links)]
 
-#[cfg(target_os = "macos")]
-pub mod apfs;
-/// Linux/non-macOS `apfs` shim. The real `apfs` module (macOS-only, above) drives
-/// APFS volume management via `diskutil`; that does not apply on Linux. But the
-/// CLI + engine consult `default_writable_backend_kind` to pick the default fs
-/// backend, and on Linux the host filesystem (cap-std passthrough) is always the
-/// fork-coherent writable source of truth. The `*_carrick_volume` functions are
-/// genuinely macOS-only — the `carrick volume` subcommand is gated off on Linux.
-/// Gated as the exact complement of the real module's `target_os = "macos"` so the
-/// two can never both exist.
-#[cfg(not(target_os = "macos"))]
-pub mod apfs {
-    pub fn default_writable_backend_kind() -> carrick_spec::FsBackendKind {
-        carrick_spec::FsBackendKind::Host
-    }
-}
-
 pub mod binfmt;
 pub mod container;
 pub mod cred_ipc;
@@ -114,8 +97,6 @@ pub mod cred_ipc;
 // `vcpu_loop::macos_helper_stubs` (Linux). No cfg gate: the functions are
 // portable libc + `crate::...` path helpers that resolve per-platform.
 pub mod core_dump;
-#[cfg(target_os = "macos")]
-pub(crate) mod darwin_fs;
 pub mod deadlock_watchdog;
 
 pub mod dispatch;
@@ -128,8 +109,6 @@ pub mod event_ring;
 pub(crate) mod eventfd_shm;
 pub(crate) mod exec_helpers;
 pub(crate) mod fanotify;
-pub mod fs_backend;
-pub mod fs_resolve_cache;
 pub mod host_process;
 pub mod host_tty;
 pub(crate) mod inotify;
@@ -140,7 +119,6 @@ pub mod interactive_supervisor;
 // graph, never in a host-process global. Rendered docs live in the module
 // itself so its intra-doc links resolve in its own scope.
 pub(crate) mod keyring;
-pub mod layer_cache;
 pub mod namespace;
 pub mod observe;
 
@@ -265,8 +243,6 @@ pub mod trap {
     pub fn dump_kick_stats() {}
 }
 
-pub mod overlay;
-pub mod pathcodec;
 pub mod run_state;
 
 /// Typed object identities and reservation contracts for the backend-neutral
@@ -297,7 +273,6 @@ pub mod execute;
 pub(crate) mod hvpatch;
 pub mod prepare;
 pub mod pty_relay;
-pub mod rootfs;
 #[cfg(feature = "platform-macos")]
 pub mod runtime;
 pub(crate) mod seccomp;
