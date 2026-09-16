@@ -26,8 +26,9 @@ use crate::kernel::{
 ///
 /// The required methods are the carrier's own facts: the exact task binding
 /// and everything the carrier attaches to the process's mm at dispatcher
-/// bind time. `stage1_mm_lease` still names the HVPatch lease type; the
-/// stage-1 projection trait that replaces it is a separate step.
+/// bind time. The stage-1 address space is reached only as a
+/// [`carrick_hal::stage1_mm::Stage1MmProjection`]; the carrier's lease type
+/// never crosses into the kernel.
 pub(crate) trait CarrierProcess: Send + Sync {
     fn kernel_graph(&self) -> &Arc<crate::kernel::Kernel>;
 
@@ -42,9 +43,9 @@ pub(crate) trait CarrierProcess: Send + Sync {
 
     fn mm_access_authority(&self) -> Option<&crate::kernel::MmAccessAuthority>;
 
-    fn stage1_mm_lease(
+    fn stage1_mm_projection(
         &self,
-    ) -> Result<Arc<crate::hvpatch::Stage1MmLease>, crate::run_result::RuntimeError>;
+    ) -> Result<Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>, crate::run_result::RuntimeError>;
 
     fn bind_vma_source(&self, source: crate::kernel::SharedVmaSnapshotSource);
 
@@ -638,9 +639,83 @@ impl carrick_hal::TimerDelivery for ProcessTimerDelivery {
 /// the test code they are.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::num::{NonZeroU16, NonZeroU64};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use carrick_guest_mem::Gpa;
+    use carrick_hal::stage1_mm::Stage1MmProjection;
 
     use super::CarrierProcess;
+
+    /// A fixed `(ASID, stage-1 root)` binding for kernel-side tests that need
+    /// an mm backend or a stage-1 projection without a carrier.
+    pub(crate) fn test_mm_binding(asid: u16, stage1_root: u64) -> crate::kernel::MmBinding {
+        let asid = crate::kernel::Asid::from_registry_allocation(
+            NonZeroU16::new(asid).expect("nonzero test ASID"),
+        );
+        let root = crate::kernel::Stage1Root::for_aarch64_4k(Gpa(stage1_root))
+            .expect("aligned stage-1 root");
+        crate::kernel::MmBinding::for_aarch64(asid, root)
+    }
+
+    /// Kernel-side stand-in for the carrier's stage-1 lease: a fixed binding
+    /// at ASID generation 1 and a COW invalidation counter, which is all the
+    /// projection seam asks of an mm. It is minted by no carrier and holds no
+    /// page tables, so a dispatcher or kernel fixture bound over it never
+    /// touches the carrier's ASID pool.
+    #[derive(Debug)]
+    pub(crate) struct TestStage1MmProjection {
+        binding: crate::kernel::MmBinding,
+        cow_invalidation_generation: AtomicU64,
+    }
+
+    impl TestStage1MmProjection {
+        pub(crate) fn new(binding: crate::kernel::MmBinding) -> Self {
+            Self {
+                binding,
+                cow_invalidation_generation: AtomicU64::new(0),
+            }
+        }
+
+        pub(crate) fn binding(&self) -> crate::kernel::MmBinding {
+            self.binding
+        }
+    }
+
+    impl Stage1MmProjection for TestStage1MmProjection {
+        fn foreign_mm_binding(&self) -> carrick_hal::ForeignMmBinding {
+            let asid = carrick_hal::ForeignAsid::from_kernel_allocation(
+                NonZeroU16::new(self.binding.asid.raw()).expect("nonzero test ASID"),
+            );
+            carrick_hal::ForeignMmBinding::for_aarch64(asid, self.binding.stage1_root.gpa())
+        }
+
+        fn foreign_stage1_identity(
+            &self,
+            mm: carrick_hal::ForeignMmId,
+        ) -> carrick_hal::ForeignStage1Identity {
+            let binding = self.foreign_mm_binding();
+            let asid_generation = carrick_hal::ForeignAsidGeneration::from_runtime_binding(
+                binding.asid(),
+                NonZeroU64::new(1).expect("nonzero test ASID generation"),
+            );
+            carrick_hal::ForeignStage1Identity::new(mm, binding, asid_generation)
+                .expect("test stage-1 identity")
+        }
+
+        fn publish_foreign_cow_invalidation(
+            &self,
+        ) -> carrick_hal::ForeignCowInvalidationGeneration {
+            let generation = self
+                .cow_invalidation_generation
+                .fetch_add(1, Ordering::AcqRel)
+                + 1;
+            carrick_hal::ForeignCowInvalidationGeneration::from_runtime_publication(
+                NonZeroU64::new(generation).expect("nonzero test COW invalidation generation"),
+            )
+        }
+    }
 
     /// In-crate `MmBackend` double: the fixed binding a test hands it, plus the
     /// VMA source and frame-inventory binding a carrier attaches at dispatcher
@@ -784,15 +859,14 @@ pub(crate) mod test_support {
     /// does (`RootBootstrap::with_mm_backend` + `Kernel::bootstrap_root`, the
     /// backend's inventory bound to the root mm), backed by a [`TestMmBackend`]
     /// instead of a stage-1 backend and with no `MmResources`. The one carrier
-    /// fact the dispatcher bind path cannot do without is a stage-1 lease:
-    /// `bind_hvpatch_process_exact` builds the foreign-mm mutation authority from
-    /// it and fail-stops otherwise, so the double holds a root lease from the
-    /// carrier's pool. The stage-1 projection trait retires that dependency.
+    /// fact the dispatcher bind path cannot do without is a stage-1
+    /// projection: `bind_hvpatch_process_exact` builds the foreign-mm mutation
+    /// authority from it and fail-stops otherwise, so the double answers with
+    /// a [`TestStage1MmProjection`] over the same binding its backend publishes.
     pub(crate) struct TestCarrierProcess {
         binding: crate::kernel::KernelTaskBinding,
         backend: Arc<TestMmBackend>,
-        stage1: Arc<crate::hvpatch::Stage1MmLease>,
-        _stage1_pool: crate::hvpatch::Stage1MmPool,
+        stage1: Arc<TestStage1MmProjection>,
         mm_access: Option<crate::kernel::MmAccessAuthority>,
     }
 
@@ -800,8 +874,7 @@ pub(crate) mod test_support {
         /// Boot a root task `pid` on its own kernel graph and return the handle
         /// together with the root's exact context.
         pub(crate) fn new(pid: i32) -> (Self, crate::kernel::KernelContext) {
-            let (stage1_pool, stage1) =
-                crate::hvpatch::Stage1MmPool::new_root(0x4000).expect("test stage-1 root lease");
+            let stage1 = Arc::new(TestStage1MmProjection::new(test_mm_binding(1, 0x4000)));
             let backend = Arc::new(TestMmBackend::new(stage1.binding()));
             let bootstrap = crate::kernel::RootBootstrap::with_mm_backend(
                 pid,
@@ -818,7 +891,6 @@ pub(crate) mod test_support {
                     binding: root.task_binding(),
                     backend,
                     stage1,
-                    _stage1_pool: stage1_pool,
                     mm_access: None,
                 },
                 root,
@@ -834,6 +906,11 @@ pub(crate) mod test_support {
 
         pub(crate) fn backend(&self) -> &Arc<TestMmBackend> {
             &self.backend
+        }
+
+        /// The binding the double's projection and backend both publish.
+        pub(crate) fn stage1_binding(&self) -> crate::kernel::MmBinding {
+            self.stage1.binding()
         }
     }
 
@@ -861,10 +938,10 @@ pub(crate) mod test_support {
             self.mm_access.as_ref()
         }
 
-        fn stage1_mm_lease(
+        fn stage1_mm_projection(
             &self,
-        ) -> Result<Arc<crate::hvpatch::Stage1MmLease>, crate::run_result::RuntimeError> {
-            Ok(Arc::clone(&self.stage1))
+        ) -> Result<Arc<dyn Stage1MmProjection>, crate::run_result::RuntimeError> {
+            Ok(Arc::clone(&self.stage1) as Arc<dyn Stage1MmProjection>)
         }
 
         fn bind_vma_source(&self, source: crate::kernel::SharedVmaSnapshotSource) {
@@ -887,7 +964,9 @@ pub(crate) mod test_support {
 }
 
 #[cfg(test)]
-pub(crate) use test_support::{TestCarrierProcess, TestMmBackend};
+pub(crate) use test_support::{
+    TestCarrierProcess, TestMmBackend, TestStage1MmProjection, test_mm_binding,
+};
 
 #[cfg(test)]
 mod tests {
@@ -911,15 +990,23 @@ mod tests {
         let bound = dispatcher.hvpatch_process().expect("bound carrier process");
         assert_eq!(bound.task_key(), root.task().key());
         assert_eq!(bound.pid(), 83_900);
-        assert!(bound.stage1_mm_lease().is_ok());
+        let projection = bound
+            .stage1_mm_projection()
+            .expect("bound carrier process projection");
         assert!(process.backend().vma_source_bound());
         let snapshot = process
             .backend()
             .snapshot(Instant::now() + Duration::from_secs(1))
             .expect("bound test backend snapshot");
+        assert_eq!(snapshot.binding, process.stage1_binding());
         assert_eq!(
-            Some(snapshot.binding),
-            bound.stage1_mm_lease().ok().map(|lease| lease.binding())
+            projection.foreign_mm_binding(),
+            carrick_hal::ForeignMmBinding::for_aarch64(
+                carrick_hal::ForeignAsid::from_kernel_allocation(
+                    std::num::NonZeroU16::new(snapshot.binding.asid.raw()).expect("test ASID"),
+                ),
+                snapshot.binding.stage1_root.gpa(),
+            )
         );
         assert!(snapshot.vma_revision.is_some());
         assert!(snapshot.frame_inventory_revision.is_some());

@@ -124,7 +124,7 @@ impl SyscallDispatcher {
         self.mm_binding
             .rebind_prepared_root(process_context.shared().mm().id());
         process.bind_vma_source(self.vma_snapshot_source());
-        let stage1 = process.stage1_mm_lease().unwrap_or_else(|error| {
+        let stage1 = process.stage1_mm_projection().unwrap_or_else(|error| {
             tracing::error!(%error, "cannot bind exact HVPatch stage-1 mutation authority");
             carrick_fatal!(
                 "dispatch::hvpatch_binding",

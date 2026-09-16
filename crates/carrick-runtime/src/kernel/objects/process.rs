@@ -259,10 +259,10 @@ impl Mm {
         self.backend.as_ref()
     }
 
-    pub(crate) fn install_foreign_mm_endpoint(
+    pub(crate) fn install_foreign_mm_endpoint<I: carrick_hal::stage1_mm::ForeignMmInstaller>(
         &self,
         endpoint: carrick_hal::ForeignMmEndpoint,
-        _permit: &crate::hvpatch::ForeignMmInstallPermit,
+        _permit: &I::InstallPermit,
     ) {
         *self.foreign_mm_endpoint.write() = Some(endpoint);
     }
@@ -285,10 +285,12 @@ impl Mm {
             .map(|endpoint| endpoint.clone())
     }
 
-    pub(crate) fn install_foreign_mm_mutation_authority(
+    pub(crate) fn install_foreign_mm_mutation_authority<
+        I: carrick_hal::stage1_mm::ForeignMmInstaller,
+    >(
         &self,
         authority: crate::dispatch::mm_mutation::ForeignMmMutationAuthority,
-        _permit: &crate::hvpatch::ForeignMmInstallPermit,
+        _permit: &I::InstallPermit,
     ) {
         *self.foreign_mm_mutation.write() = Some(authority);
     }

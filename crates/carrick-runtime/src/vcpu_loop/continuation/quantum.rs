@@ -9,6 +9,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use carrick_fatal::carrick_fatal;
+use carrick_hal::stage1_mm::Stage1MmProjection;
 use parking_lot::{Condvar, Mutex};
 
 use crate::kernel::Scheduler;
@@ -337,7 +338,9 @@ impl HvpatchTaskBinding {
                     self.identity.mm
                 );
             })
-            .foreign_stage1_identity(self.identity.mm)
+            .foreign_stage1_identity(carrick_hal::ForeignMmId::from_kernel_allocation(
+                self.identity.mm.nonzero(),
+            ))
     }
 
     pub(crate) fn pending_cow_invalidation(

@@ -177,7 +177,7 @@ impl DispatchMmAuthority {
     #[cfg(test)]
     pub(crate) fn foreign_cow_composition_for_test(
         mm_id: crate::kernel::MmId,
-        stage1: Arc<crate::hvpatch::Stage1MmLease>,
+        stage1: Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>,
         start: u64,
         end: u64,
     ) -> (Arc<Self>, mm_mutation::ForeignMmMutationAuthority) {

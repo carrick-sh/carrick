@@ -530,7 +530,7 @@ pub(crate) fn with_foreign_mm_mutation_guard<T>(
     mm: crate::kernel::MmId,
     coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
     census: &crate::kernel::GuestExecutorCensus,
-    stage1: Arc<crate::hvpatch::Stage1MmLease>,
+    stage1: Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>,
     tid: carrick_hal::ThreadId,
     run: impl FnOnce(&mut crate::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
 ) -> Result<T, crate::dispatch::mm_mutation::ForeignMmMutationError> {
@@ -1183,7 +1183,7 @@ mod tests {
         let (dispatch_mm, mutation) =
             crate::dispatch::DispatchMmAuthority::foreign_cow_composition_for_test(
                 mm,
-                Arc::clone(&stage1),
+                Arc::clone(&stage1) as Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>,
                 0x3000,
                 0x4000,
             );
@@ -1267,7 +1267,7 @@ mod tests {
         let (dispatch_mm, mutation) =
             crate::dispatch::DispatchMmAuthority::foreign_cow_composition_for_test(
                 mm,
-                Arc::clone(&stage1),
+                Arc::clone(&stage1) as Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>,
                 TEST_VA,
                 TEST_VA + shape.data_len,
             );
