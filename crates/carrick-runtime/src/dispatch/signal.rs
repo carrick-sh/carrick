@@ -148,8 +148,8 @@ fn altstack_contains_guest_sp(stack: LinuxSigaltstack, sp: u64) -> bool {
         .is_some_and(|top| sp > stack.ss_sp && sp <= top)
 }
 
-fn stop_self_by_signal(signum: i32) {
-    let host_signum = crate::host_signal::linux_to_host_signum(signum);
+fn stop_self_by_signal(host_signal: &dyn carrick_hal::HostSignalBridge, signum: i32) {
+    let host_signum = host_signal.linux_to_host_signum(signum);
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
@@ -633,7 +633,9 @@ impl<'a> SignalView<'a> {
                 *state = crate::kernel::ThreadSignalState::for_exec(state);
             });
         }
-        crate::host_signal::reset_routed_handlers_after_execve(ignored);
+        self.cross
+            .host_signal()
+            .reset_routed_handlers_after_execve(ignored);
     }
 
     /// Apply Linux handler-time masking for `signum`, returning the mask that
@@ -897,7 +899,7 @@ impl<'a> SignalView<'a> {
             return;
         }
         for (signum, code, sender_ns, sender_uid, value, target_ns_tid) in
-            crate::host_signal::xsig_drain_for_self()
+            self.cross.host_signal().xsig_drain_for_self()
         {
             // The ring carries the send's REAL si_code: a plain kill(2)/tkill of
             // an RT signal is SI_USER/SI_TKILL (kill-shaped siginfo), only
@@ -951,7 +953,9 @@ impl<'a> SignalView<'a> {
                 // this drain already broadcast a wake to every parked thread
                 // of this process (see the xsig ring's nudge-handler doc), so
                 // no separate kick is needed here.
-                crate::host_signal::publish_pending_for(target.raw(), signum);
+                self.cross
+                    .host_signal()
+                    .publish_pending_for(target.raw(), signum);
             }
         }
     }
@@ -1095,7 +1099,9 @@ impl<'a> SignalView<'a> {
         // persistent thread mask is folded in, not unioned again).
         let non_eintr = block_mask.non_eintr_union(wait_set);
         let non_eintr_block = SigBlockMask::blocking_all_of(non_eintr);
-        crate::host_signal::has_unblocked_pending_for(tid.raw(), non_eintr_block)
+        self.cross
+            .host_signal()
+            .has_unblocked_pending_for(tid.raw(), non_eintr_block)
             || carrick_signal_core::xsig::xsig_has_unblocked_for_self(non_eintr_block)
             || self.has_deliverable_dispatch_pending_for_wait(
                 context,
@@ -1250,13 +1256,13 @@ impl<'a> SignalView<'a> {
             return DispatchOutcome::Returned { value: 0 };
         }
         if s == LINUX_SIGSTOP {
-            stop_self_by_signal(s);
+            stop_self_by_signal(self.cross.host_signal(), s);
             return DispatchOutcome::Returned { value: 0 };
         }
         if self.signal_blocked(context, tid, s) {
             self.mark_signal_pending(context, tid, s);
         } else {
-            crate::host_signal::raise_for_self(s);
+            self.cross.host_signal().raise_for_self(s);
         }
         DispatchOutcome::Returned { value: 0 }
     }
@@ -1279,7 +1285,7 @@ impl<'a> SignalView<'a> {
             return DispatchOutcome::Returned { value: 0 };
         }
         if s == LINUX_SIGSTOP {
-            stop_self_by_signal(s);
+            stop_self_by_signal(self.cross.host_signal(), s);
             return DispatchOutcome::Returned { value: 0 };
         }
         if self.signal_blocked(context, tid, s) {
@@ -1288,7 +1294,7 @@ impl<'a> SignalView<'a> {
             if let Some(action) = self.registered_signal_handler(context, s) {
                 self.record_pending_signal_action(context, tid, s, action);
             }
-            crate::host_signal::publish_pending_for(tid.raw(), s);
+            self.cross.host_signal().publish_pending_for(tid.raw(), s);
         }
         DispatchOutcome::Returned { value: 0 }
     }
@@ -1780,6 +1786,7 @@ impl<'a> SignalView<'a> {
             // `pid` is the ns→host-translated kill(2) pid encoding here (see
             // the translation block above): decompose it into the typed target.
             Ok(bootstrap_signal_send_as(
+                this.cross.host_signal(),
                 SignalTarget::from_host_kill_pid(pid),
                 signum,
                 caller_euid,
@@ -1983,7 +1990,7 @@ impl<'a> SignalView<'a> {
             // sigsuspend returns only after a caught/terminating signal. A
             // pending default-ignore SIGCHLD neither returns EINTR nor spins.
             let block_mask = SigBlockMask::blocking_all_of(suspend_mask.union(ignored));
-            let host_pending = crate::host_signal::has_unblocked_pending_for(
+            let host_pending = this.cross.host_signal().has_unblocked_pending_for(
                 tid.raw(),
                 block_mask,
             );
@@ -2067,7 +2074,7 @@ impl<'a> SignalView<'a> {
                 let real_handler =
                     h != crate::linux_abi::LINUX_SIG_DFL && h != crate::linux_abi::LINUX_SIG_IGN;
                 if real_handler {
-                    crate::host_signal::ensure_host_handler(signum);
+                    this.cross.host_signal().ensure_host_handler(signum);
                     this.request_signal_pump();
                 } else if h == crate::linux_abi::LINUX_SIG_IGN {
                     // Mirror SIG_IGN to the host disposition so a CROSS-PROCESS
@@ -2075,7 +2082,7 @@ impl<'a> SignalView<'a> {
                     // host-default-terminating us (test_interprocess_signal:
                     // SIGUSR2=SIG_IGN + child kill → parent died -12; probe
                     // xprocsigign). Excludes faults/carrick-managed signals.
-                    crate::host_signal::set_host_ignore(signum);
+                    this.cross.host_signal().set_host_ignore(signum);
                 } else {
                     // h == SIG_DFL: the guest reset the disposition to default.
                     // Clear any host SIG_IGN / routed handler that was mirrored
@@ -2085,7 +2092,7 @@ impl<'a> SignalView<'a> {
                     // each forked child resets SIGTSTP to SIG_DFL before exec; the
                     // pty's ^Z (host SIGTSTP) must then actually stop the job
                     // instead of being discarded by the inherited host SIG_IGN.
-                    crate::host_signal::set_host_default(signum);
+                    this.cross.host_signal().set_host_default(signum);
                 }
                 // pid-1 protection (§5.4): if WE are the ns-init, publish whether
                 // we now handle this signal so the kill path knows not to drop a
@@ -2197,17 +2204,24 @@ impl<'a> SignalView<'a> {
             let memory = &mut *cx.memory;
             if let Some(pending) = this.take_pending_in_from(cx.kernel, tid, wait_set) {
                 return Ok(rt_sigtimedwait_deliver(
+                    this.cross.host_signal(),
                     memory,
                     info_ptr,
                     pending.signum,
                     pending.siginfo,
                 ));
             }
-            let signum = crate::host_signal::take_pending_in_for(tid.raw(), wait_set);
-            if signum != crate::host_signal::NO_PENDING_SIGNAL {
+            let signum = this.cross.host_signal().take_pending_in_for(tid.raw(), wait_set);
+            if signum != carrick_hal::NO_PENDING_SIGNAL {
                 // A host-delivered signal carries no carrick-queued payload.
                 let queued = this.take_pending_siginfo(cx.kernel, tid, signum);
-                return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum, queued));
+                return Ok(rt_sigtimedwait_deliver(
+                    this.cross.host_signal(),
+                    memory,
+                    info_ptr,
+                    signum,
+                    queued,
+                ));
             }
             let block_mask = SigBlockMask::for_signal_wait(
                 wait_set,
@@ -2218,11 +2232,11 @@ impl<'a> SignalView<'a> {
                 cx.kernel,
                 tid,
                 carrick_abi::WaitSigMask::Replace(SigSet::from_raw(block_mask.raw())),
-            ) || crate::host_signal::has_unblocked_pending_for(tid.raw(), block_mask)
+            ) || this.cross.host_signal().has_unblocked_pending_for(tid.raw(), block_mask)
             {
                 return Ok(DispatchOutcome::errno(LINUX_EINTR));
             }
-            install_host_handlers_for_wait_set(wait_set);
+            install_host_handlers_for_wait_set(this.cross.host_signal(), wait_set);
             match timeout {
                 Some(d) if d.is_zero() => Ok(DispatchOutcome::errno(LINUX_EAGAIN)),
                 _ => Ok(DispatchOutcome::WaitOnSignals {
@@ -2524,6 +2538,7 @@ impl<'a> SignalView<'a> {
                 // Preserve ESRCH/EPERM ordering without delivering a host signal.
                 let sender_uid = self.cred_snapshot().euid;
                 match bootstrap_signal_send_as(
+                    self.cross.host_signal(),
                     SignalTarget::from_host_kill_pid(ns_target),
                     /* signum = */ 0,
                     Some(sender_uid),
@@ -2545,7 +2560,7 @@ impl<'a> SignalView<'a> {
                 // convention `SignalTarget::GuestTid` uses). rt_sigqueueinfo
                 // targets the thread group, so this stays 0.
                 let target_ns_tid = if tid_directed { route_target as i32 } else { 0 };
-                if crate::host_signal::xsig_enqueue(
+                if self.cross.host_signal().xsig_enqueue(
                     target_host,
                     s,
                     code,
@@ -2554,7 +2569,7 @@ impl<'a> SignalView<'a> {
                     value,
                     target_ns_tid,
                 ) {
-                    crate::host_signal::xsig_nudge(target_host);
+                    self.cross.host_signal().xsig_nudge(target_host);
                     return DispatchOutcome::Returned { value: 0 };
                 }
                 // A host kill cannot preserve the queued payload. Report resource
@@ -2565,6 +2580,7 @@ impl<'a> SignalView<'a> {
             // check, but Linux still applies the caller's signal permissions.
             let sender_uid = self.cred_snapshot().euid;
             return bootstrap_signal_send_as(
+                self.cross.host_signal(),
                 SignalTarget::from_host_kill_pid(ns_target),
                 signum,
                 Some(sender_uid),
@@ -3156,10 +3172,13 @@ fn sigmask_bit(signum: i32) -> Option<u64> {
     }
 }
 
-fn install_host_handlers_for_wait_set(wait_set: SigSet) {
+fn install_host_handlers_for_wait_set(
+    host_signal: &dyn carrick_hal::HostSignalBridge,
+    wait_set: SigSet,
+) {
     for signum in 1..=64 {
         if wait_set.contains(signum) {
-            crate::host_signal::ensure_host_handler(signum);
+            host_signal.ensure_host_handler(signum);
         }
     }
 }
@@ -3169,11 +3188,14 @@ fn install_host_handlers_for_wait_set(wait_set: SigSet) {
 /// rt_sigqueueinfo payload supplies si_code/si_pid/si_uid/si_value; otherwise a
 /// zeroed siginfo carrying just si_signo. The kernel re-stamps si_signo. (M9)
 fn rt_sigtimedwait_deliver(
+    host_signal: &dyn carrick_hal::HostSignalBridge,
     memory: &mut impl CurrentMmMemory,
     info_ptr: u64,
     signum: i32,
     queued: Option<LinuxSiginfo>,
 ) -> DispatchOutcome {
+    #[cfg(not(test))]
+    let _ = host_signal;
     if info_ptr != 0 {
         // No carrick-queued payload (the host-kill routed path): synthesize the
         // SI_USER siginfo from the recorded last sender, exactly as async
@@ -3183,7 +3205,7 @@ fn rt_sigtimedwait_deliver(
         // cross-process signals arrive as real host signals.
         #[cfg(test)]
         let queued = queued.or_else(|| {
-            let sender_host = crate::host_signal::last_sender_for(signum);
+            let sender_host = host_signal.last_sender_for(signum);
             (sender_host > 0).then(|| {
                 let ns_pid = crate::namespace::pid::host_to_ns_or_self(sender_host as u32) as i32;
                 let uid =
@@ -3400,6 +3422,7 @@ fn hvpatch_owns_specific_thread_signal(hvpatch_lane: bool) -> bool {
 /// processes. `None` means "skip the check" (used by the self-target /
 /// process-group cases that don't cross processes).
 pub(crate) fn bootstrap_signal_send_as(
+    host_signal: &dyn carrick_hal::HostSignalBridge,
     target: SignalTarget,
     signum: u64,
     caller_euid: Option<carrick_abi::NsUid>,
@@ -3443,7 +3466,7 @@ pub(crate) fn bootstrap_signal_send_as(
         // Queue the signal for self-delivery. The runtime drains the pending
         // slot between vCPU iterations and either injects a handler frame or
         // applies the default action (terminate with 128 + signum).
-        crate::host_signal::raise_for_self(signum as i32);
+        host_signal.raise_for_self(signum as i32);
         return DispatchOutcome::Returned { value: 0 };
     }
     #[cfg(not(test))]
@@ -3465,7 +3488,7 @@ pub(crate) fn bootstrap_signal_send_as(
         // for the contained case, safe for the shared one.
         if target == 0 && unsafe { libc::getpgrp() } != std::process::id() as i32 {
             if signum != 0 {
-                crate::host_signal::raise_for_self(signum as i32);
+                host_signal.raise_for_self(signum as i32);
             }
             return DispatchOutcome::Returned { value: 0 };
         }
@@ -3507,7 +3530,7 @@ pub(crate) fn bootstrap_signal_send_as(
             // target process's registry actually has live — in practice this
             // works where it worked before (tid == pid main threads), and now
             // lands thread-directed in the target instead of process-directed.
-            if crate::host_signal::xsig_enqueue(
+            if host_signal.xsig_enqueue(
                 target as i32,
                 signum as i32,
                 crate::linux_abi::LINUX_SI_USER,
@@ -3516,7 +3539,7 @@ pub(crate) fn bootstrap_signal_send_as(
                 0,
                 target_ns_tid,
             ) {
-                crate::host_signal::xsig_nudge(target as i32);
+                host_signal.xsig_nudge(target as i32);
                 return DispatchOutcome::Returned { value: 0 };
             }
             if crate::namespace::pid::enabled()
@@ -5374,7 +5397,7 @@ mod tests {
             ));
         }
         assert_eq!(
-            crate::host_signal::take_pending_for(target.raw()),
+            carrick_signal_core::take_pending_for(target.raw()),
             0,
             "guest-originated HVPatch signals never enter the host pending bitmask"
         );

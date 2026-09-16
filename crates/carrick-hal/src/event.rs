@@ -3,7 +3,7 @@
 //! Defined here so `carrick-host-bsd`'s `KqueueMultiplexer` and the future Linux
 //! `EpollMultiplexer` share one contract. The contract is informed by the
 //! runtime's actual epoll dependencies: EVFILT_VNODE/inotify, EVFILT_EXCEPT/
-//! NOTE_OOB → EPOLLPRI, edge-vs-level, EV_EOF/error, NOTE_EXITSTATUS.
+//! NOTE_OOB → EPOLLPRI, edge-vs-level, EV_EOF/error.
 
 use crate::error::OsError;
 use std::os::fd::RawFd;
@@ -185,14 +185,6 @@ pub struct PollEvent {
     pub error: Option<i32>,
     /// → `EPOLLHUP`.
     pub eof: bool,
-    /// For a process-exit readiness (`watch_process_exit`), the exited
-    /// process's BARE exit code: `WEXITSTATUS` on a normal exit, or
-    /// `128 + signal` on a signal death (the shell convention). `None` for a
-    /// non-exit event. This is the value the guest's `waitid(P_PIDFD)`
-    /// `si_status` should reflect, NOT a raw `waitpid(2)` status word — both the
-    /// macOS kqueue backend (which decodes its `NOTE_EXITSTATUS` data) and the
-    /// Linux epoll backend (which peeks `waitid(P_PIDFD)`) normalize to it.
-    pub exit_status: Option<i32>,
     /// For an `EVFILT_VNODE`/inotify readiness, the precise filesystem events
     /// that fired (the kqueue `NOTE_*` fflags expressed structurally). `None`
     /// for non-vnode events. The macOS inotify emulation needs these to derive
@@ -211,7 +203,6 @@ pub trait EventMultiplexer: Send {
         mode: TriggerMode,
     ) -> Result<(), OsError>;
     fn register_vnode(&mut self, fd: RawFd, token: u64, mask: VnodeEvents) -> Result<(), OsError>;
-    fn watch_process_exit(&mut self, pid: i32, token: u64) -> Result<(), OsError>;
     fn register_user(&mut self, ident: u64) -> Result<(), OsError>;
     fn trigger_user(&self, ident: u64) -> Result<(), OsError>;
     fn register_timer(

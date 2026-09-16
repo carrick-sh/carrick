@@ -161,7 +161,7 @@ fn dup_fd(fd: RawFd) -> io::Result<RawFd> {
     if duplicated < 0 {
         Err(io::Error::last_os_error())
     } else {
-        Ok(crate::host_signal::relocate_internal_fd(duplicated))
+        Ok(carrick_host::internal_fd::relocate_internal_fd(duplicated))
     }
 }
 

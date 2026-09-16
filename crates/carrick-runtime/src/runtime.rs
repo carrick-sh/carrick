@@ -181,7 +181,11 @@ pub fn run_static_elf_with_hvf(
     path: impl AsRef<Path>,
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
-    run_static_elf_with_hvf_and_dispatcher(path, SyscallDispatcher::new(), max_traps)
+    run_static_elf_with_hvf_and_dispatcher(
+        path,
+        SyscallDispatcher::with_bridges(crate::platform_bridges()),
+        max_traps,
+    )
 }
 
 pub fn run_static_elf_with_hvf_and_dispatcher(
@@ -679,7 +683,8 @@ where
     run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
         path,
         rootfs,
-        SyscallDispatcher::with_rootfs_and_executable(
+        SyscallDispatcher::with_rootfs_and_executable_on(
+            crate::platform_bridges(),
             rootfs.clone(),
             path.to_string_lossy().into_owned(),
         ),
@@ -981,7 +986,12 @@ where
     M: CurrentMmMemory,
     T: SyscallTrap,
 {
-    run_syscall_loop_with_dispatcher(memory, trap, SyscallDispatcher::new(), max_traps)
+    run_syscall_loop_with_dispatcher(
+        memory,
+        trap,
+        SyscallDispatcher::with_bridges(crate::platform_bridges()),
+        max_traps,
+    )
 }
 
 pub fn run_syscall_loop_with_dispatcher<M, T>(
@@ -1004,7 +1014,11 @@ pub fn run_combined_syscall_loop<R>(
 where
     R: CurrentMmMemory + SyscallTrap,
 {
-    run_combined_syscall_loop_with_dispatcher(runtime, SyscallDispatcher::new(), max_traps)
+    run_combined_syscall_loop_with_dispatcher(
+        runtime,
+        SyscallDispatcher::with_bridges(crate::platform_bridges()),
+        max_traps,
+    )
 }
 
 pub fn run_combined_syscall_loop_with_dispatcher<R>(
@@ -1016,7 +1030,7 @@ where
     R: CurrentMmMemory + SyscallTrap,
 {
     let reporter = CompatReporter::default();
-    crate::host_signal::install_default_handlers();
+    carrick_vmm_hvf::host_signal::install_default_handlers();
     // Snapshot the host stdin termios so a guest crash mid-`stty raw`
     // doesn't leave the user's terminal wedged. The guard drops at the
     // end of this function and restores the saved state if we touched
@@ -1025,7 +1039,7 @@ where
 
     let this_tid = ThreadId::main_from_host_pid();
     // Per-thread blocking-I/O waiter (owns this thread's kqueue).
-    let mut waiter = crate::io_wait::ThreadWaiter::new(this_tid);
+    let mut waiter = carrick_vmm_hvf::io_wait::ThreadWaiter::new(this_tid);
     for traps in 1..=max_traps {
         let frame = match runtime.next_syscall()? {
             Some(f) => f,
@@ -1047,7 +1061,7 @@ where
                     Some(pc),
                 )? {
                     if let Some(signum) = action.stop_signal {
-                        stop_by_signal(signum);
+                        stop_by_signal(&*dispatcher.host_signal, signum);
                         continue;
                     }
                     if let Some(signum) = action.term_signal {
@@ -1592,7 +1606,7 @@ where
             signal_interrupted_pc,
         )? {
             if let Some(signum) = action.stop_signal {
-                stop_by_signal(signum);
+                stop_by_signal(&*dispatcher.host_signal, signum);
                 continue;
             }
             if let Some(signum) = action.term_signal {
@@ -1656,7 +1670,7 @@ fn dispatch_single_threaded_syscall<M: CurrentMmMemory>(
     syscall: PreparedSyscall,
     memory: &mut M,
     reporter: &CompatReporter,
-    waiter: &mut crate::io_wait::ThreadWaiter,
+    waiter: &mut carrick_vmm_hvf::io_wait::ThreadWaiter,
 ) -> Result<DispatchOutcome, RuntimeError> {
     dispatch_single_threaded_syscall_with(
         dispatcher,
@@ -1677,7 +1691,7 @@ fn dispatch_single_threaded_syscall_with<M, F>(
     syscall: PreparedSyscall,
     memory: &mut M,
     reporter: &CompatReporter,
-    waiter: &mut crate::io_wait::ThreadWaiter,
+    waiter: &mut carrick_vmm_hvf::io_wait::ThreadWaiter,
     mut dispatch: F,
 ) -> Result<DispatchOutcome, RuntimeError>
 where
@@ -1690,7 +1704,7 @@ where
         &CompatReporter,
     ) -> Result<DispatchOutcome, crate::dispatch::DispatchError>,
 {
-    use crate::io_wait::WaitResult;
+    use carrick_vmm_hvf::io_wait::WaitResult;
 
     // Service blocking I/O by waiting without re-entering the dispatcher's
     // blocking path: poll the host fds, then re-dispatch the same syscall on
@@ -1709,7 +1723,10 @@ where
             DispatchOutcome::BlockingWrite(mut write) => {
                 waiter.ensure_full();
                 loop {
-                    match crate::dispatch::drive_blocking_write(&mut write) {
+                    match crate::dispatch::drive_blocking_write(
+                        &mut write,
+                        &*dispatcher.host_signal,
+                    ) {
                         crate::dispatch::BlockingWriteStep::Done(outcome) => {
                             return Ok(raise_sigpipe_for_blocking_write(
                                 dispatcher,
@@ -1720,7 +1737,7 @@ where
                         }
                         crate::dispatch::BlockingWriteStep::Wait => {
                             match waiter.wait(
-                                &[crate::io_wait::WaitFd::raw(
+                                &[carrick_hal::WaitFd::raw(
                                     write.poll_fd(),
                                     write.poll_events(),
                                 )],
@@ -1750,7 +1767,10 @@ where
                 }
             }
             DispatchOutcome::BlockingRecordLock(lock) => {
-                return Ok(crate::dispatch::drive_blocking_record_lock(&lock));
+                return Ok(crate::dispatch::drive_blocking_record_lock(
+                    &lock,
+                    &*dispatcher.host_signal,
+                ));
             }
             DispatchOutcome::WaitOnFds {
                 fds,
@@ -2025,7 +2045,7 @@ impl crate::threaded_loop::HostBackend for HvfHostBackend {
     ) -> Arc<dyn carrick_hal::TimerDelivery> {
         // HVF arms an EVFILT_TIMER on the pump kqueue and owns delivery; only a
         // pump-less fork child falls back to the shared wall-clock thread.
-        Arc::new(crate::timer_delivery_impl::HvfTimerDelivery)
+        Arc::new(carrick_vmm_hvf::timer_delivery::HvfTimerDelivery)
     }
 
     fn make_signal_arrival(
@@ -2039,7 +2059,7 @@ impl crate::threaded_loop::HostBackend for HvfHostBackend {
     }
 
     fn pre_loop_setup(&self) -> Box<dyn std::any::Any> {
-        crate::host_signal::install_default_handlers();
+        carrick_vmm_hvf::host_signal::install_default_handlers();
         Box::new(crate::host_tty::TermiosRestoreGuard::new())
     }
 
@@ -2110,7 +2130,7 @@ fn shared_futex_wait(
     let host_value = unsafe { (host_addr as *const u32).read() };
     crate::probes::futex_route(host_addr as u64, 99, value as i32, host_value as u64);
     loop {
-        if crate::host_signal::has_pending_for(this_tid.raw())
+        if carrick_vmm_hvf::host_signal::has_pending_for(this_tid.raw())
             || crate::fork_quiesce::is_quiescing()
             || crate::fork_quiesce::exec_replacing_other_thread(this_tid)
         {
@@ -2724,7 +2744,7 @@ mod tests {
                 dispatcher.observers().cloned(),
             ));
             let mut memory = crate::dispatch::LinearMemory::new(0x4000_0000, vec![0; 4096]);
-            let mut waiter = crate::io_wait::ThreadWaiter::new(
+            let mut waiter = carrick_vmm_hvf::io_wait::ThreadWaiter::new(
                 crate::thread::ThreadId::synthetic_for_tests(72_410 + redispatches),
             );
             let mut handler_calls = 0;
@@ -2801,8 +2821,9 @@ mod tests {
         assert_eq!(unsafe { libc::close(fds[0]) }, 0);
         assert_eq!(unsafe { libc::close(fds[1]) }, 0);
         let mut memory = crate::dispatch::LinearMemory::new(0x4000_0000, vec![0; 4096]);
-        let mut waiter =
-            crate::io_wait::ThreadWaiter::new(crate::thread::ThreadId::synthetic_for_tests(72_411));
+        let mut waiter = carrick_vmm_hvf::io_wait::ThreadWaiter::new(
+            crate::thread::ThreadId::synthetic_for_tests(72_411),
+        );
         let mut write = Some(write);
 
         let outcome = dispatch_single_threaded_syscall_with(

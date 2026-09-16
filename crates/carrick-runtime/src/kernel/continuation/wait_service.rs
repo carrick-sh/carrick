@@ -650,6 +650,7 @@ impl CarrierWaitServiceInner {
                 Arc<Mutex<BlockingWrite>>,
                 Arc<Mutex<Option<DispatchOutcome>>>,
                 Arc<RegistrationOperationGate>,
+                Arc<dyn carrick_hal::HostSignalBridge>,
             ),
         }
         loop {
@@ -695,6 +696,7 @@ impl CarrierWaitServiceInner {
                             poll_events,
                             write,
                             completion,
+                            host_signal,
                         } => {
                             pollfds.push(libc::pollfd {
                                 fd: *poll_fd,
@@ -706,6 +708,7 @@ impl CarrierWaitServiceInner {
                                 Arc::clone(write),
                                 Arc::clone(completion),
                                 Arc::clone(&entry.operation_gate),
+                                Arc::clone(host_signal),
                             ));
                         }
                         _ => {}
@@ -805,7 +808,7 @@ impl CarrierWaitServiceInner {
                     FdSource::Ready(token) => {
                         inner.publish_event(token, ContinuationEvent::Ready);
                     }
-                    FdSource::BlockingWrite(token, write, completion, gate) => {
+                    FdSource::BlockingWrite(token, write, completion, gate, host_signal) => {
                         #[cfg(test)]
                         if let Some(hook) = inner.test_hooks.before_host_write_drive.lock().as_ref()
                         {
@@ -820,7 +823,10 @@ impl CarrierWaitServiceInner {
                                 {
                                     hook();
                                 }
-                                match crate::dispatch::drive_blocking_write(&mut write) {
+                                match crate::dispatch::drive_blocking_write(
+                                    &mut write,
+                                    &*host_signal,
+                                ) {
                                     crate::dispatch::BlockingWriteStep::Done(outcome) => {
                                         Some(outcome)
                                     }

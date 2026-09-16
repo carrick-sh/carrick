@@ -1064,7 +1064,8 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
         "hvpatch-root".to_owned(),
     )
     .map_err(|error| RuntimeError::Configuration(error.to_string()))?
-    .with_container(container);
+    .with_container(container)
+    .with_host_signal(Arc::clone(&dispatcher.host_signal));
     let launch_fs_context = dispatcher
         .launch_fs_context_for_hvpatch_bind()
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;

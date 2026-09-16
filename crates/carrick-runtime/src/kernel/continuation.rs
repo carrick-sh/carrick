@@ -100,6 +100,7 @@ impl SyscallFrame {
 #[derive(Debug)]
 pub struct ContinuationCapture {
     kernel: Weak<Kernel>,
+    host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
     task_ref: Weak<Task>,
     file_table: Arc<crate::kernel::objects::FileTable>,
     thread: ThreadKey,
@@ -138,6 +139,7 @@ impl ContinuationCapture {
         let signal_authority = context.signal_authority();
         Ok(Self {
             kernel: Arc::downgrade(context.kernel()),
+            host_signal: Arc::clone(context.kernel().host_signal()),
             task_ref: Arc::downgrade(context.task()),
             file_table: context.resources().files(),
             thread: context.thread().key(),
@@ -178,6 +180,7 @@ impl ContinuationCapture {
         let signal_authority = context.signal_authority();
         Ok(Self {
             kernel: Arc::downgrade(context.kernel()),
+            host_signal: Arc::clone(context.kernel().host_signal()),
             task_ref: Arc::downgrade(context.task()),
             file_table: context.resources().files(),
             thread: context.thread().key(),
@@ -199,6 +202,9 @@ impl ContinuationCapture {
 #[derive(Debug)]
 pub struct ContinuationAuthority {
     pub(crate) kernel: Weak<Kernel>,
+    /// The host-signal bridge of the kernel this continuation was captured
+    /// under; readiness probes consult the host pending slot through it.
+    pub(crate) host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
     pub(crate) task_ref: Weak<Task>,
     pub(crate) file_table: Arc<crate::kernel::objects::FileTable>,
     pub(crate) thread: ThreadKey,
@@ -217,6 +223,7 @@ impl ContinuationAuthority {
     fn from_capture(capture: ContinuationCapture) -> Self {
         Self {
             kernel: capture.kernel,
+            host_signal: capture.host_signal,
             task_ref: capture.task_ref,
             file_table: capture.file_table,
             thread: capture.thread,

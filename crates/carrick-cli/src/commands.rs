@@ -742,7 +742,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 bail!("dispatch-syscall requires exactly six --args values");
             }
             let mut memory = LinearMemory::new(memory_base, memory_text.into_bytes());
-            let mut dispatcher = SyscallDispatcher::new();
+            let mut dispatcher =
+                SyscallDispatcher::with_bridges(carrick_runtime::platform_bridges());
             // `CompatReporter` is a fielded struct on macOS (carrick-vmm-hvf) but a
             // unit struct in the non-macOS fallback, so `.default()` only trips
             // `default_constructed_unit_structs` off-macOS. Keep the lint strict

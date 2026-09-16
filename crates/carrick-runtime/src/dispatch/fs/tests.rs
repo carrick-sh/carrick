@@ -496,8 +496,11 @@ fn f_setlkw_cycle_reports_edeadlk_instead_of_parking_forever() {
         let locks = Arc::clone(&locks);
         let a_wants_b = logical_lock_request((41, 1), (10, 20), true);
         std::thread::spawn(move || {
-            locks
-                .wait_set_interruptibly(&a_wants_b, crate::thread::ThreadId::synthetic_for_tests(1))
+            locks.wait_set_interruptibly(
+                &a_wants_b,
+                crate::thread::ThreadId::synthetic_for_tests(1),
+                &carrick_hal::NullHostSignalBridge,
+            )
         })
     };
     // Wait for A's edge to appear rather than sleeping a fixed amount.
@@ -516,7 +519,11 @@ fn f_setlkw_cycle_reports_edeadlk_instead_of_parking_forever() {
     // B now wants A's range: A waits on B, B would wait on A. That is a cycle.
     let b_wants_a = logical_lock_request((42, 1), (0, 10), true);
     assert_eq!(
-        locks.wait_set_interruptibly(&b_wants_a, crate::thread::ThreadId::synthetic_for_tests(2)),
+        locks.wait_set_interruptibly(
+            &b_wants_a,
+            crate::thread::ThreadId::synthetic_for_tests(2),
+            &carrick_hal::NullHostSignalBridge,
+        ),
         Err(crate::linux_abi::LINUX_EDEADLK),
         "closing the cycle must be EDEADLK, not an unbounded park"
     );
@@ -631,8 +638,11 @@ fn hvpatch_blocking_classic_record_lock_wakes_after_unlock() {
     let worker_locks = Arc::clone(&locks);
     let worker = std::thread::spawn(move || {
         started_tx.send(()).expect("publish waiter start");
-        let result = worker_locks
-            .wait_set_interruptibly(&child, crate::thread::ThreadId::synthetic_for_tests(42));
+        let result = worker_locks.wait_set_interruptibly(
+            &child,
+            crate::thread::ThreadId::synthetic_for_tests(42),
+            &carrick_hal::NullHostSignalBridge,
+        );
         done_tx.send(result).expect("publish waiter result");
     });
     started_rx.recv().expect("waiter started");
@@ -8746,7 +8756,9 @@ struct FsViewFixture {
 
 impl FsViewFixture {
     fn new() -> Self {
-        let (kernel_binding, mm_id) = crate::dispatch::kernel_context::bootstrap_one_task_binding();
+        let (kernel_binding, mm_id) = crate::dispatch::kernel_context::bootstrap_one_task_binding(
+            std::sync::Arc::new(carrick_hal::NullHostSignalBridge),
+        );
         let task_context = kernel_binding
             .capture(crate::kernel::LinuxTid::for_task_leader(
                 kernel_binding.task_id(),
@@ -8788,6 +8800,9 @@ impl FsViewFixture {
 }
 
 impl FsCrossSubsystem for FsViewFixture {
+    fn host_signal(&self) -> &dyn carrick_hal::HostSignalBridge {
+        &carrick_hal::NullHostSignalBridge
+    }
     fn captured_fs_context(&self) -> Arc<crate::kernel::FsContext> {
         self.task_context.resources().fs_context()
     }

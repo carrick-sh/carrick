@@ -1353,6 +1353,101 @@ pub fn raise_for_self(signum: i32) {
     publish_pending(signum);
 }
 
+/// HVF's [`HostSignalBridge`](carrick_hal::HostSignalBridge): the kqueue
+/// signal pump, the per-thread wake pipes, the cross-process xsignal ring and
+/// the BSD signum table, reached by the dispatcher and kernel only through the
+/// trait. Every method forwards to the free function of the same name in this
+/// module (the carrier and the pump keep calling those directly).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HvfHostSignal;
+
+impl carrick_hal::HostSignalBridge for HvfHostSignal {
+    fn has_unblocked_pending_for(&self, tid: i32, block_mask: carrick_abi::SigBlockMask) -> bool {
+        has_unblocked_pending_for(tid, block_mask)
+    }
+
+    fn take_pending_for(&self, tid: i32) -> i32 {
+        take_pending_for(tid)
+    }
+
+    fn take_pending_in_for(&self, tid: i32, wait_set: carrick_abi::SigSet) -> i32 {
+        take_pending_in_for(tid, wait_set)
+    }
+
+    fn publish_pending_for(&self, tid: i32, signum: i32) {
+        publish_pending_for(tid, signum);
+    }
+
+    fn publish_process_signal(&self, signum: i32) {
+        publish_process_signal(signum);
+    }
+
+    fn last_sender_for(&self, signum: i32) -> i32 {
+        last_sender_for(signum)
+    }
+
+    fn raise_for_self(&self, signum: i32) {
+        raise_for_self(signum);
+    }
+
+    fn wake_all_waiters(&self) {
+        wake_all_waiters();
+    }
+
+    fn ensure_host_handler(&self, linux_signum: i32) {
+        ensure_host_handler(linux_signum);
+    }
+
+    fn set_host_ignore(&self, linux_signum: i32) {
+        set_host_ignore(linux_signum);
+    }
+
+    fn set_host_default(&self, linux_signum: i32) {
+        set_host_default(linux_signum);
+    }
+
+    fn reset_routed_handlers_after_execve(&self, ignored: carrick_abi::SigSet) {
+        reset_routed_handlers_after_execve(ignored);
+    }
+
+    fn xsig_enqueue(
+        &self,
+        target_host_pid: i32,
+        signum: i32,
+        code: i32,
+        sender_ns_pid: i32,
+        sender_uid: u32,
+        value: i64,
+        target_ns_tid: i32,
+    ) -> bool {
+        xsig_enqueue(
+            target_host_pid,
+            signum,
+            code,
+            sender_ns_pid,
+            sender_uid,
+            value,
+            target_ns_tid,
+        )
+    }
+
+    fn xsig_nudge(&self, target_host_pid: i32) {
+        xsig_nudge(target_host_pid);
+    }
+
+    fn xsig_drain_for_self(&self) -> Vec<(i32, i32, i32, u32, i64, i32)> {
+        xsig_drain_for_self()
+    }
+
+    fn host_to_linux_signum(&self, host_signum: i32) -> i32 {
+        host_to_linux_signum(host_signum)
+    }
+
+    fn linux_to_host_signum(&self, linux_signum: i32) -> i32 {
+        linux_to_host_signum(linux_signum)
+    }
+}
+
 /// Crate-test-shared lock serialising every test that touches process-global
 /// pump-pipe / kqueue / `PENDING` state. It lives at module scope (not inside
 /// `mod tests`) so sibling test modules — `vcpu_kick::tests`,

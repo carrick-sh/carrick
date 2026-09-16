@@ -124,7 +124,7 @@ enum HostWritePayload<'a> {
 }
 
 #[derive(Clone)]
-pub(crate) struct HostPipeWriteTarget {
+pub(crate) struct HostPipeWriteTarget<'a> {
     pub(crate) host_fd: i32,
     pub(crate) host_fd_owner: Option<HostFdRef>,
     pub(crate) nonblocking: bool,
@@ -133,6 +133,9 @@ pub(crate) struct HostPipeWriteTarget {
     pub(crate) tid: crate::thread::ThreadId,
     pub(crate) sigpipe_on_epipe: bool,
     pub(crate) authority: WaitFdAuthority,
+    /// The carrier's host-signal bridge: a pending unblocked signal ends a
+    /// partially completed blocking write with the bytes so far.
+    pub(crate) host_signal: &'a dyn carrick_hal::HostSignalBridge,
 }
 
 impl<'a> HostWritePayload<'a> {
@@ -173,13 +176,13 @@ fn prior_ar_magic_write(host_fd: i32) -> Option<(usize, u64)> {
     AR_MAGIC_WRITES.lock().get(&host_fd).copied()
 }
 
-pub(crate) fn write_host_pipe(bytes: &[u8], target: HostPipeWriteTarget) -> DispatchOutcome {
+pub(crate) fn write_host_pipe(bytes: &[u8], target: HostPipeWriteTarget<'_>) -> DispatchOutcome {
     write_host_pipe_payload(HostWritePayload::Borrowed(bytes), target)
 }
 
 pub(crate) fn write_host_pipe_owned(
     bytes: Vec<u8>,
-    target: HostPipeWriteTarget,
+    target: HostPipeWriteTarget<'_>,
 ) -> DispatchOutcome {
     write_host_pipe_payload(HostWritePayload::Owned(bytes), target)
 }
@@ -191,7 +194,7 @@ pub(crate) fn host_pipe_write_room(capacity: i64, queued: usize) -> Option<usize
 
 fn write_host_pipe_payload(
     payload: HostWritePayload<'_>,
-    target: HostPipeWriteTarget,
+    target: HostPipeWriteTarget<'_>,
 ) -> DispatchOutcome {
     let HostPipeWriteTarget {
         host_fd,
@@ -202,6 +205,7 @@ fn write_host_pipe_payload(
         tid,
         sigpipe_on_epipe,
         authority,
+        host_signal,
     } = target;
 
     // Always-on, near-zero-cost detector for archive corruption. The predicate
@@ -316,10 +320,9 @@ fn write_host_pipe_payload(
                     // dpkg's data.tar). Hand the staged bytes to the runtime the
                     // same way the EAGAIN branch does.
                     if block_until_complete && offset > 0 {
-                        if crate::host_signal::has_unblocked_pending_for(
-                            tid.raw(),
-                            carrick_abi::SigBlockMask::NONE,
-                        ) {
+                        if host_signal
+                            .has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE)
+                        {
                             return DispatchOutcome::returned_len_or_errno(offset);
                         }
                         return match BlockingWrite::from_vec(
@@ -399,10 +402,9 @@ fn write_host_pipe_payload(
                     };
                 }
                 if block_until_complete && offset > 0 {
-                    if crate::host_signal::has_unblocked_pending_for(
-                        tid.raw(),
-                        carrick_abi::SigBlockMask::NONE,
-                    ) {
+                    if host_signal
+                        .has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE)
+                    {
                         return DispatchOutcome::returned_len_or_errno(offset);
                     }
                     return match BlockingWrite::from_vec(
@@ -432,10 +434,8 @@ fn write_host_pipe_payload(
                 // A signal that arrives mid-write interrupts it on Linux,
                 // returning the partial count; check between chunks so a long
                 // write doesn't ignore an armed alarm (or a pending quiesce).
-                if crate::host_signal::has_unblocked_pending_for(
-                    tid.raw(),
-                    carrick_abi::SigBlockMask::NONE,
-                ) || crate::fork_quiesce::is_quiescing()
+                if host_signal.has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE)
+                    || crate::fork_quiesce::is_quiescing()
                 {
                     if crate::fork_quiesce::is_quiescing() {
                         return match BlockingWrite::from_vec(

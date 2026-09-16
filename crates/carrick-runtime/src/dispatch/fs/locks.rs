@@ -602,6 +602,7 @@ impl LogicalRecordLocks {
         owner: usize,
         write: bool,
         tid: crate::thread::ThreadId,
+        host_signal: &dyn carrick_hal::HostSignalBridge,
     ) -> Result<(), LinuxErrno> {
         let mut state = self.state();
         loop {
@@ -621,10 +622,7 @@ impl LogicalRecordLocks {
                 self.changed.notify_all();
                 return Ok(());
             }
-            if crate::host_signal::has_unblocked_pending_for(
-                tid.raw(),
-                carrick_abi::SigBlockMask::NONE,
-            ) {
+            if host_signal.has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE) {
                 return Err(LINUX_EINTR);
             }
             state.wait_for(&self.changed, std::time::Duration::from_millis(10));
@@ -745,6 +743,7 @@ impl LogicalRecordLocks {
         &self,
         request: &LogicalRecordLockRequest,
         tid: crate::thread::ThreadId,
+        host_signal: &dyn carrick_hal::HostSignalBridge,
     ) -> Result<(), LinuxErrno> {
         let wait = self.mint_wait_id();
         let mut state = self.state();
@@ -753,10 +752,7 @@ impl LogicalRecordLocks {
                 Err(errno) if errno == LINUX_EAGAIN => {}
                 settled => break settled,
             }
-            if crate::host_signal::has_unblocked_pending_for(
-                tid.raw(),
-                carrick_abi::SigBlockMask::NONE,
-            ) {
+            if host_signal.has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE) {
                 self.retract_wait_locked(&mut state, wait);
                 break Err(LINUX_EINTR);
             }
@@ -807,8 +803,12 @@ impl LogicalRecordLockWait {
 
     /// Park the calling host thread until the lock is taken, `EDEADLK`, or a
     /// pending signal (`EINTR`).
-    pub(crate) fn acquire(&self) -> Result<(), LinuxErrno> {
-        self.locks.wait_set_interruptibly(&self.request, self.tid)
+    pub(crate) fn acquire(
+        &self,
+        host_signal: &dyn carrick_hal::HostSignalBridge,
+    ) -> Result<(), LinuxErrno> {
+        self.locks
+            .wait_set_interruptibly(&self.request, self.tid, host_signal)
     }
 
     /// One reactor step: take the lock if it is free, `EDEADLK` if waiting
@@ -911,10 +911,13 @@ pub(crate) enum LogicalLockWait {
 }
 
 impl LogicalLockWait {
-    pub(crate) fn acquire(&self) -> Result<(), LinuxErrno> {
+    pub(crate) fn acquire(
+        &self,
+        host_signal: &dyn carrick_hal::HostSignalBridge,
+    ) -> Result<(), LinuxErrno> {
         match self {
-            Self::Record { wait, .. } => wait.acquire(),
-            Self::Flock(wait) => wait.acquire(),
+            Self::Record { wait, .. } => wait.acquire(host_signal),
+            Self::Flock(wait) => wait.acquire(host_signal),
         }
     }
 
@@ -958,9 +961,14 @@ impl LogicalFlockWait {
         }
     }
 
-    fn acquire(&self) -> Result<(), LinuxErrno> {
-        self.locks
-            .wait_flock_interruptibly(&self.file, self.owner, self.write, self.tid)
+    fn acquire(&self, host_signal: &dyn carrick_hal::HostSignalBridge) -> Result<(), LinuxErrno> {
+        self.locks.wait_flock_interruptibly(
+            &self.file,
+            self.owner,
+            self.write,
+            self.tid,
+            host_signal,
+        )
     }
 
     pub(crate) fn try_acquire(&self) -> Result<(), LinuxErrno> {

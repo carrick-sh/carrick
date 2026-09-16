@@ -4,8 +4,8 @@ use serde::Serialize;
 use crate::dispatch::fd_table::HostFdRef;
 use crate::dispatch::fifo_beacon::ParkedOpenerToken;
 use crate::dispatch::{DispatchOutcome, SyscallDispatcher};
-use crate::io_wait::WaitFd;
 use crate::linux_abi::LINUX_EBADF;
+use carrick_hal::WaitFd;
 
 #[derive(Debug, Clone)]
 pub(crate) enum WaitFdGuard {

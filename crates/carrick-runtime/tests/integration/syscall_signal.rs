@@ -74,7 +74,10 @@ fn rt_sigaction_sig_dfl_resets_host_disposition_for_job_control() {
 
     let mut memory = LinearMemory::new(0x4000, vec![0u8; 0x200]);
     let reporter = CompatReporter::default();
-    let mut dispatcher = SyscallDispatcher::new();
+    // This test reads the HOST disposition back, so it needs the platform
+    // bridge that mirrors guest dispositions onto the host; the Null bridge
+    // a bare `new()` boots with deliberately touches no host state.
+    let mut dispatcher = SyscallDispatcher::with_bridges(carrick_runtime::platform_bridges());
 
     // 1. guest SIGTSTP = SIG_IGN -> host mirrors IGN (sa_handler is at offset 0).
     memory
@@ -561,10 +564,7 @@ fn kill_tkill_tgkill_validate_logical_targets_and_queue_exact_thread_signals() {
         dispatcher.take_deliverable_pending(&context, context.thread().registry_id()),
         Some(1)
     );
-    assert_eq!(
-        carrick_runtime::host_signal::take_pending_for(thread_id as i32),
-        0
-    );
+    assert_eq!(carrick_signal_core::take_pending_for(thread_id as i32), 0);
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }

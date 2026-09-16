@@ -266,7 +266,7 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
             let out = dispatcher.stdout();
             let err = dispatcher.stderr();
             dispatcher.cleanup_sysv_ipc_on_process_exit();
-            forked_child_die_by_signal(signum, &out, &err);
+            forked_child_die_by_signal(&*dispatcher.host_signal, signum, &out, &err);
         }
         kernel.record_fatal_signal(super::FatalSignalRecord {
             image_generation: fatal_image_generation,
@@ -437,7 +437,10 @@ where
             let _ = scheduler.wake(exact);
             0
         } else if self.registry.is_live(target) {
-            crate::host_signal::publish_pending_for(target.raw(), signum);
+            kernel
+                .dispatcher
+                .host_signal
+                .publish_pending_for(target.raw(), signum);
             self.kicker.kick(target);
             0
         } else {
@@ -573,7 +576,7 @@ where
     }
 
     let pending = reserved.map_or_else(
-        || crate::host_signal::take_pending_for(tid.raw()),
+        || dispatcher.host_signal.take_pending_for(tid.raw()),
         crate::kernel::continuation::ReservedSignal::signum,
     );
     // A dispatcher dequeue returns owner and payload atomically. A host-slot
@@ -717,7 +720,7 @@ where
                             .flatten()
                     })
                     .or_else(|| {
-                        crate::host_signal::take_child_exit_siginfo(tid.raw(), pending).map(
+                        carrick_signal_core::child_watch::take_siginfo(tid.raw(), pending).map(
                             |info| {
                                 const CLD_EXITED: i32 = 1;
                                 let ns_pid = crate::namespace::pid::host_to_ns_or_self_for(
@@ -727,7 +730,9 @@ where
                                 let linux_status = if info.si_code == CLD_EXITED {
                                     info.host_status
                                 } else {
-                                    crate::host_signal::host_to_linux_signum(info.host_status)
+                                    dispatcher
+                                        .host_signal
+                                        .host_to_linux_signum(info.host_status)
                                 };
                                 crate::linux_abi::LinuxSiginfo::child_exit(
                                     pending,
@@ -741,7 +746,7 @@ where
                     });
                 #[cfg(test)]
                 let queued_siginfo = queued_siginfo.or_else(|| {
-                    let sender_host = crate::host_signal::last_sender_for(pending);
+                    let sender_host = dispatcher.host_signal.last_sender_for(pending);
                     (sender_host > 0).then(|| {
                         let ns_pid = crate::namespace::pid::host_to_ns_or_self_for(
                             context,
@@ -1017,7 +1022,10 @@ mod tests {
         assert!(child >= 0, "fork failed");
         if child == 0 {
             crate::guest_cpu::complete_child_record_post_fork_child();
-            let dispatcher = SyscallDispatcher::new();
+            // A real host child that takes a real host signal: the bridge must
+            // translate Linux signums to Darwin's (SIGSTOP is 19 on Linux but
+            // 17 on macOS), so this is the platform bridge, not the Null one.
+            let dispatcher = SyscallDispatcher::with_bridges(crate::platform_bridges());
             dispatcher.set_ptrace_traceme_for_test();
             let tid = ThreadId::main_from_host_pid();
             dispatcher.mark_signal_pending(
@@ -1058,7 +1066,10 @@ mod tests {
         assert!(child >= 0, "fork failed");
         if child == 0 {
             crate::guest_cpu::complete_child_record_post_fork_child();
-            let dispatcher = SyscallDispatcher::new();
+            // A real host child that takes a real host signal: the bridge must
+            // translate Linux signums to Darwin's (SIGSTOP is 19 on Linux but
+            // 17 on macOS), so this is the platform bridge, not the Null one.
+            let dispatcher = SyscallDispatcher::with_bridges(crate::platform_bridges());
             dispatcher.set_ptrace_traceme_for_test();
             let context = dispatcher.exact_signal_context_for_test();
             let tid = ThreadId::main_from_host_pid();
@@ -1228,12 +1239,12 @@ mod tests {
         let mut write = crate::dispatch::BlockingWrite::for_tests(fds[1], vec![0x5a], 0, tid, true)
             .expect("pin blocked pipe writer");
         assert!(matches!(
-            crate::dispatch::drive_blocking_write(&mut write),
+            crate::dispatch::drive_blocking_write(&mut write, &*dispatcher.host_signal),
             crate::dispatch::BlockingWriteStep::Wait
         ));
         assert_eq!(unsafe { libc::close(fds[0]) }, 0);
         let crate::dispatch::BlockingWriteStep::Done(outcome) =
-            crate::dispatch::drive_blocking_write(&mut write)
+            crate::dispatch::drive_blocking_write(&mut write, &*dispatcher.host_signal)
         else {
             panic!("closed reader must complete the blocked write");
         };

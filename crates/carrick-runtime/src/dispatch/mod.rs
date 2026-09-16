@@ -759,7 +759,9 @@ pub(crate) use kernel_context::bootstrap_one_task_binding;
 pub mod dispatcher;
 #[allow(unused_imports)]
 pub(crate) use dispatcher::resolv_conf_contents_for_network;
-pub use dispatcher::{FsView, IpcView, MemView, NetView, ProcView, SignalView, SyscallDispatcher};
+pub use dispatcher::{
+    CarrierBridges, FsView, IpcView, MemView, NetView, ProcView, SignalView, SyscallDispatcher,
+};
 
 pub mod execution;
 pub mod futex;
@@ -828,25 +830,6 @@ enum VfsOpenAttempt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AsyncSignalWakeOwner {
     SignalPump,
-}
-
-impl AsyncSignalWakeOwner {
-    #[allow(dead_code)]
-    pub(crate) fn publish_process_signal(self, signum: i32) {
-        #[cfg(feature = "platform-macos")]
-        match self {
-            Self::SignalPump => crate::host_signal::publish_process_signal(signum),
-        }
-        #[cfg(any(
-            feature = "platform-linux",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        ))]
-        {
-            let _ = self;
-            crate::timer_delivery::deliver(signum);
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -1102,7 +1085,7 @@ impl SyscallDispatcher {
         self.timer_delivery
             .read()
             .clone()
-            .or_else(crate::timer_delivery::delivery)
+            .or_else(|| self.timers.delivery())
     }
 
     /// Keep the CALLING MM's vvar `VVAR_OFF_REALTIME_OFF_NS` word coherent with

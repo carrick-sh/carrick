@@ -2503,6 +2503,7 @@ impl<'a> FsView<'a> {
                                 let res = write_host_pipe_owned(
                                     bytes_to_write,
                                     HostPipeWriteTarget {
+                                        host_signal: this.cross.host_signal(),
                                         host_fd: host_fd.raw(),
                                         host_fd_owner: Some(host_fd.clone()),
                                         nonblocking,
@@ -2565,6 +2566,7 @@ impl<'a> FsView<'a> {
                             let out = write_host_pipe_owned(
                                 bytes,
                                 HostPipeWriteTarget {
+                                    host_signal: this.cross.host_signal(),
                                     host_fd: host_fd.raw(),
                                     host_fd_owner: Some(host_fd.clone()),
                                     nonblocking,
@@ -2673,6 +2675,7 @@ impl<'a> FsView<'a> {
                             let out = write_host_pipe_owned(
                                 bytes,
                                 HostPipeWriteTarget {
+                                    host_signal: this.cross.host_signal(),
                                     host_fd: raw_fd,
                                     host_fd_owner: Some(host_fd.clone()),
                                     nonblocking,
@@ -3033,6 +3036,7 @@ impl<'a> FsView<'a> {
                 let outcome = write_host_pipe_owned(
                     bytes,
                     HostPipeWriteTarget {
+                        host_signal: this.cross.host_signal(),
                         host_fd: target.host_fd,
                         host_fd_owner: target.host_fd_owner.clone(),
                         nonblocking,
@@ -3210,6 +3214,7 @@ impl<'a> FsView<'a> {
                                     let res = write_host_pipe_owned(
                                         bytes_to_write,
                                         HostPipeWriteTarget {
+                                            host_signal: this.cross.host_signal(),
                                             host_fd: host_fd.raw(),
                                             host_fd_owner: Some(host_fd.clone()),
                                             nonblocking,
@@ -3257,6 +3262,7 @@ impl<'a> FsView<'a> {
                                 outcome = write_host_pipe_owned(
                                     bytes,
                                     HostPipeWriteTarget {
+                                        host_signal: this.cross.host_signal(),
                                         host_fd: host_fd.raw(),
                                         host_fd_owner: Some(host_fd.clone()),
                                         nonblocking,
@@ -3318,6 +3324,7 @@ impl<'a> FsView<'a> {
                                 outcome = write_host_pipe_owned(
                                     bytes,
                                     HostPipeWriteTarget {
+                                        host_signal: this.cross.host_signal(),
                                         host_fd: host_fd.raw(),
                                         host_fd_owner: Some(host_fd.clone()),
                                         nonblocking,

@@ -508,6 +508,7 @@ fn prepare_host_backend(
     let mut dispatcher = SyscallDispatcher::with_network_and_host_resolver(
         Arc::clone(&plan.network),
         plan.host_resolver.as_ref(),
+        crate::platform_bridges(),
     );
     dispatcher.set_container(Arc::clone(container));
     if let HostRootLayout::CachedLower(rootfs) = root_layout {
@@ -546,7 +547,8 @@ fn prepare_memory_backend(
 ) -> Result<(SyscallDispatcher, carrick_vfs::rootfs::RootFs), RuntimeError> {
     let rootfs = carrick_vfs::rootfs::RootFs::from_layer_paths(&layer_paths(spec))
         .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to compose rootfs: {e}")))?;
-    let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable(
+    let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable_on(
+        crate::platform_bridges(),
         rootfs.clone(),
         spec.process.executable.clone(),
     );

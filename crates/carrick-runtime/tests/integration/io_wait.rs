@@ -6,7 +6,8 @@ fn kqueue_wait_still_observes_readable_socket_with_listener_write_interest() {
     use std::os::fd::AsRawFd;
     use std::time::Duration;
 
-    use carrick_runtime::io_wait::{ThreadWaiter, WaitFd, WaitResult};
+    use carrick_hal::WaitFd;
+    use carrick_vmm_hvf::io_wait::{ThreadWaiter, WaitResult};
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
     listener
@@ -49,7 +50,8 @@ fn kqueue_wait_wakes_when_peer_writes_after_registration() {
     use std::os::fd::{AsRawFd, RawFd};
     use std::time::Duration;
 
-    use carrick_runtime::io_wait::{ThreadWaiter, WaitFd, WaitResult};
+    use carrick_hal::WaitFd;
+    use carrick_vmm_hvf::io_wait::{ThreadWaiter, WaitResult};
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
     listener
