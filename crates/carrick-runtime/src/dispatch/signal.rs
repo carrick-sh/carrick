@@ -55,6 +55,8 @@ use super::*;
 use carrick_abi::syscall::nr;
 use carrick_fatal::carrick_fatal;
 
+use crate::kernel::objects::signal::is_default_ignore_signal;
+
 syscall_table! {
     /// Per-module syscall routing for the `signal` subsystem (Task A1).
     ///
@@ -500,12 +502,12 @@ impl<'a> SignalView<'a> {
             Some(handler) if handler == crate::linux_abi::LINUX_SIG_IGN => false,
             Some(handler) if handler == crate::linux_abi::LINUX_SIG_DFL => {
                 self.signal_mask_for(context, tid).contains(signum)
-                    || !is_default_ignore_signum(signum)
+                    || !is_default_ignore_signal(signum)
             }
             Some(_) => true,
             None => {
                 self.signal_mask_for(context, tid).contains(signum)
-                    || !is_default_ignore_signum(signum)
+                    || !is_default_ignore_signal(signum)
             }
         }
     }
@@ -538,10 +540,10 @@ impl<'a> SignalView<'a> {
         match Self::signal_action_entry(context, signum).map(|action| action.sa_handler) {
             Some(handler) if handler == crate::linux_abi::LINUX_SIG_IGN => false,
             Some(handler) if handler == crate::linux_abi::LINUX_SIG_DFL => {
-                Self::any_thread_blocks(threads, signum) || !is_default_ignore_signum(signum)
+                Self::any_thread_blocks(threads, signum) || !is_default_ignore_signal(signum)
             }
             Some(_) => true,
-            None => Self::any_thread_blocks(threads, signum) || !is_default_ignore_signum(signum),
+            None => Self::any_thread_blocks(threads, signum) || !is_default_ignore_signal(signum),
         }
     }
 
@@ -568,9 +570,9 @@ impl<'a> SignalView<'a> {
                 Self::signal_action_entry(context, signum).map(|action| action.sa_handler);
             let ignored = match disposition {
                 Some(handler) if handler == crate::linux_abi::LINUX_SIG_IGN => true,
-                None => is_default_ignore_signum(signum),
+                None => is_default_ignore_signal(signum),
                 Some(handler) if handler == crate::linux_abi::LINUX_SIG_DFL => {
-                    is_default_ignore_signum(signum)
+                    is_default_ignore_signal(signum)
                 }
                 Some(_) => false,
             };
@@ -1057,10 +1059,10 @@ impl<'a> SignalView<'a> {
             let ignored = match Self::signal_action_entry(context, signum) {
                 Some(action) if action.sa_handler == crate::linux_abi::LINUX_SIG_IGN => true,
                 Some(action) if action.sa_handler == crate::linux_abi::LINUX_SIG_DFL => {
-                    crate::vcpu_loop::is_default_ignore_signal(signum)
+                    is_default_ignore_signal(signum)
                 }
                 Some(_) => false,
-                None => crate::vcpu_loop::is_default_ignore_signal(signum),
+                None => is_default_ignore_signal(signum),
             };
             if ignored {
                 mask = mask.with(signum);
@@ -3142,19 +3144,6 @@ impl SyscallDispatcher {
 
 pub(crate) fn is_valid_signum(signum: u64) -> bool {
     signum <= LINUX_MAX_SIGNUM
-}
-
-/// Signals whose Linux DEFAULT disposition is "ignore" (`Ign`): a SIG_DFL /
-/// no-handler instance is dropped, not a terminating action. Mirrors the
-/// runtime's `is_default_ignore_signal`; kept here so the dispatcher can
-/// compute the no-interrupt mask without crossing crates.
-fn is_default_ignore_signum(signum: i32) -> bool {
-    matches!(
-        signum,
-        crate::linux_abi::LINUX_SIGCHLD
-            | crate::linux_abi::LINUX_SIGURG
-            | crate::linux_abi::LINUX_SIGWINCH
-    )
 }
 
 /// Bit mask for `signum` (1..=64) within a Linux `sigset_t` word, or
@@ -5341,7 +5330,7 @@ mod tests {
         let target_context = d
             .capture_kernel_context(target_tid)
             .expect("target context");
-        let target_visible_tid = crate::vcpu_loop::ns_visible_guest_tid(&d, &target_context)
+        let target_visible_tid = crate::namespace::pid::ns_visible_guest_tid(&target_context)
             .expect("target must have one namespace-visible tid");
         let caller_visible_pid = crate::namespace::pid::try_ns_self_pid_for(
             &caller_context,

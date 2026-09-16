@@ -2307,9 +2307,7 @@ where
             )
             .map(Some);
         }
-        if let Err(error) =
-            super::stamp_ns_visible_guest_tid(engine, &kernel.dispatcher, &committed_context)
-        {
+        if let Err(error) = super::stamp_ns_visible_guest_tid(engine, &committed_context) {
             return Self::exec_failed_past_no_return(
                 kernel,
                 engine,

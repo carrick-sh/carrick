@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 
 use carrick_abi::{LinuxSigaction, LinuxSigaltstack, LinuxSiginfo, SigSet, WaitSigMask};
 use carrick_fatal::carrick_fatal;
+use carrick_guest_mem::CurrentMmMemory;
 
 use crate::kernel::ids::{LinuxSignal, LinuxTid, SighandId};
 use crate::kernel::operations::KernelOperationError;
@@ -686,13 +687,43 @@ pub enum SignalReservationOrigin {
     HostSlot { tid: i32 },
 }
 
-fn is_default_ignored_signal(signum: i32) -> bool {
+/// Signals whose Linux DEFAULT disposition is "ignore" (`Ign`): a `SIG_DFL` /
+/// no-handler instance is dropped, not a terminating action.
+pub(crate) fn is_default_ignore_signal(signum: i32) -> bool {
     matches!(
         signum,
         crate::linux_abi::LINUX_SIGCHLD
             | crate::linux_abi::LINUX_SIGURG
             | crate::linux_abi::LINUX_SIGWINCH
     )
+}
+
+/// Upgrade `SEGV_MAPERR` to `SEGV_ACCERR` when Carrick's protection metadata
+/// says the faulting VA belongs to a live mapping that denies the access.
+/// Linux reports ACCERR there because the VMA exists. Carrick can otherwise
+/// see MAPERR when `PROT_NONE` is represented by a non-present guest leaf, or
+/// when Darwin reports an initial read-only host mapping as a translation-style
+/// fault. The process-wide no-access and no-write sets are the durable VMA
+/// permission evidence; an address in neither set remains a genuine MAPERR.
+pub(crate) fn upgrade_protection_si_code<M: CurrentMmMemory>(
+    memory: &M,
+    signum: i32,
+    si_code: i32,
+    fault_addr: u64,
+) -> i32 {
+    const SIGSEGV: i32 = 11;
+    const SEGV_MAPERR: i32 = 1;
+    const SEGV_ACCERR: i32 = 2;
+    if signum == SIGSEGV
+        && si_code == SEGV_MAPERR
+        && memory
+            .protections()
+            .is_some_and(|p| p.range_fault_is_access_error(fault_addr, 1))
+    {
+        SEGV_ACCERR
+    } else {
+        si_code
+    }
 }
 
 impl SignalWaitReservation {
@@ -977,7 +1008,7 @@ impl SignalAuthority {
                 .unwrap_or_else(LinuxSigaction::empty);
             let ignored = action.sa_handler == crate::linux_abi::LINUX_SIG_IGN
                 || action.sa_handler == crate::linux_abi::LINUX_SIG_DFL
-                    && is_default_ignored_signal(signum);
+                    && is_default_ignore_signal(signum);
             let thread_has = thread.pending().contains(signum);
             let dequeue = if thread_has {
                 let mut pending = thread.take_lowest_in(SigSet::EMPTY.with(signum))?;
@@ -1113,6 +1144,90 @@ mod tests {
         ThreadResources,
     };
     use carrick_hal::ThreadId;
+
+    struct ProtectionOnlyMemory {
+        protections: carrick_guest_mem::protections::MemoryProtections,
+    }
+
+    impl carrick_guest_mem::GuestMemory for ProtectionOnlyMemory {
+        fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
+            Some(&self.protections)
+        }
+
+        fn read_bytes_raw(
+            &self,
+            address: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            Err(carrick_guest_mem::MemoryError::OutOfBounds { address, length })
+        }
+
+        fn write_bytes_raw(
+            &mut self,
+            address: u64,
+            bytes: &[u8],
+        ) -> Result<(), carrick_guest_mem::MemoryError> {
+            Err(carrick_guest_mem::MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            })
+        }
+    }
+
+    impl CurrentMmMemory for ProtectionOnlyMemory {}
+
+    #[test]
+    fn default_ignore_signals_are_not_terminating() {
+        // SIGCHLD/SIGURG/SIGWINCH default to Ign — a no-handler instance is
+        // dropped, not terminated. SIGURG=23 is the one that made `go build`
+        // flaky (raise(SIGURG) is a host no-op → _exit(128+23)=151).
+        assert!(is_default_ignore_signal(crate::linux_abi::LINUX_SIGURG));
+        assert!(is_default_ignore_signal(crate::linux_abi::LINUX_SIGCHLD));
+        assert!(is_default_ignore_signal(crate::linux_abi::LINUX_SIGWINCH));
+        // Genuinely-terminating defaults must NOT be treated as ignore.
+        assert!(!is_default_ignore_signal(crate::linux_abi::LINUX_SIGINT)); // 2
+        assert!(!is_default_ignore_signal(crate::linux_abi::LINUX_SIGTERM)); // 15
+        assert!(!is_default_ignore_signal(13)); // SIGPIPE: default IS terminate
+        assert!(!is_default_ignore_signal(11)); // SIGSEGV
+    }
+
+    #[test]
+    fn tracked_live_protections_upgrade_maperr_but_unmapped_does_not() {
+        const SIGSEGV: i32 = 11;
+        const SEGV_MAPERR: i32 = 1;
+        const SEGV_ACCERR: i32 = 2;
+        let address = 0x9000_0000;
+        let memory = ProtectionOnlyMemory {
+            protections: carrick_guest_mem::protections::MemoryProtections::default(),
+        };
+        memory.protections.set_no_write(address, 0x4000, true);
+
+        assert_eq!(
+            upgrade_protection_si_code(&memory, SIGSEGV, SEGV_MAPERR, address),
+            SEGV_ACCERR,
+            "a tracked read-only VMA exists, so Linux reports permission denial"
+        );
+        assert_eq!(
+            upgrade_protection_si_code(&memory, SIGSEGV, SEGV_MAPERR, address + 0x4000),
+            SEGV_MAPERR,
+            "an address outside tracked mappings remains an unmapped fault"
+        );
+
+        memory.protections.set_no_write(address, 0x4000, false);
+        memory.protections.set_no_access(address, 0x4000, true);
+        assert_eq!(
+            upgrade_protection_si_code(&memory, SIGSEGV, SEGV_MAPERR, address),
+            SEGV_ACCERR,
+            "a live PROT_NONE VMA is also a Linux permission fault"
+        );
+
+        memory.protections.set_unmapped(address, 0x4000, true);
+        assert_eq!(
+            upgrade_protection_si_code(&memory, SIGSEGV, SEGV_MAPERR, address),
+            SEGV_MAPERR,
+            "munmap removes the VMA, so a later translation fault stays MAPERR"
+        );
+    }
 
     struct Fixture {
         _ids: ObjectIdRegistry,

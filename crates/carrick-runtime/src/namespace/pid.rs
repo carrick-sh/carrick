@@ -814,6 +814,23 @@ pub(crate) fn kernel_to_ns_for(
     }
 }
 
+/// The tid the guest must observe for this thread, in its OWN pid namespace.
+///
+/// `getpid` is namespace-translated (the identity page publishes
+/// `ns_self_pid_for`), so `gettid` has to be too, or a thread-group leader
+/// observes `gettid() != getpid()` -- which no Linux process can, because a
+/// leader's tid IS its tgid. Inside a container the two numbering spaces are
+/// offset, so every containerized guest saw it.
+///
+/// Every task and secondary thread owns an exact namespace identity. A missing
+/// mapping is an invariant failure; returning zero would publish a TID Linux
+/// can never assign and could be mistaken for a successful fast-path stamp.
+pub(crate) fn ns_visible_guest_tid(context: &crate::kernel::KernelContext) -> Option<u32> {
+    u32::try_from(context.thread().key().tid.raw())
+        .ok()
+        .and_then(|tid| kernel_to_ns_for(context, tid))
+}
+
 pub(crate) fn ns_to_kernel_for(
     context: &crate::kernel::KernelContext,
     namespace_id: u32,

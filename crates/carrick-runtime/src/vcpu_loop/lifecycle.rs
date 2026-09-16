@@ -629,7 +629,7 @@ where
         RuntimeError::Configuration("process child bootstrap lost Kernel context".to_owned())
     })?;
     bootstrap_hvpatch_process_child_identity(engine, &kernel.dispatcher, context, shares_mm)?;
-    stamp_ns_visible_guest_tid(engine, &kernel.dispatcher, context).map_err(RuntimeError::Trap)?;
+    stamp_ns_visible_guest_tid(engine, context).map_err(RuntimeError::Trap)?;
     if let ProcessChildBootstrap::GuestFork { child_settid, .. } = bootstrap {
         if let Some((address, tid)) = child_settid {
             bootstrap_hvpatch_process_child_tid(engine, address, tid)?;

@@ -93,10 +93,10 @@ pub(crate) fn vcpu_reclaim_census() -> (u64, u64, u64) {
 pub(crate) mod memory;
 pub(crate) use memory::{
     KernelFrameCowAuthority, RefuseAliasInstallSpec, apply_alias_frame_inventory,
-    apply_exec_image_proc_state, apply_image_proc_state, ns_visible_guest_tid,
-    refuse_alias_install, requires_no_unwind_host_exit, stamp_identity_page,
-    stamp_identity_page_at, stamp_identity_values, stamp_ns_visible_guest_tid,
-    syscall_takes_pre_dispatch_pt_pause, with_foreign_mm_mutation_guard, with_sole_mm_stage1,
+    apply_exec_image_proc_state, apply_image_proc_state, refuse_alias_install,
+    requires_no_unwind_host_exit, stamp_identity_page, stamp_identity_page_at,
+    stamp_identity_values, stamp_ns_visible_guest_tid, syscall_takes_pre_dispatch_pt_pause,
+    with_foreign_mm_mutation_guard, with_sole_mm_stage1,
 };
 #[cfg(test)]
 pub(crate) use memory::{
@@ -400,17 +400,8 @@ pub(crate) use threads::{
     PersistentProcessMemberPublication, VcpuThreadHandle, VcpuThreadRegistry,
 };
 
-// Re-export the free fns that moved into submodules so the in-crate callers
-// (`crate::runtime`, this module's own code) keep naming them as
-// `crate::vcpu_loop::X` / bare `X`.
 // The threaded loop owns its backend-specific fault resolution. Native Darwin
 // reuses the architecture lowering and Linux signal-frame half below.
-pub(crate) use signal::is_default_ignore_signal;
-// Production reaches this through `signal::upgrade_protection_si_code` directly
-// (`poll_with_engine`); only `dispatch::mem`'s tests need it re-exported, so the
-// re-export is test-only rather than an unused import in the lib build.
-#[cfg(test)]
-pub(crate) use signal::upgrade_protection_si_code;
 use signal::{
     SignalRestartContext, deliver_fault_signal, deliver_pending_signal_with_restart,
     deliver_reserved_signal_with_restart, lower_el0_fault,
@@ -2246,7 +2237,7 @@ pub(super) fn service_signals_threaded<E: ThreadedEngine>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::binding::*;
-    use super::signal::{lower_el0_fault, upgrade_protection_si_code};
+    use super::signal::lower_el0_fault;
     use super::*;
     use carrick_guest_mem::GuestMemory;
     use std::time::{Duration, Instant};
@@ -2459,37 +2450,6 @@ pub(crate) mod tests {
             );
         }
     }
-
-    struct ProtectionOnlyMemory {
-        protections: carrick_guest_mem::protections::MemoryProtections,
-    }
-
-    impl carrick_guest_mem::GuestMemory for ProtectionOnlyMemory {
-        fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
-            Some(&self.protections)
-        }
-
-        fn read_bytes_raw(
-            &self,
-            address: u64,
-            length: usize,
-        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-            Err(carrick_guest_mem::MemoryError::OutOfBounds { address, length })
-        }
-
-        fn write_bytes_raw(
-            &mut self,
-            address: u64,
-            bytes: &[u8],
-        ) -> Result<(), carrick_guest_mem::MemoryError> {
-            Err(carrick_guest_mem::MemoryError::OutOfBounds {
-                address,
-                length: bytes.len(),
-            })
-        }
-    }
-
-    impl CurrentMmMemory for ProtectionOnlyMemory {}
 
     pub(crate) struct EndpointTestSignalPump;
 
@@ -3355,21 +3315,6 @@ pub(crate) mod tests {
     }
     pub(crate) use test_carrier_graph_with_dispatcher;
 
-    #[test]
-    fn default_ignore_signals_are_not_terminating() {
-        // SIGCHLD/SIGURG/SIGWINCH default to Ign — a no-handler instance is
-        // dropped, not terminated. SIGURG=23 is the one that made `go build`
-        // flaky (raise(SIGURG) is a host no-op → _exit(128+23)=151).
-        assert!(is_default_ignore_signal(crate::linux_abi::LINUX_SIGURG));
-        assert!(is_default_ignore_signal(crate::linux_abi::LINUX_SIGCHLD));
-        assert!(is_default_ignore_signal(crate::linux_abi::LINUX_SIGWINCH));
-        // Genuinely-terminating defaults must NOT be treated as ignore.
-        assert!(!is_default_ignore_signal(crate::linux_abi::LINUX_SIGINT)); // 2
-        assert!(!is_default_ignore_signal(crate::linux_abi::LINUX_SIGTERM)); // 15
-        assert!(!is_default_ignore_signal(13)); // SIGPIPE: default IS terminate
-        assert!(!is_default_ignore_signal(11)); // SIGSEGV
-    }
-
     // Linux asm-generic/siginfo.h SIGTRAP si_codes.
     const SIGTRAP: i32 = 5;
     const TRAP_BRKPT: i32 = 1;
@@ -3415,43 +3360,7 @@ pub(crate) mod tests {
     const SIGSEGV: i32 = 11;
     const SIGBUS: i32 = 7;
     const SEGV_MAPERR: i32 = 1;
-    const SEGV_ACCERR: i32 = 2;
     const BUS_ADRALN: i32 = 1;
-
-    #[test]
-    fn tracked_live_protections_upgrade_maperr_but_unmapped_does_not() {
-        let address = 0x9000_0000;
-        let memory = ProtectionOnlyMemory {
-            protections: carrick_guest_mem::protections::MemoryProtections::default(),
-        };
-        memory.protections.set_no_write(address, 0x4000, true);
-
-        assert_eq!(
-            upgrade_protection_si_code(&memory, SIGSEGV, SEGV_MAPERR, address),
-            SEGV_ACCERR,
-            "a tracked read-only VMA exists, so Linux reports permission denial"
-        );
-        assert_eq!(
-            upgrade_protection_si_code(&memory, SIGSEGV, SEGV_MAPERR, address + 0x4000),
-            SEGV_MAPERR,
-            "an address outside tracked mappings remains an unmapped fault"
-        );
-
-        memory.protections.set_no_write(address, 0x4000, false);
-        memory.protections.set_no_access(address, 0x4000, true);
-        assert_eq!(
-            upgrade_protection_si_code(&memory, SIGSEGV, SEGV_MAPERR, address),
-            SEGV_ACCERR,
-            "a live PROT_NONE VMA is also a Linux permission fault"
-        );
-
-        memory.protections.set_unmapped(address, 0x4000, true);
-        assert_eq!(
-            upgrade_protection_si_code(&memory, SIGSEGV, SEGV_MAPERR, address),
-            SEGV_MAPERR,
-            "munmap removes the VMA, so a later translation fault stays MAPERR"
-        );
-    }
 
     #[test]
     fn lower_el0_fault_covers_both_debug_and_abort_arms() {
