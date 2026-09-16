@@ -24,9 +24,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use carrick_fatal::carrick_fatal;
-use carrick_kernel::arena::{ArenaError, KernelArena};
-use carrick_kernel::domains::{HostPid, ProcessGeneration};
-use carrick_kernel::process::{
+use carrick_kernel_arena::arena::{ArenaError, KernelArena};
+use carrick_kernel_arena::domains::{HostPid, ProcessGeneration};
+use carrick_kernel_arena::process::{
     FLAG_ADOPTED, FLAG_ALIVE, ProcessRecord, ProcessRecordRef, ProcessRecordTransitionAction,
     ProcessRecordTransitionError, ProcessSection, RecordState, VirtualPtraceControl,
     VirtualPtraceState,
@@ -2343,7 +2343,7 @@ mod tests {
         // — never an abort of the whole guest.
         let arena = KernelArena::create().expect("create private arena");
         let section = &arena.layout().processes;
-        for i in 0..carrick_kernel::process::PROCESS_RECORDS {
+        for i in 0..carrick_kernel_arena::process::PROCESS_RECORDS {
             section
                 .claim(
                     Some(HostPid::new(0x0600_0000 + i as u32)),

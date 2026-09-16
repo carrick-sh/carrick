@@ -5240,7 +5240,7 @@ mod ipc_set_tests {
         dispatcher.bind_hvpatch_process(process);
         let parent = dispatcher.capture_one_task_context().expect("root context");
         let arena = Box::leak(Box::new(
-            carrick_kernel::arena::KernelArena::create().expect("sysv pid namespace arena"),
+            carrick_kernel_arena::arena::KernelArena::create().expect("sysv pid namespace arena"),
         ));
         parent
             .container()

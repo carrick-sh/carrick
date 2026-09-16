@@ -699,7 +699,7 @@ fn prepare_with_lease(
         PidMode::Host => {}
         PidMode::Private => {
             let region = crate::namespace::pid::NsSharedRegion::allocate(
-                carrick_kernel::arena::KernelArena::global(),
+                carrick_kernel_arena::arena::KernelArena::global(),
             )
             .map_err(|e| {
                 RuntimeError::Configuration(format!(

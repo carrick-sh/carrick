@@ -8942,7 +8942,7 @@ mod process_identity_dispatch_tests {
     fn container_pid_identity_isolated() {
         use std::sync::Arc;
 
-        use carrick_kernel::arena::KernelArena;
+        use carrick_kernel_arena::arena::KernelArena;
 
         use crate::kernel::{Container, Kernel, LaunchContext, RootBootstrap, RunId};
         use crate::namespace::pid::NsSharedRegion;
@@ -9139,7 +9139,7 @@ mod process_identity_dispatch_tests {
     fn live_groups_and_session_keep_their_namespace_ids_after_leader_reap() {
         use std::sync::Arc;
 
-        use carrick_kernel::arena::KernelArena;
+        use carrick_kernel_arena::arena::KernelArena;
 
         use crate::kernel::{Container, Kernel, LaunchContext, RootBootstrap, RunId};
         use crate::namespace::pid::NsSharedRegion;

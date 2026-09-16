@@ -1414,7 +1414,7 @@ mod identity_snapshot_tests {
         use crate::namespace::pid::NsSharedRegion;
         use carrick_abi::LinuxCloneFlags;
         use carrick_hal::ThreadId;
-        use carrick_kernel::arena::KernelArena;
+        use carrick_kernel_arena::arena::KernelArena;
 
         let arena = Box::leak(Box::new(KernelArena::create().expect("create test arena")));
 

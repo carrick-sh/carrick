@@ -5,9 +5,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use carrick_kernel::domains::{HostPid, ProcessGeneration};
-use carrick_kernel::lock::{LockOwner, RobustLock};
-use carrick_kernel::wait::SpinYield;
+use carrick_kernel_arena::domains::{HostPid, ProcessGeneration};
+use carrick_kernel_arena::lock::{LockOwner, RobustLock};
+use carrick_kernel_arena::wait::SpinYield;
 
 #[repr(C)]
 struct Shared {

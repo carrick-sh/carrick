@@ -2,7 +2,7 @@ use std::io::{Seek as _, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd as _, OwnedFd};
 use std::sync::Arc;
 
-use carrick_kernel::domains::{HostPid, ProcessGeneration};
+use carrick_kernel_arena::domains::{HostPid, ProcessGeneration};
 
 use crate::dispatch::fd_table::{
     HostPipeTestFixture, InMemoryPipeTestFixture, closed_test_description,

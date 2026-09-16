@@ -23,7 +23,7 @@ LEDGER_PATH = REPO_ROOT / "scripts" / "migrate" / "runtime-global-state.json"
 
 DEFAULT_SCAN_ROOTS = (
     "crates/carrick-runtime/src",
-    "crates/carrick-kernel/src",
+    "crates/carrick-kernel-arena/src",
     "crates/carrick-vmm-hvf/src",
     "crates/carrick-thread/src",
     "crates/carrick-embed/src",

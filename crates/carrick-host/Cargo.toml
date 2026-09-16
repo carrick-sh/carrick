@@ -13,7 +13,7 @@ workspace = true
 
 [dependencies]
 carrick-fatal.workspace = true
-carrick-kernel = { path = "../carrick-kernel" }
+carrick-kernel-arena = { path = "../carrick-kernel-arena" }
 libc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

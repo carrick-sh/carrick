@@ -153,7 +153,7 @@ fn two_namespaced_roots_for_async_owner() -> (
     crate::kernel::KernelContext,
     crate::kernel::KernelContext,
 ) {
-    use carrick_kernel::arena::KernelArena;
+    use carrick_kernel_arena::arena::KernelArena;
 
     use crate::kernel::{Container, LaunchContext, RootBootstrap, RunId};
     use crate::namespace::pid::NsSharedRegion;

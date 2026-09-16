@@ -2744,7 +2744,7 @@ mod tests {
         dispatcher.bind_hvpatch_process(process);
         let registrant = dispatcher.capture_one_task_context().unwrap();
         let arena = Box::leak(Box::new(
-            carrick_kernel::arena::KernelArena::create().expect("mqueue pid namespace arena"),
+            carrick_kernel_arena::arena::KernelArena::create().expect("mqueue pid namespace arena"),
         ));
         registrant
             .container()

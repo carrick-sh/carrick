@@ -1,8 +1,8 @@
 use std::sync::atomic::Ordering;
 
-use carrick_kernel::arena::KernelArena;
-use carrick_kernel::domains::HostPid;
-use carrick_kernel::process::FLAG_ALIVE;
+use carrick_kernel_arena::arena::KernelArena;
+use carrick_kernel_arena::domains::HostPid;
+use carrick_kernel_arena::process::FLAG_ALIVE;
 
 #[test]
 fn prefork_claim_is_complete_when_child_publishes_pid() {
@@ -149,7 +149,7 @@ fn fork_storm_never_exposes_incomplete_records() {
 
 #[test]
 fn typed_record_state_transitions_and_refusals() {
-    use carrick_kernel::process::{Busy, RecordState, RecordStateCell};
+    use carrick_kernel_arena::process::{Busy, RecordState, RecordStateCell};
 
     let cell = RecordStateCell::new();
     assert_eq!(cell.state(), RecordState::Free);

@@ -10741,7 +10741,7 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/arena.rs:127 in `create`, `std::process::id` accesses only the run-scoped kernel arena file used by `create`.",
+    "rationale": "At crates/carrick-kernel-arena/src/arena.rs:127 in `create`, `std::process::id` accesses only the run-scoped kernel arena file used by `create`.",
     "review_id": "HA-000454",
     "source": {
       "byte_end": 4645,
@@ -10749,7 +10749,7 @@
       "column": 13,
       "column_end": 29,
       "column_start": 13,
-      "file": "crates/carrick-kernel/src/arena.rs",
+      "file": "crates/carrick-kernel-arena/src/arena.rs",
       "line": 127,
       "line_end": 127,
       "line_start": 127
@@ -15205,7 +15205,7 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/wait.rs:45 in `wait`, `std::thread::yield_now` acts only on the current kernel wait worker used by `wait`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel-arena/src/wait.rs:45 in `wait`, `std::thread::yield_now` acts only on the current kernel wait worker used by `wait`; no guest identity selects its host target.",
     "review_id": "HA-000629",
     "source": {
       "byte_end": 1778,
@@ -15213,7 +15213,7 @@
       "column": 13,
       "column_end": 35,
       "column_start": 13,
-      "file": "crates/carrick-kernel/src/wait.rs",
+      "file": "crates/carrick-kernel-arena/src/wait.rs",
       "line": 45,
       "line_end": 45,
       "line_start": 45

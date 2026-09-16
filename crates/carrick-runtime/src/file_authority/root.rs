@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use carrick_kernel::domains::{HostPid, ProcessGeneration};
+use carrick_kernel_arena::domains::{HostPid, ProcessGeneration};
 
 use super::{
     AuthorityEpoch, AuthorityFatal, Command, DirectFileAuthority, FileAuthorityBinding,

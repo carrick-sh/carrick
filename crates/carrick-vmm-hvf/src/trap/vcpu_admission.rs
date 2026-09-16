@@ -370,19 +370,20 @@ impl PermitRegion {
         let table = unsafe { &*(ptr as *const SharedPermitTable) };
         // Generations start at 1 so 0 is reserved for "no owner".
         table.next_generation.store(1, Ordering::Relaxed);
-        table
-            .version
-            .store(carrick_kernel::arena::PERMIT_VERSION, Ordering::Relaxed);
+        table.version.store(
+            carrick_kernel_arena::arena::PERMIT_VERSION,
+            Ordering::Relaxed,
+        );
         // Publish the magic last (Release) so a reader that sees it also sees the
         // initialized header.
         table
             .magic
-            .store(carrick_kernel::arena::PERMIT_MAGIC, Ordering::Release);
+            .store(carrick_kernel_arena::arena::PERMIT_MAGIC, Ordering::Release);
         ptr as usize
     }
 
     pub(super) fn new_shared_global() -> PermitRegion {
-        let arena = carrick_kernel::arena::KernelArena::global();
+        let arena = carrick_kernel_arena::arena::KernelArena::global();
         PermitRegion {
             table: &arena.layout().permits as *const _ as usize,
             local: std::sync::Mutex::new(HashMap::new()),
@@ -395,7 +396,7 @@ impl PermitRegion {
     /// the slots (no separate counter to drift), and the death reaper
     /// reclaims a dead owner's slot exactly like a permit slot.
     pub(super) fn new_shared_global_vm() -> PermitRegion {
-        let arena = carrick_kernel::arena::KernelArena::global();
+        let arena = carrick_kernel_arena::arena::KernelArena::global();
         PermitRegion {
             table: &arena.layout().vm_slots as *const _ as usize,
             local: std::sync::Mutex::new(HashMap::new()),
@@ -975,21 +976,21 @@ mod vm_create_admission_tests {
     fn permit_table_is_the_arena_permit_section() {
         assert_eq!(
             std::mem::size_of::<SharedPermitTable>(),
-            std::mem::size_of::<carrick_kernel::arena::PermitSection>()
+            std::mem::size_of::<carrick_kernel_arena::arena::PermitSection>()
         );
         assert_eq!(
             std::mem::offset_of!(SharedPermitTable, slots),
-            std::mem::offset_of!(carrick_kernel::arena::PermitSection, slots)
+            std::mem::offset_of!(carrick_kernel_arena::arena::PermitSection, slots)
         );
 
-        let arena = carrick_kernel::arena::KernelArena::global();
+        let arena = carrick_kernel_arena::arena::KernelArena::global();
         let section = &arena.layout().permits as *const _ as usize;
         assert_eq!(permit_region().table_addr_for_test(), section);
     }
 
     #[test]
     fn vm_residency_region_is_the_arena_vm_slots_section() {
-        let arena = carrick_kernel::arena::KernelArena::global();
+        let arena = carrick_kernel_arena::arena::KernelArena::global();
         assert_eq!(
             vm_residency_region().table_addr_for_test(),
             &arena.layout().vm_slots as *const _ as usize,
