@@ -2194,14 +2194,6 @@
       "rationale": "Host thread-local cell THREAD_MAILBOX_SLOT_CLAIMS_TOTAL in crates/carrick-vmm-hvf/src/syscall_mailbox.rs maintaining per-host-thread execution state for the carrier."
     },
     {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/timer_delivery.rs",
-      "symbol": "DELIVERY",
-      "fingerprint": "03c1bc916e60921178b2a0b7b2174e64051d3ed32bd60f960fba144f415f279f",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static DELIVERY in crates/carrick-vmm-hvf/src/timer_delivery.rs maintaining host process lifecycle or VM resources (the HVF lane's registered TimerDelivery backend; moved from the runtime's lib.rs timer_delivery::DELIVERY#2 when the seam became GuestTimerBridge)."
-    },
-    {
       "kind": "env_var",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "atomic_permit_enabled::CARRICK_HVF_ATOMIC_PERMIT",
