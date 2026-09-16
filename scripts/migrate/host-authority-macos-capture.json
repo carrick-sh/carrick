@@ -10369,6 +10369,26 @@
         "macos-runtime-default"
       ],
       "source": {
+        "byte_end": 36997,
+        "byte_start": 36972,
+        "column": 22,
+        "column_end": 47,
+        "column_start": 22,
+        "file": "crates/carrick-runtime/src/kernel/continuation/wait_service.rs",
+        "line": 966,
+        "line_end": 966,
+        "line_start": 966
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
+      "expansion": null,
+      "operation": "std::thread::Builder::new",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
         "byte_end": 8509,
         "byte_start": 8484,
         "column": 26,
@@ -10509,8 +10529,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 185253,
-        "byte_start": 185228,
+        "byte_end": 185268,
+        "byte_start": 185243,
         "column": 35,
         "column_end": 60,
         "column_start": 35,
@@ -10529,28 +10549,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 37556,
-        "byte_start": 37531,
-        "column": 22,
-        "column_end": 47,
-        "column_start": 22,
-        "file": "crates/carrick-runtime/src/vcpu_loop/continuation/wait_service.rs",
-        "line": 975,
-        "line_end": 975,
-        "line_start": 975
-      }
-    },
-    {
-      "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
-      "expansion": null,
-      "operation": "std::thread::Builder::new",
-      "profiles": [
-        "macos-cli-default",
-        "macos-runtime-default"
-      ],
-      "source": {
-        "byte_end": 44651,
-        "byte_start": 44626,
+        "byte_end": 44645,
+        "byte_start": 44620,
         "column": 30,
         "column_end": 55,
         "column_start": 30,
@@ -11585,9 +11585,9 @@
       }
     }
   ],
-  "rows_sha256": "17fb0090a87ff5a966d4aa0b98258329aab02d33c95d7a33f44ec958964c0ee4",
+  "rows_sha256": "e9de70cb1cdffb5c5301fce26031bcc2976e55c9a254c226be4f9d3969fdcd8a",
   "schema": 1,
-  "source_head": "9c4dcfa679bb50ecd3ccf751f494208c09a22c9c",
+  "source_head": "4d33622b3f359c31cf7e20e6d420264788364c1b",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",

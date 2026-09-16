@@ -2240,6 +2240,28 @@
       "rationale": "A new mount-table owner appeared after sole ownership was proven; continuing could destroy storage still reachable by another container executor.",
       "sink": "fatal",
       "domain": "dispatch::mount_retirement"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation.rs",
+      "function": "next_nonzero",
+      "ordinal_in_function": 1,
+      "fingerprint": "4a402066f73b17402b452e03015e87017d0f1b5671b1b05822a014d7324688ff",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::continuation_identity",
+      "rationale": "Atomic generation counter overflow would cause ID collision and misroute asynchronous continuation wake tokens across carrier threads.",
+      "sink": "fatal",
+      "domain": "vcpu_loop::continuation_identity"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/continuation/wait_service.rs",
+      "function": "CarrierWaitService::prepare_registration",
+      "ordinal_in_function": 1,
+      "fingerprint": "ce0040fcb03c714fb31cbbfb642f3db4dad07ffbfbe631137241527358b6dd5b",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::continuation_registry",
+      "rationale": "Duplicate continuation token in active registration table indicates corrupted continuation lifecycle state or stolen wait token.",
+      "sink": "fatal",
+      "domain": "vcpu_loop::continuation_registry"
     }
   ]
 }
