@@ -1795,9 +1795,13 @@ fn test_mkdirat_under_resolved_parent_zero_openat_budget() {
         opens, 0,
         "mkdirat under resolved parent issued {opens} host openat calls (budget 0)"
     );
-    assert!(
-        stats <= 1,
-        "mkdirat under resolved parent issued {stats} host stat calls (budget <= 1)"
+    // Exact, not a bound: the budget is the single `libc::fstatat` in
+    // `RootFsVfs::mkdir_admitted` that probes the leaf for an existing entry.
+    // `<= 1` silently accepted 0 when that counter was compiled out of
+    // carrick-vfs, so a regression that adds a counted stat here must fail.
+    assert_eq!(
+        stats, 1,
+        "mkdirat under resolved parent issued {stats} host stat calls (budget 1)"
     );
 }
 
