@@ -1114,7 +1114,7 @@ pub(crate) mod tests {
             let pid = 68_000 + case as i32;
             let (process, root) = crate::hvpatch::process_context_for_tests(pid);
             let dispatcher = SyscallDispatcher::new();
-            dispatcher.bind_hvpatch_process(process.clone());
+            dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
             let kernel = Arc::new(KernelState::new(
                 dispatcher,
                 Arc::new(EndpointTestSignalPump),
@@ -1545,7 +1545,7 @@ pub(crate) mod tests {
     macro_rules! test_carrier_graph_with_dispatcher {
         ($pid:expr, $dispatcher:expr) => {{
             let (process, root) = crate::hvpatch::process_context_for_tests($pid);
-            $dispatcher.bind_hvpatch_process(process.clone());
+            $dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
             let kernel = Arc::new(KernelState::new(
                 $dispatcher,
                 Arc::new(EndpointTestSignalPump),
@@ -1612,7 +1612,7 @@ pub(crate) mod tests {
             let pid = 69_000 + case as i32;
             let (process, root) = crate::hvpatch::process_context_for_tests(pid);
             let dispatcher = SyscallDispatcher::new();
-            dispatcher.bind_hvpatch_process(process.clone());
+            dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
             let kernel = Arc::new(KernelState::new(
                 dispatcher,
                 Arc::new(EndpointTestSignalPump),

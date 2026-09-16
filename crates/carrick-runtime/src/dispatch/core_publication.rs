@@ -682,7 +682,7 @@ mod tests {
 
     #[test]
     fn core_snapshot_reads_rlimit_from_supplied_task_outside_dispatch_scope() {
-        let (_process, supplied) = crate::hvpatch::process_context_for_tests(41_202);
+        let (_process, supplied) = crate::kernel::TestCarrierProcess::new(41_202);
         supplied
             .task()
             .replace_rlimit(carrick_abi::LinuxResource::Core, |current| {
@@ -690,7 +690,7 @@ mod tests {
             })
             .expect("lower supplied task core limit");
 
-        let (_other_process, other) = crate::hvpatch::process_context_for_tests(41_203);
+        let (_other_process, other) = crate::kernel::TestCarrierProcess::new(41_203);
         other
             .task()
             .replace_rlimit(carrick_abi::LinuxResource::Core, |current| {
@@ -720,7 +720,7 @@ mod tests {
         let dispatcher = SyscallDispatcher::new();
         let prepared = dispatcher.mm_binding.current.load_full();
         let prepared_mem = Arc::clone(&prepared.mem);
-        let (process, context) = crate::hvpatch::process_context_for_tests(41_201);
+        let (process, context) = crate::kernel::TestCarrierProcess::new(41_201);
         let committed_mm = context.shared().mm().id();
         let wrong_raw = committed_mm.raw().checked_add(1).expect("test MM id");
         let wrong_mm = crate::kernel::MmId::from_registry_allocation(
@@ -731,7 +731,7 @@ mod tests {
             .current
             .store(Arc::new(prepared.rebind_prepared_root(wrong_mm)));
 
-        dispatcher.bind_hvpatch_process_exact(process, &context, None);
+        dispatcher.bind_hvpatch_process_exact(Arc::new(process), &context, None);
 
         let rebound = dispatcher.mm_binding.current.load_full();
         assert_eq!(rebound.mm_id, committed_mm);

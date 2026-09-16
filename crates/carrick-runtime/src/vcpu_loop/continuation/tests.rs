@@ -1528,7 +1528,7 @@ fn logical_group_wait_dispatch_builds_an_any_child_continuation() {
     let _lane = crate::dispatch::HvpatchLaneScope::force(false);
     let (process, root) = crate::hvpatch::process_context_for_tests(15_025);
     let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
-    dispatcher.bind_hvpatch_process(process);
+    dispatcher.bind_hvpatch_process(Arc::new(process));
     let _child = root
         .kernel()
         .reserve_fork(

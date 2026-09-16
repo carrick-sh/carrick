@@ -1379,7 +1379,7 @@ impl<'a> FsView<'a> {
         let creds_ns_provider =
             || Some(Arc::new(context.task().creds_ns()) as Arc<dyn carrick_vfs::FsCaller>);
         let processes_provider = || {
-            Self::synthetic_proc_processes(context, self.hvpatch_process().as_ref())
+            Self::synthetic_proc_processes(context, self.hvpatch_process().as_deref())
                 .map(std::borrow::Cow::Owned)
         };
         let threads_provider = || {

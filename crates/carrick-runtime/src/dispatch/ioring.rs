@@ -1542,8 +1542,8 @@ mod tests {
         use zerocopy::IntoBytes as _;
 
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::hvpatch::process_context_for_tests(83_030);
-        dispatcher.bind_hvpatch_process(process);
+        let (process, _) = crate::kernel::TestCarrierProcess::new(83_030);
+        dispatcher.bind_hvpatch_process(Arc::new(process));
         let context = dispatcher.capture_one_task_context().unwrap();
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
         memory.write_bytes(0x1000, b"ioring_close\0").unwrap();

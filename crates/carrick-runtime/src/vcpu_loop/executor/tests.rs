@@ -4,6 +4,7 @@ use std::sync::{Arc, Barrier};
 use std::thread::{self, ThreadId as HostThreadId};
 use std::time::{Duration, Instant};
 
+use crate::kernel::CarrierProcess;
 use carrick_abi::LinuxCloneFlags;
 use carrick_hal::ThreadId;
 use carrick_hal::threaded::{Aarch64SyscallContinuationV1, Aarch64TaskCpuStateV1, GuestCpuState};

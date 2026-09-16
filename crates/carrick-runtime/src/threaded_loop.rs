@@ -4,6 +4,7 @@
 //! loop — each plugs in a `HostBackend` impl, never a copied loop.
 
 use crate::dispatch::SyscallDispatcher;
+use crate::kernel::CarrierProcess;
 use crate::run_result::{RunResult, RuntimeError};
 use carrick_fatal::carrick_fatal;
 

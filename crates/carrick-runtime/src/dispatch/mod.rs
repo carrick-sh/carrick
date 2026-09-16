@@ -2594,7 +2594,7 @@ impl SyscallDispatcher {
     /// caller releases that mutex before entering MM snapshot authority.
     fn synthetic_proc_processes(
         context: &crate::kernel::KernelContext,
-        hvpatch_process: Option<&crate::hvpatch::ProcessContext>,
+        hvpatch_process: Option<&dyn crate::kernel::CarrierProcess>,
     ) -> Option<Vec<carrick_vfs::SyntheticProcProcess>> {
         let registry = hvpatch_process?.kernel_graph().registry();
         let container = context.container().id();
@@ -2855,7 +2855,7 @@ impl SyscallDispatcher {
         // straight off its task: unlike `oom_score_adj` these render only for
         // `/proc/self`, so there is no by-pid map to assemble.
         let creds_ns = context.task().creds_ns();
-        let processes = Self::synthetic_proc_processes(context, hvpatch_process.as_ref());
+        let processes = Self::synthetic_proc_processes(context, hvpatch_process.as_deref());
         let zombies = hvpatch_process.map(|process| {
             process
                 .kernel_graph()

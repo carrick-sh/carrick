@@ -2133,7 +2133,7 @@ where
             }
         };
         let child_process = parent_process.published_child_context(&child_context, child_backend);
-        child_dispatcher.bind_hvpatch_process(child_process.clone());
+        child_dispatcher.bind_hvpatch_process(Arc::new(child_process.clone()));
         let child_kernel = Arc::new(KernelState::new(
             child_dispatcher,
             Arc::clone(&kernel.signal_pump),

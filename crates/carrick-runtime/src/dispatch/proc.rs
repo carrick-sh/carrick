@@ -508,7 +508,7 @@ pub(super) struct ProcState {
     /// membership before every runtime-owned suffix has released its
     /// dispatcher, so those suffixes must not re-query the liveness index.
     pub namespace_pid: Option<u32>,
-    pub hvpatch_process: Option<crate::hvpatch::ProcessContext>,
+    pub hvpatch_process: Option<Arc<dyn crate::kernel::CarrierProcess>>,
     /// Interval-timer state for `[ITIMER_REAL, ITIMER_VIRTUAL, ITIMER_PROF]`,
     /// indexed by the `which` value. Anchored to the monotonic clock so
     /// setitimer/getitimer report the time remaining; `None` = disarmed.
@@ -632,7 +632,7 @@ impl ProcState {
         child.hvpatch_subreaper_ancestor = if self.child_subreaper != 0 {
             self.hvpatch_process
                 .as_ref()
-                .map(crate::hvpatch::ProcessContext::task_key)
+                .map(|process| process.task_key())
         } else {
             self.hvpatch_subreaper_ancestor
         };
@@ -809,7 +809,7 @@ impl<'a> ProcView<'a> {
     }
 
     #[inline]
-    pub(crate) fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext> {
+    pub(crate) fn hvpatch_process(&self) -> Option<Arc<dyn crate::kernel::CarrierProcess>> {
         self.proc.lock().hvpatch_process.clone()
     }
 
@@ -975,7 +975,7 @@ impl<'a> ProcView<'a> {
     /// table, never an `EVFILT_PROC` watch on the common Carrick host pid.
     pub(super) fn open_hvpatch_pidfd(
         &self,
-        process: &crate::hvpatch::ProcessContext,
+        process: &dyn crate::kernel::CarrierProcess,
         guest_pid: i32,
         status_flags: u64,
     ) -> DispatchOutcome {
@@ -3370,7 +3370,7 @@ impl<'a> ProcView<'a> {
                 else {
                     return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                 };
-                return Ok(this.open_hvpatch_pidfd(&process, host, status_flags));
+                return Ok(this.open_hvpatch_pidfd(process.as_ref(), host, status_flags));
             }
             // A task with no HVPatch process binding has no process table to
             // name: the retired 1:1 native lane's `EVFILT_PROC` watch on a
@@ -4415,6 +4415,7 @@ mod hvpatch_identity_tests {
 #[cfg(test)]
 mod kernel_process_dispatch_tests {
     use super::*;
+    use crate::kernel::CarrierProcess;
     use std::num::{NonZeroU16, NonZeroU64};
     use std::sync::Arc;
     use std::time::Instant;
@@ -4582,12 +4583,12 @@ mod kernel_process_dispatch_tests {
     ) -> (
         HvpatchLaneScope,
         SyscallDispatcher,
-        crate::hvpatch::ProcessContext,
+        Arc<crate::kernel::TestCarrierProcess>,
         KernelContext,
         crate::kernel::objects::ThreadExecutionLease,
     ) {
         let lane = HvpatchLaneScope::force(false);
-        let (mut process, root) = crate::hvpatch::process_context_for_tests(root_pid);
+        let (mut process, root) = crate::kernel::TestCarrierProcess::new(root_pid);
         let state = crate::kernel::objects::MigratableTaskState {
             cpu: carrick_hal::threaded::GuestCpuState::from_aarch64_v1(
                 carrick_hal::threaded::Aarch64TaskCpuStateV1 {
@@ -4641,6 +4642,7 @@ mod kernel_process_dispatch_tests {
             .claim_runnable(executor)
             .expect("claim test lease");
         process.enable_mm_access_for_tests();
+        let process = Arc::new(process);
         let dispatcher = SyscallDispatcher::new();
         dispatcher.bind_hvpatch_process(process.clone());
         let root = dispatcher

@@ -5236,8 +5236,8 @@ mod ipc_set_tests {
     #[test]
     fn semctl_getpid_reports_namespace_visible_operator() {
         let dispatcher = SyscallDispatcher::new();
-        let (process, _) = crate::hvpatch::process_context_for_tests(83_101);
-        dispatcher.bind_hvpatch_process(process);
+        let (process, _) = crate::kernel::TestCarrierProcess::new(83_101);
+        dispatcher.bind_hvpatch_process(Arc::new(process));
         let parent = dispatcher.capture_one_task_context().expect("root context");
         let arena = Box::leak(Box::new(
             carrick_kernel_arena::arena::KernelArena::create().expect("sysv pid namespace arena"),

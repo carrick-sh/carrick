@@ -82,7 +82,7 @@ impl SyscallDispatcher {
         )))
     }
 
-    pub(crate) fn bind_hvpatch_process(&self, process: crate::hvpatch::ProcessContext) {
+    pub(crate) fn bind_hvpatch_process(&self, process: Arc<dyn crate::kernel::CarrierProcess>) {
         let launch_fs_context = self
             .launch_fs_context_for_hvpatch_bind()
             .unwrap_or_else(|error| {
@@ -110,7 +110,7 @@ impl SyscallDispatcher {
     /// mount, interceptor, observer and filesystem setting already installed.
     pub(crate) fn bind_hvpatch_process_exact(
         &self,
-        process: crate::hvpatch::ProcessContext,
+        process: Arc<dyn crate::kernel::CarrierProcess>,
         process_context: &crate::kernel::KernelContext,
         launch_fs_context: Option<(String, Option<String>)>,
     ) {
@@ -352,7 +352,7 @@ impl SyscallDispatcher {
             .map(|context| context.thread().key().tid)
     }
 
-    pub(crate) fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext> {
+    pub(crate) fn hvpatch_process(&self) -> Option<Arc<dyn crate::kernel::CarrierProcess>> {
         self.proc.lock().hvpatch_process.clone()
     }
 
