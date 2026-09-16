@@ -1842,7 +1842,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
-      "line": 647,
+      "line": 651,
       "categories": [
         "table_guard"
       ],
@@ -1853,7 +1853,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
-      "line": 690,
+      "line": 694,
       "categories": [
         "table_guard"
       ],
@@ -1864,7 +1864,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
-      "line": 698,
+      "line": 702,
       "categories": [
         "table_guard"
       ],
@@ -4011,7 +4011,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 1940,
+      "line": 1941,
       "categories": [
         "table_guard"
       ],
@@ -4022,7 +4022,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 1971,
+      "line": 1972,
       "categories": [
         "table_guard"
       ],

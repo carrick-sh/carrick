@@ -31,7 +31,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/dispatcher.rs::SnapshotError::fork_clone_with_prepared_mm_authorized_observed::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/dispatcher.rs",
-      "line": 590,
+      "line": 599,
       "item": "SnapshotError::fork_clone_with_prepared_mm_authorized_observed",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -40,7 +40,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/dispatcher.rs::SnapshotError::event_ring_guest_pid::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/dispatcher.rs",
-      "line": 693,
+      "line": 702,
       "item": "SnapshotError::event_ring_guest_pid",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -49,7 +49,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/dispatcher.rs::String::set_executable_path::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/dispatcher.rs",
-      "line": 722,
+      "line": 731,
       "item": "String::set_executable_path",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -58,7 +58,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/dispatcher.rs::String::enter_binfmt::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/dispatcher.rs",
-      "line": 737,
+      "line": 746,
       "item": "String::enter_binfmt",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -67,7 +67,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/dispatcher.rs::String::set_native_x86_64::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/dispatcher.rs",
-      "line": 749,
+      "line": 758,
       "item": "String::set_native_x86_64",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -76,7 +76,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/dispatcher.rs::ExecSource::set_executable_identity_inner::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/dispatcher.rs",
-      "line": 797,
+      "line": 806,
       "item": "ExecSource::set_executable_identity_inner",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -202,7 +202,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/kernel_context.rs::R::hvpatch_process::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
-      "line": 359,
+      "line": 363,
       "item": "R::hvpatch_process",
       "category": "proc",
       "expression": ".proc.lock()",

@@ -5263,18 +5263,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1485 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest interpreter image used by `run_static_hvpatch`.",
+    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1486 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest interpreter image used by `run_static_hvpatch`.",
     "review_id": "HA-000231",
     "source": {
-      "byte_end": 54272,
-      "byte_start": 54259,
+      "byte_end": 54333,
+      "byte_start": 54320,
       "column": 16,
       "column_end": 29,
       "column_start": 16,
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 1485,
-      "line_end": 1485,
-      "line_start": 1485
+      "line": 1486,
+      "line_end": 1486,
+      "line_start": 1486
     }
   },
   {
@@ -5290,18 +5290,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1493 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest executable image used by `run_static_hvpatch`.",
+    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1494 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest executable image used by `run_static_hvpatch`.",
     "review_id": "HA-000232",
     "source": {
-      "byte_end": 54751,
-      "byte_start": 54738,
+      "byte_end": 54812,
+      "byte_start": 54799,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 1493,
-      "line_end": 1493,
-      "line_start": 1493
+      "line": 1494,
+      "line_end": 1494,
+      "line_start": 1494
     }
   },
   {
@@ -10340,33 +10340,6 @@
     "classification": "forbidden_semantic",
     "evidence": {
       "authority": "guest_answer",
-      "resource": "guest signal sender PID used by `raise_for_self`"
-    },
-    "expansion": null,
-    "operation": "std::process::id",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-hal/src/host_signal_bridge.rs:329 in `raise_for_self`, the host result from `std::process::id` determines the guest signal sender PID used by `raise_for_self`.",
-    "review_id": "HA-000655",
-    "source": {
-      "byte_end": 12753,
-      "byte_start": 12737,
-      "column": 52,
-      "column_end": 68,
-      "column_start": 52,
-      "file": "crates/carrick-hal/src/host_signal_bridge.rs",
-      "line": 329,
-      "line_end": 329,
-      "line_start": 329
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-PROCESS-ID",
-    "classification": "forbidden_semantic",
-    "evidence": {
-      "authority": "guest_answer",
       "resource": "raw current host PID exposed by the host-process execution seam used by `main_from_host_pid`"
     },
     "expansion": null,
@@ -11768,18 +11741,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/dispatcher.rs:696 in `event_ring_guest_pid`, `std::process::id` acts only on the current carrier event-ring diagnostic fallback used by `event_ring_guest_pid`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/dispatcher.rs:705 in `event_ring_guest_pid`, `std::process::id` acts only on the current carrier event-ring diagnostic fallback used by `event_ring_guest_pid`; no guest identity selects its host target.",
     "review_id": "HA-000497",
     "source": {
-      "byte_end": 30838,
-      "byte_start": 30822,
+      "byte_end": 31355,
+      "byte_start": 31339,
       "column": 32,
       "column_end": 48,
       "column_start": 32,
       "file": "crates/carrick-runtime/src/dispatch/dispatcher.rs",
-      "line": 696,
-      "line_end": 696,
-      "line_start": 696
+      "line": 705,
+      "line_end": 705,
+      "line_start": 705
     }
   },
   {
@@ -11852,8 +11825,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/kernel_context.rs:263 in `reset_one_task_kernel_binding_for_current_process`, the host result from `std::process::id` determines the guest fork-child identity in the one-task adapter used by `reset_one_task_kernel_binding_for_current_process`.",
     "review_id": "HA-000496",
     "source": {
-      "byte_end": 11833,
-      "byte_start": 11817,
+      "byte_end": 11820,
+      "byte_start": 11804,
       "column": 42,
       "column_end": 58,
       "column_start": 42,
@@ -12416,18 +12389,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1039 in `initialize_root_process`, `std::process::id` acts only on the current carrier identity passed to the deliberately ignored HVPatch bootstrap seam used by `initialize_root_process`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1040 in `initialize_root_process`, `std::process::id` acts only on the current carrier identity passed to the deliberately ignored HVPatch bootstrap seam used by `initialize_root_process`; no guest identity selects its host target.",
     "review_id": "HA-000523",
     "source": {
-      "byte_end": 38171,
-      "byte_start": 38155,
+      "byte_end": 38246,
+      "byte_start": 38230,
       "column": 44,
       "column_end": 60,
       "column_start": 44,
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 1039,
-      "line_end": 1039,
-      "line_start": 1039
+      "line": 1040,
+      "line_end": 1040,
+      "line_start": 1040
     }
   },
   {
@@ -13824,18 +13797,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-hal/src/guest_timer_bridge.rs:220 in `itimer_spawn_fallback_timer`, `std::thread::Builder::new` acts only on the current kick+futex interval-timer helper thread used by `itimer_spawn_fallback_timer`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-hal/src/guest_timer_bridge.rs:344 in `KickerTimerFiring::spawn_itimer_fallback`, `std::thread::Builder::new` acts only on the current kick+futex interval-timer helper thread used by `spawn_itimer_fallback`; no guest identity selects its host target.",
     "review_id": "HA-000656",
     "source": {
-      "byte_end": 9844,
-      "byte_start": 9819,
+      "byte_end": 14369,
+      "byte_start": 14344,
       "column": 17,
       "column_end": 42,
       "column_start": 17,
       "file": "crates/carrick-hal/src/guest_timer_bridge.rs",
-      "line": 220,
-      "line_end": 220,
-      "line_start": 220
+      "line": 344,
+      "line_end": 344,
+      "line_start": 344
     }
   },
   {
@@ -13852,72 +13825,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-hal/src/guest_timer_bridge.rs:255 in `posix_arm`, `std::thread::Builder::new` acts only on the current kick+futex POSIX-timer helper thread used by `posix_arm`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-hal/src/guest_timer_bridge.rs:366 in `KickerTimerFiring::spawn_posix_firing`, `std::thread::Builder::new` acts only on the current kick+futex POSIX-timer helper thread used by `spawn_posix_firing`; no guest identity selects its host target.",
     "review_id": "HA-000657",
     "source": {
-      "byte_end": 11180,
-      "byte_start": 11155,
-      "column": 21,
-      "column_end": 46,
-      "column_start": 21,
-      "file": "crates/carrick-hal/src/guest_timer_bridge.rs",
-      "line": 255,
-      "line_end": 255,
-      "line_start": 255
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
-      "resource": "current test-support Null interval-timer helper thread used by `itimer_spawn_fallback_timer`"
-    },
-    "expansion": null,
-    "operation": "std::thread::Builder::new",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-hal/src/guest_timer_bridge.rs:323 in `itimer_spawn_fallback_timer`, `std::thread::Builder::new` acts only on the current test-support Null interval-timer helper thread used by `itimer_spawn_fallback_timer`; no guest identity selects its host target.",
-    "review_id": "HA-000658",
-    "source": {
-      "byte_end": 13436,
-      "byte_start": 13411,
+      "byte_end": 15355,
+      "byte_start": 15330,
       "column": 17,
       "column_end": 42,
       "column_start": 17,
       "file": "crates/carrick-hal/src/guest_timer_bridge.rs",
-      "line": 323,
-      "line_end": 323,
-      "line_start": 323
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
-      "resource": "current test-support Null POSIX-timer helper thread used by `posix_arm`"
-    },
-    "expansion": null,
-    "operation": "std::thread::Builder::new",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-hal/src/guest_timer_bridge.rs:358 in `posix_arm`, `std::thread::Builder::new` acts only on the current test-support Null POSIX-timer helper thread used by `posix_arm`; no guest identity selects its host target.",
-    "review_id": "HA-000659",
-    "source": {
-      "byte_end": 14713,
-      "byte_start": 14688,
-      "column": 21,
-      "column_end": 46,
-      "column_start": 21,
-      "file": "crates/carrick-hal/src/guest_timer_bridge.rs",
-      "line": 358,
-      "line_end": 358,
-      "line_start": 358
+      "line": 366,
+      "line_end": 366,
+      "line_start": 366
     }
   },
   {
