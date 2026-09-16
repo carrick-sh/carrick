@@ -73,7 +73,7 @@ impl<'a> FsView<'a> {
     ) -> Vec<RootFsDirEntry> {
         let streamed = match trusted {
             Some(trusted) if self.trusted_dir_stream_is_exact(trusted, dir_path) => {
-                crate::fs_backend::read_host_dir_entries(trusted.fd.raw(), dir_path)
+                carrick_vfs::fs_backend::read_host_dir_entries(trusted.fd.raw(), dir_path)
             }
             _ => None,
         };
@@ -84,13 +84,13 @@ impl<'a> FsView<'a> {
             // child exactly. A directory deleted or renamed away since the
             // open reads as empty by its stale path — Linux would list the
             // inode's live contents; only the trusted stream matches that.
-            None => crate::fs_backend::try_layered_stream_dirents(
+            None => carrick_vfs::fs_backend::try_layered_stream_dirents(
                 self.fs.rootfs_vfs.overlay.as_ref(),
                 self.fs.rootfs_vfs.rootfs.as_ref(),
                 dir_path,
             )
             .unwrap_or_else(|| {
-                crate::overlay::layered_directory_entries(
+                carrick_vfs::overlay::layered_directory_entries(
                     self.fs.rootfs_vfs.overlay.as_ref(),
                     self.fs.rootfs_vfs.rootfs.as_ref(),
                     dir_path,
@@ -113,12 +113,12 @@ impl<'a> FsView<'a> {
         let mount_children = self.fs.vfs_mounts.mount_children_of(dir_path);
         for child in mount_children {
             let child_kind = match child.kind {
-                crate::vfs::EntryKind::Directory => RootFsEntryKind::Directory,
-                crate::vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
-                crate::vfs::EntryKind::Fifo => RootFsEntryKind::Fifo,
-                crate::vfs::EntryKind::Socket => RootFsEntryKind::Socket,
-                crate::vfs::EntryKind::CharDevice => RootFsEntryKind::CharDevice,
-                crate::vfs::EntryKind::File => RootFsEntryKind::File,
+                carrick_vfs::EntryKind::Directory => RootFsEntryKind::Directory,
+                carrick_vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
+                carrick_vfs::EntryKind::Fifo => RootFsEntryKind::Fifo,
+                carrick_vfs::EntryKind::Socket => RootFsEntryKind::Socket,
+                carrick_vfs::EntryKind::CharDevice => RootFsEntryKind::CharDevice,
+                carrick_vfs::EntryKind::File => RootFsEntryKind::File,
             };
             if let Some(existing) = entries.iter_mut().find(|e| e.name == child.name) {
                 existing.metadata.kind = child_kind;
@@ -435,10 +435,10 @@ impl<'a> FsView<'a> {
                 moved_is_dir,
             ),
              outcome| match outcome {
-                crate::vfs::rootfs::RenameOutcome::SameObject => {
+                carrick_vfs::vfs::rootfs::RenameOutcome::SameObject => {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
-                crate::vfs::rootfs::RenameOutcome::Renamed => {
+                carrick_vfs::vfs::rootfs::RenameOutcome::Renamed => {
                     if !same_executable_object && moved_directory {
                         self.notify_executable_directory_rename(&resolved_old, &resolved_new);
                     }
@@ -700,7 +700,7 @@ impl<'a> FsView<'a> {
                 // Symlink created in the writable backend (cap-std on --fs host).
                 t
             } else {
-                use crate::vfs::Vfs as _;
+                use carrick_vfs::Vfs as _;
                 match this.fs.rootfs_vfs.readlink(&path) {
                     Ok(p) => p.to_string_lossy().into_owned(),
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
@@ -710,7 +710,7 @@ impl<'a> FsView<'a> {
             // `target` is in the VFS layer's reversible escape form; decode it
             // back to the opaque link-target BYTES so readlink hands the guest
             // exactly what was stored (an undecodable target round-trips).
-            let decoded = crate::pathcodec::decode_to_bytes(&target);
+            let decoded = carrick_vfs::pathcodec::decode_to_bytes(&target);
             let written = decoded.len().min(buffer_size);
             cx.memory.write_bytes(buffer, &decoded[..written])?;
             Ok(DispatchOutcome::returned_len_or_errno(written))
@@ -795,7 +795,7 @@ impl<'a> FsView<'a> {
                                 this.dnotify_child(cx.kernel, &materialize_path, LinuxDnotifyMask::CREATE);
                                 DispatchOutcome::Returned { value: 0 }
                             }
-                            Err(crate::fs_backend::BackendError::Unsupported) => {
+                            Err(carrick_vfs::fs_backend::BackendError::Unsupported) => {
                                 DispatchOutcome::errno(LINUX_EPERM)
                             }
                             Err(_) => DispatchOutcome::errno(LINUX_EROFS),
@@ -824,7 +824,7 @@ impl<'a> FsView<'a> {
                                 this.dnotify_child(cx.kernel, &materialize_path, LinuxDnotifyMask::CREATE);
                                 DispatchOutcome::Returned { value: 0 }
                             }
-                            Err(crate::fs_backend::BackendError::Unsupported) => {
+                            Err(carrick_vfs::fs_backend::BackendError::Unsupported) => {
                                 DispatchOutcome::errno(LINUX_EPERM)
                             }
                             Err(_) => DispatchOutcome::errno(LINUX_EROFS),
@@ -852,7 +852,7 @@ impl<'a> FsView<'a> {
                                 this.dnotify_child(cx.kernel, &materialize_path, LinuxDnotifyMask::CREATE);
                                 DispatchOutcome::Returned { value: 0 }
                             }
-                            Err(crate::fs_backend::BackendError::Unsupported) => {
+                            Err(carrick_vfs::fs_backend::BackendError::Unsupported) => {
                                 DispatchOutcome::errno(LINUX_EPERM)
                             }
                             Err(_) => DispatchOutcome::errno(LINUX_EROFS),
@@ -881,7 +881,7 @@ impl<'a> FsView<'a> {
                     this.dnotify_child(cx.kernel, &materialize_path, LinuxDnotifyMask::CREATE);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
-                Err(crate::fs_backend::BackendError::Unsupported) => Ok(DispatchOutcome::errno(LINUX_EROFS)),
+                Err(carrick_vfs::fs_backend::BackendError::Unsupported) => Ok(DispatchOutcome::errno(LINUX_EROFS)),
                 Err(_) => Ok(DispatchOutcome::errno(LINUX_EROFS)),
             }
         }
@@ -972,7 +972,7 @@ impl<'a> FsView<'a> {
                 let mut st: libc::stat = unsafe { core::mem::zeroed() };
                 if unsafe { libc::fstat(pfd.as_raw_fd(), &mut st) } == 0 {
                     let (xattr_mode, _, xattr_gid, _) =
-                        crate::fs_backend::host::fd_carrick_meta(pfd.as_raw_fd());
+                        carrick_vfs::fs_backend::host::fd_carrick_meta(pfd.as_raw_fd());
                     let pmode = xattr_mode.unwrap_or(st.st_mode as u32);
                     if pmode & S_ISGID != 0 {
                         create_mode |= S_ISGID;
@@ -1340,7 +1340,7 @@ impl<'a> FsView<'a> {
             if this.is_synthetic_virtual_path(cx.kernel, &resolved) {
                 return Ok(DispatchOutcome::errno(LINUX_EROFS));
             }
-            use crate::vfs::Vfs as _;
+            use carrick_vfs::Vfs as _;
             // DAC: removing an entry needs write+search on the parent dir
             // (unlink08: 0555 lacks write, 0666 lacks search — both → EACCES).
             // A sticky parent (S_ISVTX) additionally requires owning the entry

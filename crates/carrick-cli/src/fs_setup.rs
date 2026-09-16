@@ -3,7 +3,7 @@
 //! # Theory of operation
 //!
 //! A guest needs a writable root filesystem with Linux semantics. Two backends
-//! provide one (both in `carrick_runtime::fs_backend`), and this module is the
+//! provide one (both in `carrick_vfs::fs_backend`), and this module is the
 //! policy layer that picks between them and pre-populates them — for the
 //! engine-less `run-elf` fixture path. (The docker `run` path makes the
 //! equivalent choice inside `carrick-engine`; this module is what the bare-ELF
@@ -26,7 +26,7 @@
 //! ## Default selection: `host` is the default
 //!
 //! `host` is the secure-by-default, real-semantics choice. The default
-//! (`carrick_runtime::apfs::default_writable_backend_kind`) returns `host`
+//! (`carrick_vfs::apfs::default_writable_backend_kind`) returns `host`
 //! unconditionally on stock builds. The `memory` backend is opt-in: compile
 //! with `--features fs-memory` to enable it. On a `fs-memory`-enabled build the
 //! default probes the *exact* scratch root the host backend will use —
@@ -53,10 +53,10 @@
 
 use anyhow::Result;
 use carrick_runtime::dispatch::SyscallDispatcher;
-#[cfg(feature = "fs-memory")]
-use carrick_runtime::fs_backend::MemoryBackend;
-use carrick_runtime::fs_backend::{FsBackend, HostFsBackend};
 use carrick_spec::FsBackendKind;
+#[cfg(feature = "fs-memory")]
+use carrick_vfs::fs_backend::MemoryBackend;
+use carrick_vfs::fs_backend::{FsBackend, HostFsBackend};
 
 /// On a `--fs host` failure, fall back to the in-memory backend when the
 /// `fs-memory` feature is compiled in, or hard-error with an actionable message
@@ -96,7 +96,7 @@ pub(crate) fn install_fs_backend(
     dispatcher: &mut SyscallDispatcher,
     fs: Option<FsBackendKind>,
 ) -> Result<FsBackendKind> {
-    let kind = fs.unwrap_or_else(carrick_runtime::apfs::default_writable_backend_kind);
+    let kind = fs.unwrap_or_else(carrick_vfs::apfs::default_writable_backend_kind);
     // Set once the host backend has materialised the COMPLETE rootfs onto
     // disk - after which the in-memory rootfs layer is redundant and gets
     // dropped (the disk overlay is authoritative for every read).

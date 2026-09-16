@@ -104,7 +104,7 @@ impl<'a> FsView<'a> {
                 // fd-based futimens: the descriptor already refers to the
                 // resolved inode, so never re-follow (nofollow = false).
                 match self.fs.rootfs_vfs.set_times(&path, atime, mtime, false) {
-                    Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
+                    Ok(()) | Err(carrick_vfs::fs_backend::BackendError::Unsupported) => {
                         DispatchOutcome::Returned { value: 0 }
                     }
                     Err(_) => DispatchOutcome::errno(LINUX_EROFS),
@@ -159,7 +159,7 @@ impl<'a> FsView<'a> {
             };
         }
         match self.fs.rootfs_vfs.set_mode(&resolved, mode) {
-            Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
+            Ok(()) | Err(carrick_vfs::fs_backend::BackendError::Unsupported) => {
                 self.inotify_attrib(&resolved);
                 self.dnotify_attrib(context, &resolved);
                 Ok(DispatchOutcome::Returned { value: 0 })
@@ -682,7 +682,7 @@ impl<'a> FsView<'a> {
                 Ok(()) => {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
-                Err(crate::fs_backend::BackendError::Unsupported) => {
+                Err(carrick_vfs::fs_backend::BackendError::Unsupported) => {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 // Best-effort timestamps: a successful set above persists real

@@ -81,7 +81,7 @@ impl<'a> FsView<'a> {
         if let Some(m) = self.fs.vfs_mounts.resolve(path)
             && let Ok(md) = m.vfs.lookup(&m.full_path)
         {
-            return md.kind == crate::vfs::EntryKind::Directory;
+            return md.kind == carrick_vfs::EntryKind::Directory;
         }
         match self.fs.rootfs_vfs.overlay.lookup(path) {
             Some(OverlayEntry::Dir) => return true,
@@ -100,7 +100,7 @@ impl<'a> FsView<'a> {
     /// used by stat / faccessat sites, but consults the overlay first
     /// and respects deletions.
     pub(crate) fn layered_metadata(&self, path: &str) -> Result<RootFsMetadata, LinuxErrno> {
-        use crate::vfs::Vfs as _;
+        use carrick_vfs::Vfs as _;
         // Consult the VFS mounts (/dev, /dev/pts, /proc, /sys) FIRST so stat of
         // /dev/ptmx, /dev/pts/N, /dev/tty, and synthetic /proc /sys paths
         // resolves — mirroring the open path (`try_vfs_open`). Previously stat
@@ -126,7 +126,7 @@ impl<'a> FsView<'a> {
         if let Some(target) = self.fs.rootfs_vfs.overlay.read_link(path) {
             return Some(target);
         }
-        use crate::vfs::Vfs as _;
+        use carrick_vfs::Vfs as _;
         if let Some(m) = self.fs.vfs_mounts.resolve(path)
             && let Ok(target) = m.vfs.readlink(&m.full_path)
         {
@@ -369,7 +369,7 @@ impl<'a> FsView<'a> {
         // Sample the generation at ENTRY, before reading any fs state: a new
         // entry is stamped with this, so a mutation racing our resolve (which
         // bumps to a higher generation) leaves the entry born stale.
-        let gen_at_entry = crate::fs_resolve_cache::current_generation();
+        let gen_at_entry = carrick_vfs::fs_resolve_cache::current_generation();
         if let Some(ref key) = cache_key {
             // Validate the lookup against the FRESH current generation (read
             // now, not `gen_at_entry`) so a mutation between entry and here also
@@ -377,7 +377,7 @@ impl<'a> FsView<'a> {
             if let Some(hit) = self
                 .fs
                 .resolve_cache
-                .get(key, crate::fs_resolve_cache::current_generation())
+                .get(key, carrick_vfs::fs_resolve_cache::current_generation())
             {
                 // Still enforce DAC search permission per call — it depends on
                 // live creds, not the path structure (a no-op for root, the hot
@@ -627,9 +627,9 @@ impl<'a> FsView<'a> {
         // intermediate exists, is a directory, and involves no symlink or
         // Unicode-alias redirection. Anything non-trivial → the exact slow path.
         match self.fs.rootfs_vfs.overlay.validate_parents_fast(&abs) {
-            crate::fs_backend::ParentResolve::AllDirsNoSymlink => return Ok(abs),
-            crate::fs_backend::ParentResolve::NotDir => return Err(LINUX_ENOTDIR),
-            crate::fs_backend::ParentResolve::Slow => {}
+            carrick_vfs::fs_backend::ParentResolve::AllDirsNoSymlink => return Ok(abs),
+            carrick_vfs::fs_backend::ParentResolve::NotDir => return Err(LINUX_ENOTDIR),
+            carrick_vfs::fs_backend::ParentResolve::Slow => {}
         }
         // ELOOP: Linux caps the CUMULATIVE symlinks followed across the whole path
         // at MAXSYMLINKS (40). carrick's per-component resolvers each cap at 40 but

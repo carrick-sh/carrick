@@ -46,8 +46,7 @@ fn extracts_file_dir_symlink_with_mode() {
         h3.set_link_name("motd").unwrap();
         b.append_link(&mut h3, "etc/motd.link", "motd").unwrap();
     });
-    let stats =
-        carrick_runtime::rootfs::extract_layer_paths_to_dir(&[layer], scratch.path()).unwrap();
+    let stats = carrick_vfs::rootfs::extract_layer_paths_to_dir(&[layer], scratch.path()).unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.dirs, 1);
     assert_eq!(stats.symlinks, 1);
@@ -106,7 +105,7 @@ fn later_layer_overrides_and_whiteout_deletes() {
         b.append_data(&mut hw, ".wh.b.txt", std::io::empty())
             .unwrap();
     });
-    carrick_runtime::rootfs::extract_layer_paths_to_dir(&[l0, l1], scratch.path()).unwrap();
+    carrick_vfs::rootfs::extract_layer_paths_to_dir(&[l0, l1], scratch.path()).unwrap();
     assert_eq!(std::fs::read(scratch.path().join("a.txt")).unwrap(), b"v1");
     assert!(!scratch.path().join("b.txt").exists());
 }
@@ -137,7 +136,7 @@ fn opaque_whiteout_clears_dir() {
         h.set_size(d.len() as u64);
         b.append_data(&mut h, "d/new.txt", &d[..]).unwrap();
     });
-    carrick_runtime::rootfs::extract_layer_paths_to_dir(&[l0, l1], scratch.path()).unwrap();
+    carrick_vfs::rootfs::extract_layer_paths_to_dir(&[l0, l1], scratch.path()).unwrap();
     assert!(!scratch.path().join("d/old.txt").exists());
     assert!(scratch.path().join("d/new.txt").is_file());
 }
@@ -162,8 +161,7 @@ fn skips_special_file() {
         h2.set_size(data.len() as u64);
         b.append_data(&mut h2, "readme.txt", &data[..]).unwrap();
     });
-    let stats =
-        carrick_runtime::rootfs::extract_layer_paths_to_dir(&[layer], scratch.path()).unwrap();
+    let stats = carrick_vfs::rootfs::extract_layer_paths_to_dir(&[layer], scratch.path()).unwrap();
     assert_eq!(stats.skipped_special, 1);
     assert_eq!(stats.files, 1);
     assert!(scratch.path().join("readme.txt").is_file());
@@ -202,7 +200,7 @@ fn rejects_path_escape() {
                     .write_all(&bytes)
                     .unwrap();
                 // Should return an error (UnsafePath from normalize_layer_path)
-                let result = carrick_runtime::rootfs::extract_layer_paths_to_dir(
+                let result = carrick_vfs::rootfs::extract_layer_paths_to_dir(
                     &[layer_path.clone()],
                     scratch.path(),
                 );

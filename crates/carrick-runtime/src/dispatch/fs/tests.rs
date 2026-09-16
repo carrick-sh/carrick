@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 #[test]
 fn proc_exe_open_fd_tracks_dentry_and_reads_retained_live_object() {
-    let backend = crate::fs_backend::MemoryBackend::new();
+    let backend = carrick_vfs::fs_backend::MemoryBackend::new();
     backend
         .set_file_contents("/image", b"old-image".to_vec())
         .unwrap();
@@ -804,7 +804,7 @@ fn dispatch_uname_nodename(
 }
 
 fn sysfs_link_view(context: &crate::kernel::KernelContext) -> (Vec<String>, String) {
-    use crate::vfs::Vfs;
+    use carrick_vfs::Vfs;
 
     let sys = crate::vfs::SysVfs::in_namespace(context.task().net_ns());
     let names = sys
@@ -823,14 +823,14 @@ fn sysfs_link_view(context: &crate::kernel::KernelContext) -> (Vec<String>, Stri
         .expect("uplink")
         .name
         .clone();
-    let crate::vfs::VfsHandle::Bytes { contents, .. } = sys
+    let carrick_vfs::VfsHandle::Bytes { contents, .. } = sys
         .open(
             &format!("/sys/class/net/{own}/mtu"),
-            crate::vfs::OpenFlags {
+            carrick_vfs::OpenFlags {
                 read: true,
-                ..crate::vfs::OpenFlags::default()
+                ..carrick_vfs::OpenFlags::default()
             },
-            &crate::vfs::OpenContext::default(),
+            &carrick_vfs::OpenContext::default(),
         )
         .expect("open sysfs MTU")
     else {
@@ -840,21 +840,21 @@ fn sysfs_link_view(context: &crate::kernel::KernelContext) -> (Vec<String>, Stri
 }
 
 fn proc_net_dev(context: &crate::kernel::KernelContext) -> String {
-    use crate::vfs::Vfs;
+    use carrick_vfs::Vfs;
 
     let network = context.task().net_ns().view();
-    let open_context = crate::vfs::OpenContext {
-        network_model: crate::vfs::LazyField::from_value(Some(
-            Arc::clone(&*network) as Arc<dyn crate::vfs::FsNetworkView>
+    let open_context = carrick_vfs::OpenContext {
+        network_model: carrick_vfs::LazyField::from_value(Some(
+            Arc::clone(&*network) as Arc<dyn carrick_vfs::FsNetworkView>
         )),
-        ..crate::vfs::OpenContext::default()
+        ..carrick_vfs::OpenContext::default()
     };
-    let crate::vfs::VfsHandle::Bytes { contents, .. } = crate::vfs::ProcVfs::new()
+    let carrick_vfs::VfsHandle::Bytes { contents, .. } = crate::vfs::ProcVfs::new()
         .open(
             "/proc/net/dev",
-            crate::vfs::OpenFlags {
+            carrick_vfs::OpenFlags {
                 read: true,
-                ..crate::vfs::OpenFlags::default()
+                ..carrick_vfs::OpenFlags::default()
             },
             &open_context,
         )
@@ -1076,7 +1076,7 @@ fn test_directory_open_file(path: &str) -> OpenFile {
 
 #[test]
 fn chroot_rebases_absolute_resolution() {
-    let backend = crate::fs_backend::MemoryBackend::new();
+    let backend = carrick_vfs::fs_backend::MemoryBackend::new();
     backend.make_dir("/jail").unwrap();
     backend
         .set_file_contents("/jail/chroot02_testfile", b"payload".to_vec())
@@ -1107,7 +1107,7 @@ fn chroot_rebases_absolute_resolution() {
 #[test]
 fn chroot_no_search_permission_precedes_capability_error() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.make_dir("/jail").unwrap();
     backend.set_mode("/jail", 0o600).unwrap();
 
@@ -1134,7 +1134,7 @@ fn chroot_no_search_permission_precedes_capability_error() {
 #[test]
 fn truncate_follows_final_symlink_cycle_to_eloop() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.symlink("testsymlink2", "/testsymlink1").unwrap();
     backend.symlink("testsymlink1", "/testsymlink2").unwrap();
 
@@ -1166,7 +1166,7 @@ fn truncate_follows_final_symlink_cycle_to_eloop() {
 #[cfg(target_os = "macos")]
 fn trusted_lane_fixture() -> (tempfile::TempDir, SyscallDispatcher) {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.make_dir("/walk").unwrap();
     backend.make_dir("/walk/sub").unwrap();
     backend
@@ -1193,7 +1193,7 @@ fn trusted_lane_fixture() -> (tempfile::TempDir, SyscallDispatcher) {
 #[test]
 fn mknodat_special_node_in_setgid_parent_inherits_gid_without_setgid() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.make_dir("/setgid-parent").unwrap();
     backend
         .set_owner(
@@ -1268,7 +1268,7 @@ fn mknodat_special_node_in_setgid_parent_inherits_gid_without_setgid() {
 #[test]
 fn stat_following_final_symlink_cycle_returns_eloop() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.symlink("loop/inside", "/loop").unwrap();
 
     let mut dispatcher = SyscallDispatcher::new();
@@ -1316,7 +1316,7 @@ fn trusted_lower_lane_fixture() -> (tempfile::TempDir, tempfile::TempDir, Syscal
     std::fs::write(lower.path().join("walk/file.txt"), b"lower file").unwrap();
     std::fs::write(lower.path().join("walk/sub/deep.txt"), b"deep").unwrap();
     std::os::unix::fs::symlink("file.txt", lower.path().join("walk/link")).unwrap();
-    let lower_metadata = crate::fs_backend::HostFsBackend::attach(lower.path()).unwrap();
+    let lower_metadata = carrick_vfs::fs_backend::HostFsBackend::attach(lower.path()).unwrap();
     lower_metadata.set_mode("/walk/file.txt", 0o4711).unwrap();
     lower_metadata
         .set_owner(
@@ -1328,7 +1328,7 @@ fn trusted_lower_lane_fixture() -> (tempfile::TempDir, tempfile::TempDir, Syscal
     drop(lower_metadata);
 
     let rootfs = RootFs::from_immutable_host_dir(lower.path()).unwrap();
-    let mut overlay = crate::fs_backend::HostFsBackend::from_path(upper.path()).unwrap();
+    let mut overlay = carrick_vfs::fs_backend::HostFsBackend::from_path(upper.path()).unwrap();
     overlay.enable_sparse_upper_fast_miss();
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.set_fs_backend(Box::new(overlay));
@@ -1709,7 +1709,7 @@ fn trusted_upper_only_directory_seeds_the_lane_and_streams() {
     let mut streamed = lane_getdents(&mut dispatcher, &mut memory, dir);
     streamed.retain(|(n, _)| n != "." && n != "..");
     streamed.sort();
-    let mut layered: Vec<(String, u8)> = crate::overlay::layered_directory_entries(
+    let mut layered: Vec<(String, u8)> = carrick_vfs::overlay::layered_directory_entries(
         dispatcher.fs.rootfs_vfs.overlay.as_ref(),
         dispatcher.fs.rootfs_vfs.rootfs.as_ref(),
         "/walk/scratch",
@@ -1776,8 +1776,8 @@ fn test_mkdirat_under_resolved_parent_zero_openat_budget() {
     );
     assert!(parent_dfd >= 0, "open /walk: {parent_dfd}");
 
-    crate::fs_backend::host::reset_test_host_openat_count();
-    crate::fs_backend::host::reset_test_host_stat_count();
+    carrick_vfs::fs_backend::host::reset_test_host_openat_count();
+    carrick_vfs::fs_backend::host::reset_test_host_stat_count();
 
     memory.write_bytes(0x4200, b"new_child\0").unwrap();
     let mk = lane_syscall(
@@ -1788,8 +1788,8 @@ fn test_mkdirat_under_resolved_parent_zero_openat_budget() {
     );
     assert_eq!(mk, 0, "mkdirat /walk/new_child: {mk}");
 
-    let opens = crate::fs_backend::host::test_host_openat_count();
-    let stats = crate::fs_backend::host::test_host_stat_count();
+    let opens = carrick_vfs::fs_backend::host::test_host_openat_count();
+    let stats = carrick_vfs::fs_backend::host::test_host_stat_count();
 
     assert_eq!(
         opens, 0,
@@ -1817,7 +1817,7 @@ fn test_guest_openat_1000_files_in_one_dir_host_openat_budget() {
         .unwrap();
     }
 
-    crate::fs_backend::host::reset_test_host_openat_count();
+    carrick_vfs::fs_backend::host::reset_test_host_openat_count();
     for i in 0..1000 {
         let fd = lane_openat(
             &mut dispatcher,
@@ -1828,7 +1828,7 @@ fn test_guest_openat_1000_files_in_one_dir_host_openat_budget() {
         );
         assert!(fd >= 0, "open failed: {fd}");
     }
-    let opens = crate::fs_backend::host::test_host_openat_count();
+    let opens = carrick_vfs::fs_backend::host::test_host_openat_count();
     assert!(
         opens <= 1002,
         "1,000 guest opens issued {opens} host_openat calls (budget <= 1002)"
@@ -2015,16 +2015,16 @@ fn fstat_caches_host_xattrs_and_invalidates_on_mutators() {
     assert!(fd >= 0);
 
     // Initial fstat
-    crate::fs_backend::reset_host_xattr_read_count();
+    carrick_vfs::fs_backend::reset_host_xattr_read_count();
     let st1 = dispatcher.fd_stat_record(fd as i32).unwrap();
     assert_eq!(st1.mode & 0o7777, 0o4711);
     assert_eq!(st1.uid.raw(), 7);
     assert_eq!(st1.gid.raw(), 9);
 
     // Repeat fstat: MUST be 0 host xattr reads!
-    let reads_before = crate::fs_backend::host_xattr_read_count();
+    let reads_before = carrick_vfs::fs_backend::host_xattr_read_count();
     let st2 = dispatcher.fd_stat_record(fd as i32).unwrap();
-    let reads_after = crate::fs_backend::host_xattr_read_count();
+    let reads_after = carrick_vfs::fs_backend::host_xattr_read_count();
     assert_eq!(
         reads_after, reads_before,
         "repeat fstat must perform 0 host xattr reads"
@@ -2042,18 +2042,18 @@ fn fstat_caches_host_xattrs_and_invalidates_on_mutators() {
     assert_eq!(rc, 0);
 
     // fstat after mutator: must reflect updated mode AND force a refresh
-    crate::fs_backend::reset_host_xattr_read_count();
+    carrick_vfs::fs_backend::reset_host_xattr_read_count();
     let st3 = dispatcher.fd_stat_record(fd as i32).unwrap();
     assert_eq!(st3.mode & 0o7777, 0o644);
     assert!(
-        crate::fs_backend::host_xattr_read_count() > 0,
+        carrick_vfs::fs_backend::host_xattr_read_count() > 0,
         "fstat after mutator must refresh"
     );
 
     // Repeat fstat again: MUST be 0 host xattr reads!
-    let reads_before = crate::fs_backend::host_xattr_read_count();
+    let reads_before = carrick_vfs::fs_backend::host_xattr_read_count();
     let st4 = dispatcher.fd_stat_record(fd as i32).unwrap();
-    let reads_after = crate::fs_backend::host_xattr_read_count();
+    let reads_after = carrick_vfs::fs_backend::host_xattr_read_count();
     assert_eq!(
         reads_after, reads_before,
         "repeat fstat must perform 0 host xattr reads"
@@ -2071,19 +2071,19 @@ fn fstat_caches_host_xattrs_and_invalidates_on_mutators() {
     assert_eq!(rc, 0);
 
     // fstat after fchown: must reflect updated owner AND force a refresh
-    crate::fs_backend::reset_host_xattr_read_count();
+    carrick_vfs::fs_backend::reset_host_xattr_read_count();
     let st5 = dispatcher.fd_stat_record(fd as i32).unwrap();
     assert_eq!(st5.uid.raw(), 42);
     assert_eq!(st5.gid.raw(), 84);
     assert!(
-        crate::fs_backend::host_xattr_read_count() > 0,
+        carrick_vfs::fs_backend::host_xattr_read_count() > 0,
         "fstat after fchown must refresh"
     );
 
     // Repeat fstat again: MUST be 0 host xattr reads!
-    let reads_before = crate::fs_backend::host_xattr_read_count();
+    let reads_before = carrick_vfs::fs_backend::host_xattr_read_count();
     let st6 = dispatcher.fd_stat_record(fd as i32).unwrap();
-    let reads_after = crate::fs_backend::host_xattr_read_count();
+    let reads_after = carrick_vfs::fs_backend::host_xattr_read_count();
     assert_eq!(
         reads_after, reads_before,
         "repeat fstat must perform 0 host xattr reads"
@@ -2464,7 +2464,7 @@ fn trusted_getdents_streams_layered_identical_entries() {
     streamed.retain(|(n, _)| n != "." && n != "..");
     streamed.sort();
 
-    let mut layered: Vec<(String, u8)> = crate::overlay::layered_directory_entries(
+    let mut layered: Vec<(String, u8)> = carrick_vfs::overlay::layered_directory_entries(
         dispatcher.fs.rootfs_vfs.overlay.as_ref(),
         None,
         "/walk",
@@ -2557,7 +2557,7 @@ fn socket_marker_disables_streaming_and_keeps_layered_parity() {
     let mut entries = lane_getdents(&mut dispatcher, &mut memory, root);
     entries.retain(|(n, _)| n != "." && n != "..");
     entries.sort();
-    let mut layered: Vec<(String, u8)> = crate::overlay::layered_directory_entries(
+    let mut layered: Vec<(String, u8)> = carrick_vfs::overlay::layered_directory_entries(
         dispatcher.fs.rootfs_vfs.overlay.as_ref(),
         None,
         "/walk",
@@ -3661,7 +3661,7 @@ fn bind_mount_rejects_o_directory_for_regular_file() {
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.register_mount(
         "/bind",
-        Box::new(crate::vfs::BindVfs::new("/bind", host.path(), false)),
+        Box::new(carrick_vfs::BindVfs::new("/bind", host.path(), false)),
     );
 
     let before = dispatcher.open_fd_numbers();
@@ -3812,7 +3812,7 @@ fn bind_mount_setxattr_reports_unsupported_instead_of_missing() {
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.register_mount(
         "/bind",
-        Box::new(crate::vfs::BindVfs::new("/bind", host.path(), false)),
+        Box::new(carrick_vfs::BindVfs::new("/bind", host.path(), false)),
     );
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
     memory.write_bytes(0x4000, b"/bind/target\0").unwrap();
@@ -3850,7 +3850,7 @@ fn bind_mount_setxattr_reports_unsupported_instead_of_missing() {
     let mut readonly = SyscallDispatcher::new();
     readonly.register_mount(
         "/bind",
-        Box::new(crate::vfs::BindVfs::new("/bind", host.path(), true)),
+        Box::new(carrick_vfs::BindVfs::new("/bind", host.path(), true)),
     );
     let readonly_result = readonly
         .setxattr(
@@ -3916,7 +3916,7 @@ fn sync_file_range_rejects_synthetic_character_device_with_espipe() {
 
 #[test]
 fn memory_file_open_does_not_duplicate_path_record_for_proc_fd() {
-    let backend = crate::fs_backend::MemoryBackend::new();
+    let backend = carrick_vfs::fs_backend::MemoryBackend::new();
     backend
         .set_file_contents("/regular.bin", b"payload".to_vec())
         .unwrap();
@@ -3963,7 +3963,7 @@ fn memory_file_open_does_not_duplicate_path_record_for_proc_fd() {
 
 #[test]
 fn rlimit_fsize_straddling_regular_write_returns_only_the_limit_prefix() {
-    let backend = crate::fs_backend::MemoryBackend::new();
+    let backend = carrick_vfs::fs_backend::MemoryBackend::new();
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.set_fs_backend(Box::new(backend));
@@ -4053,7 +4053,7 @@ fn rlimit_fsize_straddling_regular_write_returns_only_the_limit_prefix() {
 #[test]
 fn close_retires_the_fd_open_path_entry() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend
         .set_file_contents("/locale.bin", b"payload".to_vec())
         .unwrap();
@@ -4105,7 +4105,7 @@ fn close_retires_the_fd_open_path_entry() {
 #[test]
 fn openat2_resolve_no_symlinks_rejects_link_path() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend
         .set_file_contents("/target", b"payload".to_vec())
         .unwrap();
@@ -4133,7 +4133,7 @@ fn openat2_resolve_no_symlinks_rejects_link_path() {
 
 #[test]
 fn openat2_rejects_unknown_and_invalid_opath_flag_combinations() {
-    let backend = crate::fs_backend::MemoryBackend::new();
+    let backend = carrick_vfs::fs_backend::MemoryBackend::new();
     backend
         .set_file_contents("/regular", b"payload".to_vec())
         .unwrap();
@@ -4203,7 +4203,7 @@ fn openat2_rejects_unknown_and_invalid_opath_flag_combinations() {
 
 #[test]
 fn openat2_resolve_beneath_rejects_dotdot_escape() {
-    let backend = crate::fs_backend::MemoryBackend::new();
+    let backend = carrick_vfs::fs_backend::MemoryBackend::new();
     backend.make_dir("/root").unwrap();
     backend.make_dir("/root/dir").unwrap();
     backend
@@ -4277,7 +4277,7 @@ fn openat2_resolve_no_xdev_rejects_proc_mount_crossing() {
 
 #[test]
 fn openat2_resolve_no_magiclinks_rejects_proc_fd_reopen() {
-    let backend = crate::fs_backend::MemoryBackend::new();
+    let backend = carrick_vfs::fs_backend::MemoryBackend::new();
     backend
         .set_file_contents("/regular.bin", b"payload".to_vec())
         .unwrap();
@@ -4321,7 +4321,7 @@ fn openat2_resolve_no_magiclinks_rejects_proc_fd_reopen() {
 
 #[test]
 fn openat2_resolve_in_root_rejects_absolute_escape() {
-    let backend = crate::fs_backend::MemoryBackend::new();
+    let backend = carrick_vfs::fs_backend::MemoryBackend::new();
     backend.make_dir("/root").unwrap();
     backend
         .set_file_contents("/outside", b"payload".to_vec())
@@ -4373,7 +4373,7 @@ fn openat2_resolve_in_root_rejects_absolute_escape() {
 
 #[test]
 fn openat2_resolve_in_root_clamps_parent_components_at_dirfd() {
-    let backend = crate::fs_backend::MemoryBackend::new();
+    let backend = carrick_vfs::fs_backend::MemoryBackend::new();
     backend.make_dir("/root").unwrap();
     backend
         .set_file_contents("/root/regfile", b"payload".to_vec())
@@ -5719,7 +5719,7 @@ fn non_pipe_access_mode_readv_writev_and_splice_precedence() {
         path: "/tmp/dir".to_string(),
         metadata: RootFsMetadata {
             path: std::path::PathBuf::from("/tmp/dir"),
-            kind: crate::rootfs::RootFsEntryKind::Directory,
+            kind: carrick_vfs::rootfs::RootFsEntryKind::Directory,
             mode: 0o755,
             size: 0,
         },
@@ -5755,7 +5755,7 @@ fn non_pipe_access_mode_readv_writev_and_splice_precedence() {
 
 #[test]
 fn cross_mount_rename_and_link_boundary_semantics() {
-    use crate::vfs::{EntryKind, Metadata, Vfs, VfsError};
+    use carrick_vfs::{EntryKind, Metadata, Vfs, VfsError};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct TestMountVfs {
@@ -5796,7 +5796,7 @@ fn cross_mount_rename_and_link_boundary_semantics() {
         }
     }
 
-    let backend = crate::fs_backend::MemoryBackend::new();
+    let backend = carrick_vfs::fs_backend::MemoryBackend::new();
     backend
         .set_file_contents("/rootfs_file.txt", b"payload".to_vec())
         .unwrap();
@@ -6614,7 +6614,7 @@ fn memfd_proc_self_fd_reopen_trunc_shares_inode() {
 #[test]
 fn proc_self_fd_reopen_overlay_file_write_after_reopen_visible_in_reopened() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
 
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
@@ -6729,7 +6729,7 @@ fn proc_self_fd_reopen_overlay_file_write_after_reopen_visible_in_reopened() {
 #[test]
 fn proc_self_fd_reopen_offsets_are_independent() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
 
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
@@ -7149,7 +7149,7 @@ fn lseek_data_and_hole_across_backends() {
     let memfile_desc = OpenDescription::InMemoryFile {
         base: OpenDescriptionBase::new(0),
         path: "/inmem_file".to_string(),
-        contents: Arc::new(parking_lot::RwLock::new(crate::vfs::SparseBuffer::from(
+        contents: Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
             vec![0xCC; 100],
         ))),
         offset: 0,
@@ -7566,7 +7566,7 @@ fn lseek_data_and_hole_across_backends() {
 #[test]
 fn test_seekholemap_truncate_write_cycle() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.set_fs_backend(Box::new(backend));
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
@@ -7626,7 +7626,7 @@ fn test_seekholemap_truncate_write_cycle() {
 #[test]
 fn test_creat_through_guest_created_symlink_to_dir() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.make_dir("/realdir").unwrap();
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.set_fs_backend(Box::new(backend));
@@ -7667,7 +7667,7 @@ fn test_creat_through_guest_created_symlink_to_dir() {
 #[test]
 fn test_intermediate_symlink_loop_returns_eloop() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.make_dir("/test_eloop").unwrap();
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.set_fs_backend(Box::new(backend));
@@ -7735,7 +7735,7 @@ fn test_intermediate_symlink_loop_returns_eloop() {
 #[test]
 fn test_rename_symlink_into_symlinked_dir_preserves_symlink() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.make_dir("/realdir").unwrap();
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.set_fs_backend(Box::new(backend));
@@ -7812,7 +7812,7 @@ fn test_rename_symlink_into_symlinked_dir_preserves_symlink() {
 #[test]
 fn test_rmdir_after_unlinking_files() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.set_fs_backend(Box::new(backend));
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
@@ -7954,7 +7954,7 @@ fn test_rmdir_after_unlinking_files() {
 #[test]
 fn test_stat_absolute_path_after_chroot() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.make_dir("/jail").unwrap();
     backend
         .set_file_contents("/jail/testfile", b"hello".to_vec())
@@ -7986,7 +7986,7 @@ fn test_stat_absolute_path_after_chroot() {
 #[test]
 fn test_stat_and_lookup_dot_leaf() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.make_dir("/mydir").unwrap();
     backend
         .set_file_contents("/mydir/myfile", b"data".to_vec())
@@ -8160,7 +8160,7 @@ fn test_stat_and_lookup_dot_leaf() {
 #[test]
 fn test_path_resolution_observable_behavior_pinned() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.make_dir("/mydir").unwrap();
     backend
         .set_file_contents("/mydir/myfile", b"hello world".to_vec())

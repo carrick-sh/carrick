@@ -1,23 +1,23 @@
 //! Small Darwin filesystem primitives used by Linux syscall emulation.
 
-use crate::linux_abi::LinuxErrno;
 use crate::vfs::errno::HostSyscallError;
+use carrick_abi::LinuxErrno;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CopyfileResult {
+pub enum CopyfileResult {
     Cloned(u64),
     Copied(u64),
 }
 
 impl CopyfileResult {
-    pub(crate) fn bytes(self) -> u64 {
+    pub fn bytes(self) -> u64 {
         match self {
             CopyfileResult::Cloned(bytes) | CopyfileResult::Copied(bytes) => bytes,
         }
     }
 }
 
-pub(crate) fn copyfile_clone_or_data(
+pub fn copyfile_clone_or_data(
     src_fd: i32,
     dst_fd: i32,
     expected_len: u64,

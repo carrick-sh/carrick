@@ -11,7 +11,7 @@
 mod support;
 
 use carrick_runtime::linux_abi::{LINUX_AT_FDCWD, LINUX_EFBIG, LINUX_O_CREAT, LINUX_O_RDWR};
-use carrick_runtime::vfs::{BindVfs, MAX_IN_MEMORY_FILE_SIZE};
+use carrick_vfs::{BindVfs, MAX_IN_MEMORY_FILE_SIZE};
 use support::*;
 
 #[test]

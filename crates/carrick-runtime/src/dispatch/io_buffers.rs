@@ -8,7 +8,7 @@ use crate::dispatch::DispatchError;
 use crate::dispatch::fd_table::FileContents;
 use crate::dispatch::read_kernel_struct;
 use crate::linux_abi::LinuxErrno;
-use crate::vfs::{SparseBuffer, SyntheticDeviceKind};
+use carrick_vfs::{SparseBuffer, SyntheticDeviceKind};
 
 pub(crate) fn read_u64(memory: &impl CurrentMmMemory, address: u64) -> Result<u64, LinuxErrno> {
     let mut buf = [0u8; 8];

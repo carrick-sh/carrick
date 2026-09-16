@@ -14,9 +14,9 @@ use crate::dispatch::linux_errno;
 use crate::linux_abi::{LINUX_ENOENT, LINUX_ENOTDIR};
 
 use super::devpts::{PtyTable, open_master};
-use super::{
+use carrick_vfs::{
     DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, SyntheticDeviceKind, Vfs, VfsError,
-    VfsHandle,
+    VfsHandle, VirtualConsoleDevice,
 };
 
 /// Standard Linux character devices served purely in memory.
@@ -232,7 +232,7 @@ impl Vfs for DevVfs {
                 status_flags |= crate::linux_abi::LINUX_O_NONBLOCK as u32;
             }
             return Ok(VfsHandle::VirtualConsole {
-                console: Arc::clone(&self.virtual_console),
+                console: Arc::clone(&self.virtual_console) as Arc<dyn VirtualConsoleDevice>,
                 status_flags,
             });
         }
@@ -294,8 +294,13 @@ impl VirtualConsole {
             pty_table,
         }
     }
+}
 
-    pub fn write(&self, bytes: &[u8]) {
+/// The console reaches the dispatcher as a `carrick_vfs::VfsHandle`, which
+/// cannot name this type: the pty table it consults lives above the VFS. The
+/// behaviour crosses instead.
+impl VirtualConsoleDevice for VirtualConsole {
+    fn write(&self, bytes: &[u8]) {
         let has_terminal = self.pty_table.lock().controlling().is_some();
         if has_terminal {
             unsafe {
@@ -304,19 +309,19 @@ impl VirtualConsole {
         }
     }
 
-    pub fn get_termios(&self) -> carrick_abi::LinuxTermios {
+    fn get_termios(&self) -> carrick_abi::LinuxTermios {
         *self.termios.lock()
     }
 
-    pub fn set_termios(&self, t: carrick_abi::LinuxTermios) {
+    fn set_termios(&self, t: carrick_abi::LinuxTermios) {
         *self.termios.lock() = t;
     }
 
-    pub fn get_winsize(&self) -> carrick_abi::LinuxWinsize {
+    fn get_winsize(&self) -> carrick_abi::LinuxWinsize {
         *self.winsize.lock()
     }
 
-    pub fn set_winsize(&self, w: carrick_abi::LinuxWinsize) {
+    fn set_winsize(&self, w: carrick_abi::LinuxWinsize) {
         *self.winsize.lock() = w;
     }
 }

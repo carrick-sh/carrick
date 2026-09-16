@@ -34,7 +34,7 @@ default = ["platform-macos"]
 # library do not re-enable it through feature unification.
 syscall-shim = []
 # In-memory fs backend selection (default OFF; control point is carrick-cli).
-fs-memory = ["carrick-spec/fs-memory"]
+fs-memory = ["carrick-vfs/fs-memory", "carrick-spec/fs-memory"]
 # Debug-only tracing (compile-gated, default OFF). Own gates plus passthroughs
 # to the leaf crates, so carrick-cli can enable any of them through this crate.
 trace-tty = []
@@ -122,6 +122,7 @@ tracing-subscriber.workspace = true
 # that cannot compile it (see the carrick-observability manifest for the E0308).
 zerocopy.workspace = true
 carrick-spec = { path = "../carrick-spec" }
+carrick-vfs = { path = "../carrick-vfs" }
 
 
 # The FreeBSD/bhyve VMM backend, pulled in by `platform-freebsd`. Arch-scoped,
@@ -149,6 +150,9 @@ mach2.workspace = true
 
 [dev-dependencies]
 carrick-test-support = { path = "../carrick-test-support" }
+# The host-open/stat/xattr amplification counters live on carrick-vfs's hot
+# path and are compiled out of a normal build; the fs tests here assert on them.
+carrick-vfs = { path = "../carrick-vfs", features = ["test-support"] }
 tempfile.workspace = true
 tokio.workspace = true
 carrick-image = { path = "../carrick-image" }

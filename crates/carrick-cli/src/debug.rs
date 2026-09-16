@@ -1020,7 +1020,7 @@ fn run_container_gate(
     fs::create_dir_all(gate_dir)
         .with_context(|| format!("failed to create {}", gate_dir.display()))?;
     carrick_runtime::memory::init_alias_ipa_allocator();
-    carrick_runtime::fs_resolve_cache::init();
+    carrick_vfs::fs_resolve_cache::init();
     let engine = carrick_engine::Engine::new(store);
     let probe_mode = match mode {
         ContainerGateMode::Sequential => "solo",

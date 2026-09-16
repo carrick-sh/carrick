@@ -13,7 +13,7 @@ use carrick_abi::{
     LINUX_EMFILE, LINUX_ENOENT, LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS,
     LinuxErrno, NsGid, NsUid,
 };
-pub use carrick_runtime::vfs::{
+pub use carrick_vfs::{
     DirEnt, EntryKind, MAX_IN_MEMORY_FILE_SIZE, Metadata, OpenContext, OpenFlags, SparseBuffer,
     Vfs, VfsError, VfsHandle,
 };
@@ -992,7 +992,7 @@ impl Vfs for LayeredVfs {
         })
     }
 
-    fn real_stat(&self, path: &str, follow: bool) -> Option<carrick_runtime::fs_backend::RealStat> {
+    fn real_stat(&self, path: &str, follow: bool) -> Option<carrick_vfs::fs_backend::RealStat> {
         for layer in &self.layers {
             if let Some(stat) = layer.real_stat(path, follow) {
                 return Some(stat);
@@ -1285,7 +1285,7 @@ impl Vfs for FilterVfs {
         Ok(meta)
     }
 
-    fn real_stat(&self, path: &str, follow: bool) -> Option<carrick_runtime::fs_backend::RealStat> {
+    fn real_stat(&self, path: &str, follow: bool) -> Option<carrick_vfs::fs_backend::RealStat> {
         let mapped = self.map_path(path).ok()?;
         self.inner.real_stat(&mapped, follow)
     }
@@ -1592,7 +1592,7 @@ impl Vfs for RecordingVfs {
         res
     }
 
-    fn real_stat(&self, path: &str, follow: bool) -> Option<carrick_runtime::fs_backend::RealStat> {
+    fn real_stat(&self, path: &str, follow: bool) -> Option<carrick_vfs::fs_backend::RealStat> {
         self.inner.real_stat(path, follow)
     }
 

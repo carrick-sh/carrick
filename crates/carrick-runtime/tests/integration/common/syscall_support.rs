@@ -31,8 +31,8 @@ pub use carrick_runtime::linux_abi::{
 pub use carrick_runtime::memory::{
     AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE,
 };
-pub use carrick_runtime::rootfs::{LayerSource, RootFs};
 pub use carrick_runtime::thread::ThreadId;
+pub use carrick_vfs::rootfs::{LayerSource, RootFs};
 
 /// Synthetic thread registry key for tests (`ThreadId`'s named-constructor
 /// discipline; production code never fabricates keys).

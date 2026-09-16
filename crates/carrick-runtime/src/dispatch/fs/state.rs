@@ -131,13 +131,13 @@ pub(in crate::dispatch) struct FsState {
     /// path no mount claims (or that a mount returns ENOSYS for)
     /// falls through to the legacy code path, which reads the rootfs +
     /// overlay from [`Self::rootfs_vfs`].
-    pub vfs_mounts: std::sync::Arc<crate::vfs::VfsMounts>,
+    pub vfs_mounts: std::sync::Arc<carrick_vfs::VfsMounts>,
 
     /// The `/` mount: immutable OCI rootfs + writable overlay
     /// ([`FsBackend`]). Held as a typed field rather than mounted in
     /// `vfs_mounts` because the dispatcher's existing fs syscalls reach
     /// into the overlay/rootfs state through ~50 call sites today.
-    pub rootfs_vfs: std::sync::Arc<crate::vfs::RootFsVfs>,
+    pub rootfs_vfs: std::sync::Arc<carrick_vfs::RootFsVfs>,
 
     /// Live executable dentries keyed by exact backend object identity. Shared
     /// by forked dispatchers so a rename/unlink by one task updates every
@@ -178,8 +178,8 @@ pub(in crate::dispatch) struct FsState {
     /// loop on ONE stable path (LTP `tst_fuzzy_sync` `inotify_add_watch`) pays
     /// it every iteration. Validated against a `MAP_SHARED` generation bumped
     /// on structural fs mutations, so a sibling's mkdir/rename/unlink correctly
-    /// invalidates it. See [`crate::fs_resolve_cache`].
-    pub(in crate::dispatch) resolve_cache: crate::fs_resolve_cache::ResolveCache,
+    /// invalidates it. See [`carrick_vfs::fs_resolve_cache`].
+    pub(in crate::dispatch) resolve_cache: carrick_vfs::fs_resolve_cache::ResolveCache,
 
     /// Fully prepared, stack-independent HvPatch exec images keyed by real
     /// host-file identity and mutation timestamps. Shared by every in-process
@@ -201,7 +201,7 @@ pub(in crate::dispatch) struct FsState {
 /// joined and dropped. This preserves the lock-free `entries` read path.
 pub(crate) struct MountRetirement {
     container: crate::kernel::ContainerId,
-    mounts: Option<std::sync::Arc<crate::vfs::VfsMounts>>,
+    mounts: Option<std::sync::Arc<carrick_vfs::VfsMounts>>,
     prepared: bool,
 }
 
@@ -224,7 +224,7 @@ pub(crate) enum MountRetirementError {
 impl MountRetirement {
     pub(crate) fn new(
         container: crate::kernel::ContainerId,
-        mounts: std::sync::Arc<crate::vfs::VfsMounts>,
+        mounts: std::sync::Arc<carrick_vfs::VfsMounts>,
     ) -> Self {
         Self {
             container,
@@ -448,7 +448,7 @@ pub(super) fn set_host_fd_offset(host_fd: crate::dispatch::HostFd, offset: u64) 
 }
 
 impl FsState {
-    pub(in crate::dispatch) fn vfs_mounts_mut(&mut self) -> &mut crate::vfs::VfsMounts {
+    pub(in crate::dispatch) fn vfs_mounts_mut(&mut self) -> &mut carrick_vfs::VfsMounts {
         let strong = std::sync::Arc::strong_count(&self.vfs_mounts);
         let Some(mounts) = std::sync::Arc::get_mut(&mut self.vfs_mounts) else {
             carrick_fatal!(
@@ -461,7 +461,7 @@ impl FsState {
 
     pub(in crate::dispatch) fn try_rootfs_vfs_mut(
         &mut self,
-    ) -> Result<&mut crate::vfs::RootFsVfs, crate::run_result::RuntimeError> {
+    ) -> Result<&mut carrick_vfs::RootFsVfs, crate::run_result::RuntimeError> {
         let strong = std::sync::Arc::strong_count(&self.rootfs_vfs);
         let Some(rootfs) = std::sync::Arc::get_mut(&mut self.rootfs_vfs) else {
             return Err(crate::run_result::RuntimeError::Configuration(format!(
@@ -472,18 +472,18 @@ impl FsState {
     }
 
     #[allow(clippy::expect_used)]
-    pub(in crate::dispatch) fn rootfs_vfs_mut(&mut self) -> &mut crate::vfs::RootFsVfs {
+    pub(in crate::dispatch) fn rootfs_vfs_mut(&mut self) -> &mut carrick_vfs::RootFsVfs {
         self.try_rootfs_vfs_mut()
             .expect("rootfs cannot be reconfigured after guest fork")
     }
 
     pub(in crate::dispatch) fn new_with_host_resolver(
-        snapshot: Option<&crate::vfs::HostResolverSnapshot>,
+        snapshot: Option<&carrick_vfs::HostResolverSnapshot>,
     ) -> Self {
         let pty_table = std::sync::Arc::new(parking_lot::Mutex::new(crate::vfs::PtyTable::new()));
         Self {
             vfs_mounts: std::sync::Arc::new({
-                let mut m = crate::vfs::VfsMounts::new();
+                let mut m = carrick_vfs::VfsMounts::new();
                 m.mount(
                     "/dev",
                     Box::new(crate::vfs::DevVfs::new(std::sync::Arc::clone(&pty_table))),
@@ -504,15 +504,18 @@ impl FsState {
                 m.mount(
                     "/etc/resolv.conf",
                     Box::new(
-                        snapshot.map_or_else(crate::vfs::ResolvConfVfs::new, |snapshot| {
-                            crate::vfs::ResolvConfVfs::from_host_snapshot(snapshot)
+                        snapshot.map_or_else(carrick_vfs::ResolvConfVfs::new, |snapshot| {
+                            carrick_vfs::ResolvConfVfs::from_host_snapshot(snapshot)
                         }),
                     ),
                 );
                 // /etc/services from the macOS host (format-identical to Linux),
                 // so the guest's getservbyname/port lookups work under --fs host
                 // (the scratch has no /etc/services). Single-file mount.
-                m.mount("/etc/services", Box::new(crate::vfs::EtcServicesVfs::new()));
+                m.mount(
+                    "/etc/services",
+                    Box::new(carrick_vfs::EtcServicesVfs::new()),
+                );
                 // POSIX shared-memory: Linux apps (and LTP's `tst_test` —
                 // ~10 SIGNALS-area tests TBROKed without it) expect /dev/shm
                 // to be a writable tmpfs-style directory where MAP_SHARED
@@ -545,11 +548,11 @@ impl FsState {
                     std::fs::set_permissions(&shm_host, std::fs::Permissions::from_mode(0o1777));
                 m.mount(
                     "/dev/shm",
-                    Box::new(crate::vfs::BindVfs::new("/dev/shm", shm_host, false)),
+                    Box::new(carrick_vfs::BindVfs::new("/dev/shm", shm_host, false)),
                 );
                 m
             }),
-            rootfs_vfs: std::sync::Arc::new(crate::vfs::RootFsVfs::new()),
+            rootfs_vfs: std::sync::Arc::new(carrick_vfs::RootFsVfs::new()),
             executable_authorities: std::sync::Arc::new(
                 super::super::executable_authority::ExecutableAuthorityRegistry::default(),
             ),
@@ -557,7 +560,7 @@ impl FsState {
             inotify_registry: crate::inotify::InotifyRegistry::default(),
             fanotify_registry: crate::fanotify::FanotifyRegistry::default(),
             dnotify_registry: parking_lot::Mutex::new(Vec::new()),
-            resolve_cache: crate::fs_resolve_cache::ResolveCache::new(),
+            resolve_cache: carrick_vfs::fs_resolve_cache::ResolveCache::new(),
             hvpatch_exec_cache: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             classic_record_locks: std::sync::Arc::new(super::LogicalRecordLocks::default()),
         }
@@ -573,7 +576,7 @@ impl FsState {
             // Arc clone: the SAME table, not a copy. See the field docs.
             fanotify_registry: self.fanotify_registry.clone(),
             dnotify_registry: parking_lot::Mutex::new(self.dnotify_registry.lock().clone()),
-            resolve_cache: crate::fs_resolve_cache::ResolveCache::new(),
+            resolve_cache: carrick_vfs::fs_resolve_cache::ResolveCache::new(),
             hvpatch_exec_cache: std::sync::Arc::clone(&self.hvpatch_exec_cache),
             classic_record_locks: std::sync::Arc::clone(&self.classic_record_locks),
         }

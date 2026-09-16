@@ -655,11 +655,11 @@ impl ProcState {
     /// otherwise native aarch64. SINGLE source for every arch-dependent synthetic
     /// surface — `uname(2)`, `/proc/cpuinfo`, and future arch-keyed files — so
     /// they can never contradict each other.
-    pub(super) fn reported_arch(&self) -> crate::vfs::GuestReportedArch {
+    pub(super) fn reported_arch(&self) -> carrick_vfs::GuestReportedArch {
         if self.binfmt_interpreted || self.native_x86_64 {
-            crate::vfs::GuestReportedArch::X86_64
+            carrick_vfs::GuestReportedArch::X86_64
         } else {
-            crate::vfs::GuestReportedArch::Aarch64
+            carrick_vfs::GuestReportedArch::Aarch64
         }
     }
 }
@@ -804,7 +804,7 @@ impl<'a> ProcView<'a> {
     pub(in crate::dispatch) fn layered_lstat(
         &self,
         path: &str,
-    ) -> Result<crate::rootfs::RootFsMetadata, carrick_abi::LinuxErrno> {
+    ) -> Result<carrick_vfs::rootfs::RootFsMetadata, carrick_abi::LinuxErrno> {
         self.cross.layered_lstat(path)
     }
 
@@ -2421,10 +2421,10 @@ impl<'a> ProcView<'a> {
             let nodename = cx.kernel.task().uts_ns().nodename();
             let arch = this.proc.lock().reported_arch();
             let uts = match arch {
-                crate::vfs::GuestReportedArch::X86_64 => {
+                carrick_vfs::GuestReportedArch::X86_64 => {
                     LinuxUtsname::carrick_x86_64_with_nodename(&nodename)
                 }
-                crate::vfs::GuestReportedArch::Aarch64 => {
+                carrick_vfs::GuestReportedArch::Aarch64 => {
                     LinuxUtsname::carrick_aarch64_with_nodename(&nodename)
                 }
             };

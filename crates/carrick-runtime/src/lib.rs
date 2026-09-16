@@ -45,8 +45,9 @@
 //!   quiesce barriers), the Darwin `kqueue` wrapper, and host-signal capture.
 //!   This is the "VMM half".
 //! - **The kernel half** (this crate proper): [`dispatch`] — the syscall
-//!   dispatcher and its subsystems — plus [`vfs`]/[`rootfs`]/[`overlay`]/
-//!   [`fs_backend`] (the filesystem the guest sees), [`namespace`] (UID/GID +
+//!   dispatcher and its subsystems — plus the kernel-view filesystems in
+//!   [`vfs`] over the `carrick-vfs` filesystem model (`rootfs`, `overlay`,
+//!   `fs_backend` — the filesystem the guest sees), [`namespace`] (UID/GID +
 //!   PID namespace emulation), [`container`] (docker-style run state), and the
 //!   `/proc` and signal machinery. None of these touch HVF directly; they
 //!   answer syscalls.

@@ -14,7 +14,7 @@ use super::fd_table::{HostFdRef, HostWriteKind};
 use super::fs;
 use super::outcome::{BlockingWrite, DispatchOutcome, FdWaitCompletion};
 use super::wait_authority::{WaitFdAuthority, WaitFds};
-use crate::vfs::errno::HostSyscallResult as _;
+use carrick_vfs::errno::HostSyscallResult as _;
 
 pub(crate) const MAX_RW_COUNT: usize = 0x7fff_f000;
 const SMALL_HOST_READ_BUF: usize = 8192;

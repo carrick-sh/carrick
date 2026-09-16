@@ -450,7 +450,7 @@ pub fn resolve_run_spec(req: RunRequest, image: ResolvedImage) -> Result<Resolve
     //    (host-only unless the fs-memory feature is compiled in).
     let fs_backend = req
         .fs
-        .unwrap_or_else(carrick_runtime::apfs::default_writable_backend_kind);
+        .unwrap_or_else(carrick_vfs::apfs::default_writable_backend_kind);
 
     let debug_state_path = req.debug_state_path.map(Utf8PathBuf::from);
     let network = match req.network {

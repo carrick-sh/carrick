@@ -104,7 +104,7 @@ use crate::dispatch::{
 };
 use crate::linux_abi::LinuxErrno;
 use crate::memory::{AddressSpace, AddressSpaceError};
-use crate::rootfs::RootFs;
+use carrick_vfs::rootfs::RootFs;
 
 // The EL0 synchronous-fault translation + the threaded vCPU loop were hoisted
 // into the unconditional `crate::vcpu_loop` module (generic over
@@ -3072,7 +3072,12 @@ mod tests {
             ("dispatch/sysv.rs", [1, 0, 3]),
             ("dispatch/tests.rs", [2, 0, 0]),
             ("exec_stamps.rs", [1, 0, 0]),
-            ("fs_backend/tests.rs", [1, 0, 0]),
+            // NOT a row any more: `fs_backend/tests.rs` left this crate with
+            // the filesystem model (carrick-vfs). Its one `Command::new` is a
+            // test helper that still exists at
+            // `crates/carrick-vfs/src/fs_backend/tests.rs`; this inventory
+            // scans `CARGO_MANIFEST_DIR/src`, so it is out of scope here
+            // rather than retired.
             // Task 7's budget-one proof self-spawns this exact unit test in an
             // isolated process so it can install the process-global vCPU
             // scheduler before any sibling test initializes the OnceLock.
@@ -3233,7 +3238,7 @@ mod tests {
         assert_eq!(publication_count.get(), 1);
     }
 
-    fn rootfs_with(files: &[(&str, &[u8])]) -> crate::rootfs::RootFs {
+    fn rootfs_with(files: &[(&str, &[u8])]) -> carrick_vfs::rootfs::RootFs {
         let mut b = tar::Builder::new(Vec::new());
         for (path, data) in files {
             let mut h = tar::Header::new_gnu();
@@ -3243,8 +3248,10 @@ mod tests {
             b.append_data(&mut h, path, *data).unwrap();
         }
         let bytes = b.into_inner().unwrap();
-        crate::rootfs::RootFs::from_layers(std::iter::once(crate::rootfs::LayerSource::Tar(bytes)))
-            .unwrap()
+        carrick_vfs::rootfs::RootFs::from_layers(std::iter::once(
+            carrick_vfs::rootfs::LayerSource::Tar(bytes),
+        ))
+        .unwrap()
     }
 
     #[test]

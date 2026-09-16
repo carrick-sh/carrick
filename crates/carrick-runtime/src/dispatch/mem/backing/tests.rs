@@ -13,10 +13,10 @@ use crate::dispatch::outcome::LinearMemory;
 use crate::dispatch::{OpenDescription, OpenDescriptionBase};
 use crate::dispatch::{SyscallArgs, SyscallRequest};
 use crate::memory::{LINUX_HEAP_BASE, LINUX_MMAP_BASE};
-use crate::rootfs::{RootFsEntryKind, RootFsMetadata};
 use carrick_abi::LINUX_PAGE_SIZE;
 use carrick_guest_mem::{Gpa, GuestVa};
 use carrick_hal::trap::{HostAliasBacking, HostAliasOwnedFd, HostAliasSharing};
+use carrick_vfs::rootfs::{RootFsEntryKind, RootFsMetadata};
 use std::cell::Cell;
 use std::os::fd::FromRawFd;
 
@@ -1216,7 +1216,7 @@ fn range_owned_metadata_removal_clears_every_mmap_classification() {
     let dispatcher = SyscallDispatcher::new();
     let start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
     let len = 2 * LINUX_PAGE_SIZE;
-    let range = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start + len))
+    let range = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start + len))
         .expect("metadata range");
     let writable_memfd = kernel_file_description(
         std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
@@ -1260,7 +1260,7 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
     let page = LINUX_PAGE_SIZE;
     let len = 3 * page;
     let middle = start + page;
-    let whole = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start + len))
+    let whole = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start + len))
         .expect("whole predecessor range");
     let writable_memfd = kernel_file_description(
         std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
@@ -1335,8 +1335,8 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
         vec![(start, page), (middle + page, page)]
     );
     let expected_ranges = vec![
-        crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(middle)).expect("prefix"),
-        crate::vfs::GuestMemoryRange::new(GuestVa(middle + page), GuestVa(start + len))
+        carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(middle)).expect("prefix"),
+        carrick_vfs::GuestMemoryRange::new(GuestVa(middle + page), GuestVa(start + len))
             .expect("suffix"),
     ];
     assert_eq!(mem.locked_ranges, expected_ranges);
@@ -1501,7 +1501,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
     let dispatcher = SyscallDispatcher::new();
     let start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
     let len = LINUX_PAGE_SIZE * 2;
-    let replacement = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start + len))
+    let replacement = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start + len))
         .expect("replacement range");
     dispatcher.record_dynamic_mapping(
         start,

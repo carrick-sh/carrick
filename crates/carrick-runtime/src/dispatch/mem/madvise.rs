@@ -57,7 +57,7 @@ fn linux_madvise_advice_is_supported(advice: u64) -> bool {
 
 fn validate_mlock_range(
     memory: &mut impl CurrentMmMemory,
-    range: crate::vfs::GuestMemoryRange,
+    range: carrick_vfs::GuestMemoryRange,
     populate: bool,
     page_size: u64,
     committed_vma_covers_range: bool,
@@ -229,13 +229,13 @@ impl<'a> MemView<'a> {
         }
     }
 
-    fn add_locked_range(&self, range: crate::vfs::GuestMemoryRange) -> Result<(), LinuxErrno> {
+    fn add_locked_range(&self, range: carrick_vfs::GuestMemoryRange) -> Result<(), LinuxErrno> {
         self.check_locked_range_limit(range)?;
         locked_ranges_insert(&mut self.mem().lock().locked_ranges, range);
         Ok(())
     }
 
-    fn remove_locked_range(&self, range: crate::vfs::GuestMemoryRange) {
+    fn remove_locked_range(&self, range: carrick_vfs::GuestMemoryRange) {
         locked_ranges_remove(&mut self.mem().lock().locked_ranges, range);
     }
 
@@ -250,7 +250,7 @@ impl<'a> MemView<'a> {
         if let Some(regions) = &mem.address_space_regions {
             for region in regions {
                 if let Some(range) =
-                    crate::vfs::GuestMemoryRange::new(GuestVa(region.start), GuestVa(region.end))
+                    carrick_vfs::GuestMemoryRange::new(GuestVa(region.start), GuestVa(region.end))
                 {
                     locked_ranges_insert(&mut ranges, range);
                 }
@@ -258,7 +258,7 @@ impl<'a> MemView<'a> {
         }
         for region in &mem.dynamic_maps {
             if let Some(range) =
-                crate::vfs::GuestMemoryRange::new(GuestVa(region.start), GuestVa(region.end))
+                carrick_vfs::GuestMemoryRange::new(GuestVa(region.start), GuestVa(region.end))
             {
                 locked_ranges_insert(&mut ranges, range);
             }
@@ -286,7 +286,7 @@ impl<'a> MemView<'a> {
 
     pub(super) fn check_locked_range_limit(
         &self,
-        range: crate::vfs::GuestMemoryRange,
+        range: carrick_vfs::GuestMemoryRange,
     ) -> Result<(), LinuxErrno> {
         let creds = self.cred_snapshot();
         let memlock_limit = if creds.euid.is_root() {

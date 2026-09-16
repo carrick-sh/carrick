@@ -341,6 +341,7 @@ dependencies = [
  "carrick-runtime",
  "carrick-spec",
  "carrick-test-support",
+ "carrick-vfs",
  "carrick-vmm-bhyve",
  "carrick-vmm-hvf",
  "carrick-vmm-kvm",
@@ -412,6 +413,7 @@ dependencies = [
  "carrick-runtime",
  "carrick-spec",
  "carrick-thread",
+ "carrick-vfs",
  "flate2",
  "libc",
  "parking_lot",
@@ -433,6 +435,7 @@ dependencies = [
  "carrick-runtime",
  "carrick-spec",
  "carrick-test-support",
+ "carrick-vfs",
  "serde",
  "serde_json",
  "tempfile",
@@ -600,6 +603,7 @@ dependencies = [
  "carrick-test-support",
  "carrick-thread",
  "carrick-timer-core",
+ "carrick-vfs",
  "carrick-vmm-bhyve",
  "carrick-vmm-hvf",
  "carrick-vmm-kvm",
@@ -684,6 +688,30 @@ dependencies = [
  "carrick-abi",
  "carrick-host",
  "carrick-portable",
+]
+
+[[package]]
+name = "carrick-vfs"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-guest-mem",
+ "carrick-hal",
+ "carrick-host-bsd",
+ "carrick-host-linux",
+ "carrick-observability",
+ "carrick-portable",
+ "carrick-spec",
+ "fd-lock",
+ "flate2",
+ "libc",
+ "parking_lot",
+ "serde",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

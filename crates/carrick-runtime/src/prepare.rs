@@ -36,14 +36,14 @@ use crate::execute::{
     is_entrypoint_not_executable, is_entrypoint_not_found, prepare_host_root,
     record_detached_scratch, rosetta_license_notice, seed_guest_baseline,
 };
-use crate::fs_backend::{FsBackend, HostFsBackend};
 use crate::interactive_supervisor::InteractiveSession;
 use crate::kernel::container::LaunchContext;
 use crate::network::RuntimeNetwork;
 #[cfg(feature = "platform-macos")]
 use crate::runtime::{RunElfExecutionOptions, run_elf_from_dispatcher_debug_on};
 use crate::runtime::{RunResult, RuntimeError};
-use crate::vfs::{BindVfs, HostResolverSnapshot, Vfs};
+use carrick_vfs::fs_backend::{FsBackend, HostFsBackend};
+use carrick_vfs::{BindVfs, HostResolverSnapshot, Vfs};
 
 pub struct Runtime;
 
@@ -227,7 +227,7 @@ enum RootBacking {
     Host,
     #[cfg(feature = "fs-memory")]
     Memory {
-        rootfs: crate::rootfs::RootFs,
+        rootfs: carrick_vfs::rootfs::RootFs,
     },
 }
 
@@ -329,7 +329,7 @@ fn resolve_initial_identity_from_rootfs(
     identity: &InitialIdentity,
     uid: carrick_abi::NsUid,
     gid: carrick_abi::NsGid,
-    rootfs: &crate::rootfs::RootFs,
+    rootfs: &carrick_vfs::rootfs::RootFs,
 ) -> Result<(carrick_abi::NsUid, carrick_abi::NsGid), RuntimeError> {
     resolve_initial_identity(identity, (uid, gid), |path| {
         rootfs
@@ -449,7 +449,7 @@ fn prepare_host_backend(
     // Darwin native runs bind the once-extracted digest-keyed cache directly
     // as an immutable lower and leave this run's host root sparse; the exact
     // `CARRICK_FS_CACHED_LOWER=0` hatch keeps the full-root extraction path.
-    let cache_root = crate::fs_backend::default_scratch_root().map_err(|error| {
+    let cache_root = carrick_vfs::fs_backend::default_scratch_root().map_err(|error| {
         RuntimeError::FsBackend(anyhow::anyhow!(
             "failed to locate rootfs cache directory: {error}"
         ))
@@ -471,7 +471,7 @@ fn prepare_host_backend(
         && matches!(&spec.process.initial_identity, InitialIdentity::Named(_))
     {
         let image_root =
-            crate::rootfs::RootFs::from_layer_paths(layer_paths(spec)).map_err(|e| {
+            carrick_vfs::rootfs::RootFs::from_layer_paths(layer_paths(spec)).map_err(|e| {
                 RuntimeError::FsBackend(anyhow::anyhow!(
                     "failed to compose image rootfs to resolve user: {e}"
                 ))
@@ -543,8 +543,8 @@ fn prepare_memory_backend(
     spec: &RunSpec,
     plan: &ExecutionPlan,
     container: &Arc<crate::kernel::Container>,
-) -> Result<(SyscallDispatcher, crate::rootfs::RootFs), RuntimeError> {
-    let rootfs = crate::rootfs::RootFs::from_layer_paths(&layer_paths(spec))
+) -> Result<(SyscallDispatcher, carrick_vfs::rootfs::RootFs), RuntimeError> {
+    let rootfs = carrick_vfs::rootfs::RootFs::from_layer_paths(&layer_paths(spec))
         .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to compose rootfs: {e}")))?;
     let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable(
         rootfs.clone(),
@@ -961,7 +961,8 @@ mod tests {
             ),
         )
         .expect("write layer");
-        let rootfs = crate::rootfs::RootFs::from_layer_paths([&layer]).expect("prepared rootfs");
+        let rootfs =
+            carrick_vfs::rootfs::RootFs::from_layer_paths([&layer]).expect("prepared rootfs");
 
         let credentials = resolve_initial_identity_from_rootfs(
             &carrick_spec::InitialIdentity::Named("alice:developers".to_owned()),

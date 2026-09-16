@@ -1006,7 +1006,7 @@ impl RootFs {
     /// Bind an already-published cache directory as the immutable lower.
     /// Reads are capability-rooted through [`HostFsBackend`], while this type
     /// deliberately exposes no mutation methods for the lower.
-    pub(crate) fn from_immutable_host_dir(path: &Path) -> Result<Self, RootFsError> {
+    pub fn from_immutable_host_dir(path: &Path) -> Result<Self, RootFsError> {
         let backend = HostFsBackend::attach(path)?;
         // The cache entry root carries no metadata-xattr root marker (the
         // extraction wrote per-entry xattrs directly); its CLEAN sentinel file
@@ -1211,10 +1211,7 @@ impl RootFs {
     /// Open a byte-exact directory anchor in the immutable host lower.
     /// Callers must separately prove that the writable overlay cannot affect
     /// the path and invalidate that proof on every structural generation.
-    pub(crate) fn open_trusted_dir_fd(
-        &self,
-        path: impl AsRef<Path>,
-    ) -> Option<std::os::fd::OwnedFd> {
+    pub fn open_trusted_dir_fd(&self, path: impl AsRef<Path>) -> Option<std::os::fd::OwnedFd> {
         self.immutable_host
             .as_ref()?
             .backend

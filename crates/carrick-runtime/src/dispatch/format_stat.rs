@@ -113,20 +113,20 @@ pub(super) fn write_x8664_stat_record(
     }
 }
 
-/// Build a [`RealStat`](crate::fs_backend::RealStat) from a live `libc::stat`
+/// Build a [`RealStat`](carrick_vfs::fs_backend::RealStat) from a live `libc::stat`
 /// (e.g. an `fstat` of a host fd) carrying the REAL on-disk values: the true
 /// file type (so a symlink stat'd with `AT_SYMLINK_NOFOLLOW` reports S_IFLNK)
 /// and the real `st_nlink` (a true hard link reports more than 1). An fd-based
 /// stat then reports the SAME real size/kind/times as the path-based
 /// `real_stat` that statx/newfstatat use.
-pub(super) fn real_stat_from_libc(st: &libc::stat) -> crate::fs_backend::RealStat {
-    use crate::rootfs::RootFsEntryKind;
+pub(super) fn real_stat_from_libc(st: &libc::stat) -> carrick_vfs::fs_backend::RealStat {
+    use carrick_vfs::rootfs::RootFsEntryKind;
     let kind = match st.st_mode as u32 & LINUX_S_IFMT {
         m if m == LINUX_S_IFDIR => RootFsEntryKind::Directory,
         m if m == LINUX_S_IFLNK => RootFsEntryKind::Symlink,
         _ => RootFsEntryKind::File,
     };
-    crate::fs_backend::RealStat {
+    carrick_vfs::fs_backend::RealStat {
         kind,
         ino: st.st_ino,
         nlink: st.st_nlink as u32,
@@ -146,7 +146,7 @@ pub(crate) fn write_statx_real(
     memory: &mut impl CurrentMmMemory,
     statxbuf: u64,
     path: &str,
-    real: &crate::fs_backend::RealStat,
+    real: &carrick_vfs::fs_backend::RealStat,
 ) -> DispatchOutcome {
     write_statx_record(memory, statxbuf, &StatRecord::from_real(path, real))
 }

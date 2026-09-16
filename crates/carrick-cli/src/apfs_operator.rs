@@ -2,26 +2,26 @@
 //!
 //! This module may create the `diskutil` operator process. It is never linked
 //! into `carrick-runtime`; carrier launch receives neither this type nor an
-//! [`carrick_runtime::apfs::ApfsOperator`] capability.
+//! [`carrick_vfs::apfs::ApfsOperator`] capability.
 
 use std::process::Command;
 
 pub(crate) struct DiskutilOperator;
 
-impl carrick_runtime::apfs::ApfsOperator for DiskutilOperator {
-    fn run_diskutil(&mut self, args: &[&str]) -> Result<String, carrick_runtime::apfs::ApfsError> {
+impl carrick_vfs::apfs::ApfsOperator for DiskutilOperator {
+    fn run_diskutil(&mut self, args: &[&str]) -> Result<String, carrick_vfs::apfs::ApfsError> {
         let output = Command::new("diskutil")
             .args(args)
             .output()
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
-                    carrick_runtime::apfs::ApfsError::DiskutilMissing
+                    carrick_vfs::apfs::ApfsError::DiskutilMissing
                 } else {
-                    carrick_runtime::apfs::ApfsError::Io(error)
+                    carrick_vfs::apfs::ApfsError::Io(error)
                 }
             })?;
         if !output.status.success() {
-            return Err(carrick_runtime::apfs::ApfsError::DiskutilFailed {
+            return Err(carrick_vfs::apfs::ApfsError::DiskutilFailed {
                 operation: args.join(" "),
                 code: output.status.code().unwrap_or(-1),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),

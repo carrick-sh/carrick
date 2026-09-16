@@ -180,8 +180,8 @@ pub fn open_master(nonblock: bool) -> Result<(i32, String), i32> {
 
 // ── DevptsVfs ─────────────────────────────────────────────────────────────────
 
-use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
 use crate::linux_abi::{LINUX_ENOENT, LINUX_ENOTDIR};
+use carrick_vfs::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
 use parking_lot::Mutex;
 use std::ffi::CString;
 use std::sync::Arc;
@@ -332,8 +332,8 @@ impl Vfs for DevptsVfs {
         })
     }
 
-    fn fs_identity(&self) -> super::FsIdentity {
-        super::FsIdentity::DevPts
+    fn fs_identity(&self) -> carrick_vfs::FsIdentity {
+        carrick_vfs::FsIdentity::DevPts
     }
 
     fn name(&self) -> &'static str {
@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn devpts_lookup_and_readdir_track_live_ptys() {
-        use crate::vfs::{OpenContext, OpenFlags, Vfs};
+        use carrick_vfs::{OpenContext, OpenFlags, Vfs};
         use parking_lot::Mutex;
         use std::sync::Arc;
 
@@ -419,7 +419,7 @@ mod tests {
 
         assert_eq!(
             dev.lookup("/dev/pts").unwrap().kind,
-            crate::vfs::EntryKind::Directory
+            carrick_vfs::EntryKind::Directory
         );
         assert!(dev.lookup("/dev/pts/0").is_err());
 
@@ -428,7 +428,7 @@ mod tests {
         assert_eq!(n, 0);
         assert_eq!(
             dev.lookup("/dev/pts/0").unwrap().kind,
-            crate::vfs::EntryKind::CharDevice
+            carrick_vfs::EntryKind::CharDevice
         );
         let names: Vec<String> = dev
             .readdir("/dev/pts")
@@ -450,7 +450,7 @@ mod tests {
             )
             .unwrap();
         match h {
-            crate::vfs::VfsHandle::Pty {
+            carrick_vfs::VfsHandle::Pty {
                 is_master,
                 pts_index,
                 host_fd,

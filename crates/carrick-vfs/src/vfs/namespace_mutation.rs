@@ -8,7 +8,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use super::InodeIdentity;
 
 #[derive(Debug, Default)]
-pub(crate) struct NamespaceMutationCoordinator {
+pub struct NamespaceMutationCoordinator {
     topology: RwLock<()>,
     state: Mutex<ParentAdmissionState>,
     changed: Condvar,
@@ -25,32 +25,32 @@ struct ParentAdmissionState {
 
 /// Host inode identity and an in-memory namespace path are distinct domains.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum NamespaceParentIdentity {
+pub enum NamespaceParentIdentity {
     Host(InodeIdentity),
     Logical(crate::fs_backend::NormalizedRelPath),
 }
 
-pub(crate) struct AnchoredParent {
+pub struct AnchoredParent {
     pub path: String,
     pub identity: NamespaceParentIdentity,
     pub resolved: super::rootfs::ResolvedParent,
 }
 
-pub(crate) struct NamespaceMutationPermit<'a> {
+pub struct NamespaceMutationPermit<'a> {
     anchors: Vec<AnchoredParent>,
     topology_exclusive: bool,
     _authority: std::marker::PhantomData<&'a NamespaceMutationCoordinator>,
 }
 
 impl NamespaceMutationPermit<'_> {
-    pub(crate) fn parent(&self, path: &str) -> Option<&super::rootfs::ResolvedParent> {
+    pub fn parent(&self, path: &str) -> Option<&super::rootfs::ResolvedParent> {
         self.anchors
             .iter()
             .find(|anchor| anchor.path == path)
             .map(|anchor| &anchor.resolved)
     }
 
-    pub(crate) fn topology_exclusive(&self) -> bool {
+    pub fn topology_exclusive(&self) -> bool {
         self.topology_exclusive
     }
 }
@@ -75,7 +75,7 @@ impl Drop for ParentReservation<'_> {
 impl NamespaceMutationCoordinator {
     /// Test synchronization: observe an actual conflicting reservation waiter.
     #[cfg(test)]
-    pub(crate) fn wait_until_contended(&self) -> bool {
+    pub fn wait_until_contended(&self) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut state = self.state.lock();
         while state.waiting == 0 {
@@ -109,7 +109,7 @@ impl NamespaceMutationCoordinator {
         }
     }
 
-    pub(crate) fn with_parents<R, ResolveError, OperationError>(
+    pub fn with_parents<R, ResolveError, OperationError>(
         &self,
         topology_change: bool,
         resolve_parents: impl Fn() -> Result<Vec<AnchoredParent>, ResolveError>,
@@ -140,10 +140,7 @@ impl NamespaceMutationCoordinator {
         }
     }
 
-    pub(crate) fn with_archive<R>(
-        &self,
-        operation: impl FnOnce(&NamespaceMutationPermit<'_>) -> R,
-    ) -> R {
+    pub fn with_archive<R>(&self, operation: impl FnOnce(&NamespaceMutationPermit<'_>) -> R) -> R {
         let _topology = self.topology.write();
         operation(&NamespaceMutationPermit {
             anchors: Vec::new(),

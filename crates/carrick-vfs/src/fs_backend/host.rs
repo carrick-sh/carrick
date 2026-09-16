@@ -10,9 +10,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use crate::linux_abi::LinuxErrno;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 use crate::vfs::errno::HostSyscallResult;
+use carrick_abi::LinuxErrno;
 use carrick_abi::{NsGid, NsUid};
 
 use crate::fs_backend::path::{
@@ -44,45 +44,45 @@ pub(crate) const SCRATCH_TRASH_DIRECTORY: &str = ".carrick-trash";
 const SCRATCH_CLEANUP_QUEUE_DEPTH: usize = 8;
 const SCRATCH_SYNC_CLEANUP_LIMIT: usize = 256;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static TEST_HOST_OPENAT_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static TEST_HOST_STAT_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn record_test_host_openat() {
     TEST_HOST_OPENAT_COUNT.with(|c| c.set(c.get().saturating_add(1)));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn test_host_openat_count() -> u64 {
     TEST_HOST_OPENAT_COUNT.with(|c| c.get())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn reset_test_host_openat_count() {
     TEST_HOST_OPENAT_COUNT.with(|c| c.set(0));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn record_test_host_stat() {
     TEST_HOST_STAT_COUNT.with(|c| c.set(c.get().saturating_add(1)));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn test_host_stat_count() -> u64 {
     TEST_HOST_STAT_COUNT.with(|c| c.get())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn reset_test_host_stat_count() {
     TEST_HOST_STAT_COUNT.with(|c| c.set(0));
 }
 
 macro_rules! host_openat {
     ($($arg:expr),* $(,)?) => {{
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         record_test_host_openat();
         libc::openat($($arg),*)
     }};
@@ -90,7 +90,7 @@ macro_rules! host_openat {
 
 macro_rules! host_fstatat {
     ($($arg:expr),* $(,)?) => {{
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         record_test_host_stat();
         libc::fstatat($($arg),*)
     }};
@@ -98,7 +98,7 @@ macro_rules! host_fstatat {
 
 macro_rules! host_fstat {
     ($($arg:expr),* $(,)?) => {{
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         record_test_host_stat();
         libc::fstat($($arg),*)
     }};
@@ -106,7 +106,7 @@ macro_rules! host_fstat {
 
 macro_rules! host_open {
     ($($arg:expr),* $(,)?) => {{
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         record_test_host_openat();
         libc::open($($arg),*)
     }};
@@ -534,7 +534,7 @@ pub(crate) enum FastGuestOpen {
 /// `Missing` is stronger than an `Option::None`: the backend has proved the
 /// failed path lies below a contained existing directory and crosses no
 /// symlink whose Linux-rooted semantics require the layered resolver.
-pub(crate) enum ImmutableHostFileOpen {
+pub enum ImmutableHostFileOpen {
     Served {
         file: std::fs::File,
         metadata: RootFsMetadata,
@@ -1032,7 +1032,7 @@ impl HostFsBackend {
     /// Authorize the fail-closed sparse-upper miss proof. Callers may do this
     /// only for a newly-created writable upper that is paired with an
     /// immutable lower; arbitrary attached/materialized roots stay disabled.
-    pub(crate) fn enable_sparse_upper_fast_miss(&mut self) {
+    pub fn enable_sparse_upper_fast_miss(&mut self) {
         self.sparse_upper_fast_miss = true;
     }
 
@@ -3375,23 +3375,23 @@ fn fremove_xattr(fd: std::os::fd::RawFd, name: &[u8]) {
     crate::fs_resolve_cache::bump_meta_generation();
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub static HOST_XATTR_READS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn host_xattr_read_count() -> usize {
     HOST_XATTR_READS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn reset_host_xattr_read_count() -> usize {
     HOST_XATTR_READS.swap(0, std::sync::atomic::Ordering::SeqCst)
 }
 
 #[cfg(target_os = "macos")]
 fn fget_u32_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u32> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     HOST_XATTR_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut v = [0u8; 4];
     let n = unsafe {
@@ -3406,7 +3406,7 @@ fn fget_u32_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u32> {
 }
 
 fn lget_u32_xattr(path: *const libc::c_char, name: &[u8]) -> Option<u32> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     HOST_XATTR_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut v = [0u8; 4];
     let n = unsafe {
@@ -3437,7 +3437,7 @@ pub(crate) fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
 
 #[cfg(not(target_os = "macos"))]
 fn fget_u32_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u32> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     HOST_XATTR_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut v = [0u8; 4];
     let n = unsafe {
@@ -3500,7 +3500,7 @@ fn fset_u64_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u64) {
 }
 
 fn fget_u64_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u64> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     HOST_XATTR_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut v = [0u8; 8];
     let n = unsafe {
@@ -3529,7 +3529,7 @@ pub(crate) fn fget_rdev_xattr(fd: std::os::fd::RawFd) -> Option<u64> {
 /// node), so this collapses the typical 3–4 reads to one list + one read; a
 /// file with no carrick xattrs costs just the list. Falls back to direct reads
 /// if the name buffer is too small (a file with unusually many xattrs).
-pub(crate) fn fd_carrick_meta(
+pub fn fd_carrick_meta(
     fd: std::os::fd::RawFd,
 ) -> (Option<u32>, Option<NsUid>, Option<NsGid>, bool) {
     let mut names = [0u8; 1024];
@@ -4726,10 +4726,8 @@ impl FsBackend for HostFsBackend {
             return None;
         }
         let full_mode = read_mode_xattr(self, rel, false)?;
-        let type_bits = full_mode & crate::linux_abi::LINUX_S_IFMT;
-        if type_bits != crate::linux_abi::LINUX_S_IFCHR
-            && type_bits != crate::linux_abi::LINUX_S_IFBLK
-        {
+        let type_bits = full_mode & carrick_abi::LINUX_S_IFMT;
+        if type_bits != carrick_abi::LINUX_S_IFCHR && type_bits != carrick_abi::LINUX_S_IFBLK {
             return None;
         }
         let dev = read_rdev_xattr(self, rel).unwrap_or(0);
@@ -5514,10 +5512,7 @@ impl FsBackend for HostFsBackend {
         use std::os::unix::ffi::OsStrExt;
         use std::sync::atomic::Ordering::Relaxed;
 
-        let scratch = self
-            ._scratch
-            .as_ref()
-            .ok_or(crate::linux_abi::LINUX_ENOSYS)?;
+        let scratch = self._scratch.as_ref().ok_or(carrick_abi::LINUX_ENOSYS)?;
         // Resolution cache: `inotify_add_watch` re-resolves the SAME path every
         // iteration in the LTP fuzzy-sync loop, and `lookup_kind` +
         // `resolve_following` each do a cap-std openat-per-component walk. Serve
@@ -5544,17 +5539,15 @@ impl FsBackend for HostFsBackend {
             // A cached hit is never a tombstone — we don't store those.
             Some(entry) => entry,
             None => {
-                let kind = self
-                    .lookup_kind(path)
-                    .ok_or(crate::linux_abi::LINUX_ENOENT)?;
+                let kind = self.lookup_kind(path).ok_or(carrick_abi::LINUX_ENOENT)?;
                 if matches!(kind, OverlayEntryKind::Deleted) {
                     // Don't cache the tombstone — a re-create bumps the
                     // generation and this re-resolves anyway.
-                    return Err(crate::linux_abi::LINUX_ENOENT);
+                    return Err(carrick_abi::LINUX_ENOENT);
                 }
                 let normalized = self
                     .resolve_following(path)
-                    .ok_or(crate::linux_abi::LINUX_EINVAL)?;
+                    .ok_or(carrick_abi::LINUX_EINVAL)?;
                 (normalized, None)
             }
         };
@@ -6019,12 +6012,12 @@ impl FsBackend for HostFsBackend {
         // system.); the guest is root so trusted.* is allowed, matching the
         // Docker-as-root oracle. Other prefixes report unsupported.
         if !is_guest_xattr_namespace(name) {
-            return Err(crate::linux_abi::LINUX_ENOTSUP);
+            return Err(carrick_abi::LINUX_ENOTSUP);
         }
         // Hide carrick's internal metadata xattrs: a guest must not be able to
         // read or clobber them (they live in user.* only for Linux validity).
         if is_internal_carrick_xattr(name) {
-            return Err(crate::linux_abi::LINUX_ENOTSUP);
+            return Err(carrick_abi::LINUX_ENOTSUP);
         }
         // Open a real kernel fd for the materialised file (same approach as
         // `set_times`/`allocate`) and drive macOS `fsetxattr(2)` on it. The
@@ -6035,7 +6028,7 @@ impl FsBackend for HostFsBackend {
         // case 01: `user.*` on a directory must succeed, not fail ENODATA).
         let cname = match std::ffi::CString::new(name) {
             Ok(c) => c,
-            Err(_) => return Err(crate::linux_abi::LINUX_EINVAL),
+            Err(_) => return Err(carrick_abi::LINUX_EINVAL),
         };
         // Translate Linux XATTR_CREATE/XATTR_REPLACE to the macOS options
         // (same semantics, different numeric values).
@@ -6048,7 +6041,7 @@ impl FsBackend for HostFsBackend {
             opts |= carrick_portable::XATTR_REPLACE;
         }
 
-        let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
+        let normalized = normalize(path).ok_or(carrick_abi::LINUX_EINVAL)?;
         let owned_fd = self
             .metadata_fd(&normalized, follow)
             .map_err(crate::host_to_linux_errno)?;
@@ -6067,14 +6060,14 @@ impl FsBackend for HostFsBackend {
 
     fn get_xattr(&self, path: &str, name: &str, follow: bool) -> Result<Vec<u8>, LinuxErrno> {
         if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {
-            return Err(crate::linux_abi::LINUX_ENODATA);
+            return Err(carrick_abi::LINUX_ENODATA);
         }
         let cname = match std::ffi::CString::new(name) {
             Ok(c) => c,
-            Err(_) => return Err(crate::linux_abi::LINUX_EINVAL),
+            Err(_) => return Err(carrick_abi::LINUX_EINVAL),
         };
 
-        let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
+        let normalized = normalize(path).ok_or(carrick_abi::LINUX_EINVAL)?;
         let owned_fd = self
             .metadata_fd(&normalized, follow)
             .map_err(crate::host_to_linux_errno)?;
@@ -6111,13 +6104,13 @@ impl FsBackend for HostFsBackend {
         ) -> Result<Vec<String>, LinuxErrno> {
             let needed = match needed.host_syscall_errno() {
                 Ok(needed) => needed,
-                Err(crate::linux_abi::LINUX_ENODATA) => return Ok(Vec::new()),
+                Err(carrick_abi::LINUX_ENODATA) => return Ok(Vec::new()),
                 Err(err) => return Err(err),
             };
             let mut buf = vec![0u8; needed as usize];
             let n = match read(&mut buf).host_syscall_errno() {
                 Ok(n) => n,
-                Err(crate::linux_abi::LINUX_ENODATA) => return Ok(Vec::new()),
+                Err(carrick_abi::LINUX_ENODATA) => return Ok(Vec::new()),
                 Err(err) => return Err(err),
             };
             buf.truncate(n as usize);
@@ -6145,7 +6138,7 @@ impl FsBackend for HostFsBackend {
             })
         }
 
-        let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
+        let normalized = normalize(path).ok_or(carrick_abi::LINUX_EINVAL)?;
         let fd = self
             .metadata_fd(&normalized, follow)
             .map_err(crate::host_to_linux_errno)?;
@@ -6157,17 +6150,17 @@ impl FsBackend for HostFsBackend {
         // Mirror get_xattr: a non-`user.*` or carrick-internal name has no
         // guest-visible attribute to remove → ENODATA.
         if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {
-            return Err(crate::linux_abi::LINUX_ENODATA);
+            return Err(carrick_abi::LINUX_ENODATA);
         }
         // A directory can't be opened O_RDWR; fall back to a read-only handle so
         // its xattrs can be removed too (setxattr02 removes the `user.*` key it
         // set on a directory between iterations).
         let cname = match std::ffi::CString::new(name) {
             Ok(c) => c,
-            Err(_) => return Err(crate::linux_abi::LINUX_EINVAL),
+            Err(_) => return Err(carrick_abi::LINUX_EINVAL),
         };
 
-        let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
+        let normalized = normalize(path).ok_or(carrick_abi::LINUX_EINVAL)?;
         let owned_fd = self
             .metadata_fd(&normalized, follow)
             .map_err(crate::host_to_linux_errno)?;
@@ -6574,7 +6567,7 @@ impl FsBackend for HostFsBackend {
     }
 }
 
-pub(crate) fn default_scratch_root() -> std::io::Result<PathBuf> {
+pub fn default_scratch_root() -> std::io::Result<PathBuf> {
     // Prefer the dedicated carrick APFS volume (case-sensitive, isolated,
     // throw-away-able via `carrick volume delete`) when it exists. The
     // user lays it down once via `carrick volume create`; without it we
@@ -6866,10 +6859,7 @@ pub fn layered_directory_entries(
 /// sidecar names. `None` on any surprise (`DT_UNKNOWN`, an unmappable type,
 /// `fdopendir` failure) ⇒ the caller takes the exact layered path.
 #[cfg(target_os = "macos")]
-pub(crate) fn read_host_dir_entries(
-    host_dir_fd: i32,
-    dir_path: &str,
-) -> Option<Vec<RootFsDirEntry>> {
+pub fn read_host_dir_entries(host_dir_fd: i32, dir_path: &str) -> Option<Vec<RootFsDirEntry>> {
     struct Dirp(*mut libc::DIR);
     impl Drop for Dirp {
         fn drop(&mut self) {
@@ -6969,15 +6959,11 @@ pub(crate) fn read_host_dir_entries(
                         if is_sock {
                             RootFsEntryKind::Socket
                         } else if let Some(m) = mode {
-                            match m & crate::linux_abi::LINUX_S_IFMT {
-                                s if s == crate::linux_abi::LINUX_S_IFCHR => {
-                                    RootFsEntryKind::CharDevice
-                                }
-                                s if s == crate::linux_abi::LINUX_S_IFBLK => return None,
-                                s if s == crate::linux_abi::LINUX_S_IFIFO => RootFsEntryKind::Fifo,
-                                s if s == crate::linux_abi::LINUX_S_IFSOCK => {
-                                    RootFsEntryKind::Socket
-                                }
+                            match m & carrick_abi::LINUX_S_IFMT {
+                                s if s == carrick_abi::LINUX_S_IFCHR => RootFsEntryKind::CharDevice,
+                                s if s == carrick_abi::LINUX_S_IFBLK => return None,
+                                s if s == carrick_abi::LINUX_S_IFIFO => RootFsEntryKind::Fifo,
+                                s if s == carrick_abi::LINUX_S_IFSOCK => RootFsEntryKind::Socket,
                                 _ => RootFsEntryKind::File,
                             }
                         } else {
@@ -7053,17 +7039,14 @@ pub(crate) fn read_host_dir_entries(
 /// Trusted host dirfds are only ever minted by the macOS `--fs host` fast
 /// path; the streaming reader is unreachable elsewhere.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn read_host_dir_entries(
-    _host_dir_fd: i32,
-    _dir_path: &str,
-) -> Option<Vec<RootFsDirEntry>> {
+pub fn read_host_dir_entries(_host_dir_fd: i32, _dir_path: &str) -> Option<Vec<RootFsDirEntry>> {
     None
 }
 
 /// Dirent-only layered merge, with the same upper shadowing and whiteout
 /// precedence as layered_directory_entries. None requests its exact fallback.
 /// Returned mode/size fields are placeholders, never stat metadata.
-pub(crate) fn try_layered_stream_dirents(
+pub fn try_layered_stream_dirents(
     overlay: &dyn FsBackend,
     rootfs: Option<&RootFs>,
     dir: &str,

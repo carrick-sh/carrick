@@ -5900,7 +5900,7 @@ mod ipc_set_tests {
             .lock()
             .attachments
             .insert(addr, shmid);
-        let range = crate::vfs::GuestMemoryRange::new(GuestVa(addr), GuestVa(addr + len))
+        let range = carrick_vfs::GuestMemoryRange::new(GuestVa(addr), GuestVa(addr + len))
             .expect("shmat metadata range");
         let writable_memfd = kernel_file_description(
             std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {

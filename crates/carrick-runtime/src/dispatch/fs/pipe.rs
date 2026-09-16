@@ -616,10 +616,10 @@ impl<'a> FsView<'a> {
             let pipe = Arc::new(PipeInner::new(pipe_id, DEFAULT_PIPE_CAPACITY));
 
             let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY | nonblock)
-                .with_fs_identity(crate::vfs::FsIdentity::Pipe);
+                .with_fs_identity(carrick_vfs::FsIdentity::Pipe);
             read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
             let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY | nonblock)
-                .with_fs_identity(crate::vfs::FsIdentity::Pipe);
+                .with_fs_identity(carrick_vfs::FsIdentity::Pipe);
             write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
 
             let read_open = OpenFile::from_open_description_with_status_flags(

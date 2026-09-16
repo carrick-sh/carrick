@@ -99,7 +99,7 @@ fn mincore_onfault_lock_is_not_resident_until_page_is_touched() {
         String::new(),
     );
     let range =
-        crate::vfs::GuestMemoryRange::new(GuestVa(base), GuestVa(base.saturating_add(length)))
+        carrick_vfs::GuestMemoryRange::new(GuestVa(base), GuestVa(base.saturating_add(length)))
             .expect("valid locked range");
     locked_ranges_insert(&mut dispatcher.mem().lock().locked_ranges, range);
     let memory = LinearMemory::new(base, vec![0; length as usize]);
@@ -224,7 +224,7 @@ fn eager_lock_paths_populate_mincore_residency() {
     let base = LINUX_MMAP_BASE;
     let length = 2 * LINUX_PAGE_SIZE;
     let range =
-        crate::vfs::GuestMemoryRange::new(GuestVa(base), GuestVa(base.saturating_add(length)))
+        carrick_vfs::GuestMemoryRange::new(GuestVa(base), GuestVa(base.saturating_add(length)))
             .expect("valid locked range");
     let mut memory = LinearMemory::new(base, vec![0; length as usize]);
 

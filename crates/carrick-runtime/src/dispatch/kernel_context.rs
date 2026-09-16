@@ -512,8 +512,8 @@ mod tests {
     use super::*;
     use crate::dispatch::fd_table::kernel_file_description;
     use crate::dispatch::{OpenDescription, OpenDescriptionBase, OpenFile};
-    use crate::fs_backend::FsBackend;
     use carrick_abi::LINUX_FD_CLOEXEC;
+    use carrick_vfs::fs_backend::FsBackend;
     use parking_lot::RwLock;
 
     #[test]
@@ -766,7 +766,7 @@ mod tests {
     #[test]
     fn logical_execvp_skips_non_executable_path_candidates() {
         let mut dispatcher = SyscallDispatcher::new();
-        let backend = crate::fs_backend::MemoryBackend::new();
+        let backend = carrick_vfs::fs_backend::MemoryBackend::new();
         backend.make_dir("/blocked").expect("blocked dir");
         backend.make_dir("/allowed").expect("allowed dir");
         backend
@@ -802,8 +802,8 @@ mod tests {
     fn logical_exec_workdir_checks_target_credentials_before_mutation() {
         let mut dispatcher = SyscallDispatcher::new();
         let scratch = tempfile::tempdir().expect("scratch root");
-        let backend =
-            crate::fs_backend::HostFsBackend::from_path(scratch.path()).expect("scratch backend");
+        let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path())
+            .expect("scratch backend");
         backend.make_dir("/secret").expect("secret dir");
         backend.set_mode("/secret", 0o710).expect("secret mode");
         backend
@@ -857,8 +857,8 @@ mod tests {
     fn logical_exec_target_user_workdir_and_path_share_one_exact_resource_scope() {
         let mut dispatcher = SyscallDispatcher::new();
         let scratch = tempfile::tempdir().expect("scratch root");
-        let backend =
-            crate::fs_backend::HostFsBackend::from_path(scratch.path()).expect("scratch backend");
+        let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path())
+            .expect("scratch backend");
         backend.make_dir("/private-bin").expect("private bin");
         backend
             .set_owner(

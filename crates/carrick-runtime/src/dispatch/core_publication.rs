@@ -2,7 +2,7 @@
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use crate::vfs::ProcMapsEntry;
+use carrick_vfs::ProcMapsEntry;
 
 use super::{SyscallDispatcher, linux_task_name_to_string, mem};
 
@@ -38,7 +38,7 @@ pub(crate) enum CorePublicationError {
     Backend {
         operation: &'static str,
         path: String,
-        error: crate::fs_backend::BackendError,
+        error: carrick_vfs::fs_backend::BackendError,
     },
     #[error("core backend did not rename {from} to {to}")]
     RenameMissing { from: String, to: String },
@@ -49,7 +49,7 @@ pub(crate) enum CorePublicationError {
     )]
     Cleanup {
         path: String,
-        remove_error: crate::fs_backend::BackendError,
+        remove_error: carrick_vfs::fs_backend::BackendError,
         artifact_invalidated: bool,
     },
 }
@@ -216,7 +216,9 @@ impl SyscallDispatcher {
                     return Err(CorePublicationError::Backend {
                         operation: "rename",
                         path: final_path,
-                        error: crate::fs_backend::BackendError::Host(crate::linux_abi::LINUX_EXDEV),
+                        error: carrick_vfs::fs_backend::BackendError::Host(
+                            crate::linux_abi::LINUX_EXDEV,
+                        ),
                     });
                 }
                 let vfs = m_temp.vfs;
@@ -231,7 +233,7 @@ impl SyscallDispatcher {
                     return Err(CorePublicationError::Failpoint("unwritable-path"));
                 }
 
-                let open_flags = crate::vfs::OpenFlags {
+                let open_flags = carrick_vfs::OpenFlags {
                     write: true,
                     create: true,
                     excl: true,
@@ -240,19 +242,19 @@ impl SyscallDispatcher {
                     mode: 0o600,
                     ..Default::default()
                 };
-                let ctx = crate::vfs::OpenContext::default();
+                let ctx = carrick_vfs::OpenContext::default();
                 let handle = vfs
                     .open(&temp_vfs_path, open_flags, &ctx)
                     .map_err(|errno| CorePublicationError::Backend {
                         operation: "create",
                         path: temp_path.clone(),
-                        error: crate::fs_backend::BackendError::Host(errno),
+                        error: carrick_vfs::fs_backend::BackendError::Host(errno),
                     })?;
 
                 let bytes_len = usize::try_from(payload.emitted_bytes()).unwrap_or(usize::MAX);
                 let publication = (|| {
                     match handle {
-                        crate::vfs::VfsHandle::HostFd { host_fd, .. } => {
+                        carrick_vfs::VfsHandle::HostFd { host_fd, .. } => {
                             // SAFETY: transfers ownership of host_fd to scoped_fd so it is closed on scope exit.
                             let scoped_fd = unsafe { OwnedFd::from_raw_fd(host_fd) };
                             if failpoint == Some("short-write") {
@@ -262,7 +264,7 @@ impl SyscallDispatcher {
                                 |errno| CorePublicationError::Backend {
                                     operation: "write",
                                     path: temp_path.clone(),
-                                    error: crate::fs_backend::BackendError::Host(errno),
+                                    error: carrick_vfs::fs_backend::BackendError::Host(errno),
                                 },
                             )?;
                             for ext in &payload.extents {
@@ -270,7 +272,7 @@ impl SyscallDispatcher {
                                     .map_err(|errno| CorePublicationError::Backend {
                                     operation: "write",
                                     path: temp_path.clone(),
-                                    error: crate::fs_backend::BackendError::Host(errno),
+                                    error: carrick_vfs::fs_backend::BackendError::Host(errno),
                                 })?;
                             }
                             if payload.logical_size > 0 {
@@ -279,7 +281,7 @@ impl SyscallDispatcher {
                                         CorePublicationError::Backend {
                                             operation: "ftruncate",
                                             path: temp_path.clone(),
-                                            error: crate::fs_backend::BackendError::Host(
+                                            error: carrick_vfs::fs_backend::BackendError::Host(
                                                 crate::linux_abi::LINUX_EFBIG,
                                             ),
                                         }
@@ -292,7 +294,7 @@ impl SyscallDispatcher {
                                     return Err(CorePublicationError::Backend {
                                         operation: "ftruncate",
                                         path: temp_path.clone(),
-                                        error: crate::fs_backend::BackendError::Host(
+                                        error: carrick_vfs::fs_backend::BackendError::Host(
                                             crate::host_to_linux_errno(raw_errno),
                                         ),
                                     });
@@ -312,7 +314,7 @@ impl SyscallDispatcher {
                             }
                             drop(scoped_fd);
                         }
-                        crate::vfs::VfsHandle::InMemoryFile {
+                        carrick_vfs::VfsHandle::InMemoryFile {
                             contents,
                             writable: true,
                             ..
@@ -325,7 +327,7 @@ impl SyscallDispatcher {
                                     CorePublicationError::Backend {
                                         operation: "write",
                                         path: temp_path.clone(),
-                                        error: crate::fs_backend::BackendError::Invalid,
+                                        error: carrick_vfs::fs_backend::BackendError::Invalid,
                                     }
                                 })?;
                             let mut lock = contents.write();
@@ -334,7 +336,7 @@ impl SyscallDispatcher {
                                 CorePublicationError::Backend {
                                     operation: "write",
                                     path: temp_path.clone(),
-                                    error: crate::fs_backend::BackendError::Invalid,
+                                    error: carrick_vfs::fs_backend::BackendError::Invalid,
                                 }
                             })?;
                             for ext in &payload.extents {
@@ -342,14 +344,14 @@ impl SyscallDispatcher {
                                     CorePublicationError::Backend {
                                         operation: "write",
                                         path: temp_path.clone(),
-                                        error: crate::fs_backend::BackendError::Invalid,
+                                        error: carrick_vfs::fs_backend::BackendError::Invalid,
                                     }
                                 })?;
                                 lock.write_range(offset, &ext.bytes).map_err(|_| {
                                     CorePublicationError::Backend {
                                         operation: "write",
                                         path: temp_path.clone(),
-                                        error: crate::fs_backend::BackendError::Invalid,
+                                        error: carrick_vfs::fs_backend::BackendError::Invalid,
                                     }
                                 })?;
                             }
@@ -361,7 +363,7 @@ impl SyscallDispatcher {
                             return Err(CorePublicationError::Backend {
                                 operation: "create",
                                 path: temp_path.clone(),
-                                error: crate::fs_backend::BackendError::Host(
+                                error: carrick_vfs::fs_backend::BackendError::Host(
                                     crate::linux_abi::LINUX_EROFS,
                                 ),
                             });
@@ -375,7 +377,7 @@ impl SyscallDispatcher {
                         .map_err(|errno| CorePublicationError::Backend {
                             operation: "rename",
                             path: final_path.clone(),
-                            error: crate::fs_backend::BackendError::Host(errno),
+                            error: carrick_vfs::fs_backend::BackendError::Host(errno),
                         })?;
                     if failpoint == Some("post-publication") {
                         self.cleanup_core_artifact(&final_path)?;
@@ -427,7 +429,7 @@ impl SyscallDispatcher {
                                         CorePublicationError::Backend {
                                             operation: "write",
                                             path: temp_path.clone(),
-                                            error: crate::fs_backend::BackendError::Invalid,
+                                            error: carrick_vfs::fs_backend::BackendError::Invalid,
                                         }
                                     })?;
                                 let initial_size = logical_size.max(payload.header.len());
@@ -443,7 +445,7 @@ impl SyscallDispatcher {
                                         CorePublicationError::Backend {
                                             operation: "write",
                                             path: temp_path.clone(),
-                                            error: crate::fs_backend::BackendError::Invalid,
+                                            error: carrick_vfs::fs_backend::BackendError::Invalid,
                                         }
                                     })?;
                                     backend
@@ -499,21 +501,21 @@ impl SyscallDispatcher {
                                         error,
                                     })?;
                                 match renamed {
-                                    crate::fs_backend::OverlayRenameOutcome::Renamed => {
+                                    carrick_vfs::fs_backend::OverlayRenameOutcome::Renamed => {
                                         self.fs.rootfs_vfs.dentry_cache.entry_moved(
                                             &temp_path,
                                             &final_path,
                                             None,
                                         );
                                     }
-                                    crate::fs_backend::OverlayRenameOutcome::SameObject => {
+                                    carrick_vfs::fs_backend::OverlayRenameOutcome::SameObject => {
                                         // `renameat` validated the host operation but left
                                         // both hard-link names intact. Remove only our
                                         // temporary link; the final name already denotes the
                                         // exact same payload.
                                         self.cleanup_core_overlay_artifact(&temp_path)?;
                                     }
-                                    crate::fs_backend::OverlayRenameOutcome::NotOwned => {
+                                    carrick_vfs::fs_backend::OverlayRenameOutcome::NotOwned => {
                                         return Err(CorePublicationError::RenameMissing {
                                             from: temp_path.clone(),
                                             to: final_path.clone(),
@@ -544,14 +546,14 @@ impl SyscallDispatcher {
                     Err(errno) => Err(CorePublicationError::Backend {
                         operation: "namespace-admission",
                         path: final_path,
-                        error: crate::fs_backend::BackendError::Namespace(errno),
+                        error: carrick_vfs::fs_backend::BackendError::Namespace(errno),
                     }),
                 }
             }
             _ => Err(CorePublicationError::Backend {
                 operation: "rename",
                 path: final_path,
-                error: crate::fs_backend::BackendError::Host(crate::linux_abi::LINUX_EXDEV),
+                error: carrick_vfs::fs_backend::BackendError::Host(crate::linux_abi::LINUX_EXDEV),
             }),
         }
     }
@@ -563,7 +565,7 @@ impl SyscallDispatcher {
     fn cleanup_core_artifact(&self, path: &str) -> Result<(), CorePublicationError> {
         if let Some(m) = self.fs.vfs_mounts.resolve(path) {
             let is_regular_file = match m.vfs.lookup_nofollow(&m.full_path) {
-                Ok(meta) => meta.kind == crate::vfs::EntryKind::File,
+                Ok(meta) => meta.kind == carrick_vfs::EntryKind::File,
                 Err(e) if e == crate::linux_abi::LINUX_ENOENT => return Ok(()),
                 Err(_) => false,
             };
@@ -572,21 +574,21 @@ impl SyscallDispatcher {
                 Err(errno) if errno == crate::linux_abi::LINUX_ENOENT => Ok(()),
                 Err(remove_errno) => {
                     let artifact_invalidated = if is_regular_file {
-                        let open_flags = crate::vfs::OpenFlags {
+                        let open_flags = carrick_vfs::OpenFlags {
                             write: true,
                             trunc: true,
                             nofollow: true,
                             cloexec: true,
                             ..Default::default()
                         };
-                        let ctx = crate::vfs::OpenContext::default();
+                        let ctx = carrick_vfs::OpenContext::default();
                         match m.vfs.open(&m.full_path, open_flags, &ctx) {
-                            Ok(crate::vfs::VfsHandle::HostFd { host_fd, .. }) => {
+                            Ok(carrick_vfs::VfsHandle::HostFd { host_fd, .. }) => {
                                 // SAFETY: transfers ownership of host_fd to _scoped so it is closed on scope exit.
                                 let _scoped = unsafe { OwnedFd::from_raw_fd(host_fd) };
                                 true
                             }
-                            Ok(crate::vfs::VfsHandle::InMemoryFile {
+                            Ok(carrick_vfs::VfsHandle::InMemoryFile {
                                 contents,
                                 writable: true,
                                 ..
@@ -604,7 +606,7 @@ impl SyscallDispatcher {
                     }
                     Err(CorePublicationError::Cleanup {
                         path: path.to_owned(),
-                        remove_error: crate::fs_backend::BackendError::Host(remove_errno),
+                        remove_error: carrick_vfs::fs_backend::BackendError::Host(remove_errno),
                         artifact_invalidated,
                     })
                 }
@@ -621,7 +623,7 @@ impl SyscallDispatcher {
                 Err(errno) => Err(CorePublicationError::Backend {
                     operation: "namespace-admission",
                     path: path.to_owned(),
-                    error: crate::fs_backend::BackendError::Namespace(errno),
+                    error: carrick_vfs::fs_backend::BackendError::Namespace(errno),
                 }),
             }
         }
@@ -634,7 +636,7 @@ impl SyscallDispatcher {
         let backend = &self.fs.rootfs_vfs.overlay;
         let is_regular_file = backend
             .metadata(path)
-            .map(|m| m.kind == crate::rootfs::RootFsEntryKind::File)
+            .map(|m| m.kind == carrick_vfs::rootfs::RootFsEntryKind::File)
             .unwrap_or(false);
         match backend.remove_entry_checked(path) {
             Ok(_) => {
@@ -742,23 +744,23 @@ mod tests {
     }
 
     struct FinalCleanupErrorBackend {
-        inner: crate::fs_backend::MemoryBackend,
+        inner: carrick_vfs::fs_backend::MemoryBackend,
     }
 
     impl FinalCleanupErrorBackend {
         fn new() -> Self {
             Self {
-                inner: crate::fs_backend::MemoryBackend::new(),
+                inner: carrick_vfs::fs_backend::MemoryBackend::new(),
             }
         }
     }
 
-    impl crate::fs_backend::FsBackend for FinalCleanupErrorBackend {
-        fn lookup(&self, path: &str) -> Option<crate::fs_backend::OverlayEntry> {
+    impl carrick_vfs::fs_backend::FsBackend for FinalCleanupErrorBackend {
+        fn lookup(&self, path: &str) -> Option<carrick_vfs::fs_backend::OverlayEntry> {
             self.inner.lookup(path)
         }
 
-        fn metadata(&self, path: &str) -> Option<crate::rootfs::RootFsMetadata> {
+        fn metadata(&self, path: &str) -> Option<carrick_vfs::rootfs::RootFsMetadata> {
             self.inner.metadata(path)
         }
 
@@ -766,11 +768,11 @@ mod tests {
             self.inner.file_contents(path)
         }
 
-        fn make_dir(&self, path: &str) -> Result<(), crate::fs_backend::BackendError> {
+        fn make_dir(&self, path: &str) -> Result<(), carrick_vfs::fs_backend::BackendError> {
             self.inner.make_dir(path)
         }
 
-        fn create_file(&self, path: &str) -> Result<(), crate::fs_backend::BackendError> {
+        fn create_file(&self, path: &str) -> Result<(), carrick_vfs::fs_backend::BackendError> {
             self.inner.create_file(path)
         }
 
@@ -778,7 +780,7 @@ mod tests {
             &self,
             path: &str,
             contents: Vec<u8>,
-        ) -> Result<(), crate::fs_backend::BackendError> {
+        ) -> Result<(), carrick_vfs::fs_backend::BackendError> {
             self.inner.set_file_contents(path, contents)
         }
 
@@ -789,22 +791,22 @@ mod tests {
         fn remove_entry_checked(
             &self,
             path: &str,
-        ) -> Result<bool, crate::fs_backend::BackendError> {
+        ) -> Result<bool, carrick_vfs::fs_backend::BackendError> {
             if path == "/tmp/coretest/core" {
-                Err(crate::fs_backend::BackendError::Io)
+                Err(carrick_vfs::fs_backend::BackendError::Io)
             } else {
                 Ok(self.inner.remove_entry(path))
             }
         }
 
-        fn mark_deleted(&self, path: &str) -> Result<(), crate::fs_backend::BackendError> {
+        fn mark_deleted(&self, path: &str) -> Result<(), carrick_vfs::fs_backend::BackendError> {
             self.inner.mark_deleted(path)
         }
 
         fn child_names(
             &self,
             dir: &str,
-        ) -> Vec<(String, crate::rootfs::RootFsEntryKind, Option<u64>)> {
+        ) -> Vec<(String, carrick_vfs::rootfs::RootFsEntryKind, Option<u64>)> {
             self.inner.child_names(dir)
         }
 
@@ -816,8 +818,10 @@ mod tests {
             &self,
             from: &str,
             to: &str,
-        ) -> Result<crate::fs_backend::OverlayRenameOutcome, crate::fs_backend::BackendError>
-        {
+        ) -> Result<
+            carrick_vfs::fs_backend::OverlayRenameOutcome,
+            carrick_vfs::fs_backend::BackendError,
+        > {
             self.inner.rename_overlay_entry(from, to)
         }
 
@@ -827,7 +831,7 @@ mod tests {
             write: bool,
             create: bool,
             trunc: bool,
-        ) -> crate::fs_backend::HostFdOpen<i32> {
+        ) -> carrick_vfs::fs_backend::HostFdOpen<i32> {
             self.inner.open_raw_fd(path, write, create, trunc)
         }
     }
@@ -879,7 +883,7 @@ mod tests {
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.fs.vfs_mounts_mut().mount(
             "/evidence",
-            Box::new(crate::vfs::BindVfs::new("/evidence", &host_path, false)),
+            Box::new(carrick_vfs::BindVfs::new("/evidence", &host_path, false)),
         );
         let mut snapshot = snapshot();
         snapshot.cwd = "/evidence".to_owned();
@@ -914,7 +918,7 @@ mod tests {
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.fs.vfs_mounts_mut().mount(
             "/evidence_ro",
-            Box::new(crate::vfs::BindVfs::new("/evidence_ro", &host_path, true)),
+            Box::new(carrick_vfs::BindVfs::new("/evidence_ro", &host_path, true)),
         );
         let mut snapshot = snapshot();
         snapshot.cwd = "/evidence_ro".to_owned();
@@ -928,7 +932,7 @@ mod tests {
                 &err,
                 CorePublicationError::Backend {
                     operation: "create",
-                    error: crate::fs_backend::BackendError::Host(errno),
+                    error: carrick_vfs::fs_backend::BackendError::Host(errno),
                     ..
                 } if *errno == crate::linux_abi::LINUX_EROFS
             ),
@@ -965,7 +969,7 @@ mod tests {
             let mut dispatcher = SyscallDispatcher::new();
             dispatcher.fs.vfs_mounts_mut().mount(
                 "/evidence",
-                Box::new(crate::vfs::BindVfs::new("/evidence", &host_path, false)),
+                Box::new(carrick_vfs::BindVfs::new("/evidence", &host_path, false)),
             );
             let mut snapshot = snapshot();
             snapshot.cwd = "/evidence".to_owned();
@@ -1015,7 +1019,7 @@ mod tests {
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.fs.vfs_mounts_mut().mount(
             "/evidence",
-            Box::new(crate::vfs::BindVfs::new("/evidence", &host_path, false)),
+            Box::new(carrick_vfs::BindVfs::new("/evidence", &host_path, false)),
         );
         let mut snapshot = snapshot();
         snapshot.cwd = "/evidence".to_owned();
@@ -1062,7 +1066,7 @@ mod tests {
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.fs.vfs_mounts_mut().mount(
             "/evidence",
-            Box::new(crate::vfs::BindVfs::new("/evidence", &host_path, false)),
+            Box::new(carrick_vfs::BindVfs::new("/evidence", &host_path, false)),
         );
 
         let mut snapshot = snapshot();
@@ -1089,31 +1093,31 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         struct SymlinkInjectingVfs {
-            inner: crate::vfs::BindVfs,
+            inner: carrick_vfs::BindVfs,
             host_mount_dir: PathBuf,
             inject_temp_name: String,
             victim_file: PathBuf,
             injected: Arc<AtomicBool>,
         }
 
-        impl crate::vfs::Vfs for SymlinkInjectingVfs {
-            fn lookup(&self, path: &str) -> Result<crate::vfs::Metadata, crate::vfs::VfsError> {
+        impl carrick_vfs::Vfs for SymlinkInjectingVfs {
+            fn lookup(&self, path: &str) -> Result<carrick_vfs::Metadata, carrick_vfs::VfsError> {
                 self.inner.lookup(path)
             }
 
             fn lookup_nofollow(
                 &self,
                 path: &str,
-            ) -> Result<crate::vfs::Metadata, crate::vfs::VfsError> {
+            ) -> Result<carrick_vfs::Metadata, carrick_vfs::VfsError> {
                 self.inner.lookup_nofollow(path)
             }
 
             fn open(
                 &self,
                 path: &str,
-                flags: crate::vfs::OpenFlags,
-                ctx: &crate::vfs::OpenContext<'_>,
-            ) -> Result<crate::vfs::VfsHandle, crate::vfs::VfsError> {
+                flags: carrick_vfs::OpenFlags,
+                ctx: &carrick_vfs::OpenContext<'_>,
+            ) -> Result<carrick_vfs::VfsHandle, carrick_vfs::VfsError> {
                 if path.ends_with(&self.inject_temp_name) {
                     let host_link = self.host_mount_dir.join(&self.inject_temp_name);
                     let _ = std::os::unix::fs::symlink(&self.victim_file, &host_link);
@@ -1122,11 +1126,11 @@ mod tests {
                 self.inner.open(path, flags, ctx)
             }
 
-            fn unlink(&self, path: &str) -> Result<(), crate::vfs::VfsError> {
+            fn unlink(&self, path: &str) -> Result<(), carrick_vfs::VfsError> {
                 self.inner.unlink(path)
             }
 
-            fn rename(&self, from: &str, to: &str) -> Result<(), crate::vfs::VfsError> {
+            fn rename(&self, from: &str, to: &str) -> Result<(), carrick_vfs::VfsError> {
                 self.inner.rename(from, to)
             }
         }
@@ -1142,7 +1146,7 @@ mod tests {
         let temp_name = "core.carrick-tmp-91-20".to_string();
 
         let injecting_vfs = SymlinkInjectingVfs {
-            inner: crate::vfs::BindVfs::new("/evidence", &host_mount, false),
+            inner: carrick_vfs::BindVfs::new("/evidence", &host_mount, false),
             host_mount_dir: host_mount.clone(),
             inject_temp_name: temp_name.clone(),
             victim_file: victim_file.clone(),
@@ -1171,7 +1175,7 @@ mod tests {
                 &err,
                 CorePublicationError::Backend {
                     operation: "create",
-                    error: crate::fs_backend::BackendError::Host(errno),
+                    error: carrick_vfs::fs_backend::BackendError::Host(errno),
                     ..
                 } if *errno == crate::linux_abi::LINUX_EEXIST
             ),
@@ -1200,7 +1204,7 @@ mod tests {
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.fs.vfs_mounts_mut().mount(
             "/evidence_ro",
-            Box::new(crate::vfs::BindVfs::new("/evidence_ro", &host_mount, true)),
+            Box::new(carrick_vfs::BindVfs::new("/evidence_ro", &host_mount, true)),
         );
 
         let err = dispatcher
@@ -1262,7 +1266,7 @@ mod tests {
             error,
             CorePublicationError::Backend {
                 operation: "namespace-admission",
-                error: crate::fs_backend::BackendError::Namespace(errno),
+                error: carrick_vfs::fs_backend::BackendError::Namespace(errno),
                 ..
             } if errno == crate::linux_abi::LINUX_ENOENT
         ));
@@ -1424,7 +1428,7 @@ mod tests {
             parking_lot::RwLock<
                 std::collections::BTreeMap<
                     String,
-                    Arc<parking_lot::RwLock<crate::vfs::SparseBuffer>>,
+                    Arc<parking_lot::RwLock<carrick_vfs::SparseBuffer>>,
                 >,
             >,
         >,
@@ -1438,21 +1442,21 @@ mod tests {
         }
     }
 
-    impl crate::vfs::Vfs for MockInMemoryMountVfs {
+    impl carrick_vfs::Vfs for MockInMemoryMountVfs {
         fn open(
             &self,
             path: &str,
-            flags: crate::vfs::OpenFlags,
-            _ctx: &crate::vfs::OpenContext<'_>,
-        ) -> Result<crate::vfs::VfsHandle, crate::vfs::VfsError> {
+            flags: carrick_vfs::OpenFlags,
+            _ctx: &carrick_vfs::OpenContext<'_>,
+        ) -> Result<carrick_vfs::VfsHandle, carrick_vfs::VfsError> {
             let mut files = self.files.write();
             let buf = files
                 .entry(path.to_string())
                 .or_insert_with(|| {
-                    Arc::new(parking_lot::RwLock::new(crate::vfs::SparseBuffer::new()))
+                    Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::new()))
                 })
                 .clone();
-            Ok(crate::vfs::VfsHandle::InMemoryFile {
+            Ok(carrick_vfs::VfsHandle::InMemoryFile {
                 path: path.to_string(),
                 contents: buf,
                 status_flags: 0,
@@ -1461,11 +1465,11 @@ mod tests {
             })
         }
 
-        fn lookup(&self, path: &str) -> Result<crate::vfs::Metadata, crate::vfs::VfsError> {
+        fn lookup(&self, path: &str) -> Result<carrick_vfs::Metadata, carrick_vfs::VfsError> {
             let files = self.files.read();
             if let Some(buf) = files.get(path) {
-                Ok(crate::vfs::Metadata {
-                    kind: crate::vfs::EntryKind::File,
+                Ok(carrick_vfs::Metadata {
+                    kind: carrick_vfs::EntryKind::File,
                     mode: 0o600,
                     size: buf.read().len() as u64,
                     mtime_secs: 0,
@@ -1478,7 +1482,7 @@ mod tests {
             }
         }
 
-        fn rename(&self, old_path: &str, new_path: &str) -> Result<(), crate::vfs::VfsError> {
+        fn rename(&self, old_path: &str, new_path: &str) -> Result<(), carrick_vfs::VfsError> {
             let mut files = self.files.write();
             if let Some(buf) = files.remove(old_path) {
                 files.insert(new_path.to_string(), buf);
@@ -1488,7 +1492,7 @@ mod tests {
             }
         }
 
-        fn unlink(&self, path: &str) -> Result<(), crate::vfs::VfsError> {
+        fn unlink(&self, path: &str) -> Result<(), carrick_vfs::VfsError> {
             let mut files = self.files.write();
             if files.remove(path).is_some() {
                 Ok(())

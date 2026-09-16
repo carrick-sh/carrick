@@ -305,7 +305,7 @@ impl<'a> FsView<'a> {
                             .rootfs_vfs
                             .open_for_dispatch(&path, false, false, false, false)
                         {
-                            Ok(crate::vfs::rootfs::OpenDispatchResult::HostFile { host_fd, .. }) => {
+                            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::HostFile { host_fd, .. }) => {
                                 match state.add_watch(host_fd, mask) {
                                     Ok(wd) => wd,
                                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),

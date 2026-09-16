@@ -67,7 +67,7 @@ impl<'a> FsView<'a> {
             if is_stdio_fd(fd) && !self.stdio_is_closed(fd) {
                 let (label, mode) = self.stdio_synthetic_label_mode(fd);
                 return Ok(StatRecord::synthetic(&label, 0, mode)
-                    .with_fs_identity(crate::vfs::FsIdentity::Pipe));
+                    .with_fs_identity(carrick_vfs::FsIdentity::Pipe));
             }
             return Err(LINUX_EBADF);
         };
@@ -77,7 +77,7 @@ impl<'a> FsView<'a> {
             .is_some()
         {
             return Ok(StatRecord::synthetic("anon_inode:[io_uring]", 0, 0o600)
-                .with_fs_identity(crate::vfs::FsIdentity::AnonInode));
+                .with_fs_identity(carrick_vfs::FsIdentity::AnonInode));
         }
         let Some(open) = open_file.description.read() else {
             return Err(LINUX_EBADF);
@@ -224,7 +224,7 @@ impl<'a> FsView<'a> {
     pub(super) fn stat_record_with_device(
         &self,
         path: &str,
-        real: &crate::fs_backend::RealStat,
+        real: &carrick_vfs::fs_backend::RealStat,
     ) -> StatRecord {
         let mut record = StatRecord::from_real(path, real);
         let type_bits = real.mode & LINUX_S_IFMT;
@@ -320,7 +320,7 @@ impl<'a> FsView<'a> {
         let identity = if let Some(m) = self.fs.vfs_mounts.resolve(&path) {
             m.vfs.fs_identity()
         } else {
-            crate::vfs::FsIdentity::Overlay
+            carrick_vfs::FsIdentity::Overlay
         };
         Ok(write_statfs(memory, buffer.0, &identity.statfs()))
     }
@@ -382,10 +382,10 @@ impl<'a> FsView<'a> {
             {
                 (None, None, None, false)
             } else {
-                crate::fs_backend::fd_carrick_meta(host_dir.fd.raw())
+                carrick_vfs::fs_backend::fd_carrick_meta(host_dir.fd.raw())
             };
             let on_disk_mode = st.st_mode as u32 & 0o7777;
-            let real = crate::fs_backend::RealStat {
+            let real = carrick_vfs::fs_backend::RealStat {
                 kind: RootFsEntryKind::Directory,
                 ino: st.st_ino,
                 nlink: st.st_nlink as u32,
@@ -471,7 +471,7 @@ impl<'a> FsView<'a> {
                 }
                 // SAFETY: freshly-opened owned fd, closed on drop.
                 let leaf = unsafe { OwnedFd::from_raw_fd(raw) };
-                let meta = crate::fs_backend::fd_carrick_meta(raw);
+                let meta = carrick_vfs::fs_backend::fd_carrick_meta(raw);
                 drop(leaf);
                 meta
             };
@@ -484,7 +484,7 @@ impl<'a> FsView<'a> {
         };
         let on_disk_mode = st.st_mode as u32 & 0o7777;
         let default_mode = if is_dir { 0o755 } else { 0o644 };
-        let real = crate::fs_backend::RealStat {
+        let real = carrick_vfs::fs_backend::RealStat {
             kind,
             ino: st.st_ino,
             nlink: st.st_nlink as u32,
@@ -611,7 +611,7 @@ impl<'a> FsView<'a> {
             let memory = &mut *cx.memory;
 
             if false {
-                let uninit_real = std::mem::MaybeUninit::<crate::fs_backend::RealStat>::uninit();
+                let uninit_real = std::mem::MaybeUninit::<carrick_vfs::fs_backend::RealStat>::uninit();
                 let uninit_md = std::mem::MaybeUninit::<RootFsMetadata>::uninit();
                 unsafe {
                     let _ = write_statx_real(memory, 0, "", &*uninit_real.as_ptr());

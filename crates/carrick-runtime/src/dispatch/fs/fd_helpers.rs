@@ -359,19 +359,19 @@ impl<'a> FsView<'a> {
     /// `Some(is_dir)` if `path` exists, else `None`. Checks the VFS mount table
     /// first (so `/proc`, `/dev`, bind mounts resolve), then the rootfs+overlay.
     pub(in crate::dispatch) fn inotify_path_kind(&self, path: &str) -> Option<bool> {
-        use crate::vfs::Vfs as _;
+        use carrick_vfs::Vfs as _;
         if let Some(m) = self.fs.vfs_mounts.resolve(path) {
             return m
                 .vfs
                 .lookup(&m.full_path)
                 .ok()
-                .map(|md| md.kind == crate::vfs::EntryKind::Directory);
+                .map(|md| md.kind == carrick_vfs::EntryKind::Directory);
         }
         self.fs
             .rootfs_vfs
             .lookup(path)
             .ok()
-            .map(|md| md.kind == crate::vfs::EntryKind::Directory)
+            .map(|md| md.kind == carrick_vfs::EntryKind::Directory)
     }
 
     /// Emit a *self* inotify event (the watched object itself was acted on):
@@ -830,7 +830,8 @@ impl<'a> FsView<'a> {
             // sink when opened writable (LTP splice09). They are synthetic in
             // Carrick, so the host cannot supply that file operation for us.
             OpenDescription::SyntheticDevice {
-                kind: crate::vfs::SyntheticDeviceKind::Null | crate::vfs::SyntheticDeviceKind::Zero,
+                kind:
+                    carrick_vfs::SyntheticDeviceKind::Null | carrick_vfs::SyntheticDeviceKind::Zero,
                 ..
             } => {
                 let flags = open_file.description.common().status_flags();

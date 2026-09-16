@@ -304,7 +304,7 @@ trait InotifyBackend: Send + Sync {
     /// per-platform `add_watch_fds`. Takes ownership of the fds.
     fn add_watch_fds(
         &self,
-        watch_fds: Vec<crate::vfs::WatchFd>,
+        watch_fds: Vec<carrick_vfs::WatchFd>,
         mask: u32,
         inner: &Mutex<Inner>,
     ) -> Result<i32, LinuxErrno>;
@@ -342,7 +342,7 @@ impl InotifyBackend for NativeLinuxInotify {
 
     fn add_watch_fds(
         &self,
-        watch_fds: Vec<crate::vfs::WatchFd>,
+        watch_fds: Vec<carrick_vfs::WatchFd>,
         mask: u32,
         inner: &Mutex<Inner>,
     ) -> Result<i32, LinuxErrno> {
@@ -522,7 +522,7 @@ impl InotifyBackend for VnodeDiffInotify {
 
     fn add_watch_fds(
         &self,
-        watch_fds: Vec<crate::vfs::WatchFd>,
+        watch_fds: Vec<carrick_vfs::WatchFd>,
         mask: u32,
         inner: &Mutex<Inner>,
     ) -> Result<i32, LinuxErrno> {
@@ -815,12 +815,12 @@ impl InotifyState {
     /// If `host_fd`'s vnode is already watched, updates the mask and returns the
     /// existing wd (matching inotify, which returns the same wd for a re-add).
     pub(crate) fn add_watch(&self, host_fd: RawFd, mask: u32) -> Result<i32, LinuxErrno> {
-        self.add_watch_fds(vec![crate::vfs::WatchFd::unnamed(host_fd)], mask)
+        self.add_watch_fds(vec![carrick_vfs::WatchFd::unnamed(host_fd)], mask)
     }
 
     pub(crate) fn add_watch_fds(
         &self,
-        watch_fds: Vec<crate::vfs::WatchFd>,
+        watch_fds: Vec<carrick_vfs::WatchFd>,
         mask: u32,
     ) -> Result<i32, LinuxErrno> {
         self.backend.add_watch_fds(watch_fds, mask, &self.inner)

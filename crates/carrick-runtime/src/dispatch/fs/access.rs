@@ -194,7 +194,7 @@ impl<'a> FsView<'a> {
         // returns ENOENT. (LTP's tst_test uses this access call to choose
         // /dev/shm vs a tmpdir for its SHM file; ENOENT here makes the
         // tmpdir branch fire spuriously.)
-        use crate::vfs::Vfs as _;
+        use carrick_vfs::Vfs as _;
         if let Some(m) = self.fs.vfs_mounts.resolve(path) {
             return match m.vfs.lookup(&m.full_path) {
                 Ok(md) => access_metadata(&vfs_md_to_rootfs_md(path, &md), mode),

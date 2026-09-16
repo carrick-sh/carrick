@@ -283,7 +283,7 @@ impl<'a> FsView<'a> {
                 let new_desc = OpenDescription::File {
                     base: OpenDescriptionBase::new(0).with_fs_identity(
                         base.fs_identity()
-                            .unwrap_or(crate::vfs::FsIdentity::Overlay),
+                            .unwrap_or(carrick_vfs::FsIdentity::Overlay),
                     ),
                     path: path_str.into_owned(),
                     metadata: new_metadata,
@@ -308,7 +308,7 @@ impl<'a> FsView<'a> {
                 } else {
                     let new_desc = OpenDescription::ProcExecutable {
                         base: OpenDescriptionBase::new(0).with_fs_identity(
-                            base.fs_identity().unwrap_or(crate::vfs::FsIdentity::Proc),
+                            base.fs_identity().unwrap_or(carrick_vfs::FsIdentity::Proc),
                         ),
                         executable: executable.clone(),
                         offset: 0,
@@ -382,7 +382,7 @@ impl<'a> FsView<'a> {
                     let new_desc = OpenDescription::File {
                         base: OpenDescriptionBase::new(0).with_fs_identity(
                             base.fs_identity()
-                                .unwrap_or(crate::vfs::FsIdentity::Overlay),
+                                .unwrap_or(carrick_vfs::FsIdentity::Overlay),
                         ),
                         path: path.clone(),
                         metadata: new_metadata,
@@ -422,7 +422,7 @@ impl<'a> FsView<'a> {
                     let new_desc = OpenDescription::InMemoryFile {
                         base: OpenDescriptionBase::new(0).with_fs_identity(
                             base.fs_identity()
-                                .unwrap_or(crate::vfs::FsIdentity::Overlay),
+                                .unwrap_or(carrick_vfs::FsIdentity::Overlay),
                         ),
                         path: path.clone(),
                         contents: Arc::clone(contents),

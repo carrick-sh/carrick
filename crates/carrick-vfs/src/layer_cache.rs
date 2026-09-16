@@ -41,7 +41,7 @@ const CACHE_FORMAT_VERSION: &[u8] = b"v2-hardlink-replacement";
 /// authority. Callers must never expose mutation through it. `scratch_root` is
 /// explicit so the cache stays on the configured volume alongside the sparse
 /// writable uppers that consume it.
-pub(crate) fn acquire_immutable_entry(
+pub fn acquire_immutable_entry(
     layer_paths: &[PathBuf],
     scratch_root: &Path,
 ) -> std::io::Result<Option<PathBuf>> {

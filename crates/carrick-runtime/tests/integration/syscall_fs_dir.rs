@@ -10,10 +10,10 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
-#[cfg(target_os = "macos")]
-use carrick_runtime::fs_backend::HostFsBackend;
 use carrick_runtime::linux_abi::{LINUX_AT_FDCWD, LINUX_AT_REMOVEDIR, LINUX_O_CREAT, LINUX_O_RDWR};
-use carrick_runtime::vfs::BindVfs;
+use carrick_vfs::BindVfs;
+#[cfg(target_os = "macos")]
+use carrick_vfs::fs_backend::HostFsBackend;
 use support::*;
 
 #[test]

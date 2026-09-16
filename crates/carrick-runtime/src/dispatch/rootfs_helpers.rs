@@ -12,7 +12,7 @@ pub(crate) use carrick_abi::{
 use carrick_guest_mem::CurrentMmMemory;
 
 use crate::linux_abi::LinuxErrno;
-use crate::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
+use carrick_vfs::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
 
 use super::DispatchOutcome;
 
@@ -159,7 +159,7 @@ pub(super) fn dirent64_record(entry: &RootFsDirEntry, next_offset: usize) -> Vec
     // the opaque directory-entry BYTES so an undecodable filename round-trips
     // through getdents (Linux d_name is raw bytes, not UTF-8). Valid-UTF-8
     // names decode to themselves.
-    let name_bytes = crate::pathcodec::decode_to_bytes(&entry.name);
+    let name_bytes = carrick_vfs::pathcodec::decode_to_bytes(&entry.name);
     let name = name_bytes.as_slice();
     let record_len = align_to(LINUX_DIRENT64_HEADER_SIZE + name.len() + 1, 8);
     let header = LinuxDirent64Header {
@@ -215,14 +215,14 @@ pub(super) fn inode_for_path(path: &Path) -> u64 {
     let os_bytes = path.as_os_str().as_bytes();
     let decoded_owned;
     let canon_bytes: &[u8] = match std::str::from_utf8(os_bytes) {
-        Ok(s) if crate::pathcodec::has_escaped_bytes(s) => {
-            decoded_owned = crate::pathcodec::decode_to_bytes(s);
+        Ok(s) if carrick_vfs::pathcodec::has_escaped_bytes(s) => {
+            decoded_owned = carrick_vfs::pathcodec::decode_to_bytes(s);
             &decoded_owned
         }
         _ => os_bytes,
     };
     let normalized =
-        crate::fs_backend::normalize_raw(Path::new(std::ffi::OsStr::from_bytes(canon_bytes)));
+        carrick_vfs::fs_backend::normalize_raw(Path::new(std::ffi::OsStr::from_bytes(canon_bytes)));
     let key_os = normalized
         .as_ref()
         .map(|p| p.as_os_str().as_bytes())
@@ -392,21 +392,21 @@ mod exec_vector_tests {
     }
 }
 
-/// Adapter from the VFS-trait [`Metadata`](crate::vfs::Metadata) back to
+/// Adapter from the VFS-trait [`Metadata`](carrick_vfs::Metadata) back to
 /// [`RootFsMetadata`] for the dispatcher's existing stat/statx
 /// writers, which still take the rootfs-shaped struct. Used by every
 /// dispatcher fs syscall that's been migrated to consult
 /// `RootFsVfs::lookup`.
-pub(super) fn vfs_md_to_rootfs_md(path: &str, md: &crate::vfs::Metadata) -> RootFsMetadata {
+pub(super) fn vfs_md_to_rootfs_md(path: &str, md: &carrick_vfs::Metadata) -> RootFsMetadata {
     RootFsMetadata {
         path: Path::new(path).to_path_buf(),
         kind: match md.kind {
-            crate::vfs::EntryKind::File => RootFsEntryKind::File,
-            crate::vfs::EntryKind::Directory => RootFsEntryKind::Directory,
-            crate::vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
-            crate::vfs::EntryKind::CharDevice => RootFsEntryKind::CharDevice,
-            crate::vfs::EntryKind::Fifo => RootFsEntryKind::Fifo,
-            crate::vfs::EntryKind::Socket => RootFsEntryKind::Socket,
+            carrick_vfs::EntryKind::File => RootFsEntryKind::File,
+            carrick_vfs::EntryKind::Directory => RootFsEntryKind::Directory,
+            carrick_vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
+            carrick_vfs::EntryKind::CharDevice => RootFsEntryKind::CharDevice,
+            carrick_vfs::EntryKind::Fifo => RootFsEntryKind::Fifo,
+            carrick_vfs::EntryKind::Socket => RootFsEntryKind::Socket,
         },
         mode: md.mode,
         size: md.size as usize,
@@ -496,7 +496,7 @@ fn read_guest_c_string_bytes_bounded(
 /// carrick resolves against its String/Path-based fs layer. Linux paths are
 /// opaque BYTES; rather than reject a non-UTF-8 path with EINVAL, undecodable
 /// bytes are carried through the `&str` layer with a reversible escape
-/// (`crate::pathcodec`) — valid UTF-8 is byte-for-byte unchanged (fast path),
+/// (`carrick_vfs::pathcodec`) — valid UTF-8 is byte-for-byte unchanged (fast path),
 /// and the escape is decoded back to the raw bytes at the guest-facing read-back
 /// boundaries (getdents/readlink/getcwd). The encoded form also doubles as the
 /// durable host representation, since APFS rejects a raw non-UTF-8 name (EILSEQ).
@@ -505,7 +505,7 @@ pub(super) fn read_guest_c_string(
     memory: &impl CurrentMmMemory,
     address: u64,
 ) -> Result<String, LinuxErrno> {
-    Ok(crate::pathcodec::encode_bytes(&read_guest_c_string_bytes(
-        memory, address,
-    )?))
+    Ok(carrick_vfs::pathcodec::encode_bytes(
+        &read_guest_c_string_bytes(memory, address)?,
+    ))
 }

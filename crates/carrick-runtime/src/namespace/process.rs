@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::user::UserNs;
 use super::{FIRST_DYNAMIC_NS, NsId};
-use crate::vfs::FsCaller;
+use carrick_vfs::FsCaller;
 
 /// The Docker default bounded capability set, observed on
 /// `docker run debian:stable` (design §1.2, §4.4). carrick reports this in

@@ -5,7 +5,7 @@ use carrick_fatal::carrick_fatal;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ResidentFaultRange {
-    pub(crate) range: crate::vfs::GuestMemoryRange,
+    pub(crate) range: carrick_vfs::GuestMemoryRange,
     pub(crate) prot: LinuxProtFlags,
 }
 
@@ -44,7 +44,7 @@ struct FirstTouchArm {
 impl FirstTouchArming {
     /// Arm `range` for first-touch observation at `prot`, replacing whatever
     /// armed the pages it covers.
-    pub(crate) fn arm(&mut self, range: crate::vfs::GuestMemoryRange, prot: LinuxProtFlags) {
+    pub(crate) fn arm(&mut self, range: carrick_vfs::GuestMemoryRange, prot: LinuxProtFlags) {
         self.disarm(range);
         self.extents.insert(
             range.start().raw(),
@@ -68,7 +68,7 @@ impl FirstTouchArming {
     /// Drop `range` from the set, keeping the parts of any extent that lie
     /// outside it. This is the commit path for one page, so it must not touch
     /// entries the range does not overlap.
-    pub(crate) fn disarm(&mut self, range: crate::vfs::GuestMemoryRange) {
+    pub(crate) fn disarm(&mut self, range: carrick_vfs::GuestMemoryRange) {
         let (start, end) = (range.start().raw(), range.end().raw());
         // The one entry that may begin BEFORE `range` and still cover it.
         if let Some((&head_start, &head)) = self.extents.range(..start).next_back()
@@ -100,7 +100,7 @@ impl FirstTouchArming {
     /// never happen.
     pub(crate) fn intersections(
         &self,
-        range: crate::vfs::GuestMemoryRange,
+        range: carrick_vfs::GuestMemoryRange,
     ) -> Vec<ResidentFaultRange> {
         let (start, end) = (range.start().raw(), range.end().raw());
         let head = self
@@ -116,7 +116,7 @@ impl FirstTouchArming {
                     .map(|(&arm_start, arm)| (arm_start, *arm)),
             )
             .filter_map(|(arm_start, arm)| {
-                crate::vfs::GuestMemoryRange::new(
+                carrick_vfs::GuestMemoryRange::new(
                     GuestVa(arm_start.max(start)),
                     GuestVa(arm.end.min(end)),
                 )
@@ -144,7 +144,7 @@ impl FirstTouchArming {
     #[cfg(test)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = ResidentFaultRange> + '_ {
         self.extents.iter().filter_map(|(&start, arm)| {
-            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(arm.end)).map(|range| {
+            carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(arm.end)).map(|range| {
                 ResidentFaultRange {
                     range,
                     prot: arm.prot,
@@ -159,13 +159,13 @@ impl FirstTouchArming {
 /// invalid so their first touch is still observed.
 pub(crate) fn tracked_nonresident_subranges(
     mem: &MemState,
-    range: crate::vfs::GuestMemoryRange,
-) -> Vec<crate::vfs::GuestMemoryRange> {
+    range: carrick_vfs::GuestMemoryRange,
+) -> Vec<carrick_vfs::GuestMemoryRange> {
     let mut out = Vec::new();
     for tracked in &mem.resident_tracked_ranges {
         let start = tracked.start().raw().max(range.start().raw());
         let end = tracked.end().raw().min(range.end().raw());
-        if let Some(sub) = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) {
+        if let Some(sub) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) {
             out.push(sub);
         }
     }
@@ -340,7 +340,7 @@ impl<'a> MemView<'a> {
         length: u64,
         prot: LinuxProtFlags,
     ) {
-        let Some(range) = crate::vfs::GuestMemoryRange::new(
+        let Some(range) = carrick_vfs::GuestMemoryRange::new(
             GuestVa(address),
             GuestVa(address.saturating_add(length)),
         ) else {
@@ -373,7 +373,7 @@ impl<'a> MemView<'a> {
         length: u64,
         prot: LinuxProtFlags,
     ) -> Result<(), carrick_guest_mem::MemoryError> {
-        let Some(range) = crate::vfs::GuestMemoryRange::new(
+        let Some(range) = carrick_vfs::GuestMemoryRange::new(
             GuestVa(address),
             GuestVa(address.saturating_add(length)),
         ) else {
@@ -403,7 +403,7 @@ impl<'a> MemView<'a> {
 
     pub(in crate::dispatch::mem) fn mark_range_resident(&self, start: u64, len: u64) {
         if let Some(range) =
-            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+            carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
             locked_ranges_insert(&mut self.mem().lock().resident_ranges, range);
         }
@@ -411,7 +411,7 @@ impl<'a> MemView<'a> {
 
     pub(in crate::dispatch::mem) fn mark_range_nonresident(&self, start: u64, len: u64) {
         let Some(range) =
-            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+            carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         else {
             return;
         };
@@ -470,7 +470,7 @@ impl<'a> MemView<'a> {
         let Some(end) = plan.page.checked_add(self.linux_page_size()) else {
             return;
         };
-        let Some(range) = crate::vfs::GuestMemoryRange::new(GuestVa(plan.page), GuestVa(end))
+        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(plan.page), GuestVa(end))
         else {
             return;
         };
@@ -483,7 +483,7 @@ impl<'a> MemView<'a> {
     pub(in crate::dispatch::mem) fn populate_resident_range(
         &self,
         memory: &mut impl CurrentMmMemory,
-        range: crate::vfs::GuestMemoryRange,
+        range: carrick_vfs::GuestMemoryRange,
     ) -> Result<(), LinuxErrno> {
         let faults = {
             let mem_authority_34 = self.mem();

@@ -25,9 +25,9 @@
 
 use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR};
 
-use super::{EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
 use crate::network::model::LinuxNetworkLink;
 use carrick_abi::LINUX_IFF_RUNNING;
+use carrick_vfs::{EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
 
 pub(crate) fn synthetic_file(path: &str) -> Option<Vec<u8>> {
     match path {
@@ -132,7 +132,7 @@ fn net_path_kind_from_links(path: &str, links: &[LinuxNetworkLink]) -> Option<En
     }
 }
 
-fn synthetic_dir_entries(path: &str) -> Option<Vec<super::DirEnt>> {
+fn synthetic_dir_entries(path: &str) -> Option<Vec<carrick_vfs::DirEnt>> {
     let entries: &[(&str, EntryKind)] = match path {
         "/sys/kernel" => &[
             ("mm", EntryKind::Directory),
@@ -152,7 +152,7 @@ fn synthetic_dir_entries(path: &str) -> Option<Vec<super::DirEnt>> {
     Some(
         entries
             .iter()
-            .map(|(name, kind)| super::DirEnt {
+            .map(|(name, kind)| carrick_vfs::DirEnt {
                 name: (*name).to_string(),
                 kind: *kind,
             })
@@ -253,14 +253,14 @@ impl Vfs for SysVfs {
         Err(LINUX_ENOENT)
     }
 
-    fn readdir(&self, path: &str) -> Result<Vec<super::DirEnt>, VfsError> {
+    fn readdir(&self, path: &str) -> Result<Vec<carrick_vfs::DirEnt>, VfsError> {
         if let Some(entries) = synthetic_dir_entries(path) {
             return Ok(entries);
         }
         // /sys/class -> ["net"]; /sys/class/net -> interface names;
         // /sys/class/net/<if> -> the per-interface attribute files.
         if path == "/sys/class" {
-            return Ok(vec![super::DirEnt {
+            return Ok(vec![carrick_vfs::DirEnt {
                 name: "net".to_string(),
                 kind: EntryKind::Directory,
             }]);
@@ -271,7 +271,7 @@ impl Vfs for SysVfs {
                 .view()
                 .links
                 .iter()
-                .map(|link| super::DirEnt {
+                .map(|link| carrick_vfs::DirEnt {
                     name: link.name.clone(),
                     kind: EntryKind::Directory,
                 })
@@ -288,7 +288,7 @@ impl Vfs for SysVfs {
         {
             return Ok(NET_ATTRS
                 .iter()
-                .map(|a| super::DirEnt {
+                .map(|a| carrick_vfs::DirEnt {
                     name: (*a).to_string(),
                     kind: EntryKind::File,
                 })
@@ -316,8 +316,8 @@ impl Vfs for SysVfs {
         })
     }
 
-    fn fs_identity(&self) -> super::FsIdentity {
-        super::FsIdentity::Sysfs
+    fn fs_identity(&self) -> carrick_vfs::FsIdentity {
+        carrick_vfs::FsIdentity::Sysfs
     }
 
     fn name(&self) -> &'static str {

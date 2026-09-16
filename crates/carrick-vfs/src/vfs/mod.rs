@@ -17,11 +17,11 @@
 //! does *not* route to a `/proc` mount). The dispatcher installs the special
 //! and synthetic surfaces into this table at guest setup (`dispatch/fs/state.rs`):
 //!
-//! * `/proc` → [`ProcVfs`] — synthetic procfs rendered from live dispatcher state.
-//! * `/sys` → [`SysVfs`] — synthetic sysfs (CPU topology, cgroup stubs, …).
-//! * `/dev` → [`DevVfs`] — passthrough to macOS's same-named char devices
+//! * `/proc` → `ProcVfs` — synthetic procfs rendered from live dispatcher state.
+//! * `/sys` → `SysVfs` — synthetic sysfs (CPU topology, cgroup stubs, …).
+//! * `/dev` → `DevVfs` — passthrough to macOS's same-named char devices
 //!   (`/dev/null`, `/dev/zero`, `/dev/urandom`, …) plus the guest tty.
-//! * `/dev/pts` → [`DevptsVfs`] — real macOS ptys behind a guest pts index.
+//! * `/dev/pts` → `DevptsVfs` — real macOS ptys behind a guest pts index.
 //! * `/etc/resolv.conf` → [`ResolvConfVfs`] and `/etc/services` →
 //!   [`EtcServicesVfs`] — single-file mounts that inject host-derived config
 //!   the OCI scratch lacks (the `docker run --net host` contract).
@@ -88,54 +88,31 @@ pub mod dentry;
 pub mod errno;
 pub mod etc_services;
 pub mod mount;
-pub(crate) mod namespace_mutation;
+pub mod namespace_mutation;
 pub mod resolvconf;
 pub mod rootfs;
 pub mod sparse_buffer;
 
 pub use bind::BindVfs;
 pub use dentry::{DentryCache, InodeIdentity};
-pub use dev::{DevVfs, VirtualConsole};
-pub use devpts::{DevptsVfs, PtyRole, PtyTable};
 pub use etc_services::EtcServicesVfs;
 pub use mount::VfsMounts;
-pub use proc::{
-    GuestMemoryRange, GuestReportedArch, ProcMapSharing, ProcMapsEntry, ProcVfs,
-    SyntheticProcContext, SyntheticProcIdentity, SyntheticProcProcess, SyntheticProcThread,
-    SyntheticProcZombie,
-};
 pub use resolvconf::{HostResolverLaunchError, HostResolverSnapshot, ResolvConfVfs};
 pub use rootfs::RootFsVfs;
 pub use sparse_buffer::SparseBuffer;
-pub use sys::SysVfs;
 
 /// Maximum size Carrick will materialize as a `Vec<u8>` for memory-backed
 /// regular files. Larger files need a host-backed fd so growth remains sparse.
 pub const MAX_IN_MEMORY_FILE_SIZE: u64 = 512 * 1024 * 1024;
 
-pub(crate) fn is_synthetic_virtual_file(path: &str, ctx: &SyntheticProcContext) -> bool {
-    may_be_synthetic_virtual_path(path)
-        && (proc::synthetic_file(path, ctx).is_some() || sys::synthetic_file(path).is_some())
-}
-
-/// Whether `path` can name a synthetic `/proc` or `/sys` object at all. Every
-/// synthetic file, directory and magic link lives under one of those two
-/// roots, so a caller that only needs to CLASSIFY a path checks this before
-/// assembling a [`SyntheticProcContext`] — that assembly snapshots the address
-/// space, walks the task graph and reads `/etc/passwd`+`/etc/group` from the
-/// rootfs, which was ~7 host `openat`s per guest `unlink` of an ordinary file.
-pub(crate) fn may_be_synthetic_virtual_path(path: &str) -> bool {
-    path.starts_with("/proc") || path.starts_with("/sys")
-}
-
 use std::path::PathBuf;
 
 /// Linux errno reported by a [`Vfs`] failure. The typed
-/// [`LinuxErrno`](crate::linux_abi::LinuxErrno)
+/// [`LinuxErrno`](carrick_abi::LinuxErrno)
 /// matches the dispatcher's error pipeline (the `LINUX_E*` constants and
 /// `DispatchError::Errno`), so leaf-level mounts return typed errno values
 /// with no translation layer.
-pub type VfsError = crate::linux_abi::LinuxErrno;
+pub type VfsError = carrick_abi::LinuxErrno;
 
 #[derive(Debug)]
 pub struct WatchFd {
@@ -145,7 +122,7 @@ pub struct WatchFd {
 }
 
 impl WatchFd {
-    pub(crate) fn unnamed(host_fd: i32) -> Self {
+    pub fn unnamed(host_fd: i32) -> Self {
         Self {
             host_fd,
             name: None,
@@ -411,25 +388,40 @@ impl FsIdentity {
     }
 }
 
+/// The `/dev/tty0` virtual console a `/dev` mount hands back from
+/// [`VfsHandle::VirtualConsole`]. The console object itself lives above this
+/// crate with the pty table it consults for a controlling terminal, so the
+/// handle carries the BEHAVIOUR the dispatcher's ioctl/read/write paths need,
+/// not the concrete type.
+pub trait VirtualConsoleDevice: Send + Sync + std::fmt::Debug {
+    /// Write to the console, which reaches the host terminal only while the
+    /// guest actually has a controlling terminal.
+    fn write(&self, bytes: &[u8]);
+    fn get_termios(&self) -> carrick_abi::LinuxTermios;
+    fn set_termios(&self, termios: carrick_abi::LinuxTermios);
+    fn get_winsize(&self) -> carrick_abi::LinuxWinsize;
+    fn set_winsize(&self, winsize: carrick_abi::LinuxWinsize);
+}
+
 /// What a successful [`Vfs::open`] returns. Each variant carries just
 /// enough information for the dispatcher to construct its own private
 /// `OpenDescription` *without* the mount needing to know about that enum —
 /// the variant names *what kind of thing* was opened, and the dispatcher
 /// owns the fd-table bookkeeping. Which mount returns which variant:
 ///
-/// * [`HostFd`](VfsHandle::HostFd) — a real macOS fd, returned by [`DevVfs`]
+/// * [`HostFd`](VfsHandle::HostFd) — a real macOS fd, returned by `DevVfs`
 ///   for char-device passthrough; the dispatcher wraps it as a `HostPipe`.
 /// * [`SyntheticDevice`](VfsHandle::SyntheticDevice) — an in-memory synthetic
 ///   device (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`);
 ///   the dispatcher serves I/O without passing to host libc.
 /// * [`Bytes`](VfsHandle::Bytes) — an in-memory blob, returned by the
-///   synthetic mounts ([`ProcVfs`], [`SysVfs`], [`ResolvConfVfs`],
+///   synthetic mounts (`ProcVfs`, `SysVfs`, [`ResolvConfVfs`],
 ///   [`EtcServicesVfs`]); becomes `OpenDescription::SyntheticFile`.
-/// * [`Pty`](VfsHandle::Pty) — a master/slave pty end, returned by [`DevVfs`]
-///   (`/dev/ptmx`, `/dev/tty`) and [`DevptsVfs`] (`/dev/pts/N`); becomes a
-///   `HostPipe` tagged with [`PtyRole`] so the ioctl handler treats it as a tty.
+/// * [`Pty`](VfsHandle::Pty) — a master/slave pty end, returned by `DevVfs`
+///   (`/dev/ptmx`, `/dev/tty`) and `DevptsVfs` (`/dev/pts/N`); becomes a
+///   `HostPipe` tagged with `PtyRole` so the ioctl handler treats it as a tty.
 /// * [`Directory`](VfsHandle::Directory) — a synthetic listing served entirely
-///   from a `Vec<DirEnt>` in memory, returned by [`DevVfs`] for `/dev` so
+///   from a `Vec<DirEnt>` in memory, returned by `DevVfs` for `/dev` so
 ///   `ls /dev` shows the device nodes rather than the (typically empty) `/dev`
 ///   in the OCI image layer. The rootfs `/` mount serves its directories
 ///   through [`RootFsVfs::open_for_dispatch`] instead, not this variant.
@@ -479,7 +471,7 @@ pub enum VfsHandle {
     },
     /// A virtual console device (/dev/tty0) backed by in-memory terminal state.
     VirtualConsole {
-        console: std::sync::Arc<dev::VirtualConsole>,
+        console: std::sync::Arc<dyn VirtualConsoleDevice>,
         status_flags: u32,
     },
     /// A writable or read-only in-memory regular file backed by a shared buffer.
@@ -742,6 +734,124 @@ pub struct FsNetworkInterface {
     pub has_ipv6: bool,
 }
 
+/// The value types the kernel hands a synthetic `/proc` mount through
+/// [`OpenContext`]. They are plain render input — the renderer itself
+/// (`ProcVfs`) and the kernel-typed `SyntheticProcContext` it assembles from
+/// live task state stay above this crate; only the data crosses down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcMapsEntry {
+    pub start: u64,
+    pub end: u64,
+    pub read: bool,
+    pub write: bool,
+    pub execute: bool,
+    pub sharing: ProcMapSharing,
+    pub path: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcMapSharing {
+    Private,
+    Shared,
+}
+
+impl ProcMapSharing {
+    pub fn marker(self) -> char {
+        match self {
+            Self::Private => 'p',
+            Self::Shared => 's',
+        }
+    }
+}
+
+/// The ISA a guest reports about *itself* through arch-dependent synthetic
+/// surfaces — `uname(2)`, `/proc/cpuinfo`, and any future arch-keyed file. A
+/// single source (`ProcState::reported_arch`, mirroring `guest_hostname()`)
+/// feeds all of them so they can never contradict each other: the bug this
+/// closes was an x86_64 guest seeing `uname=x86_64` but `/proc/cpuinfo=ARM`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GuestReportedArch {
+    #[default]
+    Aarch64,
+    X86_64,
+}
+
+pub type GuestMemoryRange = carrick_guest_mem::GuestVaRange;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyntheticProcIdentity {
+    pub pid: u32,
+    pub tid: u32,
+    pub ppid: u32,
+    pub pgrp: u32,
+    pub session: u32,
+    pub user_cpu_us: u64,
+    pub system_cpu_us: u64,
+}
+
+/// One authoritative Linux thread rendered by the in-process HVPatch `/proc`
+/// view. The Linux TID is distinct from the runtime registry id on this lane;
+/// carrying the resolved state/name snapshot prevents `/proc/self/task/<tid>`
+/// from accidentally consulting another HVPatch process's global registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticProcThread {
+    pub tid: u32,
+    pub state: char,
+    pub comm: Option<String>,
+    pub user_cpu_us: u64,
+    pub system_cpu_us: u64,
+    /// The guest CPU this thread last ran on — `/proc/<pid>/stat` field 39
+    /// (`processor`) and the same `P` `sched_getcpu` reports. `None` before
+    /// its first claim.
+    pub processor: Option<carrick_hal::GuestCpuId>,
+    /// This thread's `sched_setaffinity` mask, for `/proc/<pid>/status`
+    /// `Cpus_allowed`. The scheduler honours the same value.
+    pub cpus_allowed: carrick_hal::CpuAffinity,
+}
+
+/// One LIVE Linux process other than the reader, rendered by the in-process
+/// HVPatch `/proc` view — the sibling of [`SyntheticProcZombie`], covering the
+/// interval before a process exits.
+///
+/// It exists for the same reason: under HVPatch every Linux process is a thread
+/// of ONE Darwin process, so Darwin's process table cannot describe a peer at
+/// all. Asking it yields the CARRIER's identity — which is how a guest reading
+/// `/proc/<peer>/stat` used to receive five-digit host ppid/pgrp/session values
+/// straight out of macOS. The authoritative Kernel task record must cross the
+/// dispatcher/VFS boundary instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticProcProcess {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgrp: u32,
+    pub session: u32,
+    pub state: char,
+    /// Every live thread's Linux tid, straight from the kernel graph's per-task
+    /// thread claims. It is what `/proc/<pid>/task/` lists and what `stat`
+    /// field 20 / `status`' `Threads:` count; Darwin's thread table cannot be
+    /// asked, because on HVPatch it describes every process in the carrier at
+    /// once.
+    pub tids: Vec<u32>,
+    pub comm: String,
+    pub user_cpu_us: u64,
+    pub system_cpu_us: u64,
+}
+
+/// One exited-but-unreaped Linux process rendered by the in-process HVPatch
+/// `/proc` view. HVPatch children are host threads, so Darwin's process table
+/// cannot observe their zombie interval; the authoritative Kernel record must
+/// cross the dispatcher/VFS boundary instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticProcZombie {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgrp: u32,
+    pub session: u32,
+    pub comm: String,
+    pub user_cpu_us: u64,
+    pub system_cpu_us: u64,
+}
+
 /// Live dispatcher state that some VFS mounts need at `open` time
 /// (e.g. `/proc/self/maps` reflecting the loaded address space).
 /// Threading this through `Vfs::open` keeps the trait independent of
@@ -768,7 +878,7 @@ pub struct OpenContext<'a> {
     pub environ: LazyField<'a, Option<Cow<'a, [Vec<u8>]>>>,
     pub open_fds: LazyField<'a, Option<Cow<'a, [i32]>>>,
     pub network: LazyField<'a, Option<Cow<'a, carrick_spec::NetworkNamespaceSpec>>>,
-    pub(crate) network_model: LazyField<'a, Option<Arc<dyn FsNetworkView>>>,
+    pub network_model: LazyField<'a, Option<Arc<dyn FsNetworkView>>>,
     pub groups: LazyField<'a, Option<Cow<'a, [NsGid]>>>,
     pub signals: LazyField<'a, (u64, u64, u64)>,
     pub oom_score_adj: LazyField<'a, Option<Cow<'a, std::collections::BTreeMap<u32, i32>>>>,
@@ -811,7 +921,7 @@ impl<'a> OpenContext<'a> {
         self.network.get().and_then(|opt| opt.as_deref())
     }
 
-    pub(crate) fn network_model(&self) -> Option<&dyn FsNetworkView> {
+    pub fn network_model(&self) -> Option<&dyn FsNetworkView> {
         self.network_model.get().and_then(|opt| opt.as_deref())
     }
 
@@ -906,56 +1016,6 @@ impl<'a> std::fmt::Debug for OpenContext<'a> {
     }
 }
 
-impl<'a> From<&'a SyntheticProcContext> for OpenContext<'a> {
-    fn from(ctx: &'a SyntheticProcContext) -> Self {
-        OpenContext {
-            timerslack_ns: ctx.timerslack_ns,
-            guest_arch: ctx.guest_arch,
-            native_guest_va: ctx.native_guest_va,
-            ruid: ctx.ruid,
-            euid: ctx.euid,
-            suid: ctx.suid,
-            rgid: ctx.rgid,
-            egid: ctx.egid,
-            sgid: ctx.sgid,
-            runtime_endpoint_container: ctx.runtime_endpoint_container,
-            identity: ctx.identity,
-            executable_path: LazyField::from_value(Some(Cow::Borrowed(&ctx.executable_path))),
-            argv: LazyField::from_value(Some(Cow::Borrowed(&ctx.argv))),
-            task_comm: LazyField::from_value(Some(Cow::Borrowed(&ctx.task_comm))),
-            guest_hostname: LazyField::from_value(Some(Cow::Borrowed(&ctx.guest_hostname))),
-            environ: LazyField::from_value(Some(Cow::Borrowed(&ctx.environ))),
-            open_fds: LazyField::from_value(Some(Cow::Borrowed(&ctx.open_fds))),
-            network: LazyField::from_value(Some(Cow::Borrowed(&ctx.network))),
-            network_model: LazyField::from_value(
-                ctx.network_model
-                    .clone()
-                    .map(|model| Arc::new(model) as Arc<dyn FsNetworkView>),
-            ),
-            groups: LazyField::from_value(Some(Cow::Borrowed(&ctx.groups))),
-            signals: LazyField::from_value((ctx.sig_ignored, ctx.sig_caught, ctx.sig_shdpnd)),
-            oom_score_adj: LazyField::from_value(Some(Cow::Borrowed(&ctx.oom_score_adj))),
-            creds_ns: LazyField::from_value(Some(
-                Arc::new(ctx.creds_ns.clone()) as Arc<dyn FsCaller>
-            )),
-            processes: LazyField::from_value(ctx.processes.as_deref().map(Cow::Borrowed)),
-            threads: LazyField::from_value(ctx.threads.as_deref().map(Cow::Borrowed)),
-            zombies: LazyField::from_value(ctx.zombies.as_deref().map(Cow::Borrowed)),
-            sysvipc_shm: LazyField::from_value(Some(Cow::Borrowed(&ctx.sysvipc_shm))),
-            sysvipc_sem: LazyField::from_value(Some(Cow::Borrowed(&ctx.sysvipc_sem))),
-            sysvipc_msg: LazyField::from_value(Some(Cow::Borrowed(&ctx.sysvipc_msg))),
-            mem: LazyField::from_value(OpenContextMemorySnapshot {
-                auxv: Cow::Borrowed(&ctx.auxv),
-                address_space_regions: ctx.address_space_regions.as_deref().map(Cow::Borrowed),
-                locked_memory: Cow::Borrowed(&ctx.locked_memory),
-                brk_current: ctx.brk_current,
-                mmap_next: ctx.mmap_next,
-                heap_base: ctx.heap_base,
-            }),
-        }
-    }
-}
-
 /// One mount's view of the filesystem: path metadata ([`lookup`](Vfs::lookup),
 /// [`readlink`](Vfs::readlink), [`readdir`](Vfs::readdir)), the open side
 /// ([`open`](Vfs::open), returning a [`VfsHandle`]), and the mutating ops
@@ -994,11 +1054,11 @@ pub trait Vfs: Send + Sync {
     }
 
     fn readlink(&self, _path: &str) -> Result<PathBuf, VfsError> {
-        Err(crate::linux_abi::LINUX_EINVAL)
+        Err(carrick_abi::LINUX_EINVAL)
     }
 
     fn readdir(&self, _path: &str) -> Result<Vec<DirEnt>, VfsError> {
-        Err(crate::linux_abi::LINUX_ENOTDIR)
+        Err(carrick_abi::LINUX_ENOTDIR)
     }
 
     /// Archive-only bounded enumeration. Implementations must stop after at
@@ -1006,7 +1066,7 @@ pub trait Vfs: Send + Sync {
     /// unchanged for guest getdents. Mounts that do not implement this
     /// capability fail closed instead of falling back to unbounded allocation.
     fn readdir_bounded(&self, _path: &str, _limit: usize) -> Result<Vec<DirEnt>, VfsError> {
-        Err(crate::linux_abi::LINUX_ENOSYS)
+        Err(carrick_abi::LINUX_ENOSYS)
     }
 
     /// Open `path`. Returns a [`VfsHandle`] variant that the
@@ -1019,7 +1079,7 @@ pub trait Vfs: Send + Sync {
         _flags: OpenFlags,
         _ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
-        Err(crate::linux_abi::LINUX_ENOSYS)
+        Err(carrick_abi::LINUX_ENOSYS)
     }
 
     /// True for single-file synthetic INJECTIONS that are merely defaults the
@@ -1031,7 +1091,7 @@ pub trait Vfs: Send + Sync {
     }
 
     fn watch_fd(&self, _path: &str) -> Result<i32, VfsError> {
-        Err(crate::linux_abi::LINUX_ENOSYS)
+        Err(carrick_abi::LINUX_ENOSYS)
     }
 
     fn watch_fds(&self, path: &str) -> Result<Vec<WatchFd>, VfsError> {
@@ -1040,42 +1100,42 @@ pub trait Vfs: Send + Sync {
     }
 
     fn mkdir(&self, _path: &str, _mode: u32) -> Result<(), VfsError> {
-        Err(crate::linux_abi::LINUX_EROFS)
+        Err(carrick_abi::LINUX_EROFS)
     }
 
     fn unlink(&self, _path: &str) -> Result<(), VfsError> {
-        Err(crate::linux_abi::LINUX_EROFS)
+        Err(carrick_abi::LINUX_EROFS)
     }
 
     fn rmdir(&self, _path: &str) -> Result<(), VfsError> {
-        Err(crate::linux_abi::LINUX_EROFS)
+        Err(carrick_abi::LINUX_EROFS)
     }
 
     fn rename(&self, _from: &str, _to: &str) -> Result<(), VfsError> {
-        Err(crate::linux_abi::LINUX_EROFS)
+        Err(carrick_abi::LINUX_EROFS)
     }
 
     fn symlink(&self, _target: &str, _link: &str) -> Result<(), VfsError> {
-        Err(crate::linux_abi::LINUX_EROFS)
+        Err(carrick_abi::LINUX_EROFS)
     }
 
     fn link(&self, _from: &str, _to: &str) -> Result<(), VfsError> {
-        Err(crate::linux_abi::LINUX_EROFS)
+        Err(carrick_abi::LINUX_EROFS)
     }
 
     fn chmod(&self, _path: &str, _mode: u32) -> Result<(), VfsError> {
-        Err(crate::linux_abi::LINUX_EROFS)
+        Err(carrick_abi::LINUX_EROFS)
     }
 
     /// Error returned when this mount cannot service setxattr. Mounts may
     /// distinguish an immutable filesystem (EROFS) from an unsupported xattr
     /// operation/namespace (EOPNOTSUPP) without adding an xattr data API.
-    fn setxattr_unsupported_errno(&self) -> crate::linux_abi::LinuxErrno {
-        crate::linux_abi::LINUX_ENOTSUP
+    fn setxattr_unsupported_errno(&self) -> carrick_abi::LinuxErrno {
+        carrick_abi::LINUX_ENOTSUP
     }
 
     fn create_socket(&self, _path: &str, _mode: u32) -> Result<(), VfsError> {
-        Err(crate::linux_abi::LINUX_EROFS)
+        Err(carrick_abi::LINUX_EROFS)
     }
 
     fn chown(
@@ -1085,7 +1145,7 @@ pub trait Vfs: Send + Sync {
         _gid: Option<carrick_abi::NsGid>,
         _nofollow: bool,
     ) -> Result<(), VfsError> {
-        Err(crate::linux_abi::LINUX_EROFS)
+        Err(carrick_abi::LINUX_EROFS)
     }
 
     fn set_times(
@@ -1095,11 +1155,11 @@ pub trait Vfs: Send + Sync {
         _mtime: Option<(i64, i64)>,
         _nofollow: bool,
     ) -> Result<(), VfsError> {
-        Err(crate::linux_abi::LINUX_EROFS)
+        Err(carrick_abi::LINUX_EROFS)
     }
 
     fn truncate(&mut self, _path: &str, _len: u64) -> Result<(), VfsError> {
-        Err(crate::linux_abi::LINUX_EROFS)
+        Err(carrick_abi::LINUX_EROFS)
     }
 
     /// Human-readable name for diagnostics / `--fs` reporting.
@@ -1109,7 +1169,7 @@ pub trait Vfs: Send + Sync {
     /// unsupported (only backends that can serve an executable — e.g. a `-v`
     /// bind mount — implement it).
     fn read_file(&self, _path: &str) -> Result<Vec<u8>, VfsError> {
-        Err(crate::linux_abi::LINUX_ENOSYS)
+        Err(carrick_abi::LINUX_ENOSYS)
     }
 
     fn name(&self) -> &'static str {

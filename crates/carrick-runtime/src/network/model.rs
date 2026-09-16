@@ -6,7 +6,7 @@ use carrick_abi::{
 use carrick_spec::{NetworkMode, NetworkNamespaceSpec};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use crate::vfs::{FsNetworkInterface, FsNetworkView};
+use carrick_vfs::{FsNetworkInterface, FsNetworkView};
 
 /// What the guest's network namespace looks like: which links exist, what
 /// addresses they carry, how packets leave, and who resolves names.

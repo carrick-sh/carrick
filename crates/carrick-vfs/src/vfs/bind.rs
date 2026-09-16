@@ -2,7 +2,7 @@
 //!
 //! # Theory of operation
 //!
-//! Unlike the synthetic mounts ([`super::proc`], [`super::sys`]) and the
+//! Unlike the synthetic mounts (`ProcVfs`, `SysVfs`) and the
 //! immutable rootfs, a [`BindVfs`] is a thin pass-through to a *real* host
 //! directory or file. It is the `docker run -v host:guest` mechanism, and
 //! carrick also uses it internally for `/dev/shm` (a per-process host tmpfs
@@ -37,7 +37,7 @@ use super::{
     DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle, WatchFd,
 };
 use crate::host_to_linux_errno;
-use crate::linux_abi::{LINUX_EBUSY, LINUX_EINVAL, LINUX_ENOENT, LINUX_ENXIO, LINUX_EROFS};
+use carrick_abi::{LINUX_EBUSY, LINUX_EINVAL, LINUX_ENOENT, LINUX_ENXIO, LINUX_EROFS};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeReexecBindMountV1 {
@@ -481,10 +481,10 @@ impl Vfs for BindVfs {
 
         if is_symlink {
             if flags.create && flags.excl {
-                return Err(crate::linux_abi::LINUX_EEXIST);
+                return Err(carrick_abi::LINUX_EEXIST);
             }
             if flags.nofollow {
-                return Err(crate::linux_abi::LINUX_ELOOP);
+                return Err(carrick_abi::LINUX_ELOOP);
             }
         }
         if host.is_dir() {
@@ -552,7 +552,7 @@ impl Vfs for BindVfs {
         }
 
         let status_flags = if flags.nonblock {
-            crate::linux_abi::LINUX_O_NONBLOCK as u32
+            carrick_abi::LINUX_O_NONBLOCK as u32
         } else {
             0
         };
@@ -712,11 +712,11 @@ impl Vfs for BindVfs {
         std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode)).map_err(map_io_error)
     }
 
-    fn setxattr_unsupported_errno(&self) -> crate::linux_abi::LinuxErrno {
+    fn setxattr_unsupported_errno(&self) -> carrick_abi::LinuxErrno {
         if self.readonly {
             LINUX_EROFS
         } else {
-            crate::linux_abi::LINUX_ENOTSUP
+            carrick_abi::LINUX_ENOTSUP
         }
     }
 
@@ -834,7 +834,7 @@ impl Vfs for BindVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linux_abi::LINUX_EBUSY;
+    use carrick_abi::LINUX_EBUSY;
 
     /// A read-write bind mount must let the guest delete the mount's CONTENTS
     /// but must NOT delete the mount POINT itself — that maps to the caller's
@@ -943,7 +943,7 @@ mod tests {
         };
         assert_eq!(
             vfs.open("/workspace/link_to_file", flags, &ctx),
-            Err(crate::linux_abi::LINUX_ELOOP)
+            Err(carrick_abi::LINUX_ELOOP)
         );
         let _ = std::fs::remove_dir_all(&src);
     }
@@ -964,7 +964,7 @@ mod tests {
         };
         assert_eq!(
             vfs.open("/workspace/link_to_dir", flags, &ctx),
-            Err(crate::linux_abi::LINUX_ELOOP)
+            Err(carrick_abi::LINUX_ELOOP)
         );
         let _ = std::fs::remove_dir_all(&src);
     }
@@ -991,7 +991,7 @@ mod tests {
         };
         assert_eq!(
             vfs.open("/workspace/link_to_file", flags_excl_nofollow, &ctx),
-            Err(crate::linux_abi::LINUX_EEXIST)
+            Err(carrick_abi::LINUX_EEXIST)
         );
 
         let flags_excl = OpenFlags {
@@ -1003,16 +1003,16 @@ mod tests {
         };
         assert_eq!(
             vfs.open("/workspace/link_to_file", flags_excl, &ctx),
-            Err(crate::linux_abi::LINUX_EEXIST)
+            Err(carrick_abi::LINUX_EEXIST)
         );
 
         assert_eq!(
             vfs.open("/workspace/dangling_link", flags_excl_nofollow, &ctx),
-            Err(crate::linux_abi::LINUX_EEXIST)
+            Err(carrick_abi::LINUX_EEXIST)
         );
         assert_eq!(
             vfs.open("/workspace/dangling_link", flags_excl, &ctx),
-            Err(crate::linux_abi::LINUX_EEXIST)
+            Err(carrick_abi::LINUX_EEXIST)
         );
 
         let _ = std::fs::remove_dir_all(&src);

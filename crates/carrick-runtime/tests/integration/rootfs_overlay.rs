@@ -6,7 +6,7 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
-use carrick_runtime::rootfs::{LayerSource, RootFs};
+use carrick_vfs::rootfs::{LayerSource, RootFs};
 use support::{gzip_tar, gzip_tar_with_links};
 
 #[test]

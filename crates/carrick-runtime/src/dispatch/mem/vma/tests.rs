@@ -63,7 +63,7 @@ fn vma_snapshot_projects_permissions_and_splits_kernel_hidden_coverage() {
     }]);
     locked_ranges_insert(
         &mut mem.secretmem_maps,
-        crate::vfs::GuestMemoryRange::new(GuestVa(0x2000), GuestVa(0x3000)).expect("secret range"),
+        carrick_vfs::GuestMemoryRange::new(GuestVa(0x2000), GuestVa(0x3000)).expect("secret range"),
     );
 
     assert_eq!(

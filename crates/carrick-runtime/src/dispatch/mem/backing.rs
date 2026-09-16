@@ -74,7 +74,7 @@ pub(crate) struct HostAliasMmapCommit {
     pub(crate) file_page_offset: Option<u64>,
     pub(crate) droppable: bool,
     pub(crate) semantic_vmas: Option<Vec<SemanticVma>>,
-    pub(crate) locked: Option<crate::vfs::GuestMemoryRange>,
+    pub(crate) locked: Option<carrick_vfs::GuestMemoryRange>,
     pub(crate) resident: bool,
     pub(crate) bus_fault: Option<(u64, u64)>,
     pub(crate) write_sealed_shared: bool,
@@ -198,7 +198,7 @@ pub(crate) struct SharedFileAliasCommit {
 
 #[derive(Clone)]
 pub(crate) struct SharedFileAliasEntry {
-    pub(crate) range: crate::vfs::GuestMemoryRange,
+    pub(crate) range: carrick_vfs::GuestMemoryRange,
     pub(crate) description: Arc<crate::kernel::FileDescription>,
     pub(crate) extent_base: carrick_guest_mem::Gpa,
     pub(crate) row_file_offset: u64,
@@ -230,7 +230,7 @@ pub(crate) fn trim_shared_file_alias_maps_for_range(
             continue;
         }
         if range_start < start
-            && let Some(prefix) = crate::vfs::GuestMemoryRange::new(
+            && let Some(prefix) = carrick_vfs::GuestMemoryRange::new(
                 GuestVa(range_start),
                 GuestVa(start.min(range_end)),
             )
@@ -243,8 +243,10 @@ pub(crate) fn trim_shared_file_alias_maps_for_range(
             });
         }
         if end < range_end
-            && let Some(suffix) =
-                crate::vfs::GuestMemoryRange::new(GuestVa(end.max(range_start)), GuestVa(range_end))
+            && let Some(suffix) = carrick_vfs::GuestMemoryRange::new(
+                GuestVa(end.max(range_start)),
+                GuestVa(range_end),
+            )
         {
             let suffix_start = end.max(range_start);
             let suffix_offset = entry
@@ -263,7 +265,7 @@ pub(crate) fn trim_shared_file_alias_maps_for_range(
 
 pub(crate) fn trim_writable_memfd_maps_for_range(
     maps: &mut Vec<(
-        crate::vfs::GuestMemoryRange,
+        carrick_vfs::GuestMemoryRange,
         Arc<crate::kernel::FileDescription>,
     )>,
     start: u64,
@@ -282,7 +284,7 @@ pub(crate) fn trim_writable_memfd_maps_for_range(
             continue;
         }
         if range_start < start
-            && let Some(prefix) = crate::vfs::GuestMemoryRange::new(
+            && let Some(prefix) = carrick_vfs::GuestMemoryRange::new(
                 GuestVa(range_start),
                 GuestVa(start.min(range_end)),
             )
@@ -290,8 +292,10 @@ pub(crate) fn trim_writable_memfd_maps_for_range(
             retained.push((prefix, std::sync::Arc::clone(&description)));
         }
         if end < range_end
-            && let Some(suffix) =
-                crate::vfs::GuestMemoryRange::new(GuestVa(end.max(range_start)), GuestVa(range_end))
+            && let Some(suffix) = carrick_vfs::GuestMemoryRange::new(
+                GuestVa(end.max(range_start)),
+                GuestVa(range_end),
+            )
         {
             retained.push((suffix, description));
         }
@@ -458,7 +462,7 @@ pub(crate) fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len
     trim_private_file_maps(&mut mem.private_file_maps, start, len);
     trim_remap_snapshots_for_range(&mut mem.remap_snapshots, start, len);
     let Some(remove) =
-        crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+        carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
     else {
         return;
     };
@@ -709,7 +713,7 @@ impl<'a> MemView<'a> {
             );
         };
         let Some(replacement) =
-            crate::vfs::GuestMemoryRange::new(GuestVa(commit.start), GuestVa(end))
+            carrick_vfs::GuestMemoryRange::new(GuestVa(commit.start), GuestVa(end))
         else {
             carrick_fatal!(
                 "dispatch::host_alias",
@@ -889,7 +893,7 @@ impl<'a> MemView<'a> {
                 None
             }
             OpenDescription::SyntheticDevice { kind, .. } => {
-                if *kind == crate::vfs::SyntheticDeviceKind::Zero {
+                if *kind == carrick_vfs::SyntheticDeviceKind::Zero {
                     None
                 } else {
                     return Err(linux_errno::ENODEV);
@@ -1051,7 +1055,7 @@ impl<'a> MemView<'a> {
 
     pub(crate) fn record_write_sealed_shared_map(&self, start: u64, len: u64) {
         if let Some(range) =
-            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+            carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
             locked_ranges_insert(&mut self.mem().lock().write_sealed_shared_maps, range);
         }
@@ -1059,7 +1063,7 @@ impl<'a> MemView<'a> {
 
     pub(crate) fn record_read_only_shared_file_map(&self, start: u64, len: u64) {
         if let Some(range) =
-            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+            carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
             locked_ranges_insert(&mut self.mem().lock().read_only_shared_file_maps, range);
         }
@@ -1110,7 +1114,7 @@ impl<'a> MemView<'a> {
 
     pub(in crate::dispatch::mem) fn record_secretmem_map(&self, start: u64, len: u64) {
         if let Some(range) =
-            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+            carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
             self.mem().lock().secretmem_maps.push(range);
         }
@@ -1130,7 +1134,7 @@ impl<'a> MemView<'a> {
     #[cfg(test)]
     pub(in crate::dispatch::mem) fn remove_secretmem_map(&self, start: u64, len: u64) {
         if let Some(range) =
-            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+            carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
             locked_ranges_remove(&mut self.mem().lock().secretmem_maps, range);
         }
@@ -1143,7 +1147,7 @@ impl<'a> MemView<'a> {
         description: Arc<crate::kernel::FileDescription>,
     ) {
         if let Some(range) =
-            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+            carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
             self.mem()
                 .lock()
@@ -1345,7 +1349,7 @@ impl<'a> MemView<'a> {
                 "record_alias_vma end address overflow"
             );
         };
-        let Some(range) = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) else {
+        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) else {
             carrick_fatal!(
                 "dispatch::host_alias",
                 "record_alias_vma invalid guest memory range"
