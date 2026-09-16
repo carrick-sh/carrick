@@ -381,35 +381,6 @@ enum PtraceTransport {
     VirtualHvpatch,
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct HostPgid(u32);
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PtraceWaitTarget {
-    Exact(HostPid),
-    Any,
-    ProcessGroup(HostPgid),
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VirtualPtraceControlRequest {
-    Continue,
-    Kill,
-    Detach,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PtraceRequestRoute {
-    Host,
-    Shared,
-    VirtualTraceme,
-    VirtualControl(VirtualPtraceControlRequest),
-}
-
 fn select_ptrace_transport(
     page_geometry: crate::page_profile::PageGeometry,
     hvpatch_lane: bool,
@@ -423,145 +394,8 @@ fn select_ptrace_transport(
     }
 }
 
-#[cfg(test)]
-fn should_drain_child_guest_cpu(transport: PtraceTransport, terminal_reap: bool) -> bool {
-    transport == PtraceTransport::Host || terminal_reap
-}
-
-#[cfg(test)]
-fn route_ptrace_request(
-    transport: PtraceTransport,
-    request: u64,
-    data: u64,
-) -> Result<PtraceRequestRoute, LinuxErrno> {
-    if transport == PtraceTransport::Host {
-        return Ok(PtraceRequestRoute::Host);
-    }
-    match request {
-        0 => Ok(PtraceRequestRoute::VirtualTraceme),
-        7 if data == 0 => Ok(PtraceRequestRoute::VirtualControl(
-            VirtualPtraceControlRequest::Continue,
-        )),
-        8 => Ok(PtraceRequestRoute::VirtualControl(
-            VirtualPtraceControlRequest::Kill,
-        )),
-        17 if data == 0 => Ok(PtraceRequestRoute::VirtualControl(
-            VirtualPtraceControlRequest::Detach,
-        )),
-        7 | 17 => Err(LINUX_EINVAL),
-        _ => Ok(PtraceRequestRoute::Shared),
-    }
-}
-
-#[cfg(test)]
-fn ptrace_wait_target_for_wait4(host_target: i32) -> PtraceWaitTarget {
-    match host_target {
-        target if target > 0 => PtraceWaitTarget::Exact(HostPid(target as u32)),
-        -1 => PtraceWaitTarget::Any,
-        0 => PtraceWaitTarget::ProcessGroup(HostPgid(unsafe { libc::getpgrp() } as u32)),
-        target => PtraceWaitTarget::ProcessGroup(HostPgid(target.unsigned_abs())),
-    }
-}
-
-// `libc::id_t` is u32 on Darwin and i64 on FreeBSD, so the fallible pid
-// conversion below is load-bearing on some targets and an identity on others.
-#[allow(clippy::useless_conversion)]
-#[cfg(test)]
-fn ptrace_wait_target_for_waitid(
-    host_idtype: libc::idtype_t,
-    host_id: libc::id_t,
-) -> PtraceWaitTarget {
-    // `host_id` re-enters the typed pid domain here. It was built from a host
-    // pid/pgid that already fits u32 (`ns_to_host_or_self` /
-    // `ns_to_host_pgid` / `pidfd_host_pid` all return u32 host ids; the
-    // `getpgrp` sentinel resolution is a positive pid_t), so this conversion
-    // is lossless by construction even where `libc::id_t` is a wider signed
-    // type (FreeBSD's i64). A value outside u32 names no real host process;
-    // degrade it to the conservative `Any` target (matches every lease)
-    // rather than wrapping into an unrelated pid.
-    let typed_host_id = u32::try_from(host_id).ok();
-    if host_idtype == libc::P_PID {
-        match typed_host_id {
-            Some(pid) => PtraceWaitTarget::Exact(HostPid(pid)),
-            None => PtraceWaitTarget::Any,
-        }
-    } else if host_idtype == libc::P_PGID {
-        let pgid = if host_id == 0 {
-            u32::try_from(unsafe { libc::getpgrp() }).ok()
-        } else {
-            typed_host_id
-        };
-        match pgid {
-            Some(pgid) => PtraceWaitTarget::ProcessGroup(HostPgid(pgid)),
-            None => PtraceWaitTarget::Any,
-        }
-    } else {
-        PtraceWaitTarget::Any
-    }
-}
-
-#[cfg(test)]
-fn ptrace_wait_target_conflicts(leased_pid: u32, target: PtraceWaitTarget) -> bool {
-    match target {
-        PtraceWaitTarget::Exact(pid) => pid.0 == leased_pid,
-        PtraceWaitTarget::Any => true,
-        PtraceWaitTarget::ProcessGroup(pgid) => {
-            let leased_pgid = unsafe { libc::getpgid(leased_pid as i32) };
-            leased_pgid > 0 && leased_pgid as u32 == pgid.0
-        }
-    }
-}
-
-#[cfg(test)]
-fn ptrace_wait_park_pid(target: PtraceWaitTarget) -> Option<i32> {
-    match target {
-        PtraceWaitTarget::Exact(pid) => i32::try_from(pid.0).ok(),
-        PtraceWaitTarget::Any => crate::guest_cpu::wait_any_park_pid(std::process::id()),
-        PtraceWaitTarget::ProcessGroup(pgid) => {
-            let has_direct_member = crate::guest_cpu::direct_children_for_wait(std::process::id())
-                .into_iter()
-                .any(|pid| unsafe { libc::getpgid(pid as i32) } == pgid.0 as i32);
-            if has_direct_member {
-                return Some(-1);
-            }
-            i32::try_from(pgid.0)
-                .ok()
-                .and_then(i32::checked_neg)
-                .and_then(|target| {
-                    crate::guest_cpu::pending_adopted_child(std::process::id(), target)
-                })
-                .and_then(|pid| i32::try_from(pid).ok())
-        }
-    }
-}
-
 fn hvpatch_reported_tid(kernel_tid: i32) -> Option<u32> {
     u32::try_from(kernel_tid).ok()
-}
-
-#[cfg(test)]
-fn virtual_ptrace_stop_status(linux_signum: i32) -> i32 {
-    (linux_signum << 8) | 0x7f
-}
-
-#[cfg(test)]
-fn child_is_terminally_waitable(pid: u32) -> bool {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-        )
-    };
-    if rc != 0 || carrick_portable::si_pid(&info) != pid as i32 {
-        return false;
-    }
-    const CLD_EXITED: i32 = 1;
-    const CLD_KILLED: i32 = 2;
-    const CLD_DUMPED: i32 = 3;
-    matches!(info.si_code, CLD_EXITED | CLD_KILLED | CLD_DUMPED)
 }
 
 /// Read a `struct sched_param { int sched_priority; }` out of guest memory
@@ -714,10 +548,6 @@ pub(super) struct ProcState {
     /// dispositions; Carrick needs this bit so the signal path can avoid routing
     /// those through the ordinary pending-signal queue.
     pub ptrace_traceme: bool,
-    /// Reported native virtual-ptrace stops keyed by host child PID. Presence is
-    /// also the exclusive wait lease: no terminal wait/reap may consume this PID
-    /// until control finishes its carrier delivery and removes the token.
-    pub virtual_ptrace_stops: std::collections::HashMap<u32, crate::guest_cpu::VirtualPtraceStop>,
     /// `membarrier(2)` per-process registration state: a bitmask of the
     /// expedited command bits this process has registered for (via the
     /// matching `MEMBARRIER_CMD_REGISTER_*`). An expedited private barrier
@@ -742,20 +572,6 @@ pub(super) fn affinity_to_bytes(mask: &[u64], out_len: usize) -> Vec<u8> {
         buf[off..off + n].copy_from_slice(&wb[..n]);
     }
     buf
-}
-
-/// Build a `LinuxRusage` carrying just CPU time (user/system microseconds);
-/// other fields stay zero. Used for the `wait4` rusage out-param.
-#[cfg(test)]
-fn rusage_from_us(user_us: u64, system_us: u64) -> LinuxRusage {
-    let tv = |us: u64| crate::linux_abi::LinuxTimeval {
-        tv_sec: (us / 1_000_000) as i64,
-        tv_usec: (us % 1_000_000) as i64,
-    };
-    let mut ru = LinuxRusage::zeroed();
-    ru.ru_utime = tv(user_us);
-    ru.ru_stime = tv(system_us);
-    ru
 }
 
 /// Parse a little-endian CPU bitmask from user bytes into `words` 64-bit words.
@@ -811,7 +627,6 @@ impl ProcState {
             itimers: [None, None, None],
             tso_enabled: false,
             ptrace_traceme: false,
-            virtual_ptrace_stops: std::collections::HashMap::new(),
             membarrier_ready: 0,
         }
     }
@@ -846,7 +661,6 @@ impl ProcState {
         child.timerslack_default = self.timerslack;
         child.itimers = [None, None, None];
         child.ptrace_traceme = false;
-        child.virtual_ptrace_stops.clear();
         child.membarrier_ready = 0;
         child
     }
@@ -867,35 +681,6 @@ impl ProcState {
         } else {
             crate::vfs::GuestReportedArch::Aarch64
         }
-    }
-
-    #[cfg(test)]
-    fn matching_virtual_ptrace_leases(
-        &mut self,
-        target: PtraceWaitTarget,
-    ) -> Vec<(u32, crate::guest_cpu::VirtualPtraceStop)> {
-        let stale: Vec<u32> = self
-            .virtual_ptrace_stops
-            .iter()
-            .filter_map(|(pid, stop)| {
-                (!crate::guest_cpu::virtual_ptrace_stop_is_reported(*stop)
-                    || child_is_terminally_waitable(*pid))
-                .then_some(*pid)
-            })
-            .collect();
-        for pid in stale {
-            self.virtual_ptrace_stops.remove(&pid);
-        }
-        self.virtual_ptrace_stops
-            .iter()
-            .filter(|(pid, _)| ptrace_wait_target_conflicts(**pid, target))
-            .map(|(pid, stop)| (*pid, *stop))
-            .collect()
-    }
-
-    #[cfg(test)]
-    fn record_virtual_ptrace_stop(&mut self, pid: u32, stop: crate::guest_cpu::VirtualPtraceStop) {
-        self.virtual_ptrace_stops.insert(pid, stop);
     }
 }
 
@@ -982,15 +767,6 @@ impl<'a> ProcView<'a> {
         self.cross.resolve_at_path(dirfd, path)
     }
 
-    #[cfg(test)]
-    #[inline]
-    pub(in crate::dispatch) fn drain_xsignals_process_directed(
-        &self,
-        context: &crate::kernel::KernelContext,
-    ) {
-        self.cross.drain_xsignals_process_directed(context);
-    }
-
     #[inline]
     pub(in crate::dispatch) fn hvpatch_exact_process_signal(
         &self,
@@ -1021,18 +797,6 @@ impl<'a> ProcView<'a> {
     ) -> bool {
         self.cross
             .has_deliverable_dispatch_pending_for_wait(context, tid, mask)
-    }
-
-    #[cfg(test)]
-    #[inline]
-    pub(in crate::dispatch) fn host_fd_for_poll(&self, fd: i32) -> Option<super::HostFd> {
-        self.cross.host_fd_for_poll(fd)
-    }
-
-    #[cfg(test)]
-    #[inline]
-    pub(in crate::dispatch) fn task_rlimits(&self) -> crate::kernel::RlimitSet {
-        self.cross.task_rlimits()
     }
 
     #[inline]
@@ -1104,11 +868,6 @@ impl<'a> ProcView<'a> {
         })
     }
 
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn guest_pid_is_live(&self, pid: i32) -> Option<bool> {
-        self.cross.guest_pid_is_live(pid)
-    }
     /// True once this dispatcher is running in a real host child created for a
     /// guest `fork`/fork-like `clone`. Such descendants inherited the original
     /// CLI process state and must use `_exit` on guest process exit instead of
@@ -1447,16 +1206,6 @@ impl<'a> ProcView<'a> {
                 self.proc_directory_pidfd_target(context, path)
             }
             _ => None,
-        }
-    }
-
-    /// Resolve a pidfd to its backing host pid, or `None` for guest-virtual
-    /// HvPatch pidfds and non-pidfd descriptors.
-    #[cfg(test)]
-    pub(super) fn pidfd_host_pid(&self, fd: i32) -> Option<i32> {
-        match self.pidfd_target(None, fd)? {
-            PidfdTarget::Host(pid) => Some(pid),
-            PidfdTarget::Hvpatch(_) => None,
         }
     }
 
@@ -3082,136 +2831,11 @@ impl<'a> ProcView<'a> {
                 };
                 return Ok(outcome);
             }
-            #[cfg(not(test))]
-            return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
-            #[cfg(test)]
-            {
-            // The tracee in the HOST domain (bare i32, NOT re-wrapped in
-            // NsPid: a host pid inside the ns-pid wrapper silently defeats
-            // every downstream `.names_self()`/`.to_host()`).
-            let host_pid = |pid: Pid| -> Option<i32> {
-                if crate::namespace::pid::enabled() && pid.0 > 0 {
-                    crate::namespace::pid::ns_to_host_or_self(pid.0 as u32).map(|host| host as i32)
-                } else {
-                    Some(pid.0)
-                }
-            };
-            let host_signal_data = || -> i32 {
-                let linux_signal = data as i32;
-                if linux_signal == 0 {
-                    0
-                } else {
-                    crate::host_signal::linux_to_host_signum(linux_signal)
-                }
-            };
-            // Carrick's kernel graph is the only guest-process liveness
-            // authority. A missing kernel binding is a retired one-task path,
-            // never permission to probe an arbitrary host pid.
-            let target_exists = |host: i32| -> bool {
-                this.guest_pid_is_live(host).unwrap_or(false)
-            };
-
-            let route = match route_ptrace_request(transport, request, data) {
-                Ok(route) => route,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
-            match route {
-                PtraceRequestRoute::VirtualTraceme => {
-                    let mut proc = this.proc.lock();
-                    if proc.ptrace_traceme {
-                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM));
-                    }
-                    let tracer_pid = u32::try_from(unsafe { libc::getppid() }).unwrap_or(0);
-                    if !crate::guest_cpu::register_self_virtual_ptrace(tracer_pid) {
-                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM));
-                    }
-                    proc.ptrace_traceme = true;
-                    return Ok(DispatchOutcome::Returned { value: 0 });
-                }
-                PtraceRequestRoute::VirtualControl(_) => {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
-                }
-                PtraceRequestRoute::Host | PtraceRequestRoute::Shared => {}
-            }
-
-            let result = match request {
-                0 => {
-                    if this.proc.lock().ptrace_traceme {
-                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM));
-                    }
-                    unsafe { carrick_portable::ptrace(carrick_portable::PT_TRACE_ME, 0, 0, 0) }
-                }
-                7 => match host_pid(pid) {
-                    Some(host) => unsafe {
-                        carrick_portable::ptrace(
-                            carrick_portable::PT_CONTINUE,
-                            host,
-                            1,
-                            host_signal_data(),
-                        )
-                    },
-                    None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
-                },
-                8 => match host_pid(pid) {
-                    Some(host) => unsafe {
-                        carrick_portable::ptrace(carrick_portable::PT_KILL, host, 0, 0)
-                    },
-                    None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
-                },
-                17 => match host_pid(pid) {
-                    Some(host) => unsafe {
-                        carrick_portable::ptrace(
-                            carrick_portable::PT_DETACH,
-                            host,
-                            1,
-                            host_signal_data(),
-                        )
-                    },
-                    None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
-                },
-                LINUX_PTRACE_ATTACH => match host_pid(pid) {
-                    Some(host) if host > 0 && target_exists(host) => {
-                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM));
-                    }
-                    _ => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
-                },
-                LINUX_PTRACE_PEEKTEXT
-                | LINUX_PTRACE_PEEKDATA
-                | LINUX_PTRACE_POKETEXT
-                | LINUX_PTRACE_POKEDATA => match host_pid(pid) {
-                    Some(host) if host > 0 => {
-                        let exists = target_exists(host);
-                        if !exists {
-                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-                        }
-                        if ptrace_text_data_addr_is_invalid(addr) {
-                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
-                        }
-                        return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
-                    }
-                    _ => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
-                },
-                LINUX_PTRACE_PEEKUSER | LINUX_PTRACE_POKEUSER => match host_pid(pid) {
-                    Some(host) if host > 0 => {
-                        let exists = target_exists(host);
-                        if !exists {
-                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-                        }
-                        if ptrace_user_addr_is_invalid(addr) {
-                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
-                        }
-                        return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
-                    }
-                    _ => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
-                },
-                _ => return Ok(DispatchOutcome::errno(LINUX_ENOSYS)),
-            };
-            result.host_syscall_errno()?;
-            if request == 0 {
-                this.proc.lock().ptrace_traceme = true;
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
-            }
+            // A task with no HVPatch process binding has no tracee: the
+            // retired 1:1 native lane's host `ptrace` calls lived here
+            // (e1fbfd32e) and were deleted with the kernel extraction plan;
+            // git remembers them.
+            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
         }
 
         fn reboot(this, cx) {
@@ -3352,9 +2976,6 @@ impl<'a> ProcView<'a> {
         }
 
         fn waitid(this, cx, idtype: u64, id: u64, infop_addr: GuestPtr, options: u64) {
-            #[cfg(test)]
-            let transport =
-                select_ptrace_transport(this.page_geometry(), this.hvpatch_process().is_some());
             // Retain unknown bits so the supported-mask rejection below stays
             // bit-identical to the raw `options & !SUPPORTED != 0` test.
             let options = LinuxWaitOptions::from_bits_retain(options);
@@ -3517,353 +3138,14 @@ impl<'a> ProcView<'a> {
                     }
                 }
             }
-            #[cfg(not(test))]
-            return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
-            #[cfg(test)]
-            {
-            let (host_idtype, host_id): (libc::idtype_t, libc::id_t) = match idtype {
-                LINUX_P_ALL => (libc::P_ALL, 0),
-                LINUX_P_PID => {
-                    // Translate the ns-pid arg to the host pid the kernel knows
-                    // (§5.3); an ns-pid that names no member is ECHILD.
-                    match crate::namespace::pid::ns_to_host_or_self(id as u32) {
-                        Some(h) => (libc::P_PID, h as libc::id_t),
-                        None => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD)),
-                    }
-                }
-                // P_PGID names a process group (§6.6). Linux `id == 0` means
-                // the caller's own group; Darwin requires the concrete pgid,
-                // so resolve that sentinel before entering waitid. A non-zero
-                // `id` is the guest's ns-pgid; translate it to the
-                // host pgid via the same helper `setpgid`/`F_OWNER_PGRP`/
-                // `TIOCSPGRP` use, so the host waitid matches the real host
-                // group instead of ECHILD-ing on an untranslated ns value. An
-                // ns-pgid that names no group is ECHILD (no such child).
-                LINUX_P_PGID => {
-                    if id == 0 {
-                        (libc::P_PGID, unsafe { libc::getpgrp() } as libc::id_t)
-                    } else {
-                        match crate::namespace::pid::ns_to_host_pgid(id as u32) {
-                            Some(h) => (libc::P_PGID, h as libc::id_t),
-                            None => {
-                                return Ok(DispatchOutcome::errno(
-                                    crate::linux_abi::LINUX_ECHILD,
-                                ));
-                            }
-                        }
-                    }
-                }
-                LINUX_P_PIDFD => match this.pidfd_host_pid(id as i32) {
-                    Some(host_pid) => (libc::P_PID, host_pid as libc::id_t),
-                    None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
-                },
-                _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
-            };
-            let mut host_options: i32 = 0;
-            if options.contains(LinuxWaitOptions::WEXITED) {
-                host_options |= libc::WEXITED;
-            }
-            if options.contains(LinuxWaitOptions::WSTOPPED) {
-                host_options |= libc::WSTOPPED;
-            }
-            if options.contains(LinuxWaitOptions::WCONTINUED) {
-                host_options |= libc::WCONTINUED;
-            }
-            if options.contains(LinuxWaitOptions::WNOWAIT) {
-                host_options |= libc::WNOWAIT;
-            }
-            let guest_nohang = options.contains(LinuxWaitOptions::WNOHANG);
-
-            let lease_target = ptrace_wait_target_for_waitid(host_idtype, host_id);
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            let mut virtual_waitid_stop = None;
-            let mut native_proc = (transport == PtraceTransport::VirtualNative)
-                .then(|| this.proc.lock());
-            if let Some(proc) = native_proc.as_mut() {
-                let leases = proc.matching_virtual_ptrace_leases(lease_target);
-                if options.contains(LinuxWaitOptions::WSTOPPED) {
-                    for (leased_pid, stop) in &leases {
-                        let mut leased_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                        let probe_options = libc::WSTOPPED
-                            | libc::WNOHANG
-                            | (host_options & libc::WNOWAIT);
-                        let rc = unsafe {
-                            libc::waitid(
-                                libc::P_PID,
-                                *leased_pid as libc::id_t,
-                                &mut leased_info,
-                                probe_options,
-                            )
-                        };
-                        if rc == 0
-                            && carrick_portable::si_pid(&leased_info) == *leased_pid as i32
-                            && carrick_portable::si_status(&leased_info) == libc::SIGSTOP
-                            && matches!(
-                                leased_info.si_code,
-                                libc::CLD_TRAPPED | libc::CLD_STOPPED
-                            )
-                        {
-                            info = leased_info;
-                            virtual_waitid_stop = Some(*stop);
-                            break;
-                        }
-                    }
-                }
-                if virtual_waitid_stop.is_none()
-                    && matches!(lease_target, PtraceWaitTarget::Exact(_))
-                    && let Some((leased_pid, _)) = leases.first()
-                {
-                    let leased_pid = *leased_pid;
-                    drop(native_proc);
-                    if guest_nohang {
-                        if infop_addr.0 != 0 {
-                            let memory = &mut *cx.memory;
-                            memory.write_bytes(
-                                infop_addr.0,
-                                &[0u8; crate::linux_abi::LINUX_SIGINFO_SIZE],
-                            )?;
-                        }
-                        return Ok(DispatchOutcome::Returned { value: 0 });
-                    }
-                    if idtype == LINUX_P_PIDFD && this.pidfd_is_nonblocking(id as i32) {
-                        return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
-                    }
-                    let tid = Self::ctx_tid(cx);
-                    let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
-                    let sig_mask = carrick_abi::WaitSigMask::Additive(non_interrupting);
-                    return Ok(if options.intersects(
-                        LinuxWaitOptions::WSTOPPED | LinuxWaitOptions::WCONTINUED,
-                    ) {
-                        DispatchOutcome::WaitOnProcState {
-                            pid: leased_pid as i32,
-                            sig_mask,
-                        }
-                    } else {
-                        DispatchOutcome::WaitOnProcExit {
-                            pid: leased_pid as i32,
-                            sig_mask,
-                        }
-                    });
-                }
-            }
-            let mut native_main_waitid_peek = false;
-            if virtual_waitid_stop.is_none() {
-                let internal_options = host_options
-                    | libc::WNOHANG
-                    | if transport == PtraceTransport::VirtualNative {
-                        native_main_waitid_peek = true;
-                        libc::WNOWAIT
-                    } else {
-                        0
-                    };
-                let r = unsafe {
-                    libc::waitid(host_idtype, host_id, &mut info, internal_options)
-                };
-                if r != 0 {
-                    // Route the host errno through the central Darwin->Linux helper
-                    // (a raw Darwin errno >34 would otherwise leak to the guest).
-                    let errno = crate::dispatch::HostSyscallError::last().linux_errno();
-                    return Ok(DispatchOutcome::errno(errno));
-                }
-            }
-            let selected_state = clear_unrequested_waitid_state(&mut info, options);
-            if selected_state
-                && virtual_waitid_stop.is_none()
-                && transport == PtraceTransport::VirtualNative
-                && carrick_portable::si_pid(&info) > 0
-                && carrick_portable::si_status(&info) == libc::SIGSTOP
-                && matches!(info.si_code, libc::CLD_TRAPPED | libc::CLD_STOPPED)
-                && let Some(stop) = crate::guest_cpu::report_child_virtual_ptrace_stop(
-                    carrick_portable::si_pid(&info) as u32,
-                )
-            {
-                if let Some(proc) = native_proc.as_mut() {
-                    proc.record_virtual_ptrace_stop(
-                        carrick_portable::si_pid(&info) as u32,
-                        stop,
-                    );
-                    virtual_waitid_stop = Some(stop);
-                }
-            }
-            if native_main_waitid_peek
-                && selected_state
-                && carrick_portable::si_pid(&info) > 0
-                && !options.contains(LinuxWaitOptions::WNOWAIT)
-            {
-                let selected_pid = carrick_portable::si_pid(&info);
-                let Some(state_option) = waitid_host_state_option(info.si_code) else {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                };
-                let mut consumed_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                let r = unsafe {
-                    libc::waitid(
-                        libc::P_PID,
-                        selected_pid as libc::id_t,
-                        &mut consumed_info,
-                        state_option | libc::WNOHANG,
-                    )
-                };
-                if r != 0 {
-                    let errno = crate::dispatch::HostSyscallError::last().linux_errno();
-                    return Ok(DispatchOutcome::errno(errno));
-                }
-                if carrick_portable::si_pid(&consumed_info) != selected_pid {
-                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
-                }
-                info = consumed_info;
-            }
-            drop(native_proc);
-            let si_pid = carrick_portable::si_pid(&info);
-            if si_pid == 0 && !guest_nohang {
-                if idtype == LINUX_P_PIDFD
-                    && let Some(host_fd) = this.host_fd_for_poll(id as i32) {
-                        if this.pidfd_is_nonblocking(id as i32) {
-                            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
-                        }
-                        let files = this.captured_file_table();
-                        let fds = match WaitFds::raw_one(host_fd.get(), libc::POLLIN)
-                            .with_guest_slots(&files, [id as i32])
-                        {
-                            Ok(fds) => fds,
-                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                        };
-                        return Ok(DispatchOutcome::WaitOnFds {
-                            fds,
-                            timeout: None,
-                            sig_mask: carrick_abi::WaitSigMask::NONE,
-                            completion: FdWaitCompletion::Poll { on_timeout: 0 },
-                        });
-                    }
-                if transport == PtraceTransport::VirtualNative {
-                    let Some(wait_pid) = ptrace_wait_park_pid(lease_target) else {
-                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
-                    };
-                    let tid = Self::ctx_tid(cx);
-                    let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
-                    let sig_mask = carrick_abi::WaitSigMask::Additive(non_interrupting);
-                    return Ok(if options.intersects(
-                        LinuxWaitOptions::WSTOPPED | LinuxWaitOptions::WCONTINUED,
-                    ) {
-                        DispatchOutcome::WaitOnProcState {
-                            pid: wait_pid,
-                            sig_mask,
-                        }
-                    } else {
-                        DispatchOutcome::WaitOnProcExit {
-                            pid: wait_pid,
-                            sig_mask,
-                        }
-                    });
-                }
-                if idtype == LINUX_P_PID {
-                    // Same no-interrupt mask as wait4: a blocked or
-                    // delivered-and-dropped signal must not EINTR the park.
-                    // Park on the HOST pid (host_id), not the guest ns-pid —
-                    // WaitOnProcExit watches the real host process (§5.3).
-                    let tid = Self::ctx_tid(cx);
-                    let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
-                    return Ok(DispatchOutcome::WaitOnProcExit {
-                        pid: host_id as i32,
-                        sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
-                    });
-                }
-                loop {
-                    let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };
-                    if r == 0 {
-                        if !clear_unrequested_waitid_state(&mut info, options) {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                            continue;
-                        }
-                        break;
-                    }
-                    let errno = crate::dispatch::HostSyscallError::last().linux_errno();
-                    if errno == LINUX_EINTR
-                        && !crate::host_signal::has_process_pending()
-                        && !crate::fork_quiesce::is_quiescing()
-                    {
-                        continue;
-                    }
-                    return Ok(DispatchOutcome::errno(errno));
-                }
-            }
-            // Mirror wait4 (the child-CPU drain): roll a reaped child's guest CPU
-            // into this process's child-time accumulators (RUSAGE_CHILDREN / times
-            // cutime). Only on a TERMINAL reap that consumed the zombie: si_pid
-            // set, not WNOWAIT (peek leaves the zombie for the real reap), and an
-            // exit/kill code (not stop/continue). (audit M4; probe waitidcputime)
-            let terminal_reap = {
-                const CLD_EXITED: i32 = 1;
-                const CLD_KILLED: i32 = 2;
-                const CLD_DUMPED: i32 = 3;
-                let terminal = matches!(info.si_code, CLD_EXITED | CLD_KILLED | CLD_DUMPED);
-                if carrick_portable::si_pid(&info) != 0
-                    && !options.contains(LinuxWaitOptions::WNOWAIT)
-                    && terminal
-                {
-                    // Host waitid returns no rusage; the published channel is
-                    // the only source (under the native provider it carries the
-                    // child's full Darwin CPU, published at exit).
-                    let child_guest_ns =
-                        crate::guest_cpu::reap_child_guest_ns(carrick_portable::si_pid(&info) as u32);
-                    let (child_user_us, child_system_us) =
-                        crate::guest_cpu::reaped_child_cpu_parts(child_guest_ns, None);
-                    crate::guest_cpu::add_reaped_child(child_user_us, child_system_us);
-                    // Tear down the now-dead child's leaked host VM node (bhyve);
-                    // no-op on KVM/HVF. See the wait4 reap path.
-                    carrick_hal::vm_backend::reap_child_vm(carrick_portable::si_pid(&info) as u32);
-                    true
-                } else {
-                    false
-                }
-            };
-            if infop_addr.0 != 0 {
-                let bytes = if carrick_portable::si_pid(&info) == 0 {
-                    [0u8; crate::linux_abi::LINUX_SIGINFO_SIZE]
-                } else {
-                    // The reaped child's si_pid is a host pid; the guest must see
-                    // its ns-local pid (§5.3). Identity when namespaces are off.
-                    let ns_si_pid =
-                        crate::namespace::pid::host_to_ns_or_self(carrick_portable::si_pid(&info) as u32) as i32;
-                    // macOS reports CLD_KILLED for a signal death (the host never
-                    // dumps core); Linux reports CLD_DUMPED when the child died by
-                    // a core-dumping signal with core dumps enabled. Synthesize it
-                    // (mirrors the wait4 wstatus 0x80 bit) so waitid(WEXITED)
-                    // matches — waitid10: a SIGFPE child → CLD_DUMPED.
-                    let si_code = this.core_dumped_si_code(
-                        info.si_code,
-                        carrick_portable::si_status(&info),
-                    );
-                    if let Some(stop) = virtual_waitid_stop {
-                        build_linux_sigchld_siginfo(
-                            ns_si_pid,
-                            carrick_portable::si_uid(&info),
-                            libc::CLD_TRAPPED,
-                            stop.linux_signum(),
-                        )
-                    } else {
-                        build_sigchld_siginfo(
-                            ns_si_pid,
-                            carrick_portable::si_uid(&info),
-                            si_code,
-                            carrick_portable::si_status(&info),
-                        )
-                    }
-                };
-                let memory = &mut *cx.memory;
-                memory.write_bytes(infop_addr.0, &bytes)?;
-            }
-            if terminal_reap {
-                crate::namespace::pid::unregister_reaped(carrick_portable::si_pid(&info) as u32);
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
-            }
+            // A task with no HVPatch process binding cannot wait: the retired
+            // 1:1 native lane's host-pid wait lived here (e1fbfd32e) and was
+            // deleted with the kernel extraction plan; git remembers it.
+            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
         }
 
         fn wait4(this, cx, pid: Pid, wstatus_addr: GuestPtr, options: u64, rusage_addr: GuestPtr) {
             let memory = &mut *cx.memory;
-            #[cfg(test)]
-            let transport =
-                select_ptrace_transport(this.page_geometry(), this.hvpatch_process().is_some());
             // Retain unknown bits so the supported-mask rejection stays
             // bit-identical to the raw `options & !SUPPORTED != 0` test.
             let options = LinuxWaitOptions::from_bits_retain(options);
@@ -3995,484 +3277,10 @@ impl<'a> ProcView<'a> {
                     }
                 }
             }
-            #[cfg(not(test))]
-            return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
-            #[cfg(test)]
-            {
-            // PID namespace (§5.3): a positive `pid` arg names a child by its
-            // ns-pid; translate it to the host pid the kernel knows. An ns-pid
-            // that names no member is ESRCH. pid <= 0 (any-child / pgrp) stays
-            // host-level; only the RESULT is translated back (below). Identity
-            // when namespaces are off.
-            // The wait target in the HOST domain: a positive ns-pid translates
-            // to the host pid; `<= 0` sentinels (any-child / process-group)
-            // pass through untranslated. A bare i32 (not HostPid) because the
-            // sentinel values are part of the domain; NOT an NsPid — stuffing
-            // the translated host pid back into NsPid defeated the wrapper's
-            // whole purpose (a downstream `.names_self()`/`.to_host()` would
-            // silently double-translate).
-            let host_target: i32 = if crate::namespace::pid::enabled() && pid.0 > 0 {
-                match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
-                    Some(h) => h as i32,
-                    None => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD)),
-                }
-            } else if crate::namespace::pid::enabled() && pid.0 < -1 && pid.0 != i32::MIN {
-                // A process-group wait names ns-pgid `-pid`; translate it to
-                // the host pgid via the same helper `setpgid`/`F_OWNER_PGRP`/
-                // `TIOCSPGRP` use, so the host wait4 matches the real host
-                // group instead of finding none and ECHILD-ing. An ns-pgid
-                // that names no group is ECHILD (Linux: no such child,
-                // matching the `pid > 0` non-member case above). `i32::MIN` is
-                // excluded: its magnitude can never be a real ns-pgid (LTP
-                // waitpid04's "invalid process group" case expects ESRCH, via
-                // the untranslated host_target < -1 EINVAL remap below — not
-                // this branch's ECHILD).
-                match crate::namespace::pid::ns_to_host_pgid(pid.0.unsigned_abs()) {
-                    Some(h) => -(h as i32),
-                    None => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD)),
-                }
-            } else {
-                pid.0
-            };
-            let wait_target = ptrace_wait_target_for_wait4(host_target);
-            let mut host_options: i32 = 0;
-            if options.contains(LinuxWaitOptions::WNOHANG) {
-                host_options |= libc::WNOHANG;
-            }
-            if options.contains(LinuxWaitOptions::WUNTRACED) {
-                host_options |= libc::WUNTRACED;
-            }
-            if options.contains(LinuxWaitOptions::WCONTINUED) {
-                host_options |= libc::WCONTINUED;
-            }
-            let virtual_stop_requested = transport == PtraceTransport::VirtualNative
-                && if host_target > 0 {
-                    crate::guest_cpu::child_virtual_ptrace_stop_requested(host_target as u32)
-                } else {
-                    crate::guest_cpu::direct_child_ptrace_stop_pending(std::process::id())
-                };
-            if virtual_stop_requested {
-                // Linux reports ptrace stops without requiring guest WUNTRACED;
-                // Darwin needs it only to expose our invisible SIGSTOP carrier.
-                host_options |= libc::WUNTRACED;
-            }
-            let mut host_status: i32 = 0;
-            let mut host_rusage: libc::rusage = unsafe { std::mem::zeroed() };
-            // A ptraced child can become waitable for a signal-delivery stop
-            // even without WUNTRACED. EVFILT_PROC/NOTE_EXIT would sleep past
-            // that stop, so let Darwin's wait4 observe a published pending stop.
-            let has_pending_ptrace_stop = host_target > 0
-                && crate::guest_cpu::child_has_ptrace_stop_pending(host_target as u32);
-            let can_park_on_proc_exit = (host_target > 0 || host_target == -1)
-                && host_options & libc::WNOHANG == 0
-                && !options.intersects(LinuxWaitOptions::WUNTRACED | LinuxWaitOptions::WCONTINUED)
-                && !has_pending_ptrace_stop;
-            let wait_proc_exit_pid = || -> Option<i32> {
-                if transport == PtraceTransport::VirtualNative {
-                    return ptrace_wait_park_pid(wait_target);
-                }
-                if host_target > 0 {
-                    return Some(host_target);
-                }
-                if host_target == -1 {
-                    // -1 stays -1 while any direct child exists: the io_wait
-                    // any-child kqueue path watches EVERY direct child, so a
-                    // single-pid substitution would sleep through a sibling's
-                    // exit. None (no children at all) becomes ECHILD below.
-                    return crate::guest_cpu::wait_any_park_pid(std::process::id());
-                }
-                None
-            };
-            let mut host_status_is_guest_status = false;
-            let result = if transport == PtraceTransport::VirtualNative {
-                // The process-state lock is the native backend's exclusive wait
-                // lease. Keep it across the nonblocking host poll and stop-token
-                // publication so control cannot race an in-flight consuming wait.
-                let mut proc = this.proc.lock();
-                let leases = proc.matching_virtual_ptrace_leases(wait_target);
-                let mut leased_result = None;
-                for (leased_pid, stop) in &leases {
-                    let result = unsafe {
-                        libc::wait4(
-                            *leased_pid as i32,
-                            &mut host_status,
-                            libc::WUNTRACED | libc::WNOHANG,
-                            &mut host_rusage,
-                        )
-                    }
-                    .host_syscall_errno();
-                    match result {
-                        Ok(value)
-                            if value > 0
-                                && libc::WIFSTOPPED(host_status)
-                                && libc::WSTOPSIG(host_status) == libc::SIGSTOP =>
-                        {
-                            host_status = virtual_ptrace_stop_status(stop.linux_signum());
-                            host_status_is_guest_status = true;
-                            leased_result = Some(Ok(value));
-                            break;
-                        }
-                        Ok(value)
-                            if value > 0
-                                && (libc::WIFEXITED(host_status)
-                                    || libc::WIFSIGNALED(host_status)) =>
-                        {
-                            proc.virtual_ptrace_stops.remove(leased_pid);
-                            leased_result = Some(Ok(value));
-                            break;
-                        }
-                        Err(errno) if errno != crate::linux_abi::LINUX_ECHILD => {
-                            leased_result = Some(Err(errno));
-                            break;
-                        }
-                        Ok(_) | Err(_) => {}
-                    }
-                }
-                if leased_result.is_none()
-                    && matches!(wait_target, PtraceWaitTarget::Exact(_))
-                    && let Some((leased_pid, _)) = leases.first()
-                {
-                    let leased_pid = *leased_pid;
-                    drop(proc);
-                    if options.contains(LinuxWaitOptions::WNOHANG) {
-                        return Ok(DispatchOutcome::Returned { value: 0 });
-                    }
-                    let tid = Self::ctx_tid(cx);
-                    let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
-                    let sig_mask = carrick_abi::WaitSigMask::Additive(non_interrupting);
-                    return Ok(if options.intersects(
-                        LinuxWaitOptions::WUNTRACED | LinuxWaitOptions::WCONTINUED,
-                    ) {
-                        DispatchOutcome::WaitOnProcState {
-                            pid: leased_pid as i32,
-                            sig_mask,
-                        }
-                    } else {
-                        DispatchOutcome::WaitOnProcExit {
-                            pid: leased_pid as i32,
-                            sig_mask,
-                        }
-                    });
-                }
-                let result = match leased_result {
-                    Some(result) => result,
-                    None => unsafe {
-                        libc::wait4(
-                            host_target,
-                            &mut host_status,
-                            host_options | libc::WNOHANG,
-                            &mut host_rusage,
-                        )
-                    }
-                    .host_syscall_errno(),
-                };
-                if let Ok(value) = result
-                    && value > 0
-                    && libc::WIFSTOPPED(host_status)
-                    && libc::WSTOPSIG(host_status) == libc::SIGSTOP
-                    && let Some(stop) =
-                        crate::guest_cpu::report_child_virtual_ptrace_stop(value as u32)
-                {
-                    host_status = virtual_ptrace_stop_status(stop.linux_signum());
-                    proc.record_virtual_ptrace_stop(value as u32, stop);
-                    host_status_is_guest_status = true;
-                }
-                drop(proc);
-                result
-            } else if can_park_on_proc_exit {
-                let r = loop {
-                    let r = unsafe {
-                        libc::wait4(
-                            host_target,
-                            &mut host_status,
-                            host_options | libc::WNOHANG,
-                            &mut host_rusage,
-                        )
-                    };
-                    // KVM lane: a tracee stop on a carrick-internal signal is
-                    // absorbed (PTRACE_CONT re-inject) and the WNOHANG probe is
-                    // re-issued — never surfaced to the guest.
-                    if let Ok(value) = r.host_syscall_errno()
-                        && value > 0
-                        && absorb_internal_tracee_stop(value, host_status)
-                    {
-                        continue;
-                    }
-                    break r;
-                };
-                match r.host_syscall_errno() {
-                    Ok(0) => {
-                        // Don't interrupt the park for a pending signal that is
-                        // blocked OR will be delivered-and-dropped (SIG_IGN /
-                        // default-ignore SIGCHLD/SIGURG/SIGWINCH). Otherwise a
-                        // sibling child's default-ignored SIGCHLD spuriously
-                        // EINTRs this wait — LTP futex_cmp_requeue01 / any
-                        // multi-child reap. A real handler still interrupts
-                        // (then SA_RESTART restarts wait4).
-                        let tid = Self::ctx_tid(cx);
-                        let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
-                        let Some(wait_pid) = wait_proc_exit_pid() else {
-                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
-                        };
-                        return Ok(DispatchOutcome::WaitOnProcExit {
-                            pid: wait_pid,
-                            sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
-                        });
-                    }
-                    Ok(value) => Ok(value),
-                    Err(errno) => Err(errno),
-                }
-            } else {
-                loop {
-                    let r =
-                        unsafe { libc::wait4(host_target, &mut host_status, host_options, &mut host_rusage) };
-                    match r.host_syscall_errno() {
-                        Ok(value) => {
-                            // KVM lane: absorb (PTRACE_CONT re-inject) a tracee
-                            // stop on a carrick-internal signal and re-wait.
-                            if value > 0 && absorb_internal_tracee_stop(value, host_status) {
-                                continue;
-                            }
-                            break Ok(value);
-                        }
-                        Err(errno) => {
-                            if errno == LINUX_EINTR && !crate::host_signal::has_process_pending() {
-                                continue;
-                            }
-                            break Err(errno);
-                        }
-                    }
-                }
-            };
-            // Adopted children (subreaper orphans): the host kernel answers
-            // ECHILD because this process never was the host parent. Classify
-            // ready-vs-pending in ONE table scan (`adopted_child_wait`): the
-            // orphan's exit publication (`record_child_exit_status`) flips
-            // `exit_ready` false→true concurrently with this wait, and two
-            // separate scans (reap-ready first, then pending) let the flip land
-            // BETWEEN them — both miss and a live adopted child was reported
-            // ECHILD (childsubreaper `wait_reaped_orphan=false` under native).
-            let adopted = match result {
-                Err(errno) if errno == crate::linux_abi::LINUX_ECHILD => {
-                    crate::guest_cpu::adopted_child_wait(std::process::id(), host_target)
-                }
-                _ => None,
-            };
-            let result = match result {
-                Ok(value) => value,
-                Err(errno) => {
-                    if let Some(crate::guest_cpu::AdoptedChildWait::Reaped {
-                        pid,
-                        status,
-                        guest_ns,
-                    }) = adopted
-                    {
-                        // Linux makes the child-exit signal observable by the
-                        // time waitpid returns. A DIRECT child's terminal reap
-                        // publishes its watch entry synchronously below; an
-                        // adopted child's SIGCHLD instead rides the xsig ring
-                        // (enqueued by the orphan BEFORE it published this
-                        // reapable record) — drain it now so the signal is
-                        // pending before this wait4 completes, not whenever the
-                        // async nudge lands.
-                        this.drain_xsignals_process_directed(cx.kernel);
-                        // Adopted reap: this process was never the host parent,
-                        // so there is no host rusage — the published channel is
-                        // the only source under every provider.
-                        let (child_user_us, child_system_us) =
-                            crate::guest_cpu::reaped_child_cpu_parts(guest_ns, None);
-                        crate::guest_cpu::add_reaped_child(child_user_us, child_system_us);
-                        if rusage_addr.0 != 0 {
-                            let child_rusage = rusage_from_us(child_user_us, child_system_us);
-                            if memory
-                                .write_bytes(rusage_addr.0, child_rusage.abi_bytes())
-                                .is_err()
-                            {
-                                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                            }
-                        }
-                        if wstatus_addr.0 != 0 {
-                            memory.write_bytes(wstatus_addr.0, &status.to_ne_bytes())?;
-                        }
-                        let value = if crate::namespace::pid::enabled() {
-                            crate::namespace::pid::host_to_ns_or_self(pid)
-                        } else {
-                            pid
-                        };
-                        if crate::namespace::pid::enabled() {
-                            crate::namespace::pid::unregister_reaped(pid);
-                        }
-                        return Ok(DispatchOutcome::Returned {
-                            value: i64::from(value),
-                        });
-                    }
-                    // Not-yet-exited adopted child: park on its exit. Uses the
-                    // SAME single scan's answer — a fresh `pending_adopted_child`
-                    // re-scan here would reopen the reap/pending window this
-                    // classification just closed.
-                    if host_options & libc::WNOHANG == 0
-                        && !options
-                            .intersects(LinuxWaitOptions::WUNTRACED | LinuxWaitOptions::WCONTINUED)
-                        && let Some(crate::guest_cpu::AdoptedChildWait::Pending(pid)) = adopted
-                    {
-                        let tid = Self::ctx_tid(cx);
-                        let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
-                        return Ok(DispatchOutcome::WaitOnProcExit {
-                            pid: pid as i32,
-                            sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
-                        });
-                    }
-                    // A process-group wait (pid < -1) for a group the kernel
-                    // can't find is ESRCH on Linux; macOS surfaces EINVAL for
-                    // the bad pgid (LTP waitpid04 INT_MIN case). Remap only that
-                    // case — a valid pgid with no children stays ECHILD, and
-                    // every other error passes through unchanged.
-                    if host_target < -1 && errno == LINUX_EINVAL {
-                        return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-                    }
-                    return Ok(DispatchOutcome::errno(errno));
-                }
-            };
-            if result == 0 && host_options & libc::WNOHANG != 0 {
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            if result == 0 {
-                let tid = Self::ctx_tid(cx);
-                let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
-                let Some(wait_pid) = wait_proc_exit_pid() else {
-                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
-                };
-                let sig_mask = carrick_abi::WaitSigMask::Additive(non_interrupting);
-                return Ok(if transport == PtraceTransport::VirtualNative
-                    && (virtual_stop_requested
-                        || options.intersects(
-                            LinuxWaitOptions::WUNTRACED | LinuxWaitOptions::WCONTINUED,
-                        ))
-                {
-                    DispatchOutcome::WaitOnProcState {
-                        pid: wait_pid,
-                        sig_mask,
-                    }
-                } else {
-                    DispatchOutcome::WaitOnProcExit {
-                        pid: wait_pid,
-                        sig_mask,
-                    }
-                });
-            }
-            if !host_status_is_guest_status
-                && host_wait_status_is_stopped_by(host_status, LINUX_SIGKILL)
-            {
-                crate::guest_cpu::clear_child_ptrace_stop_pending(result as u32);
-                let host_sigkill = crate::host_signal::linux_to_host_signum(LINUX_SIGKILL);
-                let cont = unsafe {
-                    carrick_portable::ptrace(carrick_portable::PT_CONTINUE, result, 1, host_sigkill)
-                };
-                cont.host_syscall_errno()?;
-                loop {
-                    let r = unsafe {
-                        libc::wait4(result, &mut host_status, host_options, &mut host_rusage)
-                    };
-                    match r.host_syscall_errno() {
-                        Ok(value) => {
-                            if value != 0 {
-                                break;
-                            }
-                            return Ok(DispatchOutcome::Returned { value: 0 });
-                        }
-                        Err(errno) => {
-                            if errno == LINUX_EINTR && !crate::host_signal::has_process_pending() {
-                                continue;
-                            }
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                    }
-                }
-            }
-            if !host_status_is_guest_status
-                && libc::WIFSTOPPED(host_status)
-                && let Some(linux_signum) =
-                    crate::guest_cpu::take_child_ptrace_stop_signal(result as u32)
-            {
-                host_status = (linux_signum << 8) | 0x7f;
-                host_status_is_guest_status = true;
-            }
-            let terminal_reap = libc::WIFEXITED(host_status) || libc::WIFSIGNALED(host_status);
-            if terminal_reap {
-                // Untraced lifecycle gauge (CARRICK_EXEC_STAMPS): closes the
-                // child's `PreHostExit` window from the parent side.
-                crate::exec_stamps::stamp_wait_reaped(
-                    result as u32,
-                    host_status,
-                    &host_rusage,
-                );
-                // The child host process is now dead; tear down its leaked host VM
-                // node (bhyve's named /dev/vmm/carrick-<pid>-* persists past the
-                // child's _exit). Sole, non-hanging teardown — no live holder. No-op
-                // on KVM/HVF. `result` is the reaped HOST pid.
-                carrick_hal::vm_backend::reap_child_vm(result as u32);
-            }
-            let ns_result = crate::namespace::pid::host_to_ns(result as u32);
-            if crate::namespace::pid::enabled() && host_target <= 0 && ns_result.is_none() {
-                if terminal_reap {
-                    crate::namespace::pid::unregister_reaped(result as u32);
-                }
-                if host_options & libc::WNOHANG != 0 {
-                    return Ok(DispatchOutcome::Returned { value: 0 });
-                }
-                let tid = Self::ctx_tid(cx);
-                let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
-                return Ok(DispatchOutcome::WaitOnProcExit {
-                    pid: host_target,
-                    sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
-                });
-            }
-            let tv_us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
-            let drain_child_guest_cpu = should_drain_child_guest_cpu(transport, terminal_reap);
-            let child_guest_ns = if drain_child_guest_cpu {
-                crate::guest_cpu::reap_child_guest_ns(result as u32)
-            } else {
-                0
-            };
-            // The published-guest-CPU channel and the host wait4 rusage combine
-            // per-provider (additive under VMMs, host-authoritative under the
-            // native backend) — single-sourced in `reaped_child_cpu_parts`.
-            let (child_user_us, child_system_us) = crate::guest_cpu::reaped_child_cpu_parts(
-                child_guest_ns,
-                Some((tv_us(host_rusage.ru_utime), tv_us(host_rusage.ru_stime))),
-            );
-            if drain_child_guest_cpu {
-                crate::guest_cpu::add_reaped_child(child_user_us, child_system_us);
-            }
-            if rusage_addr.0 != 0 {
-                let child_rusage = rusage_from_us(child_user_us, child_system_us);
-                if memory
-                    .write_bytes(rusage_addr.0, child_rusage.abi_bytes())
-                    .is_err()
-                {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
-            }
-            let host_status = if host_status_is_guest_status {
-                host_status
-            } else {
-                translate_wait_status(host_status)
-            };
-            if wstatus_addr.0 != 0 {
-                let bytes = host_status.to_ne_bytes();
-                memory.write_bytes(wstatus_addr.0, &bytes)?;
-            }
-            // PID namespace (§5.3): the guest must see the reaped child's
-            // ns-local pid, not its host pid — critical for `wait4(-1)` where
-            // the arg was never translated. Identity when namespaces are off.
-            let ns_result = ns_result.unwrap_or(result as u32);
-            if terminal_reap {
-                crate::namespace::pid::unregister_reaped(result as u32);
-            }
-            Ok(DispatchOutcome::Returned {
-                value: i64::from(ns_result),
-            })
-            }
+            // A task with no HVPatch process binding cannot wait: the retired
+            // 1:1 native lane's host-pid wait lived here (e1fbfd32e) and was
+            // deleted with the kernel extraction plan; git remembers it.
+            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
         }
 
         fn execve(this, cx, pathname_addr: GuestPtr, argv_addr: GuestPtr, envp_addr: GuestPtr) {
@@ -4735,84 +3543,13 @@ impl<'a> ProcView<'a> {
                     siginfo,
                 ));
             }
-            let PidfdTarget::Host(host_pid) = target else {
-                unreachable!("HvPatch pidfd handled above")
-            };
-            #[cfg(not(test))]
-            let _ = host_pid;
-            #[cfg(not(test))]
-            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-            #[cfg(test)]
-            {
-            if signum == 0 {
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            if !crate::dispatch::signal::is_valid_signum(signum) {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            let caller_euid = this.cred_snapshot().euid;
-            let target_euid = if host_pid as u32 == std::process::id() {
-                caller_euid
-            } else {
-                crate::cred_ipc::read_target(host_pid).unwrap_or(carrick_abi::NsUid::ROOT)
-            };
-            if info.0 != 0 {
-                let bytes = match cx
-                    .memory
-                    .read_bytes(
-                        info.0,
-                        core::mem::size_of::<crate::linux_abi::LinuxSiginfo>(),
-                    )
-                {
-                    Ok(bytes) => bytes,
-                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-                };
-                let mut user_info = match crate::linux_abi::LinuxSiginfo::read_from_bytes(&bytes) {
-                    Ok(info) => info,
-                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-                };
-                let signum_i32 = signum as i32;
-                if user_info.si_signo != signum_i32 {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                if !caller_euid.is_root() && caller_euid != target_euid {
-                    return Ok(DispatchOutcome::errno(LINUX_EPERM));
-                }
-                user_info.si_signo = signum_i32;
-                let value = user_info
-                    ._pad
-                    .get(0..8)
-                    .and_then(|b| b.try_into().ok())
-                    .map(i64::from_le_bytes)
-                    .unwrap_or(0);
-                if crate::host_signal::xsig_enqueue(
-                    host_pid,
-                    signum_i32,
-                    user_info.si_code,
-                    this.identity_pid() as i32,
-                    this.cred_snapshot().euid.raw(),
-                    value,
-                    // A pidfd names exactly one PROCESS (never a specific
-                    // thread), so this send is always process-directed.
-                    0,
-                ) {
-                    crate::host_signal::xsig_nudge(host_pid);
-                    return Ok(DispatchOutcome::Returned { value: 0 });
-                }
-                return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
-            }
-            if !caller_euid.is_root() && caller_euid != target_euid {
-                return Ok(DispatchOutcome::errno(LINUX_EPERM));
-            }
-            // A pidfd names exactly one process by the HOST pid recorded at
-            // creation (pidfd_open rejects pid <= 0; CLONE_PIDFD registers the
-            // fork child's host pid) — never a group or tid.
-            Ok(crate::dispatch::signal::bootstrap_signal_send_as(
-                crate::dispatch::signal::SignalTarget::HostProcess(HostPid(host_pid as u32)),
-                signum,
-                Some(caller_euid),
-            ))
-            }
+            // A pidfd that names a HOST process names the retired 1:1
+            // native lane, where each guest process was a Darwin process.
+            // That lane went away in e1fbfd32e, so no such process can be
+            // alive: ESRCH. The host-pid send that used to live here (an
+            // xsig enqueue, else `bootstrap_signal_send_as`) went with it;
+            // git remembers it.
+            Ok(DispatchOutcome::errno(LINUX_ESRCH))
         }
 
         fn getrandom(this, cx, address: GuestPtr, length: u64, flags: u64) {
@@ -5532,113 +4269,6 @@ fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {
     }
 }
 
-/// Absorb a tracee stop on a carrick-internal host carrier signal. Such a stop
-/// is an implementation artifact the guest knows nothing about: `PTRACE_CONT`
-/// re-injects the carrier so its handler still runs in the tracee, and the
-/// caller re-waits instead of surfacing a bogus `WIFSTOPPED` to the guest. The
-/// parked `wait_proc_exit` path absorbs the same stops; this covers the blocking
-/// host-wait4 observation points.
-#[cfg(test)]
-fn absorb_internal_tracee_stop(pid: i32, host_status: i32) -> bool {
-    if pid <= 0 || !libc::WIFSTOPPED(host_status) {
-        return false;
-    }
-    let sig = libc::WSTOPSIG(host_status);
-    if !crate::io_wait::is_internal_kick_signal(sig) {
-        return false;
-    }
-    // SAFETY: PT_CONTINUE with addr 1 ("resume where stopped"), re-injecting
-    // `sig`; same shape as the dispatch ptrace(PTRACE_CONT). Failure (the
-    // tracee died meanwhile) is benign — the caller's re-wait surfaces the
-    // real state.
-    unsafe {
-        carrick_portable::ptrace(carrick_portable::PT_CONTINUE, pid, 1, sig);
-    }
-    true
-}
-
-/// Translate a host `waitpid` status so a signal-death's termsig uses Linux
-/// numbering. The wstatus layout is shared (low 7 bits = signal, bit 7 = core
-/// dump flag, bits 8..15 = exit code); only the signal NUMBER differs between
-/// macOS and Linux. Exited children (low 7 bits == 0) and stopped children
-/// (low byte == 0x7f) are returned unchanged.
-#[cfg(test)]
-fn translate_wait_status(status: i32) -> i32 {
-    // The host IS Linux on the KVM lane: the wait status is already in the
-    // guest ABI (same encoding, same signal numbers, and 0xffff really means
-    // WIFCONTINUED). The Darwin remapping below must NOT run there — its
-    // WIFCONTINUED sentinel (stop signal 0x13 == Darwin SIGCONT) collides with
-    // a genuine Linux SIGSTOP(19) signal-delivery stop, so a ptraced child
-    // stopped by SIGSTOP (raised directly, or as the shared kill path's
-    // RT/SIGCONT carrier) was reported as WIFCONTINUED instead of WIFSTOPPED
-    // (LTP ptrace05 signums 18/19/34..64).
-    #[cfg(target_os = "linux")]
-    {
-        // The host IS Linux: signal numbers + the wstatus encoding already match
-        // the guest ABI, so no remap. But the host runs with RLIMIT_CORE=0 (so it
-        // never sets the 0x80 core-dumped bit), while carrick models the GUEST's
-        // setrlimit/PR_SET_DUMPABLE — the Linux contract is that WCOREDUMP() is
-        // true whenever the process died by a core-dumping signal. Synthesize the
-        // bit for those signals (signal numbers are already Linux-native here).
-        let low = status & 0x7f;
-        if low != 0 && low != 0x7f {
-            (status & !0x80) | core_dump_bit_for(low)
-        } else {
-            status
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    translate_wait_status_darwin(status)
-}
-
-/// The wstatus core-dumped bit (0x80) iff `linux_sig` is a core-dumping signal
-/// per signal(7): SIGQUIT(3), SIGILL(4), SIGTRAP(5), SIGABRT(6), SIGBUS(7),
-/// SIGFPE(8), SIGSEGV(11), SIGXCPU(24), SIGXFSZ(25), SIGSYS(31).
-#[cfg(test)]
-fn core_dump_bit_for(linux_sig: i32) -> i32 {
-    if matches!(linux_sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31) {
-        0x80
-    } else {
-        0
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-#[cfg(test)]
-fn translate_wait_status_darwin(status: i32) -> i32 {
-    let low = status & 0x7f;
-    if low == 0x7f {
-        // WIFSTOPPED (and macOS's WIFCONTINUED, which is a stopped status whose
-        // stop signal is the sentinel 0x13). The stop signal lives in bits 8..15
-        // and is in macOS numbering, so translate it host->Linux (e.g. SIGTSTP
-        // is 18 on macOS, 20 on Linux) — without this, bash's WSTOPSIG check
-        // after Ctrl-Z sees the wrong signal and job control misbehaves.
-        let host_stopsig = (status >> 8) & 0xff;
-        if host_stopsig == 0x13 {
-            // macOS WIFCONTINUED → Linux WIFCONTINUED status (0xffff).
-            return 0xffff;
-        }
-        let linux_stopsig = crate::host_signal::host_to_linux_signum(host_stopsig);
-        (linux_stopsig << 8) | 0x7f
-    } else if low != 0 {
-        // Terminated by signal: translate the termination signal.
-        let linux_sig = crate::host_signal::host_to_linux_signum(low);
-        // macOS by default has RLIMIT_CORE=0 so the host wait status doesn't
-        // set the core-dumped bit (0x80) — but the Linux contract is that
-        // `WCOREDUMP(status)` is true whenever the process died by a
-        // core-dumping signal (SIGABRT/SEGV/BUS/FPE/ILL/QUIT/SYS/TRAP/XCPU/
-        // XFSZ). Apps that check `WCOREDUMP` care about "did this die in a
-        // core-dumping way", not whether a core file was physically written.
-        // Mirror Linux by OR-ing the bit on for those signals; preserve the
-        // host's bit if it set it.
-        let host_core = status & 0x80;
-        (linux_sig & 0x7f) | host_core | core_dump_bit_for(linux_sig)
-    } else {
-        // Exited normally: high byte is the exit code, left untouched.
-        status
-    }
-}
-
 /// Atomically load a cross-process futex word from its fork-coherent host address
 /// (the shared aperture on HVF/KVM, the bhyve futex mirror on bhyve). Atomic to
 /// match the guest's own atomic access to the same word.
@@ -5661,60 +4291,6 @@ fn shared_futex_store(location: carrick_guest_mem::SharedFutexLocation, value: u
     unsafe {
         (*(location.wait_addr().raw() as *const std::sync::atomic::AtomicU32))
             .store(value, std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-#[cfg(test)]
-fn host_wait_status_is_stopped_by(status: i32, linux_signum: i32) -> bool {
-    let low = status & 0x7f;
-    if low != 0x7f {
-        return false;
-    }
-    let host_stopsig = (status >> 8) & 0xff;
-    crate::host_signal::host_to_linux_signum(host_stopsig) == linux_signum
-}
-
-/// Darwin can report a stopped child from `waitid(WEXITED|WNOWAIT)`. Linux only
-/// reports SIGCHLD states selected by the caller's W* bits, so filter the host
-/// siginfo before deciding whether a child is waitable.
-#[cfg(test)]
-fn clear_unrequested_waitid_state(info: &mut libc::siginfo_t, options: LinuxWaitOptions) -> bool {
-    if carrick_portable::si_pid(info) == 0 || waitid_state_requested(info.si_code, options) {
-        return true;
-    }
-    *info = unsafe { std::mem::zeroed() };
-    false
-}
-
-#[cfg(test)]
-impl<'a> ProcView<'a> {
-    /// Promote a `waitid` `CLD_KILLED` to `CLD_DUMPED` when the child died by a
-    /// core-dumping signal AND core dumps are enabled (RLIMIT_CORE soft > 0).
-    /// macOS's `waitid` never sets CLD_DUMPED (the host doesn't dump core), but
-    /// Linux does — the same "died in a core-dumping way" contract the wait4
-    /// wstatus 0x80 bit encodes. `host_si_status` is the host signal number.
-    fn core_dumped_si_code(&self, si_code: i32, host_si_status: i32) -> i32 {
-        const CLD_KILLED: i32 = 2;
-        const CLD_DUMPED: i32 = 3;
-        if si_code != CLD_KILLED {
-            return si_code;
-        }
-        let linux_sig = crate::host_signal::host_to_linux_signum(host_si_status);
-        if core_dump_bit_for(linux_sig) != 0 && self.rlimit_core_enabled() {
-            CLD_DUMPED
-        } else {
-            si_code
-        }
-    }
-
-    /// True iff RLIMIT_CORE's soft limit is nonzero (core dumps are produced).
-    /// The carrick default is RLIM_INFINITY; a `setrlimit(RLIMIT_CORE, 0)` in the
-    /// override table disables it.
-    fn rlimit_core_enabled(&self) -> bool {
-        match Some(self.task_rlimits().get(carrick_abi::LinuxResource::Core)) {
-            Some(limit) => limit.rlim_cur != 0,
-            None => true,
-        }
     }
 }
 
@@ -5873,54 +4449,8 @@ impl SyscallDispatcher {
 
     #[cfg(test)]
     #[inline]
-    pub(super) fn pidfd_host_pid(&self, fd: i32) -> Option<i32> {
-        self.proc_view().pidfd_host_pid(fd)
-    }
-
-    #[cfg(test)]
-    #[inline]
     pub(super) fn pidfd_is_nonblocking(&self, fd: i32) -> bool {
         self.proc_view().pidfd_is_nonblocking(fd)
-    }
-
-    #[cfg(test)]
-    #[inline]
-    pub(super) fn core_dumped_si_code(&self, si_code: i32, host_si_status: i32) -> i32 {
-        self.proc_view()
-            .core_dumped_si_code(si_code, host_si_status)
-    }
-
-    #[cfg(test)]
-    #[inline]
-    pub(super) fn rlimit_core_enabled(&self) -> bool {
-        self.proc_view().rlimit_core_enabled()
-    }
-}
-
-#[cfg(test)]
-fn waitid_state_requested(si_code: i32, options: LinuxWaitOptions) -> bool {
-    const CLD_EXITED: i32 = 1;
-    const CLD_KILLED: i32 = 2;
-    const CLD_DUMPED: i32 = 3;
-    const CLD_TRAPPED: i32 = 4;
-    const CLD_STOPPED: i32 = 5;
-    const CLD_CONTINUED: i32 = 6;
-
-    match si_code {
-        CLD_EXITED | CLD_KILLED | CLD_DUMPED => options.contains(LinuxWaitOptions::WEXITED),
-        CLD_TRAPPED | CLD_STOPPED => options.contains(LinuxWaitOptions::WSTOPPED),
-        CLD_CONTINUED => options.contains(LinuxWaitOptions::WCONTINUED),
-        _ => true,
-    }
-}
-
-#[cfg(test)]
-fn waitid_host_state_option(si_code: i32) -> Option<i32> {
-    match si_code {
-        libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED => Some(libc::WEXITED),
-        libc::CLD_TRAPPED | libc::CLD_STOPPED => Some(libc::WSTOPPED),
-        libc::CLD_CONTINUED => Some(libc::WCONTINUED),
-        _ => None,
     }
 }
 
@@ -5961,27 +4491,6 @@ pub(crate) fn build_hvpatch_waitid_siginfo(
 ) -> [u8; crate::linux_abi::LINUX_SIGINFO_SIZE] {
     let (si_code, si_status) = hvpatch_waitid_exit_fields(exit.status());
     build_linux_sigchld_siginfo(exit.visible_pid(), exit.ruid().raw(), si_code, si_status)
-}
-
-/// Build a Linux `siginfo_t` (SIGCHLD layout) for `waitid` from the fields
-/// macOS's `waitid` filled. The Linux struct places si_pid@16, si_uid@20,
-/// si_status@24 after the common si_signo/si_errno/si_code header. The CLD_*
-/// codes match between the kernels; si_status is the raw exit code for
-/// CLD_EXITED but a signal number otherwise, so translate that host->Linux.
-#[cfg(test)]
-fn build_sigchld_siginfo(
-    si_pid: i32,
-    si_uid: u32,
-    si_code: i32,
-    si_status: i32,
-) -> [u8; crate::linux_abi::LINUX_SIGINFO_SIZE] {
-    const CLD_EXITED: i32 = 1;
-    let linux_status = if si_code == CLD_EXITED {
-        si_status
-    } else {
-        crate::host_signal::host_to_linux_signum(si_status)
-    };
-    build_linux_sigchld_siginfo(si_pid, si_uid, si_code, linux_status)
 }
 
 fn build_linux_sigchld_siginfo(
@@ -8602,44 +7111,6 @@ mod native_virtual_ptrace_tests {
     }
 
     #[test]
-    fn outstanding_stop_lease_only_blocks_matching_wait_targets() {
-        let pid = std::process::id();
-        let pgid = unsafe { libc::getpgrp() };
-        assert!(pgid > 0);
-
-        assert!(ptrace_wait_target_conflicts(
-            pid,
-            ptrace_wait_target_for_wait4(pid as i32),
-        ));
-        assert!(!ptrace_wait_target_conflicts(
-            pid,
-            ptrace_wait_target_for_wait4(pid as i32 + 1),
-        ));
-        assert!(ptrace_wait_target_conflicts(
-            pid,
-            ptrace_wait_target_for_wait4(-1),
-        ));
-        assert!(ptrace_wait_target_conflicts(
-            pid,
-            ptrace_wait_target_for_wait4(0),
-        ));
-        assert!(ptrace_wait_target_conflicts(
-            pid,
-            ptrace_wait_target_for_wait4(-pgid),
-        ));
-        assert!(!ptrace_wait_target_conflicts(
-            pid,
-            ptrace_wait_target_for_wait4(-(pgid + 1)),
-        ));
-    }
-
-    #[test]
-    fn virtual_stop_status_uses_linux_wait_encoding() {
-        assert_eq!(virtual_ptrace_stop_status(19), 0x137f);
-        assert_eq!(virtual_ptrace_stop_status(5), 0x057f);
-    }
-
-    #[test]
     fn hvpatch_waitid_decodes_linux_terminal_wait_status() {
         assert_eq!(hvpatch_waitid_exit_fields(7 << 8), (libc::CLD_EXITED, 7));
         assert_eq!(hvpatch_waitid_exit_fields(9), (libc::CLD_KILLED, 9));
@@ -8647,42 +7118,6 @@ mod native_virtual_ptrace_tests {
             hvpatch_waitid_exit_fields(11 | 0x80),
             (libc::CLD_DUMPED, 11)
         );
-    }
-
-    #[test]
-    fn request_routing_keeps_host_traceme_and_virtualizes_native_control() {
-        assert_eq!(
-            route_ptrace_request(PtraceTransport::Host, 0, 0),
-            Ok(PtraceRequestRoute::Host)
-        );
-        assert_eq!(
-            route_ptrace_request(PtraceTransport::VirtualNative, 0, 0),
-            Ok(PtraceRequestRoute::VirtualTraceme)
-        );
-        assert_eq!(
-            route_ptrace_request(PtraceTransport::VirtualNative, 7, 0),
-            Ok(PtraceRequestRoute::VirtualControl(
-                VirtualPtraceControlRequest::Continue,
-            ))
-        );
-        assert_eq!(
-            route_ptrace_request(PtraceTransport::VirtualNative, 7, 9),
-            Err(LINUX_EINVAL)
-        );
-    }
-
-    #[test]
-    fn only_native_nonterminal_wait_reports_defer_guest_cpu_drain() {
-        assert!(should_drain_child_guest_cpu(PtraceTransport::Host, false));
-        assert!(should_drain_child_guest_cpu(PtraceTransport::Host, true));
-        assert!(!should_drain_child_guest_cpu(
-            PtraceTransport::VirtualNative,
-            false
-        ));
-        assert!(should_drain_child_guest_cpu(
-            PtraceTransport::VirtualNative,
-            true
-        ));
     }
 }
 

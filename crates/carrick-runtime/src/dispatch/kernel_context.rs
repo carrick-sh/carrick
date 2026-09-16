@@ -367,33 +367,6 @@ impl SyscallDispatcher {
         context.task().net_ns()
     }
 
-    /// Does `pid` name a LIVE Linux process, according to carrick's own kernel?
-    ///
-    /// `None` means this lane has no kernel task registry to ask — the caller
-    /// must keep whatever host probe it already used. That is what makes every
-    /// call site correct on `native` and `vmm`, where a Linux process IS a host
-    /// process and `kill(pid, 0)` is the right question.
-    ///
-    /// On the kernel lane it is the wrong question and will get worse. A Linux
-    /// process there is a THREAD of one host process, so the host process table
-    /// knows nothing about it: probing with a guest pid today matches nothing
-    /// and reports ESRCH, which is merely wrong. It becomes actively dangerous
-    /// the moment guest pids are small — a guest pid of 1 would probe the host's
-    /// pid 1, which on macOS is `launchd`. Routing these through the kernel is
-    /// therefore a prerequisite for seeding the guest id space at 1, not a
-    /// consequence of it; see
-    /// `docs/perf-results/2026-08-13-hvpatch-guest-pid-identity-design.md`.
-    #[cfg(test)]
-    pub(crate) fn guest_pid_is_live(&self, pid: i32) -> Option<bool> {
-        let process = self.hvpatch_process()?;
-        let Ok(task) = crate::kernel::TaskId::from_abi_positive(pid) else {
-            // Not a well-formed positive pid: the kernel cannot own an answer,
-            // so hand the question back rather than inventing one.
-            return None;
-        };
-        Some(process.kernel_graph().task_is_live(task))
-    }
-
     /// Resolve a guest-supplied positive pid to another Linux PROCESS and the
     /// effective uid that process runs as.
     ///

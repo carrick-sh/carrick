@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "description": "Reviewed inventory of classified production raw lock acquisitions (fail-closed, shrink-only)",
-  "total_count": 103,
+  "total_count": 98,
   "category_counts": {
-    "proc": 57,
+    "proc": 52,
     "pty_table": 10,
     "sysv_process": 1,
     "sysv_namespace": 3,
@@ -510,51 +510,6 @@
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
       "line": 2799,
       "item": "ProcView::ptrace",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/proc.rs::ProcView::ptrace::proc#2",
-      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 3120,
-      "item": "ProcView::ptrace",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 2
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/proc.rs::ProcView::ptrace::proc#3",
-      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 3139,
-      "item": "ProcView::ptrace",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 3
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/proc.rs::ProcView::ptrace::proc#4",
-      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 3211,
-      "item": "ProcView::ptrace",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 4
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/proc.rs::ProcView::waitid::proc#1",
-      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 3581,
-      "item": "ProcView::waitid",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/proc.rs::ProcView::wait4::proc#1",
-      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 4091,
-      "item": "ProcView::wait4",
       "category": "proc",
       "expression": ".proc.lock()",
       "ordinal": 1

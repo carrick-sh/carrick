@@ -1303,8 +1303,6 @@ pub(in crate::dispatch) trait ProcCrossSubsystem: Send + Sync {
         &self,
         path: &str,
     ) -> Result<crate::rootfs::RootFsMetadata, carrick_abi::LinuxErrno>;
-    #[cfg(test)]
-    fn drain_xsignals_process_directed(&self, context: &crate::kernel::KernelContext);
     fn hvpatch_exact_process_signal(
         &self,
         context: &crate::kernel::KernelContext,
@@ -1323,12 +1321,6 @@ pub(in crate::dispatch) trait ProcCrossSubsystem: Send + Sync {
         tid: crate::thread::ThreadId,
         mask: carrick_abi::WaitSigMask,
     ) -> bool;
-    #[cfg(test)]
-    fn host_fd_for_poll(&self, fd: i32) -> Option<super::HostFd>;
-    #[cfg(test)]
-    fn task_rlimits(&self) -> crate::kernel::RlimitSet;
-    #[cfg(test)]
-    fn guest_pid_is_live(&self, pid: i32) -> Option<bool>;
     fn with_current_mm_executor_released(
         &self,
         ctx: &mut dyn MmExecutorReleaser,
@@ -1378,10 +1370,6 @@ impl ProcCrossSubsystem for SyscallDispatcher {
     ) -> Result<crate::rootfs::RootFsMetadata, carrick_abi::LinuxErrno> {
         self.layered_lstat(path)
     }
-    #[cfg(test)]
-    fn drain_xsignals_process_directed(&self, context: &crate::kernel::KernelContext) {
-        self.drain_xsignals_process_directed(context);
-    }
     fn hvpatch_exact_process_signal(
         &self,
         context: &crate::kernel::KernelContext,
@@ -1405,18 +1393,6 @@ impl ProcCrossSubsystem for SyscallDispatcher {
         mask: carrick_abi::WaitSigMask,
     ) -> bool {
         self.has_deliverable_dispatch_pending_for_wait(context, tid, mask)
-    }
-    #[cfg(test)]
-    fn host_fd_for_poll(&self, fd: i32) -> Option<super::HostFd> {
-        self.host_fd_for_poll(fd)
-    }
-    #[cfg(test)]
-    fn task_rlimits(&self) -> crate::kernel::RlimitSet {
-        self.task_rlimits()
-    }
-    #[cfg(test)]
-    fn guest_pid_is_live(&self, pid: i32) -> Option<bool> {
-        self.guest_pid_is_live(pid)
     }
     fn with_current_mm_executor_released(
         &self,
