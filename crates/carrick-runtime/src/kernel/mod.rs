@@ -7,6 +7,7 @@ pub mod address;
 pub(crate) mod carrier_process;
 pub mod clone_plan;
 pub mod container;
+pub mod continuation;
 pub mod control;
 pub mod core;
 pub(crate) mod cpu_limit;

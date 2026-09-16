@@ -3078,12 +3078,14 @@ mod tests {
             // `crates/carrick-vfs/src/fs_backend/tests.rs`; this inventory
             // scans `CARGO_MANIFEST_DIR/src`, so it is out of scope here
             // rather than retired.
-            ("network/socket_namespace.rs", [7, 0, 0]),
-            ("run_state.rs", [1, 0, 0]),
             // One cfg(test)-only helper self-spawns the exact lock-order or
             // terminal-retirement regression, bounds it, and reaps its child.
             // No production process creation is added by this test containment.
-            ("vcpu_loop/continuation/tests.rs", [0, 0, 1]),
+            // (Moved with the continuation model from
+            // `vcpu_loop/continuation/tests.rs`; same helper, same count.)
+            ("kernel/continuation/tests.rs", [0, 0, 1]),
+            ("network/socket_namespace.rs", [7, 0, 0]),
+            ("run_state.rs", [1, 0, 0]),
             // This unit test self-spawns to isolate a process-global abort
             // boundary while proving pending exec error preservation. It is
             // not production host-process-per-guest architecture.

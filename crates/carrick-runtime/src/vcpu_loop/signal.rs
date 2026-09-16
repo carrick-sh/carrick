@@ -555,7 +555,7 @@ pub(crate) fn deliver_reserved_signal_with_restart<T>(
     context: &crate::kernel::KernelContext,
     restart: SignalRestartContext,
     tid: ThreadId,
-    reserved: crate::vcpu_loop::continuation::ReservedSignal,
+    reserved: crate::kernel::continuation::ReservedSignal,
 ) -> Result<Option<PendingSignalAction>, RuntimeError>
 where
     T: SyscallTrap,
@@ -584,7 +584,7 @@ fn deliver_signal_with_restart<T>(
     context: &crate::kernel::KernelContext,
     restart: SignalRestartContext,
     tid: ThreadId,
-    reserved: Option<&crate::vcpu_loop::continuation::ReservedSignal>,
+    reserved: Option<&crate::kernel::continuation::ReservedSignal>,
 ) -> Result<Option<PendingSignalAction>, RuntimeError>
 where
     T: SyscallTrap,
@@ -602,7 +602,7 @@ where
 
     let pending = reserved.map_or_else(
         || crate::host_signal::take_pending_for(tid.raw()),
-        crate::vcpu_loop::continuation::ReservedSignal::signum,
+        crate::kernel::continuation::ReservedSignal::signum,
     );
     // A dispatcher dequeue returns owner and payload atomically. A host-slot
     // signal remains thread-directed and consumes its per-thread payload below.
@@ -906,7 +906,7 @@ mod tests {
             .take_lowest_in(carrick_abi::SigSet::EMPTY.with(10))
             .expect("first reservation");
         let (action_generation, action) = authority.action_with_generation(first);
-        let reserved = crate::vcpu_loop::continuation::ReservedSignal::kernel(
+        let reserved = crate::kernel::continuation::ReservedSignal::kernel(
             authority.clone(),
             dequeued,
             action_generation,
@@ -966,7 +966,7 @@ mod tests {
                 .take_lowest_in(carrick_abi::SigSet::EMPTY.with(signum))
                 .expect("temporary mask reserves default signal");
             let (action_generation, action) = authority.action_with_generation(signal);
-            let reserved = crate::vcpu_loop::continuation::ReservedSignal::kernel(
+            let reserved = crate::kernel::continuation::ReservedSignal::kernel(
                 authority.clone(),
                 dequeued,
                 action_generation,
@@ -1012,7 +1012,7 @@ mod tests {
             .take_lowest_in(carrick_abi::SigSet::EMPTY.with(signum))
             .expect("reserve default SIGUSR1");
         let (action_generation, action) = authority.action_with_generation(signal);
-        let reserved = crate::vcpu_loop::continuation::ReservedSignal::kernel(
+        let reserved = crate::kernel::continuation::ReservedSignal::kernel(
             authority.clone(),
             dequeued,
             action_generation,

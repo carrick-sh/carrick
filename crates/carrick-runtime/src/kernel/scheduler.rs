@@ -3638,8 +3638,8 @@ impl Scheduler {
     pub fn settle_blocked_continuation(
         &self,
         mut running: RunnableThread,
-        mut continuation: crate::vcpu_loop::continuation::BlockedContinuation,
-        registration: crate::vcpu_loop::continuation::ContinuationRegistration,
+        mut continuation: crate::kernel::continuation::BlockedContinuation,
+        registration: crate::kernel::continuation::ContinuationRegistration,
     ) -> Result<SettlementDisposition, SchedulerError> {
         let _transition = self.generation_transition.lock();
         let predecessor = running.generation();
@@ -4345,11 +4345,11 @@ mod tests {
     };
     use crate::compat::SyscallArgs;
     use crate::dispatch::SyscallRequest;
-    use crate::kernel::objects::{BlockedReason, MigratableTaskState, ThreadExecutionState};
-    use crate::kernel::{ClonePlan, Kernel, KernelContext, LinuxWaitStatus, RootBootstrap};
-    use crate::vcpu_loop::continuation::{
+    use crate::kernel::continuation::{
         BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass,
     };
+    use crate::kernel::objects::{BlockedReason, MigratableTaskState, ThreadExecutionState};
+    use crate::kernel::{ClonePlan, Kernel, KernelContext, LinuxWaitStatus, RootBootstrap};
 
     fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
         let input = RootBootstrap::for_reference_model(
@@ -5421,7 +5421,7 @@ mod tests {
                 .expect("released vfork continuation")
                 .ready_event()
                 .expect("exact release event"),
-            crate::vcpu_loop::continuation::ContinuationEvent::Ready,
+            crate::kernel::continuation::ContinuationEvent::Ready,
         );
         scheduler.settle_exited(released).unwrap();
     }
@@ -5526,7 +5526,7 @@ mod tests {
                 .expect("woken futex continuation")
                 .ready_event()
                 .expect("exact futex wake event"),
-            crate::vcpu_loop::continuation::ContinuationEvent::Ready,
+            crate::kernel::continuation::ContinuationEvent::Ready,
         );
         scheduler.settle_exited(released).unwrap();
         drop(word);

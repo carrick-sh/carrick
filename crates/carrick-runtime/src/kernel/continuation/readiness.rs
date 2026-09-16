@@ -24,16 +24,16 @@ use crate::kernel::{Kernel, Task};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResumeContext {
-    pub(in crate::vcpu_loop) thread: ThreadKey,
-    pub(in crate::vcpu_loop) task: TaskKey,
-    pub(in crate::vcpu_loop) execution: ExecutionGeneration,
-    pub(in crate::vcpu_loop) mm: MmId,
-    pub(in crate::vcpu_loop) asid_generation: u64,
+    pub(crate) thread: ThreadKey,
+    pub(crate) task: TaskKey,
+    pub(crate) execution: ExecutionGeneration,
+    pub(crate) mm: MmId,
+    pub(crate) asid_generation: u64,
 }
 
 impl ResumeContext {
     #[cfg(test)]
-    pub(in crate::vcpu_loop) fn for_test(
+    pub(crate) fn for_test(
         thread: ThreadKey,
         task: TaskKey,
         execution: ExecutionGeneration,
@@ -175,7 +175,7 @@ impl ReservedSignal {
         }))
     }
 
-    pub(in crate::vcpu_loop) fn from_kernel_reservation(
+    pub(crate) fn from_kernel_reservation(
         authority: crate::kernel::objects::SignalAuthority,
         reservation: crate::kernel::objects::SignalWaitReservation,
     ) -> Self {
@@ -269,15 +269,15 @@ impl ReservedSignal {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContinuationWakeToken {
-    pub(in crate::vcpu_loop) continuation: ContinuationId,
-    pub(in crate::vcpu_loop) thread: ThreadKey,
-    pub(in crate::vcpu_loop) thread_serial: u64,
-    pub(in crate::vcpu_loop) execution: ExecutionGeneration,
-    pub(in crate::vcpu_loop) execution_raw: u64,
-    pub(in crate::vcpu_loop) mm_generation: u64,
-    pub(in crate::vcpu_loop) asid_generation: u64,
-    pub(in crate::vcpu_loop) resource_generation: u64,
-    pub(in crate::vcpu_loop) registration_generation: u64,
+    pub(crate) continuation: ContinuationId,
+    pub(crate) thread: ThreadKey,
+    pub(crate) thread_serial: u64,
+    pub(crate) execution: ExecutionGeneration,
+    pub(crate) execution_raw: u64,
+    pub(crate) mm_generation: u64,
+    pub(crate) asid_generation: u64,
+    pub(crate) resource_generation: u64,
+    pub(crate) registration_generation: u64,
 }
 
 impl ContinuationWakeToken {
@@ -286,56 +286,44 @@ impl ContinuationWakeToken {
     }
 
     #[cfg(test)]
-    pub(in crate::vcpu_loop) fn with_thread_serial_offset_for_test(mut self, offset: u64) -> Self {
+    pub(crate) fn with_thread_serial_offset_for_test(mut self, offset: u64) -> Self {
         self.thread_serial += offset;
         self
     }
 
     #[cfg(test)]
-    pub(in crate::vcpu_loop) fn with_execution_generation_offset_for_test(
-        mut self,
-        offset: u64,
-    ) -> Self {
+    pub(crate) fn with_execution_generation_offset_for_test(mut self, offset: u64) -> Self {
         self.execution_raw += offset;
         self
     }
 
     #[cfg(test)]
-    pub(in crate::vcpu_loop) fn with_resource_generation_offset_for_test(
-        mut self,
-        offset: u64,
-    ) -> Self {
+    pub(crate) fn with_resource_generation_offset_for_test(mut self, offset: u64) -> Self {
         self.resource_generation += offset;
         self
     }
 
     #[cfg(test)]
-    pub(in crate::vcpu_loop) fn with_mm_generation_offset_for_test(mut self, offset: u64) -> Self {
+    pub(crate) fn with_mm_generation_offset_for_test(mut self, offset: u64) -> Self {
         self.mm_generation += offset;
         self
     }
 
     #[cfg(test)]
-    pub(in crate::vcpu_loop) fn with_asid_generation_offset_for_test(
-        mut self,
-        offset: u64,
-    ) -> Self {
+    pub(crate) fn with_asid_generation_offset_for_test(mut self, offset: u64) -> Self {
         self.asid_generation += offset;
         self
     }
 
     #[cfg(test)]
-    pub(in crate::vcpu_loop) fn with_registration_generation_offset_for_test(
-        mut self,
-        offset: u64,
-    ) -> Self {
+    pub(crate) fn with_registration_generation_offset_for_test(mut self, offset: u64) -> Self {
         self.registration_generation += offset;
         self
     }
 }
 
 #[derive(Clone, Debug)]
-pub(in crate::vcpu_loop) enum ReadinessProbe {
+pub(crate) enum ReadinessProbe {
     Futex {
         table: FutexSource,
         wait: FutexWait,
@@ -399,21 +387,21 @@ pub(in crate::vcpu_loop) enum ReadinessProbe {
 }
 
 #[derive(Clone, Debug)]
-pub(in crate::vcpu_loop) struct SignalReadinessProbe {
-    pub(in crate::vcpu_loop) kernel: Weak<Kernel>,
-    pub(in crate::vcpu_loop) task_ref: Weak<Task>,
-    pub(in crate::vcpu_loop) observed_task_wake: u64,
-    pub(in crate::vcpu_loop) observed_task_event: u64,
-    pub(in crate::vcpu_loop) task: TaskKey,
-    pub(in crate::vcpu_loop) thread: ThreadKey,
-    pub(in crate::vcpu_loop) temporary: Option<WaitSigMask>,
-    pub(in crate::vcpu_loop) family: ContinuationFamily,
-    pub(in crate::vcpu_loop) wait_set: Option<SigSet>,
-    pub(in crate::vcpu_loop) signal_wait_block: Option<SigBlockMask>,
+pub(crate) struct SignalReadinessProbe {
+    pub(crate) kernel: Weak<Kernel>,
+    pub(crate) task_ref: Weak<Task>,
+    pub(crate) observed_task_wake: u64,
+    pub(crate) observed_task_event: u64,
+    pub(crate) task: TaskKey,
+    pub(crate) thread: ThreadKey,
+    pub(crate) temporary: Option<WaitSigMask>,
+    pub(crate) family: ContinuationFamily,
+    pub(crate) wait_set: Option<SigSet>,
+    pub(crate) signal_wait_block: Option<SigBlockMask>,
 }
 
 impl SignalReadinessProbe {
-    pub(in crate::vcpu_loop) fn from_continuation(continuation: &BlockedContinuation) -> Self {
+    pub(crate) fn from_continuation(continuation: &BlockedContinuation) -> Self {
         let state = continuation.state();
         let (wait_set, signal_wait_block) = match state.detail {
             ContinuationDetail::Signals {
@@ -451,7 +439,7 @@ impl SignalReadinessProbe {
     /// not leak into enrollment's state-only readiness sample: doing so makes
     /// every quiet wait4 continuation immediately runnable and livelocks the
     /// carrier without any producer event.
-    pub(in crate::vcpu_loop) fn event_after_task_wake(&self) -> Option<ContinuationEvent> {
+    pub(crate) fn event_after_task_wake(&self) -> Option<ContinuationEvent> {
         if self.family == ContinuationFamily::WaitOnHvpatchChild {
             return Some(ContinuationEvent::Ready);
         }
@@ -460,7 +448,7 @@ impl SignalReadinessProbe {
 
     /// Sample authoritative signal state without assuming that a producer
     /// edge occurred. This is safe to call during continuation enrollment.
-    pub(in crate::vcpu_loop) fn event(&self) -> Option<ContinuationEvent> {
+    pub(crate) fn event(&self) -> Option<ContinuationEvent> {
         let kernel = self.kernel.upgrade()?;
         let context = kernel.context(self.task.id, self.thread.tid).ok()?;
         if context.task().key() != self.task || context.thread().key() != self.thread {
@@ -553,11 +541,11 @@ impl ReadinessProbe {
     /// wait, a vfork release — is woken by its producer or by its deadline, and
     /// re-examining it on every cycle is the O(live blocked tasks) scan
     /// [`super::wait_service::ReactorWorkSet`] exists to remove.
-    pub(in crate::vcpu_loop) const fn contributes_pollfds(&self) -> bool {
+    pub(crate) const fn contributes_pollfds(&self) -> bool {
         matches!(self, Self::Fds { .. } | Self::BlockingWrite { .. })
     }
 
-    pub(in crate::vcpu_loop) fn from_continuation(continuation: &BlockedContinuation) -> Self {
+    pub(crate) fn from_continuation(continuation: &BlockedContinuation) -> Self {
         let state = continuation.state();
         match &state.detail {
             ContinuationDetail::Fds {
@@ -729,7 +717,7 @@ impl ReadinessProbe {
         }
     }
 
-    pub(in crate::vcpu_loop) fn poll(&mut self) -> Option<ContinuationEvent> {
+    pub(crate) fn poll(&mut self) -> Option<ContinuationEvent> {
         let deadline_event = |deadline: Option<Instant>| {
             deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)

@@ -777,7 +777,7 @@ impl Kernel {
         // registry. Never invoke it while holding the topology write lock.
         for thread in exiting_threads {
             let _ = thread.cancel_kernel_owned_continuation(
-                crate::vcpu_loop::continuation::CancellationCause::ProcessExit,
+                crate::kernel::continuation::CancellationCause::ProcessExit,
             );
         }
         // Queue the parent's exit notification after the exit reservation is

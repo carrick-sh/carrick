@@ -950,7 +950,7 @@ impl Kernel {
         for task in &tasks {
             for thread in task.threads() {
                 let _ = thread.cancel_kernel_owned_continuation(
-                    crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
+                    crate::kernel::continuation::CancellationCause::ServiceShutdown,
                 );
             }
         }

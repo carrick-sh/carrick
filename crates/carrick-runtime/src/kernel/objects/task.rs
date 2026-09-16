@@ -2121,7 +2121,7 @@ impl Task {
         // lose the CPU they burned.
         if let Some(thread) = retired.as_ref() {
             let _ = thread.cancel_kernel_owned_continuation(
-                crate::vcpu_loop::continuation::CancellationCause::ThreadExit,
+                crate::kernel::continuation::CancellationCause::ThreadExit,
             );
             self.retain_exited_thread_cpu(thread);
             // A retired thread has left the graph and can never reach another
