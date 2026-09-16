@@ -552,6 +552,7 @@ dependencies = [
  "carrick-portable",
  "carrick-signal-core",
  "carrick-spec",
+ "carrick-test-support",
  "carrick-thread",
  "carrick-timer-core",
  "carrick-vfs",

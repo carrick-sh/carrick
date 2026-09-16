@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used)]
-#[path = "common/syscall_support.rs"]
+#[path = "../../../carrick-kernel/tests/integration/common/syscall_support.rs"]
 mod support;
 use support::*;
 

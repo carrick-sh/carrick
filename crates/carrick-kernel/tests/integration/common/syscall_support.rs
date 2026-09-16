@@ -11,13 +11,13 @@
 // them. Allow unwrap/expect here explicitly — the no-panic gate targets production code.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+pub use carrick_kernel::compat::{CompatReporter, SyscallArgs};
 pub use carrick_kernel::dispatch::{
     CurrentMmMemory, DispatchOutcome, GuestMemory, LinearMemory, SyscallDispatcher, SyscallRequest,
     ThreadCtx,
 };
-pub use carrick_runtime::compat::{CompatReporter, SyscallArgs};
-pub use carrick_runtime::elf::SegmentPerms;
-pub use carrick_runtime::linux_abi::{
+pub use carrick_kernel::elf::SegmentPerms;
+pub use carrick_kernel::linux_abi::{
     CARRICK_PRIVATE_X86_FSTAT, CARRICK_PRIVATE_X86_LSTAT, CARRICK_PRIVATE_X86_NEWFSTATAT,
     CARRICK_PRIVATE_X86_STAT, LINUX_AF_INET, LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG,
     LINUX_EPOLLET, LINUX_S_IFCHR, LINUX_S_IFDIR, LINUX_S_IFIFO, LINUX_S_IFLNK, LINUX_S_IFMT,
@@ -28,10 +28,10 @@ pub use carrick_runtime::linux_abi::{
     LinuxStat, LinuxStatfs, LinuxStatx, LinuxTermios, LinuxTimerfdExpirations, LinuxTimespec,
     LinuxTimeval, LinuxTimezone, LinuxTms, LinuxUtsname, LinuxWinsize, LinuxX8664Stat,
 };
-pub use carrick_runtime::memory::{
+pub use carrick_kernel::memory::{
     AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE,
 };
-pub use carrick_runtime::thread::ThreadId;
+pub use carrick_kernel::thread::ThreadId;
 pub use carrick_vfs::rootfs::{LayerSource, RootFs};
 pub use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 
@@ -42,9 +42,9 @@ pub fn test_tid(raw: i32) -> ThreadId {
 }
 
 pub fn tc<'a>(
-    tid: carrick_runtime::thread::ThreadId,
-    registry: &'a carrick_runtime::thread::ThreadRegistry,
-    futex: &'a carrick_runtime::thread::FutexTable,
+    tid: carrick_kernel::thread::ThreadId,
+    registry: &'a carrick_kernel::thread::ThreadRegistry,
+    futex: &'a carrick_kernel::thread::FutexTable,
 ) -> ThreadCtx<'a> {
     ThreadCtx::new(tid, registry, futex)
 }

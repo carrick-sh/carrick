@@ -10,13 +10,13 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
-use carrick_runtime::linux_abi::LINUX_AT_FDCWD;
+use carrick_kernel::linux_abi::LINUX_AT_FDCWD;
 #[cfg(target_os = "macos")]
 use carrick_vfs::fs_backend::HostFsBackend;
 // `LINUX_EFAULT`/`LINUX_O_CREAT`/`LINUX_O_RDWR` are only referenced by the
 // macOS-only (`--fs host`) tests below, so gate their import to match.
 #[cfg(target_os = "macos")]
-use carrick_runtime::linux_abi::{LINUX_EFAULT, LINUX_O_CREAT, LINUX_O_RDWR};
+use carrick_kernel::linux_abi::{LINUX_EFAULT, LINUX_O_CREAT, LINUX_O_RDWR};
 use support::*;
 
 #[test]

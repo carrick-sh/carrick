@@ -7,18 +7,18 @@
 mod support;
 
 use carrick_kernel::dispatch::{GuestMemory, SyscallDispatcher, SyscallRequest};
-use carrick_runtime::elf::SegmentPerms;
-use carrick_runtime::linux_abi::{
+use carrick_kernel::elf::SegmentPerms;
+use carrick_kernel::linux_abi::{
     LINUX_AT_BASE, LINUX_AT_ENTRY, LINUX_AT_NULL, LINUX_AT_PAGESZ, LINUX_AT_PHDR, LINUX_AT_PHENT,
     LINUX_AT_PHNUM, LinuxAuxvEntry,
 };
-use carrick_runtime::memory::{
+use carrick_kernel::memory::{
     AddressSpace, LINUX_HEAP_BASE, LINUX_INTERPRETER_BASE, LINUX_MMAP_BASE,
 };
 use carrick_vfs::rootfs::{LayerSource, RootFs};
 use zerocopy::{FromBytes, IntoBytes};
 
-use carrick_runtime::compat::{CompatReporter, SyscallArgs};
+use carrick_kernel::compat::{CompatReporter, SyscallArgs};
 use support::gzip_tar_with_modes;
 
 #[test]

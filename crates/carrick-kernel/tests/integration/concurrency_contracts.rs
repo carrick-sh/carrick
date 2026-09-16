@@ -1,22 +1,22 @@
 use std::sync::Arc;
 
+use carrick_kernel::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use carrick_kernel::dispatch::{
     DispatchOutcome, GuestMemory, LinearMemory, SyscallDispatcher, SyscallRequest,
 };
-use carrick_runtime::compat::{CompatEvent, CompatReporter, SyscallArgs};
-use carrick_runtime::linux_abi::LinuxErrno;
-use carrick_runtime::memory::LINUX_HEAP_BASE;
-use carrick_runtime::thread::{FutexTable, ThreadRegistry};
+use carrick_kernel::linux_abi::LinuxErrno;
+use carrick_kernel::memory::LINUX_HEAP_BASE;
+use carrick_kernel::thread::{FutexTable, ThreadRegistry};
 use carrick_vfs::rootfs::{LayerSource, RootFs};
 
 /// Synthetic registry keys for these harnesses (`ThreadId`'s named-constructor
 /// discipline: tests fabricate keys explicitly).
-fn t(raw: i32) -> carrick_runtime::thread::ThreadId {
-    carrick_runtime::thread::ThreadId::synthetic_for_tests(raw)
+fn t(raw: i32) -> carrick_kernel::thread::ThreadId {
+    carrick_kernel::thread::ThreadId::synthetic_for_tests(raw)
 }
 
 fn tc<'a>(
-    tid: carrick_runtime::thread::ThreadId,
+    tid: carrick_kernel::thread::ThreadId,
     registry: &'a ThreadRegistry,
     futex: &'a FutexTable,
 ) -> carrick_kernel::dispatch::ThreadCtx<'a> {
@@ -231,7 +231,7 @@ fn shared_dispatcher_routes_sibling_thread_signals() {
     // The root task is namespace init and therefore ignores default-lethal
     // signals until it installs a handler. Make delivery observable here.
     let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(10).unwrap();
-    let mut action = carrick_runtime::linux_abi::LinuxSigaction::empty();
+    let mut action = carrick_kernel::linux_abi::LinuxSigaction::empty();
     action.sa_handler = 0x4000;
     context.shared().sighand().install_action(signal, action);
 

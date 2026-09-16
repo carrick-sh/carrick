@@ -10,7 +10,7 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
-use carrick_runtime::linux_abi::{LINUX_AT_FDCWD, LINUX_EFBIG, LINUX_O_CREAT, LINUX_O_RDWR};
+use carrick_kernel::linux_abi::{LINUX_AT_FDCWD, LINUX_EFBIG, LINUX_O_CREAT, LINUX_O_RDWR};
 use carrick_vfs::{BindVfs, MAX_IN_MEMORY_FILE_SIZE};
 use support::*;
 
@@ -771,7 +771,7 @@ fn missing_proc_file_records_compat_report_entry() {
 
 #[test]
 fn synthetic_sys_surface_serves_common_cpu_and_mm_files() {
-    let ncpu = carrick_runtime::host_facts::logical_cpu_count();
+    let ncpu = carrick_kernel::host_facts::logical_cpu_count();
     let cpu_range = if ncpu <= 1 {
         b"0\n".to_vec()
     } else {

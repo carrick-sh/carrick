@@ -10,7 +10,7 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
-use carrick_runtime::linux_abi::{LINUX_AT_FDCWD, LINUX_O_RDWR};
+use carrick_kernel::linux_abi::{LINUX_AT_FDCWD, LINUX_O_RDWR};
 #[cfg(target_os = "macos")]
 use carrick_vfs::fs_backend::HostFsBackend;
 use carrick_vfs::fs_backend::{
@@ -875,7 +875,7 @@ fn tiocgpgrp_on_real_tty_uses_host_value_not_bootstrap() {
             // Must never be the synthesised bootstrap constant on a real tty.
             assert_ne!(
                 pgrp,
-                carrick_runtime::linux_abi::LINUX_BOOTSTRAP_PGID,
+                carrick_kernel::linux_abi::LINUX_BOOTSTRAP_PGID,
                 "host_tty_tcgetpgrp must not return the faked bootstrap pgid on a real tty"
             );
         }
@@ -932,7 +932,7 @@ fn tiocgsid_on_real_tty_uses_host_value_not_bootstrap() {
             assert_eq!(sid, direct, "host_tty_tcgetsid must match tcgetsid");
             assert_ne!(
                 sid,
-                carrick_runtime::linux_abi::LINUX_BOOTSTRAP_SID,
+                carrick_kernel::linux_abi::LINUX_BOOTSTRAP_SID,
                 "host_tty_tcgetsid must not return the faked bootstrap sid on a real tty"
             );
         }
@@ -2353,7 +2353,7 @@ fn x86_private_dup2_installs_requested_fd_and_allows_same_fd_noop() {
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
-                    carrick_runtime::linux_abi::CARRICK_PRIVATE_X86_DUP2,
+                    carrick_kernel::linux_abi::CARRICK_PRIVATE_X86_DUP2,
                     SyscallArgs::from([3, 1, 0, 0, 0, 0]),
                 ),
                 &mut memory,
@@ -2367,7 +2367,7 @@ fn x86_private_dup2_installs_requested_fd_and_allows_same_fd_noop() {
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
-                    carrick_runtime::linux_abi::CARRICK_PRIVATE_X86_DUP2,
+                    carrick_kernel::linux_abi::CARRICK_PRIVATE_X86_DUP2,
                     SyscallArgs::from([1, 1, 0, 0, 0, 0]),
                 ),
                 &mut memory,

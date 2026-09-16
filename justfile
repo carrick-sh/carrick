@@ -362,6 +362,9 @@ test-integration:
     set -euo pipefail
     if [ "{{os()}}" = "macos" ]; then
         cargo test -p carrick-runtime --test integration
+        # The kernel/dispatch half of that suite: every case that names no
+        # carrier and no image store moved here with the code it exercises.
+        cargo test -p carrick-kernel --test integration
         # The P5 blocking-host-I/O ratchet scans `dispatch/{net,fs,mod}.rs`
         # by path, so it lives in the crate that owns them. It has no crate
         # dependency at all -- it reads source and asserts.
@@ -399,6 +402,11 @@ test-integration:
     # fixtures/linux-aarch64-hello image — those fail/skip ENVIRONMENTALLY off-macOS,
     # not because of feature wiring.)
     cargo test -p carrick-runtime {{_platform_features}} --test integration
+    # carrick-kernel takes no `platform-*` feature: its host-OS edges are
+    # `cfg(target_os)` dependency tables, so the same invocation is correct on
+    # every host.
+    cargo test -p carrick-kernel --test integration
+    cargo test -p carrick-kernel --test io_blocking_guard
     cargo test -p carrick-runtime {{_platform_features}} --test syscall_process
     cargo test -p carrick-cli {{_platform_features}} --test trace_profile
     cargo test -p carrick-cli {{_platform_features}} --test fs_backend_flag
