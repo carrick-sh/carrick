@@ -10,9 +10,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use crate::dispatch::HostSyscallResult;
 use crate::linux_abi::LinuxErrno;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
+use crate::vfs::errno::HostSyscallResult;
 use carrick_abi::{NsGid, NsUid};
 
 use crate::fs_backend::path::{

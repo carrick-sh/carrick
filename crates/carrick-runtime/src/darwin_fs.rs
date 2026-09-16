@@ -1,7 +1,7 @@
 //! Small Darwin filesystem primitives used by Linux syscall emulation.
 
-use crate::dispatch::HostSyscallError;
 use crate::linux_abi::LinuxErrno;
+use crate::vfs::errno::HostSyscallError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CopyfileResult {

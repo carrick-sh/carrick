@@ -763,9 +763,11 @@ pub mod io_pipe;
 pub mod routing;
 pub mod seccomp_observer;
 pub(crate) use io_pipe::{
-    HostPipeWriteTarget, HostSyscallError, HostSyscallResult, MAX_RW_COUNT, host_pipe_write_room,
-    read_host_pipe, would_block_outcome, write_host_pipe, write_host_pipe_owned,
+    HostPipeWriteTarget, MAX_RW_COUNT, host_pipe_write_room, read_host_pipe, would_block_outcome,
+    write_host_pipe, write_host_pipe_owned,
 };
+// Host-errno adaptation lives below the VFS; dispatch is a consumer of it.
+pub(crate) use crate::vfs::errno::{HostSyscallError, HostSyscallResult};
 #[allow(unused_imports)]
 pub(crate) use routing::{
     MM_MUTATION_SYSCALLS, MutationDispatchRoute, MutationSyscallHandler, NormalizedDispatchRoute,

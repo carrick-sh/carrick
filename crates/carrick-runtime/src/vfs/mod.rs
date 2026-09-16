@@ -87,6 +87,7 @@ pub mod bind;
 pub mod dentry;
 pub mod dev;
 pub mod devpts;
+pub mod errno;
 pub mod etc_services;
 pub mod mount;
 pub(crate) mod namespace_mutation;
