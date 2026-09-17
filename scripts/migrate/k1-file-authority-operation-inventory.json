@@ -10514,7 +10514,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 5650,
+      "line": 5660,
       "categories": [
         "mapping"
       ],
@@ -15979,7 +15979,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/process_lifecycle.rs",
-      "line": 133,
+      "line": 173,
       "categories": [
         "mapping"
       ],
