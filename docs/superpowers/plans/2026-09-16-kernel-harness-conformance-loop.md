@@ -1143,3 +1143,24 @@ original deferral receipts above remain historical evidence, not current waivers
   zero-event poll before parking on the original description. It retains the
   enrollment handshake and exact original-description event assertion; no
   runtime serialization or retry acceptance was introduced.
+
+
+#### Follow-up final acceptance
+
+- Product/harness fix: `db74ae4e1`; tested committed tree: `e77341d7d`.
+  Full `just ci` exited zero, including workspace Clippy, all local architecture
+  and inventory gates, compile/rustdoc, host tests, and integration/CLI/harness
+  validation. Receipt: `/tmp/deferred-ci-accepted.log`.
+- Kernel partition passed 2015 parallel + 83 serial-host tests; the sole parallel
+  ignore predates this work. The 94 harness tests all pass without ignores.
+- Clean-source reconciliation retained all 585 captured host-authority rows.
+  Independent normalized JSON comparison confirmed the five reconciled
+  inventories changed only positions/provenance, not classifications. The
+  existing UNIX listener registry's typed pending-state change was separately
+  reviewed in `e77341d7d`; its `host_kernel_object` classification is unchanged.
+  Receipt: `/tmp/deferred-inventory-reconcile.log`.
+- This closes all three deferrals. No push or signed guest conformance run was
+  performed. The macOS host-authority census reports its documented partial
+  platform coverage; Linux/FreeBSD/NetBSD profile capture remains separate.
+  Final receipt documentation and JSON spelling normalization do not change
+  the tested product or harness source.
