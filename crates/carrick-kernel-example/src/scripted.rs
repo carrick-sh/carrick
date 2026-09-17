@@ -4,7 +4,7 @@
 //! `SyscallRequest`; this one reads the next [`Step`] of a script instead.
 //! Each Linux task is one host thread owning its own `SyscallDispatcher`
 //! (forked from its parent's, exactly as the carrier forks one per Linux
-//! process), its own `LinearMemory` and its own [`ExampleProcess`] handle.
+//! process), its own `TaskMemory` and its own [`ExampleProcess`] handle.
 //! What the loop then does with every `DispatchOutcome` it meets is the
 //! backend contract, and each arm below names the carrier arm it mirrors.
 //!
@@ -13,17 +13,17 @@
 //! [`WAIT_BOUND`] so a lost wake is a failed run, not a hang.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use carrick_abi::syscall::nr;
-use carrick_abi::{LINUX_BOOTSTRAP_PID, LINUX_SIGCHLD, LinuxCloneFlags, LinuxErrno};
-use carrick_guest_mem::{GuestMemory, MemoryError};
+use carrick_abi::{LINUX_BOOTSTRAP_PID, LinuxCloneFlags, LinuxErrno};
+use carrick_guest_mem::MemoryError;
 use carrick_hal::{NullGuestTimerBridge, NullHostSignalBridge};
 use carrick_kernel::compat::{CompatReporter, SyscallArgs};
 use carrick_kernel::dispatch::mm_authority::PrepareDispatchMmForkError;
 use carrick_kernel::dispatch::{
-    CarrierBridges, DispatchError, DispatchOutcome, LinearMemory, SyscallDispatcher, SyscallRequest,
+    CarrierBridges, DispatchError, DispatchOutcome, SyscallDispatcher, SyscallRequest,
 };
 use carrick_kernel::kernel::{
     CarrierProcess, ChildExitSignal, CloneObjectMode, ClonePlan, ClonePlanError, KernelError,
@@ -32,7 +32,10 @@ use carrick_kernel::kernel::{
 use carrick_kernel::thread::ThreadId;
 use parking_lot::Mutex;
 
+use crate::memory::TaskMemory;
+use crate::operand::{Expect, Operand, Save, Step, Syscall};
 use crate::process::{AddressSpace, AddressSpaceError, AsidAllocator, ExampleProcess};
+use crate::report::{Completion, Output, RunReport};
 
 /// The bound on every wait in this backend: a child that has not exited, a
 /// pipe that has not been written, a task thread that has not finished. A
@@ -43,110 +46,11 @@ pub const WAIT_BOUND: Duration = Duration::from_secs(5);
 /// the carrier numbers its root.
 const ROOT_PID: i32 = LINUX_BOOTSTRAP_PID as i32;
 
-/// Where each task's `LinearMemory` sits in its guest address space, and the
-/// scratch layout the steps use inside it.
-const GUEST_BASE: u64 = 0x1000_0000;
-const GUEST_LEN: usize = 0x1000;
-/// `pipe2`'s `int pipefd[2]`.
-const FD_PAIR: u64 = GUEST_BASE;
-/// `wait4`'s `int *wstatus`.
-const WSTATUS: u64 = GUEST_BASE + 0x10;
-/// The `read`/`write` payload.
-const BUFFER: u64 = GUEST_BASE + 0x100;
-const BUFFER_LEN: usize = GUEST_LEN - 0x100;
+/// Specification of an output buffer: (argument index, guest address, length).
+type OutBufferSpec = (usize, u64, usize);
 
-/// Where a step takes an fd or a pid from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Operand {
-    /// A literal value.
-    Literal(i64),
-    /// Slot `n` of the task's slot table (`pipe2` fills slots 0 and 1).
-    Slot(usize),
-    /// The pid the task's most recent fork returned.
-    LastChild,
-}
-
-/// One syscall of a script.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Sys {
-    /// `pipe2(2)`: the two fds land in slots 0 and 1.
-    Pipe2 { flags: u64 },
-    /// `clone(2)` as `fork`: `clone(SIGCHLD, 0, 0, 0, 0)`. The next step must
-    /// be [`Step::child_marker`], which the child runs and the parent skips.
-    Fork,
-    /// `write(2)` of `data` to `fd`.
-    Write { fd: Operand, data: Vec<u8> },
-    /// `read(2)` of up to `len` bytes from `fd`; what came back is recorded
-    /// in [`RunReport::read_results`].
-    Read { fd: Operand, len: usize },
-    /// `wait4(2)` on `pid`; the status is recorded in
-    /// [`RunReport::wait_statuses`].
-    Wait4 { pid: Operand, options: u64 },
-    /// `exit_group(2)`: the task's last step.
-    ExitGroup { code: i32 },
-}
-
-/// One step of a script.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Step {
-    /// Issue a syscall.
-    Sys(Sys),
-    /// The script the child of the preceding [`Sys::Fork`] runs.
-    ChildMarker(Vec<Step>),
-}
-
-impl Step {
-    /// Issue `sys`.
-    pub fn sys(sys: Sys) -> Self {
-        Self::Sys(sys)
-    }
-
-    /// The child's script; must directly follow a [`Sys::Fork`].
-    pub fn child_marker(script: Vec<Step>) -> Self {
-        Self::ChildMarker(script)
-    }
-
-    /// Slot `index` of the task's slot table.
-    pub const fn slot(index: usize) -> Operand {
-        Operand::Slot(index)
-    }
-
-    /// The pid of the task's most recent fork.
-    pub const fn last_child() -> Operand {
-        Operand::LastChild
-    }
-}
-
-/// What a run produced.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RunReport {
-    exit_code: i32,
-    read_results: Vec<Vec<u8>>,
-    wait_statuses: Vec<i32>,
-    tasks_started: usize,
-}
-
-impl RunReport {
-    /// The root task's `exit_group` code.
-    pub const fn exit_code(&self) -> i32 {
-        self.exit_code
-    }
-
-    /// The bytes every [`Sys::Read`] returned, in completion order.
-    pub fn read_results(&self) -> &[Vec<u8>] {
-        &self.read_results
-    }
-
-    /// The `wstatus` every [`Sys::Wait4`] reported, in completion order.
-    pub fn wait_statuses(&self) -> &[i32] {
-        &self.wait_statuses
-    }
-
-    /// How many Linux tasks ran: the root plus every published child.
-    pub const fn tasks_started(&self) -> usize {
-        self.tasks_started
-    }
-}
+/// Resolved syscall arguments and output buffer specifications.
+type ResolvedArgs = ([u64; 6], Vec<OutBufferSpec>);
 
 /// Why a run failed.
 #[derive(Debug, thiserror::Error)]
@@ -155,6 +59,13 @@ pub enum ExampleError {
     Errno {
         syscall: &'static str,
         errno: LinuxErrno,
+    },
+    #[error("task {pid} expected {expected} on {label}, got {actual}")]
+    Expectation {
+        pid: i32,
+        label: &'static str,
+        expected: String,
+        actual: String,
     },
     #[error("a VM-less backend cannot interpret this outcome: {0}")]
     Unsupported(String),
@@ -220,6 +131,7 @@ impl ScriptedBackend {
             asids: AsidAllocator::new(),
             ledger: Mutex::new(Ledger::default()),
             children: Mutex::new(Vec::new()),
+            dispatches: AtomicUsize::new(0),
         });
         let space = AddressSpace::allocate(&shared.asids)?;
         let (process, _root) = ExampleProcess::boot_root(
@@ -237,7 +149,7 @@ impl ScriptedBackend {
         let mut root = Task {
             dispatcher,
             process,
-            memory: LinearMemory::new(GUEST_BASE, vec![0; GUEST_LEN]),
+            memory: TaskMemory::new(),
             slots: Vec::new(),
             last_child: None,
             reporter: CompatReporter::default(),
@@ -258,9 +170,12 @@ impl ScriptedBackend {
         }
         Ok(RunReport {
             exit_code,
-            read_results: ledger.read_results,
-            wait_statuses: ledger.wait_statuses,
+            completions: ledger.completions,
+            outputs: ledger.outputs,
+            deaths: ledger.deaths,
             tasks_started: ledger.tasks_started,
+            dispatches: shared.dispatches.load(Ordering::SeqCst),
+            dispatch_events: ledger.dispatch_events,
         })
     }
 
@@ -290,20 +205,24 @@ struct Shared {
     asids: AsidAllocator,
     ledger: Mutex<Ledger>,
     children: Mutex<Vec<JoinHandle<()>>>,
+    dispatches: AtomicUsize,
 }
 
 #[derive(Default)]
 struct Ledger {
-    read_results: Vec<Vec<u8>>,
-    wait_statuses: Vec<i32>,
+    completions: Vec<Completion>,
+    outputs: Vec<Output>,
+    deaths: Vec<(i32, i32)>,
+    dispatch_events: Vec<(i32, &'static str)>,
     tasks_started: usize,
     task_failures: Vec<(i32, ExampleError)>,
 }
 
-/// How one issued syscall ended, once every wait it met has been serviced.
+/// How one issued syscall ended internally.
 #[derive(Debug)]
-enum Completion {
+enum InternalCompletion {
     Returned(i64),
+    Errno(LinuxErrno),
     Exit(i32),
     Fork { flags: u64, exit_signal: u32 },
 }
@@ -312,7 +231,7 @@ enum Completion {
 struct Task {
     dispatcher: SyscallDispatcher,
     process: Arc<ExampleProcess>,
-    memory: LinearMemory,
+    memory: TaskMemory,
     slots: Vec<i64>,
     last_child: Option<i32>,
     reporter: CompatReporter,
@@ -329,16 +248,33 @@ impl Task {
                         "child_marker without a preceding fork".to_owned(),
                     ));
                 }
-                Step::Sys(Sys::Fork) => {
-                    let Some(Step::ChildMarker(child_script)) = steps.next() else {
-                        return Err(ExampleError::Script(
-                            "fork must be followed by child_marker".to_owned(),
-                        ));
-                    };
-                    self.fork(child_script, shared)?;
+                Step::Sys(syscall) => {
+                    let (args, outs) = self.resolve(syscall)?;
+                    let completion = self.issue(syscall.label, syscall.nr.raw(), args, shared)?;
+                    match completion {
+                        InternalCompletion::Fork { flags, exit_signal } => {
+                            let Some(Step::ChildMarker(child_script)) = steps.next() else {
+                                return Err(ExampleError::Script(
+                                    "fork must be followed by child_marker".to_owned(),
+                                ));
+                            };
+                            let child_pid =
+                                self.on_fork(flags, exit_signal, child_script, shared)?;
+                            self.last_child = Some(child_pid);
+                            self.finish_syscall(syscall, Ok(child_pid as i64), outs, shared)?;
+                        }
+                        InternalCompletion::Exit(code) => {
+                            self.on_exit(code)?;
+                            return Ok(code);
+                        }
+                        InternalCompletion::Returned(value) => {
+                            self.finish_syscall(syscall, Ok(value), outs, shared)?;
+                        }
+                        InternalCompletion::Errno(errno) => {
+                            self.finish_syscall(syscall, Err(errno), outs, shared)?;
+                        }
+                    }
                 }
-                Step::Sys(Sys::ExitGroup { code }) => return self.exit_group(*code),
-                Step::Sys(sys) => self.step(sys, shared)?,
             }
         }
         Err(ExampleError::Script(
@@ -355,93 +291,141 @@ impl Task {
         }
     }
 
-    fn operand(&self, operand: Operand) -> Result<i64, ExampleError> {
-        match operand {
-            Operand::Literal(value) => Ok(value),
-            Operand::Slot(index) => self
-                .slots
-                .get(index)
-                .copied()
-                .ok_or_else(|| ExampleError::Script(format!("slot {index} is unset"))),
-            Operand::LastChild => self
-                .last_child
-                .map(i64::from)
-                .ok_or_else(|| ExampleError::Script("no child has been forked".to_owned())),
+    fn resolve(&mut self, syscall: &Syscall) -> Result<ResolvedArgs, ExampleError> {
+        let mut args = [0u64; 6];
+        let mut outs = Vec::new();
+        for (i, op) in syscall.args.iter().enumerate() {
+            args[i] = match op {
+                Operand::Lit(v) => *v as u64,
+                Operand::Slot(s) => self
+                    .slots
+                    .get(*s)
+                    .copied()
+                    .map(|v| v as u64)
+                    .ok_or_else(|| ExampleError::Script(format!("slot {s} is unset")))?,
+                Operand::LastChild => self
+                    .last_child
+                    .map(|pid| pid as u64)
+                    .ok_or_else(|| ExampleError::Script("no child has been forked".to_owned()))?,
+                Operand::Bytes(b) => self.memory.put(b)?,
+                Operand::CStr(s) => {
+                    let mut b = s.as_bytes().to_vec();
+                    b.push(0);
+                    self.memory.put(&b)?
+                }
+                Operand::Out(n) => {
+                    let a = self.memory.alloc_zeroed(*n)?;
+                    outs.push((i, a, *n));
+                    a
+                }
+            };
         }
+        Ok((args, outs))
     }
 
-    fn step(&mut self, sys: &Sys, shared: &Arc<Shared>) -> Result<(), ExampleError> {
-        match sys {
-            Sys::Pipe2 { flags } => {
-                self.returned("pipe2", nr::PIPE2.raw(), [FD_PAIR, *flags, 0, 0, 0, 0])?;
-                let pair = self.memory.read_bytes(FD_PAIR, 8)?;
-                let (read_end, write_end) = (i32_at(&pair, 0)?, i32_at(&pair, 4)?);
-                self.slots = vec![i64::from(read_end), i64::from(write_end)];
-            }
-            Sys::Write { fd, data } => {
-                if data.len() > BUFFER_LEN {
-                    return Err(ExampleError::Script(format!(
-                        "write of {} bytes exceeds the {BUFFER_LEN}-byte buffer",
-                        data.len()
-                    )));
-                }
-                self.memory.write_bytes(BUFFER, data)?;
-                let fd = self.operand(*fd)?;
-                self.returned(
-                    "write",
-                    nr::WRITE.raw(),
-                    [fd as u64, BUFFER, data.len() as u64, 0, 0, 0],
-                )?;
-            }
-            Sys::Read { fd, len } => {
-                if *len > BUFFER_LEN {
-                    return Err(ExampleError::Script(format!(
-                        "read of {len} bytes exceeds the {BUFFER_LEN}-byte buffer"
-                    )));
-                }
-                let fd = self.operand(*fd)?;
-                let count = self.returned(
-                    "read",
-                    nr::READ.raw(),
-                    [fd as u64, BUFFER, *len as u64, 0, 0, 0],
-                )?;
-                let count = usize::try_from(count).map_err(|_| {
-                    ExampleError::Script(format!("read returned a negative length {count}"))
-                })?;
-                let bytes = self.memory.read_bytes(BUFFER, count)?;
-                shared.ledger.lock().read_results.push(bytes);
-            }
-            Sys::Wait4 { pid, options } => {
-                let pid = self.operand(*pid)?;
-                self.returned(
-                    "wait4",
-                    nr::WAIT4.raw(),
-                    [pid as u64, WSTATUS, *options, 0, 0, 0],
-                )?;
-                let status = i32_at(&self.memory.read_bytes(WSTATUS, 4)?, 0)?;
-                shared.ledger.lock().wait_statuses.push(status);
-            }
-            Sys::Fork | Sys::ExitGroup { .. } => {
-                return Err(ExampleError::Script(
-                    "fork and exit_group are interpreted by the run loop".to_owned(),
-                ));
-            }
+    fn save_slot(&mut self, slot: usize, value: i64) {
+        if self.slots.len() <= slot {
+            self.slots.resize(slot + 1, 0);
         }
-        Ok(())
+        self.slots[slot] = value;
     }
 
-    /// Issue a syscall that must complete with a return value.
-    fn returned(
+    fn finish_syscall(
         &mut self,
-        syscall: &'static str,
-        number: u64,
-        args: [u64; 6],
-    ) -> Result<i64, ExampleError> {
-        match self.issue(syscall, number, args)? {
-            Completion::Returned(value) => Ok(value),
-            other => Err(ExampleError::Script(format!(
-                "{syscall} completed as {other:?} instead of returning"
-            ))),
+        syscall: &Syscall,
+        result: Result<i64, LinuxErrno>,
+        outs: Vec<OutBufferSpec>,
+        shared: &Arc<Shared>,
+    ) -> Result<(), ExampleError> {
+        let pid = self.process.pid();
+        let mut captured_outputs = Vec::new();
+        for (arg_idx, addr, len) in &outs {
+            let bytes = self.memory.read(*addr, *len)?;
+            captured_outputs.push(Output {
+                pid,
+                label: syscall.label,
+                arg: *arg_idx,
+                bytes,
+            });
+        }
+
+        {
+            let mut ledger = shared.ledger.lock();
+            ledger.completions.push(Completion {
+                pid,
+                label: syscall.label,
+                result,
+            });
+            ledger.outputs.extend(captured_outputs);
+        }
+
+        for save in &syscall.saves {
+            match save {
+                Save::Ret(slot) => {
+                    if let Ok(val) = result {
+                        self.save_slot(*slot, val);
+                    }
+                }
+                Save::OutI32 { arg, index, slot } => {
+                    let out = outs.iter().find(|(a, _, _)| a == arg).ok_or_else(|| {
+                        ExampleError::Script(format!("no out buffer for arg {arg}"))
+                    })?;
+                    let offset = out.1 + (*index as u64) * 4;
+                    let bytes = self.memory.read(offset, 4)?;
+                    let word = <[u8; 4]>::try_from(bytes.as_slice())
+                        .map_err(|_| ExampleError::Script("invalid i32 slice".to_owned()))?;
+                    let val = i32::from_le_bytes(word);
+                    self.save_slot(*slot, val as i64);
+                }
+            }
+        }
+
+        match &syscall.expect {
+            Expect::Any => {
+                if let Err(errno) = result {
+                    return Err(ExampleError::Errno {
+                        syscall: syscall.label,
+                        errno,
+                    });
+                }
+                Ok(())
+            }
+            Expect::Ret(expected) => match result {
+                Ok(val) if val == *expected => Ok(()),
+                Ok(val) => Err(ExampleError::Expectation {
+                    pid,
+                    label: syscall.label,
+                    expected: format!("return value {expected}"),
+                    actual: format!("return value {val}"),
+                }),
+                Err(errno) => Err(ExampleError::Expectation {
+                    pid,
+                    label: syscall.label,
+                    expected: format!("return value {expected}"),
+                    actual: format!("errno {}", errno.get()),
+                }),
+            },
+            Expect::Errno(expected) => match result {
+                Err(errno) if errno == *expected => Ok(()),
+                Err(errno) => Err(ExampleError::Expectation {
+                    pid,
+                    label: syscall.label,
+                    expected: format!("errno {}", expected.get()),
+                    actual: format!("errno {}", errno.get()),
+                }),
+                Ok(val) => Err(ExampleError::Expectation {
+                    pid,
+                    label: syscall.label,
+                    expected: format!("errno {}", expected.get()),
+                    actual: format!("return value {val}"),
+                }),
+            },
+            Expect::Death(sig) => Err(ExampleError::Expectation {
+                pid,
+                label: syscall.label,
+                expected: format!("death by signal {sig}"),
+                actual: format!("{result:?}"),
+            }),
         }
     }
 
@@ -460,7 +444,8 @@ impl Task {
         syscall: &'static str,
         number: u64,
         args: [u64; 6],
-    ) -> Result<Completion, ExampleError> {
+        shared: &Arc<Shared>,
+    ) -> Result<InternalCompletion, ExampleError> {
         let deadline = Instant::now() + WAIT_BOUND;
         loop {
             // The context is captured per dispatch through the process
@@ -468,18 +453,24 @@ impl Task {
             // or an exit moves the task's revision, and a stale context is
             // refused by the kernel operations that check it.
             let context = self.dispatcher.capture_one_task_context()?;
+            shared.dispatches.fetch_add(1, Ordering::SeqCst);
+            shared
+                .ledger
+                .lock()
+                .dispatch_events
+                .push((self.process.pid(), syscall));
             let outcome = self.dispatcher.dispatch(
                 &context,
                 SyscallRequest::new(number, SyscallArgs::from(args)),
-                &mut self.memory,
+                &mut self.memory.linear,
                 &self.reporter,
             )?;
             match outcome {
-                DispatchOutcome::Returned { value } => return Ok(Completion::Returned(value)),
-                DispatchOutcome::Errno { errno } => {
-                    return Err(ExampleError::Errno { syscall, errno });
+                DispatchOutcome::Returned { value } => {
+                    return Ok(InternalCompletion::Returned(value));
                 }
-                DispatchOutcome::Exit { code } => return Ok(Completion::Exit(code)),
+                DispatchOutcome::Errno { errno } => return Ok(InternalCompletion::Errno(errno)),
+                DispatchOutcome::Exit { code } => return Ok(InternalCompletion::Exit(code)),
                 DispatchOutcome::Fork {
                     flags,
                     pidfd_out,
@@ -502,11 +493,11 @@ impl Task {
                              CLONE_PARENT, tid stores, child stack or vfork) runs here"
                         )));
                     }
-                    return Ok(Completion::Fork { flags, exit_signal });
+                    return Ok(InternalCompletion::Fork { flags, exit_signal });
                 }
                 DispatchOutcome::SchedulerYield => {
                     thread::yield_now();
-                    return Ok(Completion::Returned(0));
+                    return Ok(InternalCompletion::Returned(0));
                 }
                 DispatchOutcome::WaitOnHvpatchChild { .. } | DispatchOutcome::WaitOnFds { .. } => {
                     if Instant::now() >= deadline {
@@ -517,22 +508,6 @@ impl Task {
                 other => return Err(ExampleError::Unsupported(format!("{other:?}"))),
             }
         }
-    }
-
-    fn fork(&mut self, child_script: &[Step], shared: &Arc<Shared>) -> Result<(), ExampleError> {
-        let Completion::Fork { flags, exit_signal } = self.issue(
-            "clone",
-            nr::CLONE.raw(),
-            [LINUX_SIGCHLD as u64, 0, 0, 0, 0, 0],
-        )?
-        else {
-            return Err(ExampleError::Script(
-                "clone completed without a fork outcome".to_owned(),
-            ));
-        };
-        let child_pid = self.on_fork(flags, exit_signal, child_script, shared)?;
-        self.last_child = Some(child_pid);
-        Ok(())
     }
 
     /// The `Fork` arm, mirroring the carrier's in-process fork through the
@@ -625,22 +600,6 @@ impl Task {
         Ok(child_pid)
     }
 
-    fn exit_group(&mut self, code: i32) -> Result<i32, ExampleError> {
-        match self.issue(
-            "exit_group",
-            nr::EXIT_GROUP.raw(),
-            [code as u64, 0, 0, 0, 0, 0],
-        )? {
-            Completion::Exit(code) => {
-                self.on_exit(code)?;
-                Ok(code)
-            }
-            other => Err(ExampleError::Script(format!(
-                "exit_group completed as {other:?} instead of exiting"
-            ))),
-        }
-    }
-
     /// The `Exit` arm: take this Linux process through its terminal, as the
     /// carrier's terminal path does.
     ///
@@ -665,13 +624,4 @@ impl Task {
 /// A Linux pid as the dispatcher's fork clone names it.
 fn guest_pid(pid: i32) -> Result<u32, ExampleError> {
     u32::try_from(pid).map_err(|_| ExampleError::Script(format!("pid {pid} is not positive")))
-}
-
-/// The native-endian `i32` at `offset` of a guest read.
-fn i32_at(bytes: &[u8], offset: usize) -> Result<i32, ExampleError> {
-    bytes
-        .get(offset..offset + 4)
-        .and_then(|word| <[u8; 4]>::try_from(word).ok())
-        .map(i32::from_ne_bytes)
-        .ok_or_else(|| ExampleError::Script(format!("no i32 at offset {offset} of a guest read")))
 }
