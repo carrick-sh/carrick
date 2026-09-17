@@ -325,13 +325,23 @@ impl PtPauseBudget {
     };
 }
 
-/// Pure mapper from [`carrick_hal::VcpuLeaseDrainPoll`] to diagnostic thread ID.
+/// Win the stop-the-world election and raise `quiescing` — the FIRST HALF of a
+/// page-table pause, and no more than that.
 ///
-/// Maps [`carrick_hal::VcpuLeaseDrainPoll::Complete`] to 0 and
-/// [`carrick_hal::VcpuLeaseDrainPoll::Waiting`] to its exact raw `ThreadId`.
-/// Acquire and hold exact-MM admission while every registered participant is
-/// kicked and observed out of guest across all process-local registries.
-pub fn begin_pt_pause(
+/// On success this thread is the coordinator and no executor may re-enter
+/// guest, but nothing has been drained and NO guard exists: the siblings
+/// already inside the guest are still there. The caller owes the rest of the
+/// protocol — `drain_exact_mm`, which kicks and observes every registered
+/// participant out of guest and only then mints the [`PtPauseGuard`] whose drop
+/// calls `barrier.end()`. Returning early between the two leaks the coordinator
+/// flag and wedges every later editor, which is why this is private and the
+/// complete protocols ([`acquire_mm_stage1_authority`],
+/// [`acquire_frame_cow_quiesce`]) are what callers get.
+///
+/// A loser parks until the coordinator finishes or `budget.election` expires;
+/// it holds nothing while waiting, so a timeout is a plain
+/// [`PtPauseError::TimedOut`] with nothing to roll back.
+fn begin_pt_pause(
     barrier: &crate::fork_quiesce::PtQuiesce,
     tid: ThreadId,
     budget: PtPauseBudget,
@@ -370,6 +380,24 @@ pub fn begin_pt_pause(
     }
     barrier.set_quiescing();
     Ok(())
+}
+
+/// Raise a page-table pause WITHOUT draining or taking a guard — test-only.
+///
+/// This is [`begin_pt_pause`]'s half-protocol deliberately exposed, for the one
+/// assertion that needs the raised-but-not-yet-drained state as its setup: the
+/// carrier's `raised_pt_pause_denies_guest_reentry_until_guard_releases` proves
+/// an executor cannot re-enter guest while `quiescing` is up, which is exactly
+/// the window a real pause passes through before its guard exists. The caller
+/// owns `barrier.end()`; production code must use a complete protocol
+/// ([`acquire_mm_stage1_authority`], [`acquire_frame_cow_quiesce`]) instead.
+#[cfg(any(test, feature = "test-support"))]
+pub fn raise_pt_pause_for_test(
+    barrier: &crate::fork_quiesce::PtQuiesce,
+    tid: ThreadId,
+    budget: PtPauseBudget,
+) -> Result<(), PtPauseError> {
+    begin_pt_pause(barrier, tid, budget)
 }
 
 fn drain_exact_mm<'mm>(

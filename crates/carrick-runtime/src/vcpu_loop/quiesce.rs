@@ -1912,7 +1912,7 @@ mod pt_pause_tests {
     use carrick_hal::{GenericVcpuRegistry, VcpuKickDyn, VcpuRegistry};
     use carrick_kernel::dispatch::mm_quiesce::{
         PtPauseError, acquire_frame_cow_quiesce, acquire_mutation_pause_for_test, acquire_pt_pause,
-        begin_pt_pause, current_thread_holds_pt_pause, pt_barrier,
+        current_thread_holds_pt_pause, pt_barrier, raise_pt_pause_for_test,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -3107,7 +3107,7 @@ mod pt_pause_tests {
             "production must re-check the pause after publishing in-guest and before engine entry"
         );
         let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
-        begin_pt_pause(
+        raise_pt_pause_for_test(
             &barrier,
             tid(1541),
             PtPauseBudget {
