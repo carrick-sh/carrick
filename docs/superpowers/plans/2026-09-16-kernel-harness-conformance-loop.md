@@ -717,12 +717,13 @@ test-kernel *ARGS:
 | when | `just test` wall | carrick-kernel tests | carrick-vfs tests |
 |---|---|---|---|
 | initial cold correctness baseline (build overlap; not a speed comparison) | 345.15 s | 2083 passed, 1 ignored | 283 passed |
-| before Task 11 | | | |
+| before Task 11 (warm) | 63.05 s | 2083 passed, 1 ignored | 283 passed |
 | after Task 13 | | | |
 
 ### Execution checkpoint
 
 - Initial `just test`: exit 0, log `/tmp/kernel-harness-just-test-before.log`.
+- Warm `just test`: exit 0, log `/tmp/kernel-harness-just-test-warm-before.log`.
 - Task 1 worker: `AGY_RUN_ID=kernel-harness-sep16`, name `vocabulary`, worktree
   `/Users/tjfontaine/.codex/worktrees/kernel-harness-vocabulary`.
 - Tasks 11–12 scanner-only worker: same run id, name `serial-ratchet`, worktree
