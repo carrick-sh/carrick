@@ -242,7 +242,7 @@ pub(crate) fn drive(task: &mut Task, syscall: &Syscall, args: [u64; 6]) -> Resul
 ```
 `drive` dispatches once; on a wait outcome it (1) registers the wait exactly as the carrier does for that family (the carrier's mapping from outcome to `ContinuationCapture` lives in `vcpu_loop/continuation.rs` — call the same kernel functions it calls; if any of them is `pub(crate)` in `carrick-kernel`, promote it to `pub` with a doc comment in this task), (2) parks with `block_on(await_event(service, token))` under a deadline of `WAIT_BOUND` (a timeout is `ExampleError::WaitTimedOut(syscall.label)`), (3) on the event, restarts per the capture's `RestartClass` (`RestartSyscall` → dispatch the same request again and loop; a completion-carrying event → return its value). `SchedulerYield` → `std::thread::yield_now()` and re-dispatch (this is not a wait). `BlockingWrite` is driven with `carrick_kernel::dispatch::drive_blocking_write(&mut write, host_signal)` in a loop until it reports completion, parking on its wait token between steps — never restarted from offset zero.
 
-- [ ] **Step 1: Write the failing test** (in `tests/fork_pipe_wait.rs`):
+- [x] **Step 1: Write the failing test** (in `tests/fork_pipe_wait.rs`):
 
 ```rust
 #[test]
@@ -269,11 +269,11 @@ Add `Step::HostSleepMs(u64)` to `Step` in this task (a host-side `std::thread::s
 
 - [ ] **Step 2: Run it to verify it fails** — `cargo test -p carrick-kernel-example --tests a_blocked_read` → FAIL: `dispatches_for == N` with N ≫ 2 (the poll loop).
 
-- [ ] **Step 3: Implement `driver.rs`** as specified above; delete the yield/re-dispatch arms from `Task::issue`. Write the family mapping as a table at the top of `driver.rs` (one row per `DispatchOutcome` wait variant: which kernel registration call, which restart class), so the next reader does not re-derive it.
+- [x] **Step 3: Implement `driver.rs`** as specified above; delete the yield/re-dispatch arms from `Task::issue`. Write the family mapping as a table at the top of `driver.rs` (one row per `DispatchOutcome` wait variant: which kernel registration call, which restart class), so the next reader does not re-derive it.
 
-- [ ] **Step 4: Run the tests** — `cargo test -p carrick-kernel-example --tests` → all green, the new test sees exactly 2; the lost-wake test still fails inside the bound with `WaitTimedOut("wait4")` and now takes `WAIT_BOUND` because it parks (assert the elapsed window is unchanged).
+- [x] **Step 4: Run the tests** — `cargo test -p carrick-kernel-example --tests` → all green, the new test sees exactly 2; the lost-wake test still fails inside the bound with `WaitTimedOut("wait4")` and now takes `WAIT_BOUND` because it parks (assert the elapsed window is unchanged).
 
-- [ ] **Step 5: Commit** — `git commit -m "feat(kernel-example): park blocked syscalls on the kernel wait service"` (Why — a poll loop masks lost wakes, the flaky class the suite must catch; What — driver.rs + family table, HostSleepMs step; Verified — dispatch count 2, lost-wake bound unchanged).
+- [x] **Step 5: Commit** — `git commit -m "feat(kernel-example): park blocked syscalls on the kernel wait service"` (Why — a poll loop masks lost wakes, the flaky class the suite must catch; What — driver.rs + family table, HostSleepMs step; Verified — dispatch count 2, lost-wake bound unchanged).
 
 ### Task 3: Signals without handlers
 
@@ -760,3 +760,27 @@ test-kernel *ARGS:
   13–15, reconcile inventories, and run final required gates.
 - Tasks 2–15 remain subject to director acceptance; no worker report is a
   completed checkbox. No signed guest acceptance or performance claim yet.
+
+### Continuation checkpoint (supersedes Task 2 status above)
+
+- Integrated Task 2 commits `a614708c5` and `799aca301`. Director reran
+  `cargo test -p carrick-kernel-example --tests`: 1 lib + 14 integration tests
+  passed, including exactly two blocked-read dispatches, bounded lost wake,
+  128 KiB pipe delivery, and pselect timeout guest writes. Runtime compile,
+  harness Clippy, and `just check-layering` all passed.
+- Continuation completion folding, blocking-write SIGPIPE policy, and syscall
+  restart policy now live in the kernel and are called by both carrier and
+  harness. Explicit pre-change red receipt for Task 2 remains to be recovered;
+  its red-first checkbox stays open rather than inferred.
+- Harness Tasks 3–4 are running with `vocabulary`, brief
+  `/tmp/kernel-harness-phase-a-finish.md`. This includes reserved-signal
+  consumption, correct signal-death wait encoding, timer completion, removal
+  of stale polling docs, and removal of unused host-sleep ordering support.
+- Partition work ended mid-edit with a stale previous scanner result. Resumed
+  the same worker with `/tmp/kernel-harness-partition-resume.md`, requiring
+  restoration of `kernel_exec_publication_filters_cloexec_descriptors`, exact
+  name reconciliation, and all ten-run qualification receipts before acceptance.
+- Shared exit review has restored blocked-mask and pending-state coverage;
+  final review must ensure the parent registry read guard is released before
+  callbacks and child-exit suppression policy has one implementation.
+- Tasks 3–15 remain unaccepted; the overall goal is active.
