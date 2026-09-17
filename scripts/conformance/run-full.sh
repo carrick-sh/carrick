@@ -12,9 +12,14 @@
 #        * localhost:5050  -> cpython-test, ltp   (container name: registry)
 #        * localhost:5005  -> go, node            (container name: vt-ferry-registry)
 #   2. Build: the SIGNED carrick binary (cargo build strips the HVF entitlement
-#      -> HV_DENIED, so always via build-signed.sh) AND the carrick-conformance
-#      harness. cargo is incremental, so this is ~free when nothing changed and
-#      guarantees the run uses a binary that matches the working tree.
+#      -> HV_DENIED, so always via build-signed.sh) AND, as a SEPARATE explicit
+#      `-p carrick-conformance`, the harness. The two builds are separate
+#      because build-signed.sh runs an argument-less `cargo build --release`,
+#      whose selection is the root manifest's `default-members` --
+#      `crates/carrick-cli` alone -- and carrick-conformance is a bin-only
+#      crate outside carrick-cli's dependency closure, so that build never
+#      touches it. cargo is incremental, so this is ~free when nothing changed
+#      and guarantees the run uses BOTH binaries matching the working tree.
 #   3. Run: target/release/carrick-conformance --tier "$TIER" "$@". The harness
 #      itself is already idempotent downstream — its image-freshness guard keeps
 #      carrick's image bytes == docker's, and its committed oracle cache means a
@@ -81,10 +86,15 @@ fi
 
 # --- 2. build (signed carrick + harness) ------------------------------------
 log "building signed carrick + conformance harness"
-./scripts/build-signed.sh                 # builds the whole workspace, signs carrick
-if [ ! -x target/release/carrick-conformance ]; then
-    cargo build --release -p carrick-conformance
-fi
+./scripts/build-signed.sh                 # builds + signs carrick (default-members = carrick-cli)
+# UNCONDITIONAL, not `if [ ! -x ... ]`: the root manifest's `default-members`
+# is `crates/carrick-cli`, so build-signed.sh's `cargo build --release` does
+# not build this bin-only crate at all. Guarding on the binary's mere
+# existence therefore pinned every run to whatever harness a previous
+# checkout happened to leave in target/release -- a stale suite table,
+# baseline comparison or oracle-cache schema producing verdicts that belong
+# to no revision. A gate result belongs to exactly one pair of binaries.
+cargo build --release -p carrick-conformance
 
 # --- 3. run -----------------------------------------------------------------
 TIER="${TIER:-full}"
