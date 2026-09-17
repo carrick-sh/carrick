@@ -793,7 +793,8 @@ impl<'a> NetView<'a> {
                                     if i32::from_ne_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) < 0 {
                                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                                     }
-                                    if let Some(peer) = socket.peer_addr()
+                                    if (socket.socket_type != LINUX_SOCK_STREAM || socket.protocol == LINUX_IPPROTO_SCTP)
+                                        && let Some(peer) = socket.peer_addr()
                                         && let Some(sockaddr_bytes) = socket_addr_to_linux_sockaddr(peer) {
                                         if write_linux_sockaddr(
                                             memory,
@@ -1594,7 +1595,9 @@ impl<'a> NetView<'a> {
                     }
                     if msg.name != 0 {
                         let mut name_len = 0u32;
-                        if let Some(peer) = socket.peer_addr()
+                        if (socket.socket_type != LINUX_SOCK_STREAM
+                            || socket.protocol == LINUX_IPPROTO_SCTP)
+                            && let Some(peer) = socket.peer_addr()
                             && let Some(sockaddr_bytes) = socket_addr_to_linux_sockaddr(peer)
                         {
                             name_len = sockaddr_bytes.len() as u32;

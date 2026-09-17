@@ -3127,21 +3127,23 @@ impl<'a> NetView<'a> {
                         };
                         let file_desc = open_file.description();
                         let status_flags = file_desc.common().status_flags();
-                        let (old_cleanup, old_host_fd, old_family, description_local) = {
+                        let (old_cleanup, old_host_fd, old_family, description_local, guest_protocol) = {
                             let open = file_desc.read();
                             match open.as_deref() {
                                 Some(OpenDescription::HostSocket {
                                     base,
                                     host_fd,
                                     family,
+                                    protocol,
                                     ..
                                 }) => (
                                     base.inzone_cleanup(),
                                     Some(host_fd.raw()),
                                     Some(*family),
                                     base.guest_local(),
+                                    if *protocol == 0 { LINUX_IPPROTO_TCP } else { *protocol },
                                 ),
-                                _ => (None, None, None, None),
+                                _ => (None, None, None, None, LINUX_IPPROTO_TCP),
                             }
                         };
                         let family = old_family.unwrap_or(family);
@@ -3266,7 +3268,7 @@ impl<'a> NetView<'a> {
                             crate::dispatch::net::unix_pure::PureSocketInner::pair_with_family(
                                 family,
                                 LINUX_SOCK_STREAM,
-                                LINUX_IPPROTO_TCP,
+                                guest_protocol,
                                 ucred,
                                 ucred,
                             );
