@@ -142,3 +142,7 @@ The external workers were stopped before measurements. One orphaned worker
 kernel test had used an unpartitioned recipe; its log was retained and its exact
 process tree terminated. Acceptance uses the director-run partitioned recipes.
 Unrelated user plans remain unchanged. No push was performed.
+
+Follow-up: the [ptrace wait batch](2026-09-17-ptrace-wait-batch.md) adds 16
+VM-free tests, fixes the stale-selector and waitid stop-kind defects, and
+refreshes the full ecosystem ledger and remaining priorities.
