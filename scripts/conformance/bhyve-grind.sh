@@ -37,6 +37,15 @@ IMG="${BHYVE_IMG:-localhost:5050/ltp:arm64}"
 SSH="ssh -o ConnectTimeout=15 -o ServerAliveInterval=20 -o ServerAliveCountMax=400 -o BatchMode=yes"
 ENVV="CARRICK_INSECURE_REGISTRIES=$REG"
 BUILD="cargo build --release -j4 -p carrick-cli --no-default-features --features platform-freebsd,syscall-shim"
+# The harness is a SECOND explicit build, and it is not optional: the root
+# manifest's `default-members` is `crates/carrick-cli`, and carrick-conformance
+# is a bin-only crate outside that closure, so no carrick build of any shape
+# produces `target/release/carrick-conformance`. Without this the box runs
+# whichever harness an earlier checkout left behind -- a stale suite table or
+# baseline comparison silently attributing its verdicts to the synced tree.
+# It links none of the guest stack and has no platform features, so it takes
+# the plain host build on the FreeBSD box.
+BUILD_CONF="cargo build --release -j4 -p carrick-conformance"
 # Reap leaked/wedged guests; works whether run remotely (in a heredoc) or as a phrase.
 REAP='ps -axo pid,etimes,command 2>/dev/null | awk "/carrick:/ && \$2>180 {print \$1}" | xargs -r kill -9 2>/dev/null; for vm in $(ls /dev/vmm/ 2>/dev/null | grep carrick); do pid=$(echo "$vm" | sed "s/carrick-\([0-9]*\)-.*/\1/"); kill -0 "$pid" 2>/dev/null || bhyvectl --destroy --vm="$vm" >/dev/null 2>&1; done'
 
@@ -49,12 +58,14 @@ case "$cmd" in
   build)
     rsync -az crates/ "$BOX:$DIR/crates/"
     # shellcheck disable=SC2029
-    $SSH "$BOX" "cd $DIR && $BUILD 2>&1 | grep -E '^error|error\[|Finished' | tail -3"
+    $SSH "$BOX" "cd $DIR && $BUILD 2>&1 | grep -E '^error|error\[|Finished' | tail -3 && \
+      $BUILD_CONF 2>&1 | grep -E '^error|error\[|Finished' | tail -3"
     ;;
   run)
     S=""; for s in "$@"; do S="$S --suite ltp-$s"; done
     # shellcheck disable=SC2029
     $SSH "$BOX" "cd $DIR && $REAP; pkill -9 -f 'carrick:conf-' 2>/dev/null; \
+      $BUILD_CONF >/dev/null 2>&1 || { echo 'harness build FAILED'; exit 1; }; \
       $ENVV ./target/release/carrick-conformance --lane bhyve-local --ecosystem ltp $S \
         --workers 3 --flake-retries 0 2>&1 | grep -E 'MATCH|REGRESSION|DIFF|CRASH|TIMEOUT|summary' | tail -30"
     ;;
@@ -74,6 +85,7 @@ case "$cmd" in
     out="${1:-/tmp/ltpfull.jsonl}"
     # shellcheck disable=SC2029
     $SSH "$BOX" "cd $DIR && $REAP; pkill -9 -f 'carrick:conf-' 2>/dev/null; \
+      $BUILD_CONF >/dev/null 2>&1 || { echo 'harness build FAILED'; exit 1; }; \
       $ENVV ./target/release/carrick-conformance --lane bhyve-local --ecosystem ltp \
         --workers 3 --flake-retries 0 --jsonl $out 2>&1 | tail -5"
     echo "jsonl on box: $out (scp it back to tally true-MATCH = match/(total-oracle_fail))"
