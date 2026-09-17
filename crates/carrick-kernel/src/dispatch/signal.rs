@@ -498,21 +498,14 @@ impl<'a> SignalView<'a> {
         } else {
             crate::linux_abi::LINUX_SIGCHLD
         };
-        if sigmask_bit(signum).is_none() {
+        let Ok(signal) = crate::kernel::ids::LinuxSignal::for_signal_number(signum) else {
             return false;
-        }
-        match Self::signal_action_entry(context, signum).map(|action| action.sa_handler) {
-            Some(handler) if handler == crate::linux_abi::LINUX_SIG_IGN => false,
-            Some(handler) if handler == crate::linux_abi::LINUX_SIG_DFL => {
-                self.signal_mask_for(context, tid).contains(signum)
-                    || !is_default_ignore_signal(signum)
-            }
-            Some(_) => true,
-            None => {
-                self.signal_mask_for(context, tid).contains(signum)
-                    || !is_default_ignore_signal(signum)
-            }
-        }
+        };
+        let action = Self::signal_action_entry(context, signum);
+        let blocked = self.signal_mask_for(context, tid).contains(signum);
+        crate::kernel::objects::signal::child_exit_signal_needs_notification(
+            signal, action, blocked,
+        )
     }
 
     pub fn child_exit_signal_needs_process_pump(
@@ -537,17 +530,14 @@ impl<'a> SignalView<'a> {
         } else {
             crate::linux_abi::LINUX_SIGCHLD
         };
-        if sigmask_bit(signum).is_none() {
+        let Ok(signal) = crate::kernel::ids::LinuxSignal::for_signal_number(signum) else {
             return false;
-        }
-        match Self::signal_action_entry(context, signum).map(|action| action.sa_handler) {
-            Some(handler) if handler == crate::linux_abi::LINUX_SIG_IGN => false,
-            Some(handler) if handler == crate::linux_abi::LINUX_SIG_DFL => {
-                Self::any_thread_blocks(threads, signum) || !is_default_ignore_signal(signum)
-            }
-            Some(_) => true,
-            None => Self::any_thread_blocks(threads, signum) || !is_default_ignore_signal(signum),
-        }
+        };
+        let action = Self::signal_action_entry(context, signum);
+        let blocked = Self::any_thread_blocks(threads, signum);
+        crate::kernel::objects::signal::child_exit_signal_needs_notification(
+            signal, action, blocked,
+        )
     }
 
     pub(crate) fn child_exit_signal_snapshot_needs_pump(
