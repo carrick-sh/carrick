@@ -810,3 +810,32 @@ test-kernel *ARGS:
 - Shared exit final review is running; pending partition cleanup review remains
   `/tmp/kernel-harness-partition-review.md` and must be sent when the worker
   becomes terminal. Do not accept a stale earlier scanner result.
+
+### Shared-exit checkpoint
+
+- Integrated `f976f8573` + `5701bdaab` (worker originals `3bd9b048d` +
+  `d7365fbd1`). Kernel exit now owns child-signal payload/publication and
+  unconditional parent wake; the carrier retains executor routing. Shared
+  suppression policy covers ignored and default-ignored signals. Registry
+  read guards are released before notification callbacks.
+- Director verification on the final worker tree: 21 exit tests, 45 dispatch
+  signal tests, the post-exec runtime SIGCHLD regression, and kernel/runtime
+  lib Clippy passed. The lock test resets observations immediately before
+  child exit, excluding earlier wake events. After integration, all 15 current
+  harness tests and runtime compile passed.
+- Task 3 as a whole remains open: `vocabulary` must finish and verify the
+  harness integration, SIGCHLD payload tests, shared carrier disposition
+  handling, and same-call SIGPIPE death. Final shared-exit commits above are
+  available for its isolated integration.
+- New `semantics` worker, same run id, worktree
+  `/Users/tjfontaine/.codex/worktrees/kernel-harness-semantics`, implements
+  Tasks 5–7 tests in file-disjoint test modules. Brief:
+  `/tmp/kernel-harness-semantics-wait-pipe.md`. It starts on Phase A candidate
+  `03f197a5b`; final acceptance will use the fully integrated harness.
+- Partition third bounded attempt is running with
+  `/tmp/kernel-harness-partition-review.md`: restore the unchanged named-FIFO
+  test body and dropped pipe cleanup, then exact inventory and qualification.
+  Prior scanner success reports were stale; no partition commit is accepted.
+- Task 14/15 source and topology notes extended in
+  `/tmp/kernel-harness-thread-notes.md`; distinguish process pid and thread tid
+  in reports, and count all actors in a parent/child/thread script.
