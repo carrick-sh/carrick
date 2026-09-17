@@ -249,7 +249,7 @@ impl ExecutionGeneration {
         Self::INITIAL
     }
 
-    fn next(self) -> Option<Self> {
+    pub(crate) fn next(self) -> Option<Self> {
         self.0.checked_add(1).map(Self)
     }
 
@@ -547,6 +547,39 @@ pub struct ThreadExecutionLease {
     task_state: Option<Box<MigratableTaskState>>,
     blocked_continuation: Option<Box<crate::kernel::continuation::BlockedContinuation>>,
     settled: bool,
+}
+
+/// Typed record proving that an executor binding consumed a live predecessor
+/// lease by transitioning it to Exited during `execve`.
+///
+/// When an operation past the point of no return fails before the successor
+/// execution lease can be published, this token proves to the scheduler that
+/// the predecessor was legitimately consumed on this binding and should be
+/// settled as terminal without failing the claimed execution.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ExecConsumedPredecessorAuthority {
+    thread: ThreadKey,
+    generation: ExecutionGeneration,
+    executor: ExecutorId,
+    executor_epoch: u64,
+}
+
+impl ExecConsumedPredecessorAuthority {
+    pub const fn thread_key(&self) -> ThreadKey {
+        self.thread
+    }
+
+    pub const fn generation(&self) -> ExecutionGeneration {
+        self.generation
+    }
+
+    pub const fn executor(&self) -> ExecutorId {
+        self.executor
+    }
+
+    pub const fn executor_epoch(&self) -> u64 {
+        self.executor_epoch
+    }
 }
 
 /// A settlement either consumes the exact lease successfully or returns that
@@ -1571,6 +1604,21 @@ impl Thread {
             .map(|_| ())
     }
 
+    pub fn exit_predecessor_for_exec(
+        &self,
+        lease: ThreadExecutionLease,
+    ) -> Result<ExecConsumedPredecessorAuthority, (ThreadExecutionError, ThreadExecutionLease)>
+    {
+        let authority = ExecConsumedPredecessorAuthority {
+            thread: lease.owner_key,
+            generation: lease.generation,
+            executor: lease.executor,
+            executor_epoch: lease.executor_epoch,
+        };
+        self.settle_execution_lease(lease, ExecutionSettlement::Exited, false)
+            .map(|_| authority)
+    }
+
     pub(in crate::kernel) fn cancel_kernel_owned_continuation(
         &self,
         cause: crate::kernel::continuation::CancellationCause,
@@ -2078,6 +2126,9 @@ impl Thread {
         &self,
     ) -> Result<(), ThreadExecutionError> {
         let mut execution = self.execution.lock();
+        if matches!(execution.state, ThreadExecutionState::Exited { .. }) {
+            return Ok(());
+        }
         if matches!(execution.state, ThreadExecutionState::SwitchingOut { .. }) {
             execution.exec_invalidation_pending = true;
             drop(execution);
@@ -2728,5 +2779,78 @@ mod tests {
         };
         let res = fixture.leader.fail_unsettled_execution_lease(&lease);
         assert_eq!(res, Err(ThreadExecutionError::GenerationExhausted));
+    }
+
+    fn aarch64_test_task_state() -> carrick_hal::threaded::Aarch64TaskCpuStateV1 {
+        carrick_hal::threaded::Aarch64TaskCpuStateV1 {
+            gprs: std::array::from_fn(|index| index as u64 + 1),
+            pc: 0x1000,
+            pstate: 0x2000,
+            trap_pc: 0x2100,
+            trap_pstate: 0x2200,
+            sp_el0: 0x3000,
+            elr_el1: 0x3100,
+            spsr_el1: 0x3200,
+            ttbr0: 0x4000,
+            ttbr1: 0x5000,
+            tcr: 0x6000,
+            sctlr_el1: 0x6100,
+            mair_el1: 0x6200,
+            vbar_el1: 0x6300,
+            cpacr_el1: 0x6400,
+            cntkctl_el1: 0x6500,
+            tpidr_el1: 0x6600,
+            actlr_el1: 0x7000,
+            tpidr_el0: 0x8000,
+            tpidrro_el0: 0x9000,
+            contextidr_el1: 0xa000,
+            vregs: [0; 32],
+            fpsr: 0,
+            fpcr: 0,
+            pending_resume_pc: None,
+            last_syscall_nr: None,
+            last_syscall_orig_x0: 0,
+            last_fault_esr: 0,
+            last_exit_class: 0,
+            is_forked_child: false,
+            syscall_continuation: None,
+            mm_generation: 1,
+            asid_generation: 1,
+        }
+    }
+
+    #[test]
+    fn thread_exit_predecessor_for_exec_mints_linear_authority() {
+        let fixture = Fixture::new();
+        let executor = ExecutorId::synthetic_for_tests(88);
+        let mm = fixture._task.shared().mm().id();
+        let mut cpu = aarch64_test_task_state();
+        cpu.mm_generation = mm.raw();
+        cpu.asid_generation = 1;
+        fixture
+            .leader
+            .publish_initial_task_state(super::MigratableTaskState {
+                cpu: carrick_hal::threaded::GuestCpuState::from_aarch64_v1(cpu),
+                mm,
+                asid_generation: 1,
+            })
+            .unwrap();
+        let lease = fixture.leader.claim_runnable(executor).unwrap();
+        let generation = lease.generation();
+        let key = lease.thread_key();
+        let epoch = lease.executor_epoch();
+
+        let authority = fixture
+            .leader
+            .exit_predecessor_for_exec(lease)
+            .expect("mint authority");
+        assert_eq!(authority.thread_key(), key);
+        assert_eq!(authority.generation(), generation);
+        assert_eq!(authority.executor(), executor);
+        assert_eq!(authority.executor_epoch(), epoch);
+        assert!(matches!(
+            fixture.leader.execution_state(),
+            ThreadExecutionState::Exited { .. }
+        ));
     }
 }

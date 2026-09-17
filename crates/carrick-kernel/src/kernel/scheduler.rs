@@ -4003,6 +4003,61 @@ impl Scheduler {
         Ok(())
     }
 
+    pub fn settle_exec_consumed_exited(
+        &self,
+        mut running: RunnableThread,
+        consumed: super::objects::ExecConsumedPredecessorAuthority,
+    ) -> Result<(), SchedulerError> {
+        if consumed.thread_key() != running.thread_key()
+            || consumed.generation() != running.generation()
+            || consumed.executor() != running.binding.executor
+            || consumed.executor_epoch() != running.binding.executor_epoch
+        {
+            return Err(RunQueueError::AuthorityMismatch.into());
+        }
+        let settle_tid = running.thread_key().tid.raw();
+        let settle_generation = running.generation().raw();
+        crate::event_ring::rec_hvpatch_settle_step(settle_tid, settle_generation, 1);
+        let _transition = self.generation_transition.lock();
+        let predecessor = running.generation();
+        let state = running.thread.execution_state();
+        let successor = match state {
+            super::objects::ThreadExecutionState::Exited { generation }
+                if predecessor.next() == Some(generation) =>
+            {
+                generation
+            }
+            _ => return Err(RunQueueError::AuthorityMismatch.into()),
+        };
+        crate::event_ring::rec_hvpatch_settle_step(settle_tid, settle_generation, 2);
+        let _ = self.observe_generation_transition(
+            &running.thread,
+            running.thread_key(),
+            predecessor,
+            successor,
+            SchedulerGenerationTransition::Terminal,
+        );
+        self.executors.unbind(running.binding);
+        let bound_cpu = self
+            .executors
+            .state
+            .lock()
+            .entries
+            .get(&running.binding.executor)
+            .and_then(|e| e.bound_cpu)
+            .unwrap_or(GuestCpuId::new(0));
+        if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
+            guest_cpu.set_current_task(None);
+        }
+        let task_key = TaskKey::new(running.thread.task_key().serial.raw());
+        self.queue.inner.policy.on_exit(task_key, bound_cpu);
+        crate::event_ring::rec_hvpatch_settle_step(settle_tid, settle_generation, 3);
+        drop(_transition);
+        running.finish_claim();
+        crate::event_ring::rec_hvpatch_settle_step(settle_tid, settle_generation, 4);
+        Ok(())
+    }
+
     fn apply_settlement_action(
         &self,
         executor: Option<ExecutorId>,
@@ -7544,5 +7599,67 @@ mod tests {
                 other => panic!("wrong abort reason: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn settle_exec_consumed_exited_settles_terminal_and_cleans_up() {
+        let (kernel, context) = bootstrap(11_090);
+        publish(&context, 90);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let kick = Arc::new(RecordingKick::default());
+        let registration = scheduler.register_executor(kick.clone()).unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let mut running = scheduler.take(&registration).unwrap();
+        let lease = running.take_lease();
+        let consumed = context.thread().exit_predecessor_for_exec(lease).unwrap();
+        assert!(matches!(
+            context.thread().execution_state(),
+            ThreadExecutionState::Exited { .. }
+        ));
+        scheduler
+            .settle_exec_consumed_exited(running, consumed)
+            .expect("settle exec consumed exited");
+        scheduler.unregister_executor(&registration).unwrap();
+    }
+
+    #[test]
+    fn settle_exec_consumed_exited_rejects_mismatched_authority() {
+        let (kernel, context) = bootstrap(11_091);
+        publish(&context, 91);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let kick = Arc::new(RecordingKick::default());
+        let registration = scheduler.register_executor(kick.clone()).unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let mut running = scheduler.take(&registration).unwrap();
+        let lease = running.take_lease();
+        let consumed = context.thread().exit_predecessor_for_exec(lease).unwrap();
+
+        let (other_kernel, other_context) = bootstrap(11_092);
+        publish(&other_context, 92);
+        let other_scheduler = Scheduler::new(other_kernel);
+        let other_reg = other_scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        other_scheduler
+            .make_runnable(other_context.thread().key())
+            .unwrap();
+        let mut other_running = other_scheduler.take(&other_reg).unwrap();
+        let other_lease = other_running.take_lease();
+        let other_consumed = other_context
+            .thread()
+            .exit_predecessor_for_exec(other_lease)
+            .unwrap();
+
+        let err = scheduler.settle_exec_consumed_exited(running, other_consumed);
+        assert!(matches!(
+            err,
+            Err(super::SchedulerError::Queue(
+                super::RunQueueError::AuthorityMismatch
+            ))
+        ));
+
+        other_scheduler
+            .settle_exec_consumed_exited(other_running, consumed)
+            .unwrap_err();
     }
 }

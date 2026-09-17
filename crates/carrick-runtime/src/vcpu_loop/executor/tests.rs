@@ -10,14 +10,14 @@ use carrick_hal::threaded::{Aarch64SyscallContinuationV1, Aarch64TaskCpuStateV1,
 use carrick_kernel::kernel::CarrierProcess;
 
 use super::{
-    ExecBindingTransition, ExecutorBoundaryAudit, ExecutorCpuReceipt, ExecutorExit, ExecutorPool,
-    ExecutorPoolConfig, ExecutorPoolEvent, ExecutorSaveError, ExecutorSubmissionContext,
-    HvpatchActivationProof, HvpatchQuantumControl, HvpatchSubmissionShape,
-    HvpatchTaskBindingDirectory, PersistentExecutor, PersistentExecutorFactory,
-    PersistentTaskBinding, ReceiptLog, RunnableTask, SavedRunnable, TaskBindingResolver,
-    TaskLoadIdentity, WorkerBoundaryAudit, WorkerKick, executor_claim_probe_asid_generation,
-    process_leader_event_identity, restore_worker_vcpu_before_binding_publication,
-    retire_failed_hvpatch_clone_authority,
+    ExecBindingTransition, ExecutionLeaseAuthoritySlot, ExecutorBoundaryAudit, ExecutorCpuReceipt,
+    ExecutorExit, ExecutorPool, ExecutorPoolConfig, ExecutorPoolEvent, ExecutorSaveError,
+    ExecutorSubmissionContext, HvpatchActivationProof, HvpatchQuantumControl,
+    HvpatchSubmissionShape, HvpatchTaskBindingDirectory, PersistentExecutor,
+    PersistentExecutorFactory, PersistentTaskBinding, ReceiptLog, RunnableTask, SavedRunnable,
+    TaskBindingResolver, TaskLoadIdentity, WorkerBoundaryAudit, WorkerKick,
+    executor_claim_probe_asid_generation, process_leader_event_identity,
+    restore_worker_vcpu_before_binding_publication, retire_failed_hvpatch_clone_authority,
 };
 use crate::compat::SyscallArgs;
 use crate::trap::TrapError;
@@ -62,7 +62,6 @@ enum Step {
     PanicRun,
     LoseLease,
     Invalid,
-    ExecPredecessorExitWithoutSuccessor,
 }
 
 #[derive(Debug)]
@@ -956,27 +955,13 @@ impl PersistentExecutor for FakeExecutor {
             Step::PanicRun => panic!("injected executor panic"),
             Step::LoseLease => {
                 let lease = submission
-                    .execution_lease_slot_mut()
-                    .take()
+                    .authority_slot_mut()
+                    .take_lease()
                     .expect("worker injected exact lease");
                 std::mem::forget(lease);
                 Ok(ExecutorExit::InvalidState)
             }
             Step::Invalid => Ok(ExecutorExit::InvalidState),
-            Step::ExecPredecessorExitWithoutSuccessor => {
-                let lease = submission
-                    .execution_lease_slot_mut()
-                    .take()
-                    .expect("worker injected exact lease");
-                let thread = binding
-                    .thread
-                    .lock()
-                    .as_ref()
-                    .cloned()
-                    .expect("thread attached to fake binding");
-                thread.exit_from_executor(lease).expect("exit predecessor");
-                Ok(ExecutorExit::Exited)
-            }
         }
     }
 
@@ -1125,6 +1110,22 @@ impl PersistentExecutor for FakeExecutor {
             return Err(TrapError::Hypervisor(
                 "injected or observed dirty executor boundary".to_owned(),
             ));
+        }
+        Ok(())
+    }
+
+    fn detach_loaded_task(&mut self) -> Result<(), TrapError> {
+        if let Some((thread, generation, binding)) = self.current.take() {
+            self.factory
+                .concurrent_loads
+                .lock()
+                .remove(&(thread, generation));
+            if !binding.audit_fails.load(Ordering::SeqCst) {
+                self.credentials = 0;
+                self.restart_state = 0;
+                self.mailbox = 0;
+                self.tls = 0;
+            }
         }
         Ok(())
     }
@@ -1400,7 +1401,7 @@ fn hvpatch_quantum_borrows_a_fresh_injected_engine_at_every_boundary() {
         scheduler: &scheduler,
         publish_test_descendant: &reject_descendant,
         current: None,
-        lease: None,
+        authority: ExecutionLeaseAuthoritySlot::default(),
         exec_replacement: None,
     };
     let need_resched = AtomicBool::new(false);
@@ -2684,7 +2685,7 @@ fn dormant_submission_activates_all_four_exact_authority_shapes() {
         scheduler: &scheduler,
         publish_test_descendant: &reject_descendant,
         current: Some(&root_authority),
-        lease: None,
+        authority: ExecutionLeaseAuthoritySlot::default(),
         exec_replacement: None,
     };
 
@@ -5869,7 +5870,7 @@ fn test_lazy_vcpu_typed_accessor_forces_materialization() {
         scheduler: &scheduler,
         publish_test_descendant: &publish_test_descendant,
         current: None,
-        lease: Some(lease),
+        authority: ExecutionLeaseAuthoritySlot::from(Some(lease)),
         exec_replacement: None,
     };
     let exit = executor
@@ -5944,7 +5945,7 @@ fn test_lazy_vcpu_executor_destroy_materializes_resident_task() {
         scheduler: &scheduler,
         publish_test_descendant: &publish_test_descendant,
         current: None,
-        lease: Some(lease),
+        authority: ExecutionLeaseAuthoritySlot::from(Some(lease)),
         exec_replacement: None,
     };
     let exit = executor
@@ -6015,7 +6016,7 @@ fn test_lazy_vcpu_stale_record_on_reentry_after_other_executor_run_discards_and_
         scheduler: &scheduler,
         publish_test_descendant: &publish_test_descendant,
         current: None,
-        lease: Some(lease),
+        authority: ExecutionLeaseAuthoritySlot::from(Some(lease)),
         exec_replacement: None,
     };
     let exit = executor
@@ -6113,7 +6114,7 @@ fn test_lazy_vcpu_cross_executor_claim_waits_for_idle_flush_and_overlays_materia
         scheduler: &scheduler,
         publish_test_descendant: &publish_test_descendant,
         current: None,
-        lease: Some(lease1),
+        authority: ExecutionLeaseAuthoritySlot::from(Some(lease1)),
         exec_replacement: None,
     };
     let exit = exec1
@@ -6417,34 +6418,456 @@ fn test_lazy_vcpu_flush_request_in_check_wait_window_not_lost() {
     scheduler.unregister_executor(&reg).unwrap();
 }
 
-#[test]
-fn test_exec_failure_past_no_return_settles_cleanly_in_executor_pool() {
-    let (kernel, context) = bootstrap(16_001);
-    let scheduler = Arc::new(Scheduler::new(kernel));
-    let factory = Arc::new(FakeFactory::default());
-    let binding = FakeBinding::new(301, [Step::ExecPredecessorExitWithoutSuccessor]);
-    factory.install(&context, Arc::clone(&binding));
-    let generation = publish(&context, 301);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum InjectedExecFailureBoundary {
+    ImageReplacement,
+    IdentityPagePublication,
+}
 
-    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 2);
-    let authority = enqueue_root(&scheduler, &context, generation);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn suffix_failure_test_executable() -> tempfile::NamedTempFile {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while binding.progress.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
-        thread::yield_now();
+    let mut executable = tempfile::NamedTempFile::new().expect("synthetic executable");
+    executable
+        .write_all(&crate::vcpu_loop::tests::synthetic_elf(183))
+        .expect("write synthetic ELF");
+    let mut permissions = executable
+        .as_file()
+        .metadata()
+        .expect("synthetic ELF metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    executable
+        .as_file()
+        .set_permissions(permissions)
+        .expect("mark synthetic ELF executable");
+    executable
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn scripted_guest_execve_engine(path: &str) -> crate::vcpu_loop::tests::CrashCaptureTestEngine {
+    const PATH: u64 = 0x30_000;
+    const ARGV: u64 = 0x31_000;
+    let mut path_bytes = vec![0; 256];
+    path_bytes[..path.len()].copy_from_slice(path.as_bytes());
+    let guest_memory = [
+        (PATH, path_bytes),
+        (ARGV, PATH.to_le_bytes().to_vec()),
+        (ARGV + 8, 0_u64.to_le_bytes().to_vec()),
+    ]
+    .into();
+    crate::vcpu_loop::tests::CrashCaptureTestEngine {
+        next_syscall: Some(carrick_hal::RawSyscall {
+            number: carrick_abi::CanonicalNr(221),
+            args: [PATH, ARGV, 0, 0, 0, 0],
+            guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            native_number: carrick_abi::NativeNr(221),
+        }),
+        guest_memory,
+        ..Default::default()
     }
-    assert_eq!(binding.progress.load(Ordering::SeqCst), 1);
+}
 
-    // Give time for settlement
-    thread::sleep(Duration::from_millis(50));
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn enable_exec_support_for_test(
+    engine: &mut crate::vcpu_loop::tests::CrashCaptureTestEngine,
+    context: &carrick_kernel::kernel::KernelContext,
+    owner_generation: u64,
+) {
+    engine.exec_support = true;
+    engine.snapshot_cpu = Some(task_state(context, 901).cpu);
+    engine.frame_cow_owner_inventory =
+        Some(crate::vcpu_loop::fixed_frame_cow_owner_inventory_for_test(
+            carrick_hal::ForeignOwnerGeneration::from_backend_counter(
+                std::num::NonZeroU64::new(owner_generation).expect("nonzero exec owner generation"),
+            ),
+        ));
+}
 
-    // The thread must be in Exited state in the kernel
-    assert!(matches!(
-        context.thread().execution_state(),
-        ThreadExecutionState::Exited { .. }
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone)]
+struct CrashCaptureProductionFactory {
+    engine: Arc<parking_lot::Mutex<crate::vcpu_loop::tests::CrashCaptureTestEngine>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PersistentExecutorFactory for CrashCaptureProductionFactory {
+    type Executor = CrashCaptureProductionExecutor;
+
+    fn create(&self, executor: ExecutorId) -> Result<Self::Executor, TrapError> {
+        Ok(CrashCaptureProductionExecutor {
+            id: executor,
+            factory: self.clone(),
+            current_quantum: None,
+            current_task: None,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct CrashCaptureProductionExecutor {
+    id: ExecutorId,
+    factory: CrashCaptureProductionFactory,
+    current_quantum: Option<Arc<crate::vcpu_loop::continuation::HvpatchTaskQuantum>>,
+    current_task: Option<(ThreadKey, ExecutionGeneration)>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PersistentExecutor for CrashCaptureProductionExecutor {
+    type TaskBinding = crate::vcpu_loop::continuation::HvpatchTaskBinding;
+
+    fn load(&mut self, task: &RunnableTask<'_, Self::TaskBinding>) -> Result<(), TrapError> {
+        task.validate_for_load()?;
+        self.current_quantum = Some(Arc::clone(task.binding().quantum()));
+        self.current_task = Some((task.thread_key(), task.generation()));
+        Ok(())
+    }
+
+    fn run_until_boundary(
+        &mut self,
+        need_resched: &AtomicBool,
+        submission: &mut ExecutorSubmissionContext<'_>,
+    ) -> Result<ExecutorExit, TrapError> {
+        let quantum = self.current_quantum.as_ref().expect("quantum loaded");
+        let mut control = HvpatchQuantumControl::for_test(need_resched, submission);
+        let mut engine = self.factory.engine.lock();
+        let exit = quantum.poll_quantum_with_engine(&mut *engine, &mut control);
+        drop(engine);
+        Ok(exit)
+    }
+
+    fn take_cpu_receipt(&mut self) -> ExecutorCpuReceipt {
+        ExecutorCpuReceipt::default()
+    }
+
+    fn hardware_kick(&self) -> Result<super::ExactHardwareKick, TrapError> {
+        Ok(test_hardware_kick(u64::from(self.id.raw_for_probe())))
+    }
+
+    fn save(&mut self, lease: ThreadExecutionLease) -> Result<SavedRunnable, ExecutorSaveError> {
+        self.current_quantum = None;
+        self.current_task = None;
+        Ok(SavedRunnable::new(lease))
+    }
+
+    fn invalidate_asid(
+        &mut self,
+        _generation: crate::hvpatch::AsidGeneration,
+    ) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    fn audit_boundary(&mut self) -> Result<(), TrapError> {
+        if self.current_task.is_some() {
+            return Err(TrapError::Hypervisor(
+                "CrashCaptureProductionExecutor retained active task across boundary".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn detach_loaded_task(&mut self) -> Result<(), TrapError> {
+        self.current_quantum = None;
+        self.current_task = None;
+        Ok(())
+    }
+
+    fn destroy(self) -> Result<(), TrapError> {
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_production_exec_failure_pool_case(boundary: InjectedExecFailureBoundary, pid: i32) {
+    use crate::vcpu_loop::tests::{
+        CrashCaptureTestEngine, EndpointTestSignalArrival, EndpointTestSignalPump,
+        NoopPlatformFutex,
+    };
+    use crate::vcpu_loop::{
+        HvpatchExternalTerminalSettlement, HvpatchLoopResult, signal_progress_count,
+    };
+
+    let (process, context) = crate::hvpatch::process_context_for_tests(pid);
+    let dispatcher = SyscallDispatcher::new();
+    dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
+    let kernel = Arc::new(crate::vcpu_loop::KernelState::new(
+        dispatcher,
+        Arc::new(EndpointTestSignalPump),
+        Arc::new(EndpointTestSignalArrival),
+        Some(process.clone()),
+        None,
+    ));
+    let runtime = Arc::clone(kernel.hvpatch_runtime.as_ref().unwrap());
+    let (scheduler, _) = runtime.continuation_services(context.kernel());
+    runtime
+        .persistent_bindings()
+        .install_scheduler(&scheduler)
+        .unwrap();
+
+    let mut initial_state = task_state(&context, 901);
+    initial_state.asid_generation = process.asid_generation();
+    if let carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu) = &mut initial_state.cpu {
+        Arc::make_mut(cpu).asid_generation = process.asid_generation();
+    }
+    let generation = context
+        .thread()
+        .publish_initial_task_state(initial_state.clone())
+        .expect("publish root state");
+
+    let this_tid = ThreadId::synthetic_for_tests(pid);
+    let kicker: Arc<dyn crate::vcpu_loop::VcpuRegistry> =
+        Arc::new(carrick_hal::GenericVcpuRegistry::new());
+    let platform: Arc<dyn crate::vcpu_loop::PlatformFutex> = Arc::new(NoopPlatformFutex);
+    let platform_factory: crate::vcpu_loop::PlatformFutexFactory =
+        Arc::new(|_| Arc::new(NoopPlatformFutex));
+    let (execution_lease_cell, injected_lease) =
+        crate::vcpu_loop::binding::ExecutionLeaseCell::injected();
+
+    let mut state = crate::vcpu_loop::ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+        Arc::new(crate::vcpu_loop::ThreadRegistry::new(this_tid)),
+        Arc::new(crate::vcpu_loop::FutexTable::new()),
+        platform,
+        platform_factory,
+        kernel.process_fork_barrier.clone(),
+        kernel.crash_capture.clone(),
+        Some(Arc::clone(context.thread())),
+        Some(process.pid()),
+        context.thread().key().tid,
+        kernel.fatal_signal.current_generation(),
+        this_tid,
+        Arc::new(parking_lot::Mutex::new(Vec::new())),
+        Arc::clone(&kicker),
+        carrick_hal::InGuestFlag::for_guest_thread(),
+        1_000,
+    );
+    state.execution_lease = execution_lease_cell;
+    state.service_kernel_context = Some(context.retain_exact());
+    state.guest_execution = Some(
+        kernel
+            .dispatcher
+            .enter_mm_executor_for_thread(Some(Arc::clone(context.thread())), kicker, this_tid)
+            .expect("context-boundary MM participation"),
+    );
+
+    let executable = suffix_failure_test_executable();
+    let path = executable.path().to_string_lossy().into_owned();
+    let mut engine = scripted_guest_execve_engine(&path);
+    enable_exec_support_for_test(&mut engine, &context, pid as u64);
+
+    match boundary {
+        InjectedExecFailureBoundary::ImageReplacement => {
+            engine.fail_execve_into = Some("injected execve_into failure".to_string());
+        }
+        InjectedExecFailureBoundary::IdentityPagePublication => {
+            state.install_exec_terminal_context_failpoint_for_test(
+                crate::vcpu_loop::exec::ExecTerminalContextFailpoint::IdentityPublication,
+            );
+        }
+    }
+
+    let root_result = HvpatchLoopResult::pending();
+    let root_completion = crate::vcpu_loop::continuation::LogicalJobCompletion::pending();
+    let root_settlement =
+        HvpatchExternalTerminalSettlement::new(root_result, root_completion.clone());
+    crate::vcpu_loop::enroll_persistent_process_member(&state.threads, &root_settlement);
+
+    let production = crate::vcpu_loop::binding::ProductionHvpatchLoopJob {
+        kernel: Arc::clone(&kernel),
+        state,
+        phase: crate::vcpu_loop::HvpatchProductionPhase::Resident,
+        registration_wait: None,
+        terminal_settlement: root_settlement,
+        terminal_result: None,
+        completion: root_completion.clone(),
+        traps: 0,
+        budget_floor: 0,
+        seen_signal_progress: signal_progress_count(),
+        last_signal_progress: Instant::now(),
+        terminal_runtime: crate::vcpu_loop::binding::PersistentTerminalRuntimeState::Resident,
+        pending_terminal_retirement: None,
+        pending_terminal_inventory: None,
+        external_exec: None,
+    };
+    let job = crate::vcpu_loop::binding::HvpatchLoopJob::production(production, injected_lease);
+    let quantum = Arc::new(crate::vcpu_loop::continuation::HvpatchTaskQuantum::new(
+        Box::new(job),
+        root_completion,
+    ));
+    let binding = Arc::new(crate::vcpu_loop::continuation::HvpatchTaskBinding::new(
+        TaskLoadIdentity {
+            abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            version: 1,
+            mm: context.shared().mm().id(),
+            asid_generation: process.asid_generation(),
+        },
+        quantum,
+        Box::new(crate::vcpu_loop::executor::HvpatchTaskEngineBindingState::test_only()),
     ));
 
-    drop(authority);
-    pool.shutdown()
-        .expect("clean pool shutdown with healthy sibling workers");
+    let dormant = runtime
+        .persistent_bindings()
+        .prepare_submission(
+            &scheduler,
+            HvpatchSubmissionShape::Root,
+            None,
+            Arc::clone(context.thread()),
+            generation,
+            Arc::clone(&binding),
+        )
+        .expect("prepare dormant root");
+
+    activate_hvpatch_test_submission(
+        dormant,
+        &scheduler,
+        &context,
+        &initial_state,
+        generation,
+        binding.as_ref(),
+    );
+
+    // Enqueue a subsequent descendant follow-on task to prove worker survives and executes cleanly
+    let follow_child = process_child(context.kernel(), &context, pid + 1_000, "follow-child");
+    let follow_state = task_state(&follow_child, 902);
+    let follow_generation = follow_child
+        .thread()
+        .publish_initial_task_state(follow_state.clone())
+        .expect("publish follow-on state");
+    let follow_binding = hvpatch_test_binding(&follow_child, &follow_state, 902);
+    let root_grant = (context.thread().key(), generation);
+    let root_authority = runtime
+        .persistent_bindings()
+        .take_submission_authority(root_grant.0, root_grant.1)
+        .expect("worker-held root grant");
+    let follow_submission = runtime
+        .persistent_bindings()
+        .prepare_submission(
+            &scheduler,
+            HvpatchSubmissionShape::Descendant { grant: root_grant },
+            Some(&root_authority),
+            Arc::clone(follow_child.thread()),
+            follow_generation,
+            Arc::clone(&follow_binding),
+        )
+        .expect("prepare follow-on descendant");
+    activate_hvpatch_test_submission(
+        follow_submission,
+        &scheduler,
+        &follow_child,
+        &follow_state,
+        follow_generation,
+        follow_binding.as_ref(),
+    );
+    runtime
+        .persistent_bindings()
+        .restore_submission_authority(root_authority)
+        .expect("restore root authority");
+
+    let factory = Arc::new(CrashCaptureProductionFactory {
+        engine: Arc::new(parking_lot::Mutex::new(engine)),
+    });
+
+    let pool = ExecutorPool::start(
+        config(1),
+        Arc::clone(&scheduler),
+        Arc::clone(&factory),
+        Arc::clone(runtime.persistent_bindings()),
+        ExecutorBoundaryAudit::production(),
+    )
+    .expect("start executor pool");
+
+    pool.wait_for_event(
+        |event| {
+            matches!(
+                event,
+                ExecutorPoolEvent::SettledExited { thread, generation: g }
+                    if *thread == context.thread().key() && *g == generation
+            )
+        },
+        Duration::from_secs(5),
+    )
+    .expect("worker settled exited on real production exec predecessor failure");
+
+    // The predecessor thread must be in Exited state in the kernel
+    assert!(
+        matches!(
+            context.thread().execution_state(),
+            ThreadExecutionState::Exited { .. }
+        ),
+        "predecessor thread must be in Exited execution state"
+    );
+
+    // The predecessor binding must be retired from the directory
+    assert!(
+        runtime
+            .persistent_bindings()
+            .resolve(context.thread().key(), generation)
+            .is_err(),
+        "predecessor binding must be retired from the binding directory"
+    );
+
+    // Surviving worker executes and settles the follow-on task
+    pool.wait_for_event(
+        |event| {
+            matches!(
+                event,
+                ExecutorPoolEvent::SettledExited { thread, generation: g }
+                    if *thread == follow_child.thread().key() && *g == follow_generation
+            )
+        },
+        Duration::from_secs(5),
+    )
+    .expect("follow-on task settled exited on surviving worker");
+
+    assert!(
+        matches!(
+            follow_child.thread().execution_state(),
+            ThreadExecutionState::Exited { .. }
+        ),
+        "follow-on thread must be in Exited execution state"
+    );
+
+    let report = pool
+        .shutdown()
+        .expect("clean pool shutdown with healthy surviving workers");
+
+    let predecessor_settled_count = report
+        .events()
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.event,
+                ExecutorPoolEvent::SettledExited { thread, generation: g }
+                    if thread == context.thread().key() && g == generation
+            )
+        })
+        .count();
+    assert_eq!(
+        predecessor_settled_count, 1,
+        "predecessor settlement must be SettledExited exactly once"
+    );
+
+    assert!(
+        report
+            .events()
+            .iter()
+            .all(|r| !matches!(r.event, ExecutorPoolEvent::Failed { .. })),
+        "no executor worker failed during production exec failure settlement or follow-on execution"
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn test_production_exec_failure_at_image_replacement_settles_in_executor_pool() {
+    run_production_exec_failure_pool_case(InjectedExecFailureBoundary::ImageReplacement, 74_280);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn test_production_exec_failure_at_identity_publication_settles_in_executor_pool() {
+    run_production_exec_failure_pool_case(
+        InjectedExecFailureBoundary::IdentityPagePublication,
+        74_290,
+    );
 }

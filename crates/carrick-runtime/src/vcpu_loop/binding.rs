@@ -26,13 +26,12 @@ use super::*;
 /// same narrow slot API so exec/continuation helpers cannot accidentally grow
 /// a second scheduler-specific implementation.
 pub(crate) enum ExecutionLeaseCell {
-    Owned(Mutex<Option<carrick_kernel::kernel::objects::ThreadExecutionLease>>),
+    Owned(Mutex<super::executor::ExecutionLeaseAuthoritySlot>),
     Injected(Arc<InjectedExecutionLeaseSlot>),
 }
 
 pub(crate) struct InjectedExecutionLeaseSlot {
-    slot:
-        std::sync::atomic::AtomicPtr<Option<carrick_kernel::kernel::objects::ThreadExecutionLease>>,
+    slot: std::sync::atomic::AtomicPtr<super::executor::ExecutionLeaseAuthoritySlot>,
 }
 
 impl InjectedExecutionLeaseSlot {
@@ -44,7 +43,7 @@ impl InjectedExecutionLeaseSlot {
 
     pub(crate) fn install(
         self: &Arc<Self>,
-        slot: *mut Option<carrick_kernel::kernel::objects::ThreadExecutionLease>,
+        slot: *mut super::executor::ExecutionLeaseAuthoritySlot,
     ) -> InjectedExecutionLeasePublication<'_> {
         if self
             .slot
@@ -85,14 +84,12 @@ impl Drop for InjectedExecutionLeasePublication<'_> {
 }
 
 pub(crate) enum ExecutionLeaseGuard<'a> {
-    Owned(
-        parking_lot::MutexGuard<'a, Option<carrick_kernel::kernel::objects::ThreadExecutionLease>>,
-    ),
-    Injected(&'a mut Option<carrick_kernel::kernel::objects::ThreadExecutionLease>),
+    Owned(parking_lot::MutexGuard<'a, super::executor::ExecutionLeaseAuthoritySlot>),
+    Injected(&'a mut super::executor::ExecutionLeaseAuthoritySlot),
 }
 
 impl std::ops::Deref for ExecutionLeaseGuard<'_> {
-    type Target = Option<carrick_kernel::kernel::objects::ThreadExecutionLease>;
+    type Target = super::executor::ExecutionLeaseAuthoritySlot;
 
     fn deref(&self) -> &Self::Target {
         match self {
@@ -113,7 +110,9 @@ impl std::ops::DerefMut for ExecutionLeaseGuard<'_> {
 
 impl ExecutionLeaseCell {
     pub(crate) fn owned() -> Self {
-        Self::Owned(Mutex::new(None))
+        Self::Owned(Mutex::new(
+            super::executor::ExecutionLeaseAuthoritySlot::default(),
+        ))
     }
 
     pub(crate) fn injected() -> (Self, Arc<InjectedExecutionLeaseSlot>) {
@@ -1359,6 +1358,7 @@ where
         terminal: PersistentTerminal,
         pending: PendingExecTerminal,
     ) -> executor::ExecutorExit {
+        let _ = self.state.pending_exec_replacement.take();
         let PendingExecTerminal { context, handoff } = pending;
         let receipt = handoff.claim_process_exit().unwrap_or_else(|failure| {
             match &terminal {
@@ -2628,22 +2628,24 @@ where
         finished: exec::FinishedPreparedExecve,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let (outcome, context, handoff) = finished.into_parts();
-        let replaced = match self.publish_exec_replacement(control) {
-            Ok(replaced) => replaced,
-            Err(error) => {
-                return Err(ProductionHvpatchPollError::from_exec_error(
-                    error, context, handoff,
-                ));
-            }
-        };
         let pending = PendingExecTerminal { context, handoff };
         if let Some(outcome) = outcome {
+            let _ = self.state.pending_exec_replacement.take();
             return Ok(self.begin_persistent_process_terminal_from_exec(
                 engine,
                 PersistentTerminal::from_outcome(outcome),
                 pending,
             ));
         }
+        let replaced = match self.publish_exec_replacement(control) {
+            Ok(replaced) => replaced,
+            Err(error) => {
+                let PendingExecTerminal { context, handoff } = pending;
+                return Err(ProductionHvpatchPollError::from_exec_error(
+                    error, context, handoff,
+                ));
+            }
+        };
 
         // Successful replacement is the only non-terminal path that may
         // reopen clone admission. Every fallible operation after the close,
@@ -4662,7 +4664,7 @@ impl<E: 'static> continuation::PersistentQuantumJob for HvpatchLoopJob<E> {
         let Some(engine) = engine.downcast_mut::<E>() else {
             return executor::ExecutorExit::InvalidState;
         };
-        let lease_slot = control.execution_lease_slot_mut() as *mut _;
+        let lease_slot = control.authority_slot_mut() as *mut _;
         let injected_lease = self.injected_lease.clone();
         let _lease_publication = injected_lease.as_ref().map(|slot| slot.install(lease_slot));
         (self.poller)(self, engine, control)

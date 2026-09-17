@@ -47,10 +47,10 @@ pub(crate) use self::task::{PtraceMemoryAccessWitness, PtraceTextAccess, TaskJob
 pub use self::task::{PtraceStopSettlement, PtraceSynchronousFault};
 pub(in crate::kernel) use self::thread::ExecDrain;
 pub use self::thread::{
-    BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState,
-    RunnerDirective, TaskCpuSample, Thread, ThreadCpuSample, ThreadExecutionError,
-    ThreadExecutionLease, ThreadExecutionSettlementResult, ThreadExecutionState, ThreadKey,
-    ThreadRef, ThreadRunner,
+    BlockedReason, ExecConsumedPredecessorAuthority, ExecutionFailure, ExecutionGeneration,
+    ExecutorId, MigratableTaskState, RunnerDirective, TaskCpuSample, Thread, ThreadCpuSample,
+    ThreadExecutionError, ThreadExecutionLease, ThreadExecutionSettlementResult,
+    ThreadExecutionState, ThreadKey, ThreadRef, ThreadRunner,
 };
 pub(crate) use self::thread::{
     CrashSafePointParticipation, CrashSafePointParticipationError, ThreadSchedulerAction,

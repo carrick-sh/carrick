@@ -291,9 +291,9 @@ impl HvpatchTaskEngineBindingState {
                 Ok(root_receipt)
             }
             #[cfg(test)]
-            HvpatchTaskEngineBindingPayload::Test => Err(TrapError::Hypervisor(
-                "test-only backend has no detached address space".to_owned(),
-            )),
+            HvpatchTaskEngineBindingPayload::Test => {
+                Ok(root_ticket.map(crate::hvpatch::Stage1RootRetirementTicket::complete_for_test))
+            }
         }
     }
 
@@ -339,9 +339,9 @@ impl HvpatchTaskEngineBindingState {
                 }
             },
             #[cfg(test)]
-            HvpatchTaskEngineBindingPayload::Test => Err(TrapError::Hypervisor(
-                "test-only backend has no exec predecessor cleanup".to_owned(),
-            )),
+            HvpatchTaskEngineBindingPayload::Test => {
+                Ok(root_ticket.map(crate::hvpatch::Stage1RootRetirementTicket::complete_for_test))
+            }
         }
     }
 
@@ -445,6 +445,10 @@ pub(crate) trait PersistentExecutor: 'static {
     /// snapshot, vCPU/mailbox owner identity, invariant EL1 state) is audited
     /// here on the executor's owner pthread.
     fn audit_boundary(&mut self) -> Result<(), TrapError>;
+
+    fn detach_loaded_task(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
 
     fn destroy(self) -> Result<(), TrapError>;
 
@@ -946,6 +950,47 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             .audit_persistent_executor_idle()?;
         Ok(())
     }
+
+    fn detach_loaded_task(&mut self) -> Result<(), TrapError> {
+        if let Some(mut engine) = self.current.take() {
+            let _ = engine.restore_persistent_executor_invariants();
+            let (backend, vcpu) = if let Some(task_only) = self.loaded_task_only.take() {
+                let (lifecycle, vcpu) =
+                    carrick_vmm_hvf::hvf_aarch64_engine::detach_task_only_engine(
+                        &task_only, engine,
+                    );
+                if self.lifecycle.replace(lifecycle).is_some() {
+                    return Err(TrapError::Hypervisor(
+                        "HvpatchPersistentExecutor lifecycle slot unexpectedly occupied during engine detachment in detach_loaded_task".into(),
+                    ));
+                }
+                (HvpatchTaskEngineBindingState::task_only(task_only), vcpu)
+            } else {
+                let lifecycle = self
+                    .lifecycle
+                    .as_mut()
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(
+                            "HvpatchPersistentExecutor missing lifecycle state during engine detachment in detach_loaded_task".into(),
+                        )
+                    })?;
+                let (state, vcpu) =
+                    carrick_vmm_hvf::hvf_aarch64_engine::detach_task_engine(engine, lifecycle);
+                (HvpatchTaskEngineBindingState::initial(state), vcpu)
+            };
+            if let Some(binding) = self.binding.take() {
+                self.cow_invalidation_observer = None;
+                let _ = binding.put_backend(backend);
+            }
+            if self.vcpu.replace(vcpu).is_some() {
+                return Err(TrapError::Hypervisor(
+                    "HvpatchPersistentExecutor vCPU slot unexpectedly occupied during engine detachment in detach_loaded_task".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn destroy(mut self) -> Result<(), TrapError> {
         if let Some(mut engine) = self.current.take() {
             let _ = catch_unwind(AssertUnwindSafe(|| {

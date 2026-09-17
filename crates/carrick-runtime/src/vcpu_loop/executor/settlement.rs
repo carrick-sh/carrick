@@ -548,6 +548,38 @@ where
     result
 }
 
+#[track_caller]
+pub(crate) fn settle_consumed_predecessor_and_retire<B, R>(
+    resolver: &R,
+    scheduler: &Scheduler,
+    running: RunnableThread,
+    consumed: carrick_kernel::kernel::objects::ExecConsumedPredecessorAuthority,
+    receipts: &ReceiptLog,
+) -> Option<String>
+where
+    B: PersistentTaskBinding + Send + Sync + 'static,
+    R: TaskBindingResolver<B>,
+{
+    let thread = running.thread_key();
+    let generation = running.generation();
+    let executor = running.executor();
+    let result = match scheduler.settle_exec_consumed_exited(running, consumed) {
+        Ok(()) => {
+            receipts.record(
+                executor,
+                ExecutorPoolEvent::SettledExited { thread, generation },
+            );
+            None
+        }
+        Err(error) => {
+            receipts.record(executor, ExecutorPoolEvent::Failed { thread, generation });
+            Some(error.to_string())
+        }
+    };
+    resolver.retire(thread, generation);
+    result
+}
+
 #[cfg(test)]
 pub(crate) fn fail_running_and_retire_for_test<B, R>(
     resolver: &R,
