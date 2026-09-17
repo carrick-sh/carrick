@@ -859,6 +859,8 @@ test-kernel *ARGS:
 
 ### Defect: explicit SIGCHLD ignore does not autoreap
 
+Resolved by the deferred-defect follow-up below; the original discovery is retained.
+
 - Retained `wait::sigchld_set_to_sig_ign_autoreaps_and_wait4_reports_echild` with
   an explicit defect ignore. Linux authority: `wait(2)` notes for SIG_IGN.
 - Kernel child-exit publication suppresses the signal, but zombie creation and
@@ -891,6 +893,8 @@ test-kernel *ARGS:
   `/tmp/kernel-harness-director-partition-qualified-v3.log`.
 
 ### Defect: concurrent consuming wait observes exit reservation
+
+Resolved by the deferred-defect follow-up below; the original discovery is retained.
 
 - Existing `wait_consume_never_returns_unconsumed_zombie_under_interleaved_exit`
   failed with `Err(TaskBusy(TaskId(285)))`, not a consumed zombie, in a kernel
@@ -925,6 +929,8 @@ test-kernel *ARGS:
   authority bootstrap, and exact thread context semantics during integration.
 
 ### Defect: SCM_CREDENTIALS reports socket creator instead of message sender
+
+Resolved by the deferred-defect follow-up below; the original discovery is retained.
 
 - Retained `unix::scm_credentials_carry_the_senders_pid_uid_gid` as a named
   defect ignore. A fork child sends the message; received credentials report
@@ -1053,7 +1059,7 @@ for final acceptance.
   pipe: either selected waiter may acknowledge, with exact wake counts and
   each thread's completion still required. Thread-integration rustdoc links
   were also corrected; no diagnostic was suppressed.
-- Three named defects remain visible under the plan's deferral rule:
+- At original acceptance, three named defects remained under the plan's deferral rule (resolved in the follow-up below):
   SIGCHLD/SIG_IGN autoreap; SCM_CREDENTIALS reporting socket creator instead
   of message sender; and concurrent wait/exit observing TaskBusy. Each has a
   retained ignored witness and a defect entry above. One additional kernel
@@ -1063,3 +1069,77 @@ for final acceptance.
   not product source. No guest execution, signed conformance acceptance or
   push was performed. Final documentation-only closure does not change the
   tested implementation.
+
+
+### Deferred-defect follow-up — 2026-09-17
+
+This follow-up records fixes requested after the original plan acceptance. The
+original deferral receipts above remain historical evidence, not current waivers.
+
+- Lifecycle implementation: `093f16c4c`; exact namespace retirement invariant
+  classifications: `2100db490`. Explicit SIGCHLD `SIG_IGN` and `SA_NOCLDWAIT`
+  retire the child without a zombie, remove its parent topology entry, and wake
+  an already-enrolled parent with `ECHILD`. Auto-reaped usage is not charged to
+  `RUSAGE_CHILDREN`; a consumed ordinary wait still charges it. A clone child
+  with a non-SIGCHLD exit signal retains its ordinary wait behavior.
+- Exit publishes the zombie and releases its reservation under one registry
+  write guard. A consuming waiter can no longer observe the former intermediate
+  published-but-reserved zombie. The original interleaving test body is retained
+  and its defect ignore removed. Notifications and callbacks remain outside the
+  registry lock; overlapping fork/exit reservations remain checked.
+- Fresh autoreap red receipts: `/tmp/deferred-semantics-red.log` and
+  `/tmp/deferred-parked-autoreap-red.log`; verified parked-parent green receipt:
+  `/tmp/deferred-parked-autoreap-green.log`. Director verification passed all 129
+  kernel operation tests and 2014 parallel kernel tests (one preexisting ignore,
+  83 serial-host tests excluded from that parallel invocation). Receipts:
+  `/tmp/deferred-lifecycle-director-green.log` and
+  `/tmp/deferred-lifecycle-kernel-green.log`.
+- The historical TaskBusy failure remains the race's observed red evidence.
+  Twenty bounded pre-fix reproduction samples in
+  `/tmp/deferred-wait-reproduction.log` did not reproduce it; they are not a
+  retry-until-green acceptance claim. The fix removes the source-level lock gap,
+  and the original concurrent witness is enabled again.
+
+- Host-backed AF_UNIX sockets now share a per-direction sender-credential flow.
+  Nonblocking host I/O and metadata publication/consumption happen under the
+  same flow lock. Stream credential boundaries cap `recvmsg`, `MSG_PEEK` leaves
+  metadata queued, and ordinary reads discard metadata with the consumed bytes,
+  including when a later guest copyout fails. Empty datagrams carry and consume
+  a credential record. Connection-time `SO_PEERCRED` remains unchanged; default
+  message credentials use the sending task's real uid/gid, and explicit guest
+  credentials require the corresponding identity or capability authorization.
+- Fork/dup/SCM_RIGHTS retain the shared file description and flow; queued sender
+  identity outlives sender exit. Accepted endpoints attach the client's existing
+  flow rather than draining/copying a temporary queue. Pending connection
+  metadata remains under the existing listener-registry lock.
+- Director review rejected two non-atomic metadata drafts, then took over after
+  the third implementation attempt. LLDB identified a recursive description lock
+  in the draft (`/tmp/deferred-credential-deadlock.lldb.txt`); socket type is now
+  read from the already-held description. Socket writes intentionally return
+  short positive results and use readiness redispatch when full; the unnecessary
+  pipe-style owned-continuation extension was removed.
+- A real-gid regression also exposed stale immutable resource snapshots in the
+  scripted harness. Each syscall boundary now captures current resources through
+  the public exact-thread context API, preserving thread identity checks. This
+  is a harness correction, not a change to the product credential authority.
+- Fresh credential reds: `/tmp/deferred-semantics-red.log`,
+  `/tmp/deferred-sender-peek-red.log`, `/tmp/deferred-real-credentials-red.log`,
+  and `/tmp/deferred-credential-boundary-red.log`. Independent integrated
+  regressions passed in `/tmp/deferred-integrated-regressions.log`: both parked
+  autoreap policies, sender-exit/peek/read alignment, real gid, mixed-sender
+  boundaries, copyout failure, and blocked socket write after partial progress.
+- The full harness passed 1 library, 29 driver, 57 semantics, and 7 independent
+  regression tests, with no ignores (`/tmp/deferred-harness-all.log`). All three
+  named defect ignores are removed. Cross-backend guest execution and signed
+  conformance were not run for this follow-up; host harness results are not
+  signed guest acceptance.
+
+- Final focused gate: `just test-kernel` passed 2015 parallel kernel tests with
+  one preexisting ignore, plus all 94 harness tests; targeted Clippy passed.
+  Receipts: `/tmp/deferred-test-kernel.log`, `/tmp/deferred-clippy.log`.
+- Broad verification exposed an existing epoll alias test's scheduling-sensitive
+  exact redispatch count (four instead of three, with correct syscall results).
+  The test now makes the reused descriptor readable and explicitly requires a
+  zero-event poll before parking on the original description. It retains the
+  enrollment handshake and exact original-description event assertion; no
+  runtime serialization or retry acceptance was introduced.
