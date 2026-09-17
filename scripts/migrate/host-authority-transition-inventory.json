@@ -469,18 +469,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/deadlock_watchdog.rs:186 in `arm`, `libc::getpid` acts only on the current carrier deadlock diagnostic used by `arm`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/deadlock_watchdog.rs:133 in `arm`, `libc::getpid` acts only on the current carrier deadlock diagnostic used by `arm`; no guest identity selects its host target.",
     "review_id": "HA-000027",
     "source": {
-      "byte_end": 7184,
-      "byte_start": 7172,
+      "byte_end": 5581,
+      "byte_start": 5569,
       "column": 36,
       "column_end": 48,
       "column_start": 36,
       "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-      "line": 186,
-      "line_end": 186,
-      "line_start": 186
+      "line": 133,
+      "line_end": 133,
+      "line_start": 133
     }
   },
   {
@@ -8643,18 +8643,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/deadlock_watchdog.rs:87 in `ensure_private_directory`, `std::fs::set_permissions` accesses only the run-scoped external deadlock-capture request backing used by `ensure_private_directory` at line 87.",
+    "rationale": "At crates/carrick-kernel/src/deadlock_watchdog.rs:91 in `ensure_private_directory`, `std::fs::set_permissions` accesses only the run-scoped external deadlock-capture request backing used by `ensure_private_directory` at line 87.",
     "review_id": "HA-000367",
     "source": {
-      "byte_end": 3425,
-      "byte_start": 3401,
+      "byte_end": 3811,
+      "byte_start": 3787,
       "column": 5,
       "column_end": 29,
       "column_start": 5,
       "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-      "line": 87,
-      "line_end": 87,
-      "line_start": 87
+      "line": 91,
+      "line_end": 91,
+      "line_start": 91
     }
   },
   {
@@ -9021,18 +9021,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/deadlock_watchdog.rs:70 in `ensure_private_directory`, `std::fs::symlink_metadata` accesses only the run-scoped external deadlock-capture request backing used by `ensure_private_directory` at line 70.",
+    "rationale": "At crates/carrick-kernel/src/deadlock_watchdog.rs:74 in `ensure_private_directory`, `std::fs::symlink_metadata` accesses only the run-scoped external deadlock-capture request backing used by `ensure_private_directory` at line 70.",
     "review_id": "HA-000388",
     "source": {
-      "byte_end": 2754,
-      "byte_start": 2729,
+      "byte_end": 3140,
+      "byte_start": 3115,
       "column": 11,
       "column_end": 36,
       "column_start": 11,
       "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-      "line": 70,
-      "line_end": 70,
-      "line_start": 70
+      "line": 74,
+      "line_end": 74,
+      "line_start": 74
     }
   },
   {
@@ -9048,18 +9048,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/deadlock_watchdog.rs:88 in `ensure_private_directory`, `std::fs::symlink_metadata` accesses only the run-scoped external deadlock-capture request backing used by `ensure_private_directory` at line 88.",
+    "rationale": "At crates/carrick-kernel/src/deadlock_watchdog.rs:92 in `ensure_private_directory`, `std::fs::symlink_metadata` accesses only the run-scoped external deadlock-capture request backing used by `ensure_private_directory` at line 88.",
     "review_id": "HA-000389",
     "source": {
-      "byte_end": 3518,
-      "byte_start": 3493,
+      "byte_end": 3904,
+      "byte_start": 3879,
       "column": 20,
       "column_end": 45,
       "column_start": 20,
       "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-      "line": 88,
-      "line_end": 88,
-      "line_start": 88
+      "line": 92,
+      "line_end": 92,
+      "line_start": 92
     }
   },
   {
@@ -11146,18 +11146,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2040 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2044 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
     "review_id": "HA-000498",
     "source": {
-      "byte_end": 82216,
-      "byte_start": 82200,
+      "byte_end": 82318,
+      "byte_start": 82302,
       "column": 39,
       "column_end": 55,
       "column_start": 39,
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2040,
-      "line_end": 2040,
-      "line_start": 2040
+      "line": 2044,
+      "line_end": 2044,
+      "line_start": 2044
     }
   },
   {
@@ -11173,18 +11173,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2255 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2259 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
     "review_id": "HA-000499",
     "source": {
-      "byte_end": 90827,
-      "byte_start": 90811,
+      "byte_end": 90929,
+      "byte_start": 90913,
       "column": 47,
       "column_end": 63,
       "column_start": 47,
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2255,
-      "line_end": 2255,
-      "line_start": 2255
+      "line": 2259,
+      "line_end": 2259,
+      "line_start": 2259
     }
   },
   {
@@ -13961,18 +13961,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/deadlock_watchdog.rs:167 in `arm`, `std::thread::Builder::new` acts only on the current carrier deadlock-watchdog thread used by `arm`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/deadlock_watchdog.rs:113 in `arm`, `std::thread::Builder::new` acts only on the current carrier deadlock-watchdog thread used by `arm`; no guest identity selects its host target.",
     "review_id": "HA-000577",
     "source": {
-      "byte_end": 6425,
-      "byte_start": 6400,
+      "byte_end": 4755,
+      "byte_start": 4730,
       "column": 5,
       "column_end": 30,
       "column_start": 5,
       "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-      "line": 167,
-      "line_end": 167,
-      "line_start": 167
+      "line": 113,
+      "line_end": 113,
+      "line_start": 113
     }
   },
   {
@@ -14736,18 +14736,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/deadlock_watchdog.rs:174 in `arm`, `std::thread::sleep` acts only on the current carrier deadlock-watchdog thread used by `arm`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/deadlock_watchdog.rs:120 in `arm`, `std::thread::sleep` acts only on the current carrier deadlock-watchdog thread used by `arm`; no guest identity selects its host target.",
     "review_id": "HA-000604",
     "source": {
-      "byte_end": 6688,
-      "byte_start": 6670,
+      "byte_end": 5018,
+      "byte_start": 5000,
       "column": 17,
       "column_end": 35,
       "column_start": 17,
       "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-      "line": 174,
-      "line_end": 174,
-      "line_start": 174
+      "line": 120,
+      "line_end": 120,
+      "line_start": 120
     }
   },
   {
@@ -15693,18 +15693,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/runtime.rs:1175 in `run_combined_syscall_loop_with_dispatcher`, `std::thread::yield_now` acts only on the current carrier runtime helper used by `run_combined_syscall_loop_with_dispatcher`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/runtime.rs:1179 in `run_combined_syscall_loop_with_dispatcher`, `std::thread::yield_now` acts only on the current carrier runtime helper used by `run_combined_syscall_loop_with_dispatcher`; no guest identity selects its host target.",
     "review_id": "HA-000637",
     "source": {
-      "byte_end": 47717,
-      "byte_start": 47695,
+      "byte_end": 48014,
+      "byte_start": 47992,
       "column": 17,
       "column_end": 39,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 1175,
-      "line_end": 1175,
-      "line_start": 1175
+      "line": 1179,
+      "line_end": 1179,
+      "line_start": 1179
     }
   },
   {

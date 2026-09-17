@@ -1,10 +1,10 @@
 {
   "catalog_sha256": "aa230c66221233fd4f87b931261e33b4975eedfb45efa04d6929a502a7d392ad",
   "diagnostic_counts": {
-    "macos-cli-default": 579,
+    "macos-cli-default": 585,
     "macos-hvf-default": 96,
-    "macos-runtime-default": 450,
-    "merged": 579
+    "macos-runtime-default": 456,
+    "merged": 585
   },
   "executed_profiles": [
     "macos-cli-default",
@@ -187,26 +187,6 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 5633,
-        "byte_start": 5620,
-        "column": 24,
-        "column_end": 37,
-        "column_start": 24,
-        "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-        "line": 144,
-        "line_end": 144,
-        "line_start": 144
-      }
-    },
-    {
-      "catalog_id": "HA-CATALOG-PROCESS-GETEUID",
-      "expansion": null,
-      "operation": "libc::geteuid",
-      "profiles": [
-        "macos-cli-default",
-        "macos-runtime-default"
-      ],
-      "source": {
         "byte_end": 2340,
         "byte_start": 2327,
         "column": 28,
@@ -296,6 +276,26 @@
         "line": 216,
         "line_end": 216,
         "line_start": 216
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-GETEUID",
+      "expansion": null,
+      "operation": "libc::geteuid",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 11523,
+        "byte_start": 11510,
+        "column": 24,
+        "column_end": 37,
+        "column_start": 24,
+        "file": "crates/carrick-kernel/src/wedge_capture.rs",
+        "line": 310,
+        "line_end": 310,
+        "line_start": 310
       }
     },
     {
@@ -426,15 +426,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 7184,
-        "byte_start": 7172,
+        "byte_end": 5581,
+        "byte_start": 5569,
         "column": 36,
         "column_end": 48,
         "column_start": 36,
         "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-        "line": 186,
-        "line_end": 186,
-        "line_start": 186
+        "line": 133,
+        "line_end": 133,
+        "line_start": 133
       }
     },
     {
@@ -475,6 +475,26 @@
         "line": 1485,
         "line_end": 1485,
         "line_start": 1485
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-GETPID",
+      "expansion": null,
+      "operation": "libc::getpid",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 16531,
+        "byte_start": 16519,
+        "column": 33,
+        "column_end": 45,
+        "column_start": 33,
+        "file": "crates/carrick-kernel/src/wedge_capture.rs",
+        "line": 447,
+        "line_end": 447,
+        "line_start": 447
       }
     },
     {
@@ -1410,6 +1430,26 @@
         "macos-runtime-default"
       ],
       "source": {
+        "byte_end": 14163,
+        "byte_start": 14142,
+        "column": 45,
+        "column_end": 66,
+        "column_start": 45,
+        "file": "crates/carrick-kernel/src/wedge_capture.rs",
+        "line": 388,
+        "line_end": 388,
+        "line_start": 388
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-FILE-CREATE",
+      "expansion": null,
+      "operation": "std::fs::File::create",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
         "byte_end": 14725,
         "byte_start": 14704,
         "column": 8,
@@ -1843,26 +1883,6 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 5824,
-        "byte_start": 5799,
-        "column": 20,
-        "column_end": 45,
-        "column_start": 20,
-        "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-        "line": 147,
-        "line_end": 147,
-        "line_start": 147
-      }
-    },
-    {
-      "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-NEW",
-      "expansion": null,
-      "operation": "std::fs::OpenOptions::new",
-      "profiles": [
-        "macos-cli-default",
-        "macos-runtime-default"
-      ],
-      "source": {
         "byte_end": 69187,
         "byte_start": 69162,
         "column": 20,
@@ -1932,6 +1952,26 @@
         "line": 216,
         "line_end": 216,
         "line_start": 216
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-NEW",
+      "expansion": null,
+      "operation": "std::fs::OpenOptions::new",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 12507,
+        "byte_start": 12482,
+        "column": 20,
+        "column_end": 45,
+        "column_start": 20,
+        "file": "crates/carrick-kernel/src/wedge_capture.rs",
+        "line": 339,
+        "line_end": 339,
+        "line_start": 339
       }
     },
     {
@@ -2258,26 +2298,6 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 5908,
-        "byte_start": 5904,
-        "column": 10,
-        "column_end": 14,
-        "column_start": 10,
-        "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-        "line": 151,
-        "line_end": 151,
-        "line_start": 151
-      }
-    },
-    {
-      "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-OPEN",
-      "expansion": null,
-      "operation": "std::fs::OpenOptions::open",
-      "profiles": [
-        "macos-cli-default",
-        "macos-runtime-default"
-      ],
-      "source": {
         "byte_end": 69291,
         "byte_start": 69287,
         "column": 10,
@@ -2347,6 +2367,26 @@
         "line": 221,
         "line_end": 221,
         "line_start": 221
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-OPEN",
+      "expansion": null,
+      "operation": "std::fs::OpenOptions::open",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 12611,
+        "byte_start": 12607,
+        "column": 10,
+        "column_end": 14,
+        "column_start": 10,
+        "file": "crates/carrick-kernel/src/wedge_capture.rs",
+        "line": 344,
+        "line_end": 344,
+        "line_start": 344
       }
     },
     {
@@ -3091,6 +3131,26 @@
         "line": 1411,
         "line_end": 1411,
         "line_start": 1411
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-CREATE-DIR-ALL",
+      "expansion": null,
+      "operation": "std::fs::create_dir_all",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 11680,
+        "byte_start": 11657,
+        "column": 9,
+        "column_end": 32,
+        "column_start": 9,
+        "file": "crates/carrick-kernel/src/wedge_capture.rs",
+        "line": 315,
+        "line_end": 315,
+        "line_start": 315
       }
     },
     {
@@ -6405,35 +6465,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 3425,
-        "byte_start": 3401,
+        "byte_end": 3811,
+        "byte_start": 3787,
         "column": 5,
         "column_end": 29,
         "column_start": 5,
         "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-        "line": 87,
-        "line_end": 87,
-        "line_start": 87
-      }
-    },
-    {
-      "catalog_id": "HA-CATALOG-FS-SET-PERMISSIONS",
-      "expansion": null,
-      "operation": "std::fs::set_permissions",
-      "profiles": [
-        "macos-cli-default",
-        "macos-runtime-default"
-      ],
-      "source": {
-        "byte_end": 6034,
-        "byte_start": 6010,
-        "column": 5,
-        "column_end": 29,
-        "column_start": 5,
-        "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-        "line": 154,
-        "line_end": 154,
-        "line_start": 154
+        "line": 91,
+        "line_end": 91,
+        "line_start": 91
       }
     },
     {
@@ -6705,15 +6745,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 2754,
-        "byte_start": 2729,
+        "byte_end": 3140,
+        "byte_start": 3115,
         "column": 11,
         "column_end": 36,
         "column_start": 11,
         "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-        "line": 70,
-        "line_end": 70,
-        "line_start": 70
+        "line": 74,
+        "line_end": 74,
+        "line_start": 74
       }
     },
     {
@@ -6725,15 +6765,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 3518,
-        "byte_start": 3493,
+        "byte_end": 3904,
+        "byte_start": 3879,
         "column": 20,
         "column_end": 45,
         "column_start": 20,
         "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-        "line": 88,
-        "line_end": 88,
-        "line_start": 88
+        "line": 92,
+        "line_end": 92,
+        "line_start": 92
       }
     },
     {
@@ -6854,6 +6894,26 @@
         "line": 167,
         "line_end": 167,
         "line_start": 167
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-SYMLINK-METADATA",
+      "expansion": null,
+      "operation": "std::fs::symlink_metadata",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 9867,
+        "byte_start": 9842,
+        "column": 17,
+        "column_end": 42,
+        "column_start": 17,
+        "file": "crates/carrick-kernel/src/wedge_capture.rs",
+        "line": 259,
+        "line_end": 259,
+        "line_start": 259
       }
     },
     {
@@ -8257,15 +8317,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 82216,
-        "byte_start": 82200,
+        "byte_end": 82318,
+        "byte_start": 82302,
         "column": 39,
         "column_end": 55,
         "column_start": 39,
         "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-        "line": 2040,
-        "line_end": 2040,
-        "line_start": 2040
+        "line": 2044,
+        "line_end": 2044,
+        "line_start": 2044
       }
     },
     {
@@ -8277,15 +8337,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 90827,
-        "byte_start": 90811,
+        "byte_end": 90929,
+        "byte_start": 90913,
         "column": 47,
         "column_end": 63,
         "column_start": 47,
         "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-        "line": 2255,
-        "line_end": 2255,
-        "line_start": 2255
+        "line": 2259,
+        "line_end": 2259,
+        "line_start": 2259
       }
     },
     {
@@ -10351,15 +10411,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 6425,
-        "byte_start": 6400,
+        "byte_end": 4755,
+        "byte_start": 4730,
         "column": 5,
         "column_end": 30,
         "column_start": 5,
         "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-        "line": 167,
-        "line_end": 167,
-        "line_start": 167
+        "line": 113,
+        "line_end": 113,
+        "line_start": 113
       }
     },
     {
@@ -10560,6 +10620,26 @@
         "line": 414,
         "line_end": 414,
         "line_start": 414
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
+      "expansion": null,
+      "operation": "std::thread::Builder::new",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 16805,
+        "byte_start": 16780,
+        "column": 9,
+        "column_end": 34,
+        "column_start": 9,
+        "file": "crates/carrick-kernel/src/wedge_capture.rs",
+        "line": 455,
+        "line_end": 455,
+        "line_start": 455
       }
     },
     {
@@ -10903,15 +10983,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 6688,
-        "byte_start": 6670,
+        "byte_end": 5018,
+        "byte_start": 5000,
         "column": 17,
         "column_end": 35,
         "column_start": 17,
         "file": "crates/carrick-kernel/src/deadlock_watchdog.rs",
-        "line": 174,
-        "line_end": 174,
-        "line_start": 174
+        "line": 120,
+        "line_end": 120,
+        "line_start": 120
       }
     },
     {
@@ -11072,6 +11152,46 @@
         "line": 2231,
         "line_end": 2231,
         "line_start": 2231
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-THREAD-SLEEP",
+      "expansion": null,
+      "operation": "std::thread::sleep",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 15641,
+        "byte_start": 15623,
+        "column": 13,
+        "column_end": 31,
+        "column_start": 13,
+        "file": "crates/carrick-kernel/src/wedge_capture.rs",
+        "line": 427,
+        "line_end": 427,
+        "line_start": 427
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-THREAD-SLEEP",
+      "expansion": null,
+      "operation": "std::thread::sleep",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 16924,
+        "byte_start": 16906,
+        "column": 17,
+        "column_end": 35,
+        "column_start": 17,
+        "file": "crates/carrick-kernel/src/wedge_capture.rs",
+        "line": 458,
+        "line_end": 458,
+        "line_start": 458
       }
     },
     {
@@ -11575,15 +11695,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 47717,
-        "byte_start": 47695,
+        "byte_end": 48014,
+        "byte_start": 47992,
         "column": 17,
         "column_end": 39,
         "column_start": 17,
         "file": "crates/carrick-runtime/src/runtime.rs",
-        "line": 1175,
-        "line_end": 1175,
-        "line_start": 1175
+        "line": 1179,
+        "line_end": 1179,
+        "line_start": 1179
       }
     },
     {
@@ -11627,9 +11747,9 @@
       }
     }
   ],
-  "rows_sha256": "982b3b3474eaa649593f3fbe386d85604b59a4425d4486d83fb3fd009b361ee6",
+  "rows_sha256": "95571ef27b17b3b7cca6cd36c25f365771ef59fef685d5b26478dfccbf8df7d5",
   "schema": 1,
-  "source_head": "f1f127fe8de2de49f42208e4fe667060a34dd32a",
+  "source_head": "bf7acb4216d9f7a4fc287bb0193b0e2dbc7f99da",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
