@@ -78,6 +78,11 @@ impl TaskMemory {
     pub fn read(&self, addr: u64, n: usize) -> Result<Vec<u8>, MemoryError> {
         self.linear.read_bytes_raw(addr, n)
     }
+
+    /// Write `bytes` to `addr` in task memory.
+    pub fn write(&mut self, addr: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        self.linear.write_bytes_raw(addr, bytes)
+    }
 }
 
 impl Default for TaskMemory {

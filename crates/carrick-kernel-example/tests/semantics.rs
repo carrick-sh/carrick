@@ -7,10 +7,14 @@
 
 #[path = "semantics/mod.rs"]
 pub mod common;
+#[path = "semantics/futex.rs"]
+mod futex;
 #[path = "semantics/pgrp.rs"]
 mod pgrp;
 #[path = "semantics/pipe.rs"]
 mod pipe;
+#[path = "semantics/threads.rs"]
+mod threads;
 #[path = "semantics/wait.rs"]
 mod wait;
 

@@ -1022,3 +1022,193 @@ pub fn dup3(oldfd: impl Into<Operand>, newfd: impl Into<Operand>, flags: i32) ->
         ],
     )
 }
+
+/// `clone(2)` for thread creation with `CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD`.
+pub fn clone_thread(stack_len: usize) -> Syscall {
+    let flags = (carrick_abi::LinuxCloneFlags::VM
+        | carrick_abi::LinuxCloneFlags::FS
+        | carrick_abi::LinuxCloneFlags::FILES
+        | carrick_abi::LinuxCloneFlags::SIGHAND
+        | carrick_abi::LinuxCloneFlags::THREAD)
+        .bits() as i64;
+    let stack = if stack_len > 0 {
+        Operand::Out(stack_len)
+    } else {
+        0.into()
+    };
+    call(
+        "clone",
+        nr::CLONE,
+        [flags.into(), stack, 0.into(), 0.into(), 0.into(), 0.into()],
+    )
+}
+
+/// `gettid(2)`.
+pub fn gettid() -> Syscall {
+    call(
+        "gettid",
+        nr::GETTID,
+        [0.into(), 0.into(), 0.into(), 0.into(), 0.into(), 0.into()],
+    )
+}
+
+/// `exit(2)` for thread termination (NOT `exit_group`).
+pub fn exit_thread(code: i32) -> Syscall {
+    call(
+        "exit",
+        nr::EXIT,
+        [
+            (code as i64).into(),
+            0.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `set_tid_address(2)`.
+pub fn set_tid_address(tidptr: impl Into<Operand>) -> Syscall {
+    call(
+        "set_tid_address",
+        nr::SET_TID_ADDRESS,
+        [
+            tidptr.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `futex(2)` generic builder with custom label.
+pub fn futex_labeled(
+    label: &'static str,
+    uaddr: impl Into<Operand>,
+    op: u64,
+    val: u64,
+    timeout: impl Into<Operand>,
+    uaddr2: impl Into<Operand>,
+    val3: u64,
+) -> Syscall {
+    call(
+        label,
+        nr::FUTEX,
+        [
+            uaddr.into(),
+            (op as i64).into(),
+            (val as i64).into(),
+            timeout.into(),
+            uaddr2.into(),
+            (val3 as i64).into(),
+        ],
+    )
+}
+
+/// `futex(2)` generic builder.
+pub fn futex(
+    uaddr: impl Into<Operand>,
+    op: u64,
+    val: u64,
+    timeout: impl Into<Operand>,
+    uaddr2: impl Into<Operand>,
+    val3: u64,
+) -> Syscall {
+    futex_labeled("futex", uaddr, op, val, timeout, uaddr2, val3)
+}
+
+/// `futex(2)` FUTEX_WAIT with private flag and custom label.
+pub fn futex_wait_labeled(label: &'static str, uaddr: impl Into<Operand>, val: u32) -> Syscall {
+    futex_labeled(
+        label,
+        uaddr,
+        carrick_abi::LINUX_FUTEX_WAIT | carrick_abi::LINUX_FUTEX_PRIVATE_FLAG,
+        val as u64,
+        0,
+        0,
+        0,
+    )
+}
+
+/// `futex(2)` FUTEX_WAIT with private flag.
+pub fn futex_wait(uaddr: impl Into<Operand>, val: u32) -> Syscall {
+    futex_wait_labeled("futex", uaddr, val)
+}
+
+/// `futex(2)` FUTEX_WAIT with private flag and timespec timeout in milliseconds.
+pub fn futex_wait_timeout(uaddr: impl Into<Operand>, val: u32, timeout_ms: u64) -> Syscall {
+    futex_wait_timeout_labeled("futex", uaddr, val, timeout_ms)
+}
+
+/// `futex(2)` FUTEX_WAIT with private flag, custom label, and timespec timeout in milliseconds.
+pub fn futex_wait_timeout_labeled(
+    label: &'static str,
+    uaddr: impl Into<Operand>,
+    val: u32,
+    timeout_ms: u64,
+) -> Syscall {
+    let sec = (timeout_ms / 1000) as i64;
+    let nsec = ((timeout_ms % 1000) * 1_000_000) as i64;
+    let mut req = [0u8; 16];
+    req[0..8].copy_from_slice(&sec.to_le_bytes());
+    req[8..16].copy_from_slice(&nsec.to_le_bytes());
+    futex_labeled(
+        label,
+        uaddr,
+        carrick_abi::LINUX_FUTEX_WAIT | carrick_abi::LINUX_FUTEX_PRIVATE_FLAG,
+        val as u64,
+        req.as_slice(),
+        0,
+        0,
+    )
+}
+
+/// `futex(2)` FUTEX_WAKE with private flag and custom label.
+pub fn futex_wake_labeled(label: &'static str, uaddr: impl Into<Operand>, val: u32) -> Syscall {
+    futex_labeled(
+        label,
+        uaddr,
+        carrick_abi::LINUX_FUTEX_WAKE | carrick_abi::LINUX_FUTEX_PRIVATE_FLAG,
+        val as u64,
+        0,
+        0,
+        0,
+    )
+}
+
+/// `futex(2)` FUTEX_WAKE with private flag.
+pub fn futex_wake(uaddr: impl Into<Operand>, val: u32) -> Syscall {
+    futex_wake_labeled("futex", uaddr, val)
+}
+
+/// `futex(2)` FUTEX_REQUEUE with private flag and custom label.
+pub fn futex_requeue_labeled(
+    label: &'static str,
+    uaddr: impl Into<Operand>,
+    val: u32,
+    val2: u32,
+    uaddr2: impl Into<Operand>,
+) -> Syscall {
+    futex_labeled(
+        label,
+        uaddr,
+        carrick_abi::LINUX_FUTEX_REQUEUE | carrick_abi::LINUX_FUTEX_PRIVATE_FLAG,
+        val as u64,
+        Operand::Lit(val2 as i64),
+        uaddr2,
+        0,
+    )
+}
+
+/// `futex(2)` FUTEX_REQUEUE with private flag.
+pub fn futex_requeue(
+    uaddr: impl Into<Operand>,
+    val: u32,
+    val2: u32,
+    uaddr2: impl Into<Operand>,
+) -> Syscall {
+    futex_requeue_labeled("futex", uaddr, val, val2, uaddr2)
+}

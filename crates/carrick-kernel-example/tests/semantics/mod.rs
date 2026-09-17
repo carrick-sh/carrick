@@ -4,7 +4,8 @@ pub use carrick_abi::syscall::nr;
 pub use carrick_abi::*;
 pub use carrick_kernel_example::{
     ExampleError, Expect, Operand, Output, RunReport, Save, ScriptedBackend, Step, Syscall,
-    await_parked, in_out, last_child, slot, sys,
+    alloc_buffer, alloc_word, await_parked, in_out, last_child, slot, sys, write_buffer,
+    write_word,
 };
 
 pub const LINUX_O_NONBLOCK: i32 = 0x800; // 2048

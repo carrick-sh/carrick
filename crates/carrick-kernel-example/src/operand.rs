@@ -291,6 +291,46 @@ pub enum Step {
         /// Syscall label that must be parked/enrolled.
         label: &'static str,
     },
+    /// Allocate a persistent buffer in task memory initialized with `bytes` and store its guest address in `slot`.
+    AllocBuffer {
+        /// Target slot index to save the allocated guest address.
+        slot: usize,
+        /// Initial bytes to populate in the buffer.
+        bytes: Vec<u8>,
+    },
+    /// Write `bytes` to the persistent buffer address stored in `slot`.
+    WriteBuffer {
+        /// Slot holding the guest address to write to.
+        slot: usize,
+        /// Bytes to write.
+        bytes: Vec<u8>,
+    },
+}
+
+/// Allocate a persistent buffer initialized with `bytes` in task memory and store its address in `slot`.
+pub fn alloc_buffer(slot: usize, bytes: impl Into<Vec<u8>>) -> Step {
+    Step::AllocBuffer {
+        slot,
+        bytes: bytes.into(),
+    }
+}
+
+/// Allocate a 4-byte 32-bit integer word in task memory and store its address in `slot`.
+pub fn alloc_word(slot: usize, val: i32) -> Step {
+    alloc_buffer(slot, val.to_le_bytes().to_vec())
+}
+
+/// Write `bytes` to the persistent buffer address stored in `slot`.
+pub fn write_buffer(slot: usize, bytes: impl Into<Vec<u8>>) -> Step {
+    Step::WriteBuffer {
+        slot,
+        bytes: bytes.into(),
+    }
+}
+
+/// Write a 4-byte 32-bit integer word to the persistent buffer address stored in `slot`.
+pub fn write_word(slot: usize, val: i32) -> Step {
+    write_buffer(slot, val.to_le_bytes().to_vec())
 }
 
 /// Await enrollment/parking of syscall `label` on task `pid`.
