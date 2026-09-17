@@ -179,10 +179,14 @@ impl<'a> FsView<'a> {
         self.discard_splice_pushback_if_final(new_fd);
 
         let files = self.captured_file_table();
+        let retained_description = Arc::clone(&description);
         retain_open_file(&description);
         let replaced = match exact_reservation.commit(OpenFile::new(description, fd_flags)) {
             Ok(replaced) => replaced,
-            Err(errno) => return DispatchOutcome::errno(errno),
+            Err(errno) => {
+                retained_description.release_fd_ref();
+                return DispatchOutcome::errno(errno);
+            }
         };
 
         if let Some(replaced) = replaced {

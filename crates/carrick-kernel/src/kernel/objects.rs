@@ -1892,12 +1892,12 @@ impl Hasher for FileSlotHasher {
         // `Hash for i32` calls `write_i32`; retain a deterministic fallback so
         // the Hasher contract remains total if that implementation changes.
         self.0 = bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
     }
 
-    fn write_i32(&mut self, i: i32) {
-        self.0 = u64::from(i as u32);
+    fn write_i32(&mut self, value: i32) {
+        self.0 = u64::from(value as u32);
     }
 }
 
@@ -2088,6 +2088,10 @@ impl FileTable {
         min_fd: i32,
         limit: i32,
     ) -> Result<FileSlotReservation, crate::linux_abi::LinuxErrno> {
+        let _mutation = self
+            .functional_gate
+            .acquire_mutation()
+            .ok_or(crate::linux_abi::LINUX_EBADF)?;
         let open_files = self.read_open_files();
         let mut next_fd = self.lock_next_fd();
         let mut reserved = self.lock_reserved_slots();
@@ -2204,6 +2208,10 @@ impl FileTable {
         reservation_id: u64,
         slot: FileSlot,
     ) -> Result<(), crate::linux_abi::LinuxErrno> {
+        let _mutation = self
+            .functional_gate
+            .acquire_mutation()
+            .ok_or(crate::linux_abi::LINUX_EBADF)?;
         let mut open_files = self.write_open_files();
         let mut next_fd = self.lock_next_fd();
         let mut reserved = self.lock_reserved_slots();
@@ -2251,6 +2259,10 @@ impl FileTable {
         reservation_id: u64,
         slot: FileSlot,
     ) -> Result<Option<FileSlot>, crate::linux_abi::LinuxErrno> {
+        let _mutation = self
+            .functional_gate
+            .acquire_mutation()
+            .ok_or(crate::linux_abi::LINUX_EBADF)?;
         let mut open_files = self.write_open_files();
         let mut next_fd = self.lock_next_fd();
         let mut reserved = self.lock_reserved_slots();
@@ -3937,6 +3949,31 @@ mod tests {
         // Slot 3 is now occupied
         let res3 = table.reserve_slot_at_or_above(0, 1024).expect("slot 4");
         assert_eq!(res3.fd(), 4);
+    }
+
+    #[test]
+    fn retired_table_rejects_reserved_slot_commits_and_releases_reservations() {
+        let ids = ObjectIdRegistry::new();
+
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+        let reservation = table.reserve_slot_at_or_above(0, 1024).expect("slot 3");
+        assert!(table.drain_functional_refs().is_empty());
+        assert!(matches!(
+            reservation.commit(dummy_file_slot()),
+            Err(crate::linux_abi::LINUX_EBADF)
+        ));
+        assert!(!table.is_slot_reserved(3));
+
+        let exact_table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+        let exact = exact_table
+            .reserve_exact_target(3, 1024)
+            .expect("exact slot 3");
+        assert!(exact_table.drain_functional_refs().is_empty());
+        assert!(matches!(
+            exact.commit(dummy_file_slot()),
+            Err(crate::linux_abi::LINUX_EBADF)
+        ));
+        assert!(!exact_table.is_slot_reserved(3));
     }
 
     #[test]
