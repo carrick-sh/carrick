@@ -40,9 +40,10 @@ fn tee_host_passthrough(
             flags.bits() as libc::c_uint,
         )
     };
-    Ok(DispatchOutcome::returned_len_or_errno(
-        n.host_syscall_errno()?,
-    ))
+    // The host call returns `ssize_t`; the transferred count only becomes a
+    // `usize` byte length after the negative-return errno check.
+    let copied = n.host_syscall_errno()? as usize;
+    Ok(DispatchOutcome::returned_len_or_errno(copied))
 }
 
 struct InMemoryTeeEndpoint<'a> {

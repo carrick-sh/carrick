@@ -477,7 +477,7 @@ impl IoUringBacking {
 
     fn cross_process_lock(&self) -> Option<CrossProcessLock<'_>> {
         let mut lock: libc::flock = unsafe { core::mem::zeroed() };
-        lock.l_type = libc::F_WRLCK;
+        lock.l_type = libc::F_WRLCK as libc::c_short;
         lock.l_whence = libc::SEEK_SET as i16;
         lock.l_start = 0;
         lock.l_len = 1;
@@ -518,7 +518,7 @@ impl<'a> CrossProcessLock<'a> {
         }
         self.unlocked = true;
         let mut lock: libc::flock = unsafe { core::mem::zeroed() };
-        lock.l_type = libc::F_UNLCK;
+        lock.l_type = libc::F_UNLCK as libc::c_short;
         lock.l_whence = libc::SEEK_SET as i16;
         lock.l_start = 0;
         lock.l_len = 1;
