@@ -4044,6 +4044,8 @@ mod serial_host {
                 CHILD_MARKER,
             );
             let deadline = Instant::now() + Duration::from_secs(10);
+            // Bounded subprocess watchdog; this interval does not order the tested interleaving.
+            // nosemgrep: rust-no-timing-band-aids
             let status = loop {
                 if let Some(status) = child.try_wait().expect("read child status") {
                     break Some(status);
@@ -4226,6 +4228,8 @@ mod serial_host {
                 CHILD_MARKER,
             );
             let deadline = Instant::now() + Duration::from_secs(10);
+            // Bounded subprocess watchdog; this interval does not order the tested interleaving.
+            // nosemgrep: rust-no-timing-band-aids
             let status = loop {
                 if let Some(status) = child.try_wait().expect("read child status") {
                     break Some(status);
