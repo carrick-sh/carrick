@@ -37,7 +37,11 @@ Anything the guest defines about itself:
 - **Name resolution policy** — which resolver, which hosts file. (The DNS query
   itself is wire traffic and therefore host I/O; deciding what to ask is not.)
 - **Signal delivery between guest processes** — the sender, the target and the
-  disposition are all guest state.
+  disposition are all guest state. The one part that does cross into host
+  territory — mirroring a guest disposition onto the host process and raising
+  a signal there so a backend's own wake mechanism fires — lives behind
+  `carrick_hal::HostSignalBridge`, the seam a backend implements instead of an
+  ad hoc host signal call.
 
 ## Why this keeps producing guest-visible bugs
 

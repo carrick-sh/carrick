@@ -37,6 +37,17 @@ build-systems investigation.
 > rootfs + overlay) and must be checked for dispatch↔runtime/thread cycles before
 > lifting. These are the next dedicated build session.
 >
+> **A4 LANDED 2026-09-16**, under new names: `carrick-dispatch` became
+> `carrick-kernel` (the kernel object graph, syscall dispatch and its
+> subsystems, namespaces, credentials, sockets, IPC, the in-zone network, the
+> file authority and the kernel-view filesystems), and the `vfs/*` + `rootfs`
+> + `overlay` slice below it became its own `carrick-vfs` crate (the `Vfs`
+> trait, mount table, dentry cache, host/in-memory backends and the OCI
+> rootfs). See
+> [`docs/superpowers/plans/2026-09-13-extract-carrick-vfs-and-carrick-kernel.md`](../superpowers/plans/2026-09-13-extract-carrick-vfs-and-carrick-kernel.md),
+> [`docs/hal.md`](../hal.md) for the resulting layering and bridge seams, and
+> [`crates/README.md`](../../crates/README.md) for the current crate map.
+>
 > **Landed instead (DOF-safe, no linker change):** `[profile.dev]`/`[profile.test]`
 > `split-debuginfo = "unpacked"` (skip macOS dsymutil bundling per link) and a
 > `[profile.dev-fast]` (`debug = "line-tables-only"`). Verified: release
