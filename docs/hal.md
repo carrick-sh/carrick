@@ -307,6 +307,17 @@ Several older design docs used names that no longer exist. Translate them as:
 | `carrick-bhyve` | `carrick-vmm-bhyve` |
 | `carrick-nvmm` | `carrick-vmm-nvmm` |
 | `carrick-bsd` | `carrick-host-bsd` |
+| `carrick-kernel` **before 2026-09-15** (the per-run MAP_SHARED arena) | `carrick-kernel-arena` |
+
+**`carrick-kernel` is the one entry that resolves to the WRONG live crate.**
+Every other row above names something that no longer exists, so a stale
+reference fails loudly. This one does not: before 2026-09-15 `carrick-kernel`
+meant the per-run MAP_SHARED arena crate, which is now `carrick-kernel-arena`,
+and the name `carrick-kernel` was reused for the crate holding the kernel object
+graph and the syscall dispatcher extracted from `carrick-runtime`. A pre-rename
+doc, comment or commit message saying `carrick-kernel` therefore reads as a
+correct reference to a real crate that is not the one it meant — check the date
+before trusting it.
 
 Do not rename historical files just to remove old names; update active docs and
 current code comments where they would mislead an implementation or debug pass.
