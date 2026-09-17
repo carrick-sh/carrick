@@ -686,11 +686,49 @@ test-kernel *ARGS:
 
 ## Ledger
 
+### Execution decisions
+
+- Implementation branch: `codex/kernel-harness-conformance-loop`, based on
+  extraction revision `ce6dc16f6`; the original app worktree revision lacked
+  both this plan and `carrick-kernel-example`. The plan was copied from the
+  extraction worktree without changing that worktree.
+- Required ordering uses bounded explicit handshakes. The illustrative
+  `HostSleepMs` ordering examples conflict with the global prohibition on
+  sleeping to let tasks settle; dispatch-count assertions need proof that the
+  reader enrolled before the writer proceeds.
+- The code is authoritative for API spelling. `SyscallArgs` is already public
+  through `carrick_kernel::compat`; outcome conversion lives in
+  `BlockedContinuation::from_dispatch_outcome`, not the carrier's small
+  `vcpu_loop/continuation.rs` module. Reuse these public paths.
+- Correct example expectations before treating a red test as a kernel defect:
+  `setpgid(child, 0)` selects the child's pid as its group, whereas joining the
+  parent's group requires that group's id; repeated syscall labels require
+  selecting the intended successful output, not blindly taking the first;
+  subreaper coverage must use a non-init subreaper to distinguish it from
+  ordinary init adoption. Preserve the intended semantics coverage.
+- The initial `just test` run includes compilation and overlaps the vocabulary
+  worker's build. Retain it as baseline correctness evidence; obtain comparable
+  quiet, warm before/after timings before claiming a lane speedup.
+
 ### Defects
 (appended by executors: `- <test name> — <one line> — fixed in <sha> | ignored`)
 
 ### Lane timing
 | when | `just test` wall | carrick-kernel tests | carrick-vfs tests |
 |---|---|---|---|
+| initial cold correctness baseline (build overlap; not a speed comparison) | 345.15 s | 2083 passed, 1 ignored | 283 passed |
 | before Task 11 | | | |
 | after Task 13 | | | |
+
+### Execution checkpoint
+
+- Initial `just test`: exit 0, log `/tmp/kernel-harness-just-test-before.log`.
+- Task 1 worker: `AGY_RUN_ID=kernel-harness-sep16`, name `vocabulary`, worktree
+  `/Users/tjfontaine/.codex/worktrees/kernel-harness-vocabulary`.
+- Tasks 11–12 scanner-only worker: same run id, name `serial-ratchet`, worktree
+  `/Users/tjfontaine/.codex/worktrees/kernel-harness-serial-ratchet`. No lane
+  changes accepted yet.
+- Next: review Task 1, rerun its tests/layering/lint, then Task 2 using the
+  shared continuation API notes in `/tmp/kernel-harness-task2-notes.md`.
+- All 15 tasks remain subject to director acceptance; no worker report is a
+  completed checkbox. No signed guest acceptance or performance claim yet.
