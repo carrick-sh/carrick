@@ -54,7 +54,7 @@ use crate::operand::Syscall;
 use crate::scripted::{ExampleError, InternalCompletion, Shared, Task, WAIT_BOUND};
 
 /// Seed the initial `MigratableTaskState` onto a new task's leader thread so continuation captures can authenticate authority.
-pub(crate) fn seed_initial_task_state(
+pub fn seed_initial_task_state(
     context: &KernelContext,
     asid_generation: u64,
 ) -> Result<ExecutionGeneration, ExampleError> {
@@ -116,10 +116,7 @@ impl std::task::Wake for ThreadWaker {
 }
 
 /// Drive a future synchronously on the current host thread with a timeout bound.
-pub(crate) fn block_on_timeout<F: std::future::Future>(
-    future: F,
-    timeout: Duration,
-) -> Option<F::Output> {
+pub fn block_on_timeout<F: std::future::Future>(future: F, timeout: Duration) -> Option<F::Output> {
     let start = Instant::now();
     let mut future = std::pin::pin!(future);
     let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
