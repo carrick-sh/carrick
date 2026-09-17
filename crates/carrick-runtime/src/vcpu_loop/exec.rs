@@ -605,6 +605,7 @@ enum HvpatchExecInventoryFailureInjection {
     ReplacementReservation,
     BeginInventory,
     IdentityPage,
+    ImageReplace,
 }
 
 #[cfg(test)]
@@ -634,6 +635,7 @@ fn parse_hvpatch_exec_inventory_failure_injection(
         }
         "begin-inventory" => Some(HvpatchExecInventoryFailureInjection::BeginInventory),
         "identity-page" => Some(HvpatchExecInventoryFailureInjection::IdentityPage),
+        "image-replace" => Some(HvpatchExecInventoryFailureInjection::ImageReplace),
         _ => None,
     }
 }
@@ -1025,6 +1027,10 @@ mod exec_image_verification_tests {
             (
                 "identity-page@/bin/execfatalstatus",
                 Some(HvpatchExecInventoryFailureInjection::IdentityPage),
+            ),
+            (
+                "image-replace@/bin/execfatalstatus",
+                Some(HvpatchExecInventoryFailureInjection::ImageReplace),
             ),
         ] {
             assert_eq!(
@@ -1903,6 +1909,14 @@ where
                 kernel,
                 engine,
                 &format!("bind exact HVPatch exec predecessor identity: {error}"),
+            )
+            .map(Some);
+        }
+        if inventory_failure_injection == Some(HvpatchExecInventoryFailureInjection::ImageReplace) {
+            return Self::exec_failed_past_no_return(
+                kernel,
+                engine,
+                "injected HVPatch exec failure before image replacement",
             )
             .map(Some);
         }
@@ -5113,6 +5127,65 @@ pub(crate) mod tests {
                     &case.events,
                 );
             }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn production_poll_exec_failure_at_image_replacement_exits_and_retires_predecessor() {
+        for (case_index, origin) in [
+            ExecCompletionOrigin::GuestSyscall,
+            ExecCompletionOrigin::InternalControl,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let pid = 74_260 + case_index as i32;
+            let mut case = context_boundary_production_exec_failure_case(pid, origin, None);
+            case.engine.fail_execve_into = Some("injected execve_into failure".to_string());
+            let scheduler = case
+                .kernel
+                .hvpatch_runtime
+                .as_ref()
+                .expect("HVPatch runtime")
+                .continuation_services(case.context.kernel())
+                .0;
+            let need_resched = std::sync::atomic::AtomicBool::new(false);
+            let mut submission = executor::ExecutorSubmissionContext {
+                scheduler: &scheduler,
+                publish_test_descendant: &|_, _| unreachable!(),
+                current: None,
+                lease: None,
+                exec_replacement: None,
+            };
+            let mut control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+            let exit =
+                ProductionHvpatchLoopPoll::poll(&mut case.job, &mut case.engine, &mut control);
+            assert!(
+                matches!(exit, executor::ExecutorExit::Exited),
+                "exec failure past no return must exit, got {exit:?}"
+            );
+            match case.job.terminal_result.as_ref() {
+                Some(Ok(VcpuLoopOutcome::ProcessExit(run_result))) => {
+                    assert_eq!(run_result.exit_code, 139);
+                    assert_eq!(run_result.terminating_signal, Some(11));
+                }
+                other => panic!("expected SIGSEGV terminal run result, got {other:?}"),
+            }
+            assert!(matches!(case.job.phase, HvpatchProductionPhase::Complete));
+            assert!(submission.exec_replacement.is_none());
+
+            assert_eq!(
+                case.preparations.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_no_exec_return_publication(
+                &case.kernel,
+                &case.engine,
+                &case.returns,
+                &case.events,
+            );
         }
     }
 

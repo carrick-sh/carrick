@@ -2824,6 +2824,7 @@ pub(crate) mod tests {
         pub(crate) guest_memory: std::collections::BTreeMap<u64, Vec<u8>>,
         pub(crate) read_tracker: Option<CrashReadTracker>,
         pub(crate) fail_read_at: Option<u64>,
+        pub(crate) fail_execve_into: Option<String>,
     }
 
     impl carrick_guest_mem::GuestMemory for CrashCaptureTestEngine {
@@ -2927,6 +2928,9 @@ pub(crate) mod tests {
 
         fn execve_into(&mut self, _new_image: &AddressSpace) -> Result<(), TrapError> {
             self.execve_installs += 1;
+            if let Some(reason) = &self.fail_execve_into {
+                return Err(TrapError::Hypervisor(reason.clone()));
+            }
             Ok(())
         }
 
