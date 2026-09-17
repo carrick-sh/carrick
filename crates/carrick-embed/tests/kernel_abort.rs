@@ -47,7 +47,7 @@ fn a_container_that_will_not_finish_aborts_with_a_post_mortem() {
 
     let outcome = TestContainer::new(common::SMOKE_IMAGE)
         .pull_policy(PullPolicy::Missing)
-        .deadline(DEADLINE)
+        .carrier_budget(DEADLINE)
         .post_mortem_dir(capture_dir.path())
         .run(["/bin/sleep", GUEST_SLEEP_SECONDS]);
 

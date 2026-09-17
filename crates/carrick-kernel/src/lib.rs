@@ -120,6 +120,7 @@ pub(crate) mod seccomp;
 pub mod syslog;
 pub mod vdso_policy;
 pub mod vfs;
+pub mod wedge_capture;
 
 // `linux_abi` is the leaf crate `carrick-abi`, aliased under the module
 // spelling the kernel's call sites use.

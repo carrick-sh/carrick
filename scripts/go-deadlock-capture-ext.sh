@@ -1,5 +1,5 @@
 #!/bin/sh
-# External-capture variant of go-deadlock-capture.sh.
+# External-capture harness for the N-concurrent `go build` deadlock reproducer.
 #
 # Why: under `taskpolicy -b`, a hung guest's spinning vCPU threads starve its OWN
 # in-process deadlock watchdog thread, so it never self-cores — observed: only
@@ -12,8 +12,14 @@
 # dumps each one's `thread backtrace all`, so the stuck guest (a vCPU thread mid
 # guest-syscall, non-empty event ring) is guaranteed to be among them.
 #
-# The in-process watchdog is intentionally NOT armed here (no
-# CARRICK_DEADLOCK_WATCHDOG_MS) — this harness is the sole capture mechanism.
+# The in-process watchdog is not armed here — this harness is the sole capture
+# mechanism for the CLI lane. Its window is a typed parameter now
+# (`carrick_kernel::deadlock_watchdog::DeadlockWindow`), stated by the caller
+# that owns a run's budget, and the only caller today is `carrick-embed`'s
+# carrier budget in the signed test lane. The throttled-self-core variant that
+# used to live in `scripts/go-deadlock-capture.sh` is deleted: its own premise
+# (above) is that a throttled guest starves its in-process watchdog, so it never
+# self-cored.
 #
 # Usage: scripts/go-deadlock-capture-ext.sh [N] [STALL_S] [DEADLINE_S] [CPUS]
 #   N          concurrent go builds                         (default 4)

@@ -1158,15 +1158,33 @@ impl CarrierWaitService {
             ..
         } = &probe
             && let WaitFdAuthority::Logical {
-                strict,
+                registrations,
+                unclassified,
                 watched,
-                interest,
             } = fd_authority
         {
-            for authority in strict.iter().chain(watched) {
+            // ONE rule, no scalar gate: subscribe the slot, enroll on the
+            // description's wait queue, and take the post-enrollment probe iff
+            // this fd's OWN source says the enrollment needs one — with that
+            // fd's own interest, never a union folded across the whole wait.
+            // A watched slot has no interest to probe with, by type.
+            let targets = registrations
+                .iter()
+                .map(|registration| {
+                    let source = registration.source();
+                    let probe_with = if source.probe_after_enrol() {
+                        source.description_interest()
+                    } else {
+                        None
+                    };
+                    (registration.slot(), probe_with)
+                })
+                .chain(unclassified.iter().map(|slot| (slot.slot(), None)))
+                .chain(watched.iter().map(|slot| (slot.slot(), None)));
+            for (authority, probe_with) in targets {
                 let callback_weak = weak.clone();
                 let Some(subscription) = file_table.subscribe_slot_authority(
-                    *authority,
+                    authority,
                     Arc::new(move |_| {
                         if let Some(inner) = callback_weak.upgrade() {
                             inner.publish_event(token, ContinuationEvent::Ready);
@@ -1179,7 +1197,7 @@ impl CarrierWaitService {
                 self.inner
                     .attach_subscription(token, ProducerSubscription::FileSlot(subscription));
 
-                if let Some(description) = file_table.resolve_slot_authority(*authority)
+                if let Some(description) = file_table.resolve_slot_authority(authority)
                     && let Some(wq) = description.wait_queue()
                 {
                     let callback_weak = weak.clone();
@@ -1197,16 +1215,12 @@ impl CarrierWaitService {
                     // in-memory socket whose peer wrote in the gap). Probe the
                     // description once, now that the enrollment is live; the
                     // syscall re-checks under its own lock when re-dispatched.
-                    if *interest != 0 {
-                        let want = carrick_abi::LinuxEpollEvents::from_bits_retain(u32::from(
-                            *interest as u16,
-                        ));
-                        if !description
-                            .readiness(want, &crate::kernel::NoReadinessContext)
+                    if let Some(interest) = probe_with
+                        && !description
+                            .readiness(interest.epoll(), &crate::kernel::NoReadinessContext)
                             .is_empty()
-                        {
-                            self.inner.publish_event(token, ContinuationEvent::Ready);
-                        }
+                    {
+                        self.inner.publish_event(token, ContinuationEvent::Ready);
                     }
                 }
             }

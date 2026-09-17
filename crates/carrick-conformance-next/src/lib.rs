@@ -13,6 +13,71 @@ pub use carrick_embed::{
     SyscallInfo, SyscallObserver, SyscallOutcome,
 };
 
+/// The wall-clock budget one probe carrier gets, in milliseconds.
+///
+/// MEASURED, not chosen. One green `just conformance-probes` on the canonical
+/// Mac (2026-09-15, 902 generic probe runs over both libcs, quiet box) gave
+/// p50 117 ms, p90 519 ms, p95 1347 ms, p99 4650 ms, p99.5 5379 ms — 19 probes
+/// over 2 s and only two above 6 s. The budget is the embed default, which is
+/// ~11x that p99.5, so scheduling noise cannot reach it while a wedge (29m45s
+/// when one was last found by hand) is cut three orders of magnitude earlier.
+pub const PROBE_CARRIER_BUDGET_MS: u64 = carrick_embed::testing::DEFAULT_CARRIER_BUDGET_MS;
+
+/// Extra milliseconds the FIRST container in a probe process gets, for image
+/// resolution and a cold guest.
+pub const PROBE_COLD_START_ALLOWANCE_MS: u64 = carrick_embed::testing::COLD_START_ALLOWANCE_MS;
+
+/// A probe whose measured cost does not fit the global budget, and why.
+///
+/// Typed rather than a bare tuple table: the reason is the part that stops the
+/// next reader raising a budget to make a row pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeBudgetOverride {
+    pub probe: &'static str,
+    pub budget_ms: u64,
+    pub reason: &'static str,
+}
+
+/// The complete set of probes whose steady budget differs from the global one.
+///
+/// Both entries are probes that SLEEP or churn by design, measured on the same
+/// green gate as the global budget; each gets ~6x its measured cost, the same
+/// shape of headroom the global budget has.
+pub const PROBE_BUDGET_OVERRIDES: &[ProbeBudgetOverride] = &[
+    ProbeBudgetOverride {
+        probe: "mtidlesleep",
+        budget_ms: 120_000,
+        reason: "sleeps idle threads for ~20s by construction (measured 20122/20133ms)",
+    },
+    ProbeBudgetOverride {
+        probe: "futexforkrequeue",
+        budget_ms: 120_000,
+        reason: "fork + requeue churn, measured 11174/14448ms with high variance",
+    },
+];
+
+/// The steady budget for `probe`, before any cold-start allowance.
+pub fn probe_steady_budget_ms(probe: &str) -> u64 {
+    PROBE_BUDGET_OVERRIDES
+        .iter()
+        .find(|entry| entry.probe == probe)
+        .map_or(PROBE_CARRIER_BUDGET_MS, |entry| entry.budget_ms)
+}
+
+/// The total budget a probe's carrier gets.
+///
+/// This is the harness's statement of the policy; `carrick-embed` resolves the
+/// same number when the container runs (see the agreement test below), so the
+/// two can never drift into two answers.
+pub fn probe_carrier_budget(probe: &str, first_in_process: bool) -> std::time::Duration {
+    let steady = std::time::Duration::from_millis(probe_steady_budget_ms(probe));
+    if first_in_process {
+        steady + std::time::Duration::from_millis(PROBE_COLD_START_ALLOWANCE_MS)
+    } else {
+        steady
+    }
+}
+
 /// Filter all [`AuditEvent::SyscallReturn`] events for a specific syscall by name.
 pub fn find_all_syscall_returns(events: &[AuditEvent], syscall_name: &str) -> Vec<SyscallOutcome> {
     events
@@ -136,6 +201,69 @@ mod tests {
         ThreadKey {
             tid: LinuxTid::from_abi_positive(1).unwrap(),
             serial: registry.thread_serial().unwrap(),
+        }
+    }
+
+    /// Every probe is bounded, named in the override table or not: the
+    /// function is total, so a probe added tomorrow cannot arrive unbounded.
+    #[test]
+    fn every_generic_probe_has_a_carrier_budget() {
+        for probe in PROBE_BUDGET_OVERRIDES.iter().map(|entry| entry.probe) {
+            assert!(
+                probe_carrier_budget(probe, false) >= std::time::Duration::from_millis(1),
+                "{probe} must be bounded"
+            );
+        }
+        assert_eq!(
+            probe_carrier_budget("a-probe-nobody-has-written-yet", false),
+            std::time::Duration::from_millis(PROBE_CARRIER_BUDGET_MS),
+            "an unlisted probe falls back to the measured global budget"
+        );
+        for entry in PROBE_BUDGET_OVERRIDES {
+            assert!(
+                entry.budget_ms > PROBE_CARRIER_BUDGET_MS,
+                "{} is in the override table but does not raise the budget",
+                entry.probe
+            );
+            assert!(
+                !entry.reason.is_empty(),
+                "{} must say why it is slow",
+                entry.probe
+            );
+        }
+    }
+
+    #[test]
+    fn cold_start_allowance_exceeds_the_steady_budget() {
+        const {
+            // A compile-time refusal, so the pair cannot be edited into a
+            // cold-start allowance smaller than one steady run.
+            assert!(
+                PROBE_COLD_START_ALLOWANCE_MS > PROBE_CARRIER_BUDGET_MS,
+                "image resolution plus a cold guest costs more than a steady run"
+            );
+        }
+        assert_eq!(
+            probe_carrier_budget("telemetrymap", true)
+                - probe_carrier_budget("telemetrymap", false),
+            std::time::Duration::from_millis(PROBE_COLD_START_ALLOWANCE_MS)
+        );
+    }
+
+    /// The harness names the steady budget; `carrick-embed` resolves what is
+    /// actually applied. A second computation of the same number is a second
+    /// answer waiting to drift, so they are checked against each other.
+    #[test]
+    fn the_harness_budget_matches_what_embed_will_apply() {
+        for probe in ["telemetrymap", "mtidlesleep", "futexforkrequeue"] {
+            let requested = std::time::Duration::from_millis(probe_steady_budget_ms(probe));
+            for first in [false, true] {
+                assert_eq!(
+                    carrick_embed::testing::effective_carrier_budget(Some(requested), first),
+                    Some(probe_carrier_budget(probe, first)),
+                    "{probe} (first_in_process={first})"
+                );
+            }
         }
     }
 

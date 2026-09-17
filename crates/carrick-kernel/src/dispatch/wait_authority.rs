@@ -1,9 +1,14 @@
-use carrick_abi::LinuxErrno;
+use carrick_abi::{LinuxErrno, LinuxPollEvents};
 use serde::Serialize;
 
+use crate::dispatch::abi_args::{Fd, HostFd};
 use crate::dispatch::fd_table::HostFdRef;
 use crate::dispatch::fifo_beacon::ParkedOpenerToken;
+use crate::dispatch::wait_source::{
+    HostWaitTarget, WaitInterest, WaitRegistration, WaitSource, WatchedSlot,
+};
 use crate::dispatch::{DispatchOutcome, SyscallDispatcher};
+use crate::kernel::objects::FileSlotAuthority;
 use crate::linux_abi::LINUX_EBADF;
 use carrick_hal::WaitFd;
 
@@ -29,30 +34,57 @@ pub struct InternalWaitAuthority {
     generation: u64,
 }
 
+/// A guest slot a park pins STRICTLY but whose readiness source the park does
+/// not yet name.
+///
+/// It is the exact pre-migration policy, and nothing more: subscribe the slot,
+/// enroll on its description's wait queue, never probe. It carries no interest
+/// at all, so it cannot resurrect the scalar this migration deletes — an
+/// unclassified slot is a slot whose source is UNKNOWN, not a slot with an
+/// empty interest.
+///
+/// Tasks 4-7 replace every construction with a classified [`WaitRegistration`]
+/// (`net.rs`'s `wait_source_for`); the last one to go is
+/// `dispatch/net/netlink.rs`'s `WaitFds::raw_one(-1, 0)`, which Task 6 repairs
+/// red-first. Task 9's grep deletes this type with the adapters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnclassifiedSlot(FileSlotAuthority);
+
+impl UnclassifiedSlot {
+    pub(crate) const fn slot(self) -> FileSlotAuthority {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WaitFdAuthority {
     Empty,
     Missing,
     Logical {
-        strict: Vec<crate::kernel::objects::FileSlotAuthority>,
-        watched: Vec<crate::kernel::objects::FileSlotAuthority>,
-        /// Poll interest (`POLLIN`/`POLLOUT`/...) of the registrations that have
-        /// NO host fd (a carrick-owned object such as an in-memory socket).
-        /// The wait service probes the slots' description readiness with it
-        /// once, right after enrolling on their wait queues, so a wake that
-        /// fired between the syscall's own check and the enrollment is not
-        /// lost. `0` when every registration is a host fd.
-        interest: i16,
+        /// One per guest fd whose readiness source the wait names. The host
+        /// target and the exact slot live in ONE value, so the wait service
+        /// probes each description with that fd's own interest instead of a
+        /// scalar folded across the whole wait.
+        registrations: Vec<WaitRegistration>,
+        /// Strictly pinned slots still awaiting classification (see
+        /// [`UnclassifiedSlot`]).
+        unclassified: Vec<UnclassifiedSlot>,
+        /// Advisory: re-dispatch when the slot is replaced, never probed.
+        watched: Vec<WatchedSlot>,
     },
     Internal(InternalWaitAuthority),
 }
 
 impl WaitFdAuthority {
-    pub(crate) fn logical(authority: crate::kernel::objects::FileSlotAuthority) -> Self {
+    /// A park that pins ONE guest slot and whose readiness source is the wait's
+    /// own reactor entry. [`WaitFds::with_authority`] is where the two halves
+    /// meet, so the classification happens there; Task 6 replaces these call
+    /// sites with `assemble_wait`.
+    pub(crate) fn logical(slot: FileSlotAuthority) -> Self {
         Self::Logical {
-            strict: vec![authority],
+            registrations: Vec::new(),
+            unclassified: vec![UnclassifiedSlot(slot)],
             watched: Vec::new(),
-            interest: 0,
         }
     }
 
@@ -64,6 +96,112 @@ impl WaitFdAuthority {
             generation: NEXT_INTERNAL_WAIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
     }
+
+    /// Every slot the wait is STRICTLY authorised against: a close or reuse of
+    /// any of them invalidates the wait. Watched slots are advisory and are
+    /// deliberately absent.
+    pub(crate) fn strict_slots(&self) -> Vec<FileSlotAuthority> {
+        match self {
+            Self::Logical {
+                registrations,
+                unclassified,
+                ..
+            } => registrations
+                .iter()
+                .map(WaitRegistration::slot)
+                .chain(unclassified.iter().map(|slot| slot.slot()))
+                .collect(),
+            Self::Empty | Self::Missing | Self::Internal(_) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn has_strict_slots(&self) -> bool {
+        match self {
+            Self::Logical {
+                registrations,
+                unclassified,
+                ..
+            } => !registrations.is_empty() || !unclassified.is_empty(),
+            Self::Empty | Self::Missing | Self::Internal(_) => false,
+        }
+    }
+
+    /// The union of the interests the wait service will actually probe with.
+    /// Empty when every source is a host descriptor or is unclassified.
+    #[cfg(test)]
+    pub(crate) fn probed_interest_for_test(&self) -> LinuxPollEvents {
+        match self {
+            Self::Logical { registrations, .. } => registrations
+                .iter()
+                .filter(|registration| registration.source().probe_after_enrol())
+                .filter_map(|registration| registration.source().description_interest())
+                .fold(LinuxPollEvents::empty(), |acc, interest| {
+                    acc | interest.events()
+                }),
+            Self::Empty | Self::Missing | Self::Internal(_) => LinuxPollEvents::empty(),
+        }
+    }
+}
+
+/// Classify the slots an ADAPTER captured against the reactor entries the same
+/// park built, which is the correlation the two-list shape never had.
+///
+/// * a `-1` sentinel entry with non-empty events means the park has no host
+///   object for those slots: they are [`WaitSource::Description`] and take the
+///   post-enrollment probe with exactly those events;
+/// * otherwise, when the entries are all host descriptors and line up one-to-one
+///   with the slots, each slot is the [`WaitSource::Host`] at its index;
+/// * anything else stays an [`UnclassifiedSlot`] — no host target is invented
+///   and no interest is fabricated.
+///
+/// Tasks 4-7 delete this together with the adapters that call it.
+fn classify_adapter_slots(
+    fds: &[WaitFd],
+    slots: Vec<FileSlotAuthority>,
+) -> (Vec<WaitRegistration>, Vec<UnclassifiedSlot>) {
+    let sentinel = fds
+        .iter()
+        .filter(|entry| entry.fd() < 0)
+        .fold(LinuxPollEvents::empty(), |acc, entry| {
+            acc | LinuxPollEvents::from_bits_retain(entry.events())
+        });
+    if let Some(interest) = WaitInterest::new(sentinel) {
+        let registrations = slots
+            .into_iter()
+            .map(|slot| {
+                WaitRegistration::new(
+                    Fd(slot.number().raw()),
+                    slot,
+                    interest.events(),
+                    WaitSource::Description { interest },
+                )
+            })
+            .collect();
+        return (registrations, Vec::new());
+    }
+    let all_host = fds.iter().all(|entry| entry.fd() >= 0);
+    if all_host && fds.len() == slots.len() {
+        let registrations = slots
+            .into_iter()
+            .zip(fds.iter())
+            .map(|(slot, entry)| {
+                let events = LinuxPollEvents::from_bits_retain(entry.events());
+                WaitRegistration::new(
+                    Fd(slot.number().raw()),
+                    slot,
+                    events,
+                    WaitSource::Host {
+                        host: HostWaitTarget::new(HostFd(entry.fd()), events),
+                    },
+                )
+            })
+            .collect();
+        return (registrations, Vec::new());
+    }
+    (
+        Vec::new(),
+        slots.into_iter().map(UnclassifiedSlot).collect(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +247,34 @@ impl WaitFds {
         Self::raw(vec![(fd, events)])
     }
 
+    /// Build the reactor lowering and the authority from ONE list: a `Host` or
+    /// `Dual` source contributes its host descriptor, a `Description` source
+    /// contributes none. There is no `-1` sentinel to write.
+    // Tasks 6-7 route the remaining parks through this; until then the
+    // adapters below still build the authority from separately captured slots.
+    pub(crate) fn from_registrations(
+        registrations: Vec<WaitRegistration>,
+        watched: Vec<WatchedSlot>,
+    ) -> Result<Self, LinuxErrno> {
+        if registrations.is_empty() {
+            return Err(LINUX_EBADF);
+        }
+        let fds = registrations
+            .iter()
+            .filter_map(|registration| registration.source().host())
+            .map(|host| WaitFd::raw(host.fd().get(), host.events().bits()))
+            .collect();
+        Ok(Self {
+            fds,
+            guards: Vec::new(),
+            authority: WaitFdAuthority::Logical {
+                registrations,
+                unclassified: Vec::new(),
+                watched,
+            },
+        })
+    }
+
     pub(in crate::dispatch) fn authorized_raw_one(
         fd: i32,
         events: i16,
@@ -148,25 +314,46 @@ impl WaitFds {
         self.fds.first().map(|fd| (fd.fd(), fd.events()))
     }
 
+    /// Task 6 removes this with the last `raw_*` park: it pins slots captured
+    /// separately from the reactor list and classifies them against it.
     #[cfg(test)]
-    pub(crate) fn with_slot_authorities(
-        mut self,
-        slot_authorities: Vec<crate::kernel::objects::FileSlotAuthority>,
-    ) -> Self {
-        if self.fds.is_empty() && slot_authorities.is_empty() {
+    pub(crate) fn with_slot_authorities(mut self, slots: Vec<FileSlotAuthority>) -> Self {
+        if self.fds.is_empty() && slots.is_empty() {
             self.authority = WaitFdAuthority::Empty;
         } else {
+            let (registrations, unclassified) = classify_adapter_slots(&self.fds, slots);
             self.authority = WaitFdAuthority::Logical {
-                strict: slot_authorities,
+                registrations,
+                unclassified,
                 watched: Vec::new(),
-                interest: self.logical_interest(),
             };
         }
         self
     }
 
+    /// Attach an authority. A `Logical` authority built without the reactor
+    /// list (`WaitFdAuthority::logical`) is classified here, where both halves
+    /// are finally in scope; Task 6 removes that path.
     pub(crate) fn with_authority(mut self, authority: WaitFdAuthority) -> Self {
-        self.authority = authority;
+        self.authority = match authority {
+            WaitFdAuthority::Logical {
+                mut registrations,
+                unclassified,
+                watched,
+            } if !unclassified.is_empty() => {
+                let (classified, still_unclassified) = classify_adapter_slots(
+                    &self.fds,
+                    unclassified.iter().map(|slot| slot.slot()).collect(),
+                );
+                registrations.extend(classified);
+                WaitFdAuthority::Logical {
+                    registrations,
+                    unclassified: still_unclassified,
+                    watched,
+                }
+            }
+            authority => authority,
+        };
         self
     }
 
@@ -175,101 +362,87 @@ impl WaitFds {
     }
 
     #[cfg(test)]
-    pub(crate) fn logical_authorities_for_test(
-        &self,
-    ) -> &[crate::kernel::objects::FileSlotAuthority] {
-        match &self.authority {
-            WaitFdAuthority::Logical { strict, .. } => strict,
-            _ => &[],
-        }
+    pub(crate) fn logical_authorities_for_test(&self) -> Vec<FileSlotAuthority> {
+        self.authority.strict_slots()
     }
 
     #[cfg(test)]
-    pub(crate) fn watched_authorities_for_test(
-        &self,
-    ) -> &[crate::kernel::objects::FileSlotAuthority] {
+    pub(crate) fn watched_authorities_for_test(&self) -> Vec<FileSlotAuthority> {
         match &self.authority {
-            WaitFdAuthority::Logical { watched, .. } => watched,
-            _ => &[],
+            WaitFdAuthority::Logical { watched, .. } => {
+                watched.iter().map(|slot| slot.slot()).collect()
+            }
+            _ => Vec::new(),
         }
     }
 
+    /// Task 6 replaces this with `assemble_wait`: it captures the guest slots a
+    /// park named and classifies them against the park's own reactor entries.
     pub(in crate::dispatch) fn with_guest_slots(
         mut self,
         files: &crate::kernel::objects::FileTable,
         guest_fds: impl IntoIterator<Item = i32>,
     ) -> Result<Self, LinuxErrno> {
-        let slot_authorities = guest_fds
-            .into_iter()
-            .filter(|fd| *fd >= 0)
-            .map(|fd| {
-                let number =
-                    crate::kernel::FileSlotNumber::for_open_fd(fd).map_err(|_| LINUX_EBADF)?;
-                files
-                    .capture_slot_or_stdio_authority(number)
-                    .ok_or(LINUX_EBADF)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if slot_authorities.is_empty() && !self.fds.is_empty() {
+        let slots = capture_slots(files, guest_fds)?;
+        if slots.is_empty() && !self.fds.is_empty() {
             return Err(LINUX_EBADF);
         }
-        if slot_authorities.is_empty() {
+        if slots.is_empty() {
             self.authority = WaitFdAuthority::Empty;
         } else {
+            let (registrations, unclassified) = classify_adapter_slots(&self.fds, slots);
             self.authority = WaitFdAuthority::Logical {
-                strict: slot_authorities,
+                registrations,
+                unclassified,
                 watched: Vec::new(),
-                interest: self.logical_interest(),
             };
         }
         Ok(self)
     }
 
+    /// Task 6/7 replace this with `assemble_wait`: the strict slots are
+    /// classified against the park's reactor entries, the watched slots stay
+    /// advisory and probe-exempt by type.
     pub(crate) fn with_redispatch_and_watched_slots(
         mut self,
         files: &crate::kernel::objects::FileTable,
         strict_fds: impl IntoIterator<Item = i32>,
         watched_fds: impl IntoIterator<Item = i32>,
     ) -> Result<Self, LinuxErrno> {
-        let capture = |fds: Vec<i32>| {
-            fds.into_iter()
-                .filter(|fd| *fd >= 0)
-                .map(|fd| {
-                    let number =
-                        crate::kernel::FileSlotNumber::for_open_fd(fd).map_err(|_| LINUX_EBADF)?;
-                    files
-                        .capture_slot_or_stdio_authority(number)
-                        .ok_or(LINUX_EBADF)
-                })
-                .collect::<Result<Vec<_>, _>>()
-        };
-        let strict = capture(strict_fds.into_iter().collect())?;
-        let watched = watched_fds
+        let strict = capture_slots(files, strict_fds)?;
+        let watched: Vec<WatchedSlot> = watched_fds
             .into_iter()
             .filter_map(|fd| crate::kernel::FileSlotNumber::for_open_fd(fd).ok())
             .filter_map(|number| files.capture_slot_or_stdio_authority(number))
+            .map(WatchedSlot::new)
             .collect();
         if strict.is_empty() {
             return Err(LINUX_EBADF);
         }
-        let interest = self.logical_interest();
+        let (registrations, unclassified) = classify_adapter_slots(&self.fds, strict);
         self.authority = WaitFdAuthority::Logical {
-            strict,
+            registrations,
+            unclassified,
             watched,
-            interest,
         };
         Ok(self)
     }
+}
 
-    /// The union of the poll events requested on registrations without a host
-    /// fd (`fd < 0`): the interest a carrick-owned object's readiness is probed
-    /// with after the wait service enrolls on its wait queue.
-    fn logical_interest(&self) -> i16 {
-        self.fds
-            .iter()
-            .filter(|fd| fd.fd() < 0)
-            .fold(0i16, |acc, fd| acc | fd.events())
-    }
+fn capture_slots(
+    files: &crate::kernel::objects::FileTable,
+    guest_fds: impl IntoIterator<Item = i32>,
+) -> Result<Vec<FileSlotAuthority>, LinuxErrno> {
+    guest_fds
+        .into_iter()
+        .filter(|fd| *fd >= 0)
+        .map(|fd| {
+            let number = crate::kernel::FileSlotNumber::for_open_fd(fd).map_err(|_| LINUX_EBADF)?;
+            files
+                .capture_slot_or_stdio_authority(number)
+                .ok_or(LINUX_EBADF)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -282,7 +455,7 @@ mod wait_fds_tests {
         files: &crate::kernel::objects::FileTable,
         ids: &crate::kernel::ObjectIdRegistry,
         fd: i32,
-    ) -> crate::kernel::objects::FileSlotAuthority {
+    ) -> FileSlotAuthority {
         let number = crate::kernel::FileSlotNumber::for_open_fd(fd).expect("open fd");
         files.install(
             number,
@@ -296,11 +469,12 @@ mod wait_fds_tests {
             .expect("installed file slot authority")
     }
 
-    /// A registration without a host fd (`-1`) contributes its poll events as
-    /// the logical interest the wait service probes the description with after
-    /// enrolling; host-fd registrations contribute nothing.
+    /// A park with no host object for its slots makes them `Description`
+    /// sources carrying exactly the events the park asked for, and those are
+    /// the ones the wait service probes. A host-fd park makes them `Host`
+    /// sources, which are never probed.
     #[test]
-    fn logical_interest_comes_only_from_host_fd_less_registrations() {
+    fn adapter_classification_follows_the_parks_own_reactor_entries() {
         let ids = crate::kernel::ObjectIdRegistry::new();
         let files =
             crate::kernel::objects::FileTable::new(ids.file_table_id().expect("file table ID"));
@@ -308,24 +482,88 @@ mod wait_fds_tests {
         let logical = WaitFds::raw_one(-1, libc::POLLIN)
             .with_redispatch_and_watched_slots(&files, [20], [20])
             .expect("logical wait");
-        assert!(matches!(
-            logical.authority(),
-            WaitFdAuthority::Logical { interest, .. } if *interest == libc::POLLIN
-        ));
+        assert_eq!(
+            logical.authority().probed_interest_for_test(),
+            LinuxPollEvents::IN
+        );
         let host = WaitFds::raw_one(7, libc::POLLIN)
             .with_guest_slots(&files, [20])
             .expect("host wait");
-        assert!(matches!(
-            host.authority(),
-            WaitFdAuthority::Logical { interest, .. } if *interest == 0
-        ));
+        assert_eq!(
+            host.authority().probed_interest_for_test(),
+            LinuxPollEvents::empty(),
+            "a host descriptor decides its own readiness and is never probed"
+        );
         let mixed = WaitFds::raw(vec![(7, libc::POLLIN), (-1, libc::POLLOUT)])
             .with_redispatch_and_watched_slots(&files, [20], [20])
             .expect("mixed wait");
+        assert_eq!(
+            mixed.authority().probed_interest_for_test(),
+            LinuxPollEvents::OUT
+        );
+    }
+
+    /// The one park that still names no source at all — `netlink.rs`'s
+    /// `raw_one(-1, 0)` — keeps its slot STRICT and probe-free, exactly as
+    /// before. Task 6 repairs it.
+    #[test]
+    fn a_park_with_no_host_object_and_no_events_leaves_its_slot_unclassified() {
+        let ids = crate::kernel::ObjectIdRegistry::new();
+        let files =
+            crate::kernel::objects::FileTable::new(ids.file_table_id().expect("file table ID"));
+        let slot = install_slot(&files, &ids, 21);
+        let fds = WaitFds::raw_one(-1, 0)
+            .with_guest_slots(&files, [21])
+            .expect("netlink-shaped wait");
+        assert_eq!(fds.authority().strict_slots(), [slot]);
+        assert_eq!(
+            fds.authority().probed_interest_for_test(),
+            LinuxPollEvents::empty()
+        );
         assert!(matches!(
-            mixed.authority(),
-            WaitFdAuthority::Logical { interest, .. } if *interest == libc::POLLOUT
+            fds.authority(),
+            WaitFdAuthority::Logical { registrations, unclassified, .. }
+                if registrations.is_empty() && unclassified.len() == 1
         ));
+    }
+
+    /// `from_registrations` lowers `Host`/`Dual` sources to reactor entries and
+    /// `Description` sources to none: the `-1` sentinel has nowhere to live.
+    #[test]
+    fn from_registrations_lowers_only_host_backed_sources_to_the_reactor() {
+        let ids = crate::kernel::ObjectIdRegistry::new();
+        let files =
+            crate::kernel::objects::FileTable::new(ids.file_table_id().expect("file table ID"));
+        let described = install_slot(&files, &ids, 22);
+        let hosted = install_slot(&files, &ids, 23);
+        let interest = WaitInterest::new(LinuxPollEvents::IN).expect("POLLIN");
+        let fds = WaitFds::from_registrations(
+            vec![
+                WaitRegistration::new(
+                    Fd(22),
+                    described,
+                    LinuxPollEvents::IN,
+                    WaitSource::Description { interest },
+                ),
+                WaitRegistration::new(
+                    Fd(23),
+                    hosted,
+                    LinuxPollEvents::OUT,
+                    WaitSource::Host {
+                        host: HostWaitTarget::new(HostFd(9), LinuxPollEvents::OUT),
+                    },
+                ),
+            ],
+            Vec::new(),
+        )
+        .expect("typed wait");
+        assert_eq!(fds.first(), Some((9, libc::POLLOUT)));
+        assert_eq!(fds.len(), 1);
+        assert_eq!(fds.authority().strict_slots(), [described, hosted]);
+        assert_eq!(
+            fds.authority().probed_interest_for_test(),
+            LinuxPollEvents::IN
+        );
     }
 
     #[test]

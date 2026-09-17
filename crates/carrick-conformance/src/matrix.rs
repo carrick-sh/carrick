@@ -48,8 +48,10 @@ pub fn render(reports: &[SuiteReport]) -> String {
         "Verdicts: **MATCH** identical · **INCOMPLETE** closure run lacked an identical, nonempty all-pass result · **DIFF** diverges but every divergence is a \
          tracked/known or unchanged gap (green) · **REGRESSION** a new, unexcused \
          break (red, fails the gate) · **NEW** first observation, not yet baselined · \
-         **CARRICK_CRASH**/**TIMEOUT** carrick aborted/hung · **ORACLE_FAIL** the \
-         Docker oracle broke (never counted against carrick).\n\n",
+         **CARRICK_CRASH**/**TIMEOUT** carrick aborted/hung · **BUDGET_KILL** cut off at \
+         the harness's Carrick-only diagnostic budget while still progressing, below the \
+         suite's declared timeout — non-gating, re-run serially to get its real verdict · \
+         **ORACLE_FAIL** the Docker oracle broke (never counted against carrick).\n\n",
     );
 
     for (key, title) in ECOSYSTEMS {
@@ -89,22 +91,27 @@ pub fn render(reports: &[SuiteReport]) -> String {
     out
 }
 
+/// Display order for the per-ecosystem verdict counts. `headline` FILTERS over
+/// this array, so a verdict missing from it vanishes from the counts without any
+/// error — `every_verdict_appears_in_the_headline_order` is the tripwire.
+const HEADLINE_ORDER: [Verdict; 9] = [
+    Verdict::Match,
+    Verdict::Incomplete,
+    Verdict::Diff,
+    Verdict::New,
+    Verdict::Regression,
+    Verdict::CarrickCrash,
+    Verdict::Timeout,
+    Verdict::BudgetKill,
+    Verdict::OracleFail,
+];
+
 fn headline(rows: &[&SuiteReport]) -> String {
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for r in rows {
         *counts.entry(r.verdict.as_str()).or_default() += 1;
     }
-    let order = [
-        Verdict::Match,
-        Verdict::Incomplete,
-        Verdict::Diff,
-        Verdict::New,
-        Verdict::Regression,
-        Verdict::CarrickCrash,
-        Verdict::Timeout,
-        Verdict::OracleFail,
-    ];
-    let parts: Vec<String> = order
+    let parts: Vec<String> = HEADLINE_ORDER
         .iter()
         .filter_map(|v| {
             counts
@@ -114,4 +121,54 @@ fn headline(rows: &[&SuiteReport]) -> String {
         .collect();
     let noun = if rows.len() == 1 { "suite" } else { "suites" };
     format!("{} {noun} — {}", rows.len(), parts.join(" · "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `headline` counts verdicts by filtering over a hand-written order array.
+    /// A verdict missing from it does not error — it silently VANISHES from the
+    /// counts, so a matrix could read "10 suites — 10 MATCH" while hiding ten
+    /// budget kills. The exhaustive `match` below is the tripwire: adding a
+    /// `Verdict` variant breaks this test to compile until the variant is
+    /// listed here AND present in `HEADLINE_ORDER`.
+    #[test]
+    fn every_verdict_appears_in_the_headline_order() {
+        let all = [
+            Verdict::Match,
+            Verdict::Incomplete,
+            Verdict::Diff,
+            Verdict::Regression,
+            Verdict::New,
+            Verdict::CarrickCrash,
+            Verdict::Timeout,
+            Verdict::BudgetKill,
+            Verdict::OracleFail,
+        ];
+        for verdict in all {
+            match verdict {
+                Verdict::Match
+                | Verdict::Incomplete
+                | Verdict::Diff
+                | Verdict::Regression
+                | Verdict::New
+                | Verdict::CarrickCrash
+                | Verdict::Timeout
+                | Verdict::BudgetKill
+                | Verdict::OracleFail => {}
+            }
+            assert!(
+                HEADLINE_ORDER.contains(&verdict),
+                "{} is missing from the matrix headline order and would vanish \
+                 from the counts",
+                verdict.as_str()
+            );
+        }
+        assert_eq!(
+            HEADLINE_ORDER.len(),
+            all.len(),
+            "the headline order must list each verdict exactly once"
+        );
+    }
 }

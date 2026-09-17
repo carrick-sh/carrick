@@ -117,6 +117,35 @@ pub enum EmbedError {
         reason: String,
         post_mortem: Arc<PostMortem>,
     },
+    /// The carrier blew its budget AND could not consume the abort latch, so
+    /// it was described from outside by a debugger before being reaped.
+    ///
+    /// This is the rung below [`Self::KernelAborted`]: a spinning executor
+    /// never reaches a supervised wait, so the in-process sink cannot fire and
+    /// the only remaining evidence is an external backtrace and core. Killing
+    /// the carrier kills the shard, which is the intended fail-closed outcome —
+    /// `scripts/test-signed.sh` then publishes no receipt.
+    #[error(
+        "probe {label} wedged: budget {budget_ms}ms exceeded ({elapsed_ms}ms elapsed) and the \
+         kernel abort was never consumed; artifacts in {artifacts}"
+    )]
+    ProbeWedged {
+        label: String,
+        budget_ms: u64,
+        elapsed_ms: u64,
+        artifacts: std::path::PathBuf,
+    },
+    /// The carrier wedged and the external capture produced no evidence.
+    ///
+    /// Still a failure, never a skip: an absent `lldb`, a refused `sudo -n`, a
+    /// zero-length artifact or a capture that outran its own bound all arrive
+    /// here, naming the directory that was prepared for them.
+    #[error("probe {label} wedged and its capture failed: {reason}")]
+    ProbeWedgeCaptureFailed {
+        label: String,
+        reason: String,
+        artifacts: Option<std::path::PathBuf>,
+    },
 }
 
 /// Which runtime call produced a [`RuntimeError`]; decides `Prepare` vs
@@ -238,6 +267,35 @@ mod tests {
             EmbedError::from_runtime(make(), Phase::Execute),
             EmbedError::Runtime(RuntimeError::Configuration(_))
         ));
+    }
+
+    /// A wedge is only useful if the failure says where to look.
+    #[test]
+    fn probe_wedged_error_names_the_directory() {
+        let wedged = EmbedError::ProbeWedged {
+            label: "forkstackstorm".to_owned(),
+            budget_ms: 2_000,
+            elapsed_ms: 32_100,
+            artifacts: std::path::PathBuf::from("target/postmortem/forkstackstorm-4242"),
+        };
+        let text = wedged.to_string();
+        assert!(text.contains("forkstackstorm"), "{text}");
+        assert!(text.contains("2000ms"), "{text}");
+        assert!(
+            text.contains("target/postmortem/forkstackstorm-4242"),
+            "{text}"
+        );
+
+        let failed = EmbedError::ProbeWedgeCaptureFailed {
+            label: "forkstackstorm".to_owned(),
+            reason: "sudo -n lldb: No such file or directory".to_owned(),
+            artifacts: Some(std::path::PathBuf::from(
+                "target/postmortem/forkstackstorm-4242",
+            )),
+        };
+        let text = failed.to_string();
+        assert!(text.contains("forkstackstorm"), "{text}");
+        assert!(text.contains("sudo -n lldb"), "{text}");
     }
 
     #[test]
