@@ -2260,6 +2260,13 @@ impl RegistryLock {
         state
     }
 
+    #[cfg(test)]
+    pub(super) fn try_write(&self) -> Option<RwLockWriteGuard<'_, RegistryState>> {
+        let mut state = self.inner.try_write()?;
+        state.publish_epoch();
+        Some(state)
+    }
+
     fn write_unpublished(&self) -> RwLockWriteGuard<'_, RegistryState> {
         self.inner.write()
     }

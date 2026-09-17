@@ -698,6 +698,35 @@ pub fn is_default_ignore_signal(signum: i32) -> bool {
     )
 }
 
+/// True if a child exit signal needs to be delivered or queued for a parent with
+/// the given signal action and blocked status.
+///
+/// Discarded/suppressed if:
+/// - signum is 0 or invalid
+/// - handler is `SIG_IGN`
+/// - handler is `SIG_DFL` (or empty) AND not blocked AND is a default-ignore signal (like SIGCHLD)
+///
+/// Otherwise (caught handler, or non-default-ignore signal, or blocked so it queues for sigwait/unblock),
+/// notification is needed.
+pub fn child_exit_signal_needs_notification(
+    signal: LinuxSignal,
+    action: Option<LinuxSigaction>,
+    blocked: bool,
+) -> bool {
+    let signum = signal.raw();
+    if signum == 0 {
+        return false;
+    }
+    match action.map(|a| a.sa_handler) {
+        Some(handler) if handler == carrick_abi::LINUX_SIG_IGN => false,
+        Some(handler) if handler == carrick_abi::LINUX_SIG_DFL => {
+            blocked || !is_default_ignore_signal(signum)
+        }
+        Some(_) => true,
+        None => blocked || !is_default_ignore_signal(signum),
+    }
+}
+
 /// Upgrade `SEGV_MAPERR` to `SEGV_ACCERR` when Carrick's protection metadata
 /// says the faulting VA belongs to a live mapping that denies the access.
 /// Linux reports ACCERR there because the VMA exists. Carrick can otherwise
@@ -796,6 +825,13 @@ impl SignalAuthority {
 
     pub fn action(&self, signal: LinuxSignal) -> LinuxSigaction {
         self.sighand.action(signal)
+    }
+
+    /// Whether this thread authority observes a queued or delivered child-exit signal.
+    pub fn child_exit_signal_needs_notification(&self, signal: LinuxSignal) -> bool {
+        let action = self.sighand.action_entry(signal);
+        let blocked = self.blocked().contains(signal.raw());
+        child_exit_signal_needs_notification(signal, action, blocked)
     }
 
     pub fn action_generation(&self) -> u64 {

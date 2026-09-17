@@ -786,15 +786,15 @@ impl Kernel {
         // BlockedContinuation having already consumed this exit's wake edge,
         // wedging forever.
         if let Some(parent_key) = prepared.result_zombie.parent {
-            if let Some(parent_task) = self
-                .registry()
-                .state
-                .read()
-                .tasks
-                .get(&parent_key.id)
-                .filter(|record| record.task.key() == parent_key)
-                .map(|record| Arc::clone(&record.task))
-            {
+            let parent_task = {
+                let state = self.registry().state.read();
+                state
+                    .tasks
+                    .get(&parent_key.id)
+                    .filter(|record| record.task.key() == parent_key)
+                    .map(|record| Arc::clone(&record.task))
+            };
+            if let Some(parent_task) = parent_task {
                 let posted = match prepared.result_zombie.exit_signal {
                     crate::kernel::ids::ChildExitSignal::Signal(signal) => {
                         if child_exit_signal_needs_notification(&parent_task, signal) {
@@ -908,11 +908,11 @@ impl Kernel {
                 Err(KernelOperationError::TaskBusy(_)) => {
                     self.wait_for_reservation_change(observed);
                 }
-                Err(KernelOperationError::UnknownTask(id)) => {
+                Err(KernelOperationError::UnknownTask(_)) => {
                     let state = self.registry().state.read();
                     if let Some(record) = state
                         .zombies
-                        .get(&id)
+                        .get(&task.id)
                         .filter(|record| record.zombie.key == task)
                     {
                         return Ok(record.zombie.clone());
@@ -940,24 +940,16 @@ fn child_exit_signal_needs_notification(
     parent: &crate::kernel::objects::Task,
     signal: crate::kernel::ids::LinuxSignal,
 ) -> bool {
-    let signum = signal.raw();
-    if signum == 0 {
-        return false;
-    }
-    let action = parent.shared().sighand().action(signal);
-    let handler = action.sa_handler;
-    if handler == carrick_abi::LINUX_SIG_IGN {
-        return false;
-    }
-    if handler == carrick_abi::LINUX_SIG_DFL || handler == 0 {
-        let any_thread_blocks = parent
-            .threads()
-            .iter()
-            .any(|thread| thread.signal_state.lock().blocked().contains(signum));
-        return any_thread_blocks
-            || !crate::kernel::objects::signal::is_default_ignore_signal(signum);
-    }
-    true
+    let action = parent.shared().sighand().action_entry(signal);
+    let any_thread_blocks = parent
+        .threads()
+        .iter()
+        .any(|thread| thread.signal_state.lock().blocked().contains(signal.raw()));
+    crate::kernel::objects::signal::child_exit_signal_needs_notification(
+        signal,
+        action,
+        any_thread_blocks,
+    )
 }
 
 fn exit_siginfo_for_zombie(zombie: &Zombie) -> Option<carrick_abi::LinuxSiginfo> {
@@ -1688,6 +1680,10 @@ mod tests {
         assert!(!kernel.ids().is_reserved_number(grandchild_id.raw()));
     }
 
+    /// Under Linux sigaction(2), waitid(2), and signal(7), child exit produces
+    /// a SIGCHLD signal with siginfo_t containing si_code = CLD_EXITED, si_pid,
+    /// si_uid, and si_status. When SIGCHLD is blocked, it queues in the parent's
+    /// pending set retaining the siginfo payload.
     #[test]
     fn child_exit_posts_sigchld_with_siginfo_to_parent_when_blocked() {
         let (kernel, root) = bootstrap(19_600);
@@ -1731,6 +1727,9 @@ mod tests {
         assert_eq!(si_status, 42);
     }
 
+    /// Under Linux sigaction(2), waitid(2), and signal(7), child death by signal
+    /// produces SIGCHLD with si_code = CLD_KILLED and si_status set to the
+    /// terminating signal number.
     #[test]
     fn child_signaled_exit_posts_cld_killed_to_parent() {
         let (kernel, root) = bootstrap(19_610);
@@ -1934,6 +1933,80 @@ mod tests {
         assert!(
             wake_count.load(Ordering::SeqCst) > wake_count_before_2,
             "parent must be woken on SIG_IGN child exit"
+        );
+    }
+
+    #[test]
+    fn child_exit_wake_callback_does_not_hold_registry_lock() {
+        let (kernel, root) = bootstrap(19_650);
+
+        // Test 1: Suppressed exit path (SIG_DFL, unblocked SIGCHLD -> parent receives wake, no signal posted)
+        let unposted_lock_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unposted_lock_cb = Arc::clone(&unposted_lock_available);
+        let kernel_cb = Arc::clone(&kernel);
+        let current_gen = root.task().wake_generation();
+        let _sub1 = root.task().subscribe_wake(
+            current_gen,
+            Arc::new(move |_gen| {
+                // If the registry lock is not held, try_write will succeed (None if any read or write lock held).
+                if kernel_cb.registry().state.try_write().is_some() {
+                    unposted_lock_cb.store(true, Ordering::SeqCst);
+                }
+            }),
+        );
+
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let child1 = kernel
+            .fork_task(
+                &root,
+                plan,
+                ThreadId::synthetic_for_tests(19_651),
+                "child-unposted".to_string(),
+                None,
+            )
+            .expect("fork child");
+        unposted_lock_available.store(false, Ordering::SeqCst);
+        kernel
+            .exit_task_key_eventually(child1.task().key(), LinuxWaitStatus::from_wait_encoding(0))
+            .expect("exit child 1");
+        assert!(
+            unposted_lock_available.load(Ordering::SeqCst),
+            "registry state lock must not be held when waking parent on unposted child exit"
+        );
+
+        // Test 2: Posted exit path (SIGCHLD blocked -> parent receives posted SIGCHLD with siginfo, which wakes parent)
+        root.signal_authority()
+            .set_blocked(carrick_abi::SigSet::EMPTY.with(carrick_abi::LINUX_SIGCHLD));
+        let posted_lock_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let posted_lock_cb = Arc::clone(&posted_lock_available);
+        let kernel_cb2 = Arc::clone(&kernel);
+        let current_gen2 = root.task().wake_generation();
+        let _sub2 = root.task().subscribe_wake(
+            current_gen2,
+            Arc::new(move |_gen| {
+                if kernel_cb2.registry().state.try_write().is_some() {
+                    posted_lock_cb.store(true, Ordering::SeqCst);
+                }
+            }),
+        );
+
+        let plan2 = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let child2 = kernel
+            .fork_task(
+                &root,
+                plan2,
+                ThreadId::synthetic_for_tests(19_652),
+                "child-posted".to_string(),
+                None,
+            )
+            .expect("fork child 2");
+        posted_lock_available.store(false, Ordering::SeqCst);
+        kernel
+            .exit_task_key_eventually(child2.task().key(), LinuxWaitStatus::from_wait_encoding(0))
+            .expect("exit child 2");
+        assert!(
+            posted_lock_available.load(Ordering::SeqCst),
+            "registry state lock must not be held when waking parent on posted child exit"
         );
     }
 }
