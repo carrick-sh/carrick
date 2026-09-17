@@ -427,78 +427,13 @@ impl<'a> NetView<'a> {
         open_file.description.readiness(interest, self).bits()
     }
 
-    pub(super) fn host_read_avail_for_interest(&self, slot: &EpollInterest, fd: i32) -> u64 {
+    fn description_read_avail_bytes(
+        desc: &crate::kernel::FileDescription,
+        host_fd: Option<HostFd>,
+        staged_splice_bytes: u64,
+    ) -> u64 {
         let mut synthetic_bytes = 0u64;
-        if let Some(target) = &slot.target {
-            if target.fd_ref_count() == 0 {
-                return 0;
-            }
-            if let Some(open) = target.read() {
-                match &*open {
-                    OpenDescription::PipeReader { pipe, .. } => {
-                        return pipe.buffered_bytes() as u64;
-                    }
-                    OpenDescription::InMemorySocket { socket, .. } => {
-                        return socket.buffered_bytes() as u64;
-                    }
-                    OpenDescription::HostSocket { synthetic_recv, .. } => {
-                        synthetic_bytes = synthetic_recv
-                            .iter()
-                            .map(|(payload, _source)| payload.len() as u64)
-                            .sum();
-                    }
-                    _ => {}
-                }
-            }
-        } else if let Some(open_file) = self.open_file(fd) {
-            if let Some(open) = open_file.description.read() {
-                match &*open {
-                    OpenDescription::PipeReader { pipe, .. } => {
-                        return pipe.buffered_bytes() as u64;
-                    }
-                    OpenDescription::InMemorySocket { socket, .. } => {
-                        return socket.buffered_bytes() as u64;
-                    }
-                    OpenDescription::HostSocket { synthetic_recv, .. } => {
-                        synthetic_bytes = synthetic_recv
-                            .iter()
-                            .map(|(payload, _source)| payload.len() as u64)
-                            .sum();
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let host_fd = self.interest_host_fd(slot, fd);
-        let Some(host_fd) = host_fd else {
-            return synthetic_bytes;
-        };
-        let mut avail: libc::c_int = 0;
-        let rc = unsafe { libc::ioctl(host_fd.get(), libc::FIONREAD, &mut avail) };
-        let host = if rc == 0 && avail > 0 {
-            avail as u64
-        } else {
-            0
-        };
-        let staged_bytes = if let Some(target) = &slot.target {
-            self.staged_splice_description_bytes(target.id()) as u64
-        } else {
-            self.staged_splice_pipe_bytes(fd) as u64
-        };
-        host.saturating_add(staged_bytes)
-            .saturating_add(synthetic_bytes)
-    }
-
-    pub(super) fn host_read_avail_for_poll(&self, fd: i32) -> u64 {
-        // Bytes carrick queued on a socket outside the host kernel
-        // (`synthetic_recv`). Counted into the ET read-growth baseline so a
-        // gateway reply is a visible arrival, exactly as `pipe.buffered_bytes()`
-        // is for an in-memory pipe; FIONREAD on the host fd cannot see them.
-        let mut synthetic_bytes = 0u64;
-        if let Some(open_file) = self.open_file(fd) {
-            let Some(open) = open_file.description.read() else {
-                return 0;
-            };
+        if let Some(open) = desc.read() {
             match &*open {
                 OpenDescription::PipeReader { pipe, .. } => return pipe.buffered_bytes() as u64,
                 OpenDescription::InMemorySocket { socket, .. } => {
@@ -513,7 +448,7 @@ impl<'a> NetView<'a> {
                 _ => {}
             }
         }
-        let Some(host_fd) = self.host_fd_for_poll(fd) else {
+        let Some(host_fd) = host_fd else {
             return synthetic_bytes;
         };
         let mut avail: libc::c_int = 0;
@@ -523,8 +458,44 @@ impl<'a> NetView<'a> {
         } else {
             0
         };
-        host.saturating_add(self.staged_splice_pipe_bytes(fd) as u64)
+        host.saturating_add(staged_splice_bytes)
             .saturating_add(synthetic_bytes)
+    }
+
+    pub(super) fn host_read_avail_for_interest(&self, slot: &EpollInterest, fd: i32) -> u64 {
+        if let Some(target) = &slot.target {
+            if target.fd_ref_count() == 0 {
+                return 0;
+            }
+            let host_fd = Self::description_host_fd_for_poll(target);
+            let staged = self.staged_splice_description_bytes(target.id()) as u64;
+            Self::description_read_avail_bytes(target, host_fd, staged)
+        } else if let Some(open_file) = self.open_file(fd) {
+            let host_fd = Self::description_host_fd_for_poll(&open_file.description);
+            let staged = self.staged_splice_pipe_bytes(fd) as u64;
+            Self::description_read_avail_bytes(&open_file.description, host_fd, staged)
+        } else {
+            0
+        }
+    }
+
+    pub(super) fn host_read_avail_for_poll(&self, fd: i32) -> u64 {
+        if let Some(open_file) = self.open_file(fd) {
+            let host_fd = Self::description_host_fd_for_poll(&open_file.description);
+            let staged = self.staged_splice_pipe_bytes(fd) as u64;
+            return Self::description_read_avail_bytes(&open_file.description, host_fd, staged);
+        }
+        let Some(host_fd) = self.host_fd_for_poll(fd) else {
+            return 0;
+        };
+        let mut avail: libc::c_int = 0;
+        let rc = unsafe { libc::ioctl(host_fd.get(), libc::FIONREAD, &mut avail) };
+        let host = if rc == 0 && avail > 0 {
+            avail as u64
+        } else {
+            0
+        };
+        host.saturating_add(self.staged_splice_pipe_bytes(fd) as u64)
     }
 
     fn listening_socket_readiness_sample_for_interest(
@@ -1271,24 +1242,19 @@ impl<'a> NetView<'a> {
                                 host_ready_sampled.insert(gfd);
                                 let slot =
                                     interests.iter().find(|(fd, _)| *fd == gfd).map(|(_, s)| s);
-                                let listener_sample = slot
-                                    .and_then(|s| {
-                                        this.listening_socket_readiness_sample_for_interest(
-                                            s, gfd, requested,
-                                        )
-                                    })
-                                    .or_else(|| {
-                                        this.listening_socket_readiness_sample_for_poll(
-                                            gfd, requested,
-                                        )
-                                    });
+                                let listener_sample = match slot {
+                                    Some(s) => this.listening_socket_readiness_sample_for_interest(
+                                        s, gfd, requested,
+                                    ),
+                                    None => this
+                                        .listening_socket_readiness_sample_for_poll(gfd, requested),
+                                };
                                 let mut raw = listener_sample.as_ref().map_or_else(
-                                    || {
-                                        if let Some(s) = slot {
+                                    || match slot {
+                                        Some(s) => {
                                             this.epoll_ready_events_for_interest(s, gfd, requested)
-                                        } else {
-                                            this.epoll_ready_events(gfd, requested)
                                         }
+                                        None => this.epoll_ready_events(gfd, requested),
                                     },
                                     |sample| sample.ready.bits(),
                                 );
@@ -1299,10 +1265,9 @@ impl<'a> NetView<'a> {
                                     raw |= LINUX_EPOLLIN;
                                 }
                                 let read_avail = if raw & READ_READY_BITS != 0 {
-                                    if let Some(s) = slot {
-                                        this.host_read_avail_for_interest(s, gfd)
-                                    } else {
-                                        this.host_read_avail_for_poll(gfd)
+                                    match slot {
+                                        Some(s) => this.host_read_avail_for_interest(s, gfd),
+                                        None => this.host_read_avail_for_poll(gfd),
                                     }
                                 } else {
                                     0
@@ -1791,11 +1756,10 @@ impl<'a> NetView<'a> {
             // the next epoll_wait (the same shape as the events=0 fix above,
             // applied to the freshly-disarmed ONESHOT slot).
             for fd in &oneshot_fds {
-                let host_fd = interests
-                    .iter()
-                    .find(|(ifd, _)| ifd == fd)
-                    .and_then(|(_, s)| this.interest_host_fd(s, *fd))
-                    .or_else(|| this.host_fd_for_poll(*fd));
+                let host_fd = match interests.iter().find(|(ifd, _)| ifd == fd) {
+                    Some((_, s)) => this.interest_host_fd(s, *fd),
+                    None => this.host_fd_for_poll(*fd),
+                };
                 if let Some(host_fd) = host_fd {
                     kq.with_mux(|mux| {
                         let _ = mux.deregister(host_fd.get());

@@ -696,7 +696,7 @@ impl<'a> NetView<'a> {
         })
     }
 
-    /// Return the host fd backing a guest fd for ppoll's fast path.
+    /// Return the host fd backing an open file description (`&Arc<FileDescription>`) for ppoll's fast path.
     pub(super) fn description_host_fd_for_poll(
         desc: &Arc<crate::kernel::FileDescription>,
     ) -> Option<HostFd> {

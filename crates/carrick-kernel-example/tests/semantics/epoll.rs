@@ -221,45 +221,66 @@ fn closing_a_duplicated_descriptor_in_the_same_process_keeps_the_epoll_registrat
 fn reused_numeric_descriptor_does_not_trigger_or_mask_epoll_for_original_description() {
     // man 7 epoll: An epoll registration is bound to the open file description, not the numeric fd.
     // Reusing the numeric fd for a different file must not trigger or mask the original registration.
+    //
+    // File descriptor and harness slot map:
+    // - Linux fds 0, 1, 2 = standard I/O (stdin, stdout, stderr).
+    // - Pipe A: Linux fd 3 (read end, saved in harness slot 0), Linux fd 4 (write end, saved in harness slot 1).
+    // - Epoll instance: Linux fd 5 (saved in harness slot 2).
+    // - Pipe A read alias: Linux fd 6 (duplicated from Linux fd 3, saved in harness slot 3).
+    // - Linux fd 3 is closed, freeing numeric fd 3 for allocation.
+    // - Pipe B: Linux fd 3 (read end, reusing numeric fd 3, saved in harness slot 0), Linux fd 7 (write end, saved in harness slot 4).
     let script = vec![
-        // Pipe A: slot 0 (read), slot 1 (write)
+        // Pipe A: Linux fd 3 (slot 0, read), Linux fd 4 (slot 1, write)
         Step::Sys(
             sys::pipe2(0)
                 .ret(0)
                 .save_out_i32(0, 0, 0)
                 .save_out_i32(0, 1, 1),
         ),
-        // Epoll instance: slot 2
+        // Epoll instance: Linux fd 5 (slot 2)
         Step::Sys(sys::epoll_create1(0).save(2)),
-        // Register pipe A (slot 0) in epoll with data 0x1111
+        // Register Pipe A OFD (slot 0 / Linux fd 3) in epoll with data 0x1111
         Step::Sys(sys::epoll_ctl_add(slot(2), slot(0), LINUX_EPOLLIN as u32, 0x1111u64).ret(0)),
-        // Duplicate slot 0 -> slot 3 (keeps pipe A OFD alive)
+        // Duplicate slot 0 (Linux fd 3) -> slot 3 (Linux fd 6), keeping Pipe A OFD alive
         Step::Sys(sys::dup(slot(0)).save(3)),
-        // Close slot 0: numeric fd 0 is now free for allocation
+        // Close slot 0 (Linux fd 3): numeric fd 3 is now free for allocation
         Step::Sys(sys::close(slot(0)).ret(0)),
-        // Create Pipe B: allocates numeric fd 0 for read end, slot 4 for write end
+        // Create Pipe B: allocates lowest available numeric fd (Linux fd 3) for read end (slot 0), Linux fd 7 for write end (slot 4)
         Step::Sys(
             sys::pipe2(0)
                 .ret(0)
                 .save_out_i32(0, 0, 0)
                 .save_out_i32(0, 1, 4),
         ),
-        // Write to Pipe B (slot 4): numeric fd 0 is now readable for Pipe B, but epoll watched Pipe A
-        Step::Sys(sys::write(slot(4), b"pipe_B").ret(6)),
-        // epoll_pwait on slot 2 must NOT fire for Pipe B -> timeout (ret 0)
-        Step::Sys(sys::epoll_pwait(slot(2), 1, 10, 0).ret(0)),
-        // Write to Pipe A (slot 1): Pipe A becomes readable (watched description)
-        Step::Sys(sys::write(slot(1), b"pipe_A").ret(6)),
-        // epoll_pwait on slot 2 MUST fire for Pipe A (data 0x1111)
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            // Await parent parking on epoll_pwait
+            await_parked(1, "epoll_pwait"),
+            // Child writes to Pipe B (slot 4 / Linux fd 7): numeric fd 3 is readable for Pipe B,
+            // but epoll watches Pipe A's open file description so parent must remain parked.
+            Step::Sys(sys::write(slot(4), b"pipe_B").ret(6)),
+            // Child writes to Pipe A (slot 1 / Linux fd 4): Pipe A becomes readable, waking parent's epoll_pwait.
+            Step::Sys(sys::write(slot(1), b"pipe_A").ret(6)),
+            Step::Sys(sys::close(slot(0)).ret(0)),
+            Step::Sys(sys::close(slot(1)).ret(0)),
+            Step::Sys(sys::close(slot(2)).ret(0)),
+            Step::Sys(sys::close(slot(3)).ret(0)),
+            Step::Sys(sys::close(slot(4)).ret(0)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        // Parent parks on epoll_pwait: must NOT wake on Pipe B write, wakes on Pipe A write
         Step::Sys(sys::epoll_pwait(slot(2), 1, 5000, 0).ret(1)),
-        // Drain data from Pipe A via slot 3
+        Step::Sys(sys::wait4(last_child(), 0)),
+        // Drain data from Pipe A via slot 3 (Linux fd 6)
         Step::Sys(sys::read(slot(3), 6).ret(6)),
-        // Drain data from Pipe B via slot 0
+        // Drain data from Pipe B via slot 0 (Linux fd 3)
         Step::Sys(sys::read(slot(0), 6).ret(6)),
-        // Close Pipe A alias (slot 3): now Pipe A is completely closed -> auto-detached from epoll
+        // Close Pipe A alias (slot 3) and write end (slot 1): now Pipe A is completely closed -> auto-detached from epoll
         Step::Sys(sys::close(slot(3)).ret(0)),
         Step::Sys(sys::close(slot(1)).ret(0)),
-        // Clean up Pipe B
+        // epoll_pwait on slot 2 must return 0 because Pipe A registration was auto-detached upon closing last descriptor
+        Step::Sys(sys::epoll_pwait(slot(2), 1, 10, 0).ret(0)),
+        // Clean up Pipe B (slot 0 / Linux fd 3, slot 4 / Linux fd 7) and epoll (slot 2 / Linux fd 5)
         Step::Sys(sys::close(slot(0)).ret(0)),
         Step::Sys(sys::close(slot(4)).ret(0)),
         Step::Sys(sys::close(slot(2)).ret(0)),
@@ -270,6 +291,40 @@ fn reused_numeric_descriptor_does_not_trigger_or_mask_epoll_for_original_descrip
         .run_root(script)
         .expect("backend ran");
     assert_eq!(run.exit_code(), 0);
+
+    // Verify numeric fd reuse: both Pipe A and Pipe B received numeric Linux fd 3
+    let pipe_outputs = run.outputs_for("pipe2");
+    assert_eq!(pipe_outputs.len(), 2, "two pipe2 calls were issued");
+    let pipe_a_read = i32::from_le_bytes(pipe_outputs[0].bytes[0..4].try_into().unwrap());
+    let pipe_b_read = i32::from_le_bytes(pipe_outputs[1].bytes[0..4].try_into().unwrap());
+    assert_eq!(pipe_a_read, 3, "Pipe A read descriptor is Linux fd 3");
+    assert_eq!(pipe_b_read, 3, "Pipe B read descriptor reused Linux fd 3");
+    assert_eq!(
+        pipe_a_read, pipe_b_read,
+        "numeric file descriptor integers must match"
+    );
+
+    // Parent issued two epoll_pwait syscalls: the first parked and completed on kernel wake (2 dispatches),
+    // and the second timed out after auto-detachment (1 dispatch), for 3 total dispatches.
+    assert_eq!(
+        run.dispatches_for(1, "epoll_pwait"),
+        3,
+        "parked epoll_pwait (2 dispatches) plus immediate timeout epoll_pwait (1 dispatch)"
+    );
+
+    // Verify returned event data is 0x1111 (matching Pipe A registration)
+    let events_bytes = run.output_tagged("events");
+    let event_mask = u32::from_le_bytes(events_bytes[0..4].try_into().unwrap());
+    let event_data = u64::from_le_bytes(events_bytes[8..16].try_into().unwrap());
+    assert_ne!(
+        event_mask & (LINUX_EPOLLIN as u32),
+        0,
+        "EPOLLIN reported on Pipe A readability"
+    );
+    assert_eq!(
+        event_data, 0x1111,
+        "event.data must match Pipe A registration 0x1111"
+    );
 }
 
 #[test]
