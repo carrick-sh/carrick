@@ -35,11 +35,18 @@
 //! `default-members` keeps the product build to `carrick-cli`'s closure, and
 //! `just check-layering` fails if that selection enables `test-support`.
 
+pub mod memory;
+pub mod operand;
 pub mod process;
+pub mod report;
 pub mod scripted;
+pub mod sys;
 
+pub use memory::{GUEST_BASE, GUEST_LEN, TaskMemory};
+pub use operand::{Expect, Operand, Save, Step, Syscall, last_child, slot};
 pub use process::{
     AddressSpace, AddressSpaceError, AsidAllocator, ExampleInstallPermit, ExampleMmBackend,
     ExampleProcess, ExampleStage1Projection,
 };
-pub use scripted::{ExampleError, Operand, RunReport, ScriptedBackend, Step, Sys, WAIT_BOUND};
+pub use report::{Completion, Output, RunReport};
+pub use scripted::{ExampleError, ScriptedBackend, WAIT_BOUND};

@@ -7,37 +7,37 @@
 
 use std::time::Instant;
 
-use carrick_kernel_example::{ExampleError, ScriptedBackend, Step, Sys, WAIT_BOUND};
+use carrick_kernel_example::{
+    ExampleError, ScriptedBackend, Step, WAIT_BOUND, last_child, slot, sys,
+};
 
 #[test]
 fn fork_pipe_wait_through_the_public_surface() {
-    // Parent: pipe2 -> fork -> (child: write "hi", exit 7) -> read -> wait4 -> exit.
     let script = vec![
-        Step::sys(Sys::Pipe2 { flags: 0 }), // returns fds into slot 0/1
-        Step::sys(Sys::Fork),               // child continues at Step::child_marker
-        Step::child_marker(vec![
-            Step::sys(Sys::Write {
-                fd: Step::slot(1),
-                data: b"hi".to_vec(),
-            }),
-            Step::sys(Sys::ExitGroup { code: 7 }),
+        Step::Sys(
+            sys::pipe2(0)
+                .ret(0)
+                .save_out_i32(0, 0, 0)
+                .save_out_i32(0, 1, 1),
+        ),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::write(slot(1), b"hi").ret(2)),
+            Step::Sys(sys::exit_group(7)),
         ]),
-        Step::sys(Sys::Read {
-            fd: Step::slot(0),
-            len: 2,
-        }), // expect "hi"
-        Step::sys(Sys::Wait4 {
-            pid: Step::last_child(),
-            options: 0,
-        }),
-        Step::sys(Sys::ExitGroup { code: 0 }),
+        Step::Sys(sys::read(slot(0), 2).ret(2)), // man 7 pipe: read returns the bytes written
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
     ];
     let run = ScriptedBackend::new()
         .run_root(script)
         .expect("backend ran");
     assert_eq!(run.exit_code(), 0);
-    assert_eq!(run.read_results(), vec![b"hi".to_vec()]);
-    assert_eq!(run.wait_statuses(), vec![7 << 8]); // WEXITSTATUS(7)
+    assert_eq!(run.output("read"), b"hi");
+    assert_eq!(
+        run.output("wait4")[0..4],
+        7u32.wrapping_shl(8).to_le_bytes()
+    ); // man 2 wait4: WEXITSTATUS in bits 8..16
     assert_eq!(run.tasks_started(), 2);
 }
 
@@ -47,41 +47,39 @@ fn fork_pipe_wait_through_the_public_surface() {
 #[test]
 fn a_forked_task_can_fork_again() {
     let script = vec![
-        Step::sys(Sys::Pipe2 { flags: 0 }),
-        Step::sys(Sys::Fork),
-        Step::child_marker(vec![
-            Step::sys(Sys::Fork),
-            Step::child_marker(vec![
-                Step::sys(Sys::Write {
-                    fd: Step::slot(1),
-                    data: b"deep".to_vec(),
-                }),
-                Step::sys(Sys::ExitGroup { code: 5 }),
+        Step::Sys(
+            sys::pipe2(0)
+                .ret(0)
+                .save_out_i32(0, 0, 0)
+                .save_out_i32(0, 1, 1),
+        ),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::fork()),
+            Step::ChildMarker(vec![
+                Step::Sys(sys::write(slot(1), b"deep").ret(4)),
+                Step::Sys(sys::exit_group(5)),
             ]),
-            Step::sys(Sys::Wait4 {
-                pid: Step::last_child(),
-                options: 0,
-            }),
-            Step::sys(Sys::ExitGroup { code: 6 }),
+            Step::Sys(sys::wait4(last_child(), 0)),
+            Step::Sys(sys::exit_group(6)),
         ]),
-        Step::sys(Sys::Read {
-            fd: Step::slot(0),
-            len: 4,
-        }),
-        Step::sys(Sys::Wait4 {
-            pid: Step::last_child(),
-            options: 0,
-        }),
-        Step::sys(Sys::ExitGroup { code: 0 }),
+        Step::Sys(sys::read(slot(0), 4).ret(4)),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
     ];
     let run = ScriptedBackend::new()
         .run_root(script)
         .expect("backend ran");
     assert_eq!(run.exit_code(), 0);
-    assert_eq!(run.read_results(), vec![b"deep".to_vec()]);
+    assert_eq!(run.output("read"), b"deep");
     // The child's and the root's wait4 complete on different threads; only
     // the set is deterministic.
-    let mut statuses = run.wait_statuses().to_vec();
+    let mut statuses: Vec<i32> = run
+        .outputs()
+        .iter()
+        .filter(|o| o.label == "wait4")
+        .map(|o| i32::from_le_bytes(o.bytes[0..4].try_into().unwrap()))
+        .collect();
     statuses.sort_unstable();
     assert_eq!(statuses, vec![5 << 8, 6 << 8]);
     assert_eq!(run.tasks_started(), 3);
@@ -94,20 +92,19 @@ fn a_forked_task_can_fork_again() {
 #[test]
 fn a_lost_wake_fails_inside_the_bound() {
     let script = vec![
-        Step::sys(Sys::Pipe2 { flags: 0 }),
-        Step::sys(Sys::Fork),
-        Step::child_marker(vec![
-            Step::sys(Sys::Read {
-                fd: Step::slot(0),
-                len: 1,
-            }),
-            Step::sys(Sys::ExitGroup { code: 1 }),
+        Step::Sys(
+            sys::pipe2(0)
+                .ret(0)
+                .save_out_i32(0, 0, 0)
+                .save_out_i32(0, 1, 1),
+        ),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::read(slot(0), 1).ret(1)),
+            Step::Sys(sys::exit_group(1)),
         ]),
-        Step::sys(Sys::Wait4 {
-            pid: Step::last_child(),
-            options: 0,
-        }),
-        Step::sys(Sys::ExitGroup { code: 0 }),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
     ];
     let started = Instant::now();
     let error = ScriptedBackend::new()
