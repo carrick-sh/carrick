@@ -21,6 +21,7 @@ workspace = true
 # the feature would have made the template quietly depend on a test surface a
 # real backend author does not get.
 carrick-kernel = { path = "../carrick-kernel" }
+carrick-vfs = { path = "../carrick-vfs" }
 # carrick-hal's `test-support` IS required, and only for the two Null bridges
 # (`NullHostSignalBridge`, `NullGuestTimerBridge`), which are gated behind it so
 # they are not linkable from a product build. Enabled through a NORMAL
@@ -36,3 +37,7 @@ carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-abi = { path = "../carrick-abi" }
 parking_lot.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+carrick-vfs = { path = "../carrick-vfs", features = ["test-support"] }
+tempfile.workspace = true

@@ -241,6 +241,9 @@ pub struct HostFsBackend {
     /// `warm_dir_cache_bounds_path_walk_opens_per_guest_op` fails if it does
     /// not. Diagnostic only; nothing branches on it.
     path_walk_host_opens: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
+    /// Visited directory entries during fallback `name_matches_on_disk` directory scans.
+    name_validation_dir_entries: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The process generation that owns the current [`Self::dir_cache`] fds.
     /// Changed on host fork so a child drops inherited entries and adopts
     /// the cache for this process. Replaces per-call `libc::getpid()`.
@@ -1013,6 +1016,8 @@ impl HostFsBackend {
             dir_generations: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             cache_eviction_visited_keys: std::sync::atomic::AtomicU64::new(0),
             path_walk_host_opens: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            name_validation_dir_entries: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             use_stat_cache: stat_cache_enabled(),
@@ -1075,6 +1080,8 @@ impl HostFsBackend {
             dir_generations: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             cache_eviction_visited_keys: std::sync::atomic::AtomicU64::new(0),
             path_walk_host_opens: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            name_validation_dir_entries: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             use_stat_cache: stat_cache_enabled(),
@@ -1638,6 +1645,31 @@ impl HostFsBackend {
 
     pub fn reset_cache_eviction_visited_keys(&self) {
         self.cache_eviction_visited_keys
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Handle to this instance's directory entry visit counter for test assertions.
+    pub fn name_validation_dir_entries_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.name_validation_dir_entries.clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Visited directory entries during fallback `name_matches_on_disk` directory scans.
+    ///
+    /// The macOS `getattrlistat` single-leaf query avoids directory scans entirely;
+    /// this counter measures entries visited when fallbacks or enumerations are executed.
+    pub fn name_validation_dir_entries(&self) -> u64 {
+        self.name_validation_dir_entries
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Reset `name_validation_dir_entries` to zero.
+    pub fn reset_name_validation_dir_entries(&self) {
+        self.name_validation_dir_entries
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -3239,9 +3271,12 @@ impl HostFsBackend {
             return true;
         }
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
-        let Ok(entries) =
-            self.read_dir_entries(parent, |d_name, _, _| Some(d_name.to_bytes() == want))
-        else {
+        let Ok(entries) = self.read_dir_entries(parent, |d_name, _, _| {
+            #[cfg(any(test, feature = "test-support"))]
+            self.name_validation_dir_entries
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(d_name.to_bytes() == want)
+        }) else {
             return true;
         };
         entries.into_iter().any(|matched| matched)

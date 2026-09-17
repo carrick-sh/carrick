@@ -67,6 +67,22 @@ pub fn read(fd: impl Into<Operand>, len: usize) -> Syscall {
     )
 }
 
+/// `read(2)`: allocates a `TaggedOut(tag, len)` buffer at arg 1.
+pub fn read_tagged(fd: impl Into<Operand>, len: usize, tag: &'static str) -> Syscall {
+    call(
+        "read",
+        nr::READ,
+        [
+            fd.into(),
+            Operand::TaggedOut(tag, len),
+            (len as i64).into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
 /// `write(2)`: puts `data` into guest memory at arg 1.
 pub fn write(fd: impl Into<Operand>, data: &[u8]) -> Syscall {
     call(
@@ -1245,4 +1261,153 @@ pub fn futex_requeue(
     uaddr2: impl Into<Operand>,
 ) -> Syscall {
     futex_requeue_labeled("futex", uaddr, val, val2, uaddr2)
+}
+
+/// `openat(2)`: open a file relative to a directory file descriptor.
+pub fn openat(
+    dirfd: impl Into<Operand>,
+    path: impl Into<Operand>,
+    flags: i32,
+    mode: u32,
+) -> Syscall {
+    call(
+        "openat",
+        nr::OPENAT,
+        [
+            dirfd.into(),
+            path.into(),
+            (flags as i64).into(),
+            (mode as i64).into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `unlinkat(2)`: delete a name and possibly the file it refers to.
+pub fn unlinkat(dirfd: impl Into<Operand>, path: impl Into<Operand>, flags: i32) -> Syscall {
+    call(
+        "unlinkat",
+        nr::UNLINKAT,
+        [
+            dirfd.into(),
+            path.into(),
+            (flags as i64).into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `newfstatat(2)`: get file status relative to a directory file descriptor.
+pub fn newfstatat(dirfd: impl Into<Operand>, path: impl Into<Operand>, flags: i32) -> Syscall {
+    call(
+        "newfstatat",
+        nr::NEWFSTATAT,
+        [
+            dirfd.into(),
+            path.into(),
+            Operand::Out(128),
+            (flags as i64).into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `mkdirat(2)`: create a directory relative to a directory file descriptor.
+pub fn mkdirat(dirfd: impl Into<Operand>, path: impl Into<Operand>, mode: u32) -> Syscall {
+    call(
+        "mkdirat",
+        nr::MKDIRAT,
+        [
+            dirfd.into(),
+            path.into(),
+            (mode as i64).into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `symlinkat(2)`: make a new name for a file.
+pub fn symlinkat(
+    target: impl Into<Operand>,
+    newdirfd: impl Into<Operand>,
+    linkpath: impl Into<Operand>,
+) -> Syscall {
+    call(
+        "symlinkat",
+        nr::SYMLINKAT,
+        [
+            target.into(),
+            newdirfd.into(),
+            linkpath.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `readlinkat(2)`: read value of a symbolic link.
+pub fn readlinkat(dirfd: impl Into<Operand>, path: impl Into<Operand>, bufsiz: usize) -> Syscall {
+    call(
+        "readlinkat",
+        nr::READLINKAT,
+        [
+            dirfd.into(),
+            path.into(),
+            Operand::Out(bufsiz),
+            (bufsiz as i64).into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `linkat(2)`: make a new name for an existing file.
+pub fn linkat(
+    olddirfd: impl Into<Operand>,
+    oldpath: impl Into<Operand>,
+    newdirfd: impl Into<Operand>,
+    newpath: impl Into<Operand>,
+    flags: i32,
+) -> Syscall {
+    call(
+        "linkat",
+        nr::LINKAT,
+        [
+            olddirfd.into(),
+            oldpath.into(),
+            newdirfd.into(),
+            newpath.into(),
+            (flags as i64).into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `renameat2(2)`: rename a file relative to directory file descriptors.
+pub fn renameat2(
+    olddirfd: impl Into<Operand>,
+    oldpath: impl Into<Operand>,
+    newdirfd: impl Into<Operand>,
+    newpath: impl Into<Operand>,
+    flags: u32,
+) -> Syscall {
+    call(
+        "renameat2",
+        nr::RENAMEAT2,
+        [
+            olddirfd.into(),
+            oldpath.into(),
+            newdirfd.into(),
+            newpath.into(),
+            (flags as i64).into(),
+            0.into(),
+        ],
+    )
 }

@@ -108,6 +108,7 @@ pub enum ExampleError {
 /// The backend: one kernel per run, one host thread per Linux task.
 pub struct ScriptedBackend {
     bridges: CarrierBridges,
+    fs_backend: Option<Box<dyn carrick_vfs::fs_backend::FsBackend>>,
 }
 
 impl Default for ScriptedBackend {
@@ -125,7 +126,14 @@ impl ScriptedBackend {
                 host_signal: Arc::new(NullHostSignalBridge::default()),
                 timers: Arc::new(NullGuestTimerBridge::default()),
             },
+            fs_backend: None,
         }
+    }
+
+    /// Configure a custom filesystem backend (e.g. [`carrick_vfs::fs_backend::HostFsBackend`]).
+    pub fn with_fs_backend(mut self, fs: Box<dyn carrick_vfs::fs_backend::FsBackend>) -> Self {
+        self.fs_backend = Some(fs);
+        self
     }
 
     /// Boot the root task and run `script` on the calling thread; every
@@ -162,7 +170,10 @@ impl ScriptedBackend {
             process_exit_codes: Mutex::new(std::collections::HashMap::new()),
         });
         let process = Arc::new(process);
-        let dispatcher = SyscallDispatcher::with_bridges(self.bridges);
+        let mut dispatcher = SyscallDispatcher::with_bridges(self.bridges);
+        if let Some(fs) = self.fs_backend {
+            dispatcher.set_fs_backend(fs);
+        }
         dispatcher.bind_hvpatch_process(Arc::clone(&process) as Arc<dyn CarrierProcess>);
         if let Some(failure) = process.take_bind_failure() {
             return Err(failure.into());
