@@ -1394,6 +1394,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn child_exit_interest_distinguishes_sigwait_from_sigsuspend_restore_mask() {
+        let fixture = Fixture::new();
+        let shared = fixture.task.shared();
+        let authority = SignalAuthority::new(
+            shared.sighand(),
+            shared.pending_signals(),
+            Arc::clone(&fixture.task),
+            Arc::clone(&fixture.leader),
+        );
+        let signal = LinuxSignal::SIGCHLD;
+        let wanted = SigSet::EMPTY.with(signal.raw());
+        // man 2 sigsuspend: the temporary mask replaces the blocked mask.
+        // A saved persistent mask does not turn default-ignore into a signal wait.
+        authority.arm_restore_mask(Some(wanted));
+        authority.set_blocked(SigSet::EMPTY);
+        assert!(!authority.child_exit_signal_needs_notification(signal));
+        // man 2 sigwaitinfo: an explicit synchronous waiter consumes SIGCHLD.
+        authority.set_active_wait_set(Some(wanted));
+        assert!(authority.child_exit_signal_needs_notification(signal));
+        authority.set_active_wait_set(None);
+        assert!(!authority.child_exit_signal_needs_notification(signal));
+        authority.set_blocked(wanted);
+        assert!(authority.child_exit_signal_needs_notification(signal));
+    }
+
     fn siginfo(signal: LinuxSignal, payload: i32) -> LinuxSiginfo {
         let mut info: LinuxSiginfo = unsafe { std::mem::zeroed() };
         info.si_signo = signal.raw();

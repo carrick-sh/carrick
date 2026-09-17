@@ -155,6 +155,10 @@ impl ScriptedBackend {
         if let Some(failure) = process.take_bind_failure() {
             return Err(failure.into());
         }
+        // Match carrier bootstrap: canonical file operations use the run's authority.
+        dispatcher
+            .activate_file_authority(root_context.resources().files())
+            .map_err(DispatchError::FileAuthorityFatal)?;
         let root_generation =
             crate::driver::seed_initial_task_state(&root_context, process.asid_generation())?;
         let mut root = Task {

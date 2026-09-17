@@ -398,10 +398,17 @@ pub fn timerfd_settime(
 }
 
 /// `timerfd_settime` for a one-shot `ms` milliseconds expiration helper.
-pub fn timerfd_settime_ms(fd: impl Into<Operand>, flags: i32, ms: u64) -> Syscall {
+pub fn timerfd_settime_ms(
+    fd: impl Into<Operand>,
+    flags: i32,
+    ms: u64,
+    interval_ms: u64,
+) -> Syscall {
     let sec = (ms / 1000) as i64;
     let nsec = ((ms % 1000) * 1_000_000) as i64;
     let mut spec = [0u8; 32];
+    spec[..8].copy_from_slice(&((interval_ms / 1000) as i64).to_le_bytes());
+    spec[8..16].copy_from_slice(&(((interval_ms % 1000) * 1_000_000) as i64).to_le_bytes());
     spec[16..24].copy_from_slice(&sec.to_le_bytes());
     spec[24..32].copy_from_slice(&nsec.to_le_bytes());
     timerfd_settime(fd, flags, &spec[..], 0)

@@ -472,8 +472,13 @@ fn nanosleep_completes_after_its_interval_with_zero_remaining() {
         .run_root(script)
         .expect("backend ran");
     assert_eq!(run.exit_code(), 0);
+    assert_eq!(
+        run.dispatches_for(1, "nanosleep"),
+        1,
+        "sleep completion must not restart the interval"
+    );
     assert!(
-        start.elapsed() >= std::time::Duration::from_millis(9),
+        start.elapsed() >= std::time::Duration::from_millis(10),
         "nanosleep should sleep for at least requested duration"
     );
 }
@@ -489,8 +494,13 @@ fn clock_nanosleep_completes_after_its_interval() {
         .run_root(script)
         .expect("backend ran");
     assert_eq!(run.exit_code(), 0);
+    assert_eq!(
+        run.dispatches_for(1, "clock_nanosleep"),
+        1,
+        "sleep completion must not restart the interval"
+    );
     assert!(
-        start.elapsed() >= std::time::Duration::from_millis(9),
+        start.elapsed() >= std::time::Duration::from_millis(10),
         "clock_nanosleep should sleep for at least requested duration"
     );
 }
@@ -503,7 +513,7 @@ fn a_timerfd_read_parks_until_the_timer_fires() {
                 .ret(3)
                 .save(0),
         ),
-        Step::Sys(sys::timerfd_settime_ms(slot(0), 0, 10).ret(0)),
+        Step::Sys(sys::timerfd_settime_ms(slot(0), 0, 100, 0).ret(0)),
         Step::Sys(sys::read(slot(0), 8).ret(8)), // man 2 timerfd_create: read returns an 8-byte unsigned integer
         Step::Sys(sys::close(slot(0)).ret(0)),
         Step::Sys(sys::exit_group(0)),
@@ -515,7 +525,12 @@ fn a_timerfd_read_parks_until_the_timer_fires() {
     let count_bytes = run.output("read");
     assert_eq!(count_bytes.len(), 8);
     let expirations = u64::from_le_bytes(count_bytes[0..8].try_into().unwrap());
-    assert!(expirations >= 1, "at least one expiration occurred");
+    assert_eq!(expirations, 1, "man 2 timerfd_create: one-shot expiration");
+    assert_eq!(
+        run.dispatches_for(1, "read"),
+        1,
+        "owned TimerFdRead completion must not redispatch"
+    );
 }
 
 #[test]
@@ -527,14 +542,13 @@ fn child_write_to_broken_pipe_terminates_with_sigpipe() {
                 .save_out_i32(0, 0, 0)
                 .save_out_i32(0, 1, 1),
         ),
+        // Remove every reader before fork, so scheduling cannot hide SIGPIPE.
+        Step::Sys(sys::close(slot(0)).ret(0)),
         Step::Sys(sys::fork()),
         Step::ChildMarker(vec![
-            // Child closes its inherited read end, then writes to write end after parent closed reader
-            Step::Sys(sys::close(slot(0)).ret(0)),
+            // man 7 pipe: a write with no readers generates SIGPIPE.
             Step::Sys(sys::write(slot(1), b"hello").death(carrick_abi::LINUX_SIGPIPE)),
         ]),
-        // Parent closes both ends immediately so child's write is against a broken pipe
-        Step::Sys(sys::close(slot(0)).ret(0)),
         Step::Sys(sys::close(slot(1)).ret(0)),
         Step::Sys(sys::wait4(last_child(), 0)),
         Step::Sys(sys::exit_group(0)),
@@ -558,7 +572,10 @@ fn sigprocmask_blocked_sigchld_received_by_sigtimedwait_with_pid_and_status() {
         // Block SIGCHLD on parent
         Step::Sys(sys::rt_sigprocmask_block(sigchld_mask).ret(0)),
         Step::Sys(sys::fork()),
-        Step::ChildMarker(vec![Step::Sys(sys::exit_group(42))]),
+        Step::ChildMarker(vec![
+            await_parked(1, "rt_sigtimedwait"),
+            Step::Sys(sys::exit_group(42)),
+        ]),
         // Parent waits synchronously for SIGCHLD via rt_sigtimedwait
         Step::Sys(
             sys::rt_sigtimedwait_siginfo(sigchld_mask).ret(carrick_abi::LINUX_SIGCHLD as i64),
