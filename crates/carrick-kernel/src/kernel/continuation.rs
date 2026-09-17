@@ -1719,6 +1719,10 @@ impl BlockedContinuation {
 
     pub fn install_temporary_signal_mask(&self, context: &KernelContext) {
         let masks = self.state().signal_masks;
+        let authority = context.signal_authority();
+        if let ContinuationDetail::Signals { wait_set, .. } = &self.state().detail {
+            authority.set_active_wait_set(Some(*wait_set));
+        }
         let Some(temporary) = masks.temporary else {
             return;
         };
@@ -1726,7 +1730,6 @@ impl BlockedContinuation {
             WaitSigMask::Additive(extra) => masks.persistent.union(extra),
             WaitSigMask::Replace(replacement) => replacement,
         };
-        let authority = context.signal_authority();
         authority.arm_restore_mask(Some(masks.restore_after_signal.unwrap_or(masks.persistent)));
         authority.set_blocked(effective);
     }
@@ -1846,8 +1849,9 @@ impl BlockedContinuation {
         };
         if !exact_file_slots_live {
             let masks = self.state().signal_masks;
+            let authority = context.signal_authority();
+            authority.set_active_wait_set(None);
             if masks.temporary.is_some() {
-                let authority = context.signal_authority();
                 authority.set_blocked(masks.persistent);
                 authority.arm_restore_mask(masks.restore_after_signal);
             }
@@ -2102,6 +2106,7 @@ impl BlockedContinuation {
                 } else {
                     ContinuationCompletion::Errno(LINUX_EINTR)
                 };
+                signal_authority.set_active_wait_set(None);
                 if signal_masks.temporary.is_some() {
                     if let Some(reserved) = reserved_signal.as_ref() {
                         signal_authority.set_blocked(reserved.effective_mask());
@@ -2125,8 +2130,9 @@ impl BlockedContinuation {
                 });
             }
         };
+        let authority = context.signal_authority();
+        authority.set_active_wait_set(None);
         if signal_masks.temporary.is_some() {
-            let authority = context.signal_authority();
             authority.set_blocked(signal_masks.persistent);
             authority.arm_restore_mask(signal_masks.restore_after_signal);
         }
@@ -2276,8 +2282,31 @@ pub enum BlockingWriteOutcome {
 
 /// Check whether a canonical Linux syscall number is restartable upon signal interruption or readiness wake.
 ///
-/// Slow devices (pipes, terminals, sockets without timeouts), flock, fcntl F_SETLKW,
-/// mq_timedsend/mq_timedreceive, getrandom, and child waits (waitid/wait4) restart when SA_RESTART is set.
+/// Under Linux, a blocking syscall interrupted by a signal handler that specified
+/// `SA_RESTART` in its `sigaction` flags is automatically restarted rather than
+/// returning `-EINTR` (`signal(7)` "Interruption of system calls and library
+/// functions by signal handlers").
+///
+/// The decision to restart belongs to the syscall boundary: a syscall that
+/// blocks inside Carrick returns `-EINTR` to EL0 only when it is NOT
+/// restartable OR the signal handler that ran did not set `SA_RESTART`.
+/// System calls on "slow" devices (pipes, terminals, sockets without timeouts),
+/// file locking (flock, fcntl F_SETLKW), POSIX message queues, getrandom,
+/// and child waits (waitid, wait4) are restarted when `SA_RESTART` is set.
+///
+/// The `signal(7)` "never restarted" list is deliberately EXCLUDED, so those
+/// keep surfacing `EINTR` as Linux does: `poll`/`ppoll`, `select`/`pselect6`,
+/// `epoll_wait`/`epoll_pwait`, `nanosleep`/`clock_nanosleep`, `io_getevents`,
+/// `msgrcv`/`msgsnd`, `semop`/`semtimedop`, and the `sigsuspend`/
+/// `rt_sigtimedwait` family.
+///
+/// Socket calls (`accept`, `connect`, the `recv`/`send` families) are also
+/// absent, and that is a KNOWN REMAINING GAP rather than a judgement that they
+/// do not restart — they do, but only when the socket carries no
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO`. This decision point sees only the syscall
+/// NUMBER, not the fd, so honouring that exclusion needs the timeout plumbed
+/// through first; restarting unconditionally would re-block a timeout socket
+/// that Linux would have failed with `EINTR`.
 pub fn is_restartable_syscall(nr: u64) -> bool {
     matches!(
         nr,

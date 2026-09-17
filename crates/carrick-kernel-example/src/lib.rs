@@ -16,9 +16,9 @@
 //!   `MmBackend`, [`ExampleStage1Projection`] as `Stage1MmProjection`).
 //!
 //! What it deliberately does not do: run real guest code, fork host
-//! processes, or emulate a CPU. A wait is a bounded re-dispatch after a
-//! `yield_now` ([`WAIT_BOUND`]), not a parked continuation, and a child's
-//! exit posts no `SIGCHLD` -- a scripted task has no signal delivery.
+//! processes, or emulate a CPU. Waits are parked as kernel continuations on
+//! the shared wait service, bounded by [`WAIT_BOUND`] so a lost wake is a
+//! failed run, not a hang.
 //!
 //! It is built from `pub` items of `carrick-kernel`, `carrick-hal`,
 //! `carrick-guest-mem` and `carrick-abi` alone. It takes `carrick-kernel` with
@@ -44,9 +44,7 @@ pub mod scripted;
 pub mod sys;
 
 pub use memory::{GUEST_BASE, GUEST_LEN, TaskMemory};
-pub use operand::{
-    Expect, Operand, Save, Step, Syscall, await_parked, host_sleep_ms, in_out, last_child, slot,
-};
+pub use operand::{Expect, Operand, Save, Step, Syscall, await_parked, in_out, last_child, slot};
 pub use process::{
     AddressSpace, AddressSpaceError, AsidAllocator, ExampleInstallPermit, ExampleMmBackend,
     ExampleProcess, ExampleStage1Projection,

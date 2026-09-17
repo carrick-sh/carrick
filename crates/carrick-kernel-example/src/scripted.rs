@@ -8,11 +8,10 @@
 //! What the loop then does with every `DispatchOutcome` it meets is the
 //! backend contract, and each arm below names the carrier arm it mirrors.
 //!
-//! Waits never park the thread inside the kernel: a `WaitOnHvpatchChild` or
-//! `WaitOnFds` outcome is re-dispatched after a `yield_now`, bounded by
-//! [`WAIT_BOUND`] so a lost wake is a failed run, not a hang.
+//! Waits are parked as kernel continuations on the shared wait service, bounded
+//! by [`WAIT_BOUND`] so a lost wake is a failed run, not a hang.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
@@ -28,7 +27,7 @@ use carrick_kernel::kernel::continuation::CarrierWaitService;
 use carrick_kernel::kernel::objects::ExecutionGeneration;
 use carrick_kernel::kernel::{
     CarrierProcess, ChildExitSignal, CloneObjectMode, ClonePlan, ClonePlanError, KernelError,
-    KernelOperationError, KernelTaskBinding, LinuxWaitStatus, Scheduler, SnapshotError, TaskKey,
+    KernelOperationError, LinuxWaitStatus, Scheduler, SnapshotError,
 };
 use carrick_kernel::thread::ThreadId;
 use parking_lot::{Condvar, Mutex};
@@ -149,12 +148,7 @@ impl ScriptedBackend {
             parked_notifications: Mutex::new(HashSet::new()),
             parked_condvar: Condvar::new(),
             wait_service,
-            process_bindings: Mutex::new(HashMap::new()),
         });
-        shared
-            .process_bindings
-            .lock()
-            .insert(process.task_key(), process.task_binding());
         let process = Arc::new(process);
         let dispatcher = SyscallDispatcher::with_bridges(self.bridges);
         dispatcher.bind_hvpatch_process(Arc::clone(&process) as Arc<dyn CarrierProcess>);
@@ -227,7 +221,6 @@ pub(crate) struct Shared {
     pub(crate) parked_notifications: Mutex<HashSet<(i32, &'static str)>>,
     pub(crate) parked_condvar: Condvar,
     pub(crate) wait_service: CarrierWaitService,
-    pub(crate) process_bindings: Mutex<HashMap<TaskKey, KernelTaskBinding>>,
 }
 
 impl Shared {
@@ -304,11 +297,25 @@ impl Task {
                         "child_marker without a preceding fork".to_owned(),
                     ));
                 }
-                Step::HostSleepMs(ms) => {
-                    thread::sleep(Duration::from_millis(*ms));
-                }
                 Step::AwaitParked { pid, label } => {
-                    shared.await_parked(*pid, label, WAIT_BOUND)?;
+                    let resolved_pid = match pid {
+                        Operand::Lit(v) => *v as i32,
+                        Operand::Slot(s) => self
+                            .slots
+                            .get(*s)
+                            .copied()
+                            .map(|v| v as i32)
+                            .ok_or_else(|| ExampleError::Script(format!("slot {s} is unset")))?,
+                        Operand::LastChild => self.last_child.ok_or_else(|| {
+                            ExampleError::Script("no child has been forked".to_owned())
+                        })?,
+                        other => {
+                            return Err(ExampleError::Script(format!(
+                                "await_parked does not support operand {other:?}"
+                            )));
+                        }
+                    };
+                    shared.await_parked(resolved_pid, label, WAIT_BOUND)?;
                 }
                 Step::Sys(syscall) => {
                     let (args, outs) = self.resolve(syscall)?;
@@ -353,7 +360,7 @@ impl Task {
                                     actual: format!("exit code {code}"),
                                 }),
                             };
-                            self.on_exit(code, shared)?;
+                            self.on_exit(code)?;
                             expectation_check?;
                             return Ok(code);
                         }
@@ -382,7 +389,7 @@ impl Task {
                                     actual: format!("death by signal {sig}"),
                                 }),
                             };
-                            self.on_exit(sig, shared)?;
+                            self.on_death(sig)?;
                             expectation_check?;
                             return Ok(sig);
                         }
@@ -657,10 +664,6 @@ impl Task {
             &child_context,
             child_process.asid_generation(),
         )?;
-        shared
-            .process_bindings
-            .lock()
-            .insert(child_process.task_key(), child_process.task_binding());
         let child = Task {
             dispatcher: child_dispatcher,
             process: child_process,
@@ -688,25 +691,27 @@ impl Task {
     /// task is still registered), then the zombie is published with the
     /// `wait(2)` encoding of a normal exit, `(code & 0xff) << 8` -- the same
     /// form `RunResult::wait_status_encoding` produces for the carrier.
-    /// `SIGCHLD` is not posted to the parent: a scripted task has no signal
-    /// delivery, and the parent's `wait4` observes the zombie directly.
-    fn on_exit(&mut self, code: i32, shared: &Arc<Shared>) -> Result<(), ExampleError> {
+    /// Child exit publishes the exit signal with `LinuxSiginfo` payload and
+    /// wakes the parent via kernel exit operations.
+    fn on_exit(&mut self, code: i32) -> Result<(), ExampleError> {
         let context = self.dispatcher.capture_one_task_context()?;
         self.dispatcher.retire_hvpatch_process_fds(&context);
         let status = LinuxWaitStatus::from_wait_encoding((code & 0xff) << 8);
-        context.kernel().exit_task_key_eventually_notifying(
-            context.task().key(),
-            status,
-            None,
-            |parent| {
-                if let Some(parent_key) = parent
-                    && let Some(binding) = shared.process_bindings.lock().get(&parent_key)
-                    && let Ok(snapshot) = binding.capture_signal_snapshot()
-                {
-                    let _ = snapshot.context().task().publish_wake_subscriptions();
-                }
-            },
-        )?;
+        context
+            .kernel()
+            .exit_task_key_eventually(context.task().key(), status)?;
+        Ok(())
+    }
+
+    /// The `Death` arm: publish the zombie with signal death wait status `signum & 0x7f`.
+    fn on_death(&mut self, sig: i32) -> Result<(), ExampleError> {
+        let context = self.dispatcher.capture_one_task_context()?;
+        self.dispatcher.retire_hvpatch_process_fds(&context);
+        // man 2 wait4: WTERMSIG is encoded as (sig & 0x7f).
+        let status = LinuxWaitStatus::from_wait_encoding(sig & 0x7f);
+        context
+            .kernel()
+            .exit_task_key_eventually(context.task().key(), status)?;
         Ok(())
     }
 }

@@ -595,38 +595,28 @@ where
         return Ok(Some(PendingSignalAction::ignored()));
     }
     carrick_kernel::exec_helpers::stop_for_debug_signal(pending);
-    let (action, is_ignored) = if let Some(reserved) = reserved {
-        let action = reserved.action();
-        if action.sa_handler == carrick_abi::LINUX_SIG_IGN {
-            (None, true)
-        } else if action.sa_handler == carrick_abi::LINUX_SIG_DFL {
-            (None, false)
-        } else {
-            (Some(action), false)
-        }
+    let raw_action = if let Some(reserved) = reserved {
+        reserved.action()
     } else if let Some(action) = dispatcher.take_pending_signal_action(context, tid, pending) {
-        if action.sa_handler == carrick_abi::LINUX_SIG_IGN {
-            (None, true)
-        } else if action.sa_handler == carrick_abi::LINUX_SIG_DFL {
-            (None, false)
-        } else {
-            (Some(action), false)
-        }
+        action
     } else {
-        let action = dispatcher.signal_action(context, pending);
-        if action.sa_handler == carrick_abi::LINUX_SIG_IGN {
-            (None, true)
-        } else if action.sa_handler == carrick_abi::LINUX_SIG_DFL {
-            (None, false)
-        } else {
-            (Some(action), false)
-        }
+        dispatcher.signal_action(context, pending)
     };
-    if is_ignored {
-        return Ok(Some(PendingSignalAction::ignored()));
-    }
-    match action {
-        Some(action) => {
+    let delivery_action =
+        carrick_kernel::kernel::evaluate_signal_delivery_action(pending, raw_action);
+    match delivery_action {
+        carrick_kernel::kernel::SignalDeliveryAction::Ignore => {
+            Ok(Some(PendingSignalAction::ignored()))
+        }
+        carrick_kernel::kernel::SignalDeliveryAction::Stop => Ok(Some(PendingSignalAction::stop(
+            pending,
+            job_control_generation,
+        ))),
+        carrick_kernel::kernel::SignalDeliveryAction::Terminate => {
+            Ok(Some(PendingSignalAction::terminate(pending)))
+        }
+        carrick_kernel::kernel::SignalDeliveryAction::Handler { .. } => {
+            let action = raw_action;
             // A handler is about to run in the guest: real progress, resets the
             // trap watchdog (a busy-wait-for-signal loop is not a hang).
             note_signal_progress();
@@ -775,21 +765,6 @@ where
                 Err(e) => Err(e.into()),
             }
         }
-        // No registered handler → the kernel takes the signal's DEFAULT action.
-        // SIGCONT's state transition happens at generation time so a stopped
-        // HVPatch task can wake before any vCPU is available to consume this
-        // queue entry. Delivery itself has no terminate/stop action.
-        None if pending == crate::linux_abi::LINUX_SIGCONT => {
-            Ok(Some(PendingSignalAction::ignored()))
-        }
-        None if carrick_kernel::kernel::objects::signal::is_default_ignore_signal(pending) => {
-            Ok(Some(PendingSignalAction::ignored()))
-        }
-        None if is_default_stop_signal(pending) => Ok(Some(PendingSignalAction::stop(
-            pending,
-            job_control_generation,
-        ))),
-        None => Ok(Some(PendingSignalAction::terminate(pending))),
     }
 }
 

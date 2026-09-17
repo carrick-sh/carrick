@@ -1588,6 +1588,7 @@ impl Thread {
                 continuation: None,
             };
         }
+        self.signal_state.lock().set_active_wait_set(None);
         drop(execution);
         self.revision.publish();
         Some(receipt)

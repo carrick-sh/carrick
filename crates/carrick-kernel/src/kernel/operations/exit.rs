@@ -941,10 +941,13 @@ fn child_exit_signal_needs_notification(
     signal: crate::kernel::ids::LinuxSignal,
 ) -> bool {
     let action = parent.shared().sighand().action_entry(signal);
-    let any_thread_blocks = parent
-        .threads()
-        .iter()
-        .any(|thread| thread.signal_state.lock().blocked().contains(signal.raw()));
+    let any_thread_blocks = parent.threads().iter().any(|thread| {
+        let state = thread.signal_state.lock();
+        state.blocked().contains(signal.raw())
+            || state
+                .active_wait_set()
+                .is_some_and(|set| set.contains(signal.raw()))
+    });
     crate::kernel::objects::signal::child_exit_signal_needs_notification(
         signal,
         action,
