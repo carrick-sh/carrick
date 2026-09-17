@@ -1411,3 +1411,24 @@ pub fn renameat2(
         ],
     )
 }
+
+/// `prlimit64(2)`: get and/or set resource limits of a process.
+pub fn prlimit64(
+    pid: impl Into<Operand>,
+    resource: impl Into<Operand>,
+    new_limit: impl Into<Operand>,
+    old_limit: impl Into<Operand>,
+) -> Syscall {
+    call(
+        "prlimit64",
+        nr::PRLIMIT64,
+        [
+            pid.into(),
+            resource.into(),
+            new_limit.into(),
+            old_limit.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
