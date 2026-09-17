@@ -690,7 +690,7 @@ mod mount_api;
 mod mqueue;
 pub use mqueue::BlockingMqueue;
 pub use mqueue::BlockingMqueueStep;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) use mqueue::blocking_mqueue_for_continuation_test;
 pub(crate) use mqueue::{MqueueChangeEnrollment, MqueueChangeSubscription};
 mod syslog;
@@ -701,7 +701,7 @@ pub mod sysv;
 pub use sysv::BlockingSemop;
 pub use sysv::BlockingSemopStep;
 pub use sysv::SysvWaitState;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) use sysv::blocking_semop_for_continuation_test;
 pub(crate) use sysv::{SemopChangeEnrollment, SemopChangeSubscription};
 #[macro_use]

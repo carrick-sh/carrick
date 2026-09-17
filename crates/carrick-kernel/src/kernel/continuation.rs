@@ -2370,4 +2370,6 @@ pub async fn yield_runner_quantum() {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub mod tests;
+pub mod test_support;
+#[cfg(test)]
+mod tests;

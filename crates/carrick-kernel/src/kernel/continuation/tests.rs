@@ -1,12 +1,5 @@
 //! Unit and integration test suite for the kernel continuation model.
 
-// Compiled without `cfg(test)` when a sibling crate builds this through
-// `test-support`, so neither the test-harness import pruning nor clippy's
-// `allow-{unwrap,expect,panic}-in-tests` applies. This is test code either
-// way; state the same allowances explicitly.
-#![allow(dead_code, unused_imports)]
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
-
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
@@ -17,8 +10,8 @@ use std::time::{Duration, Instant};
 use carrick_abi::{LinuxCloneFlags, SigBlockMask, SigSet, WaitSigMask};
 use carrick_guest_mem::{GuestMemory, GuestVa, HostVa, SharedFutexLocation};
 use carrick_hal::ThreadId;
-use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 
+use super::test_support::*;
 use super::*;
 use crate::dispatch::SharedFutexTarget;
 
@@ -30,34 +23,6 @@ fn spawn_contained_test_child(test_name: &str, marker: &str) -> std::process::Ch
         .stdin(std::process::Stdio::null())
         .spawn()
         .expect("spawn contained test child")
-}
-
-/// Drive one future to completion on the calling test thread.
-///
-/// This used to submit the future to the transitional runner pool, which is
-/// retired. A test awaiting a single future needs no executor at all: park
-/// the thread and let the waker unpark it. Parking here is a test-only host
-/// wait and is outside the production source the host-blocking-authority
-/// gate inspects.
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    struct ThreadWaker(std::thread::Thread);
-    impl Wake for ThreadWaker {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-    let mut future = std::pin::pin!(future);
-    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
-    let mut cx = Context::from_waker(&waker);
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
-            return value;
-        }
-        std::thread::park();
-    }
 }
 
 fn block_on_timeout<F: std::future::Future>(future: F, timeout: Duration) -> Option<F::Output> {
@@ -85,14 +50,6 @@ fn block_on_timeout<F: std::future::Future>(future: F, timeout: Duration) -> Opt
         let remaining = timeout.saturating_sub(elapsed);
         std::thread::park_timeout(remaining);
     }
-}
-
-pub fn await_event(
-    service: &CarrierWaitService,
-    token: ContinuationWakeToken,
-) -> Result<ContinuationEvent, WaitServiceError> {
-    let service = service.clone();
-    block_on(async move { service.event(token).await })
 }
 
 fn await_event_timeout(
@@ -495,96 +452,9 @@ fn enrollment_samples_signal_pending_before_continuation_capture() {
 
 use crate::compat::SyscallArgs;
 use crate::dispatch::{BlockingWrite, DispatchOutcome, SyscallRequest, WaitFds};
-use crate::kernel::objects::{
-    BlockedReason, ExecutionGeneration, MigratableTaskState, ThreadExecutionState,
-};
-use crate::kernel::{ClonePlan, Kernel, KernelContext, RootBootstrap, Scheduler};
+use crate::kernel::objects::{BlockedReason, ExecutionGeneration, ThreadExecutionState};
+use crate::kernel::{ClonePlan, KernelContext, Scheduler};
 use crate::thread::FutexTable;
-
-pub fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
-    let input = RootBootstrap::for_reference_model(
-        pid,
-        ThreadId::synthetic_for_tests(pid),
-        "continuation test".to_owned(),
-    )
-    .expect("bootstrap input");
-    Kernel::bootstrap_root(input).expect("kernel")
-}
-
-pub(crate) fn task_state(context: &KernelContext, marker: u64) -> MigratableTaskState {
-    task_state_with_asid(context, marker, context.shared().mm().id().raw())
-}
-
-pub(crate) fn task_state_with_asid(
-    context: &KernelContext,
-    marker: u64,
-    asid_generation: u64,
-) -> MigratableTaskState {
-    let mm = context.shared().mm().id();
-    MigratableTaskState {
-        cpu: GuestCpuState::from_aarch64_v1(Aarch64TaskCpuStateV1 {
-            gprs: std::array::from_fn(|index| marker + index as u64),
-            pc: marker + 0x1000,
-            pstate: marker + 0x2000,
-            trap_pc: marker + 0x2100,
-            trap_pstate: marker + 0x2200,
-            sp_el0: marker + 0x3000,
-            elr_el1: marker + 0x3100,
-            spsr_el1: marker + 0x3200,
-            ttbr0: marker + 0x4000,
-            ttbr1: marker + 0x5000,
-            tcr: marker + 0x6000,
-            sctlr_el1: marker + 0x6100,
-            mair_el1: marker + 0x6200,
-            vbar_el1: marker + 0x6300,
-            cpacr_el1: marker + 0x6400,
-            cntkctl_el1: marker + 0x6500,
-            tpidr_el1: marker + 0x6600,
-            actlr_el1: marker + 0x7000,
-            tpidr_el0: marker + 0x8000,
-            tpidrro_el0: marker + 0x9000,
-            contextidr_el1: marker + 0xa000,
-            vregs: std::array::from_fn(|index| marker as u128 + index as u128),
-            fpsr: marker as u32,
-            fpcr: marker as u32 + 1,
-            pending_resume_pc: Some(marker + 0xb000),
-            last_syscall_nr: Some(marker),
-            last_syscall_orig_x0: marker + 2,
-            last_fault_esr: marker + 3,
-            last_exit_class: marker,
-            is_forked_child: false,
-            syscall_continuation: None,
-            mm_generation: mm.raw(),
-            asid_generation,
-        }),
-        mm,
-        asid_generation,
-    }
-}
-
-pub fn publish(context: &KernelContext, marker: u64) -> ExecutionGeneration {
-    context
-        .thread()
-        .publish_initial_task_state(task_state(context, marker))
-        .expect("publish task state")
-}
-
-pub(crate) fn request(number: u64) -> SyscallRequest {
-    SyscallRequest::new(
-        number,
-        SyscallArgs([0x1100, 0x2200, 0x3300, 0x4400, 0x5500, 0x6600]),
-    )
-}
-
-pub fn capture(context: &KernelContext, generation: ExecutionGeneration) -> ContinuationCapture {
-    ContinuationCapture::new(
-        context,
-        generation,
-        request(73),
-        RestartClass::RestartSyscall,
-    )
-    .expect("capture exact continuation authority")
-}
 
 fn pipe_pair() -> [RawFd; 2] {
     let mut fds = [-1; 2];
@@ -741,26 +611,6 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
         }
     }
 }
-
-pub const DISPATCH_FAMILIES: [ContinuationFamily; 17] = [
-    ContinuationFamily::FutexWait,
-    ContinuationFamily::FutexWaitv,
-    ContinuationFamily::SharedFutexWait,
-    ContinuationFamily::SharedFutexWaitv,
-    ContinuationFamily::WaitOnSharedWord,
-    ContinuationFamily::WaitOnFds,
-    ContinuationFamily::WaitOnFdsSelect,
-    ContinuationFamily::WaitOnPollFds,
-    ContinuationFamily::BlockingWrite,
-    ContinuationFamily::TimerFdRead,
-    ContinuationFamily::Semop,
-    ContinuationFamily::Mqueue,
-    ContinuationFamily::FdWait,
-    ContinuationFamily::BlockingRecordLock,
-    ContinuationFamily::WaitOnHvpatchChild,
-    ContinuationFamily::WaitOnSignals,
-    ContinuationFamily::WaitOnSleep,
-];
 
 #[test]
 fn continuation_family_event_codes_are_stable_unique_and_nonzero() {
@@ -5941,7 +5791,6 @@ fn controller_nested_epoll_5_levels_deep_real_service_wake() {
 /// built lists joined by one `logical_interest` scalar, because a registration
 /// built from a slot alone carries no per-fd interest and the post-enrollment
 /// probe is skipped.
-#[cfg(test)]
 mod wait_enrollment_gap {
     use std::sync::Arc;
 

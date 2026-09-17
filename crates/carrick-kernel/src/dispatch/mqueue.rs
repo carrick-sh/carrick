@@ -1537,7 +1537,7 @@ impl BlockingMqueue {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub fn blocking_mqueue_for_continuation_test(tid: crate::thread::ThreadId) -> BlockingMqueue {
     BlockingMqueue {
         queue: Arc::new(MqueueInner::new(1, 8, 0)),

@@ -54,7 +54,7 @@ pub use crash_capture::{
 };
 pub use mm_access::MmAccessAuthority;
 #[cfg(test)]
-pub(crate) use mm_access::tests::consumer_cow_fixture;
+pub(crate) use mm_access::test_support::consumer_cow_fixture;
 pub use mm_access::{
     CowBroken, CurrentMm, ForeignMm, ForeignWriteReceipt, MmAccessError, MmReadRange, MmRelation,
     MmToken, MmWriteRange,
