@@ -62,6 +62,7 @@ enum Step {
     PanicRun,
     LoseLease,
     Invalid,
+    ExecPredecessorExitWithoutSuccessor,
 }
 
 #[derive(Debug)]
@@ -75,6 +76,7 @@ struct DescendantPublication {
 #[derive(Debug)]
 struct FakeBinding {
     marker: u64,
+    thread: parking_lot::Mutex<Option<Arc<carrick_kernel::kernel::Thread>>>,
     steps: parking_lot::Mutex<VecDeque<Step>>,
     load_fails: AtomicBool,
     save_fails: AtomicBool,
@@ -139,6 +141,7 @@ impl FakeBinding {
     fn new(marker: u64, steps: impl IntoIterator<Item = Step>) -> Arc<Self> {
         Arc::new(Self {
             marker,
+            thread: parking_lot::Mutex::new(None),
             steps: parking_lot::Mutex::new(steps.into_iter().collect()),
             load_fails: AtomicBool::new(false),
             save_fails: AtomicBool::new(false),
@@ -371,6 +374,7 @@ impl FakeFactory {
             mm,
             asid_generation: mm.raw(),
         });
+        *binding.thread.lock() = Some(Arc::clone(context.thread()));
         self.bindings.lock().insert(context.thread().key(), binding);
     }
 
@@ -959,6 +963,20 @@ impl PersistentExecutor for FakeExecutor {
                 Ok(ExecutorExit::InvalidState)
             }
             Step::Invalid => Ok(ExecutorExit::InvalidState),
+            Step::ExecPredecessorExitWithoutSuccessor => {
+                let lease = submission
+                    .execution_lease_slot_mut()
+                    .take()
+                    .expect("worker injected exact lease");
+                let thread = binding
+                    .thread
+                    .lock()
+                    .as_ref()
+                    .cloned()
+                    .expect("thread attached to fake binding");
+                thread.exit_from_executor(lease).expect("exit predecessor");
+                Ok(ExecutorExit::Exited)
+            }
         }
     }
 
@@ -6397,4 +6415,36 @@ fn test_lazy_vcpu_flush_request_in_check_wait_window_not_lost() {
 
     reg.clear_flush_request();
     scheduler.unregister_executor(&reg).unwrap();
+}
+
+#[test]
+fn test_exec_failure_past_no_return_settles_cleanly_in_executor_pool() {
+    let (kernel, context) = bootstrap(16_001);
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(301, [Step::ExecPredecessorExitWithoutSuccessor]);
+    factory.install(&context, Arc::clone(&binding));
+    let generation = publish(&context, 301);
+
+    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 2);
+    let authority = enqueue_root(&scheduler, &context, generation);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while binding.progress.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(binding.progress.load(Ordering::SeqCst), 1);
+
+    // Give time for settlement
+    thread::sleep(Duration::from_millis(50));
+
+    // The thread must be in Exited state in the kernel
+    assert!(matches!(
+        context.thread().execution_state(),
+        ThreadExecutionState::Exited { .. }
+    ));
+
+    drop(authority);
+    pool.shutdown()
+        .expect("clean pool shutdown with healthy sibling workers");
 }

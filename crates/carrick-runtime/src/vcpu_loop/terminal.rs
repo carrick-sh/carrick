@@ -644,6 +644,7 @@ pub(crate) fn try_claim_persistent_process_exit_with(
 }
 
 /// What a single vCPU loop did when it stopped.
+#[derive(Debug)]
 pub(crate) enum VcpuLoopOutcome {
     /// Whole-process exit (last thread, exit_group, or fatal signal). Carries
     /// the assembled RunResult so the main thread can return it.
