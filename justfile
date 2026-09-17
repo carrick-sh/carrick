@@ -263,6 +263,16 @@ fmt:
 # also runs the serial host tests; run it and the signed gates before pushing.
 test-kernel *ARGS:
     cargo test -p carrick-kernel --lib --features test-support {{ARGS}} -- --skip serial_host
+    just --justfile {{justfile()}} test-kernel-semantics {{ARGS}}
+
+# The scripted kernel-semantics suites alone (crates/carrick-kernel-example):
+# two-process Linux semantics against the public kernel API with no VMM, no
+# codesign, no Docker and no host-specific state, so they run natively on ANY
+# host the kernel compiles for. Hosted CI runs this on a Linux aarch64 runner
+# (`kernel-linux-native` in .github/workflows/ci.yml) as the fast, independent
+# semantics signal beside the macOS job. Measured 2026-09-17 in the lima
+# aarch64 VM: 94 tests, 0 failures, ~5 s.
+test-kernel-semantics *ARGS:
     cargo test -p carrick-kernel-example --tests {{ARGS}}
 
 # Host unit/integration tests that do NOT need the HVF runtime or Docker.
@@ -513,8 +523,17 @@ check-layering:
 # In `ci`, right after `check-layering`: the layering gate proves the DEPENDENCY
 # graph carries no HVF, and this proves the SOURCE compiles without it. Both are
 # cheap and neither runs a guest, so they sit together ahead of the build gates.
+#
+# The kernel's own unit tests and the semantics suites are part of the portable
+# surface too: they compile for the same VMM-less target, so a Darwin-only
+# `sockaddr_in.sin_len` or a macOS-gated helper in a test is caught here, not on
+# the Linux runner. (Measured 2026-09-17 in the lima aarch64 VM: the semantics
+# suites pass natively on Linux; the kernel lib lane passes 1957/1964 there —
+# the seven host-specific failures, named in .github/workflows/ci.yml, are the
+# follow-up that lets the Linux job run the lib lane too.)
 check-kernel-portable:
-    cargo check -p carrick-kernel --features test-support --target aarch64-unknown-linux-gnu
+    cargo check -p carrick-kernel --lib --tests --features test-support --target aarch64-unknown-linux-gnu
+    cargo check -p carrick-kernel-example --tests --target aarch64-unknown-linux-gnu
 
 # Deterministic, line-exact ABI probe gate vs Docker (the precise gate; self-skips).
 # On the x86_64 fleet the AMD64 probe sets are built NATIVELY here (cheap: host

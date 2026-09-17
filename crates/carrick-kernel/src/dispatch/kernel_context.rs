@@ -860,6 +860,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn logical_exec_target_user_workdir_and_path_share_one_exact_resource_scope() {
         let mut dispatcher = SyscallDispatcher::new();

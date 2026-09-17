@@ -73,7 +73,7 @@ jobs:
       - name: Layering gate (crate closures + product feature closure)
         run: just check-layering
 
-      - name: Portable kernel compile (aarch64-linux, no HVF)
+      - name: Portable kernel compile (aarch64-linux, no HVF; lib, tests and semantics suites)
         run: just check-kernel-portable
 
       - name: Build
@@ -156,6 +156,46 @@ jobs:
       # IS x86_64-linux, so run them natively. No /dev/kvm, no guest needed.
       - name: Native unit tests for carrick-host-linux
         run: cargo test -p carrick-host-linux
+
+  # Native Linux run of the kernel-semantics suites (crates/carrick-kernel-example):
+  # scripted two-process Linux semantics against the public kernel API with no
+  # VMM, no codesign, no Docker. The kernel is portable by construction
+  # (`just check-kernel-portable` above proves the source; this proves the
+  # SEMANTICS on a Linux host), and an aarch64 runner matches the kernel's guest
+  # ABI and the portable-check target. It is the fast, independent signal beside
+  # the macOS job: ~5 s of tests after the build. Measured 2026-09-17 in the lima
+  # aarch64 VM before wiring: 94 passed, 0 failed.
+  #
+  # NOT yet run here: the kernel lib lane (`cargo test -p carrick-kernel --lib
+  # --features test-support -- --skip serial_host`). On Linux it passes 1957/1964;
+  # the seven failures are host-specific expectations, each a named follow-up
+  # (fix the Linux host path or gate the Darwin expectation), never a skip list:
+  #   dispatch::fs::tests::lseek_data_and_hole_across_backends
+  #   dispatch::mem::backing::tests::readonly_host_fd_cannot_carry_a_writable_shared_file_mapping
+  #   dispatch::net::support::tests::host_to_linux_sockaddr_unix_does_not_leak_private_hash_path_without_metadata
+  #   dispatch::net::support::tests::host_to_linux_sockaddr_unix_falls_back_to_xattr_across_processes
+  #   dispatch::overlay_dispatch_tests::epoll_et_delivers_listener_edge_without_read_byte_growth
+  #   dispatch::overlay_dispatch_tests::large_nonblocking_host_pipe_write_uses_small_ready_window
+  #   dispatch::overlay_dispatch_tests::large_nonblocking_host_socket_write_uses_small_ready_window
+  # When those are green, replace `test-kernel-semantics` below with `test-kernel`.
+  kernel-linux-native:
+    name: aarch64-linux native · kernel semantics suites (no VMM)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Kernel semantics suites, natively on Linux
+        run: just test-kernel-semantics
 
   # Cross-compile the FULL carrick-cli + carrick-runtime closure for
   # x86_64-unknown-freebsd — INCLUDING the C deps (ring via oci-client), handled
