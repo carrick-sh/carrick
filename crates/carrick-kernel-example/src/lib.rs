@@ -43,6 +43,7 @@ pub mod report;
 pub mod scripted;
 pub mod sys;
 
+pub use driver::{block_on_timeout, seed_initial_task_state};
 pub use memory::{GUEST_BASE, GUEST_LEN, TaskMemory};
 pub use operand::{
     Expect, Layout, Operand, RelocWidth, Relocation, Save, Step, Syscall, alloc_buffer, alloc_word,
