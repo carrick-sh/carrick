@@ -134,7 +134,7 @@ impl RunReport {
 }
 ```
 
-- [ ] **Step 1: Write the failing test** — rewrite `tests/fork_pipe_wait.rs::fork_pipe_wait_through_the_public_surface` on the new vocabulary:
+- [x] **Step 1: Write the failing test** — rewrite `tests/fork_pipe_wait.rs::fork_pipe_wait_through_the_public_surface` on the new vocabulary:
 
 ```rust
 use carrick_kernel_example::{sys, slot, last_child, ScriptedBackend, Step};
@@ -162,9 +162,9 @@ fn fork_pipe_wait_through_the_public_surface() {
 
 Keep `a_forked_task_can_fork_again` and `a_lost_wake_fails_inside_the_bound` as they are in intent, rewritten on the vocabulary (the lost-wake test asserts `ExampleError::WaitTimedOut("wait4")` unchanged).
 
-- [ ] **Step 2: Run it to verify it fails** — `cargo test -p carrick-kernel-example --tests` → compile error: `sys` module and `Step::Sys` on `Syscall` do not exist.
+- [x] **Step 2: Run it to verify it fails** — `cargo test -p carrick-kernel-example --tests` → compile error: `sys` module and `Step::Sys` on `Syscall` do not exist.
 
-- [ ] **Step 3: Implement `operand.rs`, `sys.rs`, `memory.rs`, `report.rs`** and rewire `scripted.rs`:
+- [x] **Step 3: Implement `operand.rs`, `sys.rs`, `memory.rs`, `report.rs`** and rewire `scripted.rs`:
 
 `memory.rs`:
 ```rust
@@ -219,9 +219,9 @@ pub fn getppid() -> Syscall { call("getppid", nr::GETPPID, [0.into(); 6]) }
 ```
 (The `fork()` constructor issues `clone` with `flags = SIGCHLD`, exactly what the old `Sys::Fork` did — read the old arm before deleting it and keep the same flag word. `carrick_abi::LINUX_SIGCHLD`: verify the constant name with `grep -rn "LINUX_SIGCHLD" crates/carrick-abi/src`.)
 
-- [ ] **Step 4: Run the tests** — `cargo test -p carrick-kernel-example --tests` → 3 passed. `just check-layering` → ok.
+- [x] **Step 4: Run the tests** — `cargo test -p carrick-kernel-example --tests` → 3 passed. `just check-layering` → ok.
 
-- [ ] **Step 5: Commit** — `git add crates/carrick-kernel-example && git commit -m "feat(kernel-example): generic syscall vocabulary with inline expectations"` (body: Why — the closed six-variant enum caps the semantics the harness can express; What — Operand/Save/Expect/Syscall, bump-allocated task memory, a shared RunReport with a dispatch counter; Verified — the three existing tests rewritten and green, check-layering ok).
+- [x] **Step 5: Commit** — `git add crates/carrick-kernel-example && git commit -m "feat(kernel-example): generic syscall vocabulary with inline expectations"` (body: Why — the closed six-variant enum caps the semantics the harness can express; What — Operand/Save/Expect/Syscall, bump-allocated task memory, a shared RunReport with a dispatch counter; Verified — the three existing tests rewritten and green, check-layering ok).
 
 ### Task 2: Park on the kernel wait service, not on a poll loop
 
@@ -724,12 +724,19 @@ test-kernel *ARGS:
 
 - Initial `just test`: exit 0, log `/tmp/kernel-harness-just-test-before.log`.
 - Warm `just test`: exit 0, log `/tmp/kernel-harness-just-test-warm-before.log`.
-- Task 1 worker: `AGY_RUN_ID=kernel-harness-sep16`, name `vocabulary`, worktree
+- Task 1 accepted: `fa64f1492` + `9b7406340`; director reran 11 tests,
+  `just check-layering`, and crate Clippy with `-D warnings`, all exit 0.
+- Task 2 worker (continuing the Task 1 conversation): `AGY_RUN_ID=kernel-harness-sep16`, name `vocabulary`, worktree
   `/Users/tjfontaine/.codex/worktrees/kernel-harness-vocabulary`.
-- Tasks 11–12 scanner-only worker: same run id, name `serial-ratchet`, worktree
-  `/Users/tjfontaine/.codex/worktrees/kernel-harness-serial-ratchet`. No lane
+- Tasks 11–12 partition worker: same run id, name `serial-ratchet`, worktree
+  `/Users/tjfontaine/.codex/worktrees/kernel-harness-serial-ratchet`. Scanner narrowed to 388 lines using the existing lexer; 16 self-tests pass.
+  A fixpoint termination fix and actual partition are in flight. No lane
   changes accepted yet.
-- Next: review Task 1, rerun its tests/layering/lint, then Task 2 using the
-  shared continuation API notes in `/tmp/kernel-harness-task2-notes.md`.
-- All 15 tasks remain subject to director acceptance; no worker report is a
+- Next: review Task 2 and partition results using `agy_worker.py status/result`
+  with the run id above. Task 2 brief: `/tmp/kernel-harness-task2.md`;
+  API notes: `/tmp/kernel-harness-task2-notes.md`; partition brief:
+  `/tmp/kernel-harness-partition.md`. Task 2 still polls in the director tree
+  until its worker is reviewed and integrated. Then implement Tasks 3–10 and
+  13–15, reconcile inventories, and run final required gates.
+- Tasks 2–15 remain subject to director acceptance; no worker report is a
   completed checkbox. No signed guest acceptance or performance claim yet.
