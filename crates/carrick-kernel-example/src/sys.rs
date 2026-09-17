@@ -1432,3 +1432,34 @@ pub fn prlimit64(
         ],
     )
 }
+
+/// `mknodat(2)`: create a filesystem node.
+pub fn mknodat(
+    dirfd: impl Into<Operand>,
+    path: impl Into<Operand>,
+    mode: u32,
+    dev: u64,
+) -> Syscall {
+    call(
+        "mknodat",
+        nr::MKNODAT,
+        [
+            dirfd.into(),
+            path.into(),
+            (mode as i64).into(),
+            (dev as i64).into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `mkfifo` helper using `mknodat(AT_FDCWD, path, S_IFIFO | mode, 0)`.
+pub fn mkfifo(path: impl Into<Operand>, mode: u32) -> Syscall {
+    mknodat(
+        carrick_abi::LINUX_AT_FDCWD,
+        path,
+        carrick_abi::LINUX_S_IFIFO | (mode & 0o777),
+        0,
+    )
+}
