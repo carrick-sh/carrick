@@ -29,11 +29,14 @@ fn a_descriptor_passed_over_scm_rights_reads_the_same_pipe() {
                 .save_out_i32(3, 0, 2)
                 .save_out_i32(3, 1, 3),
         ),
+        // Send fd 10; the receiver must allocate its own lowest free fd 3.
+        Step::Sys(sys::dup3(slot(0), 10, 0).ret(10).save(5)),
         // Parent writes data to the pipe write end
         Step::Sys(sys::write(slot(1), b"hello SCM_RIGHTS").ret(16)),
         Step::Sys(sys::fork()),
         Step::ChildMarker(vec![
-            // Child closes its inherited read end (slot 0) and socketpair parent end (slot 2)
+            // Close both inherited pipe readers and the socketpair parent end.
+            Step::Sys(sys::close(slot(5)).ret(0)),
             Step::Sys(sys::close(slot(0)).ret(0)),
             Step::Sys(sys::close(slot(2)).ret(0)),
             // Child receives the passed pipe read descriptor over socketpair end (slot 3)
@@ -52,8 +55,9 @@ fn a_descriptor_passed_over_scm_rights_reads_the_same_pipe() {
         ]),
         // Parent closes socketpair child end (slot 3)
         Step::Sys(sys::close(slot(3)).ret(0)),
-        // Parent sends the pipe read descriptor (slot 0) to child over slot 2
-        Step::Sys(sys::sendmsg_fds(slot(2), &[slot(0)], b"payload", 0).ret(7)),
+        // Parent sends descriptor 10 to the child over slot 2.
+        Step::Sys(sys::sendmsg_fds(slot(2), &[slot(5)], b"payload", 0).ret(7)),
+        Step::Sys(sys::close(slot(5)).ret(0)),
         Step::Sys(sys::close(slot(0)).ret(0)),
         Step::Sys(sys::close(slot(1)).ret(0)),
         Step::Sys(sys::close(slot(2)).ret(0)),
@@ -91,11 +95,10 @@ fn a_descriptor_passed_over_scm_rights_reads_the_same_pipe() {
     );
 
     // man 7 unix: received descriptor is the lowest unused descriptor in the receiver.
-    // In the child task before recvmsg:
-    // fd 0 (pipe read, slot 0) was closed; fd 2 (socketpair parent end, slot 2) was closed;
-    // fd 1 (pipe write, slot 1) and fd 4 (socketpair child end, slot 3) remain open.
-    // Since fd 0 and fd 2 were closed and fd 3 was the parent socket end (now closed),
-    // the lowest unused descriptor in the child is fd 3.
+    // Stdio occupies 0..2. The child closed its pipe reader (3), socketpair
+    // parent end (5), and inherited duplicate (10). Pipe writer (4) and its
+    // socketpair end (6) remain open. Thus the new descriptor is 3, not the
+    // sender's descriptor 10.
     let received_fd = i32::from_le_bytes(
         control_bytes[LINUX_CMSGHDR_LEN..LINUX_CMSGHDR_LEN + 4]
             .try_into()
