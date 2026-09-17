@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use carrick_fatal::carrick_fatal;
-use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 use parking_lot::Mutex;
 
 use super::host_alias::{HostAliasDispatchGuard, HostAliasTransactions};
@@ -183,13 +182,13 @@ impl DispatchMmAuthority {
         let authority = Arc::new(Self::new(mm_id));
         {
             let mut mem = authority.mem.lock();
-            mem.dynamic_maps.push(ProcMapsEntry {
+            mem.dynamic_maps.push(carrick_vfs::ProcMapsEntry {
                 start,
                 end,
                 read: true,
                 write: true,
                 execute: false,
-                sharing: ProcMapSharing::Private,
+                sharing: carrick_vfs::ProcMapSharing::Private,
                 path: "[foreign-cow-composition]".to_owned(),
             });
         }
