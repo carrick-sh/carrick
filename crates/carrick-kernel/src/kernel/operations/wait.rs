@@ -848,7 +848,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "defect: concurrent wait observes TaskBusy while child exit reservation is active"]
     fn wait_consume_never_returns_unconsumed_zombie_under_interleaved_exit() {
         let (kernel, root) = bootstrap(199);
         let fork_plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
@@ -943,5 +942,387 @@ mod tests {
         kernel.sweep_retired_threads();
         assert!(!kernel.ids().is_reserved_number(child_id.raw()));
         assert_eq!(kernel.registry().zombie_count(), 0);
+    }
+
+    #[test]
+    fn sigchld_set_to_sig_ign_autoreaps_child_in_kernel() {
+        let (kernel, root) = bootstrap(500);
+        let mut ign_action = carrick_abi::LinuxSigaction::empty();
+        ign_action.sa_handler = carrick_abi::LINUX_SIG_IGN;
+        root.task
+            .shared()
+            .sighand()
+            .install_action(LinuxSignal::SIGCHLD, ign_action);
+
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(501),
+                "child".to_string(),
+                None,
+            )
+            .expect("fork");
+        let child_id = child.task.key().id;
+        drop(child);
+
+        assert!(matches!(
+            kernel.wait_child(root.task.key().id, Some(child_id), WaitMode::Observe),
+            Ok(WaitOutcome::StillRunning(_))
+        ));
+
+        let initial_wake_gen = root.task.wake_generation();
+        kernel
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("exit");
+
+        assert_eq!(kernel.registry().zombie_count(), 0);
+        assert!(!root.task.children().iter().any(|k| k.id == child_id));
+        assert!(root.task.wake_generation() > initial_wake_gen);
+
+        assert!(matches!(
+            kernel.wait_child(root.task.key().id, Some(child_id), WaitMode::Consume),
+            Ok(WaitOutcome::NoChild)
+        ));
+        kernel.sweep_retired_threads();
+        assert!(!kernel.ids().is_reserved_number(child_id.raw()));
+    }
+
+    #[test]
+    fn sigchld_with_sa_nocldwait_autoreaps_child_in_kernel() {
+        let (kernel, root) = bootstrap(600);
+        let mut nocldwait_action = carrick_abi::LinuxSigaction::empty();
+        nocldwait_action.sa_flags = carrick_abi::LINUX_SA_NOCLDWAIT;
+        root.task
+            .shared()
+            .sighand()
+            .install_action(LinuxSignal::SIGCHLD, nocldwait_action);
+
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(601),
+                "child".to_string(),
+                None,
+            )
+            .expect("fork");
+        let child_id = child.task.key().id;
+        drop(child);
+
+        kernel
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("exit");
+
+        assert_eq!(kernel.registry().zombie_count(), 0);
+        assert!(matches!(
+            kernel.wait_child(root.task.key().id, Some(child_id), WaitMode::Consume),
+            Ok(WaitOutcome::NoChild)
+        ));
+    }
+
+    #[test]
+    fn clone_child_with_non_sigchld_exit_signal_is_not_autoreaped_when_sigchld_ignored() {
+        let (kernel, root) = bootstrap(700);
+        let mut ign_action = carrick_abi::LinuxSigaction::empty();
+        ign_action.sa_handler = carrick_abi::LINUX_SIG_IGN;
+        root.task
+            .shared()
+            .sighand()
+            .install_action(LinuxSignal::SIGCHLD, ign_action);
+
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::empty())
+            .expect("fork plan")
+            .with_exit_signal(ChildExitSignal::for_clone_request(
+                carrick_abi::LINUX_SIGUSR1 as u32,
+            ));
+        let child = kernel
+            .fork_task(
+                &root,
+                plan,
+                ThreadId::synthetic_for_tests(701),
+                "child".to_string(),
+                None,
+            )
+            .expect("fork");
+        let child_id = child.task.key().id;
+        drop(child);
+
+        kernel
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("exit");
+
+        assert_eq!(kernel.registry().zombie_count(), 1);
+        assert!(matches!(
+            kernel.wait_child(root.task.key().id, Some(child_id), WaitMode::Consume),
+            Ok(WaitOutcome::NoChild)
+        ));
+        assert!(matches!(
+            kernel.wait_child_with_job_control(
+                root.task.key().id,
+                Some(child_id),
+                WaitChildClass::Clone,
+                false,
+                false,
+                WaitMode::Consume,
+            ),
+            Ok(WaitOutcome::Exited(_))
+        ));
+        assert_eq!(kernel.registry().zombie_count(), 0);
+    }
+
+    #[test]
+    fn autoreap_does_not_charge_rusage_children_and_consumed_wait_does() {
+        let (kernel, root) = bootstrap(850);
+        let mut ign_action = carrick_abi::LinuxSigaction::empty();
+        ign_action.sa_handler = carrick_abi::LINUX_SIG_IGN;
+        root.task
+            .shared()
+            .sighand()
+            .install_action(LinuxSignal::SIGCHLD, ign_action);
+
+        let child1 = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(851),
+                "child-autoreap".to_string(),
+                None,
+            )
+            .expect("fork");
+        let child1_id = child1.task.key().id;
+        let child1_leader_tid = LinuxTid::for_task_leader(child1_id);
+        child1
+            .task
+            .thread(child1_leader_tid)
+            .expect("thread")
+            .charge_user_ns(50_000_000); // 50 ms
+        drop(child1);
+
+        kernel
+            .exit_task(child1_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("exit");
+
+        // Autoreaped child must NOT charge parent's RUSAGE_CHILDREN
+        assert_eq!(
+            root.task.children_cpu_us(),
+            (0, 0),
+            "autoreaped child must not charge RUSAGE_CHILDREN"
+        );
+
+        // Reset SIGCHLD to default for ordinary zombie reaping test
+        let dfl_action = carrick_abi::LinuxSigaction::empty();
+        root.task
+            .shared()
+            .sighand()
+            .install_action(LinuxSignal::SIGCHLD, dfl_action);
+
+        let child2 = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(852),
+                "child-consumed".to_string(),
+                None,
+            )
+            .expect("fork");
+        let child2_id = child2.task.key().id;
+        let child2_leader_tid = LinuxTid::for_task_leader(child2_id);
+        child2
+            .task
+            .thread(child2_leader_tid)
+            .expect("thread")
+            .charge_user_ns(30_000_000); // 30 ms
+        drop(child2);
+
+        kernel
+            .exit_task(child2_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("exit");
+
+        // Before consuming wait, children ledger is still uncharged
+        assert_eq!(root.task.children_cpu_us(), (0, 0));
+
+        // Consuming wait must charge reaped child's CPU time to parent
+        assert!(matches!(
+            kernel.wait_child(root.task.key().id, Some(child2_id), WaitMode::Consume),
+            Ok(WaitOutcome::Exited(_))
+        ));
+        assert_eq!(
+            root.task.children_cpu_us(),
+            (30_000, 0),
+            "consuming wait must charge reaped child CPU to RUSAGE_CHILDREN"
+        );
+    }
+
+    #[test]
+    fn overlapping_parent_fork_and_child_auto_exit_respects_reservation() {
+        let (kernel, root) = bootstrap(900);
+        let mut ign_action = carrick_abi::LinuxSigaction::empty();
+        ign_action.sa_handler = carrick_abi::LINUX_SIG_IGN;
+        root.task
+            .shared()
+            .sighand()
+            .install_action(LinuxSignal::SIGCHLD, ign_action);
+
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(901),
+                "child".to_string(),
+                None,
+            )
+            .expect("fork");
+        let child_id = child.task.key().id;
+        let root_id = root.task.key().id;
+        drop(child);
+
+        // 1. Parent begins fork reservation, reserving parent_id
+        let fork_reservation = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "child2".to_string(),
+                None,
+            )
+            .expect("reserve fork");
+
+        // 2. Child tries to prepare auto-exit. Since parent is reserved by fork,
+        // prepare_task_exit must return TaskBusy on parent_id without corrupting state.
+        let exit_attempt =
+            kernel.prepare_task_exit(child_id, LinuxWaitStatus::from_wait_encoding(0), None);
+        assert!(matches!(
+            exit_attempt,
+            Err(KernelOperationError::TaskBusy(id)) if id == root_id
+        ));
+
+        // Verify child remains Live and parent children topology is intact
+        assert!(root.task.children().iter().any(|k| k.id == child_id));
+        assert_eq!(kernel.registry().zombie_count(), 0);
+
+        // 3. Abort the parent fork reservation
+        drop(fork_reservation);
+
+        // 4. Child prepares exit successfully now that parent is unreserved
+        let prepared = kernel
+            .prepare_task_exit(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("prepare exit");
+
+        // While child exit is prepared, parent trying to fork sees TaskBusy on parent_id
+        let fork_attempt = kernel.reserve_fork(
+            &root,
+            ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+            "child2".to_string(),
+            None,
+        );
+        assert!(matches!(
+            fork_attempt,
+            Err(KernelOperationError::TaskBusy(id)) if id == root_id
+        ));
+
+        // 5. Commit child exit -> auto-reaps cleanly
+        prepared.commit().expect("commit exit");
+        assert_eq!(kernel.registry().zombie_count(), 0);
+        assert!(!root.task.children().iter().any(|k| k.id == child_id));
+        assert!(matches!(
+            kernel.wait_child(root_id, Some(child_id), WaitMode::Consume),
+            Ok(WaitOutcome::NoChild)
+        ));
+
+        // 6. Parent can now fork cleanly
+        let second_fork = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(902),
+                "child2".to_string(),
+                None,
+            )
+            .expect("fork");
+        assert_eq!(second_fork.task.parent(), Some(root.task.key()));
+    }
+
+    struct ExitNotificationAuditor {
+        kernel: std::sync::Weak<Kernel>,
+        parent_id: TaskId,
+        verified: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::observe::KernelAuditor for ExitNotificationAuditor {
+        fn zombie_created(
+            &self,
+            task: TaskKey,
+            _reaper: crate::observe::ZombieReaper,
+        ) -> crate::observe::AuditVerdict {
+            let Some(kernel) = self.kernel.upgrade() else {
+                return crate::observe::AuditVerdict::Continue;
+            };
+            let state = kernel.registry().state.read();
+            assert!(
+                state.zombies.contains_key(&task.id),
+                "zombie must be visible in registry when zombie_created fires"
+            );
+            assert!(
+                !state.reservations.contains_key(&task.id),
+                "task must be unreserved when zombie_created fires"
+            );
+            drop(state);
+
+            // Consuming wait immediately inside zombie_created notification must succeed
+            let outcome = kernel.wait_child(self.parent_id, Some(task.id), WaitMode::Consume);
+            assert!(
+                matches!(outcome, Ok(WaitOutcome::Exited(_))),
+                "wait_child in WaitMode::Consume must succeed upon zombie creation notification"
+            );
+            self.verified
+                .store(true, std::sync::atomic::Ordering::Release);
+            crate::observe::AuditVerdict::Continue
+        }
+    }
+
+    #[test]
+    fn exit_notification_allows_consuming_wait() {
+        let (kernel, root) = bootstrap(950);
+        let root_id = root.task.key().id;
+        let auditor = Arc::new(ExitNotificationAuditor {
+            kernel: Arc::downgrade(&kernel),
+            parent_id: root_id,
+            verified: std::sync::atomic::AtomicBool::new(false),
+        });
+        kernel.set_auditors(Arc::new(crate::observe::auditor::AuditorChain::new(vec![
+            auditor.clone(),
+        ])));
+
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(951),
+                "child".to_string(),
+                None,
+            )
+            .expect("fork");
+        let child_id = child.task.key().id;
+        drop(child);
+
+        kernel
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("exit");
+
+        assert!(
+            auditor.verified.load(std::sync::atomic::Ordering::Acquire),
+            "auditor must have verified notification and consumption"
+        );
+        assert_eq!(
+            kernel.registry().zombie_count(),
+            0,
+            "zombie was consumed by auditor"
+        );
+        assert!(matches!(
+            kernel.wait_child(root_id, Some(child_id), WaitMode::Consume),
+            Ok(WaitOutcome::NoChild)
+        ));
+
+        kernel.set_auditors(Arc::new(crate::observe::auditor::AuditorChain::new(vec![])));
     }
 }

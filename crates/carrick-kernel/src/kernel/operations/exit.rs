@@ -36,6 +36,8 @@ pub struct PreparedTaskExit {
     pub(super) affected_revisions: BTreeMap<TaskId, (TaskRevision, TaskRevision)>,
     pub(super) adopter: Option<TaskKey>,
     pub(super) prepared_adopter_children: Option<BTreeSet<TaskKey>>,
+    pub(super) autoreap_parent: Option<TaskKey>,
+    pub(super) prepared_parent_children: Option<BTreeSet<TaskKey>>,
     /// The container's pid-namespace init as of this transaction, when it is
     /// still LIVE (the exiting task itself counts: it is live until this exit
     /// commits). `None` means the init has already become a zombie, so nothing
@@ -518,6 +520,17 @@ impl Kernel {
             }
         }
 
+        let autoreap_parent = if let Some(parent_key) = task.parent()
+            && task.exit_signal() == crate::kernel::ids::ChildExitSignal::SIGCHLD
+            && let Some(parent_record) = state.tasks.get(&parent_key.id)
+            && parent_record.task.key() == parent_key
+            && parent_record.task.autoreaps_children()
+        {
+            Some(parent_key)
+        } else {
+            None
+        };
+
         let prepared_adopter_children = if let Some(adopter_key) = adopter {
             reserved_ids.insert(adopter_key.id);
             let adopter_record = state
@@ -533,7 +546,33 @@ impl Kernel {
                 ),
             );
             let mut prepared = adopter_record.task.children_set();
+            if autoreap_parent == Some(adopter_key) {
+                prepared.remove(&task_key);
+            }
             prepared.extend(children.iter().copied());
+            Some(prepared)
+        } else {
+            None
+        };
+
+        let prepared_parent_children = if let Some(parent_key) = autoreap_parent
+            && adopter != Some(parent_key)
+        {
+            reserved_ids.insert(parent_key.id);
+            let parent_record = state
+                .tasks
+                .get(&parent_key.id)
+                .filter(|record| record.task.key() == parent_key)
+                .ok_or(KernelOperationError::ExitTopologyChanged(parent_key.id))?;
+            affected_revisions.insert(
+                parent_key.id,
+                (
+                    parent_record.revision,
+                    next_revision(parent_record.revision)?,
+                ),
+            );
+            let mut prepared = parent_record.task.children_set();
+            prepared.remove(&task_key);
             Some(prepared)
         } else {
             None
@@ -574,6 +613,8 @@ impl Kernel {
             affected_revisions,
             adopter,
             prepared_adopter_children,
+            autoreap_parent,
+            prepared_parent_children,
             namespace_init,
             registry_zombie,
             result_zombie,
@@ -733,6 +774,13 @@ impl Kernel {
         {
             adopter_record.task.publish_prepared_children(children);
         }
+        if let (Some(parent_key), Some(children)) = (
+            prepared.autoreap_parent,
+            prepared.prepared_parent_children.take(),
+        ) && let Some(parent_record) = state.tasks.get(&parent_key.id)
+        {
+            parent_record.task.publish_prepared_children(children);
+        }
         for (affected_id, (_, published)) in &prepared.affected_revisions {
             if let Some(affected) = state.tasks.get_mut(affected_id) {
                 affected.revision = *published;
@@ -742,24 +790,31 @@ impl Kernel {
         let process_group = task.process_group();
         let session = task.session();
         remove_group_member(&mut state, process_group, session, prepared.task);
-        state.zombies.insert(
-            prepared.task.id,
-            ZombieRecord {
-                zombie: prepared.registry_zombie,
-                _task_claim: task_claim,
-            },
-        );
+
+        if prepared.autoreap_parent.is_none() {
+            state.zombies.insert(
+                prepared.task.id,
+                ZombieRecord {
+                    zombie: prepared.registry_zombie,
+                    _task_claim: task_claim,
+                },
+            );
+        }
+
         // Detach this exact task generation's watchers before the zombie can
         // be consumed and its numeric claim eventually reused. Callbacks stay
         // outside the registry lock, but a later generation can no longer be
         // mistaken for this exit.
         let subscribers = self.exit_subscribers.take(prepared.task);
-        drop(state);
-        let mut state = self.registry().state.write();
         let pending_publication = prepared.reservation.commit(&mut state)?;
         drop(state);
         pending_publication.publish();
-        self.auditors().zombie_created(prepared.task, zombie_reaper);
+
+        if let Some(parent_key) = prepared.autoreap_parent {
+            self.auditors().reaped(parent_key, prepared.task);
+        } else {
+            self.auditors().zombie_created(prepared.task, zombie_reaper);
+        }
         if self.registry().state.read().tasks.is_empty() {
             self.auditors().process_graph_empty(self.unpublished_jobs());
         }
@@ -769,6 +824,20 @@ impl Kernel {
                     carrick_fatal!(
                         "kernel::task_exit_identity",
                         "failed to unregister reaped secondary thread"
+                    );
+                }
+            }
+            if prepared.autoreap_parent.is_some() {
+                let leader_tid = u32::try_from(prepared.task.id.raw()).unwrap_or_else(|_| {
+                    carrick_fatal!(
+                        "kernel::task_exit_identity",
+                        "leader tid exceeds u32 in commit_task_exit_notifying"
+                    );
+                });
+                if !region.unregister_reaped(leader_tid) {
+                    carrick_fatal!(
+                        "kernel::task_exit_identity",
+                        "failed to unregister reaped leader thread"
                     );
                 }
             }
