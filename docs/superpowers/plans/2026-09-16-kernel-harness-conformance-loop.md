@@ -709,6 +709,15 @@ test-kernel *ARGS:
 - The initial `just test` run includes compilation and overlaps the vocabulary
   worker's build. Retain it as baseline correctness evidence; obtain comparable
   quiet, warm before/after timings before claiming a lane speedup.
+- Continuation completion, not illustrative dispatch counts, determines whether
+  to dispatch again: the shared kernel completes a woken futex with `Return(0)`
+  in `kernel/continuation.rs`. Task 15 must assert one futex dispatch plus an
+  observed park/wake; redispatching it would create a new wait and lose the
+  consumed wake. Ordinary read readiness still requires two dispatches.
+- Task 14's shared dispatcher and memory locks must be released before parking
+  a continuation. Capture the exact thread context rather than using
+  `capture_one_task_context`, which selects the process leader. Use the public
+  thread reservation/prepare/commit path, not the test-only `clone_thread` helper.
 
 ### Defects
 (appended by executors: `- <test name> — <one line> — fixed in <sha> | ignored`)
@@ -732,6 +741,17 @@ test-kernel *ARGS:
   `/Users/tjfontaine/.codex/worktrees/kernel-harness-serial-ratchet`. Scanner narrowed to 388 lines using the existing lexer; 16 self-tests pass.
   A fixpoint termination fix and actual partition are in flight. No lane
   changes accepted yet.
+- Task 3 shared notification worker: same run id, name `exit-signals`, worktree
+  `/Users/tjfontaine/.codex/worktrees/kernel-harness-exit-signals`, brief
+  `/tmp/kernel-harness-exit-signals.md`. Owns kernel exit notification and the
+  carrier's remaining wake routing, not harness signal handling.
+- Exact pre-partition names are saved in
+  `/tmp/kernel-harness-kernel-tests-before.txt` (2084 names) and
+  `/tmp/kernel-harness-vfs-tests-before.txt` (283 names).
+- Draft Task 2 review is `/tmp/kernel-harness-task2-review.md`; check the final
+  worker diff before sending it. The draft discarded guest writes, restarted
+  owned operation completions, and copied the carrier's restart policy. None
+  is accepted. Task 14–15 API notes: `/tmp/kernel-harness-thread-notes.md`.
 - Next: review Task 2 and partition results using `agy_worker.py status/result`
   with the run id above. Task 2 brief: `/tmp/kernel-harness-task2.md`;
   API notes: `/tmp/kernel-harness-task2-notes.md`; partition brief:
