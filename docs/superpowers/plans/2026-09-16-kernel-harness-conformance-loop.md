@@ -661,7 +661,7 @@ test-kernel *ARGS:
     cargo test -p carrick-kernel-example --tests {{ARGS}}
 ```
 - [x] **Step 2: Docs** — AGENTS.md Commands table gains `just test-kernel` with that one-line purpose; the `just test` row names the `serial_host` convention and the ratchet; `crates/carrick-kernel-example/README.md` describes the vocabulary (Operand/Save/Expect, `dispatches_for`, `HostSleepMs`), the parking driver, what it cannot do (no exec, no guest code, no handlers, threads per Task 14), and the citation rule for expectations; `docs/conformance-testing.md` gains the section with the loop: write the semantics test (cite the man page or oracle) → `just test-kernel` → fix in `carrick-kernel` → `just test` → the signed gates before push.
-- [ ] **Step 3: Timing** — `time just test` after; append the before/after table to `### Lane timing` in this plan and to the commit body.
+- [x] **Step 3: Timing** — `time just test` after; append the before/after table to `### Lane timing` in this plan and to the commit body.
 - [x] **Step 4: Commit** — `git commit -m "docs: the kernel-semantics inner loop (just test-kernel)"`.
 
 ---
@@ -727,7 +727,7 @@ test-kernel *ARGS:
 |---|---|---|---|
 | initial cold correctness baseline (build overlap; not a speed comparison) | 345.15 s | 2083 passed, 1 ignored | 283 passed |
 | before Task 11 (warm) | 63.05 s | 2083 passed, 1 ignored | 283 passed |
-| after Task 13 | | | |
+| after integration (warm, quiet host) | 48.91 s | 2090 passed, 2 ignored | 283 passed |
 
 ### Execution checkpoint
 
@@ -984,8 +984,8 @@ test-kernel *ARGS:
 | 5–7 | 20 wait/group/pipe tests pass; SIGCHLD autoreap test retained as a named defect. |
 | 8–10 | 17 IPC/epoll/pidfd tests pass; SCM_CREDENTIALS test retained as a named defect. Epoll alias defects fixed. |
 | 11–12 | Parallel/serial partition and ratchet accepted after ten-run qualification and exact name reconciliation. |
-| 13 | Recipe/docs implemented; final warm timing awaits thread integration. |
-| 14–15 | Thread/futex implementation accepted; integrated host gates below remain the final closure check. |
+| 13 | Recipe/docs and final warm timing accepted: 48.91 s versus 63.05 s baseline. |
+| 14–15 | Thread/futex implementation accepted; full host gates and public inner-loop recipe pass. |
 
 - Integrated kernel test inventory: 2092 names (2084 original plus eight
   signal/exit regressions), with zero original names lost. VFS: 283 names,
@@ -1021,3 +1021,45 @@ test-kernel *ARGS:
 - Final targeted verification: 1 library + 29 driver + 48 semantics pass,
   two named semantics defects ignored; targeted Clippy passes. Receipts:
   `/tmp/kernel-harness-thread-final-{green,clippy}.log`.
+
+### Final acceptance — 2026-09-17
+
+All fifteen implementation tasks are complete under this plan's explicit defect
+policy. Earlier checkpoints above are historical; this section is authoritative
+for final acceptance.
+
+- Tested code/inventory revision: `b6a9d4bae`. Full `just ci` passed, including
+  formatting, workspace Clippy, lint-domains, dependency policy, matrix,
+  layering, portability, compile, rustdoc, host tests and integration suites.
+  Receipt: `/tmp/kernel-harness-ci-accepted.log`.
+- `just test-kernel` passed: 2007 kernel parallel tests, two kernel ignores,
+  1 harness library + 29 driver + 48 semantics passes, two semantics ignores.
+  Receipt: `/tmp/kernel-harness-test-kernel-final.log`.
+- Quiet warm `/usr/bin/time -p just test` passed: **48.91 s real**, 20.71 s
+  user, 31.45 s sys, versus **63.05 s** warm baseline. This observed reduction
+  is 14.14 s (22.4%); the workload grew, so this is a before/after inner-loop
+  measurement, not an isolated algorithm benchmark. Receipt:
+  `/tmp/kernel-harness-just-test-warm-after.log`.
+- Kernel partition: 2007 passed / 2 ignored parallel, 83 passed serial;
+  original 2084 names preserved plus eight new tests = 2092. Nested subprocess
+  test-result lines are not extra inventory entries. VFS: 251 parallel + 32
+  serial = all 283 original tests. Ten-run partition qualification remains
+  recorded above; no retry-until-green acceptance was used.
+- Final clean-tree reconciliation passed: all 585 captured rows and their
+  digest remained identical; only capture source revision changed. Receipt:
+  `/tmp/kernel-harness-inventory-final.log`. The subsequent full CI includes
+  the required lint-domains inventory checks.
+- Final review corrected the futex wake-count witness to use a shared ack
+  pipe: either selected waiter may acknowledge, with exact wake counts and
+  each thread's completion still required. Thread-integration rustdoc links
+  were also corrected; no diagnostic was suppressed.
+- Three named defects remain visible under the plan's deferral rule:
+  SIGCHLD/SIG_IGN autoreap; SCM_CREDENTIALS reporting socket creator instead
+  of message sender; and concurrent wait/exit observing TaskBusy. Each has a
+  retained ignored witness and a defect entry above. One additional kernel
+  ignore predates this work. Missing harness support is not ignored.
+- Signed product build/closure evidence above remains valid for its named
+  artifact: later changes affect the harness, documentation and inventories,
+  not product source. No guest execution, signed conformance acceptance or
+  push was performed. Final documentation-only closure does not change the
+  tested implementation.
