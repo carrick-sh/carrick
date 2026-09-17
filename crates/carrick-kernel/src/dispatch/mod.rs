@@ -675,7 +675,7 @@ pub(crate) mod net;
 #[macro_use]
 mod perf;
 pub mod executable_authority;
-mod proc;
+pub(crate) mod proc;
 #[cfg(any(test, feature = "test-support"))]
 pub use proc::build_hvpatch_waitid_siginfo;
 mod proctitle;

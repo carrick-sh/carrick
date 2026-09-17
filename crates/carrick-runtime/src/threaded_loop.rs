@@ -421,7 +421,6 @@ where
         signal_arrival,
         hvpatch_process,
         shared_hvpatch_runtime,
-        None,
     ));
     kernel.register_hvpatch_runtime_endpoint(
         Arc::clone(&futex),

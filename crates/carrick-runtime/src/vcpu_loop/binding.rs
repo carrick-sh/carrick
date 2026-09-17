@@ -5689,7 +5689,6 @@ mod tests {
             Arc::new(EndpointTestSignalArrival),
             None,
             None,
-            None,
         ));
         directory.register_endpoint(
             context.task().key(),
@@ -5699,7 +5698,7 @@ mod tests {
         let compatibility_wake = Arc::new(EndpointRecordingWaker::default());
         context.task().set_waker(compatibility_wake.clone());
 
-        directory.notify_child_exit(context.task().key(), None);
+        directory.notify_child_exit(context.task().key());
         assert_eq!(scheduler.queued_len(), 1);
         assert_eq!(
             compatibility_wake
@@ -5731,7 +5730,6 @@ mod tests {
             Arc::new(EndpointTestSignalArrival),
             None,
             None,
-            None,
         ));
         directory.register_endpoint(
             context.task().key(),
@@ -5741,7 +5739,7 @@ mod tests {
         let compatibility_wake = Arc::new(EndpointRecordingWaker::default());
         context.task().set_waker(compatibility_wake.clone());
 
-        directory.notify_child_exit(context.task().key(), None);
+        directory.notify_child_exit(context.task().key());
 
         assert_eq!(
             compatibility_wake
@@ -6310,7 +6308,6 @@ mod tests {
             Arc::new(EndpointTestSignalArrival),
             Some(process.clone()),
             None,
-            None,
         ));
         let this_tid = ThreadId::synthetic_for_tests(70_222);
         let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
@@ -6654,7 +6651,6 @@ mod tests {
             dispatcher,
             Arc::new(EndpointTestSignalPump),
             Arc::new(EndpointTestSignalArrival),
-            None,
             None,
             None,
         );
