@@ -26,9 +26,11 @@ and asserts the read returned `"hi"`, the wait status is `7 << 8`
 `pub` that regresses to `pub(crate)` on any item the backend names fails the
 test at compile time.
 
-Run it with `cargo test -p carrick-kernel-example`; `just test` runs it in
-the parallel workspace lane (it forks no host process, so it needs no serial
-slot).
+Run it with `cargo test -p carrick-kernel-example`. `just test` names it on
+its own line (`cargo test -p carrick-kernel-example --tests`) right after the
+parallel workspace lane, because that lane is `--lib --bins` and never reaches
+a crate's `tests/` directory; it forks no host process, so it needs no serial
+slot.
 
 ## What a backend writes, file by file
 
