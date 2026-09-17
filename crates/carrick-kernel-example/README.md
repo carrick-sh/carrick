@@ -1,78 +1,78 @@
 # carrick-kernel-example
 
-This is the template for a bring-your-own execution backend. It has no VM:
-tasks are host threads and guest memory is a `Vec<u8>`. What it implements is
-exactly what your backend must: construct the kernel with your bridges,
-translate your trap source into `SyscallRequest`, interpret every
-`DispatchOutcome` you meet. What it deliberately does not do: run real guest
-code, fork host processes, or emulate a CPU.
+This crate is the VM-free kernel conformance harness and a template for a
+bring-your-own execution backend. Scripts issue Linux syscalls through the
+public `carrick-kernel` API. Host threads execute the scripts over bounded,
+`Vec`-backed guest memory; they do not execute guest instructions or fork host
+processes.
 
-It is built from `pub` items of `carrick-kernel`, `carrick-hal`,
-`carrick-guest-mem` and `carrick-abi` alone. `just check-layering` asserts
-that no `carrick-runtime`, `carrick-vmm-*` or `applevisor*` crate is in its
-closure.
+Use `just test-kernel` for the inner loop. It runs the kernel's parallel lib
+lane and this crate's integration suites without a VM, codesign, or Docker.
+`just test` also runs the `serial_host` kernel and VFS cases and the other host
+suites. Host results do not replace the signed guest conformance gates.
 
-## The proof
+## Writing a script
 
-`tests/fork_pipe_wait.rs` runs one Linux process through
-`SyscallDispatcher`:
+A `Step::Sys(Syscall)` contains a canonical syscall number, six `Operand`s,
+optional `Save`s, and an `Expect`. The constructors in `sys` are conveniences;
+the generic vocabulary can express other syscalls without adding an interpreter
+variant.
 
-```text
-pipe2 -> fork -> (child: write "hi", exit_group 7) -> read -> wait4 -> exit_group 0
-```
+- `Operand::Lit`, `Slot`, and `LastChild` supply scalar values. Slots contain
+  values saved earlier in the task and are inherited by fork children.
+- `Bytes` and `CStr` allocate input memory; `Out` allocates a zeroed output;
+  `InOut` initializes memory and captures its final contents.
+- `Save::Ret` saves a successful return; `Save::OutI32` saves an element from
+  an output buffer, such as a descriptor returned by `pipe2`.
+- `Expect::Ret`, `Errno`, and `Death` assert the syscall's outcome. `Any`
+  accepts a successful return, not an unexpected errno. Failures identify the
+  task and syscall label.
+- A fork syscall is followed by `Step::ChildMarker` with the child's script.
+  `await_parked(pid, label)` establishes that another task enrolled its wait
+  before the next action. Do not sleep to arrange execution order.
 
-and asserts the read returned `"hi"`, the wait status is `7 << 8`
-(`WEXITSTATUS(7)`) and two tasks ran. No VM, no host fork, no guest code. A
-`pub` that regresses to `pub(crate)` on any item the backend names fails the
-test at compile time.
+Give separate labels to calls whose outputs you need to distinguish.
+`RunReport` exposes completions, output bytes, deaths, task counts, and
+`dispatches_for(pid, label)`. A blocked read awakened by a writer dispatches
+exactly twice. A continuation that returns its result directly, such as a
+successful futex wait, must not redispatch the original request.
 
-Run it with `cargo test -p carrick-kernel-example`. `just test` names it on
-its own line (`cargo test -p carrick-kernel-example --tests`) right after the
-parallel workspace lane, because that lane is `--lib --bins` and never reaches
-a crate's `tests/` directory; it forks no host process, so it needs no serial
-slot.
+Every semantic expectation must cite a man-page section or a committed Docker
+oracle alongside the assertion. A new test that exposes a kernel defect remains
+visible: fix a small dispatch defect with red/green evidence, or record a named
+`defect:` ignore and its reason in the implementation ledger. Missing harness
+support is not a kernel conformance defect.
 
-## What a backend writes, file by file
+## Implementation map
 
-| File | What it implements |
+| File | Responsibility |
 |---|---|
-| `src/process.rs` | The three per-process seams. `ExampleProcess` is the `CarrierProcess` (the exact task binding, the kernel graph, per-tid contexts, the two mm-authority bindings). `ExampleMmBackend` is the `MmBackend` the root boots on: it reports the VMA source the dispatcher publishes at bind time and no frame inventory, because guest memory is one `Vec` per task. `ExampleStage1Projection` is the `Stage1MmProjection`: an ASID label this backend allocates and a root derived from it, with no page tables behind either. |
-| `src/scripted.rs` | The trap source and the run loop. A script of `Step`s stands in for a guest's syscall entry; `Task::issue` is the backend's outcome interpreter, and `on_fork`/`on_exit` are the `Fork` and `Exit` arms written against the public kernel operations (`reserve_fork` -> `prepare_with_mm_backend` -> `prepare_fork_mm` + `fork_clone_with_prepared_mm_authorized` -> `PreparedFork::commit` -> `into_parts`; `retire_hvpatch_process_fds` -> `exit_task_key_eventually`). |
-| `tests/fork_pipe_wait.rs` | The end-to-end proof above. |
+| `src/operand.rs`, `src/sys.rs` | Generic vocabulary and syscall constructors. |
+| `src/memory.rs` | Bounded guest-memory allocation and output access. |
+| `src/report.rs` | Per-task completions, outputs, and dispatch accounting. |
+| `src/scripted.rs` | Script execution, process construction, fork, and retirement through public kernel operations. |
+| `src/driver.rs` | Outcome handling and kernel continuation enrollment; bounded parking on `CarrierWaitService`. |
+| `src/process.rs` | `CarrierProcess`, `MmBackend`, and `Stage1MmProjection` implementations with exact kernel identity and address-space bindings. |
+| `tests/fork_pipe_wait.rs` | Harness contracts, including lost-wake bounds and dispatch counts. |
+| `tests/semantics/` | Linux semantics across processes and threads, grouped by syscall domain. |
 
-Guest memory is `carrick_kernel::dispatch::LinearMemory`, the kernel's own
-witness that `SyscallDispatcher::dispatch`'s `CurrentMmMemory` bound is
-satisfiable from a plain `Vec`; a backend with a different memory model
-implements `GuestMemory + CurrentMmMemory` itself.
+The driver shares continuation completion and signal policy with the real
+carrier. It does not poll and redispatch a blocked syscall until it happens to
+succeed. `WAIT_BOUND` is five seconds; a missing wake is a named timeout.
+Signals that need no guest handler and kernel timer waits can be tested without
+an instruction stream. Process fork copies memory; threads share the process's
+dispatcher and address space and use their own kernel thread context.
 
-## The outcomes it interprets
+## Boundaries
 
-| Outcome | Here |
-|---|---|
-| `Returned` / `Errno` | The syscall's value; an errno fails the run (a scripted task has nothing to do with one). |
-| `Exit` | `on_exit`: retire the process's fds, publish the zombie with `(code & 0xff) << 8`. |
-| `Fork` | `on_fork`: a plain fork only. `CLONE_PIDFD`, `CLONE_PARENT`, tid stores, a child stack and vfork are refused by name rather than half-done. |
-| `WaitOnHvpatchChild` / `WaitOnFds` | Re-dispatch after `yield_now`, bounded by `WAIT_BOUND` (5 s). There is no continuation reactor; a lost wake is a failed run, not a hang. |
-| `SchedulerYield` | Complete with 0 and yield the host thread, the only execution lease this backend holds. |
-| anything else | `ExampleError::Unsupported`, naming the outcome. |
+The harness does not emulate a CPU, execute an image with `execve`, or run guest
+signal handlers. It has no real page tables or frame inventory and no foreign-mm
+endpoint for `process_vm_readv`-style access. Unsupported outcomes fail by name;
+a passing script proves the kernel behavior it actually exercises.
 
-## What it does not do, on purpose
-
-- No signal delivery: a child's exit posts no `SIGCHLD`; the parent's `wait4`
-  observes the zombie directly.
-- No foreign-mm access: `mm_access_authority` is `None`, so
-  `process_vm_readv`-class syscalls have no endpoint.
-- No frame inventory: nothing is mapped, shared or COW-tracked.
-- No `execve`, threads, futexes or timers: the script vocabulary is the six
-  syscalls the proof needs. Adding one is adding a `Sys` variant and, if it
-  can block, an outcome arm in `Task::issue`.
-
-## Status
-
-Experimental, like the kernel it drives. It is not on the product path, the
-`carrick` binary ships none of it, and its API changes with the kernel's.
-That is by construction, not convention: this crate's `test-support`
-dependency on `carrick-kernel`/`carrick-hal` would unify into any build that
-selects it together with `carrick-cli`, so the root manifest's
-`default-members` restricts the product build to `carrick-cli`'s closure and
-`just check-layering` fails if that selection ever enables `test-support`.
+This experimental crate uses public items of `carrick-kernel`, `carrick-hal`,
+`carrick-guest-mem`, and `carrick-abi`. It is outside the product path.
+`just check-layering` excludes runtime/VMM dependencies from the harness and
+keeps its `test-support` dependencies out of the product selection. The root
+manifest's `default-members` selects only `carrick-cli`, preventing accidental
+feature unification into the shipped binary.

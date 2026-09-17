@@ -28,6 +28,34 @@ how-to-run-and-interpret companion.
 
 ---
 
+## Kernel semantics suite
+
+`just test-kernel` is the VM-free inner loop for a kernel conformance defect.
+It runs the kernel lib tests outside `serial_host` and the integration suites in
+[`carrick-kernel-example`](../crates/carrick-kernel-example/README.md). Scripts
+exercise the public syscall dispatcher and kernel-owned waits, process identity,
+and signals. They need no guest binary, codesign, or Docker.
+
+1. Write a semantics test, citing the relevant man-page section or committed
+   Docker oracle next to every expected Linux result. Establish ordering with
+   explicit handshakes or wait enrollment, not sleeps.
+2. Run `just test-kernel` and retain the failing result before fixing the kernel.
+   A timeout is evidence of a missing wake; do not replace parking with polling.
+3. Fix the kernel behavior and rerun the focused test and `just test-kernel`.
+4. Run `just test` to include the serial host cases and the other host suites.
+   The `serial_host` partition preserves host-fork tests and process-wide state
+   checks; the ratchet in `just lint-domains` prevents those cases drifting into
+   the parallel lane.
+5. Run the required signed gates on the final artifact before push:
+   `just conformance-probes`, then `just conformance smoke`, then
+   `just conformance`. Also run `just ci`. Host-semantic results alone are not
+   evidence of real guest execution; retain artifact provenance and cleanup
+   receipts, and never run Carrick and Docker concurrently.
+
+The harness has no CPU execution or guest signal handlers. Its results cover
+kernel semantics exercised by the scripts; guest instruction execution, VMM
+mappings, and runtime integration still require the signed differential gates.
+
 ## CI evidence boundary
 
 Public pull requests run source, ABI, host-only kernel-semantic, and target
