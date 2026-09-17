@@ -4330,7 +4330,13 @@ impl SyscallDispatcher {
 
 /// Decode the Linux wait-status word stored by the in-process process table
 /// into the `si_code`/`si_status` pair returned by `waitid(2)`.
-pub(crate) fn hvpatch_waitid_exit_fields(wait_status: i32) -> (i32, i32) {
+///
+/// Ptrace stops report `CLD_TRAPPED` (4) with `si_status = signum`, while ordinary
+/// job-control stops report `CLD_STOPPED` (5) with `si_status = signum`.
+pub(crate) fn hvpatch_waitid_exit_fields(
+    wait_status: i32,
+    stop_kind: Option<crate::kernel::StopKind>,
+) -> (i32, i32) {
     // Job-control statuses are decoded FIRST: their encodings collide with the
     // exited/killed ones. A stop is `(signal << 8) | 0x7f` and a continue is
     // 0xffff (see `ProcessContext::wait_child_with_job_control`), so a stopped
@@ -4344,7 +4350,11 @@ pub(crate) fn hvpatch_waitid_exit_fields(wait_status: i32) -> (i32, i32) {
         return (libc::CLD_CONTINUED, crate::linux_abi::LINUX_SIGCONT);
     }
     if wait_status & 0xff == 0x7f {
-        return (libc::CLD_STOPPED, (wait_status >> 8) & 0xff);
+        let code = match stop_kind {
+            Some(crate::kernel::StopKind::Ptrace) => libc::CLD_TRAPPED,
+            Some(crate::kernel::StopKind::JobControl) | None => libc::CLD_STOPPED,
+        };
+        return (code, (wait_status >> 8) & 0xff);
     }
     let signal = wait_status & 0x7f;
     if signal == 0 {
@@ -4363,7 +4373,7 @@ pub(crate) fn hvpatch_waitid_exit_fields(wait_status: i32) -> (i32, i32) {
 pub fn build_hvpatch_waitid_siginfo(
     exit: crate::kernel::ChildExit,
 ) -> [u8; crate::linux_abi::LINUX_SIGINFO_SIZE] {
-    let (si_code, si_status) = hvpatch_waitid_exit_fields(exit.status());
+    let (si_code, si_status) = hvpatch_waitid_exit_fields(exit.status(), exit.stop_kind());
     build_linux_sigchld_siginfo(exit.visible_pid(), exit.ruid().raw(), si_code, si_status)
 }
 
@@ -7010,11 +7020,28 @@ mod hvpatch_wait_status_tests {
 
     #[test]
     fn hvpatch_waitid_decodes_linux_terminal_wait_status() {
-        assert_eq!(hvpatch_waitid_exit_fields(7 << 8), (libc::CLD_EXITED, 7));
-        assert_eq!(hvpatch_waitid_exit_fields(9), (libc::CLD_KILLED, 9));
+        use crate::kernel::StopKind;
+
         assert_eq!(
-            hvpatch_waitid_exit_fields(11 | 0x80),
+            hvpatch_waitid_exit_fields(7 << 8, None),
+            (libc::CLD_EXITED, 7)
+        );
+        assert_eq!(hvpatch_waitid_exit_fields(9, None), (libc::CLD_KILLED, 9));
+        assert_eq!(
+            hvpatch_waitid_exit_fields(11 | 0x80, None),
             (libc::CLD_DUMPED, 11)
+        );
+        assert_eq!(
+            hvpatch_waitid_exit_fields((libc::SIGSTOP << 8) | 0x7f, Some(StopKind::JobControl)),
+            (libc::CLD_STOPPED, libc::SIGSTOP)
+        );
+        assert_eq!(
+            hvpatch_waitid_exit_fields((libc::SIGSTOP << 8) | 0x7f, Some(StopKind::Ptrace)),
+            (libc::CLD_TRAPPED, libc::SIGSTOP)
+        );
+        assert_eq!(
+            hvpatch_waitid_exit_fields(0xffff, None),
+            (libc::CLD_CONTINUED, crate::linux_abi::LINUX_SIGCONT)
         );
     }
 }

@@ -249,23 +249,63 @@ fn scm_credentials_tracks_multiple_forked_senders_and_preserves_so_peercred() {
         assert_eq!(gid, 0);
     }
 
-    // Verify SCM_CREDENTIALS results: first from PID 2, second from PID 3
+    // Verify SCM_CREDENTIALS results: match each received payload byte (tag iov)
+    // with credentials from that SAME recvmsg (tag control).
+    // Child 1 (PID 2) sent b"1", Child 2 (PID 3) sent b"2". Both must be present
+    // regardless of arrival order.
     let recvmsg_outputs = run.outputs_for("recvmsg");
+    let iov_outputs: Vec<_> = recvmsg_outputs
+        .iter()
+        .filter(|o| o.tag == Some("iov"))
+        .collect();
     let control_outputs: Vec<_> = recvmsg_outputs
-        .into_iter()
+        .iter()
         .filter(|o| o.tag == Some("control"))
         .collect();
-    assert_eq!(control_outputs.len(), 2);
-
-    let pid1 = i32::from_le_bytes(control_outputs[0].bytes[16..20].try_into().unwrap());
-    let pid2 = i32::from_le_bytes(control_outputs[1].bytes[16..20].try_into().unwrap());
+    assert_eq!(iov_outputs.len(), 2, "must receive exactly 2 messages");
     assert_eq!(
-        pid1, 2,
-        "First message credentials must reflect Child 1 (PID 2)"
+        control_outputs.len(),
+        2,
+        "must receive exactly 2 control headers"
     );
-    assert_eq!(
-        pid2, 3,
-        "Second message credentials must reflect Child 2 (PID 3)"
+
+    let mut seen_child1 = false;
+    let mut seen_child2 = false;
+
+    for (iov, control) in iov_outputs.iter().zip(control_outputs.iter()) {
+        assert_eq!(iov.bytes.len(), 1);
+        let pid = i32::from_le_bytes(control.bytes[16..20].try_into().unwrap());
+        let uid = u32::from_le_bytes(control.bytes[20..24].try_into().unwrap());
+        let gid = u32::from_le_bytes(control.bytes[24..28].try_into().unwrap());
+        assert_eq!(uid, 0, "ucred.uid must be 0");
+        assert_eq!(gid, 0, "ucred.gid must be 0");
+
+        match iov.bytes[0] {
+            b'1' => {
+                assert_eq!(
+                    pid, 2,
+                    "Message carrying payload '1' credentials must reflect Child 1 (PID 2)"
+                );
+                seen_child1 = true;
+            }
+            b'2' => {
+                assert_eq!(
+                    pid, 3,
+                    "Message carrying payload '2' credentials must reflect Child 2 (PID 3)"
+                );
+                seen_child2 = true;
+            }
+            other => panic!("Unexpected payload byte: {other}"),
+        }
+    }
+
+    assert!(
+        seen_child1,
+        "Must have received message from Child 1 (PID 2)"
+    );
+    assert!(
+        seen_child2,
+        "Must have received message from Child 2 (PID 3)"
     );
 }
 

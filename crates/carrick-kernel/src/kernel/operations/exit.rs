@@ -1030,7 +1030,7 @@ fn exit_siginfo_for_zombie(zombie: &Zombie) -> Option<carrick_abi::LinuxSiginfo>
         crate::kernel::ids::ChildExitSignal::Signal(signal) => signal,
     };
     let (si_code, si_status) =
-        crate::dispatch::proc::hvpatch_waitid_exit_fields(zombie.status.raw());
+        crate::dispatch::proc::hvpatch_waitid_exit_fields(zombie.status.raw(), None);
     let internal_pid = i32::try_from(zombie.namespace_pid).unwrap_or(0);
     Some(carrick_abi::LinuxSiginfo::child_exit(
         signal.raw(),

@@ -132,6 +132,8 @@ impl ChildWaitPrecheck {
     }
 }
 
+use crate::kernel::StopKind;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WaitOutcome {
     Exited(Zombie),
@@ -139,6 +141,7 @@ pub enum WaitOutcome {
         task: TaskId,
         signal: LinuxSignal,
         ruid: NsUid,
+        kind: StopKind,
     },
     Continued {
         task: TaskId,
@@ -306,11 +309,14 @@ impl Kernel {
                                 false,
                             )
                             .map(|event| match event {
-                                TaskJobControlEvent::Stopped(signal) => WaitOutcome::Stopped {
-                                    task: child_key.id,
-                                    signal,
-                                    ruid: record.task.process_credentials().ruid(),
-                                },
+                                TaskJobControlEvent::Stopped { signal, kind } => {
+                                    WaitOutcome::Stopped {
+                                        task: child_key.id,
+                                        signal,
+                                        ruid: record.task.process_credentials().ruid(),
+                                        kind,
+                                    }
+                                }
                                 TaskJobControlEvent::Continued => WaitOutcome::Continued {
                                     task: child_key.id,
                                     ruid: record.task.process_credentials().ruid(),
@@ -334,11 +340,14 @@ impl Kernel {
                             .task
                             .waitable_job_control_event(true, job_control.continued, false)
                             .map(|event| match event {
-                                TaskJobControlEvent::Stopped(signal) => WaitOutcome::Stopped {
-                                    task: tracee_key.id,
-                                    signal,
-                                    ruid: record.task.process_credentials().ruid(),
-                                },
+                                TaskJobControlEvent::Stopped { signal, kind } => {
+                                    WaitOutcome::Stopped {
+                                        task: tracee_key.id,
+                                        signal,
+                                        ruid: record.task.process_credentials().ruid(),
+                                        kind,
+                                    }
+                                }
                                 TaskJobControlEvent::Continued => WaitOutcome::Continued {
                                     task: tracee_key.id,
                                     ruid: record.task.process_credentials().ruid(),
@@ -534,10 +543,11 @@ impl Kernel {
                             mode == WaitMode::Consume,
                         )
                         .map(|event| match event {
-                            TaskJobControlEvent::Stopped(signal) => WaitOutcome::Stopped {
+                            TaskJobControlEvent::Stopped { signal, kind } => WaitOutcome::Stopped {
                                 task: child_key.id,
                                 signal,
                                 ruid: record.task.process_credentials().ruid(),
+                                kind,
                             },
                             TaskJobControlEvent::Continued => WaitOutcome::Continued {
                                 task: child_key.id,
@@ -567,10 +577,11 @@ impl Kernel {
                             mode == WaitMode::Consume,
                         )
                         .map(|event| match event {
-                            TaskJobControlEvent::Stopped(signal) => WaitOutcome::Stopped {
+                            TaskJobControlEvent::Stopped { signal, kind } => WaitOutcome::Stopped {
                                 task: tracee_key.id,
                                 signal,
                                 ruid: record.task.process_credentials().ruid(),
+                                kind,
                             },
                             TaskJobControlEvent::Continued => WaitOutcome::Continued {
                                 task: tracee_key.id,

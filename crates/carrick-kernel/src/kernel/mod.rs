@@ -129,7 +129,7 @@ pub(crate) use operations::{CloseRangeUnshare, TtyControlError};
 pub use operations::{ExactSignalTargetAuthorization, ExactThreadSignalPost};
 pub use process_lifecycle::ProcessThreadExit;
 pub(crate) use process_lifecycle::RetiredThreadResources;
-pub use process_lifecycle::{ChildExit, WaitResult, identity_operation_errno};
+pub use process_lifecycle::{ChildExit, StopKind, WaitResult, identity_operation_errno};
 pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,
     TaskReservation, ThreadClaim, ThreadReservation,

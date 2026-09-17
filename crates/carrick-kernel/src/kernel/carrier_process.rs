@@ -285,16 +285,16 @@ fn wait_result<P: CarrierProcess + ?Sized>(
         // job-control event as "still running" DISCARDS it. Render the
         // wait-status encoding and let the caller decide whether it asked
         // for it.
-        Ok(crate::kernel::WaitOutcome::Stopped { task, signal, ruid }) => {
+        Ok(crate::kernel::WaitOutcome::Stopped {
+            task,
+            signal,
+            ruid,
+            kind,
+        }) => {
             let Some(visible_pid) = visible_task_id(process, task) else {
                 return WaitResult::NoChild;
             };
-            WaitResult::StateChanged(ChildExit::new(
-                task,
-                visible_pid,
-                ruid,
-                (signal.raw() << 8) | 0x7f,
-            ))
+            WaitResult::StateChanged(ChildExit::stopped(task, visible_pid, ruid, signal, kind))
         }
         Ok(crate::kernel::WaitOutcome::Continued { task, ruid }) => {
             let Some(visible_pid) = visible_task_id(process, task) else {
