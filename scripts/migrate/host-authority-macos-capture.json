@@ -3376,15 +3376,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 16431,
-        "byte_start": 16414,
+        "byte_end": 16287,
+        "byte_start": 16270,
         "column": 34,
         "column_end": 51,
         "column_start": 34,
         "file": "crates/carrick-kernel/src/dispatch/fs/access.rs",
-        "line": 379,
-        "line_end": 379,
-        "line_start": 379
+        "line": 377,
+        "line_end": 377,
+        "line_start": 377
       }
     },
     {
@@ -11627,9 +11627,9 @@
       }
     }
   ],
-  "rows_sha256": "66a9dc2726aabe00d090868fa9388beacd5ab19b0c3f3a2d65fd035da6b4bf0f",
+  "rows_sha256": "982b3b3474eaa649593f3fbe386d85604b59a4425d4486d83fb3fd009b361ee6",
   "schema": 1,
-  "source_head": "8360bb7220d6f8356d88e1af1ec4e4953ae6f4e1",
+  "source_head": "f1f127fe8de2de49f42208e4fe667060a34dd32a",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
