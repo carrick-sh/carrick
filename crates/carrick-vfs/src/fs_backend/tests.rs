@@ -3093,4 +3093,59 @@ mod serial_host {
             );
         }
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_name_matches_on_disk_bounds_directory_entry_visits_with_siblings() {
+        let (b, _scratch) = host_backend();
+        b.make_dir("/wide_unicode").unwrap();
+        for i in 0..200 {
+            let path = format!("/wide_unicode/sibling_{i:04}.txt");
+            b.create_file(&path).unwrap();
+        }
+        b.create_file("/wide_unicode/café").unwrap();
+
+        b.reset_name_validation_dir_entries();
+
+        assert!(
+            b.name_matches_on_disk(Path::new("wide_unicode/café")),
+            "exact on-disk NFC name must match"
+        );
+
+        let visits = b.name_validation_dir_entries();
+        assert_eq!(
+            visits, 0,
+            "macOS single-leaf query must visit 0 directory entries (got {visits})"
+        );
+
+        assert!(
+            !b.name_matches_on_disk(Path::new("wide_unicode/cafe\u{0301}")),
+            "NFD alias must not match NFC stored file"
+        );
+
+        assert!(
+            !b.name_matches_on_disk(Path::new("wide_unicode/nonexistent_é")),
+            "non-existent leaf must return false"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_name_matches_on_disk_hardlinks_symlinks_directories() {
+        let (b, _scratch) = host_backend();
+        b.make_dir("/hl_dir").unwrap();
+        b.create_file("/hl_dir/f_é").unwrap();
+        b.hard_link("/hl_dir/f_é", "/hl_dir/hl_é").unwrap();
+
+        assert!(b.name_matches_on_disk(Path::new("hl_dir/hl_é")));
+        assert!(!b.name_matches_on_disk(Path::new("hl_dir/hl_e\u{0301}")));
+
+        b.symlink("f_é", "/hl_dir/sym_é").unwrap();
+        assert!(b.name_matches_on_disk(Path::new("hl_dir/sym_é")));
+        assert!(!b.name_matches_on_disk(Path::new("hl_dir/sym_e\u{0301}")));
+
+        b.make_dir("/hl_dir/sub_é").unwrap();
+        assert!(b.name_matches_on_disk(Path::new("hl_dir/sub_é")));
+        assert!(!b.name_matches_on_disk(Path::new("hl_dir/sub_e\u{0301}")));
+    }
 }

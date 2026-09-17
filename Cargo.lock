@@ -592,7 +592,9 @@ dependencies = [
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-kernel",
+ "carrick-vfs",
  "parking_lot",
+ "tempfile",
  "thiserror",
 ]
 
