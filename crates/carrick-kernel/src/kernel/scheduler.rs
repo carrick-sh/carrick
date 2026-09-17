@@ -4338,7 +4338,8 @@ mod tests {
 
     use super::{
         CpuAffinity, ExecutorBinding, ExecutorKick, ExecutorKickToken, GuestCpuId, GuestCpuPolicy,
-        QueueKey, RunQueueError, Scheduler, TrapError, WakeDisposition,
+        QueueKey, RunQueueError, Scheduler, SchedulerGenerationObserver,
+        SchedulerGenerationTransition, SettlementDisposition, TrapError, WakeDisposition,
     };
     use crate::compat::SyscallArgs;
     use crate::dispatch::SyscallRequest;
@@ -6754,83 +6755,6 @@ mod tests {
         }
     }
 
-    /// A thread that is merely ABSENT from the exact scheduler registry is not
-    /// a reaped thread: the kernel graph has no zombie and no retirement for
-    /// it, so nothing proves that generation will never run again. Round 4
-    /// called that shape a reap, retired a reachable authority and published
-    /// nothing — RED here as `retired = [(thread, generation)]` and no abort
-    /// request. It is now a lost exact transition, which ends the carrier
-    /// through lane B's sink with a post-mortem that names the thread, both
-    /// generations and both kernel views.
-    #[test]
-    fn an_absent_but_non_terminal_target_is_a_lost_transition_not_a_reap() {
-        let (kernel, root) = bootstrap(12_413);
-        publish(&root, 83);
-        let scheduler = Scheduler::new(Arc::clone(&kernel));
-        let key = root.thread().key();
-        let generation = root
-            .thread()
-            .execution_state()
-            .generation()
-            .expect("published root generation");
-        let executor = scheduler
-            .register_executor(Arc::new(RecordingKick::default()) as Arc<dyn ExecutorKick>)
-            .unwrap();
-        let authority = scheduler.admit_root(key, generation).unwrap();
-        scheduler.make_runnable(key).unwrap();
-        authority
-            .publish(&scheduler, Arc::clone(root.thread()))
-            .expect("activation publishes the admitted row");
-        let running = scheduler.take(&executor).unwrap();
-        let claimed_generation = running.generation();
-
-        let observer = Arc::new(RecordDroppingObserver {
-            kernel: Arc::clone(&kernel),
-            task: root.thread().task_key().id,
-            on_kind: super::SchedulerGenerationTransition::Runnable,
-            held: parking_lot::Mutex::new(BTreeMap::from([((key, claimed_generation), authority)])),
-            retired: parking_lot::Mutex::new(Vec::new()),
-        });
-        scheduler
-            .install_generation_observer(
-                Arc::clone(&observer) as Arc<dyn super::SchedulerGenerationObserver>
-            )
-            .unwrap();
-
-        // The settlement still FINISHES: an abandoned transaction leaves the
-        // executor bound with the claim unfinished, which is a second failure
-        // on top of the first.
-        let disposition = scheduler
-            .settle_runnable_successor(running)
-            .expect("the settlement itself always finishes");
-        assert_eq!(
-            disposition,
-            super::SettlementDisposition::LostExactTransition
-        );
-
-        assert!(
-            observer.retired.lock().is_empty(),
-            "a reachable generation's authority is not the scheduler's to retire"
-        );
-        let reason = crate::kernel::debug::take_abort_request()
-            .expect("a lost exact transition ends the carrier through the post-mortem sink");
-        match reason {
-            crate::kernel::debug::AbortReason::LostExactTransition {
-                tid,
-                serial,
-                predecessor,
-                successor,
-                ..
-            } => {
-                assert_eq!(tid, key.tid.raw());
-                assert_eq!(serial, key.serial.raw());
-                assert_eq!(predecessor, claimed_generation.raw());
-                assert_eq!(successor, claimed_generation.raw() + 1);
-            }
-            other => panic!("wrong abort reason: {other:?}"),
-        }
-    }
-
     /// A wake whose target is reaped in flight must leave NOTHING holding the
     /// queue open. `reap_task_record_for_test` retires the task's threads the
     /// way a real reap does, so the kernel graph can still prove the target
@@ -7538,5 +7462,87 @@ mod tests {
         assert_eq!(expected, 0);
         assert_eq!(observed, 0);
         assert_eq!(lifecycle, super::QueueLifecycle::Closed);
+    }
+    mod serial_host {
+        use super::*;
+        /// A thread that is merely ABSENT from the exact scheduler registry is not
+        /// a reaped thread: the kernel graph has no zombie and no retirement for
+        /// it, so nothing proves that generation will never run again. Round 4
+        /// called that shape a reap, retired a reachable authority and published
+        /// nothing — RED here as `retired = [(thread, generation)]` and no abort
+        /// request. It is now a lost exact transition, which ends the carrier
+        /// through lane B's sink with a post-mortem that names the thread, both
+        /// generations and both kernel views.
+        #[test]
+        fn an_absent_but_non_terminal_target_is_a_lost_transition_not_a_reap() {
+            let (kernel, root) = bootstrap(12_413);
+            publish(&root, 83);
+            let scheduler = Scheduler::new(Arc::clone(&kernel));
+            let key = root.thread().key();
+            let generation = root
+                .thread()
+                .execution_state()
+                .generation()
+                .expect("published root generation");
+            let executor = scheduler
+                .register_executor(Arc::new(RecordingKick::default()) as Arc<dyn ExecutorKick>)
+                .unwrap();
+            let authority = scheduler.admit_root(key, generation).unwrap();
+            scheduler.make_runnable(key).unwrap();
+            authority
+                .publish(&scheduler, Arc::clone(root.thread()))
+                .expect("activation publishes the admitted row");
+            let running = scheduler.take(&executor).unwrap();
+            let claimed_generation = running.generation();
+
+            let observer = Arc::new(RecordDroppingObserver {
+                kernel: Arc::clone(&kernel),
+                task: root.thread().task_key().id,
+                on_kind: super::SchedulerGenerationTransition::Runnable,
+                held: parking_lot::Mutex::new(BTreeMap::from([(
+                    (key, claimed_generation),
+                    authority,
+                )])),
+                retired: parking_lot::Mutex::new(Vec::new()),
+            });
+            scheduler
+                .install_generation_observer(
+                    Arc::clone(&observer) as Arc<dyn super::SchedulerGenerationObserver>
+                )
+                .unwrap();
+
+            // The settlement still FINISHES: an abandoned transaction leaves the
+            // executor bound with the claim unfinished, which is a second failure
+            // on top of the first.
+            let disposition = scheduler
+                .settle_runnable_successor(running)
+                .expect("the settlement itself always finishes");
+            assert_eq!(
+                disposition,
+                super::SettlementDisposition::LostExactTransition
+            );
+
+            assert!(
+                observer.retired.lock().is_empty(),
+                "a reachable generation's authority is not the scheduler's to retire"
+            );
+            let reason = crate::kernel::debug::take_abort_request()
+                .expect("a lost exact transition ends the carrier through the post-mortem sink");
+            match reason {
+                crate::kernel::debug::AbortReason::LostExactTransition {
+                    tid,
+                    serial,
+                    predecessor,
+                    successor,
+                    ..
+                } => {
+                    assert_eq!(tid, key.tid.raw());
+                    assert_eq!(serial, key.serial.raw());
+                    assert_eq!(predecessor, claimed_generation.raw());
+                    assert_eq!(successor, claimed_generation.raw() + 1);
+                }
+                other => panic!("wrong abort reason: {other:?}"),
+            }
+        }
     }
 }

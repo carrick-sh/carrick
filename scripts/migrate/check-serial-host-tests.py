@@ -29,6 +29,10 @@ Token = _MOD.Token
 ROOTS = ("crates/carrick-kernel/src", "crates/carrick-vfs/src")
 
 DIRECT_PATTERNS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
+    # A closed descriptor number can be reused by any concurrently opening test.
+    ("closed host fd probe", (("F_GETFD", ")", "}", ",", "-", "1"),)),
+    ("take_abort_request", (("take_abort_request",),)),
+    ("reset_for_tests", (("reset_for_tests",),)),
     ("libc::fork", (("libc", "::", "fork"),)),
     ("Command::new", (("Command", "::", "new"), ("process", "::", "Command", "::", "new"))),
     ("Command::spawn", (("Command", "::", "spawn"),)),
@@ -204,6 +208,11 @@ def scan_source(path_str: str, source: str) -> list[str]:
                                         if body_tokens[b_i + k].text != seq[k]:
                                             match = False
                                             break
+                                    if match and pat_name == "closed host fd probe":
+                                        # The same token suffix occurs in assert_ne! on a live fd.
+                                        assertion = next((t.text for t in reversed(body_tokens[:b_i])
+                                                          if t.text in ("assert_eq", "assert_ne")), None)
+                                        match = assertion == "assert_eq"
                                     if match:
                                         fn_item.direct_violations.append((b_tok.line, pat_name))
 
@@ -250,7 +259,7 @@ def scan_source(path_str: str, source: str) -> list[str]:
     while changed:
         changed = False
         for f in fns:
-            if f.name not in serial_helpers and (f.is_test_mod or f.is_test or f.is_serial_host):
+            if f.qual_name not in serial_helpers and (f.is_test_mod or f.is_test or f.is_serial_host):
                 for call in f.calls:
                     if call in serial_helpers:
                         sub_reason = serial_helpers[call]
@@ -258,6 +267,10 @@ def scan_source(path_str: str, source: str) -> list[str]:
                         if f.name not in TRAIT_METHODS:
                             serial_helpers[f.name] = desc
                         serial_helpers[f.qual_name] = desc
+                        if "::" in f.qual_name:
+                            struct_name = f.qual_name.split("::")[0]
+                            if struct_name not in serial_helpers:
+                                serial_helpers[struct_name] = f"instantiates {struct_name} (which {desc})"
                         changed = True
                         break
 
@@ -285,6 +298,8 @@ def scan_source(path_str: str, source: str) -> list[str]:
 def run_self_tests() -> int:
     """Validate scanner against comprehensive test fixtures."""
     fixtures = [
+        ("fail_closed_fd_probe", "#[test]\nfn t() { assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1); }\n", True),
+        ("pass_live_fd_probe", "#[test]\nfn t() { assert_ne!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1); }\n", False),
         ("pass_clean_test", "#[test]\nfn t() { assert_eq!(1, 1); }\n", False),
         ("fail_unguarded_fork", "#[test]\nfn t() { unsafe { libc::fork() }; }\n", True),
         ("pass_serial_fork", "mod serial_host {\n#[test]\nfn t() { unsafe { libc::fork() }; }\n}\n", False),
@@ -351,6 +366,11 @@ def run_self_tests() -> int:
         (
             "fail_multi_hop_helper",
             "#[cfg(test)]\nmod tests {\nfn leaf() { libc::fork(); }\nfn mid() { leaf(); }\n#[test]\nfn t() { mid(); }\n}\n",
+            True,
+        ),
+        (
+            "fail_drop_calls_fork_helper",
+            "#[cfg(test)]\nmod tests {\nstruct DropFork;\nimpl Drop for DropFork {\nfn drop(&mut self) { fork_helper(); }\n}\nfn fork_helper() { unsafe { libc::fork() }; }\n#[test]\nfn t() { let _d = DropFork {}; }\n}\n",
             True,
         ),
     ]

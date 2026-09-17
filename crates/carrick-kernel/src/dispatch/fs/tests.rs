@@ -1316,36 +1316,6 @@ fn stat_following_final_symlink_cycle_returns_eloop() {
     );
 }
 
-/// Cached-lower form of the walk fixture: the immutable image tree is a
-/// real host directory and the writable host overlay starts sparse.
-#[cfg(target_os = "macos")]
-fn trusted_lower_lane_fixture() -> (tempfile::TempDir, tempfile::TempDir, SyscallDispatcher) {
-    let lower = tempfile::tempdir().unwrap();
-    let upper = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(lower.path().join("walk/sub")).unwrap();
-    std::fs::write(lower.path().join("walk/file.txt"), b"lower file").unwrap();
-    std::fs::write(lower.path().join("walk/sub/deep.txt"), b"deep").unwrap();
-    std::os::unix::fs::symlink("file.txt", lower.path().join("walk/link")).unwrap();
-    let lower_metadata = carrick_vfs::fs_backend::HostFsBackend::attach(lower.path()).unwrap();
-    lower_metadata.set_mode("/walk/file.txt", 0o4711).unwrap();
-    lower_metadata
-        .set_owner(
-            "/walk/file.txt",
-            Some(carrick_abi::NsUid::new(7)),
-            Some(carrick_abi::NsGid::new(9)),
-        )
-        .unwrap();
-    drop(lower_metadata);
-
-    let rootfs = RootFs::from_immutable_host_dir(lower.path()).unwrap();
-    let mut overlay = carrick_vfs::fs_backend::HostFsBackend::from_path(upper.path()).unwrap();
-    overlay.enable_sparse_upper_fast_miss();
-    let mut dispatcher = SyscallDispatcher::new();
-    dispatcher.set_fs_backend(Box::new(overlay));
-    dispatcher.set_rootfs_layer(rootfs);
-    (lower, upper, dispatcher)
-}
-
 #[cfg(target_os = "macos")]
 fn lane_syscall(
     dispatcher: &mut SyscallDispatcher,
@@ -1530,228 +1500,6 @@ fn trusted_dirfd_lane_serves_walk_and_recurses() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn trusted_immutable_lower_serves_walk_recursively_while_upper_is_unchanged() {
-    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
-    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
-
-    let root = lane_openat(
-        &mut dispatcher,
-        &mut memory,
-        LINUX_AT_FDCWD,
-        "/walk",
-        LINUX_O_DIRECTORY,
-    );
-    assert!(root >= 0, "open lower /walk: {root}");
-    assert!(
-        lane_dir_is_trusted(&dispatcher, root),
-        "an upper-absent immutable-lower directory must seed the trusted lane"
-    );
-
-    let sub = lane_openat(
-        &mut dispatcher,
-        &mut memory,
-        root as u64,
-        "sub",
-        LINUX_O_DIRECTORY,
-    );
-    assert!(sub >= 0, "open lower sub: {sub}");
-    assert!(
-        lane_dir_is_trusted(&dispatcher, sub),
-        "unchanged sparse-upper state must propagate lower trust"
-    );
-
-    let file = lane_openat(&mut dispatcher, &mut memory, sub as u64, "deep.txt", 0);
-    assert!(file >= 0, "open lower deep.txt: {file}");
-    let n = lane_syscall(
-        &mut dispatcher,
-        &mut memory,
-        63,
-        [file as u64, 0x9000, 64, 0, 0, 0],
-    );
-    assert_eq!(n, 4);
-    assert_eq!(memory.read_bytes(0x9000, 4).unwrap(), b"deep");
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn trusted_immutable_lower_falls_back_after_an_upper_shadow() {
-    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
-    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
-    let root = lane_openat(
-        &mut dispatcher,
-        &mut memory,
-        LINUX_AT_FDCWD,
-        "/walk",
-        LINUX_O_DIRECTORY,
-    );
-    assert!(root >= 0 && lane_dir_is_trusted(&dispatcher, root));
-
-    dispatcher
-        .fs
-        .rootfs_vfs
-        .overlay
-        .set_file_contents("/walk/file.txt", b"upper file".to_vec())
-        .unwrap();
-
-    let file = lane_openat(&mut dispatcher, &mut memory, root as u64, "file.txt", 0);
-    assert!(file >= 0, "open upper shadow through lower dirfd: {file}");
-    let n = lane_syscall(
-        &mut dispatcher,
-        &mut memory,
-        63,
-        [file as u64, 0x9000, 64, 0, 0, 0],
-    );
-    assert_eq!(n, 10);
-    assert_eq!(
-        memory.read_bytes(0x9000, 10).unwrap(),
-        b"upper file",
-        "a stale lower anchor must not bypass the writable shadow"
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn trusted_immutable_lower_stat_preserves_layered_guest_identity() {
-    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
-    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
-    let root = lane_openat(
-        &mut dispatcher,
-        &mut memory,
-        LINUX_AT_FDCWD,
-        "/walk",
-        LINUX_O_DIRECTORY,
-    );
-    assert!(root >= 0 && lane_dir_is_trusted(&dispatcher, root));
-
-    let fast = dispatcher
-        .path_stat_record(
-            &dispatcher.exact_signal_context_for_test(),
-            root as u64,
-            "file.txt",
-            LINUX_AT_SYMLINK_NOFOLLOW,
-        )
-        .unwrap();
-    let slow = dispatcher
-        .path_stat_record(
-            &dispatcher.exact_signal_context_for_test(),
-            LINUX_AT_FDCWD,
-            "/walk/file.txt",
-            LINUX_AT_SYMLINK_NOFOLLOW,
-        )
-        .unwrap();
-    assert_eq!(fast, slow, "trusted lower stat must equal layered stat");
-    assert_eq!(fast.mode & 0o7777, 0o4711);
-}
-
-/// LTP `creat05` shape: the test `mkdir`s its own scratch directory (which
-/// only the WRITABLE upper holds — the immutable lower never had it), fills
-/// it with thousands of files, and then `open(O_DIRECTORY)`s it through the
-/// harness. An upper-only directory under an immutable lower must seed the
-/// trusted lane exactly like a lower-only one: the lower's absence is
-/// permanent, so the upper dirfd IS the merged namespace for that subtree.
-/// Before this landed the open fell to the layered path and enumerated
-/// every child (fstatat + open + flistxattr + close each) on EVERY open.
-#[cfg(target_os = "macos")]
-#[test]
-fn trusted_upper_only_directory_seeds_the_lane_and_streams() {
-    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
-    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
-
-    memory.write_bytes(0x4200, b"/walk/scratch\0").unwrap();
-    let mk = lane_syscall(
-        &mut dispatcher,
-        &mut memory,
-        34,
-        [LINUX_AT_FDCWD, 0x4200, 0o755, 0, 0, 0],
-    );
-    assert_eq!(mk, 0, "mkdirat /walk/scratch: {mk}");
-    for name in ["a.txt", "b.txt"] {
-        let fd = lane_openat(
-            &mut dispatcher,
-            &mut memory,
-            LINUX_AT_FDCWD,
-            &format!("/walk/scratch/{name}"),
-            LINUX_O_CREAT | LINUX_O_WRONLY,
-        );
-        assert!(fd >= 0, "create {name}: {fd}");
-        memory.write_bytes(0x9000, name.as_bytes()).unwrap();
-        let n = lane_syscall(
-            &mut dispatcher,
-            &mut memory,
-            64,
-            [fd as u64, 0x9000, name.len() as u64, 0, 0, 0],
-        );
-        assert_eq!(n, name.len() as i64);
-        assert_eq!(
-            lane_syscall(&mut dispatcher, &mut memory, 57, [fd as u64, 0, 0, 0, 0, 0]),
-            0
-        );
-    }
-
-    let dir = lane_openat(
-        &mut dispatcher,
-        &mut memory,
-        LINUX_AT_FDCWD,
-        "/walk/scratch",
-        LINUX_O_DIRECTORY,
-    );
-    assert!(dir >= 0, "open upper-only /walk/scratch: {dir}");
-    assert!(
-        lane_dir_is_trusted(&dispatcher, dir),
-        "an upper-only directory whose lower is permanently absent must seed the trusted lane"
-    );
-
-    // Children resolve through the upper dirfd.
-    let file = lane_openat(&mut dispatcher, &mut memory, dir as u64, "a.txt", 0);
-    assert!(file >= 0, "open a.txt through the upper dirfd: {file}");
-    let n = lane_syscall(
-        &mut dispatcher,
-        &mut memory,
-        63,
-        [file as u64, 0x9100, 64, 0, 0, 0],
-    );
-    assert_eq!(n, 5);
-    assert_eq!(memory.read_bytes(0x9100, 5).unwrap(), b"a.txt");
-    let missing = lane_openat(&mut dispatcher, &mut memory, dir as u64, "nope", 0);
-    assert_eq!(missing, -i64::from(LINUX_ENOENT.get()));
-
-    // The listing equals the layered truth.
-    let mut streamed = lane_getdents(&mut dispatcher, &mut memory, dir);
-    streamed.retain(|(n, _)| n != "." && n != "..");
-    streamed.sort();
-    let mut layered: Vec<(String, u8)> = carrick_vfs::overlay::layered_directory_entries(
-        dispatcher.fs.rootfs_vfs.overlay.as_ref(),
-        dispatcher.fs.rootfs_vfs.rootfs.as_ref(),
-        "/walk/scratch",
-    )
-    .unwrap()
-    .into_iter()
-    .map(|e| (e.name, linux_dirent_type(e.metadata.kind)))
-    .collect();
-    layered.sort();
-    assert_eq!(streamed, layered);
-    assert_eq!(streamed.len(), 2);
-
-    // A MERGED directory (lower + upper contributions) still takes the
-    // exact layered path: /walk itself now has an upper child.
-    let merged = lane_openat(
-        &mut dispatcher,
-        &mut memory,
-        LINUX_AT_FDCWD,
-        "/walk",
-        LINUX_O_DIRECTORY,
-    );
-    assert!(merged >= 0);
-    let mut listed = lane_getdents(&mut dispatcher, &mut memory, merged);
-    listed.retain(|(n, _)| n != "." && n != "..");
-    let names: Vec<&str> = listed.iter().map(|(n, _)| n.as_str()).collect();
-    assert!(names.contains(&"scratch"), "{names:?}");
-    assert!(names.contains(&"file.txt"), "{names:?}");
-    assert!(names.contains(&"sub"), "{names:?}");
-}
-
-#[cfg(target_os = "macos")]
-#[test]
 fn host_mkdirat_existing_root_returns_eexist() {
     let (_scratch, mut dispatcher) = trusted_lane_fixture();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
@@ -1770,502 +1518,891 @@ fn host_mkdirat_existing_root_returns_eexist() {
     }
 }
 
-#[cfg(target_os = "macos")]
-#[test]
-fn test_mkdirat_under_resolved_parent_zero_openat_budget() {
-    let (_scratch, mut dispatcher) = trusted_lane_fixture();
-    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+mod serial_host {
+    use super::*;
 
-    // Warm up / resolve parent directory fd in dentry cache
-    let parent_dfd = lane_openat(
-        &mut dispatcher,
-        &mut memory,
-        LINUX_AT_FDCWD,
-        "/walk",
-        LINUX_O_RDONLY | LINUX_O_DIRECTORY,
-    );
-    assert!(parent_dfd >= 0, "open /walk: {parent_dfd}");
+    /// Cached-lower form of the walk fixture: the immutable image tree is a
+    /// real host directory and the writable host overlay starts sparse.
+    #[cfg(target_os = "macos")]
+    fn trusted_lower_lane_fixture() -> (tempfile::TempDir, tempfile::TempDir, SyscallDispatcher) {
+        let lower = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(lower.path().join("walk/sub")).unwrap();
+        std::fs::write(lower.path().join("walk/file.txt"), b"lower file").unwrap();
+        std::fs::write(lower.path().join("walk/sub/deep.txt"), b"deep").unwrap();
+        std::os::unix::fs::symlink("file.txt", lower.path().join("walk/link")).unwrap();
+        let lower_metadata = carrick_vfs::fs_backend::HostFsBackend::attach(lower.path()).unwrap();
+        lower_metadata.set_mode("/walk/file.txt", 0o4711).unwrap();
+        lower_metadata
+            .set_owner(
+                "/walk/file.txt",
+                Some(carrick_abi::NsUid::new(7)),
+                Some(carrick_abi::NsGid::new(9)),
+            )
+            .unwrap();
+        drop(lower_metadata);
 
-    carrick_vfs::fs_backend::host::reset_test_host_openat_count();
-    carrick_vfs::fs_backend::host::reset_test_host_stat_count();
-
-    memory.write_bytes(0x4200, b"new_child\0").unwrap();
-    let mk = lane_syscall(
-        &mut dispatcher,
-        &mut memory,
-        34, // mkdirat
-        [parent_dfd as u64, 0x4200, 0o755, 0, 0, 0],
-    );
-    assert_eq!(mk, 0, "mkdirat /walk/new_child: {mk}");
-
-    let opens = carrick_vfs::fs_backend::host::test_host_openat_count();
-    let stats = carrick_vfs::fs_backend::host::test_host_stat_count();
-
-    assert_eq!(
-        opens, 0,
-        "mkdirat under resolved parent issued {opens} host openat calls (budget 0)"
-    );
-    // Exact, not a bound: the budget is the single `libc::fstatat` in
-    // `RootFsVfs::mkdir_admitted` that probes the leaf for an existing entry.
-    // `<= 1` silently accepted 0 when that counter was compiled out of
-    // carrick-vfs, so a regression that adds a counted stat here must fail.
-    assert_eq!(
-        stats, 1,
-        "mkdirat under resolved parent issued {stats} host stat calls (budget 1)"
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn test_guest_openat_1000_files_in_one_dir_host_openat_budget() {
-    let (_lower, scratch, mut dispatcher) = trusted_lower_lane_fixture();
-    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
-
-    std::fs::create_dir_all(scratch.path().join("walk")).unwrap();
-
-    for i in 0..1000 {
-        std::fs::write(
-            scratch.path().join("walk").join(format!("f_{i:04}")),
-            b"hello",
-        )
-        .unwrap();
+        let rootfs = RootFs::from_immutable_host_dir(lower.path()).unwrap();
+        let mut overlay = carrick_vfs::fs_backend::HostFsBackend::from_path(upper.path()).unwrap();
+        overlay.enable_sparse_upper_fast_miss();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(overlay));
+        dispatcher.set_rootfs_layer(rootfs);
+        (lower, upper, dispatcher)
     }
 
-    carrick_vfs::fs_backend::host::reset_test_host_openat_count();
-    for i in 0..1000 {
-        let fd = lane_openat(
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trusted_immutable_lower_serves_walk_recursively_while_upper_is_unchanged() {
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+        let root = lane_openat(
             &mut dispatcher,
             &mut memory,
             LINUX_AT_FDCWD,
-            &format!("/walk/f_{i:04}"),
-            LINUX_O_RDONLY | carrick_abi::LINUX_O_NOFOLLOW,
+            "/walk",
+            LINUX_O_DIRECTORY,
         );
-        assert!(fd >= 0, "open failed: {fd}");
-    }
-    let opens = carrick_vfs::fs_backend::host::test_host_openat_count();
-    assert!(
-        opens <= 1002,
-        "1,000 guest opens issued {opens} host_openat calls (budget <= 1002)"
-    );
-}
-
-/// A directory listing is taken when the guest READS it, not when it opens
-/// it (Linux `getdents64` walks the live dentry tree; `rewinddir` re-reads).
-/// Two consequences the old open-time snapshot got wrong — and one cost:
-/// every `open(O_DIRECTORY)` walk anchor paid a full enumeration (O(n)
-/// stats) whether or not the guest ever listed it, which is what put
-/// `creat05` at 8x the oracle.
-#[cfg(target_os = "macos")]
-#[test]
-fn directory_listing_is_taken_at_read_time_not_open_time() {
-    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
-    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
-    // Shadow a lower file so /walk is a MERGED directory that cannot take
-    // the trusted lane.
-    dispatcher
-        .fs
-        .rootfs_vfs
-        .overlay
-        .set_file_contents("/walk/file.txt", b"upper".to_vec())
-        .unwrap();
-    let dir = lane_openat(
-        &mut dispatcher,
-        &mut memory,
-        LINUX_AT_FDCWD,
-        "/walk",
-        LINUX_O_DIRECTORY,
-    );
-    assert!(dir >= 0);
-    assert!(!lane_dir_is_trusted(&dispatcher, dir));
-    {
-        let open_file = dispatcher.open_file(dir as i32).unwrap();
-        let open = open_file.description.read().unwrap();
-        let OpenDescription::Directory { listing, .. } = &*open else {
-            panic!("expected a directory description");
-        };
+        assert!(root >= 0, "open lower /walk: {root}");
         assert!(
-            matches!(listing, DirListing::Pending),
-            "open(O_DIRECTORY) must not enumerate the directory: {listing:?}"
+            lane_dir_is_trusted(&dispatcher, root),
+            "an upper-absent immutable-lower directory must seed the trusted lane"
+        );
+
+        let sub = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            root as u64,
+            "sub",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(sub >= 0, "open lower sub: {sub}");
+        assert!(
+            lane_dir_is_trusted(&dispatcher, sub),
+            "unchanged sparse-upper state must propagate lower trust"
+        );
+
+        let file = lane_openat(&mut dispatcher, &mut memory, sub as u64, "deep.txt", 0);
+        assert!(file >= 0, "open lower deep.txt: {file}");
+        let n = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            63,
+            [file as u64, 0x9000, 64, 0, 0, 0],
+        );
+        assert_eq!(n, 4);
+        assert_eq!(memory.read_bytes(0x9000, 4).unwrap(), b"deep");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trusted_immutable_lower_falls_back_after_an_upper_shadow() {
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        let root = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/walk",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(root >= 0 && lane_dir_is_trusted(&dispatcher, root));
+
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents("/walk/file.txt", b"upper file".to_vec())
+            .unwrap();
+
+        let file = lane_openat(&mut dispatcher, &mut memory, root as u64, "file.txt", 0);
+        assert!(file >= 0, "open upper shadow through lower dirfd: {file}");
+        let n = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            63,
+            [file as u64, 0x9000, 64, 0, 0, 0],
+        );
+        assert_eq!(n, 10);
+        assert_eq!(
+            memory.read_bytes(0x9000, 10).unwrap(),
+            b"upper file",
+            "a stale lower anchor must not bypass the writable shadow"
         );
     }
 
-    // Created AFTER the open, BEFORE the first read: visible (Linux).
-    dispatcher
-        .fs
-        .rootfs_vfs
-        .overlay
-        .set_file_contents("/walk/after-open.txt", b"x".to_vec())
-        .unwrap();
-    let first = lane_getdents(&mut dispatcher, &mut memory, dir);
-    assert!(
-        first.iter().any(|(n, _)| n == "after-open.txt"),
-        "a child created before the first getdents must be listed: {first:?}"
-    );
-    assert!(first.iter().any(|(n, _)| n == "file.txt"));
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trusted_immutable_lower_stat_preserves_layered_guest_identity() {
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        let root = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/walk",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(root >= 0 && lane_dir_is_trusted(&dispatcher, root));
 
-    // Created after the first drain: visible after a rewind (rewinddir).
-    dispatcher
-        .fs
-        .rootfs_vfs
-        .overlay
-        .set_file_contents("/walk/after-drain.txt", b"y".to_vec())
-        .unwrap();
-    let again = lane_getdents(&mut dispatcher, &mut memory, dir);
-    assert!(again.is_empty(), "a drained directory reads EOF: {again:?}");
-    let seek = lane_syscall(
-        &mut dispatcher,
-        &mut memory,
-        62,
-        [dir as u64, 0, 0, 0, 0, 0],
-    );
-    assert_eq!(seek, 0);
-    let rewound = lane_getdents(&mut dispatcher, &mut memory, dir);
-    assert!(
-        rewound.iter().any(|(n, _)| n == "after-drain.txt"),
-        "a rewound untrusted directory must re-read: {rewound:?}"
-    );
-}
+        let fast = dispatcher
+            .path_stat_record(
+                &dispatcher.exact_signal_context_for_test(),
+                root as u64,
+                "file.txt",
+                LINUX_AT_SYMLINK_NOFOLLOW,
+            )
+            .unwrap();
+        let slow = dispatcher
+            .path_stat_record(
+                &dispatcher.exact_signal_context_for_test(),
+                LINUX_AT_FDCWD,
+                "/walk/file.txt",
+                LINUX_AT_SYMLINK_NOFOLLOW,
+            )
+            .unwrap();
+        assert_eq!(fast, slow, "trusted lower stat must equal layered stat");
+        assert_eq!(fast.mode & 0o7777, 0o4711);
+    }
 
-/// The three lanes that publish a file's identity — `stat(path)`,
-/// `fstat(open(path))` and `getdents64`'s `d_ino` — must agree for an entry
-/// only the immutable cache lower holds.
-///
-/// The fd lane opens the lower's REAL host file and reports its APFS inode,
-/// and `getdents64` already publishes that same inode, but the path lane
-/// dropped it at the `RootFsMetadata` boundary and hashed the path instead.
-/// GNU coreutils `cp` stats its source through the path AND the fd it opened,
-/// and refuses the copy when the two disagree — `cp: skipping file '…', as it
-/// was replaced while being copied` — which broke LTP `execve02`'s setup with
-/// TBROK the moment the cached lower was enabled for HvPatch.
-#[cfg(target_os = "macos")]
-#[test]
-fn immutable_lower_reports_one_inode_through_stat_fstat_and_getdents() {
-    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
-    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+    /// LTP `creat05` shape: the test `mkdir`s its own scratch directory (which
+    /// only the WRITABLE upper holds — the immutable lower never had it), fills
+    /// it with thousands of files, and then `open(O_DIRECTORY)`s it through the
+    /// harness. An upper-only directory under an immutable lower must seed the
+    /// trusted lane exactly like a lower-only one: the lower's absence is
+    /// permanent, so the upper dirfd IS the merged namespace for that subtree.
+    /// Before this landed the open fell to the layered path and enumerated
+    /// every child (fstatat + open + flistxattr + close each) on EVERY open.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trusted_upper_only_directory_seeds_the_lane_and_streams() {
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
 
-    for (dir, name) in [("/walk", "file.txt"), ("/walk/sub", "deep.txt")] {
-        let full = format!("{dir}/{name}");
+        memory.write_bytes(0x4200, b"/walk/scratch\0").unwrap();
+        let mk = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            34,
+            [LINUX_AT_FDCWD, 0x4200, 0o755, 0, 0, 0],
+        );
+        assert_eq!(mk, 0, "mkdirat /walk/scratch: {mk}");
+        for name in ["a.txt", "b.txt"] {
+            let fd = lane_openat(
+                &mut dispatcher,
+                &mut memory,
+                LINUX_AT_FDCWD,
+                &format!("/walk/scratch/{name}"),
+                LINUX_O_CREAT | LINUX_O_WRONLY,
+            );
+            assert!(fd >= 0, "create {name}: {fd}");
+            memory.write_bytes(0x9000, name.as_bytes()).unwrap();
+            let n = lane_syscall(
+                &mut dispatcher,
+                &mut memory,
+                64,
+                [fd as u64, 0x9000, name.len() as u64, 0, 0, 0],
+            );
+            assert_eq!(n, name.len() as i64);
+            assert_eq!(
+                lane_syscall(&mut dispatcher, &mut memory, 57, [fd as u64, 0, 0, 0, 0, 0]),
+                0
+            );
+        }
+
+        let dir = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/walk/scratch",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(dir >= 0, "open upper-only /walk/scratch: {dir}");
+        assert!(
+            lane_dir_is_trusted(&dispatcher, dir),
+            "an upper-only directory whose lower is permanently absent must seed the trusted lane"
+        );
+
+        // Children resolve through the upper dirfd.
+        let file = lane_openat(&mut dispatcher, &mut memory, dir as u64, "a.txt", 0);
+        assert!(file >= 0, "open a.txt through the upper dirfd: {file}");
+        let n = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            63,
+            [file as u64, 0x9100, 64, 0, 0, 0],
+        );
+        assert_eq!(n, 5);
+        assert_eq!(memory.read_bytes(0x9100, 5).unwrap(), b"a.txt");
+        let missing = lane_openat(&mut dispatcher, &mut memory, dir as u64, "nope", 0);
+        assert_eq!(missing, -i64::from(LINUX_ENOENT.get()));
+
+        // The listing equals the layered truth.
+        let mut streamed = lane_getdents(&mut dispatcher, &mut memory, dir);
+        streamed.retain(|(n, _)| n != "." && n != "..");
+        streamed.sort();
+        let mut layered: Vec<(String, u8)> = carrick_vfs::overlay::layered_directory_entries(
+            dispatcher.fs.rootfs_vfs.overlay.as_ref(),
+            dispatcher.fs.rootfs_vfs.rootfs.as_ref(),
+            "/walk/scratch",
+        )
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.name, linux_dirent_type(e.metadata.kind)))
+        .collect();
+        layered.sort();
+        assert_eq!(streamed, layered);
+        assert_eq!(streamed.len(), 2);
+
+        // A MERGED directory (lower + upper contributions) still takes the
+        // exact layered path: /walk itself now has an upper child.
+        let merged = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/walk",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(merged >= 0);
+        let mut listed = lane_getdents(&mut dispatcher, &mut memory, merged);
+        listed.retain(|(n, _)| n != "." && n != "..");
+        let names: Vec<&str> = listed.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"scratch"), "{names:?}");
+        assert!(names.contains(&"file.txt"), "{names:?}");
+        assert!(names.contains(&"sub"), "{names:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_mkdirat_under_resolved_parent_zero_openat_budget() {
+        let (_scratch, mut dispatcher) = trusted_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+        // Warm up / resolve parent directory fd in dentry cache
+        let parent_dfd = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/walk",
+            LINUX_O_RDONLY | LINUX_O_DIRECTORY,
+        );
+        assert!(parent_dfd >= 0, "open /walk: {parent_dfd}");
+
+        carrick_vfs::fs_backend::host::reset_test_host_openat_count();
+        carrick_vfs::fs_backend::host::reset_test_host_stat_count();
+
+        memory.write_bytes(0x4200, b"new_child\0").unwrap();
+        let mk = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            34, // mkdirat
+            [parent_dfd as u64, 0x4200, 0o755, 0, 0, 0],
+        );
+        assert_eq!(mk, 0, "mkdirat /walk/new_child: {mk}");
+
+        let opens = carrick_vfs::fs_backend::host::test_host_openat_count();
+        let stats = carrick_vfs::fs_backend::host::test_host_stat_count();
+
+        assert_eq!(
+            opens, 0,
+            "mkdirat under resolved parent issued {opens} host openat calls (budget 0)"
+        );
+        // Exact, not a bound: the budget is the single `libc::fstatat` in
+        // `RootFsVfs::mkdir_admitted` that probes the leaf for an existing entry.
+        // `<= 1` silently accepted 0 when that counter was compiled out of
+        // carrick-vfs, so a regression that adds a counted stat here must fail.
+        assert_eq!(
+            stats, 1,
+            "mkdirat under resolved parent issued {stats} host stat calls (budget 1)"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_guest_openat_1000_files_in_one_dir_host_openat_budget() {
+        let (_lower, scratch, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+        std::fs::create_dir_all(scratch.path().join("walk")).unwrap();
+
+        for i in 0..1000 {
+            std::fs::write(
+                scratch.path().join("walk").join(format!("f_{i:04}")),
+                b"hello",
+            )
+            .unwrap();
+        }
+
+        carrick_vfs::fs_backend::host::reset_test_host_openat_count();
+        for i in 0..1000 {
+            let fd = lane_openat(
+                &mut dispatcher,
+                &mut memory,
+                LINUX_AT_FDCWD,
+                &format!("/walk/f_{i:04}"),
+                LINUX_O_RDONLY | carrick_abi::LINUX_O_NOFOLLOW,
+            );
+            assert!(fd >= 0, "open failed: {fd}");
+        }
+        let opens = carrick_vfs::fs_backend::host::test_host_openat_count();
+        assert!(
+            opens <= 1002,
+            "1,000 guest opens issued {opens} host_openat calls (budget <= 1002)"
+        );
+    }
+
+    /// A directory listing is taken when the guest READS it, not when it opens
+    /// it (Linux `getdents64` walks the live dentry tree; `rewinddir` re-reads).
+    /// Two consequences the old open-time snapshot got wrong — and one cost:
+    /// every `open(O_DIRECTORY)` walk anchor paid a full enumeration (O(n)
+    /// stats) whether or not the guest ever listed it, which is what put
+    /// `creat05` at 8x the oracle.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn directory_listing_is_taken_at_read_time_not_open_time() {
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        // Shadow a lower file so /walk is a MERGED directory that cannot take
+        // the trusted lane.
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents("/walk/file.txt", b"upper".to_vec())
+            .unwrap();
+        let dir = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/walk",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(dir >= 0);
+        assert!(!lane_dir_is_trusted(&dispatcher, dir));
+        {
+            let open_file = dispatcher.open_file(dir as i32).unwrap();
+            let open = open_file.description.read().unwrap();
+            let OpenDescription::Directory { listing, .. } = &*open else {
+                panic!("expected a directory description");
+            };
+            assert!(
+                matches!(listing, DirListing::Pending),
+                "open(O_DIRECTORY) must not enumerate the directory: {listing:?}"
+            );
+        }
+
+        // Created AFTER the open, BEFORE the first read: visible (Linux).
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents("/walk/after-open.txt", b"x".to_vec())
+            .unwrap();
+        let first = lane_getdents(&mut dispatcher, &mut memory, dir);
+        assert!(
+            first.iter().any(|(n, _)| n == "after-open.txt"),
+            "a child created before the first getdents must be listed: {first:?}"
+        );
+        assert!(first.iter().any(|(n, _)| n == "file.txt"));
+
+        // Created after the first drain: visible after a rewind (rewinddir).
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents("/walk/after-drain.txt", b"y".to_vec())
+            .unwrap();
+        let again = lane_getdents(&mut dispatcher, &mut memory, dir);
+        assert!(again.is_empty(), "a drained directory reads EOF: {again:?}");
+        let seek = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            62,
+            [dir as u64, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(seek, 0);
+        let rewound = lane_getdents(&mut dispatcher, &mut memory, dir);
+        assert!(
+            rewound.iter().any(|(n, _)| n == "after-drain.txt"),
+            "a rewound untrusted directory must re-read: {rewound:?}"
+        );
+    }
+
+    /// The three lanes that publish a file's identity — `stat(path)`,
+    /// `fstat(open(path))` and `getdents64`'s `d_ino` — must agree for an entry
+    /// only the immutable cache lower holds.
+    ///
+    /// The fd lane opens the lower's REAL host file and reports its APFS inode,
+    /// and `getdents64` already publishes that same inode, but the path lane
+    /// dropped it at the `RootFsMetadata` boundary and hashed the path instead.
+    /// GNU coreutils `cp` stats its source through the path AND the fd it opened,
+    /// and refuses the copy when the two disagree — `cp: skipping file '…', as it
+    /// was replaced while being copied` — which broke LTP `execve02`'s setup with
+    /// TBROK the moment the cached lower was enabled for HvPatch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn immutable_lower_reports_one_inode_through_stat_fstat_and_getdents() {
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+        for (dir, name) in [("/walk", "file.txt"), ("/walk/sub", "deep.txt")] {
+            let full = format!("{dir}/{name}");
+            let by_path = dispatcher
+                .path_stat_record(
+                    &dispatcher.exact_signal_context_for_test(),
+                    LINUX_AT_FDCWD,
+                    &full,
+                    LINUX_AT_SYMLINK_NOFOLLOW,
+                )
+                .unwrap();
+
+            let fd = lane_openat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, &full, 0);
+            assert!(fd >= 0, "open lower-only {full}: {fd}");
+            let by_fd = dispatcher.fd_stat_record(fd as i32).unwrap();
+            assert_eq!(
+                by_path.ino, by_fd.ino,
+                "stat({full}).st_ino must equal fstat(open({full})).st_ino"
+            );
+
+            let dirfd = lane_openat(
+                &mut dispatcher,
+                &mut memory,
+                LINUX_AT_FDCWD,
+                dir,
+                LINUX_O_DIRECTORY,
+            );
+            assert!(dirfd >= 0, "open lower-only dir {dir}: {dirfd}");
+            let d_ino = lane_getdents_inos(&mut dispatcher, &mut memory, dirfd)
+                .into_iter()
+                .find(|(entry, _)| entry == name)
+                .unwrap_or_else(|| panic!("{name} missing from getdents64 of {dir}"))
+                .1;
+            assert_eq!(
+                d_ino, by_path.ino,
+                "getdents64 d_ino for {full} must equal its stat st_ino"
+            );
+        }
+    }
+
+    /// A lower-only DIRECTORY must satisfy the same identity invariant: Python's
+    /// `shutil.rmtree` and Go's `os.SameFile` compare `lstat(dir)` against
+    /// `fstat(open(dir))` and refuse to recurse when they differ.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn immutable_lower_directory_path_stat_matches_its_fd_stat() {
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
         let by_path = dispatcher
             .path_stat_record(
                 &dispatcher.exact_signal_context_for_test(),
                 LINUX_AT_FDCWD,
-                &full,
+                "/walk/sub",
                 LINUX_AT_SYMLINK_NOFOLLOW,
             )
             .unwrap();
-
-        let fd = lane_openat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, &full, 0);
-        assert!(fd >= 0, "open lower-only {full}: {fd}");
-        let by_fd = dispatcher.fd_stat_record(fd as i32).unwrap();
-        assert_eq!(
-            by_path.ino, by_fd.ino,
-            "stat({full}).st_ino must equal fstat(open({full})).st_ino"
-        );
-
         let dirfd = lane_openat(
             &mut dispatcher,
             &mut memory,
             LINUX_AT_FDCWD,
-            dir,
+            "/walk/sub",
             LINUX_O_DIRECTORY,
         );
-        assert!(dirfd >= 0, "open lower-only dir {dir}: {dirfd}");
-        let d_ino = lane_getdents_inos(&mut dispatcher, &mut memory, dirfd)
-            .into_iter()
-            .find(|(entry, _)| entry == name)
-            .unwrap_or_else(|| panic!("{name} missing from getdents64 of {dir}"))
-            .1;
+        assert!(dirfd >= 0, "open lower-only directory: {dirfd}");
+        let by_fd = dispatcher.fd_stat_record(dirfd as i32).unwrap();
         assert_eq!(
-            d_ino, by_path.ino,
-            "getdents64 d_ino for {full} must equal its stat st_ino"
+            by_path.ino, by_fd.ino,
+            "lstat(dir).st_ino must equal fstat(open(dir)).st_ino"
         );
     }
-}
 
-/// A lower-only DIRECTORY must satisfy the same identity invariant: Python's
-/// `shutil.rmtree` and Go's `os.SameFile` compare `lstat(dir)` against
-/// `fstat(open(dir))` and refuse to recurse when they differ.
-#[cfg(target_os = "macos")]
-#[test]
-fn immutable_lower_directory_path_stat_matches_its_fd_stat() {
-    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
-    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
-
-    let by_path = dispatcher
-        .path_stat_record(
-            &dispatcher.exact_signal_context_for_test(),
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fstat_caches_host_xattrs_and_invalidates_on_mutators() {
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        let fd = lane_openat(
+            &mut dispatcher,
+            &mut memory,
             LINUX_AT_FDCWD,
-            "/walk/sub",
-            LINUX_AT_SYMLINK_NOFOLLOW,
+            "/walk/file.txt",
+            0,
+        );
+        assert!(fd >= 0);
+
+        // Initial fstat
+        carrick_vfs::fs_backend::reset_host_xattr_read_count();
+        let st1 = dispatcher.fd_stat_record(fd as i32).unwrap();
+        assert_eq!(st1.mode & 0o7777, 0o4711);
+        assert_eq!(st1.uid.raw(), 7);
+        assert_eq!(st1.gid.raw(), 9);
+
+        // Repeat fstat: MUST be 0 host xattr reads!
+        let reads_before = carrick_vfs::fs_backend::host_xattr_read_count();
+        let st2 = dispatcher.fd_stat_record(fd as i32).unwrap();
+        let reads_after = carrick_vfs::fs_backend::host_xattr_read_count();
+        assert_eq!(
+            reads_after, reads_before,
+            "repeat fstat must perform 0 host xattr reads"
+        );
+        assert_eq!(st1, st2);
+
+        // Mutator: fchmod
+        const SYS_FCHMOD: u64 = 52;
+        let rc = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            SYS_FCHMOD,
+            [fd as u64, 0o644, 0, 0, 0, 0],
+        );
+        assert_eq!(rc, 0);
+
+        // fstat after mutator: must reflect updated mode AND force a refresh
+        carrick_vfs::fs_backend::reset_host_xattr_read_count();
+        let st3 = dispatcher.fd_stat_record(fd as i32).unwrap();
+        assert_eq!(st3.mode & 0o7777, 0o644);
+        assert!(
+            carrick_vfs::fs_backend::host_xattr_read_count() > 0,
+            "fstat after mutator must refresh"
+        );
+
+        // Repeat fstat again: MUST be 0 host xattr reads!
+        let reads_before = carrick_vfs::fs_backend::host_xattr_read_count();
+        let st4 = dispatcher.fd_stat_record(fd as i32).unwrap();
+        let reads_after = carrick_vfs::fs_backend::host_xattr_read_count();
+        assert_eq!(
+            reads_after, reads_before,
+            "repeat fstat must perform 0 host xattr reads"
+        );
+        assert_eq!(st3, st4);
+
+        // Mutator: fchown
+        const SYS_FCHOWN: u64 = 55;
+        let rc = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            SYS_FCHOWN,
+            [fd as u64, 42, 84, 0, 0, 0],
+        );
+        assert_eq!(rc, 0);
+
+        // fstat after fchown: must reflect updated owner AND force a refresh
+        carrick_vfs::fs_backend::reset_host_xattr_read_count();
+        let st5 = dispatcher.fd_stat_record(fd as i32).unwrap();
+        assert_eq!(st5.uid.raw(), 42);
+        assert_eq!(st5.gid.raw(), 84);
+        assert!(
+            carrick_vfs::fs_backend::host_xattr_read_count() > 0,
+            "fstat after fchown must refresh"
+        );
+
+        // Repeat fstat again: MUST be 0 host xattr reads!
+        let reads_before = carrick_vfs::fs_backend::host_xattr_read_count();
+        let st6 = dispatcher.fd_stat_record(fd as i32).unwrap();
+        let reads_after = carrick_vfs::fs_backend::host_xattr_read_count();
+        assert_eq!(
+            reads_after, reads_before,
+            "repeat fstat must perform 0 host xattr reads"
+        );
+        assert_eq!(st5, st6);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn deep_tree_lookups_and_negative_opens_via_dentry_cache() {
+        let (lower, upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let deep_dir = lower.path().join("d1/d2/d3/d4/d5/d6");
+        std::fs::create_dir_all(&deep_dir).unwrap();
+        std::fs::write(deep_dir.join("leaf.txt"), b"leaf content").unwrap();
+
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+        // 1. Initial stat and open to warm the dentry cache
+        let path = "/d1/d2/d3/d4/d5/d6/leaf.txt";
+        let st = dispatcher.fs.rootfs_vfs.dentry_stat(path, false).unwrap();
+        assert_eq!(st.size, 12);
+
+        let fd = lane_openat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, path, 0);
+        assert!(fd >= 0);
+
+        // 2. Warm cache stat: MUST be <= 1 host syscall (0 openat per component)
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .dentry_cache
+            .reset_host_open_count();
+        let st2 = dispatcher.fs.rootfs_vfs.dentry_stat(path, false).unwrap();
+        assert_eq!(st2.size, 12);
+        assert_eq!(
+            dispatcher.fs.rootfs_vfs.dentry_cache.host_open_count(),
+            0,
+            "warm stat must take 0 host opens"
+        );
+
+        // 3. Warm cache open: MUST take exactly 1 host openat (at the leaf, 0 per component)
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .dentry_cache
+            .reset_host_open_count();
+        let fd2 = lane_openat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, path, 0);
+        assert!(fd2 >= 0);
+        assert_eq!(
+            dispatcher.fs.rootfs_vfs.dentry_cache.host_open_count(),
+            1,
+            "warm open of existing file must take exactly 1 host openat (the leaf)"
+        );
+
+        // 4. Relative open on warm cache: MUST take exactly 1 host openat (the leaf)
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .dentry_cache
+            .reset_host_open_count();
+        let rel_path = "d1/d2/d3/d4/d5/d6/leaf.txt";
+        let fd3 = lane_openat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, rel_path, 0);
+        assert!(fd3 >= 0);
+        assert_eq!(
+            dispatcher.fs.rootfs_vfs.dentry_cache.host_open_count(),
+            1,
+            "relative open on warm cache must take exactly 1 host openat (the leaf)"
+        );
+
+        // 5. Negative lookup: open non-existent file under 6-deep dir
+        let missing_path = "/d1/d2/d3/d4/d5/d6/missing.txt";
+        let missing_fd = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            missing_path,
+            0,
+        );
+        assert_eq!(missing_fd, -(crate::linux_abi::LINUX_ENOENT.get() as i64));
+
+        // Repeat negative open: MUST be cached and take 0 host opens
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .dentry_cache
+            .reset_host_open_count();
+        let missing_fd2 = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            missing_path,
+            0,
+        );
+        assert_eq!(missing_fd2, -(crate::linux_abi::LINUX_ENOENT.get() as i64));
+        assert_eq!(
+            dispatcher.fs.rootfs_vfs.dentry_cache.host_open_count(),
+            0,
+            "cached negative open must take 0 host opens"
+        );
+
+        // 6. Invalidation by create: create the missing file in upper
+        let upper_deep = upper.path().join("d1/d2/d3/d4/d5/d6");
+        std::fs::create_dir_all(&upper_deep).unwrap();
+        std::fs::write(upper_deep.join("missing.txt"), b"now created").unwrap();
+        // Notify VFS mutator of creation (as open(O_CREAT) or mknod does)
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .dentry_cache
+            .entry_created(missing_path, None);
+
+        // Opening newly created file must now succeed!
+        let created_fd = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            missing_path,
+            0,
+        );
+        assert!(created_fd >= 0, "open after create must succeed");
+    }
+
+    /// A lower-only file's `st_mtime`/`st_nlink` must come from the real host
+    /// inode too. The path lane reported `mtime=0`/`nlink=1` for every untouched
+    /// image file, so `make`-style newer-than comparisons saw the epoch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn immutable_lower_path_stat_reports_real_mtime_and_nlink() {
+        let (lower, _upper, dispatcher) = trusted_lower_lane_fixture();
+        let host = std::fs::metadata(lower.path().join("walk/sub/deep.txt")).unwrap();
+
+        let record = dispatcher
+            .path_stat_record(
+                &dispatcher.exact_signal_context_for_test(),
+                LINUX_AT_FDCWD,
+                "/walk/sub/deep.txt",
+                LINUX_AT_SYMLINK_NOFOLLOW,
+            )
+            .unwrap();
+
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(
+            record.mtime.0,
+            host.mtime(),
+            "an untouched lower file must not report the epoch as its mtime"
+        );
+        assert_eq!(record.nlink, host.nlink() as u32);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn absolute_readonly_open_can_install_an_upper_absent_lower_file_directly() {
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let outcome = dispatcher
+            .try_immutable_lower_absolute_open(LINUX_AT_FDCWD, "/walk/file.txt", LINUX_O_RDONLY)
+            .expect("eligible absolute lower open should take the direct lane");
+        let DispatchOutcome::Returned { value: fd } = outcome else {
+            panic!("unexpected direct-open outcome: {outcome:?}");
+        };
+
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        let n = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            63,
+            [fd as u64, 0x9000, 64, 0, 0, 0],
+        );
+        assert_eq!(n, 10);
+        assert_eq!(memory.read_bytes(0x9000, 10).unwrap(), b"lower file");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn absolute_lower_fast_open_refuses_nofollow_symlink_semantics() {
+        let (_lower, _upper, dispatcher) = trusted_lower_lane_fixture();
+        assert!(
+            dispatcher
+                .try_immutable_lower_absolute_open(
+                    LINUX_AT_FDCWD,
+                    "/walk/link",
+                    LINUX_O_RDONLY | LinuxOpenFlags::NOFOLLOW.bits(),
+                )
+                .is_none(),
+            "O_NOFOLLOW must reach the layered lstat path and return ELOOP"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tty0_two_opens_share_termios_and_winsize() {
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+        // Open /dev/tty0 twice
+        let fd1 = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/dev/tty0",
+            LINUX_O_RDWR,
+        );
+        assert!(fd1 >= 0, "first open of /dev/tty0 should succeed: {fd1}");
+
+        let fd2 = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/dev/tty0",
+            LINUX_O_RDWR,
+        );
+        assert!(fd2 >= 0, "second open of /dev/tty0 should succeed: {fd2}");
+        assert_ne!(fd1, fd2, "independent opens should yield different fds");
+
+        // Check fstat reports character device with major 4 minor 0
+        let stat_buf = [0u8; core::mem::size_of::<carrick_abi::LinuxStat>()];
+        memory.write_bytes(0x5000, &stat_buf).unwrap();
+        let fstat_rc = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            80, // fstat
+            [fd1 as u64, 0x5000, 0, 0, 0, 0],
+        );
+        assert_eq!(fstat_rc, 0);
+        let stat = carrick_abi::LinuxStat::read_from_bytes(
+            &memory.read_bytes(0x5000, stat_buf.len()).unwrap(),
         )
         .unwrap();
-    let dirfd = lane_openat(
-        &mut dispatcher,
-        &mut memory,
-        LINUX_AT_FDCWD,
-        "/walk/sub",
-        LINUX_O_DIRECTORY,
-    );
-    assert!(dirfd >= 0, "open lower-only directory: {dirfd}");
-    let by_fd = dispatcher.fd_stat_record(dirfd as i32).unwrap();
-    assert_eq!(
-        by_path.ino, by_fd.ino,
-        "lstat(dir).st_ino must equal fstat(open(dir)).st_ino"
-    );
-}
+        assert_eq!(
+            stat.st_mode & carrick_abi::LINUX_S_IFMT,
+            carrick_abi::LINUX_S_IFCHR
+        );
+        let rdev = stat.st_rdev;
+        assert_eq!(rdev, 4 << 8);
 
-#[cfg(target_os = "macos")]
-#[test]
-fn fstat_caches_host_xattrs_and_invalidates_on_mutators() {
-    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
-    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
-    let fd = lane_openat(
-        &mut dispatcher,
-        &mut memory,
-        LINUX_AT_FDCWD,
-        "/walk/file.txt",
-        0,
-    );
-    assert!(fd >= 0);
+        // Write a customized termios struct to memory at 0x6000
+        let mut custom = carrick_abi::LinuxTermios::default_cooked();
+        custom.c_iflag = 0x1234_5678;
+        custom.c_oflag = 0x8765_4321;
+        let custom_bytes = zerocopy::IntoBytes::as_bytes(&custom);
+        memory.write_bytes(0x6000, custom_bytes).unwrap();
 
-    // Initial fstat
-    carrick_vfs::fs_backend::reset_host_xattr_read_count();
-    let st1 = dispatcher.fd_stat_record(fd as i32).unwrap();
-    assert_eq!(st1.mode & 0o7777, 0o4711);
-    assert_eq!(st1.uid.raw(), 7);
-    assert_eq!(st1.gid.raw(), 9);
+        // TCSETS via fd1
+        let set_rc = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            29, // ioctl
+            [fd1 as u64, carrick_abi::LINUX_TCSETS, 0x6000, 0, 0, 0],
+        );
+        assert_eq!(set_rc, 0, "TCSETS via fd1 should return 0");
 
-    // Repeat fstat: MUST be 0 host xattr reads!
-    let reads_before = carrick_vfs::fs_backend::host_xattr_read_count();
-    let st2 = dispatcher.fd_stat_record(fd as i32).unwrap();
-    let reads_after = carrick_vfs::fs_backend::host_xattr_read_count();
-    assert_eq!(
-        reads_after, reads_before,
-        "repeat fstat must perform 0 host xattr reads"
-    );
-    assert_eq!(st1, st2);
+        // TCGETS via fd2 into 0x7000
+        let get_rc = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            29, // ioctl
+            [fd2 as u64, carrick_abi::LINUX_TCGETS, 0x7000, 0, 0, 0],
+        );
+        assert_eq!(get_rc, 0, "TCGETS via fd2 should return 0");
 
-    // Mutator: fchmod
-    const SYS_FCHMOD: u64 = 52;
-    let rc = lane_syscall(
-        &mut dispatcher,
-        &mut memory,
-        SYS_FCHMOD,
-        [fd as u64, 0o644, 0, 0, 0, 0],
-    );
-    assert_eq!(rc, 0);
-
-    // fstat after mutator: must reflect updated mode AND force a refresh
-    carrick_vfs::fs_backend::reset_host_xattr_read_count();
-    let st3 = dispatcher.fd_stat_record(fd as i32).unwrap();
-    assert_eq!(st3.mode & 0o7777, 0o644);
-    assert!(
-        carrick_vfs::fs_backend::host_xattr_read_count() > 0,
-        "fstat after mutator must refresh"
-    );
-
-    // Repeat fstat again: MUST be 0 host xattr reads!
-    let reads_before = carrick_vfs::fs_backend::host_xattr_read_count();
-    let st4 = dispatcher.fd_stat_record(fd as i32).unwrap();
-    let reads_after = carrick_vfs::fs_backend::host_xattr_read_count();
-    assert_eq!(
-        reads_after, reads_before,
-        "repeat fstat must perform 0 host xattr reads"
-    );
-    assert_eq!(st3, st4);
-
-    // Mutator: fchown
-    const SYS_FCHOWN: u64 = 55;
-    let rc = lane_syscall(
-        &mut dispatcher,
-        &mut memory,
-        SYS_FCHOWN,
-        [fd as u64, 42, 84, 0, 0, 0],
-    );
-    assert_eq!(rc, 0);
-
-    // fstat after fchown: must reflect updated owner AND force a refresh
-    carrick_vfs::fs_backend::reset_host_xattr_read_count();
-    let st5 = dispatcher.fd_stat_record(fd as i32).unwrap();
-    assert_eq!(st5.uid.raw(), 42);
-    assert_eq!(st5.gid.raw(), 84);
-    assert!(
-        carrick_vfs::fs_backend::host_xattr_read_count() > 0,
-        "fstat after fchown must refresh"
-    );
-
-    // Repeat fstat again: MUST be 0 host xattr reads!
-    let reads_before = carrick_vfs::fs_backend::host_xattr_read_count();
-    let st6 = dispatcher.fd_stat_record(fd as i32).unwrap();
-    let reads_after = carrick_vfs::fs_backend::host_xattr_read_count();
-    assert_eq!(
-        reads_after, reads_before,
-        "repeat fstat must perform 0 host xattr reads"
-    );
-    assert_eq!(st5, st6);
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn deep_tree_lookups_and_negative_opens_via_dentry_cache() {
-    let (lower, upper, mut dispatcher) = trusted_lower_lane_fixture();
-    let deep_dir = lower.path().join("d1/d2/d3/d4/d5/d6");
-    std::fs::create_dir_all(&deep_dir).unwrap();
-    std::fs::write(deep_dir.join("leaf.txt"), b"leaf content").unwrap();
-
-    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
-
-    // 1. Initial stat and open to warm the dentry cache
-    let path = "/d1/d2/d3/d4/d5/d6/leaf.txt";
-    let st = dispatcher.fs.rootfs_vfs.dentry_stat(path, false).unwrap();
-    assert_eq!(st.size, 12);
-
-    let fd = lane_openat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, path, 0);
-    assert!(fd >= 0);
-
-    // 2. Warm cache stat: MUST be <= 1 host syscall (0 openat per component)
-    dispatcher
-        .fs
-        .rootfs_vfs
-        .dentry_cache
-        .reset_host_open_count();
-    let st2 = dispatcher.fs.rootfs_vfs.dentry_stat(path, false).unwrap();
-    assert_eq!(st2.size, 12);
-    assert_eq!(
-        dispatcher.fs.rootfs_vfs.dentry_cache.host_open_count(),
-        0,
-        "warm stat must take 0 host opens"
-    );
-
-    // 3. Warm cache open: MUST take exactly 1 host openat (at the leaf, 0 per component)
-    dispatcher
-        .fs
-        .rootfs_vfs
-        .dentry_cache
-        .reset_host_open_count();
-    let fd2 = lane_openat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, path, 0);
-    assert!(fd2 >= 0);
-    assert_eq!(
-        dispatcher.fs.rootfs_vfs.dentry_cache.host_open_count(),
-        1,
-        "warm open of existing file must take exactly 1 host openat (the leaf)"
-    );
-
-    // 4. Relative open on warm cache: MUST take exactly 1 host openat (the leaf)
-    dispatcher
-        .fs
-        .rootfs_vfs
-        .dentry_cache
-        .reset_host_open_count();
-    let rel_path = "d1/d2/d3/d4/d5/d6/leaf.txt";
-    let fd3 = lane_openat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, rel_path, 0);
-    assert!(fd3 >= 0);
-    assert_eq!(
-        dispatcher.fs.rootfs_vfs.dentry_cache.host_open_count(),
-        1,
-        "relative open on warm cache must take exactly 1 host openat (the leaf)"
-    );
-
-    // 5. Negative lookup: open non-existent file under 6-deep dir
-    let missing_path = "/d1/d2/d3/d4/d5/d6/missing.txt";
-    let missing_fd = lane_openat(
-        &mut dispatcher,
-        &mut memory,
-        LINUX_AT_FDCWD,
-        missing_path,
-        0,
-    );
-    assert_eq!(missing_fd, -(crate::linux_abi::LINUX_ENOENT.get() as i64));
-
-    // Repeat negative open: MUST be cached and take 0 host opens
-    dispatcher
-        .fs
-        .rootfs_vfs
-        .dentry_cache
-        .reset_host_open_count();
-    let missing_fd2 = lane_openat(
-        &mut dispatcher,
-        &mut memory,
-        LINUX_AT_FDCWD,
-        missing_path,
-        0,
-    );
-    assert_eq!(missing_fd2, -(crate::linux_abi::LINUX_ENOENT.get() as i64));
-    assert_eq!(
-        dispatcher.fs.rootfs_vfs.dentry_cache.host_open_count(),
-        0,
-        "cached negative open must take 0 host opens"
-    );
-
-    // 6. Invalidation by create: create the missing file in upper
-    let upper_deep = upper.path().join("d1/d2/d3/d4/d5/d6");
-    std::fs::create_dir_all(&upper_deep).unwrap();
-    std::fs::write(upper_deep.join("missing.txt"), b"now created").unwrap();
-    // Notify VFS mutator of creation (as open(O_CREAT) or mknod does)
-    dispatcher
-        .fs
-        .rootfs_vfs
-        .dentry_cache
-        .entry_created(missing_path, None);
-
-    // Opening newly created file must now succeed!
-    let created_fd = lane_openat(
-        &mut dispatcher,
-        &mut memory,
-        LINUX_AT_FDCWD,
-        missing_path,
-        0,
-    );
-    assert!(created_fd >= 0, "open after create must succeed");
-}
-
-/// A lower-only file's `st_mtime`/`st_nlink` must come from the real host
-/// inode too. The path lane reported `mtime=0`/`nlink=1` for every untouched
-/// image file, so `make`-style newer-than comparisons saw the epoch.
-#[cfg(target_os = "macos")]
-#[test]
-fn immutable_lower_path_stat_reports_real_mtime_and_nlink() {
-    let (lower, _upper, dispatcher) = trusted_lower_lane_fixture();
-    let host = std::fs::metadata(lower.path().join("walk/sub/deep.txt")).unwrap();
-
-    let record = dispatcher
-        .path_stat_record(
-            &dispatcher.exact_signal_context_for_test(),
-            LINUX_AT_FDCWD,
-            "/walk/sub/deep.txt",
-            LINUX_AT_SYMLINK_NOFOLLOW,
+        let read_termios = carrick_abi::LinuxTermios::read_from_bytes(
+            &memory
+                .read_bytes(0x7000, core::mem::size_of::<carrick_abi::LinuxTermios>())
+                .unwrap(),
         )
         .unwrap();
+        let (iflag, oflag) = (read_termios.c_iflag, read_termios.c_oflag);
+        assert_eq!(iflag, 0x1234_5678, "fd2 should observe termios set by fd1");
+        assert_eq!(oflag, 0x8765_4321, "fd2 should observe termios set by fd1");
 
-    use std::os::unix::fs::MetadataExt as _;
-    assert_eq!(
-        record.mtime.0,
-        host.mtime(),
-        "an untouched lower file must not report the epoch as its mtime"
-    );
-    assert_eq!(record.nlink, host.nlink() as u32);
-}
+        // TIOCSWINSZ via fd1 into 0x8000
+        let mut custom_ws = carrick_abi::LinuxWinsize::terminal_80x24();
+        custom_ws.ws_row = 50;
+        custom_ws.ws_col = 132;
+        let ws_bytes = zerocopy::IntoBytes::as_bytes(&custom_ws);
+        memory.write_bytes(0x8000, ws_bytes).unwrap();
 
-#[cfg(target_os = "macos")]
-#[test]
-fn absolute_readonly_open_can_install_an_upper_absent_lower_file_directly() {
-    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
-    let outcome = dispatcher
-        .try_immutable_lower_absolute_open(LINUX_AT_FDCWD, "/walk/file.txt", LINUX_O_RDONLY)
-        .expect("eligible absolute lower open should take the direct lane");
-    let DispatchOutcome::Returned { value: fd } = outcome else {
-        panic!("unexpected direct-open outcome: {outcome:?}");
-    };
+        let set_ws_rc = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            29, // ioctl
+            [fd1 as u64, carrick_abi::LINUX_TIOCSWINSZ, 0x8000, 0, 0, 0],
+        );
+        assert_eq!(set_ws_rc, 0, "TIOCSWINSZ via fd1 should return 0");
 
-    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
-    let n = lane_syscall(
-        &mut dispatcher,
-        &mut memory,
-        63,
-        [fd as u64, 0x9000, 64, 0, 0, 0],
-    );
-    assert_eq!(n, 10);
-    assert_eq!(memory.read_bytes(0x9000, 10).unwrap(), b"lower file");
+        // TIOCGWINSZ via fd2 into 0x9000
+        let get_ws_rc = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            29, // ioctl
+            [fd2 as u64, carrick_abi::LINUX_TIOCGWINSZ, 0x9000, 0, 0, 0],
+        );
+        assert_eq!(get_ws_rc, 0, "TIOCGWINSZ via fd2 should return 0");
+
+        let read_ws = carrick_abi::LinuxWinsize::read_from_bytes(
+            &memory
+                .read_bytes(0x9000, core::mem::size_of::<carrick_abi::LinuxWinsize>())
+                .unwrap(),
+        )
+        .unwrap();
+        let (ws_row, ws_col) = (read_ws.ws_row, read_ws.ws_col);
+        assert_eq!(ws_row, 50, "fd2 should observe winsize set by fd1");
+        assert_eq!(ws_col, 132, "fd2 should observe winsize set by fd1");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2283,22 +2420,6 @@ fn dentry_fast_open_preserves_nofollow_after_following_stat() {
         LINUX_O_RDONLY | LinuxOpenFlags::NOFOLLOW.bits(),
     );
     assert_eq!(result, -i64::from(crate::linux_abi::LINUX_ELOOP.get()));
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn absolute_lower_fast_open_refuses_nofollow_symlink_semantics() {
-    let (_lower, _upper, dispatcher) = trusted_lower_lane_fixture();
-    assert!(
-        dispatcher
-            .try_immutable_lower_absolute_open(
-                LINUX_AT_FDCWD,
-                "/walk/link",
-                LINUX_O_RDONLY | LinuxOpenFlags::NOFOLLOW.bits(),
-            )
-            .is_none(),
-        "O_NOFOLLOW must reach the layered lstat path and return ELOOP"
-    );
 }
 
 #[cfg(target_os = "macos")]
@@ -8940,121 +9061,4 @@ fn fs_view_direct_construction_and_operations() {
         DispatchOutcome::Returned { value: 0 }
     );
     assert!(!view.fd_table_contains(new_fd3));
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn tty0_two_opens_share_termios_and_winsize() {
-    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
-    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
-
-    // Open /dev/tty0 twice
-    let fd1 = lane_openat(
-        &mut dispatcher,
-        &mut memory,
-        LINUX_AT_FDCWD,
-        "/dev/tty0",
-        LINUX_O_RDWR,
-    );
-    assert!(fd1 >= 0, "first open of /dev/tty0 should succeed: {fd1}");
-
-    let fd2 = lane_openat(
-        &mut dispatcher,
-        &mut memory,
-        LINUX_AT_FDCWD,
-        "/dev/tty0",
-        LINUX_O_RDWR,
-    );
-    assert!(fd2 >= 0, "second open of /dev/tty0 should succeed: {fd2}");
-    assert_ne!(fd1, fd2, "independent opens should yield different fds");
-
-    // Check fstat reports character device with major 4 minor 0
-    let stat_buf = [0u8; core::mem::size_of::<carrick_abi::LinuxStat>()];
-    memory.write_bytes(0x5000, &stat_buf).unwrap();
-    let fstat_rc = lane_syscall(
-        &mut dispatcher,
-        &mut memory,
-        80, // fstat
-        [fd1 as u64, 0x5000, 0, 0, 0, 0],
-    );
-    assert_eq!(fstat_rc, 0);
-    let stat = carrick_abi::LinuxStat::read_from_bytes(
-        &memory.read_bytes(0x5000, stat_buf.len()).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        stat.st_mode & carrick_abi::LINUX_S_IFMT,
-        carrick_abi::LINUX_S_IFCHR
-    );
-    let rdev = stat.st_rdev;
-    assert_eq!(rdev, 4 << 8);
-
-    // Write a customized termios struct to memory at 0x6000
-    let mut custom = carrick_abi::LinuxTermios::default_cooked();
-    custom.c_iflag = 0x1234_5678;
-    custom.c_oflag = 0x8765_4321;
-    let custom_bytes = zerocopy::IntoBytes::as_bytes(&custom);
-    memory.write_bytes(0x6000, custom_bytes).unwrap();
-
-    // TCSETS via fd1
-    let set_rc = lane_syscall(
-        &mut dispatcher,
-        &mut memory,
-        29, // ioctl
-        [fd1 as u64, carrick_abi::LINUX_TCSETS, 0x6000, 0, 0, 0],
-    );
-    assert_eq!(set_rc, 0, "TCSETS via fd1 should return 0");
-
-    // TCGETS via fd2 into 0x7000
-    let get_rc = lane_syscall(
-        &mut dispatcher,
-        &mut memory,
-        29, // ioctl
-        [fd2 as u64, carrick_abi::LINUX_TCGETS, 0x7000, 0, 0, 0],
-    );
-    assert_eq!(get_rc, 0, "TCGETS via fd2 should return 0");
-
-    let read_termios = carrick_abi::LinuxTermios::read_from_bytes(
-        &memory
-            .read_bytes(0x7000, core::mem::size_of::<carrick_abi::LinuxTermios>())
-            .unwrap(),
-    )
-    .unwrap();
-    let (iflag, oflag) = (read_termios.c_iflag, read_termios.c_oflag);
-    assert_eq!(iflag, 0x1234_5678, "fd2 should observe termios set by fd1");
-    assert_eq!(oflag, 0x8765_4321, "fd2 should observe termios set by fd1");
-
-    // TIOCSWINSZ via fd1 into 0x8000
-    let mut custom_ws = carrick_abi::LinuxWinsize::terminal_80x24();
-    custom_ws.ws_row = 50;
-    custom_ws.ws_col = 132;
-    let ws_bytes = zerocopy::IntoBytes::as_bytes(&custom_ws);
-    memory.write_bytes(0x8000, ws_bytes).unwrap();
-
-    let set_ws_rc = lane_syscall(
-        &mut dispatcher,
-        &mut memory,
-        29, // ioctl
-        [fd1 as u64, carrick_abi::LINUX_TIOCSWINSZ, 0x8000, 0, 0, 0],
-    );
-    assert_eq!(set_ws_rc, 0, "TIOCSWINSZ via fd1 should return 0");
-
-    // TIOCGWINSZ via fd2 into 0x9000
-    let get_ws_rc = lane_syscall(
-        &mut dispatcher,
-        &mut memory,
-        29, // ioctl
-        [fd2 as u64, carrick_abi::LINUX_TIOCGWINSZ, 0x9000, 0, 0, 0],
-    );
-    assert_eq!(get_ws_rc, 0, "TIOCGWINSZ via fd2 should return 0");
-
-    let read_ws = carrick_abi::LinuxWinsize::read_from_bytes(
-        &memory
-            .read_bytes(0x9000, core::mem::size_of::<carrick_abi::LinuxWinsize>())
-            .unwrap(),
-    )
-    .unwrap();
-    let (ws_row, ws_col) = (read_ws.ws_row, read_ws.ws_col);
-    assert_eq!(ws_row, 50, "fd2 should observe winsize set by fd1");
-    assert_eq!(ws_col, 132, "fd2 should observe winsize set by fd1");
 }

@@ -1122,80 +1122,6 @@ mod tests {
     }
 
     #[test]
-    fn exec_status_and_wait_return_and_consume_exact_terminal_result() {
-        let (_temp, endpoint) = endpoint::test_endpoint("control-exec-result");
-        let (kernel, init) = kernel_with_init();
-        let runtime = Arc::new(ExecRuntime::new(2));
-        runtime
-            .install_waker(Arc::new(|| {}))
-            .expect("install waker");
-        let mut server = CarrierControlServer::start_at_with_exec(
-            Arc::clone(&kernel),
-            init.task().key(),
-            endpoint.clone(),
-            runtime.clone(),
-        )
-        .expect("server");
-        let state = server.state();
-        let submit_endpoint = endpoint.clone();
-        let submit_state = state.clone();
-        let submitter = std::thread::spawn(move || {
-            send_at(
-                &submit_endpoint,
-                &submit_state,
-                ControlOperation::Exec {
-                    request: minimal_exec_request(),
-                },
-            )
-        });
-        let mut work = loop {
-            if let Some(work) = runtime.try_take() {
-                break work;
-            }
-            std::thread::yield_now();
-        };
-        assert!(work.admit(ControlTaskKey { pid: 44, serial: 9 }));
-        let capability = match submitter.join().expect("submitter").expect("admitted") {
-            ControlOutcome::ExecAccepted { capability } => capability,
-            other => panic!("unexpected admission outcome: {other:?}"),
-        };
-        assert_eq!(
-            send_at(
-                &endpoint,
-                &state,
-                ControlOperation::ExecStatus { capability },
-            )
-            .expect("running status"),
-            ControlOutcome::ExecRunning,
-        );
-        work.complete(ExecResult {
-            exit_code: 7,
-            terminating_signal: None,
-            stdout: b"seven".to_vec(),
-            stderr: Vec::new(),
-            output_truncated: false,
-        })
-        .expect("terminal result");
-        assert!(matches!(
-            send_at(&endpoint, &state, ControlOperation::ExecWait { capability },)
-                .expect("wait result"),
-            ControlOutcome::ExecComplete {
-                result: ExecResult { exit_code: 7, .. }
-            },
-        ));
-        assert_eq!(
-            send_at(
-                &endpoint,
-                &state,
-                ControlOperation::ExecStatus { capability },
-            )
-            .expect("consumed status"),
-            ControlOutcome::UnknownExecCapability,
-        );
-        server.shutdown();
-    }
-
-    #[test]
     fn running_exec_wait_poll_does_not_monopolize_status_connection() {
         let (_temp, endpoint) = endpoint::test_endpoint("control-exec-wait-poll");
         let (kernel, init) = kernel_with_init();
@@ -1616,5 +1542,82 @@ mod tests {
             Some(&b"archive"[..])
         );
         server.shutdown();
+    }
+    // Host control-socket EOF under parallel test load stranded the admission loop.
+    mod serial_host {
+        use super::*;
+        #[test]
+        fn exec_status_and_wait_return_and_consume_exact_terminal_result() {
+            let (_temp, endpoint) = endpoint::test_endpoint("control-exec-result");
+            let (kernel, init) = kernel_with_init();
+            let runtime = Arc::new(ExecRuntime::new(2));
+            runtime
+                .install_waker(Arc::new(|| {}))
+                .expect("install waker");
+            let mut server = CarrierControlServer::start_at_with_exec(
+                Arc::clone(&kernel),
+                init.task().key(),
+                endpoint.clone(),
+                runtime.clone(),
+            )
+            .expect("server");
+            let state = server.state();
+            let submit_endpoint = endpoint.clone();
+            let submit_state = state.clone();
+            let submitter = std::thread::spawn(move || {
+                send_at(
+                    &submit_endpoint,
+                    &submit_state,
+                    ControlOperation::Exec {
+                        request: minimal_exec_request(),
+                    },
+                )
+            });
+            let mut work = loop {
+                if let Some(work) = runtime.try_take() {
+                    break work;
+                }
+                std::thread::yield_now();
+            };
+            assert!(work.admit(ControlTaskKey { pid: 44, serial: 9 }));
+            let capability = match submitter.join().expect("submitter").expect("admitted") {
+                ControlOutcome::ExecAccepted { capability } => capability,
+                other => panic!("unexpected admission outcome: {other:?}"),
+            };
+            assert_eq!(
+                send_at(
+                    &endpoint,
+                    &state,
+                    ControlOperation::ExecStatus { capability },
+                )
+                .expect("running status"),
+                ControlOutcome::ExecRunning,
+            );
+            work.complete(ExecResult {
+                exit_code: 7,
+                terminating_signal: None,
+                stdout: b"seven".to_vec(),
+                stderr: Vec::new(),
+                output_truncated: false,
+            })
+            .expect("terminal result");
+            assert!(matches!(
+                send_at(&endpoint, &state, ControlOperation::ExecWait { capability },)
+                    .expect("wait result"),
+                ControlOutcome::ExecComplete {
+                    result: ExecResult { exit_code: 7, .. }
+                },
+            ));
+            assert_eq!(
+                send_at(
+                    &endpoint,
+                    &state,
+                    ControlOperation::ExecStatus { capability },
+                )
+                .expect("consumed status"),
+                ControlOutcome::UnknownExecCapability,
+            );
+            server.shutdown();
+        }
     }
 }

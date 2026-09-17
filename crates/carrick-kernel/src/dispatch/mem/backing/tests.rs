@@ -396,87 +396,6 @@ fn mmap_private_hostfile_backend_refusal_falls_back_to_snapshot() {
 }
 
 #[test]
-fn mmap_private_hostfile_refusal_with_unstattable_fd_keeps_legacy_success() {
-    const SYS_MMAP: u64 = 222;
-    const PAGE_SIZE: u64 = 16 * 1024;
-
-    let dispatcher = native16k_dispatcher();
-    // A HostFile description whose backing host fd is already closed:
-    // fstat and pread both fail. The pre-E1 eager path SUCCEEDED here
-    // (best-effort pread, errors left the zeroed buffer), and mmap
-    // failure atomicity demands the candidate path not invent a new
-    // errno AFTER the address/scrub steps have run — so a refused
-    // candidate must reproduce the legacy zero-filled success exactly.
-    let dead = unsafe { libc::dup(0) };
-    assert!(dead >= 0);
-    assert_eq!(unsafe { libc::close(dead) }, 0);
-    // Handing an already-closed fd to an owner is an I/O-safety violation by
-    // construction (production never does it; `OwnedFd`'s drop asserts
-    // liveness under debug UB checks). This test wants exactly that
-    // impossible state, so it keeps a clone of the description alive for the
-    // life of the test binary: the owner is never dropped, the dead fd is
-    // never closed twice, and the lie stays confined to this test.
-    let dead_description =
-        std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
-            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
-            host_fd: HostFdRef::new(dead),
-            metadata: RootFsMetadata {
-                path: std::path::PathBuf::from("/host-private-map-dead"),
-                kind: RootFsEntryKind::File,
-                mode: 0o644,
-                size: 0,
-            },
-            writable: false,
-        }));
-    std::mem::forget(std::sync::Arc::clone(&dead_description));
-    dispatcher.captured_file_table().write_open_files().insert(
-        34,
-        OpenFile::from_open_description_with_status_flags(
-            dead_description,
-            crate::linux_abi::LINUX_O_RDONLY,
-            0,
-        ),
-    );
-    let registry =
-        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1340));
-    let reporter = CompatReporter::default();
-    let mut memory = FileBackedLoweringMemory::new(LINUX_MMAP_BASE, 4 * PAGE_SIZE as usize, false);
-    let outcome = threaded_memory_call(
-        &dispatcher,
-        &mut memory,
-        &registry,
-        &reporter,
-        SyscallRequest::new(
-            SYS_MMAP,
-            SyscallArgs([
-                0,
-                PAGE_SIZE,
-                LINUX_PROT_READ,
-                crate::linux_abi::LINUX_MAP_PRIVATE,
-                34,
-                0,
-            ]),
-        ),
-    );
-    let DispatchOutcome::Returned { value } = outcome else {
-        panic!("legacy contract: unreadable backing still maps zero-filled, got {outcome:?}");
-    };
-    let address = value as u64;
-    assert_eq!(
-        memory
-            .inner
-            .read_bytes_raw(address, 32)
-            .expect("mapped range readable"),
-        vec![0u8; 32],
-        "unreadable backing must surface as zeros, the pre-E1 contract"
-    );
-    assert!(
-        !dispatcher.mmap_fault_is_sigbus(address),
-        "no BUS tail may be published without a known file length"
-    );
-}
-
-#[test]
 fn mmap_shared_is_never_offered_the_lowering_and_exec_private_is_admitted() {
     const SYS_MMAP: u64 = 222;
     const PAGE_SIZE: u64 = 16 * 1024;
@@ -547,50 +466,380 @@ fn mmap_shared_is_never_offered_the_lowering_and_exec_private_is_admitted() {
     );
 }
 
-#[test]
-fn mmap_private_hostfile_hatch_zero_keeps_snapshot_path() {
-    const SYS_MMAP: u64 = 222;
-    const PAGE_SIZE: u64 = 16 * 1024;
+mod serial_host {
+    use super::*;
 
-    let dispatcher = native16k_dispatcher();
-    install_host_file_fd(&dispatcher, 33, &[0x22u8; 16]);
-    let registry =
-        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1330));
-    let reporter = CompatReporter::default();
-    let mut memory = FileBackedLoweringMemory::new(LINUX_MMAP_BASE, 4 * PAGE_SIZE as usize, true);
-    // SAFETY: `just test` runs carrick-runtime single-threaded
-    // (RUST_TEST_THREADS=1), the house pattern for env-hatch tests.
-    unsafe { std::env::set_var("CARRICK_MMAP_FILE_BACKED", "0") };
-    let outcome = threaded_memory_call(
-        &dispatcher,
-        &mut memory,
-        &registry,
-        &reporter,
-        SyscallRequest::new(
-            SYS_MMAP,
-            SyscallArgs([
+    #[test]
+    fn mmap_private_hostfile_refusal_with_unstattable_fd_keeps_legacy_success() {
+        const SYS_MMAP: u64 = 222;
+        const PAGE_SIZE: u64 = 16 * 1024;
+
+        let dispatcher = native16k_dispatcher();
+        // A HostFile description whose backing host fd is already closed:
+        // fstat and pread both fail. The pre-E1 eager path SUCCEEDED here
+        // (best-effort pread, errors left the zeroed buffer), and mmap
+        // failure atomicity demands the candidate path not invent a new
+        // errno AFTER the address/scrub steps have run — so a refused
+        // candidate must reproduce the legacy zero-filled success exactly.
+        let dead = unsafe { libc::dup(0) };
+        assert!(dead >= 0);
+        assert_eq!(unsafe { libc::close(dead) }, 0);
+        // Handing an already-closed fd to an owner is an I/O-safety violation by
+        // construction (production never does it; `OwnedFd`'s drop asserts
+        // liveness under debug UB checks). This test wants exactly that
+        // impossible state, so it keeps a clone of the description alive for the
+        // life of the test binary: the owner is never dropped, the dead fd is
+        // never closed twice, and the lie stays confined to this test.
+        let dead_description =
+            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
+                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                host_fd: HostFdRef::new(dead),
+                metadata: RootFsMetadata {
+                    path: std::path::PathBuf::from("/host-private-map-dead"),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o644,
+                    size: 0,
+                },
+                writable: false,
+            }));
+        std::mem::forget(std::sync::Arc::clone(&dead_description));
+        dispatcher.captured_file_table().write_open_files().insert(
+            34,
+            OpenFile::from_open_description_with_status_flags(
+                dead_description,
+                crate::linux_abi::LINUX_O_RDONLY,
                 0,
-                PAGE_SIZE,
-                LINUX_PROT_READ,
-                crate::linux_abi::LINUX_MAP_PRIVATE,
-                33,
-                0,
-            ]),
-        ),
-    );
-    unsafe { std::env::remove_var("CARRICK_MMAP_FILE_BACKED") };
-    assert!(
-        matches!(outcome, DispatchOutcome::Returned { .. }),
-        "hatched mapping must still succeed, got {outcome:?}"
-    );
-    assert!(
-        memory.offers.borrow().is_empty(),
-        "CARRICK_MMAP_FILE_BACKED=0 must keep the snapshot path"
-    );
-    assert!(
-        memory.inner.write_calls.get() > 0,
-        "the hatched path must eagerly materialize"
-    );
+            ),
+        );
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1340));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            FileBackedLoweringMemory::new(LINUX_MMAP_BASE, 4 * PAGE_SIZE as usize, false);
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    PAGE_SIZE,
+                    LINUX_PROT_READ,
+                    crate::linux_abi::LINUX_MAP_PRIVATE,
+                    34,
+                    0,
+                ]),
+            ),
+        );
+        let DispatchOutcome::Returned { value } = outcome else {
+            panic!("legacy contract: unreadable backing still maps zero-filled, got {outcome:?}");
+        };
+        let address = value as u64;
+        assert_eq!(
+            memory
+                .inner
+                .read_bytes_raw(address, 32)
+                .expect("mapped range readable"),
+            vec![0u8; 32],
+            "unreadable backing must surface as zeros, the pre-E1 contract"
+        );
+        assert!(
+            !dispatcher.mmap_fault_is_sigbus(address),
+            "no BUS tail may be published without a known file length"
+        );
+    }
+
+    #[test]
+    fn mmap_private_hostfile_hatch_zero_keeps_snapshot_path() {
+        const SYS_MMAP: u64 = 222;
+        const PAGE_SIZE: u64 = 16 * 1024;
+
+        let dispatcher = native16k_dispatcher();
+        install_host_file_fd(&dispatcher, 33, &[0x22u8; 16]);
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1330));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            FileBackedLoweringMemory::new(LINUX_MMAP_BASE, 4 * PAGE_SIZE as usize, true);
+        // SAFETY: `just test` runs carrick-runtime single-threaded
+        // (RUST_TEST_THREADS=1), the house pattern for env-hatch tests.
+        unsafe { std::env::set_var("CARRICK_MMAP_FILE_BACKED", "0") };
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    PAGE_SIZE,
+                    LINUX_PROT_READ,
+                    crate::linux_abi::LINUX_MAP_PRIVATE,
+                    33,
+                    0,
+                ]),
+            ),
+        );
+        unsafe { std::env::remove_var("CARRICK_MMAP_FILE_BACKED") };
+        assert!(
+            matches!(outcome, DispatchOutcome::Returned { .. }),
+            "hatched mapping must still succeed, got {outcome:?}"
+        );
+        assert!(
+            memory.offers.borrow().is_empty(),
+            "CARRICK_MMAP_FILE_BACKED=0 must keep the snapshot path"
+        );
+        assert!(
+            memory.inner.write_calls.get() > 0,
+            "the hatched path must eagerly materialize"
+        );
+    }
+
+    #[test]
+    fn partial_shared_file_munmaps_write_exact_fragments_and_close_once() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        const SYS_MUNMAP: u64 = 215;
+        const GRANULE: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
+        const LENGTH: u64 = 3 * GRANULE;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1190));
+        let reporter = CompatReporter::default();
+        let file = tempfile::tempfile().expect("temporary shared backing");
+        file.set_len(LENGTH).expect("size shared backing");
+        let dup = unsafe { libc::dup(file.as_raw_fd()) };
+        assert!(
+            dup >= 0,
+            "dup shared backing: {}",
+            std::io::Error::last_os_error()
+        );
+        let owned = unsafe { OwnedFd::from_raw_fd(dup) };
+        let owned_raw = owned.as_raw_fd();
+        let source = dispatcher
+            .mem()
+            .lock()
+            .shared
+            .alloc(
+                LENGTH,
+                crate::shared_aperture::BackingObject::shared_file(owned, 0),
+            )
+            .expect("shared file aperture allocation");
+        dispatcher.record_dynamic_mapping(
+            source,
+            LENGTH,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Shared,
+            "shared-file".into(),
+        );
+        let mut memory = ProtectionTrackingMemory::new(source, LENGTH as usize);
+        memory.inner.bytes[..GRANULE as usize].fill(0x11);
+        memory.inner.bytes[GRANULE as usize..(2 * GRANULE) as usize].fill(0x22);
+        memory.inner.bytes[(2 * GRANULE) as usize..].fill(0x33);
+
+        for offset in [GRANULE, 0, 2 * GRANULE] {
+            assert_eq!(
+                threaded_memory_call(
+                    &dispatcher,
+                    &mut memory,
+                    &registry,
+                    &reporter,
+                    SyscallRequest::new(
+                        SYS_MUNMAP,
+                        SyscallArgs([source + offset, GRANULE, 0, 0, 0, 0]),
+                    ),
+                ),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            if offset != 2 * GRANULE {
+                assert_ne!(
+                    unsafe { libc::fcntl(owned_raw, libc::F_GETFD) },
+                    -1,
+                    "a surviving fragment must retain the one fd owner"
+                );
+            }
+        }
+        assert_eq!(unsafe { libc::fcntl(owned_raw, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+
+        let mut actual = vec![0_u8; LENGTH as usize];
+        assert_eq!(
+            unsafe {
+                libc::pread(
+                    file.as_raw_fd(),
+                    actual.as_mut_ptr().cast(),
+                    actual.len(),
+                    0,
+                )
+            },
+            LENGTH as isize
+        );
+        assert!(actual[..GRANULE as usize].iter().all(|byte| *byte == 0x11));
+        assert!(
+            actual[GRANULE as usize..(2 * GRANULE) as usize]
+                .iter()
+                .all(|byte| *byte == 0x22)
+        );
+        assert!(
+            actual[(2 * GRANULE) as usize..]
+                .iter()
+                .all(|byte| *byte == 0x33)
+        );
+    }
+
+    #[test]
+    fn clean_private_repoint_failure_does_not_commit_shared_file_writeback() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        const SYS_MMAP: u64 = 222;
+        const SYS_MUNMAP: u64 = 215;
+        const LENGTH: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1191));
+        let reporter = CompatReporter::default();
+        let file = tempfile::tempfile().expect("temporary repoint backing");
+        file.set_len(LENGTH).expect("size repoint backing");
+        let dup = unsafe { libc::dup(file.as_raw_fd()) };
+        assert!(dup >= 0, "dup repoint backing");
+        let owned = unsafe { OwnedFd::from_raw_fd(dup) };
+        let owned_raw = owned.as_raw_fd();
+        let source = dispatcher
+            .mem()
+            .lock()
+            .shared
+            .alloc(
+                LENGTH,
+                crate::shared_aperture::BackingObject::shared_file(owned, 0),
+            )
+            .expect("shared file source");
+        dispatcher.record_dynamic_mapping(
+            source,
+            LENGTH,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Shared,
+            "shared-file".into(),
+        );
+        let mut memory = ProtectionTrackingMemory::new(source, LENGTH as usize);
+        memory.inner.bytes.fill(0x61);
+        memory.fail_repoint = true;
+
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    source,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        );
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
+        let mut byte = [0xff_u8; 1];
+        assert_eq!(
+            unsafe { libc::pread(file.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
+            1
+        );
+        assert_eq!(byte, [0], "clean failure must not commit writeback");
+        assert!(
+            dispatcher
+                .mem()
+                .lock()
+                .shared
+                .guest_range_has_owner(source, LENGTH)
+        );
+        assert_ne!(unsafe { libc::fcntl(owned_raw, libc::F_GETFD) }, -1);
+
+        assert_eq!(
+            threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(SYS_MUNMAP, SyscallArgs([source, LENGTH, 0, 0, 0, 0]),),
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(unsafe { libc::fcntl(owned_raw, libc::F_GETFD) }, -1);
+        assert_eq!(
+            unsafe { libc::pread(file.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
+            1
+        );
+        assert_eq!(byte, [0x61]);
+    }
+
+    #[test]
+    fn dropping_unconsumed_host_alias_outcome_closes_fd_and_aborts_transaction() {
+        let dispatcher = SyscallDispatcher::new();
+        let transaction = dispatcher.with_host_alias_dispatch_for_test(|guard| {
+            guard
+                .publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+                    start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
+                    len: LINUX_PAGE_SIZE,
+                    prot: LinuxProtFlags::READ,
+                    sharing: ProcMapSharing::Shared,
+                    path: String::new(),
+                    file_page_offset: None,
+                    droppable: false,
+                    semantic_vmas: None,
+                    locked: None,
+                    resident: false,
+                    bus_fault: None,
+                    write_sealed_shared: false,
+                    read_only_shared_file: false,
+                    secretmem: false,
+                    writable_memfd: None,
+                    private_file: None,
+                    shared_file_alias: None,
+                }))
+                .expect("publish")
+        });
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let read_fd = pipe[0];
+        let outcome = DispatchOutcome::MapHostAlias {
+            success_retval: 0,
+            transaction,
+            va: GuestVa(crate::memory::LINUX_HIGH_VA_THRESHOLD),
+            ipa: Gpa(crate::memory::LINUX_ALIAS_IPA_BASE),
+            len: LINUX_PAGE_SIZE,
+            payload: Vec::new(),
+            backing: HostAliasBacking::File {
+                // SAFETY: the successful pipe read end is uniquely transferred.
+                fd: HostAliasOwnedFd::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(read_fd) }),
+                offset: 0,
+                host_prot: libc::PROT_READ,
+                sharing: HostAliasSharing::Shared,
+            },
+            prot: crate::linux_abi::LINUX_PROT_READ,
+            prot_none: false,
+        };
+
+        drop(outcome);
+        assert_eq!(unsafe { libc::fcntl(read_fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(unsafe { libc::close(pipe[1]) }, 0);
+        // Drop of the transaction handle also returned the exclusion to Idle.
+        dispatcher.with_host_alias_dispatch_for_test(|guard| drop(guard));
+    }
 }
 
 #[test]
@@ -930,191 +1179,6 @@ fn shared_owner_suffix_replacement_then_unmap_reuses_only_suffix() {
     assert_shared_owner_survives_partial_private_replacement(
         2 * carrick_guest_mem::HOST_PAGE_GRANULE,
     );
-}
-
-#[test]
-fn partial_shared_file_munmaps_write_exact_fragments_and_close_once() {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-    const SYS_MUNMAP: u64 = 215;
-    const GRANULE: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
-    const LENGTH: u64 = 3 * GRANULE;
-
-    let dispatcher = SyscallDispatcher::new();
-    let registry =
-        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1190));
-    let reporter = CompatReporter::default();
-    let file = tempfile::tempfile().expect("temporary shared backing");
-    file.set_len(LENGTH).expect("size shared backing");
-    let dup = unsafe { libc::dup(file.as_raw_fd()) };
-    assert!(
-        dup >= 0,
-        "dup shared backing: {}",
-        std::io::Error::last_os_error()
-    );
-    let owned = unsafe { OwnedFd::from_raw_fd(dup) };
-    let owned_raw = owned.as_raw_fd();
-    let source = dispatcher
-        .mem()
-        .lock()
-        .shared
-        .alloc(
-            LENGTH,
-            crate::shared_aperture::BackingObject::shared_file(owned, 0),
-        )
-        .expect("shared file aperture allocation");
-    dispatcher.record_dynamic_mapping(
-        source,
-        LENGTH,
-        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
-        ProcMapSharing::Shared,
-        "shared-file".into(),
-    );
-    let mut memory = ProtectionTrackingMemory::new(source, LENGTH as usize);
-    memory.inner.bytes[..GRANULE as usize].fill(0x11);
-    memory.inner.bytes[GRANULE as usize..(2 * GRANULE) as usize].fill(0x22);
-    memory.inner.bytes[(2 * GRANULE) as usize..].fill(0x33);
-
-    for offset in [GRANULE, 0, 2 * GRANULE] {
-        assert_eq!(
-            threaded_memory_call(
-                &dispatcher,
-                &mut memory,
-                &registry,
-                &reporter,
-                SyscallRequest::new(
-                    SYS_MUNMAP,
-                    SyscallArgs([source + offset, GRANULE, 0, 0, 0, 0]),
-                ),
-            ),
-            DispatchOutcome::Returned { value: 0 }
-        );
-        if offset != 2 * GRANULE {
-            assert_ne!(
-                unsafe { libc::fcntl(owned_raw, libc::F_GETFD) },
-                -1,
-                "a surviving fragment must retain the one fd owner"
-            );
-        }
-    }
-    assert_eq!(unsafe { libc::fcntl(owned_raw, libc::F_GETFD) }, -1);
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EBADF)
-    );
-
-    let mut actual = vec![0_u8; LENGTH as usize];
-    assert_eq!(
-        unsafe {
-            libc::pread(
-                file.as_raw_fd(),
-                actual.as_mut_ptr().cast(),
-                actual.len(),
-                0,
-            )
-        },
-        LENGTH as isize
-    );
-    assert!(actual[..GRANULE as usize].iter().all(|byte| *byte == 0x11));
-    assert!(
-        actual[GRANULE as usize..(2 * GRANULE) as usize]
-            .iter()
-            .all(|byte| *byte == 0x22)
-    );
-    assert!(
-        actual[(2 * GRANULE) as usize..]
-            .iter()
-            .all(|byte| *byte == 0x33)
-    );
-}
-
-#[test]
-fn clean_private_repoint_failure_does_not_commit_shared_file_writeback() {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-    const SYS_MMAP: u64 = 222;
-    const SYS_MUNMAP: u64 = 215;
-    const LENGTH: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
-
-    let dispatcher = SyscallDispatcher::new();
-    let registry =
-        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1191));
-    let reporter = CompatReporter::default();
-    let file = tempfile::tempfile().expect("temporary repoint backing");
-    file.set_len(LENGTH).expect("size repoint backing");
-    let dup = unsafe { libc::dup(file.as_raw_fd()) };
-    assert!(dup >= 0, "dup repoint backing");
-    let owned = unsafe { OwnedFd::from_raw_fd(dup) };
-    let owned_raw = owned.as_raw_fd();
-    let source = dispatcher
-        .mem()
-        .lock()
-        .shared
-        .alloc(
-            LENGTH,
-            crate::shared_aperture::BackingObject::shared_file(owned, 0),
-        )
-        .expect("shared file source");
-    dispatcher.record_dynamic_mapping(
-        source,
-        LENGTH,
-        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
-        ProcMapSharing::Shared,
-        "shared-file".into(),
-    );
-    let mut memory = ProtectionTrackingMemory::new(source, LENGTH as usize);
-    memory.inner.bytes.fill(0x61);
-    memory.fail_repoint = true;
-
-    let outcome = threaded_memory_call(
-        &dispatcher,
-        &mut memory,
-        &registry,
-        &reporter,
-        SyscallRequest::new(
-            SYS_MMAP,
-            SyscallArgs([
-                source,
-                LENGTH,
-                LINUX_PROT_READ | LINUX_PROT_WRITE,
-                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
-                u64::MAX,
-                0,
-            ]),
-        ),
-    );
-    assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
-    let mut byte = [0xff_u8; 1];
-    assert_eq!(
-        unsafe { libc::pread(file.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
-        1
-    );
-    assert_eq!(byte, [0], "clean failure must not commit writeback");
-    assert!(
-        dispatcher
-            .mem()
-            .lock()
-            .shared
-            .guest_range_has_owner(source, LENGTH)
-    );
-    assert_ne!(unsafe { libc::fcntl(owned_raw, libc::F_GETFD) }, -1);
-
-    assert_eq!(
-        threaded_memory_call(
-            &dispatcher,
-            &mut memory,
-            &registry,
-            &reporter,
-            SyscallRequest::new(SYS_MUNMAP, SyscallArgs([source, LENGTH, 0, 0, 0, 0]),),
-        ),
-        DispatchOutcome::Returned { value: 0 }
-    );
-    assert_eq!(unsafe { libc::fcntl(owned_raw, libc::F_GETFD) }, -1);
-    assert_eq!(
-        unsafe { libc::pread(file.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
-        1
-    );
-    assert_eq!(byte, [0x61]);
 }
 
 #[test]
@@ -1710,64 +1774,6 @@ fn proc_mem_snapshot_waits_for_install_and_returns_one_coherent_generation() {
             thread.join().expect("snapshot worker exits");
         })
         .expect("claim host-alias install");
-}
-
-#[test]
-fn dropping_unconsumed_host_alias_outcome_closes_fd_and_aborts_transaction() {
-    let dispatcher = SyscallDispatcher::new();
-    let transaction = dispatcher.with_host_alias_dispatch_for_test(|guard| {
-        guard
-            .publish(HostAliasCommit::mmap(HostAliasMmapCommit {
-                start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
-                len: LINUX_PAGE_SIZE,
-                prot: LinuxProtFlags::READ,
-                sharing: ProcMapSharing::Shared,
-                path: String::new(),
-                file_page_offset: None,
-                droppable: false,
-                semantic_vmas: None,
-                locked: None,
-                resident: false,
-                bus_fault: None,
-                write_sealed_shared: false,
-                read_only_shared_file: false,
-                secretmem: false,
-                writable_memfd: None,
-                private_file: None,
-                shared_file_alias: None,
-            }))
-            .expect("publish")
-    });
-    let mut pipe = [-1; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-    let read_fd = pipe[0];
-    let outcome = DispatchOutcome::MapHostAlias {
-        success_retval: 0,
-        transaction,
-        va: GuestVa(crate::memory::LINUX_HIGH_VA_THRESHOLD),
-        ipa: Gpa(crate::memory::LINUX_ALIAS_IPA_BASE),
-        len: LINUX_PAGE_SIZE,
-        payload: Vec::new(),
-        backing: HostAliasBacking::File {
-            // SAFETY: the successful pipe read end is uniquely transferred.
-            fd: HostAliasOwnedFd::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(read_fd) }),
-            offset: 0,
-            host_prot: libc::PROT_READ,
-            sharing: HostAliasSharing::Shared,
-        },
-        prot: crate::linux_abi::LINUX_PROT_READ,
-        prot_none: false,
-    };
-
-    drop(outcome);
-    assert_eq!(unsafe { libc::fcntl(read_fd, libc::F_GETFD) }, -1);
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EBADF)
-    );
-    assert_eq!(unsafe { libc::close(pipe[1]) }, 0);
-    // Drop of the transaction handle also returned the exclusion to Idle.
-    dispatcher.with_host_alias_dispatch_for_test(|guard| drop(guard));
 }
 
 #[test]

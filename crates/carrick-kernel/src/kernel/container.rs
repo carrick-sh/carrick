@@ -1575,124 +1575,128 @@ mod tests {
 
     /// The env tests write the process environment, so they take one lock
     /// even though `just test` already runs this crate serially.
-    static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    mod serial_host {
+        use super::*;
 
-    fn with_env<T>(vars: &[(&str, Option<&str>)], body: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock();
-        let saved: Vec<(String, Option<String>)> = vars
-            .iter()
-            .map(|(key, _)| ((*key).to_owned(), std::env::var(key).ok()))
-            .collect();
-        for (key, value) in vars {
-            // SAFETY: serialized by ENV_LOCK; no other thread reads the
-            // environment while a test holds it.
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
+        static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+        fn with_env<T>(vars: &[(&str, Option<&str>)], body: impl FnOnce() -> T) -> T {
+            let _guard = ENV_LOCK.lock();
+            let saved: Vec<(String, Option<String>)> = vars
+                .iter()
+                .map(|(key, _)| ((*key).to_owned(), std::env::var(key).ok()))
+                .collect();
+            for (key, value) in vars {
+                // SAFETY: serialized by ENV_LOCK; no other thread reads the
+                // environment while a test holds it.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
                 }
             }
-        }
-        let result = body();
-        for (key, value) in saved {
-            // SAFETY: as above.
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(&key, value),
-                    None => std::env::remove_var(&key),
+            let result = body();
+            for (key, value) in saved {
+                // SAFETY: as above.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(&key, value),
+                        None => std::env::remove_var(&key),
+                    }
                 }
             }
+            result
         }
-        result
-    }
 
-    const IDENTITY_ENV: [&str; 4] = [
-        "CARRICK_RUN_ID",
-        "CARRICK_CONTAINER_ID",
-        "CARRICK_LAUNCH_AUTHORIZATION",
-        "CARRICK_EXEC_OVERLAY",
-    ];
+        const IDENTITY_ENV: [&str; 4] = [
+            "CARRICK_RUN_ID",
+            "CARRICK_CONTAINER_ID",
+            "CARRICK_LAUNCH_AUTHORIZATION",
+            "CARRICK_EXEC_OVERLAY",
+        ];
 
-    #[test]
-    fn from_process_env_reads_a_managed_detached_carrier() {
-        with_env(
-            &[
-                ("CARRICK_RUN_ID", Some("run-7")),
-                ("CARRICK_CONTAINER_ID", Some("deadbeefcafe")),
-                ("CARRICK_LAUNCH_AUTHORIZATION", Some("ticket-1")),
-                ("CARRICK_EXEC_OVERLAY", Some("/tmp/overlay")),
-            ],
-            || {
-                let launch = LaunchContext::from_process_env().expect("managed context");
-                assert_eq!(launch.run_id.as_str(), "run-7");
-                assert_eq!(launch.registry_id(), Some("deadbeefcafe"));
-                assert_eq!(
-                    launch
-                        .launch_authorization
-                        .as_ref()
-                        .map(LaunchAuthorization::ticket),
-                    Some("ticket-1")
-                );
-                assert_eq!(
-                    launch.exec_overlay.as_deref().map(camino::Utf8Path::as_str),
-                    Some("/tmp/overlay")
-                );
-            },
-        );
-    }
+        #[test]
+        fn from_process_env_reads_a_managed_detached_carrier() {
+            with_env(
+                &[
+                    ("CARRICK_RUN_ID", Some("run-7")),
+                    ("CARRICK_CONTAINER_ID", Some("deadbeefcafe")),
+                    ("CARRICK_LAUNCH_AUTHORIZATION", Some("ticket-1")),
+                    ("CARRICK_EXEC_OVERLAY", Some("/tmp/overlay")),
+                ],
+                || {
+                    let launch = LaunchContext::from_process_env().expect("managed context");
+                    assert_eq!(launch.run_id.as_str(), "run-7");
+                    assert_eq!(launch.registry_id(), Some("deadbeefcafe"));
+                    assert_eq!(
+                        launch
+                            .launch_authorization
+                            .as_ref()
+                            .map(LaunchAuthorization::ticket),
+                        Some("ticket-1")
+                    );
+                    assert_eq!(
+                        launch.exec_overlay.as_deref().map(camino::Utf8Path::as_str),
+                        Some("/tmp/overlay")
+                    );
+                },
+            );
+        }
 
-    #[test]
-    fn from_process_env_treats_an_empty_run_id_as_absent() {
-        with_env(
-            &[
-                ("CARRICK_RUN_ID", Some("")),
-                ("CARRICK_CONTAINER_ID", Some("deadbeefcafe")),
-                ("CARRICK_LAUNCH_AUTHORIZATION", None),
-                ("CARRICK_EXEC_OVERLAY", None),
-            ],
-            || {
-                let launch = LaunchContext::from_process_env().expect("managed context");
+        #[test]
+        fn from_process_env_treats_an_empty_run_id_as_absent() {
+            with_env(
+                &[
+                    ("CARRICK_RUN_ID", Some("")),
+                    ("CARRICK_CONTAINER_ID", Some("deadbeefcafe")),
+                    ("CARRICK_LAUNCH_AUTHORIZATION", None),
+                    ("CARRICK_EXEC_OVERLAY", None),
+                ],
+                || {
+                    let launch = LaunchContext::from_process_env().expect("managed context");
+                    assert_eq!(
+                        launch.run_id.as_str(),
+                        format!("pid-{}", std::process::id()),
+                        "an EMPTY run id is absent: the carrier-pid scope, never a \
+                         `carrick-kernel//arena`-shaped path"
+                    );
+                    assert_eq!(launch.registry_id(), Some("deadbeefcafe"));
+                },
+            );
+        }
+
+        #[test]
+        fn from_process_env_falls_back_to_the_carrier_pid_scope() {
+            with_env(&IDENTITY_ENV.map(|key| (key, None)), || {
+                let launch = LaunchContext::from_process_env().expect("unmanaged context");
                 assert_eq!(
                     launch.run_id.as_str(),
-                    format!("pid-{}", std::process::id()),
-                    "an EMPTY run id is absent: the carrier-pid scope, never a \
-                     `carrick-kernel//arena`-shaped path"
+                    format!("pid-{}", std::process::id())
                 );
-                assert_eq!(launch.registry_id(), Some("deadbeefcafe"));
-            },
-        );
-    }
+                assert!(launch.registry_id.is_none());
+                assert!(launch.launch_authorization.is_none());
+                assert!(launch.exec_overlay.is_none());
+            });
+        }
 
-    #[test]
-    fn from_process_env_falls_back_to_the_carrier_pid_scope() {
-        with_env(&IDENTITY_ENV.map(|key| (key, None)), || {
-            let launch = LaunchContext::from_process_env().expect("unmanaged context");
-            assert_eq!(
-                launch.run_id.as_str(),
-                format!("pid-{}", std::process::id())
+        #[test]
+        fn from_process_env_refuses_an_unsafe_registry_id() {
+            with_env(
+                &[
+                    ("CARRICK_RUN_ID", None),
+                    ("CARRICK_CONTAINER_ID", Some("../../etc")),
+                    ("CARRICK_LAUNCH_AUTHORIZATION", None),
+                    ("CARRICK_EXEC_OVERLAY", None),
+                ],
+                || {
+                    assert!(matches!(
+                        LaunchContext::from_process_env(),
+                        Err(RuntimeError::Configuration(message)) if message.contains("CARRICK_CONTAINER_ID")
+                    ));
+                },
             );
-            assert!(launch.registry_id.is_none());
-            assert!(launch.launch_authorization.is_none());
-            assert!(launch.exec_overlay.is_none());
-        });
-    }
-
-    #[test]
-    fn from_process_env_refuses_an_unsafe_registry_id() {
-        with_env(
-            &[
-                ("CARRICK_RUN_ID", None),
-                ("CARRICK_CONTAINER_ID", Some("../../etc")),
-                ("CARRICK_LAUNCH_AUTHORIZATION", None),
-                ("CARRICK_EXEC_OVERLAY", None),
-            ],
-            || {
-                assert!(matches!(
-                    LaunchContext::from_process_env(),
-                    Err(RuntimeError::Configuration(message)) if message.contains("CARRICK_CONTAINER_ID")
-                ));
-            },
-        );
+        }
     }
 }
 

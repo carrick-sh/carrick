@@ -219,131 +219,135 @@ pub(super) fn reset_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // GROUPS and its reset hook are process-wide.
+    mod serial_host {
+        use super::*;
 
-    fn key() -> GroupKey {
-        GroupKey::new(1, vec![2, 0, 0x23, 0x8b, 127, 0, 0, 1])
-    }
-
-    /// A socket in no group must behave exactly as before: always its turn,
-    /// never shared, no siblings. Every call site is gated on this, so getting
-    /// it wrong would change ordinary sockets.
-    #[test]
-    fn an_ungrouped_socket_is_untouched() {
-        reset_for_tests();
-        assert!(is_turn(42));
-        assert!(!is_shared(42));
-        assert!(siblings(42).is_empty());
-    }
-
-    /// One member is not a group. Darwin already delivers everything to a lone
-    /// socket, so it must stay on the untouched path.
-    #[test]
-    fn a_lone_member_is_not_shared() {
-        reset_for_tests();
-        join(key(), 10);
-        assert!(is_turn(10));
-        assert!(!is_shared(10));
-        assert!(siblings(10).is_empty());
-    }
-
-    /// The property the libuv rows actually assert: with two members, turns
-    /// strictly alternate, so BOTH receive work. Darwin alone gives one of them
-    /// zero.
-    #[test]
-    fn two_members_alternate_deterministically() {
-        reset_for_tests();
-        join(key(), 10);
-        join(key(), 11);
-        assert!(is_shared(10) && is_shared(11));
-
-        let mut turns = Vec::new();
-        for _ in 0..6 {
-            let taker = if is_turn(10) { 10 } else { 11 };
-            turns.push(taker);
-            advance_turn(taker);
+        fn key() -> GroupKey {
+            GroupKey::new(1, vec![2, 0, 0x23, 0x8b, 127, 0, 0, 1])
         }
-        assert_eq!(turns, vec![10, 11, 10, 11, 10, 11]);
-    }
 
-    /// A member may drain its OWN socket freely but may take a sibling's work
-    /// only on its turn. Otherwise the first member to wake steals the whole
-    /// backlog in one `recvmmsg` and its sibling still gets nothing — which is
-    /// exactly the failure `udp_reuseport` reported before this split.
-    #[test]
-    fn stealing_is_gated_on_the_turn_but_own_draining_is_not() {
-        reset_for_tests();
-        join(key(), 10);
-        join(key(), 11);
-        assert_eq!(steal_targets(10), vec![11], "10 has the turn");
-        assert!(
-            steal_targets(11).is_empty(),
-            "11 must not steal out of turn"
-        );
-        advance_turn(10);
-        assert!(steal_targets(10).is_empty());
-        assert_eq!(steal_targets(11), vec![10]);
-    }
-
-    /// Whoever's turn it is must be able to find the sibling holding the work,
-    /// because Darwin parks everything on the last binder.
-    #[test]
-    fn siblings_exclude_self_and_start_at_the_cursor() {
-        reset_for_tests();
-        for fd in [10, 11, 12] {
-            join(key(), fd);
+        /// A socket in no group must behave exactly as before: always its turn,
+        /// never shared, no siblings. Every call site is gated on this, so getting
+        /// it wrong would change ordinary sockets.
+        #[test]
+        fn an_ungrouped_socket_is_untouched() {
+            reset_for_tests();
+            assert!(is_turn(42));
+            assert!(!is_shared(42));
+            assert!(siblings(42).is_empty());
         }
-        assert_eq!(siblings(10), vec![11, 12]);
-        advance_turn(10); // cursor -> 11
-        assert_eq!(siblings(10), vec![11, 12]);
-        assert_eq!(siblings(11), vec![12, 10]);
-    }
 
-    /// Host fds are REUSED. A membership that outlived its socket would hand a
-    /// later, unrelated socket's traffic to this group, so close must remove it
-    /// and an emptied group must disappear entirely.
-    #[test]
-    fn leaving_prunes_the_member_and_empty_groups() {
-        reset_for_tests();
-        join(key(), 10);
-        join(key(), 11);
-        leave(11);
-        assert!(!is_shared(10), "one survivor is no longer a group");
-        assert!(is_turn(10));
-        leave(10);
-        // A brand-new socket that happens to reuse fd 10 must be ungrouped.
-        assert!(!is_shared(10));
-        assert!(siblings(10).is_empty());
-    }
-
-    /// Removing a member must not skip the surviving members' turns, and must
-    /// never leave the cursor pointing past the end.
-    #[test]
-    fn leaving_keeps_the_cursor_in_range() {
-        reset_for_tests();
-        for fd in [10, 11, 12] {
-            join(key(), fd);
+        /// One member is not a group. Darwin already delivers everything to a lone
+        /// socket, so it must stay on the untouched path.
+        #[test]
+        fn a_lone_member_is_not_shared() {
+            reset_for_tests();
+            join(key(), 10);
+            assert!(is_turn(10));
+            assert!(!is_shared(10));
+            assert!(siblings(10).is_empty());
         }
-        advance_turn(10);
-        advance_turn(11); // cursor -> index 2 (fd 12)
-        assert!(is_turn(12));
-        leave(10); // members [11, 12], the removed index was before the cursor
-        assert!(
-            is_turn(12),
-            "12 keeps its turn after an earlier member left"
-        );
-        leave(12);
-        assert!(is_turn(11), "the last survivor always has the turn");
-    }
 
-    /// A TCP and a UDP socket on the same port are different groups, as on
-    /// Linux.
-    #[test]
-    fn socket_type_separates_groups() {
-        reset_for_tests();
-        let addr = vec![2, 0, 0x23, 0x8b, 127, 0, 0, 1];
-        join(GroupKey::new(1, addr.clone()), 10);
-        join(GroupKey::new(2, addr), 11);
-        assert!(!is_shared(10));
-        assert!(!is_shared(11));
+        /// The property the libuv rows actually assert: with two members, turns
+        /// strictly alternate, so BOTH receive work. Darwin alone gives one of them
+        /// zero.
+        #[test]
+        fn two_members_alternate_deterministically() {
+            reset_for_tests();
+            join(key(), 10);
+            join(key(), 11);
+            assert!(is_shared(10) && is_shared(11));
+
+            let mut turns = Vec::new();
+            for _ in 0..6 {
+                let taker = if is_turn(10) { 10 } else { 11 };
+                turns.push(taker);
+                advance_turn(taker);
+            }
+            assert_eq!(turns, vec![10, 11, 10, 11, 10, 11]);
+        }
+
+        /// A member may drain its OWN socket freely but may take a sibling's work
+        /// only on its turn. Otherwise the first member to wake steals the whole
+        /// backlog in one `recvmmsg` and its sibling still gets nothing — which is
+        /// exactly the failure `udp_reuseport` reported before this split.
+        #[test]
+        fn stealing_is_gated_on_the_turn_but_own_draining_is_not() {
+            reset_for_tests();
+            join(key(), 10);
+            join(key(), 11);
+            assert_eq!(steal_targets(10), vec![11], "10 has the turn");
+            assert!(
+                steal_targets(11).is_empty(),
+                "11 must not steal out of turn"
+            );
+            advance_turn(10);
+            assert!(steal_targets(10).is_empty());
+            assert_eq!(steal_targets(11), vec![10]);
+        }
+
+        /// Whoever's turn it is must be able to find the sibling holding the work,
+        /// because Darwin parks everything on the last binder.
+        #[test]
+        fn siblings_exclude_self_and_start_at_the_cursor() {
+            reset_for_tests();
+            for fd in [10, 11, 12] {
+                join(key(), fd);
+            }
+            assert_eq!(siblings(10), vec![11, 12]);
+            advance_turn(10); // cursor -> 11
+            assert_eq!(siblings(10), vec![11, 12]);
+            assert_eq!(siblings(11), vec![12, 10]);
+        }
+
+        /// Host fds are REUSED. A membership that outlived its socket would hand a
+        /// later, unrelated socket's traffic to this group, so close must remove it
+        /// and an emptied group must disappear entirely.
+        #[test]
+        fn leaving_prunes_the_member_and_empty_groups() {
+            reset_for_tests();
+            join(key(), 10);
+            join(key(), 11);
+            leave(11);
+            assert!(!is_shared(10), "one survivor is no longer a group");
+            assert!(is_turn(10));
+            leave(10);
+            // A brand-new socket that happens to reuse fd 10 must be ungrouped.
+            assert!(!is_shared(10));
+            assert!(siblings(10).is_empty());
+        }
+
+        /// Removing a member must not skip the surviving members' turns, and must
+        /// never leave the cursor pointing past the end.
+        #[test]
+        fn leaving_keeps_the_cursor_in_range() {
+            reset_for_tests();
+            for fd in [10, 11, 12] {
+                join(key(), fd);
+            }
+            advance_turn(10);
+            advance_turn(11); // cursor -> index 2 (fd 12)
+            assert!(is_turn(12));
+            leave(10); // members [11, 12], the removed index was before the cursor
+            assert!(
+                is_turn(12),
+                "12 keeps its turn after an earlier member left"
+            );
+            leave(12);
+            assert!(is_turn(11), "the last survivor always has the turn");
+        }
+
+        /// A TCP and a UDP socket on the same port are different groups, as on
+        /// Linux.
+        #[test]
+        fn socket_type_separates_groups() {
+            reset_for_tests();
+            let addr = vec![2, 0, 0x23, 0x8b, 127, 0, 0, 1];
+            join(GroupKey::new(1, addr.clone()), 10);
+            join(GroupKey::new(2, addr), 11);
+            assert!(!is_shared(10));
+            assert!(!is_shared(11));
+        }
     }
 }

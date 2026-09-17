@@ -344,107 +344,111 @@ fn monotonic_raw_ns() -> Option<u64> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn stamp_appends_one_line_per_phase_when_gated() {
-        let dir = tempfile::tempdir().expect("stamp tempdir");
-        let path = dir.path().join("stamps.txt");
-        // SAFETY: env mutation is process-global; this test is the only
-        // writer of this variable in the suite and restores it before
-        // returning, and the runtime suite runs single-threaded
-        // (RUST_TEST_THREADS=1 per the `just test` recipe).
-        unsafe { std::env::set_var("CARRICK_EXEC_STAMPS", &path) };
-        stamp(ExecStampPhase::PreExec);
-        stamp(ExecStampPhase::MainEntry);
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("CARRICK_EXEC_STAMPS") };
-        stamp(ExecStampPhase::RuntimeReady);
-        let contents = std::fs::read_to_string(&path).expect("stamp file");
-        let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 2, "ungated stamp must not write: {contents}");
-        let pid = std::process::id();
-        assert!(lines[0].starts_with(&format!(
-            "EXECSTAMP2|pid={pid}|phase=pre-exec|valid=7|mono_ns="
-        )));
-        assert!(lines[1].starts_with(&format!(
-            "EXECSTAMP2|pid={pid}|phase=main-entry|valid=7|mono_ns="
-        )));
-        for line in lines {
-            assert!(line.contains("|process_user_ns="), "{line}");
-            assert!(line.contains("|process_system_ns="), "{line}");
-            assert!(line.contains("|thread_user_ns="), "{line}");
-            assert!(line.contains("|thread_system_ns="), "{line}");
-            assert!(line.ends_with(
-                "|related_pid=0|link_id=0|related_status=0|related_user_ns=0|related_system_ns=0"
+    mod serial_host {
+        use super::*;
+
+        #[test]
+        fn stamp_appends_one_line_per_phase_when_gated() {
+            let dir = tempfile::tempdir().expect("stamp tempdir");
+            let path = dir.path().join("stamps.txt");
+            // SAFETY: env mutation is process-global; this test is the only
+            // writer of this variable in the suite and restores it before
+            // returning, and the runtime suite runs single-threaded
+            // (RUST_TEST_THREADS=1 per the `just test` recipe).
+            unsafe { std::env::set_var("CARRICK_EXEC_STAMPS", &path) };
+            stamp(ExecStampPhase::PreExec);
+            stamp(ExecStampPhase::MainEntry);
+            // SAFETY: as above.
+            unsafe { std::env::remove_var("CARRICK_EXEC_STAMPS") };
+            stamp(ExecStampPhase::RuntimeReady);
+            let contents = std::fs::read_to_string(&path).expect("stamp file");
+            let lines: Vec<&str> = contents.lines().collect();
+            assert_eq!(lines.len(), 2, "ungated stamp must not write: {contents}");
+            let pid = std::process::id();
+            assert!(lines[0].starts_with(&format!(
+                "EXECSTAMP2|pid={pid}|phase=pre-exec|valid=7|mono_ns="
+            )));
+            assert!(lines[1].starts_with(&format!(
+                "EXECSTAMP2|pid={pid}|phase=main-entry|valid=7|mono_ns="
+            )));
+            for line in lines {
+                assert!(line.contains("|process_user_ns="), "{line}");
+                assert!(line.contains("|process_system_ns="), "{line}");
+                assert!(line.contains("|thread_user_ns="), "{line}");
+                assert!(line.contains("|thread_system_ns="), "{line}");
+                assert!(line.ends_with(
+                    "|related_pid=0|link_id=0|related_status=0|related_user_ns=0|related_system_ns=0"
+                ));
+            }
+        }
+
+        #[test]
+        fn related_and_reap_records_bind_the_exact_child() {
+            let dir = tempfile::tempdir().expect("stamp tempdir");
+            let path = dir.path().join("stamps.txt");
+            // SAFETY: this suite is serialized by the repository's test recipe.
+            unsafe { std::env::set_var("CARRICK_EXEC_STAMPS", &path) };
+            stamp_fork(ExecStampPhase::CloneParentReturn, 17, 4242);
+            let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+            usage.ru_utime.tv_sec = 1;
+            usage.ru_utime.tv_usec = 2;
+            usage.ru_stime.tv_sec = 3;
+            usage.ru_stime.tv_usec = 4;
+            stamp_wait_reaped(4242, 7 << 8, &usage);
+            // SAFETY: as above.
+            unsafe { std::env::remove_var("CARRICK_EXEC_STAMPS") };
+
+            let contents = std::fs::read_to_string(&path).expect("stamp file");
+            let lines: Vec<_> = contents.lines().collect();
+            assert_eq!(lines.len(), 2, "{contents}");
+            assert!(lines[0].contains("|phase=clone-parent-return|valid=7|"));
+            assert!(lines[0].ends_with(
+                "|related_pid=4242|link_id=17|related_status=0|related_user_ns=0|related_system_ns=0"
+            ));
+            assert!(lines[1].contains("|phase=wait-reaped|valid=15|"));
+            assert!(lines[1].ends_with(
+                "|related_pid=4242|link_id=0|related_status=1792|related_user_ns=1000002000|related_system_ns=3000004000"
             ));
         }
-    }
 
-    #[test]
-    fn related_and_reap_records_bind_the_exact_child() {
-        let dir = tempfile::tempdir().expect("stamp tempdir");
-        let path = dir.path().join("stamps.txt");
-        // SAFETY: this suite is serialized by the repository's test recipe.
-        unsafe { std::env::set_var("CARRICK_EXEC_STAMPS", &path) };
-        stamp_fork(ExecStampPhase::CloneParentReturn, 17, 4242);
-        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-        usage.ru_utime.tv_sec = 1;
-        usage.ru_utime.tv_usec = 2;
-        usage.ru_stime.tv_sec = 3;
-        usage.ru_stime.tv_usec = 4;
-        stamp_wait_reaped(4242, 7 << 8, &usage);
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("CARRICK_EXEC_STAMPS") };
-
-        let contents = std::fs::read_to_string(&path).expect("stamp file");
-        let lines: Vec<_> = contents.lines().collect();
-        assert_eq!(lines.len(), 2, "{contents}");
-        assert!(lines[0].contains("|phase=clone-parent-return|valid=7|"));
-        assert!(lines[0].ends_with(
-            "|related_pid=4242|link_id=17|related_status=0|related_user_ns=0|related_system_ns=0"
-        ));
-        assert!(lines[1].contains("|phase=wait-reaped|valid=15|"));
-        assert!(lines[1].ends_with(
-            "|related_pid=4242|link_id=0|related_status=1792|related_user_ns=1000002000|related_system_ns=3000004000"
-        ));
-    }
-
-    #[test]
-    fn run_completion_carries_the_transitive_child_cpu_denominator() {
-        let dir = tempfile::tempdir().expect("stamp tempdir");
-        let path = dir.path().join("stamps.txt");
-        // SAFETY: this suite is serialized by the repository's test recipe.
-        unsafe { std::env::set_var("CARRICK_EXEC_STAMPS", &path) };
-        stamp_run_complete();
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("CARRICK_EXEC_STAMPS") };
-        let contents = std::fs::read_to_string(&path).expect("stamp file");
-        let line = contents.trim_end();
-        assert!(line.contains("|phase=run-complete|valid=15|"), "{line}");
-        assert!(line.contains("|related_pid=0|link_id=0|related_status=0|"));
-    }
-
-    #[test]
-    fn spawned_guest_process_exit_exports_both_terminal_stamps_before_raw_exit() {
-        let dir = tempfile::tempdir().expect("stamp tempdir");
-        let path = dir.path().join("stamps.txt");
-        // SAFETY: this suite is serialized by the repository's test recipe.
-        unsafe { std::env::set_var("CARRICK_EXEC_STAMPS", &path) };
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
-        if child == 0 {
-            spawned_guest_process_exit(23);
+        #[test]
+        fn run_completion_carries_the_transitive_child_cpu_denominator() {
+            let dir = tempfile::tempdir().expect("stamp tempdir");
+            let path = dir.path().join("stamps.txt");
+            // SAFETY: this suite is serialized by the repository's test recipe.
+            unsafe { std::env::set_var("CARRICK_EXEC_STAMPS", &path) };
+            stamp_run_complete();
+            // SAFETY: as above.
+            unsafe { std::env::remove_var("CARRICK_EXEC_STAMPS") };
+            let contents = std::fs::read_to_string(&path).expect("stamp file");
+            let line = contents.trim_end();
+            assert!(line.contains("|phase=run-complete|valid=15|"), "{line}");
+            assert!(line.contains("|related_pid=0|link_id=0|related_status=0|"));
         }
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("CARRICK_EXEC_STAMPS") };
-        assert!(libc::WIFEXITED(status), "status={status:#x}");
-        assert_eq!(libc::WEXITSTATUS(status), 23);
-        let contents = std::fs::read_to_string(&path).expect("stamp file");
-        let phases: Vec<_> = contents
-            .lines()
-            .map(|line| line.split('|').nth(2).expect("phase field"))
-            .collect();
-        assert_eq!(phases, ["phase=runtime-return", "phase=pre-host-exit"]);
+
+        #[test]
+        fn spawned_guest_process_exit_exports_both_terminal_stamps_before_raw_exit() {
+            let dir = tempfile::tempdir().expect("stamp tempdir");
+            let path = dir.path().join("stamps.txt");
+            // SAFETY: this suite is serialized by the repository's test recipe.
+            unsafe { std::env::set_var("CARRICK_EXEC_STAMPS", &path) };
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+            if child == 0 {
+                spawned_guest_process_exit(23);
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+            // SAFETY: as above.
+            unsafe { std::env::remove_var("CARRICK_EXEC_STAMPS") };
+            assert!(libc::WIFEXITED(status), "status={status:#x}");
+            assert_eq!(libc::WEXITSTATUS(status), 23);
+            let contents = std::fs::read_to_string(&path).expect("stamp file");
+            let phases: Vec<_> = contents
+                .lines()
+                .map(|line| line.split('|').nth(2).expect("phase field"))
+                .collect();
+            assert_eq!(phases, ["phase=runtime-return", "phase=pre-host-exit"]);
+        }
     }
 }

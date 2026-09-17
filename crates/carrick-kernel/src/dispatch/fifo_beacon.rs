@@ -466,271 +466,275 @@ pub(crate) fn read_end_at_eof(host_fd: i32) -> bool {
 mod tests {
     use super::*;
 
-    fn is_readable(fd: i32) -> bool {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-        rc > 0 && pfd.revents & libc::POLLIN != 0
-    }
+    mod serial_host {
+        use super::*;
 
-    #[test]
-    fn register_close_requires_a_live_host_fd_owner() {
-        let mut fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let writer = crate::dispatch::fd_table::HostFdRef::new(fds[1]);
+        fn is_readable(fd: i32) -> bool {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+            rc > 0 && pfd.revents & libc::POLLIN != 0
+        }
 
-        assert!(!register_close(&writer));
+        #[test]
+        fn register_close_requires_a_live_host_fd_owner() {
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            let writer = crate::dispatch::fd_table::HostFdRef::new(fds[1]);
 
-        unsafe { libc::close(fds[0]) };
-    }
+            assert!(!register_close(&writer));
 
-    #[test]
-    fn writer_reopen_rearms_a_live_reader_beacon() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("reopen-fifo");
-        let c_path =
-            std::ffi::CString::new(path.to_str().expect("utf-8 path")).expect("cstring path");
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            unsafe { libc::close(fds[0]) };
+        }
 
-        let read_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
-        assert!(read_fd >= 0, "open read end");
-        let read_fd = HostFdRef::new(read_fd);
-        register_open(read_fd.raw(), 0);
+        #[test]
+        fn writer_reopen_rearms_a_live_reader_beacon() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("reopen-fifo");
+            let c_path =
+                std::ffi::CString::new(path.to_str().expect("utf-8 path")).expect("cstring path");
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 
-        let first_writer =
-            unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
-        assert!(first_writer >= 0, "open first writer");
-        let first_writer = HostFdRef::new(first_writer);
-        register_open(first_writer.raw(), 1);
-        assert!(
-            !read_end_at_eof(read_fd.raw()),
-            "live writer keeps beacon armed"
-        );
+            let read_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+            assert!(read_fd >= 0, "open read end");
+            let read_fd = HostFdRef::new(read_fd);
+            register_open(read_fd.raw(), 0);
 
-        assert!(register_close(&first_writer));
-        drop(first_writer);
-        assert!(
-            read_end_at_eof(read_fd.raw()),
-            "last writer close reports EOF"
-        );
+            let first_writer =
+                unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            assert!(first_writer >= 0, "open first writer");
+            let first_writer = HostFdRef::new(first_writer);
+            register_open(first_writer.raw(), 1);
+            assert!(
+                !read_end_at_eof(read_fd.raw()),
+                "live writer keeps beacon armed"
+            );
 
-        let second_writer =
-            unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
-        assert!(second_writer >= 0, "open replacement writer");
-        let second_writer = HostFdRef::new(second_writer);
-        register_open(second_writer.raw(), 1);
-        assert!(
-            !read_end_at_eof(read_fd.raw()),
-            "replacement writer must re-arm the retained reader beacon"
-        );
+            assert!(register_close(&first_writer));
+            drop(first_writer);
+            assert!(
+                read_end_at_eof(read_fd.raw()),
+                "last writer close reports EOF"
+            );
 
-        assert!(register_close(&second_writer));
-        drop(second_writer);
-        assert!(
-            read_end_at_eof(read_fd.raw()),
-            "replacement writer close must restore EOF"
-        );
-        assert!(!register_close(&read_fd));
-        let read_raw = read_fd.raw();
-        drop(read_fd);
-        assert!(
-            !has_beacon_for_fd(read_raw),
-            "last reader close must remove the exhausted beacon"
-        );
-    }
+            let second_writer =
+                unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            assert!(second_writer >= 0, "open replacement writer");
+            let second_writer = HostFdRef::new(second_writer);
+            register_open(second_writer.raw(), 1);
+            assert!(
+                !read_end_at_eof(read_fd.raw()),
+                "replacement writer must re-arm the retained reader beacon"
+            );
 
-    #[test]
-    fn readers_present_becomes_readable_and_unreadable_on_close() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("readers-present-fifo");
-        let c_path =
-            std::ffi::CString::new(path.to_str().expect("utf-8 path")).expect("cstring path");
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            assert!(register_close(&second_writer));
+            drop(second_writer);
+            assert!(
+                read_end_at_eof(read_fd.raw()),
+                "replacement writer close must restore EOF"
+            );
+            assert!(!register_close(&read_fd));
+            let read_raw = read_fd.raw();
+            drop(read_fd);
+            assert!(
+                !has_beacon_for_fd(read_raw),
+                "last reader close must remove the exhausted beacon"
+            );
+        }
 
-        let r1 = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
-        assert!(r1 >= 0, "open reader 1");
-        let r1 = HostFdRef::new(r1);
-        let id = fifo_identity(r1.raw()).expect("identity");
-        let r_pipe = readers_present_read_fd(id).expect("readers_present pipe");
-        assert!(!is_readable(r_pipe), "no reader yet");
+        #[test]
+        fn readers_present_becomes_readable_and_unreadable_on_close() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("readers-present-fifo");
+            let c_path =
+                std::ffi::CString::new(path.to_str().expect("utf-8 path")).expect("cstring path");
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 
-        register_open(r1.raw(), 0);
-        assert!(is_readable(r_pipe), "first reader asserts presence");
+            let r1 = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+            assert!(r1 >= 0, "open reader 1");
+            let r1 = HostFdRef::new(r1);
+            let id = fifo_identity(r1.raw()).expect("identity");
+            let r_pipe = readers_present_read_fd(id).expect("readers_present pipe");
+            assert!(!is_readable(r_pipe), "no reader yet");
 
-        let r2 = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
-        assert!(r2 >= 0, "open reader 2");
-        let r2 = HostFdRef::new(r2);
-        register_open(r2.raw(), 0);
-        assert!(is_readable(r_pipe), "second reader keeps presence asserted");
+            register_open(r1.raw(), 0);
+            assert!(is_readable(r_pipe), "first reader asserts presence");
 
-        // Keep a writer registered so the beacon node is not destroyed when readers close
-        let (_, parked_writer) = ParkedOpenerToken::new_writer(id).expect("parked writer");
+            let r2 = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+            assert!(r2 >= 0, "open reader 2");
+            let r2 = HostFdRef::new(r2);
+            register_open(r2.raw(), 0);
+            assert!(is_readable(r_pipe), "second reader keeps presence asserted");
 
-        assert!(!register_close(&r1));
-        drop(r1);
-        assert!(
-            is_readable(r_pipe),
-            "one reader remaining keeps presence asserted"
-        );
+            // Keep a writer registered so the beacon node is not destroyed when readers close
+            let (_, parked_writer) = ParkedOpenerToken::new_writer(id).expect("parked writer");
 
-        assert!(!register_close(&r2));
-        drop(r2);
-        assert!(!is_readable(r_pipe), "last reader closed drains presence");
+            assert!(!register_close(&r1));
+            drop(r1);
+            assert!(
+                is_readable(r_pipe),
+                "one reader remaining keeps presence asserted"
+            );
 
-        drop(parked_writer);
-    }
+            assert!(!register_close(&r2));
+            drop(r2);
+            assert!(!is_readable(r_pipe), "last reader closed drains presence");
 
-    #[test]
-    fn writers_present_becomes_readable_and_unreadable_on_close() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("writers-present-fifo");
-        let c_path =
-            std::ffi::CString::new(path.to_str().expect("utf-8 path")).expect("cstring path");
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            drop(parked_writer);
+        }
 
-        let reader = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
-        assert!(reader >= 0, "open reader");
-        let reader = HostFdRef::new(reader);
-        let id = fifo_identity(reader.raw()).expect("identity");
-        register_open(reader.raw(), 0);
+        #[test]
+        fn writers_present_becomes_readable_and_unreadable_on_close() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("writers-present-fifo");
+            let c_path =
+                std::ffi::CString::new(path.to_str().expect("utf-8 path")).expect("cstring path");
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 
-        let w1 = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
-        assert!(w1 >= 0, "open writer 1");
-        let w1 = HostFdRef::new(w1);
-        let w_pipe = writers_present_read_fd(id).expect("writers_present pipe");
-        assert!(!is_readable(w_pipe), "no writer yet");
+            let reader = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+            assert!(reader >= 0, "open reader");
+            let reader = HostFdRef::new(reader);
+            let id = fifo_identity(reader.raw()).expect("identity");
+            register_open(reader.raw(), 0);
 
-        register_open(w1.raw(), 1);
-        assert!(is_readable(w_pipe), "first writer asserts presence");
+            let w1 = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            assert!(w1 >= 0, "open writer 1");
+            let w1 = HostFdRef::new(w1);
+            let w_pipe = writers_present_read_fd(id).expect("writers_present pipe");
+            assert!(!is_readable(w_pipe), "no writer yet");
 
-        let w2 = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
-        assert!(w2 >= 0, "open writer 2");
-        let w2 = HostFdRef::new(w2);
-        register_open(w2.raw(), 1);
-        assert!(is_readable(w_pipe), "second writer keeps presence asserted");
+            register_open(w1.raw(), 1);
+            assert!(is_readable(w_pipe), "first writer asserts presence");
 
-        assert!(register_close(&w1));
-        drop(w1);
-        assert!(
-            is_readable(w_pipe),
-            "one writer remaining keeps presence asserted"
-        );
+            let w2 = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            assert!(w2 >= 0, "open writer 2");
+            let w2 = HostFdRef::new(w2);
+            register_open(w2.raw(), 1);
+            assert!(is_readable(w_pipe), "second writer keeps presence asserted");
 
-        assert!(register_close(&w2));
-        drop(w2);
-        assert!(!is_readable(w_pipe), "last writer closed drains presence");
+            assert!(register_close(&w1));
+            drop(w1);
+            assert!(
+                is_readable(w_pipe),
+                "one writer remaining keeps presence asserted"
+            );
 
-        assert!(!register_close(&reader));
-        let reader_raw = reader.raw();
-        drop(reader);
-        assert!(!has_beacon_for_fd(reader_raw));
-    }
+            assert!(register_close(&w2));
+            drop(w2);
+            assert!(!is_readable(w_pipe), "last writer closed drains presence");
 
-    #[test]
-    fn rdwr_registration_asserts_both_presence_pipes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("rdwr-present-fifo");
-        let c_path =
-            std::ffi::CString::new(path.to_str().expect("utf-8 path")).expect("cstring path");
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            assert!(!register_close(&reader));
+            let reader_raw = reader.raw();
+            drop(reader);
+            assert!(!has_beacon_for_fd(reader_raw));
+        }
 
-        let rw = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
-        assert!(rw >= 0, "open rdwr");
-        let rw = HostFdRef::new(rw);
-        let id = fifo_identity(rw.raw()).expect("identity");
+        #[test]
+        fn rdwr_registration_asserts_both_presence_pipes() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("rdwr-present-fifo");
+            let c_path =
+                std::ffi::CString::new(path.to_str().expect("utf-8 path")).expect("cstring path");
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 
-        register_open(rw.raw(), 2);
-        let r_pipe = readers_present_read_fd(id).expect("readers_present pipe");
-        let w_pipe = writers_present_read_fd(id).expect("writers_present pipe");
-        assert!(is_readable(r_pipe), "O_RDWR asserts reader presence");
-        assert!(is_readable(w_pipe), "O_RDWR asserts writer presence");
+            let rw = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
+            assert!(rw >= 0, "open rdwr");
+            let rw = HostFdRef::new(rw);
+            let id = fifo_identity(rw.raw()).expect("identity");
 
-        assert!(register_close(&rw));
-        let rw_raw = rw.raw();
-        drop(rw);
-        assert!(!has_beacon_for_fd(rw_raw));
-    }
+            register_open(rw.raw(), 2);
+            let r_pipe = readers_present_read_fd(id).expect("readers_present pipe");
+            let w_pipe = writers_present_read_fd(id).expect("writers_present pipe");
+            assert!(is_readable(r_pipe), "O_RDWR asserts reader presence");
+            assert!(is_readable(w_pipe), "O_RDWR asserts writer presence");
 
-    #[test]
-    fn parked_reader_and_writer_cleanup_drains_presence_and_removes_beacon() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("parked-token-cleanup-fifo");
-        let c_path =
-            std::ffi::CString::new(path.to_str().expect("utf-8 path")).expect("cstring path");
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            assert!(register_close(&rw));
+            let rw_raw = rw.raw();
+            drop(rw);
+            assert!(!has_beacon_for_fd(rw_raw));
+        }
 
-        // 1. Parked reader cleanup test
-        let read_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
-        assert!(read_fd >= 0, "open reader for parking");
-        let id = fifo_identity(read_fd).expect("fifo identity");
+        #[test]
+        fn parked_reader_and_writer_cleanup_drains_presence_and_removes_beacon() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("parked-token-cleanup-fifo");
+            let c_path =
+                std::ffi::CString::new(path.to_str().expect("utf-8 path")).expect("cstring path");
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 
-        let parked_reader = ParkedOpenerToken::new_reader(read_fd, id);
-        let r_pipe = readers_present_read_fd(id).expect("readers_present pipe");
-        let w_pipe = writers_present_read_fd(id).expect("writers_present pipe");
+            // 1. Parked reader cleanup test
+            let read_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+            assert!(read_fd >= 0, "open reader for parking");
+            let id = fifo_identity(read_fd).expect("fifo identity");
 
-        assert!(is_readable(r_pipe), "parked reader asserts readers_present");
-        assert!(!is_readable(w_pipe), "no writer present yet");
-        assert!(is_reader_present(id));
-        assert!(has_beacon_for_fd(read_fd));
-        assert!(has_beacon_for_identity(id));
+            let parked_reader = ParkedOpenerToken::new_reader(read_fd, id);
+            let r_pipe = readers_present_read_fd(id).expect("readers_present pipe");
+            let w_pipe = writers_present_read_fd(id).expect("writers_present pipe");
 
-        // Dropping parked reader unregisters, drains presence pipe, closes read_fd, and frees beacon
-        drop(parked_reader);
-        assert!(!is_reader_present(id), "reader count dropped to 0");
-        assert!(!has_beacon_for_fd(read_fd));
-        assert!(
-            !has_beacon_for_identity(id),
-            "beacon node removed when empty"
-        );
-        // Verify read_fd was closed
-        assert_eq!(unsafe { libc::fcntl(read_fd, libc::F_GETFD) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
-        );
+            assert!(is_readable(r_pipe), "parked reader asserts readers_present");
+            assert!(!is_readable(w_pipe), "no writer present yet");
+            assert!(is_reader_present(id));
+            assert!(has_beacon_for_fd(read_fd));
+            assert!(has_beacon_for_identity(id));
 
-        // 2. Parked writer cleanup test
-        let (r_pipe, parked_writer) =
-            ParkedOpenerToken::new_writer(id).expect("register parked writer");
-        let w_pipe = writers_present_read_fd(id).expect("writers_present pipe");
+            // Dropping parked reader unregisters, drains presence pipe, closes read_fd, and frees beacon
+            drop(parked_reader);
+            assert!(!is_reader_present(id), "reader count dropped to 0");
+            assert!(!has_beacon_for_fd(read_fd));
+            assert!(
+                !has_beacon_for_identity(id),
+                "beacon node removed when empty"
+            );
+            // Verify read_fd was closed
+            assert_eq!(unsafe { libc::fcntl(read_fd, libc::F_GETFD) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
 
-        assert!(is_readable(w_pipe), "parked writer asserts writers_present");
-        assert!(!is_readable(r_pipe), "no reader present");
-        assert!(is_writer_present(id));
-        assert!(has_beacon_for_identity(id));
+            // 2. Parked writer cleanup test
+            let (r_pipe, parked_writer) =
+                ParkedOpenerToken::new_writer(id).expect("register parked writer");
+            let w_pipe = writers_present_read_fd(id).expect("writers_present pipe");
 
-        // Dropping parked writer unregisters, drains presence pipe, and frees beacon
-        drop(parked_writer);
-        assert!(!is_writer_present(id), "writer count dropped to 0");
-        assert!(
-            !has_beacon_for_identity(id),
-            "beacon node removed when empty"
-        );
+            assert!(is_readable(w_pipe), "parked writer asserts writers_present");
+            assert!(!is_readable(r_pipe), "no reader present");
+            assert!(is_writer_present(id));
+            assert!(has_beacon_for_identity(id));
 
-        // 3. Multiple parked openers cleanup
-        let r1_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
-        assert!(r1_fd >= 0);
-        let r2_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
-        assert!(r2_fd >= 0);
+            // Dropping parked writer unregisters, drains presence pipe, and frees beacon
+            drop(parked_writer);
+            assert!(!is_writer_present(id), "writer count dropped to 0");
+            assert!(
+                !has_beacon_for_identity(id),
+                "beacon node removed when empty"
+            );
 
-        let t_r1 = ParkedOpenerToken::new_reader(r1_fd, id);
-        let t_r2 = ParkedOpenerToken::new_reader(r2_fd, id);
-        let r_pipe = readers_present_read_fd(id).expect("readers_present pipe");
-        assert!(is_readable(r_pipe));
+            // 3. Multiple parked openers cleanup
+            let r1_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+            assert!(r1_fd >= 0);
+            let r2_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+            assert!(r2_fd >= 0);
 
-        drop(t_r1);
-        assert!(
-            is_readable(r_pipe),
-            "second parked reader keeps presence asserted"
-        );
-        assert_eq!(unsafe { libc::fcntl(r1_fd, libc::F_GETFD) }, -1);
+            let t_r1 = ParkedOpenerToken::new_reader(r1_fd, id);
+            let t_r2 = ParkedOpenerToken::new_reader(r2_fd, id);
+            let r_pipe = readers_present_read_fd(id).expect("readers_present pipe");
+            assert!(is_readable(r_pipe));
 
-        drop(t_r2);
-        assert!(!is_reader_present(id));
-        assert!(!has_beacon_for_identity(id));
-        assert_eq!(unsafe { libc::fcntl(r2_fd, libc::F_GETFD) }, -1);
+            drop(t_r1);
+            assert!(
+                is_readable(r_pipe),
+                "second parked reader keeps presence asserted"
+            );
+            assert_eq!(unsafe { libc::fcntl(r1_fd, libc::F_GETFD) }, -1);
+
+            drop(t_r2);
+            assert!(!is_reader_present(id));
+            assert!(!has_beacon_for_identity(id));
+            assert_eq!(unsafe { libc::fcntl(r2_fd, libc::F_GETFD) }, -1);
+        }
     }
 }

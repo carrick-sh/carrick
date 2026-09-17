@@ -2726,131 +2726,916 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// The durable record files exist because a forked guest child cannot see
-    /// the parent's in-process registry. Sharding the service records changed
-    /// where those files live, so pin the property they exist for: a child must
-    /// still resolve what its parent published both before and after the fork.
-    #[test]
-    fn forked_child_resolves_service_and_endpoint_records_across_the_fork() {
-        let suffix = std::process::id();
-        let bridge = BridgeId::new(format!("test-forkdns-{suffix}"));
-        let mut prefork = NetworkNamespaceSpec::bridge_default(
-            Some("prefork".to_string()),
-            vec!["shared".to_string()],
-            Vec::new(),
-        );
-        prefork.bridge_id = bridge.clone();
-        prefork.ipv4 = Ipv4Addr::new(172, 31, 60, 10);
-        prefork.namespace_id = Some(NetworkNamespaceId::new(format!("test-forkdns-a-{suffix}")));
-        let mut postfork = NetworkNamespaceSpec::bridge_default(
-            Some("postfork".to_string()),
-            vec!["shared".to_string()],
-            Vec::new(),
-        );
-        postfork.bridge_id = bridge.clone();
-        postfork.ipv4 = Ipv4Addr::new(172, 31, 60, 11);
-        postfork.namespace_id = Some(NetworkNamespaceId::new(format!("test-forkdns-b-{suffix}")));
+    mod serial_host {
+        use super::*;
 
-        let provider = SocketNamespaceProvider::new();
-        provider
-            .create_namespace(&prefork)
-            .expect("pre-fork namespace");
+        /// The durable record files exist because a forked guest child cannot see
+        /// the parent's in-process registry. Sharding the service records changed
+        /// where those files live, so pin the property they exist for: a child must
+        /// still resolve what its parent published both before and after the fork.
+        #[test]
+        fn forked_child_resolves_service_and_endpoint_records_across_the_fork() {
+            let suffix = std::process::id();
+            let bridge = BridgeId::new(format!("test-forkdns-{suffix}"));
+            let mut prefork = NetworkNamespaceSpec::bridge_default(
+                Some("prefork".to_string()),
+                vec!["shared".to_string()],
+                Vec::new(),
+            );
+            prefork.bridge_id = bridge.clone();
+            prefork.ipv4 = Ipv4Addr::new(172, 31, 60, 10);
+            prefork.namespace_id =
+                Some(NetworkNamespaceId::new(format!("test-forkdns-a-{suffix}")));
+            let mut postfork = NetworkNamespaceSpec::bridge_default(
+                Some("postfork".to_string()),
+                vec!["shared".to_string()],
+                Vec::new(),
+            );
+            postfork.bridge_id = bridge.clone();
+            postfork.ipv4 = Ipv4Addr::new(172, 31, 60, 11);
+            postfork.namespace_id =
+                Some(NetworkNamespaceId::new(format!("test-forkdns-b-{suffix}")));
 
-        let mut fds = [0i32; 2];
-        assert_eq!(
-            unsafe { libc::pipe(fds.as_mut_ptr()) },
-            0,
-            "pipe: {}",
-            io::Error::last_os_error()
-        );
-        let (read_fd, write_fd) = (fds[0], fds[1]);
-        let post_endpoint = guest(SocketAddr::new(IpAddr::V4(postfork.ipv4), 5432));
-        let post_host = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45432));
+            let provider = SocketNamespaceProvider::new();
+            provider
+                .create_namespace(&prefork)
+                .expect("pre-fork namespace");
 
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
-        if pid == 0 {
-            unsafe { libc::close(write_fd) };
-            // Block until the parent has published the post-fork records; the
-            // child's copy-on-write registry can never learn about them, so a
-            // hit here can only have come from the shared files.
-            let mut byte = 0u8;
-            let read = unsafe { libc::read(read_fd, (&raw mut byte).cast(), 1) };
-            let mut code = 0;
-            if read != 1 {
-                code |= 1;
+            let mut fds = [0i32; 2];
+            assert_eq!(
+                unsafe { libc::pipe(fds.as_mut_ptr()) },
+                0,
+                "pipe: {}",
+                io::Error::last_os_error()
+            );
+            let (read_fd, write_fd) = (fds[0], fds[1]);
+            let post_endpoint = guest(SocketAddr::new(IpAddr::V4(postfork.ipv4), 5432));
+            let post_host = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45432));
+
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+            if pid == 0 {
+                unsafe { libc::close(write_fd) };
+                // Block until the parent has published the post-fork records; the
+                // child's copy-on-write registry can never learn about them, so a
+                // hit here can only have come from the shared files.
+                let mut byte = 0u8;
+                let read = unsafe { libc::read(read_fd, (&raw mut byte).cast(), 1) };
+                let mut code = 0;
+                if read != 1 {
+                    code |= 1;
+                }
+                if provider.resolve_dns_name(&prefork, "prefork").ok() != Some(vec![prefork.ipv4]) {
+                    code |= 2;
+                }
+                if provider.resolve_dns_name(&prefork, "postfork").ok() != Some(vec![postfork.ipv4])
+                {
+                    code |= 4;
+                }
+                if provider.resolve_dns_name(&prefork, "shared").ok()
+                    != Some(vec![prefork.ipv4, postfork.ipv4])
+                {
+                    code |= 8;
+                }
+                let hosts = provider.guest_hosts_entries(&prefork).unwrap_or_default();
+                if !hosts
+                    .iter()
+                    .any(|entry| entry.addr == IpAddr::V4(postfork.ipv4))
+                    || !hosts
+                        .iter()
+                        .any(|entry| entry.addr == IpAddr::V4(prefork.ipv4))
+                {
+                    code |= 16;
+                }
+                if provider
+                    .resolve_registered_connect(
+                        &bridge,
+                        postfork.namespace_id.as_ref(),
+                        post_endpoint,
+                        PortProtocol::Tcp,
+                    )
+                    .ok()
+                    .flatten()
+                    != Some(post_host)
+                {
+                    code |= 32;
+                }
+                unsafe { libc::_exit(code) };
             }
-            if provider.resolve_dns_name(&prefork, "prefork").ok() != Some(vec![prefork.ipv4]) {
+
+            unsafe { libc::close(read_fd) };
+            provider
+                .create_namespace(&postfork)
+                .expect("post-fork namespace");
+            provider
+                .register_virtual_endpoint(
+                    bridge.clone(),
+                    postfork.namespace_id.clone().expect("namespace id"),
+                    post_endpoint,
+                    PortProtocol::Tcp,
+                    post_host,
+                )
+                .expect("post-fork endpoint");
+            assert_eq!(
+                unsafe { libc::write(write_fd, [1u8].as_ptr().cast(), 1) },
+                1,
+                "signal child: {}",
+                io::Error::last_os_error()
+            );
+            unsafe { libc::close(write_fd) };
+
+            let mut status = 0i32;
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &raw mut status, 0) },
+                pid,
+                "waitpid: {}",
+                io::Error::last_os_error()
+            );
+            assert!(libc::WIFEXITED(status), "child did not exit normally");
+            assert_eq!(
+                libc::WEXITSTATUS(status),
+                0,
+                "forked child failed to resolve records across the fork (bitmask)"
+            );
+        }
+
+        #[cfg(target_os = "freebsd")]
+        #[test]
+        fn fork_child_closes_published_listener_fds_for_port_release() {
+            let _test_lock = FORK_SOCKET_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let tcp_port = free_loopback_port();
+            let reserved_udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve udp port");
+            let udp_port = reserved_udp.local_addr().expect("udp addr").port();
+            drop(reserved_udp);
+            let tcp_mapping = PortMapping {
+                host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                host_port: Some(tcp_port),
+                container_port: 8080,
+                protocol: PortProtocol::Tcp,
+            };
+            let udp_mapping = PortMapping {
+                host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                host_port: Some(udp_port),
+                container_port: 8081,
+                protocol: PortProtocol::Udp,
+            };
+            let spec = unnamed_bridge_spec(vec![tcp_mapping.clone(), udp_mapping.clone()]);
+            let provider = SocketNamespaceProvider::new();
+            let lease = provider.create_namespace(&spec).expect("namespace");
+            provider
+                .publish_port(lease.id, tcp_mapping)
+                .expect("publish tcp");
+            provider
+                .publish_port(lease.id, udp_mapping)
+                .expect("publish udp");
+            wait_for_fork_tracked_fds(&provider, 2);
+
+            let mut ready_pipe = [0; 2];
+            assert_eq!(unsafe { libc::pipe(ready_pipe.as_mut_ptr()) }, 0);
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let fork_guard = loop {
+                if let Some(guard) = provider.try_fork_guard() {
+                    break guard;
+                }
+                assert!(std::time::Instant::now() < deadline, "fork gate timed out");
+                thread::yield_now();
+            };
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+            if pid == 0 {
+                unsafe {
+                    libc::close(ready_pipe[0]);
+                }
+                drop(fork_guard);
+                provider.after_fork_child();
+                let ready = [1_u8];
+                let wrote =
+                    unsafe { libc::write(ready_pipe[1], ready.as_ptr().cast(), ready.len()) };
+                unsafe {
+                    libc::close(ready_pipe[1]);
+                }
+                if wrote == 1 {
+                    thread::sleep(Duration::from_secs(2));
+                    unsafe { libc::_exit(0) };
+                }
+                unsafe { libc::_exit(122) };
+            }
+            drop(fork_guard);
+            unsafe {
+                libc::close(ready_pipe[1]);
+            }
+            let mut ready = [0_u8; 1];
+            let read = unsafe { libc::read(ready_pipe[0], ready.as_mut_ptr().cast(), ready.len()) };
+            unsafe {
+                libc::close(ready_pipe[0]);
+            }
+            assert_eq!(read, 1, "child did not signal fork cleanup readiness");
+
+            provider
+                .destroy_namespace(lease.id)
+                .expect("destroy namespace");
+            let _tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, tcp_port))
+                .expect("child released published TCP port");
+            let _udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, udp_port))
+                .expect("child released published UDP port");
+
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+        }
+
+        #[cfg(target_os = "freebsd")]
+        #[test]
+        fn fork_child_closes_active_udp_transient_and_parent_reuses_proxy() {
+            let _test_lock = FORK_SOCKET_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let reserved = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve host port");
+            let host_port = reserved.local_addr().expect("reserved addr").port();
+            drop(reserved);
+            let container_port = 8083;
+            let mapping = PortMapping {
+                host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                host_port: Some(host_port),
+                container_port,
+                protocol: PortProtocol::Udp,
+            };
+            let spec = unnamed_bridge_spec(vec![mapping.clone()]);
+            let provider = SocketNamespaceProvider::new();
+            let lease = provider.create_namespace(&spec).expect("namespace");
+            provider.publish_port(lease.id, mapping).expect("publish");
+
+            let target = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("target bind");
+            let target_addr = target.local_addr().expect("target addr");
+            let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let server = thread::spawn(move || {
+                let mut request = [0_u8; 8];
+                let (len, peer) = target
+                    .recv_from(&mut request)
+                    .expect("first target request");
+                assert_eq!(&request[..len], b"one");
+                first_tx.send(()).expect("report active UDP transient");
+                release_rx.recv().expect("release first UDP response");
+                target.send_to(b"one", peer).expect("first target response");
+                let (len, peer) = target
+                    .recv_from(&mut request)
+                    .expect("second target request");
+                assert_eq!(&request[..len], b"two");
+                target
+                    .send_to(b"two", peer)
+                    .expect("second target response");
+            });
+            provider
+                .register_virtual_endpoint(
+                    spec.bridge_id.clone(),
+                    spec.namespace_id.clone().expect("namespace id"),
+                    guest(SocketAddr::new(IpAddr::V4(spec.ipv4), container_port)),
+                    PortProtocol::Udp,
+                    host(target_addr),
+                )
+                .expect("register UDP target");
+            let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client bind");
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("client timeout");
+            client
+                .send_to(b"one", (Ipv4Addr::LOCALHOST, host_port))
+                .expect("send first published datagram");
+            first_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("UDP transient became active");
+            wait_for_fork_tracked_fds(&provider, 2);
+            let active_fds = provider
+                .fork_tracked_fds
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let fork_guard = loop {
+                if let Some(guard) = provider.try_fork_guard() {
+                    break guard;
+                }
+                assert!(std::time::Instant::now() < deadline, "fork gate timed out");
+                thread::yield_now();
+            };
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+            if pid == 0 {
+                drop(fork_guard);
+                provider.after_fork_child();
+                let all_closed = active_fds.iter().all(|fd| {
+                    let rc = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+                    rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+                });
+                unsafe { libc::_exit(if all_closed { 0 } else { 123 }) };
+            }
+            drop(fork_guard);
+            for fd in &active_fds {
+                assert!(
+                    unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0,
+                    "child close changed parent UDP fd {fd}"
+                );
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+
+            release_tx.send(()).expect("release first response");
+            let mut response = [0_u8; 8];
+            let (len, _) = client
+                .recv_from(&mut response)
+                .expect("first proxy response");
+            assert_eq!(&response[..len], b"one");
+            client
+                .send_to(b"two", (Ipv4Addr::LOCALHOST, host_port))
+                .expect("reuse published UDP proxy");
+            let (len, _) = client
+                .recv_from(&mut response)
+                .expect("second proxy response");
+            assert_eq!(&response[..len], b"two");
+            server.join().expect("UDP target thread");
+            provider
+                .destroy_namespace(lease.id)
+                .expect("destroy namespace");
+        }
+
+        #[cfg(target_os = "freebsd")]
+        #[test]
+        fn fork_child_closes_raw_published_stream_fds_without_shutdown() {
+            let _test_lock = FORK_SOCKET_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let host_port = free_loopback_port();
+            let container_port = 8082;
+            let mapping = PortMapping {
+                host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                host_port: Some(host_port),
+                container_port,
+                protocol: PortProtocol::Tcp,
+            };
+            let spec = unnamed_bridge_spec(vec![mapping.clone()]);
+            let provider = SocketNamespaceProvider::new();
+            let lease = provider.create_namespace(&spec).expect("namespace");
+            provider.publish_port(lease.id, mapping).expect("publish");
+
+            let target_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("target bind");
+            let target_addr = target_listener.local_addr().expect("target addr");
+            let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_target_tx, release_target_rx) = std::sync::mpsc::sync_channel(1);
+            let target = thread::spawn(move || {
+                let (_stream, _) = target_listener.accept().expect("target accept");
+                accepted_tx.send(()).expect("report target accept");
+                release_target_rx.recv().expect("release target stream");
+            });
+            provider
+                .register_virtual_endpoint(
+                    spec.bridge_id.clone(),
+                    spec.namespace_id.clone().expect("namespace id"),
+                    guest(SocketAddr::new(IpAddr::V4(spec.ipv4), container_port)),
+                    PortProtocol::Tcp,
+                    host(target_addr),
+                )
+                .expect("register target endpoint");
+
+            let client = TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).expect("connect");
+            accepted_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("target accepted proxy stream");
+            wait_for_fork_tracked_fds(&provider, 5);
+            let tracked_before_fork = provider
+                .fork_tracked_fds
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+
+            let mut ready_pipe = [0; 2];
+            assert_eq!(unsafe { libc::pipe(ready_pipe.as_mut_ptr()) }, 0);
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let fork_guard = loop {
+                if let Some(guard) = provider.try_fork_guard() {
+                    break guard;
+                }
+                assert!(std::time::Instant::now() < deadline, "fork gate timed out");
+                thread::yield_now();
+            };
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+            if pid == 0 {
+                unsafe {
+                    libc::close(ready_pipe[0]);
+                }
+                drop(fork_guard);
+                provider.after_fork_child();
+                let all_closed = tracked_before_fork.iter().all(|fd| {
+                    let rc = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+                    rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+                });
+                let ready = [u8::from(all_closed)];
+                let wrote =
+                    unsafe { libc::write(ready_pipe[1], ready.as_ptr().cast(), ready.len()) };
+                unsafe {
+                    libc::close(ready_pipe[1]);
+                }
+                if wrote == 1 {
+                    thread::sleep(Duration::from_secs(2));
+                    unsafe { libc::_exit(0) };
+                }
+                unsafe { libc::_exit(122) };
+            }
+            drop(fork_guard);
+            unsafe {
+                libc::close(ready_pipe[1]);
+            }
+            let mut ready = [0_u8; 1];
+            let read = unsafe { libc::read(ready_pipe[0], ready.as_mut_ptr().cast(), ready.len()) };
+            unsafe {
+                libc::close(ready_pipe[0]);
+            }
+            assert_eq!(read, 1, "child did not signal fork cleanup readiness");
+            assert_eq!(
+                ready,
+                [1],
+                "child retained at least one raw bridge stream fd"
+            );
+            for fd in &tracked_before_fork {
+                assert!(
+                    unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0,
+                    "child close changed the parent's reference for raw fd {fd}"
+                );
+            }
+            drop(client);
+            release_target_tx.send(()).expect("release target stream");
+            target.join().expect("target thread");
+
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+
+            provider
+                .destroy_namespace(lease.id)
+                .expect("destroy namespace");
+        }
+
+        #[cfg(target_os = "freebsd")]
+        #[test]
+        fn fork_guard_unlocks_registry_and_child_abandons_parent_publications() {
+            let mut spec = NetworkNamespaceSpec::bridge_default(
+                Some("fork-net".to_string()),
+                Vec::new(),
+                Vec::new(),
+            );
+            let namespace_id = NetworkNamespaceId::new(format!("fork-net-{}", std::process::id()));
+            spec.namespace_id = Some(namespace_id.clone());
+            spec.bridge_id = BridgeId::new(format!("fork-bridge-{}", std::process::id()));
+            let provider = SocketNamespaceProvider::new();
+            let lease = provider.create_namespace(&spec).expect("create namespace");
+            let guest_addr = guest(SocketAddr::new(IpAddr::V4(spec.ipv4), 41000));
+            let host_addr = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 41001));
+            provider
+                .register_virtual_endpoint(
+                    spec.bridge_id.clone(),
+                    namespace_id,
+                    guest_addr,
+                    PortProtocol::Tcp,
+                    host_addr,
+                )
+                .expect("register durable endpoint");
+            let endpoint = VirtualEndpoint {
+                scope: bridge_scope(
+                    spec.bridge_id.clone(),
+                    spec.namespace_id.as_ref(),
+                    guest_addr,
+                ),
+                addr: guest_addr,
+                protocol: PortProtocol::Tcp,
+            };
+            let durable_path = endpoint_path(&provider.endpoint_dir, &endpoint);
+            assert!(durable_path.exists());
+
+            // Exercise the exact helper order gate->registry, then retain that
+            // thread's JoinHandle in the publication collection across the real
+            // fork. The child hook must forget rather than join this vanished
+            // pthread, while the parent later retains normal stop/join ownership.
+            let helper_gate = Arc::clone(&provider.fork_gate);
+            let helper_registry = Arc::clone(&provider.registry);
+            let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let (finish_tx, finish_rx) = std::sync::mpsc::sync_channel(1);
+            let handle = thread::spawn(move || {
+                {
+                    let _gate = helper_gate.lock().unwrap_or_else(|p| p.into_inner());
+                    let _registry = helper_registry.lock().unwrap_or_else(|p| p.into_inner());
+                    locked_tx.send(()).expect("report helper critical section");
+                    release_rx.recv().expect("release helper critical section");
+                }
+                finish_rx.recv().expect("finish parent publication helper");
+            });
+            let _tracked_listener = ForkTrackedSocket::new(
+                TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("tracked listener"),
+                &provider.fork_gate,
+                &provider.fork_tracked_fds,
+            );
+            provider
+                .published_tcp
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(lease.id)
+                .or_default()
+                .push(PublishedTcpProxy {
+                    stop: Arc::new(AtomicBool::new(false)),
+                    handle: Some(handle),
+                    owner: std::process::id(),
+                });
+            locked_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("helper holds gate and registry");
+            assert!(
+                provider.try_fork_guard().is_none(),
+                "fork guard must not pass a helper in the registry"
+            );
+            release_tx.send(()).expect("release helper registry access");
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let fork_guard = loop {
+                if let Some(guard) = provider.try_fork_guard() {
+                    break guard;
+                }
+                assert!(std::time::Instant::now() < deadline, "fork gate timed out");
+                thread::yield_now();
+            };
+
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+            if pid == 0 {
+                drop(fork_guard);
+                provider.after_fork_child();
+                let accessible = provider
+                    .translate_host_source(host_addr, PortProtocol::Tcp)
+                    .ok()
+                    .flatten()
+                    == Some(guest_addr);
+                let child_helpers_empty = provider
+                    .published_tcp
+                    .lock()
+                    .map(|published| published.is_empty())
+                    .unwrap_or(false);
+                let child_owns_no_files = provider
+                    .owned_endpoint_files
+                    .lock()
+                    .map(|owned| owned.is_empty())
+                    .unwrap_or(false);
+                let _ = provider.destroy_namespace(lease.id);
+                let durable_preserved = durable_path.exists();
+                unsafe {
+                    libc::_exit(
+                        if accessible
+                            && child_helpers_empty
+                            && child_owns_no_files
+                            && durable_preserved
+                        {
+                            0
+                        } else {
+                            121
+                        },
+                    );
+                }
+            }
+            drop(fork_guard);
+
+            let wait_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut status = 0;
+            loop {
+                let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if waited == pid {
+                    break;
+                }
+                assert_eq!(waited, 0, "waitpid failed: {}", io::Error::last_os_error());
+                if std::time::Instant::now() >= wait_deadline {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                        libc::waitpid(pid, &mut status, 0);
+                    }
+                    panic!("fork child joined a vanished publication helper");
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            finish_tx
+                .send(())
+                .expect("finish parent publication helper");
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            assert!(durable_path.exists(), "child removed parent endpoint file");
+            provider
+                .destroy_namespace(lease.id)
+                .expect("parent destroys namespace");
+            assert!(
+                !durable_path.exists(),
+                "parent retained owned endpoint file"
+            );
+        }
+
+        /// The regression test for the cross-wire itself, in the shape it ships in:
+        /// two separate **processes**, each publishing a port for an unnamed
+        /// container, sharing one endpoint namespace.
+        ///
+        /// Every ordering edge is a blocking pipe read or a `waitpid`; nothing
+        /// sleeps and nothing retries. Each child publishes its port, records its
+        /// container listener, writes one ready byte and blocks. The parent reads
+        /// **both** ready bytes before connecting to anything, so both records are
+        /// on disk first -- which is what makes the pre-fix failure certain rather
+        /// than a race: with one shared key, whichever child wrote last owns it, and
+        /// the other child's relay necessarily proxies to the wrong container.
+        ///
+        /// Each child publishes its container listener with `write_endpoint_file`
+        /// rather than `register_virtual_endpoint`, and asserts its own registry
+        /// does not hold the key. That is the real shape: the guest listener is
+        /// bound by a *forked descendant*, whose registry insert landed in its own
+        /// copy-on-write copy, so the relay has nothing in memory and the durable
+        /// record is the only channel.
+        #[test]
+        fn published_relays_of_two_instances_do_not_cross_wire() {
+            // Mint this process's instance id before forking, so both children
+            // inherit the same one. That is deliberate: it holds the identity check
+            // constant so this test can only pass because the *key* separates the
+            // two instances, not because their process identities differ.
+            let _ = instance_id();
+            let root = shared_instance_root("crosswire");
+            let (port_a, port_b) = two_free_loopback_ports();
+            let instances = [(port_a, *b"AAAA"), (port_b, *b"BBBB")];
+
+            let mut release = [0i32; 2];
+            assert_eq!(
+                unsafe { libc::pipe(release.as_mut_ptr()) },
+                0,
+                "release pipe: {}",
+                io::Error::last_os_error()
+            );
+            let (release_read, release_write) = (release[0], release[1]);
+
+            let mut children = Vec::new();
+            for (host_port, token) in instances {
+                let mut ready = [0i32; 2];
+                assert_eq!(
+                    unsafe { libc::pipe(ready.as_mut_ptr()) },
+                    0,
+                    "ready pipe: {}",
+                    io::Error::last_os_error()
+                );
+                let (ready_read, ready_write) = (ready[0], ready[1]);
+                let pid = unsafe { libc::fork() };
+                assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+                if pid == 0 {
+                    unsafe {
+                        libc::close(ready_read);
+                        // The child must not hold the release pipe's write end or
+                        // the parent closing its own copy would never be an EOF.
+                        libc::close(release_write);
+                    }
+                    let code =
+                        run_crosswire_instance(&root, host_port, token, ready_write, release_read);
+                    unsafe { libc::_exit(code) };
+                }
+                unsafe { libc::close(ready_write) };
+                children.push((pid, ready_read));
+            }
+            unsafe { libc::close(release_read) };
+
+            // Happens-after: both listeners are bound and both records are written.
+            for (_, ready_read) in &children {
+                let mut byte = 0u8;
+                assert_eq!(
+                    unsafe { libc::read(*ready_read, (&raw mut byte).cast(), 1) },
+                    1,
+                    "child never reported ready: {}",
+                    io::Error::last_os_error()
+                );
+            }
+
+            let mut served = Vec::new();
+            for (host_port, _) in instances {
+                let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, host_port))
+                    .expect("connect published");
+                let mut reply = [0_u8; 4];
+                client
+                    .read_exact(&mut reply)
+                    .unwrap_or_else(|e| panic!("published port {host_port} served nothing: {e}"));
+                served.push(reply);
+            }
+
+            unsafe { libc::close(release_write) };
+            for (pid, ready_read) in children {
+                unsafe { libc::close(ready_read) };
+                let mut status = 0i32;
+                assert_eq!(
+                    unsafe { libc::waitpid(pid, &raw mut status, 0) },
+                    pid,
+                    "waitpid: {}",
+                    io::Error::last_os_error()
+                );
+                assert!(libc::WIFEXITED(status), "instance did not exit normally");
+                assert_eq!(
+                    libc::WEXITSTATUS(status),
+                    0,
+                    "instance failed to set itself up (bitmask)"
+                );
+            }
+            let _ = fs::remove_dir_all(&root);
+
+            for (index, (_, token)) in instances.iter().enumerate() {
+                assert_eq!(
+                    &served[index],
+                    token,
+                    "published port {} was proxied into the wrong container: served {:?}, expected {:?}",
+                    instances[index].0,
+                    String::from_utf8_lossy(&served[index]),
+                    String::from_utf8_lossy(token)
+                );
+            }
+        }
+
+        /// One instance of the cross-wire harness, running in its own process.
+        /// Returns a bitmask so a failure is reported through `waitpid` rather than
+        /// by unwinding a panic through a forked child.
+        fn run_crosswire_instance(
+            root: &Path,
+            host_port: u16,
+            token: [u8; 4],
+            ready_fd: RawFd,
+            release_fd: RawFd,
+        ) -> i32 {
+            let mut code = 0;
+            let mapping = PortMapping {
+                host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                host_port: Some(host_port),
+                container_port: 8080,
+                protocol: PortProtocol::Tcp,
+            };
+            let mut spec =
+                NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+            spec.namespace_id = Some(NetworkNamespaceId::anonymous(std::process::id()));
+            let provider = SocketNamespaceProvider::with_endpoint_root(root);
+            let Ok(lease) = provider.create_namespace(&spec) else {
+                return 1;
+            };
+            if provider.publish_port(lease.id, mapping).is_err() {
                 code |= 2;
             }
-            if provider.resolve_dns_name(&prefork, "postfork").ok() != Some(vec![postfork.ipv4]) {
-                code |= 4;
-            }
-            if provider.resolve_dns_name(&prefork, "shared").ok()
-                != Some(vec![prefork.ipv4, postfork.ipv4])
-            {
-                code |= 8;
-            }
-            let hosts = provider.guest_hosts_entries(&prefork).unwrap_or_default();
-            if !hosts
-                .iter()
-                .any(|entry| entry.addr == IpAddr::V4(postfork.ipv4))
-                || !hosts
-                    .iter()
-                    .any(|entry| entry.addr == IpAddr::V4(prefork.ipv4))
+
+            let Ok(target_listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
+                return code | 4;
+            };
+            let Ok(target_addr) = target_listener.local_addr() else {
+                return code | 8;
+            };
+            thread::spawn(move || {
+                while let Ok((mut stream, _)) = target_listener.accept() {
+                    let _ = stream.write_all(&token);
+                }
+            });
+
+            let endpoint = bridge_endpoint(&spec, 8080, PortProtocol::Tcp);
+            if provider
+                .write_endpoint_file(&endpoint, spec.namespace_id.as_ref(), host(target_addr))
+                .is_err()
             {
                 code |= 16;
             }
             if provider
-                .resolve_registered_connect(
-                    &bridge,
-                    postfork.namespace_id.as_ref(),
-                    post_endpoint,
-                    PortProtocol::Tcp,
-                )
-                .ok()
-                .flatten()
-                != Some(post_host)
+                .registry
+                .lock()
+                .map(|registry| registry.contains_key(&endpoint))
+                .unwrap_or(true)
             {
+                // Without this the relay would answer from its own memory and the
+                // durable record -- the thing that aliases -- would never be read.
                 code |= 32;
             }
-            unsafe { libc::_exit(code) };
+
+            if unsafe { libc::write(ready_fd, [1u8].as_ptr().cast(), 1) } != 1 {
+                code |= 64;
+            }
+            let mut byte = 0u8;
+            let _ = unsafe { libc::read(release_fd, (&raw mut byte).cast(), 1) };
+            code
         }
 
-        unsafe { libc::close(read_fd) };
-        provider
-            .create_namespace(&postfork)
-            .expect("post-fork namespace");
-        provider
-            .register_virtual_endpoint(
-                bridge.clone(),
-                postfork.namespace_id.clone().expect("namespace id"),
-                post_endpoint,
-                PortProtocol::Tcp,
-                post_host,
-            )
-            .expect("post-fork endpoint");
-        assert_eq!(
-            unsafe { libc::write(write_fd, [1u8].as_ptr().cast(), 1) },
-            1,
-            "signal child: {}",
-            io::Error::last_os_error()
-        );
-        unsafe { libc::close(write_fd) };
+        /// Fork-coherence for the realm-qualified key. The realm is derived from
+        /// `namespace_id`, which lives in spec memory `fork()` copies, so a child
+        /// must compute the identical path with no communication -- both for a
+        /// record its parent published *before* the fork and for one published
+        /// *after* it, which the child's copy-on-write registry can never explain.
+        #[test]
+        fn forked_child_resolves_private_realm_endpoints_across_the_fork() {
+            let mut spec = unnamed_bridge_spec(Vec::new());
+            spec.namespace_id = Some(NetworkNamespaceId::new(format!(
+                "fork-realm-{}",
+                std::process::id()
+            )));
+            spec.bridge_id = BridgeId::new(format!("fork-realm-bridge-{}", std::process::id()));
+            assert!(carrick_spec::is_bridge_placeholder_ipv4(spec.ipv4));
 
-        let mut status = 0i32;
-        assert_eq!(
-            unsafe { libc::waitpid(pid, &raw mut status, 0) },
-            pid,
-            "waitpid: {}",
-            io::Error::last_os_error()
-        );
-        assert!(libc::WIFEXITED(status), "child did not exit normally");
-        assert_eq!(
-            libc::WEXITSTATUS(status),
-            0,
-            "forked child failed to resolve records across the fork (bitmask)"
-        );
+            let provider = SocketNamespaceProvider::new();
+            let lease = provider.create_namespace(&spec).expect("namespace");
+            let prefork = bridge_endpoint(&spec, 7001, PortProtocol::Tcp);
+            let prefork_host = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 47001));
+            // Published without touching the registry, so the child's hit can only
+            // come from the file at the realm-qualified path.
+            provider
+                .write_endpoint_file(&prefork, spec.namespace_id.as_ref(), prefork_host)
+                .expect("pre-fork endpoint");
+            let postfork = bridge_endpoint(&spec, 7002, PortProtocol::Tcp);
+            let postfork_host = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 47002));
+            let realm_dir = provider.endpoint_dir.join(format!(
+                "{PRIVATE_REALM_PREFIX}{}",
+                hex_name(spec.namespace_id.as_ref().expect("namespace id").as_str())
+            ));
+
+            let mut fds = [0i32; 2];
+            assert_eq!(
+                unsafe { libc::pipe(fds.as_mut_ptr()) },
+                0,
+                "pipe: {}",
+                io::Error::last_os_error()
+            );
+            let (read_fd, write_fd) = (fds[0], fds[1]);
+
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+            if pid == 0 {
+                unsafe { libc::close(write_fd) };
+                let mut byte = 0u8;
+                let mut code = 0;
+                if unsafe { libc::read(read_fd, (&raw mut byte).cast(), 1) } != 1 {
+                    code |= 1;
+                }
+                if provider
+                    .resolve_bridge_connect(&spec, prefork.addr, PortProtocol::Tcp)
+                    .ok()
+                    != Some(ConnectTarget::Host(prefork_host))
+                {
+                    code |= 2;
+                }
+                if provider
+                    .resolve_bridge_connect(&spec, postfork.addr, PortProtocol::Tcp)
+                    .ok()
+                    != Some(ConnectTarget::Host(postfork_host))
+                {
+                    code |= 4;
+                }
+                if endpoint_path(&provider.endpoint_dir, &postfork).parent()
+                    != Some(realm_dir.as_path())
+                {
+                    code |= 8;
+                }
+                unsafe { libc::_exit(code) };
+            }
+
+            unsafe { libc::close(read_fd) };
+            provider
+                .register_virtual_endpoint(
+                    spec.bridge_id.clone(),
+                    spec.namespace_id.clone().expect("namespace id"),
+                    postfork.addr,
+                    PortProtocol::Tcp,
+                    postfork_host,
+                )
+                .expect("post-fork endpoint");
+            assert_eq!(
+                unsafe { libc::write(write_fd, [1u8].as_ptr().cast(), 1) },
+                1,
+                "signal child: {}",
+                io::Error::last_os_error()
+            );
+            unsafe { libc::close(write_fd) };
+
+            let mut status = 0i32;
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &raw mut status, 0) },
+                pid,
+                "waitpid: {}",
+                io::Error::last_os_error()
+            );
+            assert!(libc::WIFEXITED(status), "child did not exit normally");
+            assert_eq!(
+                libc::WEXITSTATUS(status),
+                0,
+                "forked child lost its parent's private-realm records (bitmask)"
+            );
+            provider.destroy_namespace(lease.id).expect("destroy");
+            provider
+                .destroy_namespace(NetworkLeaseId(0))
+                .expect("release the registry-free publication");
+        }
     }
 
     #[test]
@@ -4038,332 +4823,6 @@ mod tests {
             UdpSocket::bind((Ipv4Addr::LOCALHOST, host_port)).expect("published port released");
     }
 
-    #[cfg(target_os = "freebsd")]
-    #[test]
-    fn fork_child_closes_published_listener_fds_for_port_release() {
-        let _test_lock = FORK_SOCKET_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let tcp_port = free_loopback_port();
-        let reserved_udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve udp port");
-        let udp_port = reserved_udp.local_addr().expect("udp addr").port();
-        drop(reserved_udp);
-        let tcp_mapping = PortMapping {
-            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            host_port: Some(tcp_port),
-            container_port: 8080,
-            protocol: PortProtocol::Tcp,
-        };
-        let udp_mapping = PortMapping {
-            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            host_port: Some(udp_port),
-            container_port: 8081,
-            protocol: PortProtocol::Udp,
-        };
-        let spec = unnamed_bridge_spec(vec![tcp_mapping.clone(), udp_mapping.clone()]);
-        let provider = SocketNamespaceProvider::new();
-        let lease = provider.create_namespace(&spec).expect("namespace");
-        provider
-            .publish_port(lease.id, tcp_mapping)
-            .expect("publish tcp");
-        provider
-            .publish_port(lease.id, udp_mapping)
-            .expect("publish udp");
-        wait_for_fork_tracked_fds(&provider, 2);
-
-        let mut ready_pipe = [0; 2];
-        assert_eq!(unsafe { libc::pipe(ready_pipe.as_mut_ptr()) }, 0);
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        let fork_guard = loop {
-            if let Some(guard) = provider.try_fork_guard() {
-                break guard;
-            }
-            assert!(std::time::Instant::now() < deadline, "fork gate timed out");
-            thread::yield_now();
-        };
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
-        if pid == 0 {
-            unsafe {
-                libc::close(ready_pipe[0]);
-            }
-            drop(fork_guard);
-            provider.after_fork_child();
-            let ready = [1_u8];
-            let wrote = unsafe { libc::write(ready_pipe[1], ready.as_ptr().cast(), ready.len()) };
-            unsafe {
-                libc::close(ready_pipe[1]);
-            }
-            if wrote == 1 {
-                thread::sleep(Duration::from_secs(2));
-                unsafe { libc::_exit(0) };
-            }
-            unsafe { libc::_exit(122) };
-        }
-        drop(fork_guard);
-        unsafe {
-            libc::close(ready_pipe[1]);
-        }
-        let mut ready = [0_u8; 1];
-        let read = unsafe { libc::read(ready_pipe[0], ready.as_mut_ptr().cast(), ready.len()) };
-        unsafe {
-            libc::close(ready_pipe[0]);
-        }
-        assert_eq!(read, 1, "child did not signal fork cleanup readiness");
-
-        provider
-            .destroy_namespace(lease.id)
-            .expect("destroy namespace");
-        let _tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, tcp_port))
-            .expect("child released published TCP port");
-        let _udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, udp_port))
-            .expect("child released published UDP port");
-
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        assert!(libc::WIFEXITED(status));
-        assert_eq!(libc::WEXITSTATUS(status), 0);
-    }
-
-    #[cfg(target_os = "freebsd")]
-    #[test]
-    fn fork_child_closes_active_udp_transient_and_parent_reuses_proxy() {
-        let _test_lock = FORK_SOCKET_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let reserved = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve host port");
-        let host_port = reserved.local_addr().expect("reserved addr").port();
-        drop(reserved);
-        let container_port = 8083;
-        let mapping = PortMapping {
-            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            host_port: Some(host_port),
-            container_port,
-            protocol: PortProtocol::Udp,
-        };
-        let spec = unnamed_bridge_spec(vec![mapping.clone()]);
-        let provider = SocketNamespaceProvider::new();
-        let lease = provider.create_namespace(&spec).expect("namespace");
-        provider.publish_port(lease.id, mapping).expect("publish");
-
-        let target = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("target bind");
-        let target_addr = target.local_addr().expect("target addr");
-        let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        let server = thread::spawn(move || {
-            let mut request = [0_u8; 8];
-            let (len, peer) = target
-                .recv_from(&mut request)
-                .expect("first target request");
-            assert_eq!(&request[..len], b"one");
-            first_tx.send(()).expect("report active UDP transient");
-            release_rx.recv().expect("release first UDP response");
-            target.send_to(b"one", peer).expect("first target response");
-            let (len, peer) = target
-                .recv_from(&mut request)
-                .expect("second target request");
-            assert_eq!(&request[..len], b"two");
-            target
-                .send_to(b"two", peer)
-                .expect("second target response");
-        });
-        provider
-            .register_virtual_endpoint(
-                spec.bridge_id.clone(),
-                spec.namespace_id.clone().expect("namespace id"),
-                guest(SocketAddr::new(IpAddr::V4(spec.ipv4), container_port)),
-                PortProtocol::Udp,
-                host(target_addr),
-            )
-            .expect("register UDP target");
-        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client bind");
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("client timeout");
-        client
-            .send_to(b"one", (Ipv4Addr::LOCALHOST, host_port))
-            .expect("send first published datagram");
-        first_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("UDP transient became active");
-        wait_for_fork_tracked_fds(&provider, 2);
-        let active_fds = provider
-            .fork_tracked_fds
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        let fork_guard = loop {
-            if let Some(guard) = provider.try_fork_guard() {
-                break guard;
-            }
-            assert!(std::time::Instant::now() < deadline, "fork gate timed out");
-            thread::yield_now();
-        };
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
-        if pid == 0 {
-            drop(fork_guard);
-            provider.after_fork_child();
-            let all_closed = active_fds.iter().all(|fd| {
-                let rc = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
-                rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
-            });
-            unsafe { libc::_exit(if all_closed { 0 } else { 123 }) };
-        }
-        drop(fork_guard);
-        for fd in &active_fds {
-            assert!(
-                unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0,
-                "child close changed parent UDP fd {fd}"
-            );
-        }
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        assert!(libc::WIFEXITED(status));
-        assert_eq!(libc::WEXITSTATUS(status), 0);
-
-        release_tx.send(()).expect("release first response");
-        let mut response = [0_u8; 8];
-        let (len, _) = client
-            .recv_from(&mut response)
-            .expect("first proxy response");
-        assert_eq!(&response[..len], b"one");
-        client
-            .send_to(b"two", (Ipv4Addr::LOCALHOST, host_port))
-            .expect("reuse published UDP proxy");
-        let (len, _) = client
-            .recv_from(&mut response)
-            .expect("second proxy response");
-        assert_eq!(&response[..len], b"two");
-        server.join().expect("UDP target thread");
-        provider
-            .destroy_namespace(lease.id)
-            .expect("destroy namespace");
-    }
-
-    #[cfg(target_os = "freebsd")]
-    #[test]
-    fn fork_child_closes_raw_published_stream_fds_without_shutdown() {
-        let _test_lock = FORK_SOCKET_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let host_port = free_loopback_port();
-        let container_port = 8082;
-        let mapping = PortMapping {
-            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            host_port: Some(host_port),
-            container_port,
-            protocol: PortProtocol::Tcp,
-        };
-        let spec = unnamed_bridge_spec(vec![mapping.clone()]);
-        let provider = SocketNamespaceProvider::new();
-        let lease = provider.create_namespace(&spec).expect("namespace");
-        provider.publish_port(lease.id, mapping).expect("publish");
-
-        let target_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("target bind");
-        let target_addr = target_listener.local_addr().expect("target addr");
-        let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_target_tx, release_target_rx) = std::sync::mpsc::sync_channel(1);
-        let target = thread::spawn(move || {
-            let (_stream, _) = target_listener.accept().expect("target accept");
-            accepted_tx.send(()).expect("report target accept");
-            release_target_rx.recv().expect("release target stream");
-        });
-        provider
-            .register_virtual_endpoint(
-                spec.bridge_id.clone(),
-                spec.namespace_id.clone().expect("namespace id"),
-                guest(SocketAddr::new(IpAddr::V4(spec.ipv4), container_port)),
-                PortProtocol::Tcp,
-                host(target_addr),
-            )
-            .expect("register target endpoint");
-
-        let client = TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).expect("connect");
-        accepted_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("target accepted proxy stream");
-        wait_for_fork_tracked_fds(&provider, 5);
-        let tracked_before_fork = provider
-            .fork_tracked_fds
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-
-        let mut ready_pipe = [0; 2];
-        assert_eq!(unsafe { libc::pipe(ready_pipe.as_mut_ptr()) }, 0);
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        let fork_guard = loop {
-            if let Some(guard) = provider.try_fork_guard() {
-                break guard;
-            }
-            assert!(std::time::Instant::now() < deadline, "fork gate timed out");
-            thread::yield_now();
-        };
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
-        if pid == 0 {
-            unsafe {
-                libc::close(ready_pipe[0]);
-            }
-            drop(fork_guard);
-            provider.after_fork_child();
-            let all_closed = tracked_before_fork.iter().all(|fd| {
-                let rc = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
-                rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
-            });
-            let ready = [u8::from(all_closed)];
-            let wrote = unsafe { libc::write(ready_pipe[1], ready.as_ptr().cast(), ready.len()) };
-            unsafe {
-                libc::close(ready_pipe[1]);
-            }
-            if wrote == 1 {
-                thread::sleep(Duration::from_secs(2));
-                unsafe { libc::_exit(0) };
-            }
-            unsafe { libc::_exit(122) };
-        }
-        drop(fork_guard);
-        unsafe {
-            libc::close(ready_pipe[1]);
-        }
-        let mut ready = [0_u8; 1];
-        let read = unsafe { libc::read(ready_pipe[0], ready.as_mut_ptr().cast(), ready.len()) };
-        unsafe {
-            libc::close(ready_pipe[0]);
-        }
-        assert_eq!(read, 1, "child did not signal fork cleanup readiness");
-        assert_eq!(
-            ready,
-            [1],
-            "child retained at least one raw bridge stream fd"
-        );
-        for fd in &tracked_before_fork {
-            assert!(
-                unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0,
-                "child close changed the parent's reference for raw fd {fd}"
-            );
-        }
-        drop(client);
-        release_target_tx.send(()).expect("release target stream");
-        target.join().expect("target thread");
-
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        assert!(libc::WIFEXITED(status));
-        assert_eq!(libc::WEXITSTATUS(status), 0);
-
-        provider
-            .destroy_namespace(lease.id)
-            .expect("destroy namespace");
-    }
-
     #[test]
     fn destroy_namespace_keeps_other_leases_alive() {
         let suffix = std::process::id();
@@ -4840,160 +5299,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "freebsd")]
-    #[test]
-    fn fork_guard_unlocks_registry_and_child_abandons_parent_publications() {
-        let mut spec = NetworkNamespaceSpec::bridge_default(
-            Some("fork-net".to_string()),
-            Vec::new(),
-            Vec::new(),
-        );
-        let namespace_id = NetworkNamespaceId::new(format!("fork-net-{}", std::process::id()));
-        spec.namespace_id = Some(namespace_id.clone());
-        spec.bridge_id = BridgeId::new(format!("fork-bridge-{}", std::process::id()));
-        let provider = SocketNamespaceProvider::new();
-        let lease = provider.create_namespace(&spec).expect("create namespace");
-        let guest_addr = guest(SocketAddr::new(IpAddr::V4(spec.ipv4), 41000));
-        let host_addr = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 41001));
-        provider
-            .register_virtual_endpoint(
-                spec.bridge_id.clone(),
-                namespace_id,
-                guest_addr,
-                PortProtocol::Tcp,
-                host_addr,
-            )
-            .expect("register durable endpoint");
-        let endpoint = VirtualEndpoint {
-            scope: bridge_scope(
-                spec.bridge_id.clone(),
-                spec.namespace_id.as_ref(),
-                guest_addr,
-            ),
-            addr: guest_addr,
-            protocol: PortProtocol::Tcp,
-        };
-        let durable_path = endpoint_path(&provider.endpoint_dir, &endpoint);
-        assert!(durable_path.exists());
-
-        // Exercise the exact helper order gate->registry, then retain that
-        // thread's JoinHandle in the publication collection across the real
-        // fork. The child hook must forget rather than join this vanished
-        // pthread, while the parent later retains normal stop/join ownership.
-        let helper_gate = Arc::clone(&provider.fork_gate);
-        let helper_registry = Arc::clone(&provider.registry);
-        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        let (finish_tx, finish_rx) = std::sync::mpsc::sync_channel(1);
-        let handle = thread::spawn(move || {
-            {
-                let _gate = helper_gate.lock().unwrap_or_else(|p| p.into_inner());
-                let _registry = helper_registry.lock().unwrap_or_else(|p| p.into_inner());
-                locked_tx.send(()).expect("report helper critical section");
-                release_rx.recv().expect("release helper critical section");
-            }
-            finish_rx.recv().expect("finish parent publication helper");
-        });
-        let _tracked_listener = ForkTrackedSocket::new(
-            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("tracked listener"),
-            &provider.fork_gate,
-            &provider.fork_tracked_fds,
-        );
-        provider
-            .published_tcp
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .entry(lease.id)
-            .or_default()
-            .push(PublishedTcpProxy {
-                stop: Arc::new(AtomicBool::new(false)),
-                handle: Some(handle),
-                owner: std::process::id(),
-            });
-        locked_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("helper holds gate and registry");
-        assert!(
-            provider.try_fork_guard().is_none(),
-            "fork guard must not pass a helper in the registry"
-        );
-        release_tx.send(()).expect("release helper registry access");
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        let fork_guard = loop {
-            if let Some(guard) = provider.try_fork_guard() {
-                break guard;
-            }
-            assert!(std::time::Instant::now() < deadline, "fork gate timed out");
-            thread::yield_now();
-        };
-
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
-        if pid == 0 {
-            drop(fork_guard);
-            provider.after_fork_child();
-            let accessible = provider
-                .translate_host_source(host_addr, PortProtocol::Tcp)
-                .ok()
-                .flatten()
-                == Some(guest_addr);
-            let child_helpers_empty = provider
-                .published_tcp
-                .lock()
-                .map(|published| published.is_empty())
-                .unwrap_or(false);
-            let child_owns_no_files = provider
-                .owned_endpoint_files
-                .lock()
-                .map(|owned| owned.is_empty())
-                .unwrap_or(false);
-            let _ = provider.destroy_namespace(lease.id);
-            let durable_preserved = durable_path.exists();
-            unsafe {
-                libc::_exit(
-                    if accessible && child_helpers_empty && child_owns_no_files && durable_preserved
-                    {
-                        0
-                    } else {
-                        121
-                    },
-                );
-            }
-        }
-        drop(fork_guard);
-
-        let wait_deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let mut status = 0;
-        loop {
-            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-            if waited == pid {
-                break;
-            }
-            assert_eq!(waited, 0, "waitpid failed: {}", io::Error::last_os_error());
-            if std::time::Instant::now() >= wait_deadline {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                    libc::waitpid(pid, &mut status, 0);
-                }
-                panic!("fork child joined a vanished publication helper");
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        finish_tx
-            .send(())
-            .expect("finish parent publication helper");
-        assert!(libc::WIFEXITED(status));
-        assert_eq!(libc::WEXITSTATUS(status), 0);
-        assert!(durable_path.exists(), "child removed parent endpoint file");
-        provider
-            .destroy_namespace(lease.id)
-            .expect("parent destroys namespace");
-        assert!(
-            !durable_path.exists(),
-            "parent retained owned endpoint file"
-        );
-    }
-
     #[test]
     fn translates_peer_source_registered_on_attachment_bridge() {
         let suffix = std::process::id();
@@ -5211,191 +5516,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// The regression test for the cross-wire itself, in the shape it ships in:
-    /// two separate **processes**, each publishing a port for an unnamed
-    /// container, sharing one endpoint namespace.
-    ///
-    /// Every ordering edge is a blocking pipe read or a `waitpid`; nothing
-    /// sleeps and nothing retries. Each child publishes its port, records its
-    /// container listener, writes one ready byte and blocks. The parent reads
-    /// **both** ready bytes before connecting to anything, so both records are
-    /// on disk first -- which is what makes the pre-fix failure certain rather
-    /// than a race: with one shared key, whichever child wrote last owns it, and
-    /// the other child's relay necessarily proxies to the wrong container.
-    ///
-    /// Each child publishes its container listener with `write_endpoint_file`
-    /// rather than `register_virtual_endpoint`, and asserts its own registry
-    /// does not hold the key. That is the real shape: the guest listener is
-    /// bound by a *forked descendant*, whose registry insert landed in its own
-    /// copy-on-write copy, so the relay has nothing in memory and the durable
-    /// record is the only channel.
-    #[test]
-    fn published_relays_of_two_instances_do_not_cross_wire() {
-        // Mint this process's instance id before forking, so both children
-        // inherit the same one. That is deliberate: it holds the identity check
-        // constant so this test can only pass because the *key* separates the
-        // two instances, not because their process identities differ.
-        let _ = instance_id();
-        let root = shared_instance_root("crosswire");
-        let (port_a, port_b) = two_free_loopback_ports();
-        let instances = [(port_a, *b"AAAA"), (port_b, *b"BBBB")];
-
-        let mut release = [0i32; 2];
-        assert_eq!(
-            unsafe { libc::pipe(release.as_mut_ptr()) },
-            0,
-            "release pipe: {}",
-            io::Error::last_os_error()
-        );
-        let (release_read, release_write) = (release[0], release[1]);
-
-        let mut children = Vec::new();
-        for (host_port, token) in instances {
-            let mut ready = [0i32; 2];
-            assert_eq!(
-                unsafe { libc::pipe(ready.as_mut_ptr()) },
-                0,
-                "ready pipe: {}",
-                io::Error::last_os_error()
-            );
-            let (ready_read, ready_write) = (ready[0], ready[1]);
-            let pid = unsafe { libc::fork() };
-            assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
-            if pid == 0 {
-                unsafe {
-                    libc::close(ready_read);
-                    // The child must not hold the release pipe's write end or
-                    // the parent closing its own copy would never be an EOF.
-                    libc::close(release_write);
-                }
-                let code =
-                    run_crosswire_instance(&root, host_port, token, ready_write, release_read);
-                unsafe { libc::_exit(code) };
-            }
-            unsafe { libc::close(ready_write) };
-            children.push((pid, ready_read));
-        }
-        unsafe { libc::close(release_read) };
-
-        // Happens-after: both listeners are bound and both records are written.
-        for (_, ready_read) in &children {
-            let mut byte = 0u8;
-            assert_eq!(
-                unsafe { libc::read(*ready_read, (&raw mut byte).cast(), 1) },
-                1,
-                "child never reported ready: {}",
-                io::Error::last_os_error()
-            );
-        }
-
-        let mut served = Vec::new();
-        for (host_port, _) in instances {
-            let mut client =
-                TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).expect("connect published");
-            let mut reply = [0_u8; 4];
-            client
-                .read_exact(&mut reply)
-                .unwrap_or_else(|e| panic!("published port {host_port} served nothing: {e}"));
-            served.push(reply);
-        }
-
-        unsafe { libc::close(release_write) };
-        for (pid, ready_read) in children {
-            unsafe { libc::close(ready_read) };
-            let mut status = 0i32;
-            assert_eq!(
-                unsafe { libc::waitpid(pid, &raw mut status, 0) },
-                pid,
-                "waitpid: {}",
-                io::Error::last_os_error()
-            );
-            assert!(libc::WIFEXITED(status), "instance did not exit normally");
-            assert_eq!(
-                libc::WEXITSTATUS(status),
-                0,
-                "instance failed to set itself up (bitmask)"
-            );
-        }
-        let _ = fs::remove_dir_all(&root);
-
-        for (index, (_, token)) in instances.iter().enumerate() {
-            assert_eq!(
-                &served[index],
-                token,
-                "published port {} was proxied into the wrong container: served {:?}, expected {:?}",
-                instances[index].0,
-                String::from_utf8_lossy(&served[index]),
-                String::from_utf8_lossy(token)
-            );
-        }
-    }
-
-    /// One instance of the cross-wire harness, running in its own process.
-    /// Returns a bitmask so a failure is reported through `waitpid` rather than
-    /// by unwinding a panic through a forked child.
-    fn run_crosswire_instance(
-        root: &Path,
-        host_port: u16,
-        token: [u8; 4],
-        ready_fd: RawFd,
-        release_fd: RawFd,
-    ) -> i32 {
-        let mut code = 0;
-        let mapping = PortMapping {
-            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            host_port: Some(host_port),
-            container_port: 8080,
-            protocol: PortProtocol::Tcp,
-        };
-        let mut spec =
-            NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
-        spec.namespace_id = Some(NetworkNamespaceId::anonymous(std::process::id()));
-        let provider = SocketNamespaceProvider::with_endpoint_root(root);
-        let Ok(lease) = provider.create_namespace(&spec) else {
-            return 1;
-        };
-        if provider.publish_port(lease.id, mapping).is_err() {
-            code |= 2;
-        }
-
-        let Ok(target_listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
-            return code | 4;
-        };
-        let Ok(target_addr) = target_listener.local_addr() else {
-            return code | 8;
-        };
-        thread::spawn(move || {
-            while let Ok((mut stream, _)) = target_listener.accept() {
-                let _ = stream.write_all(&token);
-            }
-        });
-
-        let endpoint = bridge_endpoint(&spec, 8080, PortProtocol::Tcp);
-        if provider
-            .write_endpoint_file(&endpoint, spec.namespace_id.as_ref(), host(target_addr))
-            .is_err()
-        {
-            code |= 16;
-        }
-        if provider
-            .registry
-            .lock()
-            .map(|registry| registry.contains_key(&endpoint))
-            .unwrap_or(true)
-        {
-            // Without this the relay would answer from its own memory and the
-            // durable record -- the thing that aliases -- would never be read.
-            code |= 32;
-        }
-
-        if unsafe { libc::write(ready_fd, [1u8].as_ptr().cast(), 1) } != 1 {
-            code |= 64;
-        }
-        let mut byte = 0u8;
-        let _ = unsafe { libc::read(release_fd, (&raw mut byte).cast(), 1) };
-        code
-    }
-
     /// The shipped feature realm-qualification must not touch: two separate
     /// `carrick run --name db` / `--name web` processes reaching each other on
     /// the **default** bridge. That is what `conformance_bridge_compose_pair`
@@ -5509,114 +5629,6 @@ mod tests {
             ConnectTarget::Denied(carrick_abi::LINUX_ECONNREFUSED)
         );
         let _ = fs::remove_dir_all(&root);
-    }
-
-    /// Fork-coherence for the realm-qualified key. The realm is derived from
-    /// `namespace_id`, which lives in spec memory `fork()` copies, so a child
-    /// must compute the identical path with no communication -- both for a
-    /// record its parent published *before* the fork and for one published
-    /// *after* it, which the child's copy-on-write registry can never explain.
-    #[test]
-    fn forked_child_resolves_private_realm_endpoints_across_the_fork() {
-        let mut spec = unnamed_bridge_spec(Vec::new());
-        spec.namespace_id = Some(NetworkNamespaceId::new(format!(
-            "fork-realm-{}",
-            std::process::id()
-        )));
-        spec.bridge_id = BridgeId::new(format!("fork-realm-bridge-{}", std::process::id()));
-        assert!(carrick_spec::is_bridge_placeholder_ipv4(spec.ipv4));
-
-        let provider = SocketNamespaceProvider::new();
-        let lease = provider.create_namespace(&spec).expect("namespace");
-        let prefork = bridge_endpoint(&spec, 7001, PortProtocol::Tcp);
-        let prefork_host = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 47001));
-        // Published without touching the registry, so the child's hit can only
-        // come from the file at the realm-qualified path.
-        provider
-            .write_endpoint_file(&prefork, spec.namespace_id.as_ref(), prefork_host)
-            .expect("pre-fork endpoint");
-        let postfork = bridge_endpoint(&spec, 7002, PortProtocol::Tcp);
-        let postfork_host = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 47002));
-        let realm_dir = provider.endpoint_dir.join(format!(
-            "{PRIVATE_REALM_PREFIX}{}",
-            hex_name(spec.namespace_id.as_ref().expect("namespace id").as_str())
-        ));
-
-        let mut fds = [0i32; 2];
-        assert_eq!(
-            unsafe { libc::pipe(fds.as_mut_ptr()) },
-            0,
-            "pipe: {}",
-            io::Error::last_os_error()
-        );
-        let (read_fd, write_fd) = (fds[0], fds[1]);
-
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
-        if pid == 0 {
-            unsafe { libc::close(write_fd) };
-            let mut byte = 0u8;
-            let mut code = 0;
-            if unsafe { libc::read(read_fd, (&raw mut byte).cast(), 1) } != 1 {
-                code |= 1;
-            }
-            if provider
-                .resolve_bridge_connect(&spec, prefork.addr, PortProtocol::Tcp)
-                .ok()
-                != Some(ConnectTarget::Host(prefork_host))
-            {
-                code |= 2;
-            }
-            if provider
-                .resolve_bridge_connect(&spec, postfork.addr, PortProtocol::Tcp)
-                .ok()
-                != Some(ConnectTarget::Host(postfork_host))
-            {
-                code |= 4;
-            }
-            if endpoint_path(&provider.endpoint_dir, &postfork).parent()
-                != Some(realm_dir.as_path())
-            {
-                code |= 8;
-            }
-            unsafe { libc::_exit(code) };
-        }
-
-        unsafe { libc::close(read_fd) };
-        provider
-            .register_virtual_endpoint(
-                spec.bridge_id.clone(),
-                spec.namespace_id.clone().expect("namespace id"),
-                postfork.addr,
-                PortProtocol::Tcp,
-                postfork_host,
-            )
-            .expect("post-fork endpoint");
-        assert_eq!(
-            unsafe { libc::write(write_fd, [1u8].as_ptr().cast(), 1) },
-            1,
-            "signal child: {}",
-            io::Error::last_os_error()
-        );
-        unsafe { libc::close(write_fd) };
-
-        let mut status = 0i32;
-        assert_eq!(
-            unsafe { libc::waitpid(pid, &raw mut status, 0) },
-            pid,
-            "waitpid: {}",
-            io::Error::last_os_error()
-        );
-        assert!(libc::WIFEXITED(status), "child did not exit normally");
-        assert_eq!(
-            libc::WEXITSTATUS(status),
-            0,
-            "forked child lost its parent's private-realm records (bitmask)"
-        );
-        provider.destroy_namespace(lease.id).expect("destroy");
-        provider
-            .destroy_namespace(NetworkLeaseId(0))
-            .expect("release the registry-free publication");
     }
 
     /// A private realm is `anon-<pid>`, so one liveness check settles every

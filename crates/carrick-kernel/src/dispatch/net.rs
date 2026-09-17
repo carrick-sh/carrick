@@ -2470,91 +2470,6 @@ mod netlink_readiness_tests {
     }
 
     #[test]
-    fn named_fifo_terminal_readiness_reports_implicit_hup() {
-        let dispatcher = SyscallDispatcher::new();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let fifo_path = dir.path().join("test_fifo");
-        let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-
-        // Open read end (O_NONBLOCK | O_RDONLY)
-        let rfd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
-        assert!(rfd >= 0, "open fifo read end");
-        let read_host_fd = HostFdRef::new(rfd);
-        // Open write end (O_NONBLOCK | O_WRONLY)
-        let wfd = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
-        assert!(wfd >= 0, "open fifo write end");
-        let write_host_fd = HostFdRef::new(wfd);
-
-        // Register with fifo_beacon
-        crate::dispatch::fifo_beacon::register_open(rfd, 0);
-        crate::dispatch::fifo_beacon::register_open(wfd, 1);
-
-        let read_pipe = OpenFile::from_open_description_with_status_flags(
-            Arc::new(RwLock::new(OpenDescription::HostPipe {
-                base: OpenDescriptionBase::new(LINUX_O_RDONLY | LINUX_O_NONBLOCK),
-                host_fd: read_host_fd.clone(),
-                is_read_end: true,
-                pipe_id: 601,
-                pty: None,
-                bidirectional: false,
-                write_kind: HostWriteKind::PipeLike,
-                stdio_stream: None,
-            })),
-            LINUX_O_RDONLY | LINUX_O_NONBLOCK,
-            0,
-        );
-        let guest_rfd = dispatcher
-            .install_fd_at_or_above(3, read_pipe)
-            .expect("install fifo read end");
-
-        // Write data into FIFO before writer close so read end has buffered data
-        assert_eq!(unsafe { libc::write(wfd, b"data".as_ptr().cast(), 4) }, 4);
-
-        // Unregister while ownership keeps the raw fd live, then close it.
-        assert!(crate::dispatch::fifo_beacon::register_close(&write_host_fd));
-        drop(write_host_fd);
-
-        // Buffered data plus EOF: IN interest receives IN | HUP (buffered data does not mask HUP)
-        let ready_in = dispatcher.epoll_ready_events(guest_rfd, LINUX_EPOLLIN);
-        assert_eq!(
-            ready_in & (LINUX_EPOLLIN | LINUX_EPOLLHUP),
-            LINUX_EPOLLIN | LINUX_EPOLLHUP,
-            "buffered data plus EOF must report both IN and HUP"
-        );
-        let poll_in = dispatcher.poll_ready_events(guest_rfd, LINUX_POLLIN);
-        assert_eq!(
-            poll_in & (LINUX_POLLIN | LINUX_POLLHUP),
-            LINUX_POLLIN | LINUX_POLLHUP,
-            "buffered data plus EOF poll must report both IN and HUP"
-        );
-
-        // Query OUT only: even though IN was not requested and OUT is not ready on a read end,
-        // HUP must be delivered implicitly.
-        let ready_events = dispatcher.epoll_ready_events(guest_rfd, LINUX_EPOLLOUT);
-        assert_eq!(
-            ready_events & LINUX_EPOLLHUP,
-            LINUX_EPOLLHUP,
-            "OUT-only registration must receive implicit HUP after writer closes"
-        );
-        let poll_events = dispatcher.poll_ready_events(guest_rfd, LINUX_POLLOUT);
-        assert_eq!(
-            poll_events & LINUX_POLLHUP,
-            LINUX_POLLHUP,
-            "OUT-only poll must receive implicit HUP after writer closes"
-        );
-
-        // Unregister reader from beacon; HostFdRef will close rfd when dropped
-        assert!(!crate::dispatch::fifo_beacon::register_close(&read_host_fd));
-
-        // Prove this FIFO's beacon and read end are cleanly removed on full lifecycle completion
-        assert!(
-            !crate::dispatch::fifo_beacon::has_beacon_for_fd(rfd),
-            "beacon and read-end registration must be cleaned up after last reader unregisters"
-        );
-    }
-
-    #[test]
     fn in_memory_socket_rdhup_is_not_implicit() {
         let dispatcher = SyscallDispatcher::new();
         let creds1 = crate::dispatch::net::unix_pure::LinuxUcred {
@@ -2618,6 +2533,95 @@ mod netlink_readiness_tests {
             LINUX_POLLRDHUP,
             "explicit RDHUP poll must report RDHUP"
         );
+    }
+
+    mod serial_host {
+        use super::*;
+
+        #[test]
+        fn named_fifo_terminal_readiness_reports_implicit_hup() {
+            let dispatcher = SyscallDispatcher::new();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let fifo_path = dir.path().join("test_fifo");
+            let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+            // Open read end (O_NONBLOCK | O_RDONLY)
+            let rfd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+            assert!(rfd >= 0, "open fifo read end");
+            let read_host_fd = HostFdRef::new(rfd);
+            // Open write end (O_NONBLOCK | O_WRONLY)
+            let wfd = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            assert!(wfd >= 0, "open fifo write end");
+            let write_host_fd = HostFdRef::new(wfd);
+
+            // Register with fifo_beacon
+            crate::dispatch::fifo_beacon::register_open(rfd, 0);
+            crate::dispatch::fifo_beacon::register_open(wfd, 1);
+
+            let read_pipe = OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::HostPipe {
+                    base: OpenDescriptionBase::new(LINUX_O_RDONLY | LINUX_O_NONBLOCK),
+                    host_fd: read_host_fd.clone(),
+                    is_read_end: true,
+                    pipe_id: 601,
+                    pty: None,
+                    bidirectional: false,
+                    write_kind: HostWriteKind::PipeLike,
+                    stdio_stream: None,
+                })),
+                LINUX_O_RDONLY | LINUX_O_NONBLOCK,
+                0,
+            );
+            let guest_rfd = dispatcher
+                .install_fd_at_or_above(3, read_pipe)
+                .expect("install fifo read end");
+
+            // Write data into FIFO before writer close so read end has buffered data
+            assert_eq!(unsafe { libc::write(wfd, b"data".as_ptr().cast(), 4) }, 4);
+
+            // Unregister while ownership keeps the raw fd live, then close it.
+            assert!(crate::dispatch::fifo_beacon::register_close(&write_host_fd));
+            drop(write_host_fd);
+
+            // Buffered data plus EOF: IN interest receives IN | HUP (buffered data does not mask HUP)
+            let ready_in = dispatcher.epoll_ready_events(guest_rfd, LINUX_EPOLLIN);
+            assert_eq!(
+                ready_in & (LINUX_EPOLLIN | LINUX_EPOLLHUP),
+                LINUX_EPOLLIN | LINUX_EPOLLHUP,
+                "buffered data plus EOF must report both IN and HUP"
+            );
+            let poll_in = dispatcher.poll_ready_events(guest_rfd, LINUX_POLLIN);
+            assert_eq!(
+                poll_in & (LINUX_POLLIN | LINUX_POLLHUP),
+                LINUX_POLLIN | LINUX_POLLHUP,
+                "buffered data plus EOF poll must report both IN and HUP"
+            );
+
+            // Query OUT only: even though IN was not requested and OUT is not ready on a read end,
+            // HUP must be delivered implicitly.
+            let ready_events = dispatcher.epoll_ready_events(guest_rfd, LINUX_EPOLLOUT);
+            assert_eq!(
+                ready_events & LINUX_EPOLLHUP,
+                LINUX_EPOLLHUP,
+                "OUT-only registration must receive implicit HUP after writer closes"
+            );
+            let poll_events = dispatcher.poll_ready_events(guest_rfd, LINUX_POLLOUT);
+            assert_eq!(
+                poll_events & LINUX_POLLHUP,
+                LINUX_POLLHUP,
+                "OUT-only poll must receive implicit HUP after writer closes"
+            );
+
+            // Unregister reader from beacon; HostFdRef will close rfd when dropped
+            assert!(!crate::dispatch::fifo_beacon::register_close(&read_host_fd));
+
+            // Prove this FIFO's beacon and read end are cleanly removed on full lifecycle completion
+            assert!(
+                !crate::dispatch::fifo_beacon::has_beacon_for_fd(rfd),
+                "beacon and read-end registration must be cleaned up after last reader unregisters"
+            );
+        }
     }
 }
 

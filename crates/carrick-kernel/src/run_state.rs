@@ -1054,58 +1054,62 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parent_seed_races_child_blocked_publish_across_fork() {
-        // Cross-process reducer for the round-8 sysvsem GETZCNT undercount:
-        // a REAL fork child publishes `Blocked` through the shared arena and
-        // parks; the parent's seed lands strictly after and must not regress
-        // it. Mirrors parent-descheduled-after-fork under campaign load.
-        init_table();
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork failed");
-        if child == 0 {
-            // Child: exactly what a native fork child does before parking in
-            // a host blocking semop — reinit, then publish Blocked. Atomics on
-            // the pre-fork-mapped arena only (fork-safe in a threaded harness).
-            reinit_booting_after_fork();
-            publish(RunState::Blocked);
+    mod serial_host {
+        use super::*;
+
+        #[test]
+        fn parent_seed_races_child_blocked_publish_across_fork() {
+            // Cross-process reducer for the round-8 sysvsem GETZCNT undercount:
+            // a REAL fork child publishes `Blocked` through the shared arena and
+            // parks; the parent's seed lands strictly after and must not regress
+            // it. Mirrors parent-descheduled-after-fork under campaign load.
+            init_table();
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0, "fork failed");
+            if child == 0 {
+                // Child: exactly what a native fork child does before parking in
+                // a host blocking semop — reinit, then publish Blocked. Atomics on
+                // the pre-fork-mapped arena only (fork-safe in a threaded harness).
+                reinit_booting_after_fork();
+                publish(RunState::Blocked);
+                unsafe {
+                    let req = libc::timespec {
+                        tv_sec: 30,
+                        tv_nsec: 0,
+                    };
+                    libc::nanosleep(&req, core::ptr::null_mut());
+                    libc::_exit(0);
+                }
+            }
+            let child_pid = child as u32;
+            let mut blocked_seen = false;
+            for _ in 0..5000 {
+                if published(child_pid) == Some(RunState::Blocked) {
+                    blocked_seen = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // The parent's seed arrives AFTER the child is provably parked-blocked.
+            let after_seed = if blocked_seen {
+                publish_child_booting(child_pid);
+                published(child_pid)
+            } else {
+                None
+            };
             unsafe {
-                let req = libc::timespec {
-                    tv_sec: 30,
-                    tv_nsec: 0,
-                };
-                libc::nanosleep(&req, core::ptr::null_mut());
-                libc::_exit(0);
+                libc::kill(child, libc::SIGKILL);
+                let mut status = 0;
+                libc::waitpid(child, &mut status, 0);
             }
+            wipe_id(child_pid);
+            assert!(blocked_seen, "child never published Blocked");
+            assert_eq!(
+                after_seed,
+                Some(RunState::Blocked),
+                "parent's late Booting seed clobbered the parked child's Blocked state"
+            );
         }
-        let child_pid = child as u32;
-        let mut blocked_seen = false;
-        for _ in 0..5000 {
-            if published(child_pid) == Some(RunState::Blocked) {
-                blocked_seen = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        // The parent's seed arrives AFTER the child is provably parked-blocked.
-        let after_seed = if blocked_seen {
-            publish_child_booting(child_pid);
-            published(child_pid)
-        } else {
-            None
-        };
-        unsafe {
-            libc::kill(child, libc::SIGKILL);
-            let mut status = 0;
-            libc::waitpid(child, &mut status, 0);
-        }
-        wipe_id(child_pid);
-        assert!(blocked_seen, "child never published Blocked");
-        assert_eq!(
-            after_seed,
-            Some(RunState::Blocked),
-            "parent's late Booting seed clobbered the parked child's Blocked state"
-        );
     }
 
     #[test]

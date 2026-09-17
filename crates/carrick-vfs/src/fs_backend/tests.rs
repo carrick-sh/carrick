@@ -207,102 +207,6 @@ fn layered_directory_entries_hide_internal_sidecar_names() {
     assert_eq!(names, vec!["visible"]);
 }
 
-/// Answering "does the upper shadow this lower entry?" from the upper's
-/// own child-name set (one directory read) instead of one full path
-/// lookup per lower entry must be EXACT: every way the sparse upper can
-/// contribute to a lower-backed directory has to be reflected.
-///
-/// Red-first shape: replace the `upper_names.contains(..)` test in
-/// [`layered_directory_entries`] with `false` and the SHADOW case below
-/// reports `a` twice; drop the `deleted` test and the WHITEOUT case keeps
-/// listing `b`. The EMPTY SHELL case is the one that made the cheaper
-/// whole-directory proof (`fast_nofollow_absent`) useless on the hot
-/// image directories: the upper holds the directory with no children at
-/// all, so a proof keyed on the directory's absence never fires there.
-#[cfg(target_os = "macos")]
-#[test]
-fn layered_listing_reflects_every_upper_contribution_to_a_lower_directory() {
-    // name:kind, so a SHADOWED entry is caught by the type the merge
-    // publishes (getdents64's `d_type`), not merely by the name set — the
-    // upper and the lower can hold the same name with different types.
-    fn names(upper: &HostFsBackend, lower: &RootFs, dir: &str) -> Vec<String> {
-        let entries = layered_directory_entries(upper, Some(lower), dir).unwrap();
-        if let Some(stream) = try_layered_stream_dirents(upper, Some(lower), dir) {
-            let project = |rows: &[RootFsDirEntry]| {
-                let mut projected: Vec<_> = rows
-                    .iter()
-                    .map(|row| format!("{}:{:?}:{}", row.name, row.metadata.kind, row.ino))
-                    .collect();
-                projected.sort();
-                projected
-            };
-            assert_eq!(project(&stream), project(&entries));
-        }
-        let mut names: Vec<String> = entries
-            .into_iter()
-            .map(|entry| format!("{}:{:?}", entry.name, entry.metadata.kind))
-            .collect();
-        names.sort();
-        names
-    }
-
-    let lower_dir = tempfile::TempDir::new().unwrap();
-    {
-        let lower_backend = HostFsBackend::from_path(lower_dir.path()).unwrap();
-        lower_backend.make_dir("/img").unwrap();
-        lower_backend.create_file("/img/a").unwrap();
-        lower_backend.create_file("/img/b").unwrap();
-        lower_backend.create_file("/img/.carrick-lnkown.a").unwrap();
-    }
-    let lower = RootFs::from_immutable_host_dir(lower_dir.path()).unwrap();
-
-    let (mut upper, _scratch) = host_backend();
-    upper.enable_sparse_upper_fast_miss();
-
-    // Upper holds nothing at /img: the short-circuit serves the lower's
-    // listing, still hiding carrick's own sidecar names.
-    assert!(upper.fast_nofollow_absent("/img"));
-    assert_eq!(names(&upper, &lower, "/img"), vec!["a:File", "b:File"]);
-
-    // EMPTY SHELL: the sparse upper materializes /img as an ancestor with
-    // no children of its own. The whole-directory absence proof is now
-    // dead (`fast_nofollow_absent` is false) but the listing is still
-    // exactly the lower's — this is the shape the hot image directories
-    // are actually in during a python spawn.
-    upper.make_dir("/img").unwrap();
-    assert!(try_layered_stream_dirents(&upper, Some(&lower), "/img").is_some());
-    assert!(!upper.fast_nofollow_absent("/img"));
-    assert_eq!(names(&upper, &lower, "/img"), vec!["a:File", "b:File"]);
-
-    // ADDITION: a guest create under /img makes the upper a contributor;
-    // its child must appear exactly once.
-    upper.create_file("/img/c").unwrap();
-    assert_eq!(
-        names(&upper, &lower, "/img"),
-        vec!["a:File", "b:File", "c:File"]
-    );
-
-    // SHADOW: an upper entry with a lower entry's name is listed ONCE and
-    // with the UPPER's type. `a` is a file in the lower and a directory in
-    // the upper, so a merge that failed to drop the lower copy would both
-    // duplicate the name and report the wrong `d_type` for it.
-    upper.make_dir("/img/a").unwrap();
-    assert_eq!(
-        names(&upper, &lower, "/img"),
-        vec!["a:Directory", "b:File", "c:File"]
-    );
-
-    // WHITEOUT: a tombstone hides the lower's entry. A published whiteout
-    // also disarms the upper's authoritative-miss proof globally, so no
-    // OTHER directory can be short-circuited past this deletion either.
-    upper.mark_deleted("/img/b").unwrap();
-    assert_eq!(names(&upper, &lower, "/img"), vec!["a:Directory", "c:File"]);
-    assert!(
-        !upper.fast_nofollow_absent("/never-existed"),
-        "a published whiteout must disarm the upper's authoritative miss"
-    );
-}
-
 #[test]
 fn memory_normalize_strips_root_and_collapses_dots() {
     assert_eq!(
@@ -761,61 +665,6 @@ fn open_trusted_dir_fd_trusts_only_byte_exact_paths() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn test_open_trusted_dir_fd_reuses_cached_dir_fd() {
-    let (b, _scratch) = host_backend();
-    b.make_dir("/cached_dir").unwrap();
-    b.make_dir("/cached_dir/sub").unwrap();
-
-    // Prime the directory in dir_cache
-    let first = b.open_trusted_dir_fd("/cached_dir");
-    assert!(first.is_some());
-
-    reset_test_host_openat_count();
-
-    // Opening the same trusted directory again should reuse the dir_cache (0 host openat)
-    let second = b.open_trusted_dir_fd("/cached_dir");
-    assert!(second.is_some());
-    let opens = test_host_openat_count();
-    assert_eq!(
-        opens, 0,
-        "repeated open_trusted_dir_fd of cached directory should issue 0 host openat (got {opens})"
-    );
-
-    // Opening sub-directory reuses the parent dirfd (at most 1 host openat for the leaf)
-    reset_test_host_openat_count();
-    let sub = b.open_trusted_dir_fd("/cached_dir/sub");
-    assert!(sub.is_some());
-    let sub_opens = test_host_openat_count();
-    assert!(
-        sub_opens <= 1,
-        "open_trusted_dir_fd of sub directory should issue <= 1 host openat (got {sub_opens})"
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn sparse_upper_fast_absence_disarms_before_a_symlink_is_visible() {
-    let (mut b, _scratch) = host_backend();
-    b.enable_sparse_upper_fast_miss();
-
-    assert!(b.fast_nofollow_absent("/missing"));
-    b.make_dir("/target").unwrap();
-    b.create_file("/target/file").unwrap();
-    b.symlink("target", "/alias").unwrap();
-
-    assert!(
-        !b.fast_nofollow_absent("/alias/file"),
-        "a durable symlink marker must disarm authoritative upper misses"
-    );
-    assert_eq!(
-        b.lookup_kind("/alias/file"),
-        Some(OverlayEntryKind::File),
-        "the conservative fallback must still follow the upper symlink"
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[test]
 fn marker_nodes_flip_dir_overlay_interference() {
     let (b, scratch) = host_backend();
     b.make_dir("/walk").unwrap();
@@ -861,19 +710,6 @@ fn host_backend_reexec_authority_reattaches_exact_root() {
         resumed.file_contents("/handoff"),
         Some(b"same-root".to_vec())
     );
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn host_backend_reexec_authority_preserves_sparse_upper_fast_miss() {
-    let scratch = tempfile::tempdir().unwrap();
-    let mut backend = HostFsBackend::attach(scratch.path()).unwrap();
-    backend.enable_sparse_upper_fast_miss();
-    let authority = backend.native_reexec_authority().unwrap();
-    assert!(authority.sparse_upper_fast_miss);
-
-    let resumed = HostFsBackend::attach_for_reexec(&authority).unwrap();
-    assert!(resumed.fast_nofollow_absent("/lower-only"));
 }
 
 #[cfg(target_os = "macos")]
@@ -1084,290 +920,6 @@ fn stat_cache_anchors_one_parent_dirfd_per_directory() {
         1,
         "24 cached leaves under one directory must share ONE host dirfd, got {}",
         anchors.len()
-    );
-}
-
-/// A directory is resolved ONCE and then reused: the whole point of the
-/// kernel directory cache. Repeated `dir_fd_for` on the same directory must
-/// hand back the same host fd, and a nested directory must be reachable
-/// through it.
-#[cfg(target_os = "macos")]
-#[test]
-fn dir_cache_resolves_a_directory_once_and_reuses_it() {
-    use std::os::fd::AsRawFd;
-
-    let scratch_root = tempfile::TempDir::new().unwrap();
-    let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-    std::fs::create_dir(b.root_path.join("pkg")).unwrap();
-    std::fs::create_dir(b.root_path.join("pkg/inner")).unwrap();
-
-    let first = b.dir_fd_for(Path::new("pkg")).expect("pkg resolves");
-    let again = b.dir_fd_for(Path::new("pkg")).expect("pkg resolves again");
-    assert_eq!(
-        first.as_raw_fd(),
-        again.as_raw_fd(),
-        "a repeat resolution must reuse the cached dirfd, not open a second"
-    );
-
-    let inner = b
-        .dir_fd_for(Path::new("pkg/inner"))
-        .expect("nested dir resolves");
-    assert_ne!(inner.as_raw_fd(), first.as_raw_fd());
-    // Descending stored both levels, so the parent is still the same fd.
-    assert_eq!(
-        b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd(),
-        first.as_raw_fd()
-    );
-}
-
-/// The load-bearing property that makes the cache viable on a build:
-/// creating and unlinking FILES must not invalidate a directory's fd.
-///
-/// A single generation counter shared with the path-resolution cache would
-/// fail this — `go build` creates thousands of files, every one of which
-/// bumps that counter, so the dirfds would be flushed continuously and the
-/// walk they replace would be repaid on every call.
-#[cfg(target_os = "macos")]
-#[test]
-fn dir_cache_survives_a_file_create_and_unlink_storm() {
-    use std::os::fd::AsRawFd;
-
-    let scratch_root = tempfile::TempDir::new().unwrap();
-    let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-    std::fs::create_dir(b.root_path.join("pkg")).unwrap();
-    let before = b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd();
-
-    for index in 0..64 {
-        b.create_file(&format!("/pkg/f{index}")).unwrap();
-        assert!(b.remove_entry(&format!("/pkg/f{index}")));
-    }
-
-    assert_eq!(
-        b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd(),
-        before,
-        "file churn must not invalidate the directory cache"
-    );
-}
-
-/// THE MEASURED INVARIANT: on a warm `dir_cache`, one guest-level
-/// `mkdirat` / `unlinkat` / `openat` under an already-resolved parent costs
-/// at most 2 host `openat` calls spent walking the path — and in practice
-/// zero, because `namei_leaf`'s `dir_fd_for(parent)` hits the cache.
-///
-/// This is the cpython-tarfile amplification expressed as an assertion.
-/// Before the per-subtree eviction landed, `remove_entry` on a directory
-/// called `bump_dir_generation()` + `drop_dir_cache()`, which invalidated
-/// EVERY cached dirfd in every process; the next operation therefore
-/// re-walked its whole path from the sandbox root. Measured red-first
-/// against that behaviour this test reports 60 walk opens for the 20
-/// operations below (3 per op, one per component of `pkg/a/b`); with the
-/// per-subtree eviction it reports 0.
-#[cfg(target_os = "macos")]
-#[test]
-fn warm_dir_cache_bounds_path_walk_opens_per_guest_op() {
-    let scratch_root = tempfile::TempDir::new().unwrap();
-    let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-    b.make_dir("/pkg").unwrap();
-    b.make_dir("/pkg/a").unwrap();
-    b.make_dir("/pkg/a/b").unwrap();
-
-    // Warm the cache the way a real workload does: resolve the parent once.
-    b.dir_fd_for(Path::new("pkg/a/b")).unwrap();
-
-    // extractall/rmtree shape: create a child directory, create a file in
-    // it, remove both, repeat. Every one of these is a guest syscall whose
-    // host cost must not grow with the depth of the path.
-    const CYCLES: u64 = 5;
-    b.reset_path_walk_host_opens();
-    for i in 0..CYCLES {
-        let dir = format!("/pkg/a/b/d{i}");
-        let file = format!("{dir}/f");
-        b.make_dir(&dir).unwrap();
-        b.create_file(&file).unwrap();
-        assert!(b.remove_entry(&file));
-        assert!(b.remove_entry(&dir));
-    }
-    let ops = CYCLES * 4;
-    let walked = b.path_walk_host_opens();
-    // The bar in the brief is <=2 host opens per warm guest op; the shape
-    // actually achieved is 0 for the whole loop, so assert the strong form.
-    // Red-first receipt: with the pre-fix `bump_dir_generation()` +
-    // `drop_dir_cache()` on directory removal this same assertion measures
-    // 12 (each of the 5 rmdirs invalidates the whole cache and the next
-    // operations re-walk `pkg`, `a`, `b`).
-    assert!(
-        walked <= 2,
-        "a warm dir_cache must cost no host path-walk opens; measured \
-         {walked} walk opens across {ops} warm guest operations"
-    );
-}
-
-/// Running 1,000 warm operations under a 4-deep directory tree must
-/// bound host path-walk opens to <= 1 per operation and ensure cache eviction
-/// visits <= (evicted entries + log n) keys per eviction (ordered BTreeMap range
-/// removal instead of O(cache) linear scans and re-stamping).
-#[cfg(target_os = "macos")]
-#[test]
-fn warm_dir_cache_1000_ops_under_4_deep_tree_bounds_opens_and_eviction_visits() {
-    let scratch_root = tempfile::TempDir::new().unwrap();
-    let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-    b.make_dir("/l1").unwrap();
-    b.make_dir("/l1/l2").unwrap();
-    b.make_dir("/l1/l2/l3").unwrap();
-    b.make_dir("/l1/l2/l3/l4").unwrap();
-
-    // Populate sibling directories so cache size n is non-trivial (> 60 entries).
-    for s in 0..64 {
-        let sib = format!("/l1/l2/l3/sib{s}");
-        b.make_dir(&sib).unwrap();
-        b.dir_fd_for(Path::new(sib.trim_start_matches('/')))
-            .unwrap();
-    }
-
-    // Warm the parent directory of our target workload.
-    b.dir_fd_for(Path::new("l1/l2/l3/l4")).unwrap();
-
-    let n = b.dir_cache.lock().len() as u64;
-    let log_n = (64 - n.leading_zeros()).max(1) as u64;
-
-    b.reset_path_walk_host_opens();
-    b.reset_cache_eviction_visited_keys();
-
-    // 250 cycles of (mkdir, create_file, remove_file, rmdir) = 1,000 warm operations.
-    const CYCLES: u64 = 250;
-    for i in 0..CYCLES {
-        let dir = format!("/l1/l2/l3/l4/d{i}");
-        let file = format!("{dir}/f");
-        b.make_dir(&dir).unwrap();
-        b.create_file(&file).unwrap();
-        assert!(b.remove_entry(&file));
-        assert!(b.remove_entry(&dir));
-    }
-
-    let total_ops = CYCLES * 4;
-    let walked_opens = b.path_walk_host_opens();
-    assert!(
-        walked_opens <= total_ops,
-        "expected <= 1 host open per operation on warm cache; got {walked_opens} for {total_ops} ops"
-    );
-
-    let visited_keys = b.cache_eviction_visited_keys();
-    // Each of the 250 cycles does 2 removals (file + dir).
-    // For each eviction, range scan visits at most (evicted + 1) keys <= (evicted + log n).
-    let total_evictions = CYCLES * 2;
-    let max_expected_visits = total_evictions * (1 + log_n);
-    assert!(
-        visited_keys <= max_expected_visits,
-        "eviction visits {visited_keys} exceeded bound {max_expected_visits} for {total_evictions} evictions (n={n}, log_n={log_n})"
-    );
-}
-
-/// Deleting a leaf directory (e.g. during `rmtree`) must NOT invalidate
-/// parent or ancestor directory file descriptors. Only the deleted subtree
-/// is evicted.
-#[cfg(target_os = "macos")]
-#[test]
-fn dir_cache_survives_directory_tree_deletion() {
-    use std::os::fd::AsRawFd;
-
-    let scratch_root = tempfile::TempDir::new().unwrap();
-    let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-    b.make_dir("/pkg").unwrap();
-    b.make_dir("/pkg/a").unwrap();
-    b.make_dir("/pkg/a/b").unwrap();
-    b.make_dir("/pkg/a/b/c").unwrap();
-
-    let pkg_fd = b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd();
-    let a_fd = b.dir_fd_for(Path::new("pkg/a")).unwrap().as_raw_fd();
-    let b_fd = b.dir_fd_for(Path::new("pkg/a/b")).unwrap().as_raw_fd();
-    let _c_fd = b.dir_fd_for(Path::new("pkg/a/b/c")).unwrap().as_raw_fd();
-
-    // Removing leaf directory `c` must evict `c` but preserve `b`, `a`, and `pkg`.
-    assert!(b.remove_entry("/pkg/a/b/c"));
-    assert!(b.dir_fd_for(Path::new("pkg/a/b/c")).is_err());
-    assert_eq!(
-        b.dir_fd_for(Path::new("pkg/a/b")).unwrap().as_raw_fd(),
-        b_fd
-    );
-    assert_eq!(b.dir_fd_for(Path::new("pkg/a")).unwrap().as_raw_fd(), a_fd);
-    assert_eq!(b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd(), pkg_fd);
-
-    // Removing `b` preserves `a` and `pkg`.
-    assert!(b.remove_entry("/pkg/a/b"));
-    assert!(b.dir_fd_for(Path::new("pkg/a/b")).is_err());
-    assert_eq!(b.dir_fd_for(Path::new("pkg/a")).unwrap().as_raw_fd(), a_fd);
-    assert_eq!(b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd(), pkg_fd);
-}
-
-/// A cached dirfd names an INODE, so a rename of the directory would make
-/// it silently serve a path that no longer exists — identity revalidation
-/// cannot catch it, because the inode, ctime and size are all unchanged at
-/// the new location. The directory-topology generation must.
-///
-/// This asserts the guest-visible outcome rather than a cache internal: a
-/// stat of the OLD path after the rename must fail, and the new path must
-/// work.
-#[cfg(target_os = "macos")]
-#[test]
-fn rename_stops_the_old_directory_path_from_resolving() {
-    let scratch_root = tempfile::TempDir::new().unwrap();
-    let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-    assert!(b.stat_cache_active());
-    std::fs::create_dir(b.root_path.join("pkg")).unwrap();
-    std::fs::write(b.root_path.join("pkg/a"), b"x").unwrap();
-
-    // Warm both caches on the pre-rename topology.
-    assert!(b.stat_cache_lookup("/pkg/a").is_some());
-    assert!(b.dir_fd_for(Path::new("pkg")).is_ok());
-
-    assert!(
-        b.rename_overlay_entry("/pkg", "/moved")
-            .unwrap()
-            .source_was_owned()
-    );
-
-    assert!(
-        b.dir_fd_for(Path::new("pkg")).is_err(),
-        "the old directory path must not resolve after its rename"
-    );
-    assert!(
-        b.stat_cache_lookup("/pkg/a").is_none(),
-        "a leaf under the renamed directory must not be served from cache"
-    );
-    assert!(
-        b.stat_cache_lookup("/moved/a").is_some(),
-        "the leaf must be reachable at its new path"
-    );
-}
-
-/// Containment, the invariant the whole cache rests on. A symlink is never
-/// published as a directory, and a path THROUGH a symlink that leaves the
-/// sandbox is refused rather than cached — the caller then keeps its exact
-/// existing fallback, which re-roots absolute targets at the guest root.
-#[cfg(target_os = "macos")]
-#[test]
-fn dir_cache_refuses_a_symlink_that_escapes_the_sandbox() {
-    let outside = tempfile::TempDir::new().unwrap();
-    std::fs::create_dir(outside.path().join("target")).unwrap();
-    let scratch_root = tempfile::TempDir::new().unwrap();
-    let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-
-    // An absolute symlink pointing clean out of the sandbox.
-    std::os::unix::fs::symlink(outside.path(), scratch_root.path().join("escape")).unwrap();
-
-    assert!(
-        b.dir_fd_for(Path::new("escape")).is_err(),
-        "a symlink leaf must not be resolved as a directory (O_NOFOLLOW)"
-    );
-    assert!(
-        b.dir_fd_for(Path::new("escape/target")).is_err(),
-        "a path through a symlink out of the sandbox must be refused"
-    );
-    let cache = b.dir_cache.lock();
-    assert!(
-        !cache.contains_key(Path::new("escape")) && !cache.contains_key(Path::new("escape/target")),
-        "nothing reached through a symlink may be published, got {:?}",
-        cache.keys().collect::<Vec<_>>()
     );
 }
 
@@ -1629,32 +1181,6 @@ fn host_fast_open_rejects_unicode_aliased_name() {
         b.fast_open_for_guest(Path::new("cafe\u{301}.txt"), false),
         FastGuestOpen::Fallback
     ));
-}
-
-// -- may_have_fifo_nodes durable marker ---------------------------
-
-#[cfg(target_os = "macos")]
-#[test]
-fn host_may_have_fifo_nodes_tracks_durable_marker() {
-    let scratch = tempfile::TempDir::new().unwrap();
-    let a = HostFsBackend::attach(scratch.path()).unwrap();
-    assert!(!a.may_have_fifo_nodes(), "fresh scratch has no FIFOs");
-    // Regular activity does not flip it, even across a structural
-    // generation bump (which forces a durable-marker re-read).
-    a.set_file_contents("/plain", b"x".to_vec()).unwrap();
-    crate::fs_resolve_cache::bump_generation();
-    assert!(!a.may_have_fifo_nodes());
-
-    a.create_fifo("/f", 0o600).unwrap();
-    assert!(a.may_have_fifo_nodes(), "creator sees its own FIFO");
-
-    // A SEPARATE handle on the same scratch — the stand-in for a sibling
-    // carrick process (`mkfifo f` in one guest process, `cat f` in
-    // another): the DURABLE marker must answer, where an in-process flag
-    // would silently say false and route the FIFO open down the blocking
-    // regular-file path.
-    let b = HostFsBackend::attach(scratch.path()).unwrap();
-    assert!(b.may_have_fifo_nodes());
 }
 
 /// Deep-path (> PATH_MAX) operations: a guest that mkdir/chdir's its way
@@ -2262,65 +1788,6 @@ fn host_resolve_following_enforces_symlink_hop_limit() {
     assert_eq!(b.file_contents("/a"), None);
 }
 
-/// HostFsBackend must survive `libc::fork(2)`: the apt-resolver
-/// regression under `--fs host` had the symptom of a forked
-/// child carrick process reading /etc/hosts via the inherited
-/// cap-std Dir fd and somehow not seeing the seeded content.
-/// This test reproduces the exact pattern (seed in parent, read
-/// in `libc::fork` child) to nail down whether cap-std's openat
-/// against an inherited dir fd returns the right bytes.
-#[cfg(all(test, target_os = "macos"))]
-#[test]
-fn host_backend_survives_libc_fork_for_etc_hosts() {
-    let (b, scratch) = host_backend();
-    b.make_dir("/etc").unwrap();
-    b.set_file_contents("/etc/hosts", b"151.101.194.132\tdeb.debian.org\n".to_vec())
-        .unwrap();
-
-    // Pipe the child carrick's read result back to the parent
-    // so we can assert on it. The child must see the SAME bytes
-    // the parent wrote.
-    let mut pipefd: [i32; 2] = [0, 0];
-    assert_eq!(unsafe { libc::pipe(pipefd.as_mut_ptr()) }, 0);
-    let (read_end, write_end) = (pipefd[0], pipefd[1]);
-
-    let pid = unsafe { libc::fork() };
-    assert!(pid >= 0, "fork failed");
-    if pid == 0 {
-        // Child: read /etc/hosts via the inherited backend, write
-        // the result to the pipe, then _exit so we bypass Rust
-        // destructors that might race with the parent's view.
-        unsafe { libc::close(read_end) };
-        let buf = b.file_contents("/etc/hosts").unwrap_or_default();
-        unsafe {
-            libc::write(write_end, buf.as_ptr() as *const _, buf.len());
-            libc::close(write_end);
-            libc::_exit(0);
-        }
-    }
-    // Parent: read what the child saw.
-    unsafe { libc::close(write_end) };
-    let mut got = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        let n = unsafe { libc::read(read_end, chunk.as_mut_ptr() as *mut _, chunk.len()) };
-        if n <= 0 {
-            break;
-        }
-        got.extend_from_slice(&chunk[..n as usize]);
-    }
-    unsafe { libc::close(read_end) };
-    let mut status = 0;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
-
-    assert_eq!(
-        String::from_utf8_lossy(&got),
-        "151.101.194.132\tdeb.debian.org\n",
-        "forked child read different bytes from /etc/hosts than the parent wrote"
-    );
-    drop(scratch);
-}
-
 /// Build a minimal tar layer on disk and verify that
 /// `HostFsBackend::extract_layers` streams it into the scratch Dir
 /// so that subsequent `lookup` / `metadata` calls return correct
@@ -2465,123 +1932,6 @@ fn create_raw_fd_applies_the_guest_mode_on_the_held_fd() {
     assert_eq!(b.metadata("/d/t").unwrap().size, 3);
 }
 
-/// Pin this process's descriptor table shut for the guard's lifetime: a zero
-/// soft limit leaves existing descriptors valid but makes every new host
-/// `open`, `dup` or `openat` fail `EMFILE`, even if another task closes a
-/// lower descriptor. Restores the limit on drop.
-/// Requires the serial `just test` lane (a process-wide limit).
-struct DescriptorTableShut {
-    saved: libc::rlimit,
-}
-
-impl DescriptorTableShut {
-    fn new() -> Self {
-        let mut saved: libc::rlimit = unsafe { core::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
-            0
-        );
-        let shut = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: saved.rlim_max,
-        };
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &shut) }, 0);
-        Self { saved }
-    }
-}
-
-impl Drop for DescriptorTableShut {
-    fn drop(&mut self) {
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) };
-    }
-}
-
-static FS_RLIMIT_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-/// A host `EMFILE` on the guest's own open is the guest's answer, not a
-/// "not servable from here" that the dispatcher lowers to a create (and
-/// then `EINVAL`). LTP `fork09` opens files until `EMFILE` and TBROKs on
-/// any other errno; before this lane every host exhaustion surfaced as
-/// `EINVAL`. The guest is under its own `RLIMIT_NOFILE` (the fd table
-/// enforced that first), so the honest Linux errno is `ENFILE`.
-#[test]
-fn host_descriptor_exhaustion_is_refused_not_unavailable() {
-    let _serial = FS_RLIMIT_TEST_LOCK.lock();
-    let scratch_root = tempfile::TempDir::new().unwrap();
-    let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-    std::fs::create_dir(b.root_path.join("d")).unwrap();
-    std::fs::write(b.root_path.join("d/existing"), b"x").unwrap();
-    // Nothing cached: a reclaim under exhaustion must find nothing to
-    // free, so the refusal is the only possible outcome.
-    b.drop_dir_cache();
-
-    {
-        let _shut = DescriptorTableShut::new();
-        match b.create_raw_fd("/d/new", 0o644, false) {
-            HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
-            HostFdOpen::Served((fd, _)) => {
-                unsafe { libc::close(fd) };
-                panic!("create served with the descriptor table shut");
-            }
-            HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
-        }
-        match b.open_raw_fd("/d/existing", false, false, false) {
-            HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
-            HostFdOpen::Served(fd) => {
-                unsafe { libc::close(fd) };
-                panic!("open served with the descriptor table shut");
-            }
-            HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
-        }
-        match b.open_raw_fd_with_metadata("/d/existing", false, false, false) {
-            HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
-            HostFdOpen::Served((fd, _)) => {
-                unsafe { libc::close(fd) };
-                panic!("open-with-metadata served with the descriptor table shut");
-            }
-            HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
-        }
-        assert_eq!(
-            b.create_file("/d/new2"),
-            Err(BackendError::Host(LINUX_ENFILE)),
-            "create_file must carry the host refusal, not a bare Io"
-        );
-    }
-
-    // With the table open again the same calls serve, and a genuine
-    // miss stays Unavailable (path semantics belong to the resolver).
-    let (fd, _) = b.create_raw_fd("/d/new", 0o644, false).served().unwrap();
-    unsafe { libc::close(fd) };
-    let fd = b
-        .open_raw_fd("/d/existing", false, false, false)
-        .served()
-        .unwrap();
-    unsafe { libc::close(fd) };
-    assert!(
-        b.open_raw_fd("/d/missing", false, false, false)
-            .served()
-            .is_none()
-    );
-}
-
-#[test]
-fn host_descriptor_exhaustion_stays_shut_after_lower_fd_released() {
-    let _serial = FS_RLIMIT_TEST_LOCK.lock();
-    // Releasing a pre-existing descriptor after guard admission must not make a
-    // new descriptor allocation possible while the guard is active.
-    let released = unsafe { libc::dup(0) };
-    assert!(released >= 0);
-    let _shut = DescriptorTableShut::new();
-    assert_eq!(unsafe { libc::close(released) }, 0);
-    let reopened = unsafe { libc::dup(0) };
-    let errno = std::io::Error::last_os_error().raw_os_error();
-    if reopened >= 0 {
-        unsafe { libc::close(reopened) };
-    }
-    assert_eq!(reopened, -1, "guard admitted a released lower descriptor");
-    assert_eq!(errno, Some(libc::EMFILE));
-}
-
 /// `lookup_kind_and_metadata` on a plain file or directory is served by
 /// the stat cache -- one revalidating `fstatat` -- not by opening the
 /// entry. The reported kind/mode/size must still be exact.
@@ -2667,302 +2017,6 @@ fn plain_tree_stat_fill_is_the_inode_alone() {
     assert_eq!(real.mode, 0o400, "marked tree honours the override");
     let g = b.stat_cache_get_or_fill(Path::new("pkg/g")).unwrap();
     assert_eq!(g.uid, NsUid::new(7));
-}
-
-/// The `open_raw_fd` contract: every host fd the backend hands out is
-/// already `O_NONBLOCK`, across the fast lane, the cap-std path
-/// (create/truncate), `create_raw_fd`, `open_file_readonly` and the
-/// immutable-lower open, so the dispatcher's install sites never pay a
-/// `fcntl` to establish its host-fd invariant.
-#[test]
-fn host_all_opens_are_nonblocking() {
-    fn is_nonblocking(fd: i32) -> bool {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        flags >= 0 && flags & libc::O_NONBLOCK != 0
-    }
-    fn take(fd: i32) -> bool {
-        let ok = is_nonblocking(fd);
-        unsafe { libc::close(fd) };
-        ok
-    }
-    let scratch_root = tempfile::TempDir::new().unwrap();
-    let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-    std::fs::create_dir(b.root_path.join("d")).unwrap();
-    std::fs::write(b.root_path.join("d/f"), b"hello").unwrap();
-
-    // Non-creating reads and writes (fast lane on macOS, cap-std elsewhere).
-    assert!(
-        take(b.open_raw_fd("/d/f", false, false, false).served().unwrap()),
-        "read open"
-    );
-    assert!(
-        take(b.open_raw_fd("/d/f", true, false, false).served().unwrap()),
-        "write open"
-    );
-    // Truncating and creating opens take the cap-std path.
-    assert!(
-        take(b.open_raw_fd("/d/f", true, false, true).served().unwrap()),
-        "trunc open"
-    );
-    assert!(
-        take(b.open_raw_fd("/d/new", true, true, false).served().unwrap()),
-        "create open"
-    );
-    assert!(
-        take(
-            b.create_raw_fd("/d/created", 0o644, false)
-                .served()
-                .unwrap()
-                .0
-        ),
-        "create_raw_fd"
-    );
-    assert!(
-        take(b.create_raw_fd("/d/f", 0o644, false).served().unwrap().0),
-        "create_raw_fd over an existing file (cap-std fallback)"
-    );
-    {
-        use std::os::fd::AsRawFd as _;
-        let file = b.open_file_readonly("/d/f").unwrap();
-        assert!(is_nonblocking(file.as_raw_fd()), "open_file_readonly");
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::fd::AsRawFd as _;
-        let ImmutableHostFileOpen::Served { file, .. } = b.open_immutable_file_readonly("/d/f")
-        else {
-            panic!("immutable-lower open should be served");
-        };
-        assert!(is_nonblocking(file.as_raw_fd()), "immutable-lower open");
-    }
-}
-
-/// (a) `mkdir` of a new child under a 2,000-sibling directory issues <= 1 host `openat`.
-#[cfg(target_os = "macos")]
-#[test]
-fn test_mkdir_2000_siblings_host_openat_budget() {
-    use crate::vfs::Vfs as _;
-    let (backend, _scratch) = host_backend();
-    let mut vfs = crate::vfs::RootFsVfs::new();
-    vfs.set_overlay(Box::new(backend));
-
-    vfs.mkdir("/wide", 0o755).unwrap();
-    for i in 0..2000 {
-        let p = format!("/wide/f_{i:04}");
-        vfs.create_file(&p).unwrap();
-    }
-    // Warm up the directory handle / resolver
-    let _ = vfs.dentry_stat("/wide", false);
-
-    reset_test_host_openat_count();
-
-    // Emulate directory creation with mode (as in mkdirat)
-    vfs.mkdir("/wide/new_child", 0o755).unwrap();
-    let _ = vfs.set_mode("/wide/new_child", 0o755);
-
-    let opens = test_host_openat_count();
-    assert!(
-        opens <= 1,
-        "mkdir under 2,000-sibling dir issued {opens} host openat calls (budget <= 1)"
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn test_mkdir_under_resolved_parent_zero_openat_budget() {
-    use crate::vfs::Vfs as _;
-    let (backend, _scratch) = host_backend();
-    let mut vfs = crate::vfs::RootFsVfs::new();
-    vfs.set_overlay(Box::new(backend));
-
-    vfs.mkdir("/parent", 0o755).unwrap();
-    // Warm up / resolve parent directory fd in dentry cache
-    let _ = vfs.resolved_parent("/parent/dummy").unwrap();
-
-    reset_test_host_openat_count();
-    reset_test_host_stat_count();
-
-    vfs.mkdir("/parent/child", 0o755).unwrap();
-
-    let opens = test_host_openat_count();
-    let stats = test_host_stat_count();
-
-    assert_eq!(
-        opens, 0,
-        "mkdir under resolved parent issued {opens} host openat calls (budget 0)"
-    );
-    assert!(
-        stats <= 1,
-        "mkdir under resolved parent issued {stats} host stat calls (budget <= 1)"
-    );
-}
-
-/// (b) `getdents64` over a 2,000-entry directory issues <= 2 host `openat` and
-/// <= 1 host stat per entry *only* when the stream reports `DT_UNKNOWN`.
-#[cfg(target_os = "macos")]
-#[test]
-fn test_getdents64_2000_entries_host_openat_and_stat_budget() {
-    let (backend, _scratch) = host_backend();
-    let lower = RootFs::from_layers(std::iter::empty::<crate::rootfs::LayerSource>()).unwrap();
-
-    backend.make_dir("/wide").unwrap();
-    for i in 0..2000 {
-        let p = format!("/wide/f_{i:04}");
-        backend.create_file(&p).unwrap();
-    }
-
-    reset_test_host_openat_count();
-    reset_test_host_stat_count();
-
-    // Stream directory entries as getdents64 does via try_layered_stream_dirents with fallback
-    let entries =
-        try_layered_stream_dirents(&backend, Some(&lower), "/wide").unwrap_or_else(|| {
-            layered_directory_entries(&backend, Some(&lower), "/wide").unwrap_or_default()
-        });
-
-    assert_eq!(entries.len(), 2000);
-    let opens = test_host_openat_count();
-    let stats = test_host_stat_count();
-
-    assert!(
-        opens <= 2,
-        "getdents64 over 2,000-entry dir issued {opens} host openat calls (budget <= 2)"
-    );
-    // On APFS, readdir yields DT_REG for files, so 0 per-entry stats are needed.
-    assert_eq!(
-        stats, 0,
-        "getdents64 over 2,000-entry dir issued {stats} host stat calls when types are known (budget 0)"
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn test_getdents64_marker_node_per_directory_interference_budget() {
-    let (backend, _scratch) = host_backend();
-
-    // Directory /a has a marker node (socket)
-    backend.make_dir("/a").unwrap();
-    backend.create_socket("/a/sock", 0o600).unwrap();
-
-    // Directory /b has 2,000 plain files
-    backend.make_dir("/b").unwrap();
-    for i in 0..2000 {
-        let p = format!("/b/f_{i:04}");
-        backend.create_file(&p).unwrap();
-    }
-
-    reset_test_host_openat_count();
-    reset_test_host_stat_count();
-
-    // getdents64 over /b via try_layered_stream_dirents with fallback
-    let entries = try_layered_stream_dirents(&backend, None, "/b")
-        .unwrap_or_else(|| layered_directory_entries(&backend, None, "/b").unwrap());
-
-    assert_eq!(entries.len(), 2000);
-
-    let opens = test_host_openat_count();
-    let stats = test_host_stat_count();
-
-    assert!(
-        opens <= 2,
-        "getdents64 over /b issued {opens} host openat calls (budget <= 2)"
-    );
-    assert_eq!(
-        stats, 0,
-        "getdents64 over /b issued {stats} host stat calls (budget 0)"
-    );
-}
-
-/// (c) `stat` of an existing path resolved through `namei` issues 0 host `openat`
-/// (`fstatat` on parent dirfd; `stat_cache_get_or_fill` must not open).
-#[cfg(target_os = "macos")]
-#[test]
-fn test_stat_existing_path_namei_zero_host_openat() {
-    let (backend, _scratch) = host_backend();
-
-    backend.make_dir("/wide").unwrap();
-    for i in 0..2000 {
-        let p = format!("/wide/f_{i:04}");
-        backend.create_file(&p).unwrap();
-    }
-
-    // Set an owner on one entry so that the tree metadata markers are stamped
-    // and serves_plain_metadata() returns false.
-    backend
-        .set_owner("/wide/f_0000", Some(NsUid::new(1000)), None)
-        .unwrap();
-    assert!(
-        !backend.serves_plain_metadata(),
-        "tree must have metadata markers stamped"
-    );
-
-    // Warm up the parent dirfd in dir_cache
-    let _ = backend.stat_cache_get_or_fill(Path::new("wide/f_0001"));
-
-    reset_test_host_openat_count();
-    reset_test_host_stat_count();
-
-    // Stat an existing file in the directory
-    let res = backend.stat_cache_get_or_fill(Path::new("wide/f_0002"));
-    assert!(res.is_some(), "stat should succeed");
-
-    let opens = test_host_openat_count();
-    let stats = test_host_stat_count();
-
-    assert_eq!(
-        opens, 0,
-        "stat of existing path issued {opens} host openat calls (budget 0)"
-    );
-    assert_eq!(
-        stats, 1,
-        "stat of existing path issued {stats} host stat calls (expected 1 fstatat)"
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn test_mkdir_mode_fidelity_under_host_umask() {
-    use crate::vfs::Vfs as _;
-    let (backend, scratch) = host_backend();
-    let mut vfs = crate::vfs::RootFsVfs::new();
-    vfs.set_overlay(Box::new(backend));
-
-    let old_umask = unsafe { libc::umask(0o022) };
-    struct UmaskGuard(libc::mode_t);
-    impl Drop for UmaskGuard {
-        fn drop(&mut self) {
-            unsafe { libc::umask(self.0) };
-        }
-    }
-    let _guard = UmaskGuard(old_umask);
-
-    let test_modes: &[(u32, &str)] = &[
-        (0o777, "/d777"),
-        (0o775, "/d775"),
-        (0o2775, "/d2775"),
-        (0o700, "/d700"),
-    ];
-
-    for &(mode, path) in test_modes {
-        vfs.mkdir(path, mode).unwrap();
-        let disk_path = scratch.path().join(path.trim_start_matches('/'));
-        let c_path = std::ffi::CString::new(disk_path.to_str().unwrap()).unwrap();
-        let mut st: libc::stat = unsafe { core::mem::zeroed() };
-        let rc = unsafe {
-            libc::fstatat(
-                libc::AT_FDCWD,
-                c_path.as_ptr(),
-                &mut st,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        assert_eq!(rc, 0);
-        let on_disk_mode = (st.st_mode as u32) & 0o7777;
-        assert_eq!(
-            on_disk_mode, mode,
-            "on-disk mode for {path} requested {mode:#o} got {on_disk_mode:#o}"
-        );
-    }
 }
 
 /// Per-directory marker tracking must survive `rename`/`link`: a socket
@@ -3088,5 +2142,955 @@ fn trusted_dirent_stream_owns_its_seek_offset() {
         .collect();
     for worker in workers {
         worker.join().unwrap();
+    }
+}
+
+mod serial_host {
+    use super::*;
+    /// Answering "does the upper shadow this lower entry?" from the upper's
+    /// own child-name set (one directory read) instead of one full path
+    /// lookup per lower entry must be EXACT: every way the sparse upper can
+    /// contribute to a lower-backed directory has to be reflected.
+    ///
+    /// Red-first shape: replace the `upper_names.contains(..)` test in
+    /// [`layered_directory_entries`] with `false` and the SHADOW case below
+    /// reports `a` twice; drop the `deleted` test and the WHITEOUT case keeps
+    /// listing `b`. The EMPTY SHELL case is the one that made the cheaper
+    /// whole-directory proof (`fast_nofollow_absent`) useless on the hot
+    /// image directories: the upper holds the directory with no children at
+    /// all, so a proof keyed on the directory's absence never fires there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn layered_listing_reflects_every_upper_contribution_to_a_lower_directory() {
+        // name:kind, so a SHADOWED entry is caught by the type the merge
+        // publishes (getdents64's `d_type`), not merely by the name set — the
+        // upper and the lower can hold the same name with different types.
+        fn names(upper: &HostFsBackend, lower: &RootFs, dir: &str) -> Vec<String> {
+            let entries = layered_directory_entries(upper, Some(lower), dir).unwrap();
+            if let Some(stream) = try_layered_stream_dirents(upper, Some(lower), dir) {
+                let project = |rows: &[RootFsDirEntry]| {
+                    let mut projected: Vec<_> = rows
+                        .iter()
+                        .map(|row| format!("{}:{:?}:{}", row.name, row.metadata.kind, row.ino))
+                        .collect();
+                    projected.sort();
+                    projected
+                };
+                assert_eq!(project(&stream), project(&entries));
+            }
+            let mut names: Vec<String> = entries
+                .into_iter()
+                .map(|entry| format!("{}:{:?}", entry.name, entry.metadata.kind))
+                .collect();
+            names.sort();
+            names
+        }
+
+        let lower_dir = tempfile::TempDir::new().unwrap();
+        {
+            let lower_backend = HostFsBackend::from_path(lower_dir.path()).unwrap();
+            lower_backend.make_dir("/img").unwrap();
+            lower_backend.create_file("/img/a").unwrap();
+            lower_backend.create_file("/img/b").unwrap();
+            lower_backend.create_file("/img/.carrick-lnkown.a").unwrap();
+        }
+        let lower = RootFs::from_immutable_host_dir(lower_dir.path()).unwrap();
+
+        let (mut upper, _scratch) = host_backend();
+        upper.enable_sparse_upper_fast_miss();
+
+        // Upper holds nothing at /img: the short-circuit serves the lower's
+        // listing, still hiding carrick's own sidecar names.
+        assert!(upper.fast_nofollow_absent("/img"));
+        assert_eq!(names(&upper, &lower, "/img"), vec!["a:File", "b:File"]);
+
+        // EMPTY SHELL: the sparse upper materializes /img as an ancestor with
+        // no children of its own. The whole-directory absence proof is now
+        // dead (`fast_nofollow_absent` is false) but the listing is still
+        // exactly the lower's — this is the shape the hot image directories
+        // are actually in during a python spawn.
+        upper.make_dir("/img").unwrap();
+        assert!(try_layered_stream_dirents(&upper, Some(&lower), "/img").is_some());
+        assert!(!upper.fast_nofollow_absent("/img"));
+        assert_eq!(names(&upper, &lower, "/img"), vec!["a:File", "b:File"]);
+
+        // ADDITION: a guest create under /img makes the upper a contributor;
+        // its child must appear exactly once.
+        upper.create_file("/img/c").unwrap();
+        assert_eq!(
+            names(&upper, &lower, "/img"),
+            vec!["a:File", "b:File", "c:File"]
+        );
+
+        // SHADOW: an upper entry with a lower entry's name is listed ONCE and
+        // with the UPPER's type. `a` is a file in the lower and a directory in
+        // the upper, so a merge that failed to drop the lower copy would both
+        // duplicate the name and report the wrong `d_type` for it.
+        upper.make_dir("/img/a").unwrap();
+        assert_eq!(
+            names(&upper, &lower, "/img"),
+            vec!["a:Directory", "b:File", "c:File"]
+        );
+
+        // WHITEOUT: a tombstone hides the lower's entry. A published whiteout
+        // also disarms the upper's authoritative-miss proof globally, so no
+        // OTHER directory can be short-circuited past this deletion either.
+        upper.mark_deleted("/img/b").unwrap();
+        assert_eq!(names(&upper, &lower, "/img"), vec!["a:Directory", "c:File"]);
+        assert!(
+            !upper.fast_nofollow_absent("/never-existed"),
+            "a published whiteout must disarm the upper's authoritative miss"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_open_trusted_dir_fd_reuses_cached_dir_fd() {
+        let (b, _scratch) = host_backend();
+        b.make_dir("/cached_dir").unwrap();
+        b.make_dir("/cached_dir/sub").unwrap();
+
+        // Prime the directory in dir_cache
+        let first = b.open_trusted_dir_fd("/cached_dir");
+        assert!(first.is_some());
+
+        reset_test_host_openat_count();
+
+        // Opening the same trusted directory again should reuse the dir_cache (0 host openat)
+        let second = b.open_trusted_dir_fd("/cached_dir");
+        assert!(second.is_some());
+        let opens = test_host_openat_count();
+        assert_eq!(
+            opens, 0,
+            "repeated open_trusted_dir_fd of cached directory should issue 0 host openat (got {opens})"
+        );
+
+        // Opening sub-directory reuses the parent dirfd (at most 1 host openat for the leaf)
+        reset_test_host_openat_count();
+        let sub = b.open_trusted_dir_fd("/cached_dir/sub");
+        assert!(sub.is_some());
+        let sub_opens = test_host_openat_count();
+        assert!(
+            sub_opens <= 1,
+            "open_trusted_dir_fd of sub directory should issue <= 1 host openat (got {sub_opens})"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sparse_upper_fast_absence_disarms_before_a_symlink_is_visible() {
+        let (mut b, _scratch) = host_backend();
+        b.enable_sparse_upper_fast_miss();
+
+        assert!(b.fast_nofollow_absent("/missing"));
+        b.make_dir("/target").unwrap();
+        b.create_file("/target/file").unwrap();
+        b.symlink("target", "/alias").unwrap();
+
+        assert!(
+            !b.fast_nofollow_absent("/alias/file"),
+            "a durable symlink marker must disarm authoritative upper misses"
+        );
+        assert_eq!(
+            b.lookup_kind("/alias/file"),
+            Some(OverlayEntryKind::File),
+            "the conservative fallback must still follow the upper symlink"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_backend_reexec_authority_preserves_sparse_upper_fast_miss() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut backend = HostFsBackend::attach(scratch.path()).unwrap();
+        backend.enable_sparse_upper_fast_miss();
+        let authority = backend.native_reexec_authority().unwrap();
+        assert!(authority.sparse_upper_fast_miss);
+
+        let resumed = HostFsBackend::attach_for_reexec(&authority).unwrap();
+        assert!(resumed.fast_nofollow_absent("/lower-only"));
+    }
+
+    /// A directory is resolved ONCE and then reused: the whole point of the
+    /// kernel directory cache. Repeated `dir_fd_for` on the same directory must
+    /// hand back the same host fd, and a nested directory must be reachable
+    /// through it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dir_cache_resolves_a_directory_once_and_reuses_it() {
+        use std::os::fd::AsRawFd;
+
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        std::fs::create_dir(b.root_path.join("pkg")).unwrap();
+        std::fs::create_dir(b.root_path.join("pkg/inner")).unwrap();
+
+        let first = b.dir_fd_for(Path::new("pkg")).expect("pkg resolves");
+        let again = b.dir_fd_for(Path::new("pkg")).expect("pkg resolves again");
+        assert_eq!(
+            first.as_raw_fd(),
+            again.as_raw_fd(),
+            "a repeat resolution must reuse the cached dirfd, not open a second"
+        );
+
+        let inner = b
+            .dir_fd_for(Path::new("pkg/inner"))
+            .expect("nested dir resolves");
+        assert_ne!(inner.as_raw_fd(), first.as_raw_fd());
+        // Descending stored both levels, so the parent is still the same fd.
+        assert_eq!(
+            b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd(),
+            first.as_raw_fd()
+        );
+    }
+
+    /// The load-bearing property that makes the cache viable on a build:
+    /// creating and unlinking FILES must not invalidate a directory's fd.
+    ///
+    /// A single generation counter shared with the path-resolution cache would
+    /// fail this — `go build` creates thousands of files, every one of which
+    /// bumps that counter, so the dirfds would be flushed continuously and the
+    /// walk they replace would be repaid on every call.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dir_cache_survives_a_file_create_and_unlink_storm() {
+        use std::os::fd::AsRawFd;
+
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        std::fs::create_dir(b.root_path.join("pkg")).unwrap();
+        let before = b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd();
+
+        for index in 0..64 {
+            b.create_file(&format!("/pkg/f{index}")).unwrap();
+            assert!(b.remove_entry(&format!("/pkg/f{index}")));
+        }
+
+        assert_eq!(
+            b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd(),
+            before,
+            "file churn must not invalidate the directory cache"
+        );
+    }
+
+    /// THE MEASURED INVARIANT: on a warm `dir_cache`, one guest-level
+    /// `mkdirat` / `unlinkat` / `openat` under an already-resolved parent costs
+    /// at most 2 host `openat` calls spent walking the path — and in practice
+    /// zero, because `namei_leaf`'s `dir_fd_for(parent)` hits the cache.
+    ///
+    /// This is the cpython-tarfile amplification expressed as an assertion.
+    /// Before the per-subtree eviction landed, `remove_entry` on a directory
+    /// called `bump_dir_generation()` + `drop_dir_cache()`, which invalidated
+    /// EVERY cached dirfd in every process; the next operation therefore
+    /// re-walked its whole path from the sandbox root. Measured red-first
+    /// against that behaviour this test reports 60 walk opens for the 20
+    /// operations below (3 per op, one per component of `pkg/a/b`); with the
+    /// per-subtree eviction it reports 0.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn warm_dir_cache_bounds_path_walk_opens_per_guest_op() {
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        b.make_dir("/pkg").unwrap();
+        b.make_dir("/pkg/a").unwrap();
+        b.make_dir("/pkg/a/b").unwrap();
+
+        // Warm the cache the way a real workload does: resolve the parent once.
+        b.dir_fd_for(Path::new("pkg/a/b")).unwrap();
+
+        // extractall/rmtree shape: create a child directory, create a file in
+        // it, remove both, repeat. Every one of these is a guest syscall whose
+        // host cost must not grow with the depth of the path.
+        const CYCLES: u64 = 5;
+        b.reset_path_walk_host_opens();
+        for i in 0..CYCLES {
+            let dir = format!("/pkg/a/b/d{i}");
+            let file = format!("{dir}/f");
+            b.make_dir(&dir).unwrap();
+            b.create_file(&file).unwrap();
+            assert!(b.remove_entry(&file));
+            assert!(b.remove_entry(&dir));
+        }
+        let ops = CYCLES * 4;
+        let walked = b.path_walk_host_opens();
+        // The bar in the brief is <=2 host opens per warm guest op; the shape
+        // actually achieved is 0 for the whole loop, so assert the strong form.
+        // Red-first receipt: with the pre-fix `bump_dir_generation()` +
+        // `drop_dir_cache()` on directory removal this same assertion measures
+        // 12 (each of the 5 rmdirs invalidates the whole cache and the next
+        // operations re-walk `pkg`, `a`, `b`).
+        assert!(
+            walked <= 2,
+            "a warm dir_cache must cost no host path-walk opens; measured \
+         {walked} walk opens across {ops} warm guest operations"
+        );
+    }
+
+    /// Running 1,000 warm operations under a 4-deep directory tree must
+    /// bound host path-walk opens to <= 1 per operation and ensure cache eviction
+    /// visits <= (evicted entries + log n) keys per eviction (ordered BTreeMap range
+    /// removal instead of O(cache) linear scans and re-stamping).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn warm_dir_cache_1000_ops_under_4_deep_tree_bounds_opens_and_eviction_visits() {
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        b.make_dir("/l1").unwrap();
+        b.make_dir("/l1/l2").unwrap();
+        b.make_dir("/l1/l2/l3").unwrap();
+        b.make_dir("/l1/l2/l3/l4").unwrap();
+
+        // Populate sibling directories so cache size n is non-trivial (> 60 entries).
+        for s in 0..64 {
+            let sib = format!("/l1/l2/l3/sib{s}");
+            b.make_dir(&sib).unwrap();
+            b.dir_fd_for(Path::new(sib.trim_start_matches('/')))
+                .unwrap();
+        }
+
+        // Warm the parent directory of our target workload.
+        b.dir_fd_for(Path::new("l1/l2/l3/l4")).unwrap();
+
+        let n = b.dir_cache.lock().len() as u64;
+        let log_n = (64 - n.leading_zeros()).max(1) as u64;
+
+        b.reset_path_walk_host_opens();
+        b.reset_cache_eviction_visited_keys();
+
+        // 250 cycles of (mkdir, create_file, remove_file, rmdir) = 1,000 warm operations.
+        const CYCLES: u64 = 250;
+        for i in 0..CYCLES {
+            let dir = format!("/l1/l2/l3/l4/d{i}");
+            let file = format!("{dir}/f");
+            b.make_dir(&dir).unwrap();
+            b.create_file(&file).unwrap();
+            assert!(b.remove_entry(&file));
+            assert!(b.remove_entry(&dir));
+        }
+
+        let total_ops = CYCLES * 4;
+        let walked_opens = b.path_walk_host_opens();
+        assert!(
+            walked_opens <= total_ops,
+            "expected <= 1 host open per operation on warm cache; got {walked_opens} for {total_ops} ops"
+        );
+
+        let visited_keys = b.cache_eviction_visited_keys();
+        // Each of the 250 cycles does 2 removals (file + dir).
+        // For each eviction, range scan visits at most (evicted + 1) keys <= (evicted + log n).
+        let total_evictions = CYCLES * 2;
+        let max_expected_visits = total_evictions * (1 + log_n);
+        assert!(
+            visited_keys <= max_expected_visits,
+            "eviction visits {visited_keys} exceeded bound {max_expected_visits} for {total_evictions} evictions (n={n}, log_n={log_n})"
+        );
+    }
+
+    /// Deleting a leaf directory (e.g. during `rmtree`) must NOT invalidate
+    /// parent or ancestor directory file descriptors. Only the deleted subtree
+    /// is evicted.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dir_cache_survives_directory_tree_deletion() {
+        use std::os::fd::AsRawFd;
+
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        b.make_dir("/pkg").unwrap();
+        b.make_dir("/pkg/a").unwrap();
+        b.make_dir("/pkg/a/b").unwrap();
+        b.make_dir("/pkg/a/b/c").unwrap();
+
+        let pkg_fd = b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd();
+        let a_fd = b.dir_fd_for(Path::new("pkg/a")).unwrap().as_raw_fd();
+        let b_fd = b.dir_fd_for(Path::new("pkg/a/b")).unwrap().as_raw_fd();
+        let _c_fd = b.dir_fd_for(Path::new("pkg/a/b/c")).unwrap().as_raw_fd();
+
+        // Removing leaf directory `c` must evict `c` but preserve `b`, `a`, and `pkg`.
+        assert!(b.remove_entry("/pkg/a/b/c"));
+        assert!(b.dir_fd_for(Path::new("pkg/a/b/c")).is_err());
+        assert_eq!(
+            b.dir_fd_for(Path::new("pkg/a/b")).unwrap().as_raw_fd(),
+            b_fd
+        );
+        assert_eq!(b.dir_fd_for(Path::new("pkg/a")).unwrap().as_raw_fd(), a_fd);
+        assert_eq!(b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd(), pkg_fd);
+
+        // Removing `b` preserves `a` and `pkg`.
+        assert!(b.remove_entry("/pkg/a/b"));
+        assert!(b.dir_fd_for(Path::new("pkg/a/b")).is_err());
+        assert_eq!(b.dir_fd_for(Path::new("pkg/a")).unwrap().as_raw_fd(), a_fd);
+        assert_eq!(b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd(), pkg_fd);
+    }
+
+    /// A cached dirfd names an INODE, so a rename of the directory would make
+    /// it silently serve a path that no longer exists — identity revalidation
+    /// cannot catch it, because the inode, ctime and size are all unchanged at
+    /// the new location. The directory-topology generation must.
+    ///
+    /// This asserts the guest-visible outcome rather than a cache internal: a
+    /// stat of the OLD path after the rename must fail, and the new path must
+    /// work.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rename_stops_the_old_directory_path_from_resolving() {
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        assert!(b.stat_cache_active());
+        std::fs::create_dir(b.root_path.join("pkg")).unwrap();
+        std::fs::write(b.root_path.join("pkg/a"), b"x").unwrap();
+
+        // Warm both caches on the pre-rename topology.
+        assert!(b.stat_cache_lookup("/pkg/a").is_some());
+        assert!(b.dir_fd_for(Path::new("pkg")).is_ok());
+
+        assert!(
+            b.rename_overlay_entry("/pkg", "/moved")
+                .unwrap()
+                .source_was_owned()
+        );
+
+        assert!(
+            b.dir_fd_for(Path::new("pkg")).is_err(),
+            "the old directory path must not resolve after its rename"
+        );
+        assert!(
+            b.stat_cache_lookup("/pkg/a").is_none(),
+            "a leaf under the renamed directory must not be served from cache"
+        );
+        assert!(
+            b.stat_cache_lookup("/moved/a").is_some(),
+            "the leaf must be reachable at its new path"
+        );
+    }
+
+    /// Containment, the invariant the whole cache rests on. A symlink is never
+    /// published as a directory, and a path THROUGH a symlink that leaves the
+    /// sandbox is refused rather than cached — the caller then keeps its exact
+    /// existing fallback, which re-roots absolute targets at the guest root.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dir_cache_refuses_a_symlink_that_escapes_the_sandbox() {
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(outside.path().join("target")).unwrap();
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+
+        // An absolute symlink pointing clean out of the sandbox.
+        std::os::unix::fs::symlink(outside.path(), scratch_root.path().join("escape")).unwrap();
+
+        assert!(
+            b.dir_fd_for(Path::new("escape")).is_err(),
+            "a symlink leaf must not be resolved as a directory (O_NOFOLLOW)"
+        );
+        assert!(
+            b.dir_fd_for(Path::new("escape/target")).is_err(),
+            "a path through a symlink out of the sandbox must be refused"
+        );
+        let cache = b.dir_cache.lock();
+        assert!(
+            !cache.contains_key(Path::new("escape"))
+                && !cache.contains_key(Path::new("escape/target")),
+            "nothing reached through a symlink may be published, got {:?}",
+            cache.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // -- may_have_fifo_nodes durable marker ---------------------------
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_may_have_fifo_nodes_tracks_durable_marker() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let a = HostFsBackend::attach(scratch.path()).unwrap();
+        assert!(!a.may_have_fifo_nodes(), "fresh scratch has no FIFOs");
+        // Regular activity does not flip it, even across a structural
+        // generation bump (which forces a durable-marker re-read).
+        a.set_file_contents("/plain", b"x".to_vec()).unwrap();
+        crate::fs_resolve_cache::bump_generation();
+        assert!(!a.may_have_fifo_nodes());
+
+        a.create_fifo("/f", 0o600).unwrap();
+        assert!(a.may_have_fifo_nodes(), "creator sees its own FIFO");
+
+        // A SEPARATE handle on the same scratch — the stand-in for a sibling
+        // carrick process (`mkfifo f` in one guest process, `cat f` in
+        // another): the DURABLE marker must answer, where an in-process flag
+        // would silently say false and route the FIFO open down the blocking
+        // regular-file path.
+        let b = HostFsBackend::attach(scratch.path()).unwrap();
+        assert!(b.may_have_fifo_nodes());
+    }
+
+    /// HostFsBackend must survive `libc::fork(2)`: the apt-resolver
+    /// regression under `--fs host` had the symptom of a forked
+    /// child carrick process reading /etc/hosts via the inherited
+    /// cap-std Dir fd and somehow not seeing the seeded content.
+    /// This test reproduces the exact pattern (seed in parent, read
+    /// in `libc::fork` child) to nail down whether cap-std's openat
+    /// against an inherited dir fd returns the right bytes.
+    #[cfg(all(test, target_os = "macos"))]
+    #[test]
+    fn host_backend_survives_libc_fork_for_etc_hosts() {
+        let (b, scratch) = host_backend();
+        b.make_dir("/etc").unwrap();
+        b.set_file_contents("/etc/hosts", b"151.101.194.132\tdeb.debian.org\n".to_vec())
+            .unwrap();
+
+        // Pipe the child carrick's read result back to the parent
+        // so we can assert on it. The child must see the SAME bytes
+        // the parent wrote.
+        let mut pipefd: [i32; 2] = [0, 0];
+        assert_eq!(unsafe { libc::pipe(pipefd.as_mut_ptr()) }, 0);
+        let (read_end, write_end) = (pipefd[0], pipefd[1]);
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // Child: read /etc/hosts via the inherited backend, write
+            // the result to the pipe, then _exit so we bypass Rust
+            // destructors that might race with the parent's view.
+            unsafe { libc::close(read_end) };
+            let buf = b.file_contents("/etc/hosts").unwrap_or_default();
+            unsafe {
+                libc::write(write_end, buf.as_ptr() as *const _, buf.len());
+                libc::close(write_end);
+                libc::_exit(0);
+            }
+        }
+        // Parent: read what the child saw.
+        unsafe { libc::close(write_end) };
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(read_end, chunk.as_mut_ptr() as *mut _, chunk.len()) };
+            if n <= 0 {
+                break;
+            }
+            got.extend_from_slice(&chunk[..n as usize]);
+        }
+        unsafe { libc::close(read_end) };
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "151.101.194.132\tdeb.debian.org\n",
+            "forked child read different bytes from /etc/hosts than the parent wrote"
+        );
+        drop(scratch);
+    }
+
+    /// Pin this process's descriptor table shut for the guard's lifetime: a zero
+    /// soft limit leaves existing descriptors valid but makes every new host
+    /// `open`, `dup` or `openat` fail `EMFILE`, even if another task closes a
+    /// lower descriptor. Restores the limit on drop.
+    /// Requires the serial `just test` lane (a process-wide limit).
+    struct DescriptorTableShut {
+        saved: libc::rlimit,
+    }
+
+    impl DescriptorTableShut {
+        fn new() -> Self {
+            let mut saved: libc::rlimit = unsafe { core::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
+                0
+            );
+            let shut = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: saved.rlim_max,
+            };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &shut) }, 0);
+            Self { saved }
+        }
+    }
+
+    impl Drop for DescriptorTableShut {
+        fn drop(&mut self) {
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) };
+        }
+    }
+
+    static FS_RLIMIT_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// A host `EMFILE` on the guest's own open is the guest's answer, not a
+    /// "not servable from here" that the dispatcher lowers to a create (and
+    /// then `EINVAL`). LTP `fork09` opens files until `EMFILE` and TBROKs on
+    /// any other errno; before this lane every host exhaustion surfaced as
+    /// `EINVAL`. The guest is under its own `RLIMIT_NOFILE` (the fd table
+    /// enforced that first), so the honest Linux errno is `ENFILE`.
+    #[test]
+    fn host_descriptor_exhaustion_is_refused_not_unavailable() {
+        let _serial = FS_RLIMIT_TEST_LOCK.lock();
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        std::fs::create_dir(b.root_path.join("d")).unwrap();
+        std::fs::write(b.root_path.join("d/existing"), b"x").unwrap();
+        // Nothing cached: a reclaim under exhaustion must find nothing to
+        // free, so the refusal is the only possible outcome.
+        b.drop_dir_cache();
+
+        {
+            let _shut = DescriptorTableShut::new();
+            match b.create_raw_fd("/d/new", 0o644, false) {
+                HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
+                HostFdOpen::Served((fd, _)) => {
+                    unsafe { libc::close(fd) };
+                    panic!("create served with the descriptor table shut");
+                }
+                HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
+            }
+            match b.open_raw_fd("/d/existing", false, false, false) {
+                HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
+                HostFdOpen::Served(fd) => {
+                    unsafe { libc::close(fd) };
+                    panic!("open served with the descriptor table shut");
+                }
+                HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
+            }
+            match b.open_raw_fd_with_metadata("/d/existing", false, false, false) {
+                HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
+                HostFdOpen::Served((fd, _)) => {
+                    unsafe { libc::close(fd) };
+                    panic!("open-with-metadata served with the descriptor table shut");
+                }
+                HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
+            }
+            assert_eq!(
+                b.create_file("/d/new2"),
+                Err(BackendError::Host(LINUX_ENFILE)),
+                "create_file must carry the host refusal, not a bare Io"
+            );
+        }
+
+        // With the table open again the same calls serve, and a genuine
+        // miss stays Unavailable (path semantics belong to the resolver).
+        let (fd, _) = b.create_raw_fd("/d/new", 0o644, false).served().unwrap();
+        unsafe { libc::close(fd) };
+        let fd = b
+            .open_raw_fd("/d/existing", false, false, false)
+            .served()
+            .unwrap();
+        unsafe { libc::close(fd) };
+        assert!(
+            b.open_raw_fd("/d/missing", false, false, false)
+                .served()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn host_descriptor_exhaustion_stays_shut_after_lower_fd_released() {
+        let _serial = FS_RLIMIT_TEST_LOCK.lock();
+        // Releasing a pre-existing descriptor after guard admission must not make a
+        // new descriptor allocation possible while the guard is active.
+        let released = unsafe { libc::dup(0) };
+        assert!(released >= 0);
+        let _shut = DescriptorTableShut::new();
+        assert_eq!(unsafe { libc::close(released) }, 0);
+        let reopened = unsafe { libc::dup(0) };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        if reopened >= 0 {
+            unsafe { libc::close(reopened) };
+        }
+        assert_eq!(reopened, -1, "guard admitted a released lower descriptor");
+        assert_eq!(errno, Some(libc::EMFILE));
+    }
+
+    /// The `open_raw_fd` contract: every host fd the backend hands out is
+    /// already `O_NONBLOCK`, across the fast lane, the cap-std path
+    /// (create/truncate), `create_raw_fd`, `open_file_readonly` and the
+    /// immutable-lower open, so the dispatcher's install sites never pay a
+    /// `fcntl` to establish its host-fd invariant.
+    #[test]
+    fn host_all_opens_are_nonblocking() {
+        fn is_nonblocking(fd: i32) -> bool {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            flags >= 0 && flags & libc::O_NONBLOCK != 0
+        }
+        fn take(fd: i32) -> bool {
+            let ok = is_nonblocking(fd);
+            unsafe { libc::close(fd) };
+            ok
+        }
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        std::fs::create_dir(b.root_path.join("d")).unwrap();
+        std::fs::write(b.root_path.join("d/f"), b"hello").unwrap();
+
+        // Non-creating reads and writes (fast lane on macOS, cap-std elsewhere).
+        assert!(
+            take(b.open_raw_fd("/d/f", false, false, false).served().unwrap()),
+            "read open"
+        );
+        assert!(
+            take(b.open_raw_fd("/d/f", true, false, false).served().unwrap()),
+            "write open"
+        );
+        // Truncating and creating opens take the cap-std path.
+        assert!(
+            take(b.open_raw_fd("/d/f", true, false, true).served().unwrap()),
+            "trunc open"
+        );
+        assert!(
+            take(b.open_raw_fd("/d/new", true, true, false).served().unwrap()),
+            "create open"
+        );
+        assert!(
+            take(
+                b.create_raw_fd("/d/created", 0o644, false)
+                    .served()
+                    .unwrap()
+                    .0
+            ),
+            "create_raw_fd"
+        );
+        assert!(
+            take(b.create_raw_fd("/d/f", 0o644, false).served().unwrap().0),
+            "create_raw_fd over an existing file (cap-std fallback)"
+        );
+        {
+            use std::os::fd::AsRawFd as _;
+            let file = b.open_file_readonly("/d/f").unwrap();
+            assert!(is_nonblocking(file.as_raw_fd()), "open_file_readonly");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd as _;
+            let ImmutableHostFileOpen::Served { file, .. } = b.open_immutable_file_readonly("/d/f")
+            else {
+                panic!("immutable-lower open should be served");
+            };
+            assert!(is_nonblocking(file.as_raw_fd()), "immutable-lower open");
+        }
+    }
+
+    /// (a) `mkdir` of a new child under a 2,000-sibling directory issues <= 1 host `openat`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_mkdir_2000_siblings_host_openat_budget() {
+        use crate::vfs::Vfs as _;
+        let (backend, _scratch) = host_backend();
+        let mut vfs = crate::vfs::RootFsVfs::new();
+        vfs.set_overlay(Box::new(backend));
+
+        vfs.mkdir("/wide", 0o755).unwrap();
+        for i in 0..2000 {
+            let p = format!("/wide/f_{i:04}");
+            vfs.create_file(&p).unwrap();
+        }
+        // Warm up the directory handle / resolver
+        let _ = vfs.dentry_stat("/wide", false);
+
+        reset_test_host_openat_count();
+
+        // Emulate directory creation with mode (as in mkdirat)
+        vfs.mkdir("/wide/new_child", 0o755).unwrap();
+        let _ = vfs.set_mode("/wide/new_child", 0o755);
+
+        let opens = test_host_openat_count();
+        assert!(
+            opens <= 1,
+            "mkdir under 2,000-sibling dir issued {opens} host openat calls (budget <= 1)"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_mkdir_under_resolved_parent_zero_openat_budget() {
+        use crate::vfs::Vfs as _;
+        let (backend, _scratch) = host_backend();
+        let mut vfs = crate::vfs::RootFsVfs::new();
+        vfs.set_overlay(Box::new(backend));
+
+        vfs.mkdir("/parent", 0o755).unwrap();
+        // Warm up / resolve parent directory fd in dentry cache
+        let _ = vfs.resolved_parent("/parent/dummy").unwrap();
+
+        reset_test_host_openat_count();
+        reset_test_host_stat_count();
+
+        vfs.mkdir("/parent/child", 0o755).unwrap();
+
+        let opens = test_host_openat_count();
+        let stats = test_host_stat_count();
+
+        assert_eq!(
+            opens, 0,
+            "mkdir under resolved parent issued {opens} host openat calls (budget 0)"
+        );
+        assert!(
+            stats <= 1,
+            "mkdir under resolved parent issued {stats} host stat calls (budget <= 1)"
+        );
+    }
+
+    /// (b) `getdents64` over a 2,000-entry directory issues <= 2 host `openat` and
+    /// <= 1 host stat per entry *only* when the stream reports `DT_UNKNOWN`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_getdents64_2000_entries_host_openat_and_stat_budget() {
+        let (backend, _scratch) = host_backend();
+        let lower = RootFs::from_layers(std::iter::empty::<crate::rootfs::LayerSource>()).unwrap();
+
+        backend.make_dir("/wide").unwrap();
+        for i in 0..2000 {
+            let p = format!("/wide/f_{i:04}");
+            backend.create_file(&p).unwrap();
+        }
+
+        reset_test_host_openat_count();
+        reset_test_host_stat_count();
+
+        // Stream directory entries as getdents64 does via try_layered_stream_dirents with fallback
+        let entries =
+            try_layered_stream_dirents(&backend, Some(&lower), "/wide").unwrap_or_else(|| {
+                layered_directory_entries(&backend, Some(&lower), "/wide").unwrap_or_default()
+            });
+
+        assert_eq!(entries.len(), 2000);
+        let opens = test_host_openat_count();
+        let stats = test_host_stat_count();
+
+        assert!(
+            opens <= 2,
+            "getdents64 over 2,000-entry dir issued {opens} host openat calls (budget <= 2)"
+        );
+        // On APFS, readdir yields DT_REG for files, so 0 per-entry stats are needed.
+        assert_eq!(
+            stats, 0,
+            "getdents64 over 2,000-entry dir issued {stats} host stat calls when types are known (budget 0)"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_getdents64_marker_node_per_directory_interference_budget() {
+        let (backend, _scratch) = host_backend();
+
+        // Directory /a has a marker node (socket)
+        backend.make_dir("/a").unwrap();
+        backend.create_socket("/a/sock", 0o600).unwrap();
+
+        // Directory /b has 2,000 plain files
+        backend.make_dir("/b").unwrap();
+        for i in 0..2000 {
+            let p = format!("/b/f_{i:04}");
+            backend.create_file(&p).unwrap();
+        }
+
+        reset_test_host_openat_count();
+        reset_test_host_stat_count();
+
+        // getdents64 over /b via try_layered_stream_dirents with fallback
+        let entries = try_layered_stream_dirents(&backend, None, "/b")
+            .unwrap_or_else(|| layered_directory_entries(&backend, None, "/b").unwrap());
+
+        assert_eq!(entries.len(), 2000);
+
+        let opens = test_host_openat_count();
+        let stats = test_host_stat_count();
+
+        assert!(
+            opens <= 2,
+            "getdents64 over /b issued {opens} host openat calls (budget <= 2)"
+        );
+        assert_eq!(
+            stats, 0,
+            "getdents64 over /b issued {stats} host stat calls (budget 0)"
+        );
+    }
+
+    /// (c) `stat` of an existing path resolved through `namei` issues 0 host `openat`
+    /// (`fstatat` on parent dirfd; `stat_cache_get_or_fill` must not open).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_stat_existing_path_namei_zero_host_openat() {
+        let (backend, _scratch) = host_backend();
+
+        backend.make_dir("/wide").unwrap();
+        for i in 0..2000 {
+            let p = format!("/wide/f_{i:04}");
+            backend.create_file(&p).unwrap();
+        }
+
+        // Set an owner on one entry so that the tree metadata markers are stamped
+        // and serves_plain_metadata() returns false.
+        backend
+            .set_owner("/wide/f_0000", Some(NsUid::new(1000)), None)
+            .unwrap();
+        assert!(
+            !backend.serves_plain_metadata(),
+            "tree must have metadata markers stamped"
+        );
+
+        // Warm up the parent dirfd in dir_cache
+        let _ = backend.stat_cache_get_or_fill(Path::new("wide/f_0001"));
+
+        reset_test_host_openat_count();
+        reset_test_host_stat_count();
+
+        // Stat an existing file in the directory
+        let res = backend.stat_cache_get_or_fill(Path::new("wide/f_0002"));
+        assert!(res.is_some(), "stat should succeed");
+
+        let opens = test_host_openat_count();
+        let stats = test_host_stat_count();
+
+        assert_eq!(
+            opens, 0,
+            "stat of existing path issued {opens} host openat calls (budget 0)"
+        );
+        assert_eq!(
+            stats, 1,
+            "stat of existing path issued {stats} host stat calls (expected 1 fstatat)"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_mkdir_mode_fidelity_under_host_umask() {
+        use crate::vfs::Vfs as _;
+        let (backend, scratch) = host_backend();
+        let mut vfs = crate::vfs::RootFsVfs::new();
+        vfs.set_overlay(Box::new(backend));
+
+        let old_umask = unsafe { libc::umask(0o022) };
+        struct UmaskGuard(libc::mode_t);
+        impl Drop for UmaskGuard {
+            fn drop(&mut self) {
+                unsafe { libc::umask(self.0) };
+            }
+        }
+        let _guard = UmaskGuard(old_umask);
+
+        let test_modes: &[(u32, &str)] = &[
+            (0o777, "/d777"),
+            (0o775, "/d775"),
+            (0o2775, "/d2775"),
+            (0o700, "/d700"),
+        ];
+
+        for &(mode, path) in test_modes {
+            vfs.mkdir(path, mode).unwrap();
+            let disk_path = scratch.path().join(path.trim_start_matches('/'));
+            let c_path = std::ffi::CString::new(disk_path.to_str().unwrap()).unwrap();
+            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+            let rc = unsafe {
+                libc::fstatat(
+                    libc::AT_FDCWD,
+                    c_path.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            assert_eq!(rc, 0);
+            let on_disk_mode = (st.st_mode as u32) & 0o7777;
+            assert_eq!(
+                on_disk_mode, mode,
+                "on-disk mode for {path} requested {mode:#o} got {on_disk_mode:#o}"
+            );
+        }
     }
 }
