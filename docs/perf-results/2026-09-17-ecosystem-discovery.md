@@ -5,6 +5,8 @@ close semantics. This recommendation comes from a fresh full ecosystem run,
 followed by a separate one-worker reproduction of nine concrete failures.
 No runtime or test implementation was changed during this discovery.
 
+The approved follow-up is recorded in [the socket conformance batch](2026-09-17-socket-conformance-batch.md), including fixes, red-first backend tests, and fresh post-fix gates.
+
 ## Measurement and evidence
 
 - Source: `00fb0920b` (full revision in the evidence directory).
