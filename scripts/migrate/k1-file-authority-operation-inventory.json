@@ -17932,7 +17932,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 339,
+      "line": 341,
       "categories": [
         "mapping"
       ],
