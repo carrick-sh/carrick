@@ -3,6 +3,7 @@
 use super::*;
 use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::*;
+use carrick_vfs::ProcMapSharing;
 use std::os::fd::{FromRawFd, OwnedFd};
 
 /// Why a guest `mmap` was refused — and whether the guest can work that out

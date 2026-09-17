@@ -546,6 +546,7 @@ use crate::linux_abi::{LINUX_MAP_PRIVATE, LINUX_MAP_SHARED};
 #[cfg(test)]
 use carrick_abi::{LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLLET};
 use carrick_fatal::carrick_fatal;
+use carrick_vfs::ProcMapsEntry;
 use carrick_vfs::fs_backend::FsBackend;
 use carrick_vfs::overlay::OverlayEntry;
 use carrick_vfs::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
@@ -714,11 +715,6 @@ pub use proctitle::carrier_proc_label;
 pub use proctitle::{init as proctitle_init, set_carrier_process_title, set_host_process_name};
 
 pub use abi_args::{Fd, GuestLen, GuestPtr, HostFd, HostPid, NsPid, Pid, Signal};
-// Imported at the dispatch root so the submodules can name them bare, as
-// they did when the types lived in `crate::vfs`. `pub(crate)`, not `pub`:
-// carrick-kernel must not re-export a carrick-vfs type on its own public
-// surface -- a consumer names `carrick_vfs::ProcMapsEntry` directly.
-pub(crate) use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 use fd_table::*;
 
 pub mod wait_authority;
@@ -783,8 +779,6 @@ pub(crate) use io_pipe::{
     HostPipeWriteTarget, MAX_RW_COUNT, host_pipe_write_room, read_host_pipe, would_block_outcome,
     write_host_pipe, write_host_pipe_owned,
 };
-// Host-errno adaptation lives below the VFS; dispatch is a consumer of it.
-pub(crate) use carrick_vfs::errno::{HostSyscallError, HostSyscallResult};
 pub use routing::MM_MUTATION_SYSCALLS;
 #[allow(unused_imports)]
 pub use routing::syscall_requires_mm_mutation;

@@ -14,7 +14,9 @@ use thiserror::Error;
 
 use super::sysv::SysvWaitState;
 use super::wait_authority::WaitFds;
-use super::{GuestPtr, HostAliasTransaction, HostSyscallResult};
+use carrick_vfs::errno::HostSyscallResult;
+
+use super::{GuestPtr, HostAliasTransaction};
 
 #[derive(Debug)]
 pub struct PinnedHostFd {

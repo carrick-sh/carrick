@@ -276,7 +276,7 @@ pub(in crate::dispatch) fn poll_errors(host_fd: i32) {
             // this socket's data (the guest reads its own socket). Discard.
             continue;
         }
-        let Err(linux) = crate::dispatch::HostSyscallResult::host_syscall_errno(n as i32) else {
+        let Err(linux) = carrick_vfs::errno::HostSyscallResult::host_syscall_errno(n as i32) else {
             return;
         };
         if linux == crate::linux_abi::LINUX_EAGAIN {

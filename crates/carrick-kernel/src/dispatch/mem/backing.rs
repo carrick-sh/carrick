@@ -6,6 +6,7 @@ use crate::dispatch::dispatcher::MemView;
 use carrick_abi::LinuxProtFlags;
 use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::GuestVa;
+use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

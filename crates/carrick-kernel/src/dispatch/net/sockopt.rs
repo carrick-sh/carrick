@@ -6,6 +6,7 @@
 //! AF_NETLINK socket option handling.
 
 use carrick_abi::{LINUX_AF_PACKET, LINUX_SOL_PACKET};
+use carrick_vfs::errno::HostSyscallResult as _;
 
 use super::support::*;
 use super::*;

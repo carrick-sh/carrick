@@ -7,6 +7,7 @@
 //! transitions, SCM rights registration, error state caching, and synthetic
 //! responses (ICMP echo, DNS gateway replies).
 
+use carrick_vfs::errno::HostSyscallResult as _;
 use std::sync::Arc;
 
 use carrick_abi::{
@@ -15,6 +16,8 @@ use carrick_abi::{
     LinuxErrno, LinuxSocketTypeFlags,
 };
 use parking_lot::RwLock;
+
+use carrick_vfs::errno::HostSyscallError;
 
 use super::support::*;
 use super::*;

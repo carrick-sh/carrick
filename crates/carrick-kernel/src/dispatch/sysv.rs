@@ -30,6 +30,8 @@ use super::*;
 use crate::linux_abi::{LINUX_EIO, LINUX_ENOMSG, LINUX_ENOSPC, LinuxErrno};
 use carrick_abi::{NsGid, NsUid};
 use carrick_fatal::carrick_fatal;
+use carrick_vfs::ProcMapSharing;
+use carrick_vfs::errno::HostSyscallResult as _;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 #[cfg(not(doctest))]

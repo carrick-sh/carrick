@@ -78,6 +78,7 @@ const _: () = {
 // - complete_wait_fd_authority
 
 use carrick_abi::syscall::nr;
+use carrick_vfs::errno::HostSyscallResult as _;
 
 syscall_table! {
     /// Per-module syscall routing for the `fs` subsystem (Task A1).

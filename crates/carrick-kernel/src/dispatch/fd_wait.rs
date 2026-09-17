@@ -11,7 +11,9 @@ use std::time::Instant;
 
 use carrick_guest_mem::CurrentMmMemory;
 
-use super::{DispatchOutcome, HostSyscallResult, SyscallDispatcher, WaitFdAuthority, WaitFds};
+use carrick_vfs::errno::HostSyscallResult;
+
+use super::{DispatchOutcome, SyscallDispatcher, WaitFdAuthority, WaitFds};
 use crate::dispatch::format_time::{TimerFdPollSource, timerfd_poll_source_from_lease};
 use crate::kernel::objects::FileDescriptionFdLease;
 use crate::linux_abi::{LINUX_EFAULT, LinuxErrno};
