@@ -161,7 +161,8 @@ impl ScriptedBackend {
         if let Some(failure) = process.take_bind_failure() {
             return Err(failure.into());
         }
-        let root_generation = crate::driver::seed_initial_task_state(&root_context)?;
+        let root_generation =
+            crate::driver::seed_initial_task_state(&root_context, process.asid_generation())?;
         let mut root = Task {
             dispatcher,
             process,
@@ -436,6 +437,11 @@ impl Task {
                     outs.push((i, a, *n));
                     a
                 }
+                Operand::InOut(b) => {
+                    let a = self.memory.put(b)?;
+                    outs.push((i, a, b.len()));
+                    a
+                }
             };
         }
         Ok((args, outs))
@@ -647,7 +653,10 @@ impl Task {
             return Err(failure.into());
         }
 
-        let child_generation = crate::driver::seed_initial_task_state(&child_context)?;
+        let child_generation = crate::driver::seed_initial_task_state(
+            &child_context,
+            child_process.asid_generation(),
+        )?;
         shared
             .process_bindings
             .lock()

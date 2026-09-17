@@ -28,8 +28,8 @@ use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 use carrick_kernel::compat::SyscallArgs;
 use carrick_kernel::dispatch::{DispatchOutcome, SyscallRequest};
 use carrick_kernel::kernel::continuation::{
-    BlockedContinuation, CancellationCause, ContinuationCapture, ContinuationCompletion,
-    ContinuationResult, RestartClass, is_blocking_dispatch_outcome,
+    BlockedContinuation, CancellationCause, ContinuationCapture, ContinuationResult, RestartClass,
+    fold_continuation_completion, is_blocking_dispatch_outcome, is_restartable_syscall,
 };
 use carrick_kernel::kernel::objects::{ExecutionGeneration, MigratableTaskState};
 use carrick_kernel::kernel::{CarrierProcess, KernelContext};
@@ -37,35 +37,12 @@ use carrick_kernel::kernel::{CarrierProcess, KernelContext};
 use crate::operand::Syscall;
 use crate::scripted::{ExampleError, InternalCompletion, Shared, Task, WAIT_BOUND};
 
-/// Check whether a Linux syscall is restartable upon signal interruption or readiness wake.
-pub(crate) fn is_restartable_syscall(nr: u64) -> bool {
-    matches!(
-        nr,
-        63  // read
-        | 64  // write
-        | 65  // readv
-        | 66  // writev
-        | 67  // pread64
-        | 68  // pwrite64
-        | 69  // preadv
-        | 70  // pwritev
-        | 286 // preadv2
-        | 287 // pwritev2
-        | 29  // ioctl
-        | 56  // openat
-        | 32  // flock
-        | 25  // fcntl
-        | 182 // mq_timedsend
-        | 183 // mq_timedreceive
-    )
-}
-
 /// Seed the initial `MigratableTaskState` onto a new task's leader thread so continuation captures can authenticate authority.
 pub(crate) fn seed_initial_task_state(
     context: &KernelContext,
+    asid_generation: u64,
 ) -> Result<ExecutionGeneration, ExampleError> {
     let mm = context.shared().mm().id();
-    let asid_generation = mm.raw();
     let state = MigratableTaskState {
         cpu: GuestCpuState::from_aarch64_v1(Aarch64TaskCpuStateV1 {
             gprs: [0; 31],
@@ -161,128 +138,122 @@ pub(crate) fn drive(
             .push((task.process.pid(), syscall.label));
 
         let request = SyscallRequest::new(syscall.nr.raw(), SyscallArgs::from(args));
-        let outcome =
+        let mut outcome =
             task.dispatcher
                 .dispatch(&context, request, &mut task.memory.linear, &task.reporter)?;
 
-        match outcome {
-            DispatchOutcome::Returned { value } => return Ok(InternalCompletion::Returned(value)),
-            DispatchOutcome::Errno { errno } => return Ok(InternalCompletion::Errno(errno)),
-            DispatchOutcome::Exit { code } => return Ok(InternalCompletion::Exit(code)),
-            DispatchOutcome::SignalDeath { signum } => {
-                return Ok(InternalCompletion::Death(signum));
-            }
-            DispatchOutcome::Fork {
-                flags,
-                pidfd_out,
-                clone_parent,
-                parent_tid_addr,
-                child_tid_addr,
-                exit_signal,
-                child_stack,
-                vfork,
-            } => {
-                let plain = pidfd_out.is_none()
-                    && !clone_parent
-                    && parent_tid_addr.is_none()
-                    && child_tid_addr.is_none()
-                    && child_stack == 0
-                    && vfork.is_none();
-                if !plain {
-                    return Err(ExampleError::Unsupported(format!(
-                        "clone flags {flags:#x}: only a plain fork (no CLONE_PIDFD, \
-                         CLONE_PARENT, tid stores, child stack or vfork) runs here"
-                    )));
+        loop {
+            match outcome {
+                DispatchOutcome::Returned { value } => {
+                    return Ok(InternalCompletion::Returned(value));
                 }
-                return Ok(InternalCompletion::Fork { flags, exit_signal });
-            }
-            DispatchOutcome::SchedulerYield => {
-                std::thread::yield_now();
-                return Ok(InternalCompletion::Returned(0));
-            }
-            outcome if is_blocking_dispatch_outcome(&outcome) => {
-                let restart = if is_restartable_syscall(syscall.nr.raw()) {
-                    RestartClass::RestartSyscall
-                } else {
-                    RestartClass::Never
-                };
-                let capture =
-                    ContinuationCapture::new(&context, task.execution_generation, request, restart)
+                DispatchOutcome::Errno { errno } => return Ok(InternalCompletion::Errno(errno)),
+                DispatchOutcome::Exit { code } => return Ok(InternalCompletion::Exit(code)),
+                DispatchOutcome::SignalDeath { signum } => {
+                    return Ok(InternalCompletion::Death(signum));
+                }
+                DispatchOutcome::Fork {
+                    flags,
+                    pidfd_out,
+                    clone_parent,
+                    parent_tid_addr,
+                    child_tid_addr,
+                    exit_signal,
+                    child_stack,
+                    vfork,
+                } => {
+                    let plain = pidfd_out.is_none()
+                        && !clone_parent
+                        && parent_tid_addr.is_none()
+                        && child_tid_addr.is_none()
+                        && child_stack == 0
+                        && vfork.is_none();
+                    if !plain {
+                        return Err(ExampleError::Unsupported(format!(
+                            "clone flags {flags:#x}: only a plain fork (no CLONE_PIDFD, \
+                             CLONE_PARENT, tid stores, child stack or vfork) runs here"
+                        )));
+                    }
+                    return Ok(InternalCompletion::Fork { flags, exit_signal });
+                }
+                DispatchOutcome::SchedulerYield => {
+                    std::thread::yield_now();
+                    return Ok(InternalCompletion::Returned(0));
+                }
+                blocking_outcome if is_blocking_dispatch_outcome(&blocking_outcome) => {
+                    let restart = if is_restartable_syscall(syscall.nr.raw()) {
+                        RestartClass::RestartSyscall
+                    } else {
+                        RestartClass::Never
+                    };
+                    let capture = ContinuationCapture::new(
+                        &context,
+                        task.execution_generation,
+                        request,
+                        restart,
+                    )
+                    .map_err(|e| {
+                        ExampleError::Unsupported(format!("continuation capture failed: {e}"))
+                    })?;
+
+                    let mut continuation =
+                        BlockedContinuation::from_dispatch_outcome(blocking_outcome, capture)
+                            .map_err(|e| {
+                                ExampleError::Unsupported(format!("continuation build failed: {e}"))
+                            })?;
+                    continuation.install_temporary_signal_mask(&context);
+
+                    let mut registration = shared.wait_service.prepare_registration(&continuation);
+                    shared.wait_service.enroll(&mut registration).map_err(|e| {
+                        ExampleError::Unsupported(format!("wait service enroll failed: {e}"))
+                    })?;
+                    let token = registration.wake_token();
+                    continuation
+                        .attach_registration(registration)
                         .map_err(|e| {
-                            ExampleError::Unsupported(format!("continuation capture failed: {e}"))
+                            ExampleError::Unsupported(format!("attach registration failed: {e}"))
                         })?;
 
-                let mut continuation = BlockedContinuation::from_dispatch_outcome(outcome, capture)
-                    .map_err(|e| {
-                        ExampleError::Unsupported(format!("continuation build failed: {e}"))
-                    })?;
-                continuation.install_temporary_signal_mask(&context);
+                    // Notify listeners that this task is now parked/enrolled.
+                    shared.notify_parked(task.process.pid(), syscall.label);
 
-                let mut registration = shared.wait_service.prepare_registration(&continuation);
-                shared.wait_service.enroll(&mut registration).map_err(|e| {
-                    ExampleError::Unsupported(format!("wait service enroll failed: {e}"))
-                })?;
-                let token = registration.wake_token();
-                continuation
-                    .attach_registration(registration)
-                    .map_err(|e| {
-                        ExampleError::Unsupported(format!("attach registration failed: {e}"))
+                    let event_result =
+                        block_on_timeout(shared.wait_service.event(token), WAIT_BOUND);
+                    let Some(event_result) = event_result else {
+                        let _ = continuation.cancel(CancellationCause::ServiceShutdown);
+                        return Err(ExampleError::WaitTimedOut(syscall.label));
+                    };
+
+                    let event = event_result.map_err(|e| {
+                        ExampleError::Unsupported(format!("wait service event error: {e}"))
                     })?;
 
-                // Notify listeners that this task is now parked/enrolled.
-                shared.notify_parked(task.process.pid(), syscall.label);
+                    let fresh_context = task.dispatcher.capture_one_task_context()?;
+                    let result: ContinuationResult =
+                        continuation.resume(event, &fresh_context).map_err(|e| {
+                            ExampleError::Unsupported(format!("continuation resume failed: {e:?}"))
+                        })?;
 
-                let event_result = block_on_timeout(shared.wait_service.event(token), WAIT_BOUND);
-                let Some(event_result) = event_result else {
-                    let _ = continuation.cancel(CancellationCause::ServiceShutdown);
-                    return Err(ExampleError::WaitTimedOut(syscall.label));
-                };
-
-                let event = event_result.map_err(|e| {
-                    ExampleError::Unsupported(format!("wait service event error: {e}"))
-                })?;
-
-                let fresh_context = task.dispatcher.capture_one_task_context()?;
-                let result: ContinuationResult =
-                    continuation.resume(event, &fresh_context).map_err(|e| {
-                        ExampleError::Unsupported(format!("continuation resume failed: {e:?}"))
-                    })?;
-
-                match result.completion {
-                    ContinuationCompletion::Return(val) => {
-                        return Ok(InternalCompletion::Returned(val));
-                    }
-                    ContinuationCompletion::Errno(errno) => {
-                        return Ok(InternalCompletion::Errno(errno));
-                    }
-                    ContinuationCompletion::ReturnWithGuestWrites(val, _writes) => {
-                        return Ok(InternalCompletion::Returned(val));
-                    }
-                    ContinuationCompletion::ErrnoWithGuestWrites(errno, _writes) => {
-                        return Ok(InternalCompletion::Errno(errno));
-                    }
-                    ContinuationCompletion::Redispatch => continue,
-                    ContinuationCompletion::RedispatchWithPartial(_offset) => continue,
-                    ContinuationCompletion::BlockingWrite { outcome, .. } => match outcome {
-                        carrick_kernel::kernel::continuation::BlockingWriteOutcome::Return(val) => {
-                            return Ok(InternalCompletion::Returned(val));
+                    match fold_continuation_completion(
+                        result.completion,
+                        &task.dispatcher,
+                        &fresh_context,
+                        &mut task.memory.linear,
+                    ) {
+                        Ok(Some(next_outcome)) => {
+                            outcome = next_outcome;
+                            continue;
                         }
-                        carrick_kernel::kernel::continuation::BlockingWriteOutcome::Errno(
-                            errno,
-                        ) => {
-                            return Ok(InternalCompletion::Errno(errno));
+                        Ok(None) => break, // redispatch original syscall request
+                        Err(err) => {
+                            return Err(ExampleError::Unsupported(format!(
+                                "memory error folding continuation: {err:?}"
+                            )));
                         }
-                    },
-                    ContinuationCompletion::TimerFdRead(_)
-                    | ContinuationCompletion::Semop(_)
-                    | ContinuationCompletion::Mqueue(_)
-                    | ContinuationCompletion::FdWait { .. } => continue,
-                    ContinuationCompletion::InterruptedSleep { .. } => {
-                        return Ok(InternalCompletion::Errno(carrick_abi::LINUX_EINTR));
                     }
                 }
+                other => return Err(ExampleError::Unsupported(format!("{other:?}"))),
             }
-            other => return Err(ExampleError::Unsupported(format!("{other:?}"))),
         }
     }
 }

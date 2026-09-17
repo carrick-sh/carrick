@@ -17,15 +17,15 @@ use std::time::{Duration, Instant};
 
 use carrick_abi::{SigBlockMask, SigSet, WaitSigMask};
 use carrick_fatal::carrick_fatal;
-use carrick_guest_mem::{GuestVa, SharedFutexLocation};
+use carrick_guest_mem::{CurrentMmMemory, GuestVa, MemoryError, SharedFutexLocation};
 use parking_lot::Mutex;
 
 use crate::dispatch::fd_wait::BlockingFdWait;
 use crate::dispatch::format_time::{BlockingTimerFdRead, TimerFdPollSource};
 use crate::dispatch::{BlockingMqueue, BlockingSemop};
 use crate::dispatch::{
-    BlockingRecordLock, BlockingWrite, DispatchOutcome, FdWaitCompletion, SyscallRequest,
-    WaitFdAuthority, WaitFds,
+    BlockingRecordLock, BlockingWrite, DispatchOutcome, FdWaitCompletion, GuestPtr,
+    SyscallDispatcher, SyscallRequest, WaitFdAuthority, WaitFds,
 };
 use crate::kernel::objects::{ExecutionGeneration, ThreadKey};
 use crate::kernel::{Kernel, KernelContext, MmId, Task, TaskKey, TaskRevision, VforkParentWait};
@@ -2272,6 +2272,141 @@ pub enum ContinuationCompletion {
 pub enum BlockingWriteOutcome {
     Return(i64),
     Errno(LinuxErrno),
+}
+
+/// Check whether a canonical Linux syscall number is restartable upon signal interruption or readiness wake.
+///
+/// Slow devices (pipes, terminals, sockets without timeouts), flock, fcntl F_SETLKW,
+/// mq_timedsend/mq_timedreceive, getrandom, and child waits (waitid/wait4) restart when SA_RESTART is set.
+pub fn is_restartable_syscall(nr: u64) -> bool {
+    matches!(
+        nr,
+        // Reads and writes on "slow" devices — pipes, terminals, sockets. On a
+        // regular file these never return EINTR, so listing them is harmless.
+        63  // read
+        | 64  // write
+        | 65  // readv
+        | 66  // writev
+        | 67  // pread64
+        | 68  // pwrite64
+        | 69  // preadv
+        | 70  // pwritev
+        | 286 // preadv2
+        | 287 // pwritev2
+        | 29  // ioctl (on a slow device)
+        | 56  // openat (blocks opening a FIFO)
+        // Advisory file locking: flock, and fcntl's F_SETLKW. fcntl is listed
+        // whole because the blocking lock commands are the only ones that can
+        // return EINTR.
+        | 32  // flock
+        | 25  // fcntl
+        // POSIX message queues.
+        | 182 // mq_timedsend
+        | 183 // mq_timedreceive
+        | 278 // getrandom
+        // Waits.
+        | 95  // waitid
+        | 260 // wait4
+    )
+}
+
+/// Raise SIGPIPE on the task when a blocking write encounters EPIPE and SIGPIPE is not ignored.
+pub fn raise_sigpipe_for_blocking_write(
+    dispatcher: &SyscallDispatcher,
+    context: &KernelContext,
+    write: &BlockingWrite,
+    outcome: DispatchOutcome,
+) -> DispatchOutcome {
+    if write.sigpipe_on_epipe()
+        && matches!(
+            &outcome,
+            DispatchOutcome::Errno {
+                errno: carrick_abi::LINUX_EPIPE
+            }
+        )
+        && !dispatcher.signal_is_ignored(context, carrick_abi::LINUX_SIGPIPE)
+    {
+        dispatcher.mark_signal_pending(context, write.tid(), carrick_abi::LINUX_SIGPIPE);
+    }
+    outcome
+}
+
+/// Interpret and fold a completed continuation outcome into the resulting `DispatchOutcome`.
+///
+/// Handlers that perform memory operations (like zeroing fd-set ranges on timeout or copying
+/// interrupted sleep remaining durations) mutate `memory`. Returns `Some(outcome)` if the continuation
+/// completed with a concrete return value, errno, or intermediate wait step, or `None` if the original
+/// syscall request must be re-dispatched.
+pub fn fold_continuation_completion<M: CurrentMmMemory>(
+    completion: ContinuationCompletion,
+    dispatcher: &SyscallDispatcher,
+    context: &KernelContext,
+    memory: &mut M,
+) -> Result<Option<DispatchOutcome>, MemoryError> {
+    Ok(match completion {
+        ContinuationCompletion::Return(value) => Some(DispatchOutcome::Returned { value }),
+        ContinuationCompletion::Errno(errno) => Some(DispatchOutcome::Errno { errno }),
+        ContinuationCompletion::Redispatch => None,
+        ContinuationCompletion::RedispatchWithPartial(value) => {
+            Some(DispatchOutcome::Returned { value })
+        }
+        ContinuationCompletion::ReturnWithGuestWrites(value, writes) => {
+            for range in writes {
+                memory.zero_guest_range(range.start().raw(), range.len())?;
+            }
+            Some(DispatchOutcome::Returned { value })
+        }
+        ContinuationCompletion::ErrnoWithGuestWrites(errno, writes) => {
+            for range in writes {
+                memory.zero_guest_range(range.start().raw(), range.len())?;
+            }
+            Some(DispatchOutcome::Errno { errno })
+        }
+        ContinuationCompletion::BlockingWrite { write, outcome } => {
+            let outcome = match outcome {
+                BlockingWriteOutcome::Return(value) => DispatchOutcome::Returned { value },
+                BlockingWriteOutcome::Errno(errno) => DispatchOutcome::Errno { errno },
+            };
+            Some(raise_sigpipe_for_blocking_write(
+                dispatcher, context, &write, outcome,
+            ))
+        }
+        ContinuationCompletion::TimerFdRead(read) => match read.complete(memory) {
+            crate::dispatch::format_time::TimerFdReadStep::Done(outcome) => Some(outcome),
+            crate::dispatch::format_time::TimerFdReadStep::Wait(read) => {
+                Some(DispatchOutcome::BlockingTimerFdRead(read))
+            }
+        },
+        ContinuationCompletion::Semop(semop) => match semop.complete() {
+            crate::dispatch::BlockingSemopStep::Done(outcome) => Some(outcome),
+            crate::dispatch::BlockingSemopStep::Wait(semop) => {
+                Some(DispatchOutcome::BlockingSemop(semop))
+            }
+        },
+        ContinuationCompletion::Mqueue(mqueue) => {
+            match mqueue.complete(dispatcher, context, memory) {
+                crate::dispatch::BlockingMqueueStep::Done(outcome) => Some(outcome),
+                crate::dispatch::BlockingMqueueStep::Wait(mqueue) => {
+                    Some(DispatchOutcome::BlockingMqueue(mqueue))
+                }
+            }
+        }
+        ContinuationCompletion::FdWait { wait, sig_mask } => {
+            match wait.complete(memory, dispatcher) {
+                crate::dispatch::fd_wait::BlockingFdWaitStep::Done(outcome) => Some(outcome),
+                crate::dispatch::fd_wait::BlockingFdWaitStep::Wait(wait) => {
+                    Some(DispatchOutcome::BlockingFdWait { wait, sig_mask })
+                }
+            }
+        }
+        ContinuationCompletion::InterruptedSleep { remaining } => {
+            Some(crate::dispatch::complete_interrupted_sleep(
+                memory,
+                remaining.map(|(range, _)| GuestPtr(range.start().raw())),
+                remaining.map_or(Duration::ZERO, |(_, duration)| duration),
+            ))
+        }
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use carrick_abi::{LINUX_EBADF, LINUX_EINVAL};
 use carrick_kernel_example::{
-    ExampleError, ScriptedBackend, Step, WAIT_BOUND, await_parked, host_sleep_ms, last_child, slot,
-    sys,
+    ExampleError, ScriptedBackend, Step, WAIT_BOUND, await_parked, host_sleep_ms, in_out,
+    last_child, slot, sys,
 };
 
 #[test]
@@ -292,4 +292,66 @@ fn host_sleep_step_executes() {
         .run_root(script)
         .expect("backend ran");
     assert_eq!(run.exit_code(), 0);
+}
+
+#[test]
+fn blocking_write_over_pipe_capacity_completes_byte_exact() {
+    let payload: Vec<u8> = (0..131072).map(|i| (i % 251) as u8).collect();
+    let script = vec![
+        Step::Sys(
+            sys::pipe2(0)
+                .ret(0)
+                .save_out_i32(0, 0, 0)
+                .save_out_i32(0, 1, 1),
+        ),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            await_parked(1, "write"),
+            Step::Sys(sys::read(slot(0), 65536).ret(65536)),
+            Step::Sys(sys::read(slot(0), 65536).ret(65536)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        Step::Sys(sys::write(slot(1), &payload).ret(131072)),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+    let mut received = Vec::new();
+    for output in run.outputs() {
+        if output.label == "read" {
+            received.extend_from_slice(&output.bytes);
+        }
+    }
+    assert_eq!(received.len(), 131072);
+    assert_eq!(received, payload);
+}
+
+#[test]
+fn pselect6_timeout_zeroes_non_null_fd_set() {
+    let mut initial_readfds = [0u8; 8];
+    initial_readfds[0] = 0x08; // bit 3 set (fd 3)
+
+    let mut timeout = [0u8; 16];
+    timeout[8..16].copy_from_slice(&10_000_000u64.to_le_bytes()); // 10ms
+
+    let script = vec![
+        Step::Sys(
+            sys::pipe2(0)
+                .ret(0)
+                .save_out_i32(0, 0, 0)
+                .save_out_i32(0, 1, 1),
+        ),
+        Step::Sys(sys::pselect6(4, in_out(&initial_readfds), 0, 0, &timeout[..], 0).ret(0)),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+    assert_eq!(run.output("pselect6"), &[0u8; 8]);
 }

@@ -17,6 +17,8 @@ pub enum Operand {
     CStr(String),
     /// A zeroed output buffer of `n` bytes allocated in task memory; captured into the report after the call.
     Out(usize),
+    /// A buffer initialized with bytes whose updated contents are captured into the report after the call.
+    InOut(Vec<u8>),
 }
 
 /// A value to save from a syscall's result or output buffer.
@@ -140,6 +142,11 @@ pub const fn slot(i: usize) -> Operand {
 /// Reference the pid of the most recent fork child.
 pub const fn last_child() -> Operand {
     Operand::LastChild
+}
+
+/// A buffer initialized with `bytes` whose updated contents are captured into the report after the call.
+pub fn in_out(bytes: &[u8]) -> Operand {
+    Operand::InOut(bytes.to_vec())
 }
 
 impl From<i64> for Operand {
