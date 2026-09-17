@@ -33,7 +33,7 @@ use carrick_kernel::thread::ThreadId;
 use parking_lot::{Condvar, Mutex};
 
 use crate::memory::TaskMemory;
-use crate::operand::{Expect, Operand, Save, Step, Syscall};
+use crate::operand::{Expect, Layout, Operand, Save, Step, Syscall};
 use crate::process::{AddressSpace, AddressSpaceError, AsidAllocator, ExampleProcess};
 use crate::report::{Completion, Output, RunReport};
 
@@ -46,8 +46,14 @@ pub const WAIT_BOUND: Duration = Duration::from_secs(5);
 /// the carrier numbers its root.
 const ROOT_PID: i32 = LINUX_BOOTSTRAP_PID as i32;
 
-/// Specification of an output buffer: (argument index, guest address, length).
-type OutBufferSpec = (usize, u64, usize);
+/// Specification of an output buffer: (argument index, optional tag, guest address, length).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OutBufferSpec {
+    pub(crate) arg: usize,
+    pub(crate) tag: Option<&'static str>,
+    pub(crate) addr: u64,
+    pub(crate) len: usize,
+}
 
 /// Resolved syscall arguments and output buffer specifications.
 type ResolvedArgs = ([u64; 6], Vec<OutBufferSpec>);
@@ -310,6 +316,15 @@ impl Task {
                             .copied()
                             .map(|v| v as i32)
                             .ok_or_else(|| ExampleError::Script(format!("slot {s} is unset")))?,
+                        Operand::Negated(s) => self
+                            .slots
+                            .get(*s)
+                            .copied()
+                            .and_then(|v| v.checked_neg())
+                            .map(|v| v as i32)
+                            .ok_or_else(|| {
+                                ExampleError::Script(format!("slot {s} is unset or overflow"))
+                            })?,
                         Operand::LastChild => self.last_child.ok_or_else(|| {
                             ExampleError::Script("no child has been forked".to_owned())
                         })?,
@@ -425,37 +440,203 @@ impl Task {
         let mut args = [0u64; 6];
         let mut outs = Vec::new();
         for (i, op) in syscall.args.iter().enumerate() {
-            args[i] = match op {
-                Operand::Lit(v) => *v as u64,
-                Operand::Slot(s) => self
+            args[i] = self.resolve_operand(i, op, &mut outs)?;
+        }
+        // Validate that capture tags within one syscall are unique.
+        let mut seen_tags = HashSet::new();
+        for out in &outs {
+            if let Some(tag) = out.tag
+                && !seen_tags.insert(tag)
+            {
+                return Err(ExampleError::Script(format!(
+                    "duplicate capture tag '{tag}' in syscall {}",
+                    syscall.label
+                )));
+            }
+        }
+        Ok((args, outs))
+    }
+
+    fn resolve_operand(
+        &mut self,
+        arg_idx: usize,
+        op: &Operand,
+        outs: &mut Vec<OutBufferSpec>,
+    ) -> Result<u64, ExampleError> {
+        match op {
+            Operand::Lit(v) => Ok(*v as u64),
+            Operand::Slot(s) => self
+                .slots
+                .get(*s)
+                .copied()
+                .map(|v| v as u64)
+                .ok_or_else(|| ExampleError::Script(format!("slot {s} is unset"))),
+            Operand::Negated(s) => {
+                let val = self
                     .slots
                     .get(*s)
                     .copied()
-                    .map(|v| v as u64)
-                    .ok_or_else(|| ExampleError::Script(format!("slot {s} is unset")))?,
-                Operand::LastChild => self
-                    .last_child
-                    .map(|pid| pid as u64)
-                    .ok_or_else(|| ExampleError::Script("no child has been forked".to_owned()))?,
-                Operand::Bytes(b) => self.memory.put(b)?,
-                Operand::CStr(s) => {
-                    let mut b = s.as_bytes().to_vec();
-                    b.push(0);
-                    self.memory.put(&b)?
-                }
-                Operand::Out(n) => {
-                    let a = self.memory.alloc_zeroed(*n)?;
-                    outs.push((i, a, *n));
-                    a
-                }
-                Operand::InOut(b) => {
-                    let a = self.memory.put(b)?;
-                    outs.push((i, a, b.len()));
-                    a
-                }
-            };
+                    .ok_or_else(|| ExampleError::Script(format!("slot {s} is unset")))?;
+                let neg = val.checked_neg().ok_or_else(|| {
+                    ExampleError::Script(format!("negation overflow on slot {s} ({val})"))
+                })?;
+                Ok(neg as u64)
+            }
+            Operand::LastChild => self
+                .last_child
+                .map(|pid| pid as u64)
+                .ok_or_else(|| ExampleError::Script("no child has been forked".to_owned())),
+            Operand::Bytes(b) => self.memory.put(b).map_err(ExampleError::from),
+            Operand::CStr(s) => {
+                let mut b = s.as_bytes().to_vec();
+                b.push(0);
+                self.memory.put(&b).map_err(ExampleError::from)
+            }
+            Operand::Out(n) => {
+                let a = self.memory.alloc_zeroed(*n)?;
+                outs.push(OutBufferSpec {
+                    arg: arg_idx,
+                    tag: None,
+                    addr: a,
+                    len: *n,
+                });
+                Ok(a)
+            }
+            Operand::TaggedOut(tag, n) => {
+                let a = self.memory.alloc_zeroed(*n)?;
+                outs.push(OutBufferSpec {
+                    arg: arg_idx,
+                    tag: Some(*tag),
+                    addr: a,
+                    len: *n,
+                });
+                Ok(a)
+            }
+            Operand::InOut(b) => {
+                let a = self.memory.put(b)?;
+                outs.push(OutBufferSpec {
+                    arg: arg_idx,
+                    tag: None,
+                    addr: a,
+                    len: b.len(),
+                });
+                Ok(a)
+            }
+            Operand::TaggedInOut(tag, b) => {
+                let a = self.memory.put(b)?;
+                outs.push(OutBufferSpec {
+                    arg: arg_idx,
+                    tag: Some(*tag),
+                    addr: a,
+                    len: b.len(),
+                });
+                Ok(a)
+            }
+            Operand::Layout(layout) => self.resolve_layout(arg_idx, layout, outs),
         }
-        Ok((args, outs))
+    }
+
+    fn resolve_layout(
+        &mut self,
+        arg_idx: usize,
+        layout: &Layout,
+        outs: &mut Vec<OutBufferSpec>,
+    ) -> Result<u64, ExampleError> {
+        use crate::operand::RelocWidth;
+        let mut buffer = layout.bytes.clone();
+        for reloc in &layout.relocations {
+            let val = self.resolve_operand(arg_idx, &reloc.operand, outs)?;
+            let width_bytes = reloc.width.bytes();
+            let end = reloc
+                .offset
+                .checked_add(width_bytes)
+                .ok_or_else(|| ExampleError::Script("relocation offset overflow".to_owned()))?;
+            if end > buffer.len() {
+                return Err(ExampleError::Script(format!(
+                    "relocation at offset {} (width {}) exceeds layout size {}",
+                    reloc.offset,
+                    width_bytes,
+                    buffer.len()
+                )));
+            }
+            match reloc.width {
+                RelocWidth::U8 => {
+                    let u8_val = if val <= u8::MAX as u64 {
+                        val as u8
+                    } else if (val as i64) >= i8::MIN as i64 && (val as i64) <= i8::MAX as i64 {
+                        (val as i64) as u8
+                    } else {
+                        return Err(ExampleError::Script(format!(
+                            "relocation value {val} does not fit in width U8"
+                        )));
+                    };
+                    buffer[reloc.offset] = u8_val;
+                }
+                RelocWidth::U16 => {
+                    let u16_val = if val <= u16::MAX as u64 {
+                        val as u16
+                    } else if (val as i64) >= i16::MIN as i64 && (val as i64) <= i16::MAX as i64 {
+                        (val as i64) as u16
+                    } else {
+                        return Err(ExampleError::Script(format!(
+                            "relocation value {val} does not fit in width U16"
+                        )));
+                    };
+                    buffer[reloc.offset..end].copy_from_slice(&u16_val.to_le_bytes());
+                }
+                RelocWidth::I16 => {
+                    let i16_val = if ((val as i64) >= i16::MIN as i64
+                        && (val as i64) <= i16::MAX as i64)
+                        || val <= u16::MAX as u64
+                    {
+                        val as i16
+                    } else {
+                        return Err(ExampleError::Script(format!(
+                            "relocation value {val} does not fit in width I16"
+                        )));
+                    };
+                    buffer[reloc.offset..end].copy_from_slice(&i16_val.to_le_bytes());
+                }
+                RelocWidth::U32 => {
+                    let u32_val = if val <= u32::MAX as u64 {
+                        val as u32
+                    } else if (val as i64) >= i32::MIN as i64 && (val as i64) <= i32::MAX as i64 {
+                        (val as i64) as u32
+                    } else {
+                        return Err(ExampleError::Script(format!(
+                            "relocation value {val} does not fit in width U32"
+                        )));
+                    };
+                    buffer[reloc.offset..end].copy_from_slice(&u32_val.to_le_bytes());
+                }
+                RelocWidth::I32 => {
+                    let i32_val = if ((val as i64) >= i32::MIN as i64
+                        && (val as i64) <= i32::MAX as i64)
+                        || val <= u32::MAX as u64
+                    {
+                        val as i32
+                    } else {
+                        return Err(ExampleError::Script(format!(
+                            "relocation value {val} does not fit in width I32"
+                        )));
+                    };
+                    buffer[reloc.offset..end].copy_from_slice(&i32_val.to_le_bytes());
+                }
+                RelocWidth::U64 | RelocWidth::I64 => {
+                    buffer[reloc.offset..end].copy_from_slice(&val.to_le_bytes());
+                }
+            }
+        }
+        let addr = self.memory.put(&buffer)?;
+        if layout.capture {
+            outs.push(OutBufferSpec {
+                arg: arg_idx,
+                tag: layout.tag,
+                addr,
+                len: buffer.len(),
+            });
+        }
+        Ok(addr)
     }
 
     fn save_slot(&mut self, slot: usize, value: i64) {
@@ -474,12 +655,13 @@ impl Task {
     ) -> Result<(), ExampleError> {
         let pid = self.process.pid();
         let mut captured_outputs = Vec::new();
-        for (arg_idx, addr, len) in &outs {
-            let bytes = self.memory.read(*addr, *len)?;
+        for out in &outs {
+            let bytes = self.memory.read(out.addr, out.len)?;
             captured_outputs.push(Output {
                 pid,
                 label: syscall.label,
-                arg: *arg_idx,
+                arg: out.arg,
+                tag: out.tag,
                 bytes,
             });
         }
@@ -564,23 +746,71 @@ impl Task {
                     }
                 },
                 Save::OutI32 { arg, index, slot } => {
-                    let out = outs.iter().find(|(a, _, _)| a == arg).ok_or_else(|| {
-                        ExampleError::Script(format!("no out buffer for arg {arg}"))
-                    })?;
+                    let out = outs
+                        .iter()
+                        .find(|o| o.arg == *arg && o.tag.is_none())
+                        .or_else(|| outs.iter().find(|o| o.arg == *arg))
+                        .ok_or_else(|| {
+                            ExampleError::Script(format!("no out buffer for arg {arg}"))
+                        })?;
                     let byte_offset = index
                         .checked_mul(4)
                         .ok_or_else(|| ExampleError::Script("out_i32 index overflow".to_owned()))?;
                     let end_offset = byte_offset
                         .checked_add(4)
                         .ok_or_else(|| ExampleError::Script("out_i32 index overflow".to_owned()))?;
-                    if end_offset > out.2 {
+                    if end_offset > out.len {
                         return Err(ExampleError::Script(format!(
                             "out_i32 index {index} (byte range {byte_offset}..{end_offset}) exceeds out buffer len {}",
-                            out.2
+                            out.len
                         )));
                     }
-                    let offset = out.1 + byte_offset as u64;
+                    let offset = out.addr + byte_offset as u64;
                     let bytes = self.memory.read(offset, 4)?;
+                    let word = <[u8; 4]>::try_from(bytes.as_slice())
+                        .map_err(|_| ExampleError::Script("invalid i32 slice".to_owned()))?;
+                    let val = i32::from_le_bytes(word);
+                    self.save_slot(*slot, val as i64);
+                }
+                Save::OutI32At { arg, offset, slot } => {
+                    let out = outs
+                        .iter()
+                        .find(|o| o.arg == *arg && o.tag.is_none())
+                        .or_else(|| outs.iter().find(|o| o.arg == *arg))
+                        .ok_or_else(|| {
+                            ExampleError::Script(format!("no out buffer for arg {arg}"))
+                        })?;
+                    let end_offset = offset.checked_add(4).ok_or_else(|| {
+                        ExampleError::Script("out_i32_at offset overflow".to_owned())
+                    })?;
+                    if end_offset > out.len {
+                        return Err(ExampleError::Script(format!(
+                            "out_i32_at offset {offset} (byte range {offset}..{end_offset}) exceeds out buffer len {}",
+                            out.len
+                        )));
+                    }
+                    let addr = out.addr + *offset as u64;
+                    let bytes = self.memory.read(addr, 4)?;
+                    let word = <[u8; 4]>::try_from(bytes.as_slice())
+                        .map_err(|_| ExampleError::Script("invalid i32 slice".to_owned()))?;
+                    let val = i32::from_le_bytes(word);
+                    self.save_slot(*slot, val as i64);
+                }
+                Save::TaggedOutI32 { tag, offset, slot } => {
+                    let out = outs.iter().find(|o| o.tag == Some(*tag)).ok_or_else(|| {
+                        ExampleError::Script(format!("no out buffer with tag {tag}"))
+                    })?;
+                    let end_offset = offset.checked_add(4).ok_or_else(|| {
+                        ExampleError::Script("tagged_out_i32 offset overflow".to_owned())
+                    })?;
+                    if end_offset > out.len {
+                        return Err(ExampleError::Script(format!(
+                            "tagged_out_i32 offset {offset} (byte range {offset}..{end_offset}) exceeds out buffer len {}",
+                            out.len
+                        )));
+                    }
+                    let addr = out.addr + *offset as u64;
+                    let bytes = self.memory.read(addr, 4)?;
                     let word = <[u8; 4]>::try_from(bytes.as_slice())
                         .map_err(|_| ExampleError::Script("invalid i32 slice".to_owned()))?;
                     let val = i32::from_le_bytes(word);

@@ -44,7 +44,10 @@ pub mod scripted;
 pub mod sys;
 
 pub use memory::{GUEST_BASE, GUEST_LEN, TaskMemory};
-pub use operand::{Expect, Operand, Save, Step, Syscall, await_parked, in_out, last_child, slot};
+pub use operand::{
+    Expect, Layout, Operand, RelocWidth, Relocation, Save, Step, Syscall, await_parked, in_out,
+    last_child, negated, slot, tagged_in_out, tagged_out,
+};
 pub use process::{
     AddressSpace, AddressSpaceError, AsidAllocator, ExampleInstallPermit, ExampleMmBackend,
     ExampleProcess, ExampleStage1Projection,
