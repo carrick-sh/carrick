@@ -708,7 +708,7 @@
     {
       "kind": "env_var_os",
       "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
-      "symbol": "ipc_set_tests::proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock::CARRICK_SYSVIPC_TEST_CHILD",
+      "symbol": "ipc_set_tests::serial_host::proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock::CARRICK_SYSVIPC_TEST_CHILD",
       "fingerprint": "e28376f20995e878ba99603697a82582e826926b3fec69ce4d2cf26aaeb05157",
       "classification": "test_only",
       "rationale": "Test-only subprocess sentinel isolates the proc_sysvipc deadlock regression test and is absent from production builds."
@@ -716,7 +716,7 @@
     {
       "kind": "env_var_os",
       "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
-      "symbol": "ipc_set_tests::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting::CARRICK_SAME_SHMID_TEST_CHILD",
+      "symbol": "ipc_set_tests::serial_host::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting::CARRICK_SAME_SHMID_TEST_CHILD",
       "fingerprint": "5ce33d23c6269f3e9d7b296cc5ad1d97c03659130da4ada9048d434d10412736",
       "classification": "test_only",
       "rationale": "Test-only subprocess sentinel isolates the same-shmid remapped shmat deadlock watchdog regression test and is absent from production builds."
@@ -724,7 +724,7 @@
     {
       "kind": "env_var_os",
       "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
-      "symbol": "ipc_set_tests::watchdog_kills_and_reaps_on_deadlock_timeout::CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK",
+      "symbol": "ipc_set_tests::serial_host::watchdog_kills_and_reaps_on_deadlock_timeout::CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK",
       "fingerprint": "e050f8de716dc76a296742adc56a973f60c4915aefd51b0a44653218cf8da7d2",
       "classification": "test_only",
       "rationale": "Test-only subprocess sentinel for negative watchdog termination and child reaping verification."
@@ -1012,7 +1012,7 @@
     {
       "kind": "static",
       "file": "crates/carrick-vfs/src/fs_backend/tests.rs",
-      "symbol": "FS_RLIMIT_TEST_LOCK",
+      "symbol": "serial_host::FS_RLIMIT_TEST_LOCK",
       "fingerprint": "ff23d140e02e55b39ed7676ed239c438d8d20f84c00c2783b51158d506282509",
       "classification": "test_only",
       "rationale": "The cfg(test) mutex serializes host descriptor exhaustion tests that manipulate process rlimits."
@@ -1132,7 +1132,7 @@
     {
       "kind": "env_var",
       "file": "crates/carrick-kernel/src/kernel/container.rs",
-      "symbol": "tests::with_env::key",
+      "symbol": "tests::serial_host::with_env::key",
       "fingerprint": "d0eab53b3bdca61a0d38973031cf88d0ea84564679fdf423da6ef171543335b5",
       "classification": "test_only",
       "rationale": "Test-only fixture or lock tests::with_env::key in crates/carrick-runtime/src/kernel/container.rs scoped strictly to test harness execution."
@@ -1148,7 +1148,7 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/kernel/container.rs",
-      "symbol": "tests::ENV_LOCK",
+      "symbol": "tests::serial_host::ENV_LOCK",
       "fingerprint": "d3e8fa8c63e53fe4921dbba7c17f1ebe992389c0367e7e1c2a7aad79f0477143",
       "classification": "test_only",
       "rationale": "Test-only fixture or lock tests::ENV_LOCK in crates/carrick-runtime/src/kernel/container.rs scoped strictly to test harness execution."
@@ -1247,7 +1247,7 @@
       "symbol": "SYSTEM_CHARGE_WINDOW",
       "fingerprint": "761f744a623027ad2ff9fefe442521860f8fcfae43bd03d5dd2c8dbd9b920fee",
       "classification": "carrier_infra",
-      "rationale": "Host thread-local cell SYSTEM_CHARGE_WINDOW in crates/carrick-runtime/src/kernel/objects.rs holding this HOST thread's open system-CPU charge window for the logical guest thread its executor is currently running. It is per-host-thread by construction — the CLOCK_THREAD_CPUTIME_ID reading it brackets describes this host thread and no other — and it selects no container state: the logical thread it charges is named by a WEAK reference that every use upgrades, so it neither keeps a retired Thread alive nor can be aliased by a recycled allocation, and the executor closes it at every boundary audit."
+      "rationale": "Host thread-local cell SYSTEM_CHARGE_WINDOW in crates/carrick-runtime/src/kernel/objects.rs holding this HOST thread's open system-CPU charge window for the logical guest thread its executor is currently running. It is per-host-thread by construction \u2014 the CLOCK_THREAD_CPUTIME_ID reading it brackets describes this host thread and no other \u2014 and it selects no container state: the logical thread it charges is named by a WEAK reference that every use upgrades, so it neither keeps a retired Thread alive nor can be aliased by a recycled allocation, and the executor closes it at every boundary audit."
     },
     {
       "kind": "env_var_os",
@@ -1452,7 +1452,7 @@
     {
       "kind": "env_var_os",
       "file": "crates/carrick-kernel/src/kernel/continuation/tests.rs",
-      "symbol": "event_future_cancelled_observation_drains_inflight_operation_safely::CHILD_MARKER",
+      "symbol": "serial_host::event_future_cancelled_observation_drains_inflight_operation_safely::CHILD_MARKER",
       "fingerprint": "f2196b97922c18c843b5e8b263cc01e6548e67f5c5949e88399767be84c1d622",
       "classification": "test_only",
       "rationale": "Read only by the cfg(test) bounded self-spawn regression to select its exact owned child body; the parent kills and reaps that child on a failed deadline."
@@ -1460,7 +1460,7 @@
     {
       "kind": "env_var_os",
       "file": "crates/carrick-kernel/src/kernel/continuation/tests.rs",
-      "symbol": "lock_ordering_opposing_locks_rendezvous_completes_without_deadlock::CHILD_MARKER",
+      "symbol": "serial_host::lock_ordering_opposing_locks_rendezvous_completes_without_deadlock::CHILD_MARKER",
       "fingerprint": "f2196b97922c18c843b5e8b263cc01e6548e67f5c5949e88399767be84c1d622",
       "classification": "test_only",
       "rationale": "Read only by the cfg(test) bounded self-spawn regression to select its exact owned child body; the parent kills and reaps that child on a failed deadline."

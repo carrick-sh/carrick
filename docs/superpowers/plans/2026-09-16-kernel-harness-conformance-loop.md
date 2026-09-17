@@ -923,3 +923,31 @@ test-kernel *ARGS:
   `/tmp/kernel-harness-threads.md`. It intentionally lacks IPC candidate changes;
   director must reconcile shared harness files and preserve checked layouts,
   authority bootstrap, and exact thread context semantics during integration.
+
+### Defect: SCM_CREDENTIALS reports socket creator instead of message sender
+
+- Retained `unix::scm_credentials_carry_the_senders_pid_uid_gid` as a named
+  defect ignore. A fork child sends the message; received credentials report
+  pid 1 (socket creator), whereas the sender is pid 2. Authority: `unix(7)`
+  SCM_CREDENTIALS. Receipt: `/tmp/kernel-harness-ipc-defects.log`.
+- `dispatch/net/send_recv.rs` synthesizes the control message from `peer_ucred`,
+  whose lifecycle cache intentionally records creation-time peer credentials
+  for SO_PEERCRED. Changing that cache would break the separate SO_PEERCRED
+  contract. Per-message sender identity must cross the socket transport and
+  receive path; this exceeds a two-file dispatch fix. Do not replace Linux pid
+  with host pid or weaken the assertion.
+
+### Integrated host-gate checkpoint
+
+- At `1ec9f83aa`, `just test` passed: log
+  `/tmp/kernel-harness-integrated-just-test.log`, wall 174.65 s including
+  compilation while isolated workers were active. This is correctness evidence,
+  not the final warm lane comparison. Harness: 1 lib + 29 driver + 34 semantics
+  tests passed, four semantics ignores (two epoll cases under active review).
+- Reconciled exactly eight global-state ledger symbols through the new
+  `serial_host` namespaces, retaining their classifications and rationales.
+  `check-runtime-global-state.py --check` passes. Remaining line-pinned
+  inventories wait for the final epoll/thread source tree.
+- Phase A/B and partition code are integrated and independently checked.
+  Epoll review, thread/futex integration, final plan/doc reconciliation,
+  warm timing, product closure, and final lint gates remain open.
