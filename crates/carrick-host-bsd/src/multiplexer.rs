@@ -145,7 +145,6 @@ impl EventMultiplexer for KqueueMultiplexer {
 
             let mut readiness = Readiness::empty();
             let mut is_eof = false;
-            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
             let mut vnode = None;
 
             match filter {

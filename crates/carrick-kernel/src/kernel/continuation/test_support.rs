@@ -40,7 +40,7 @@ use crate::kernel::{Kernel, KernelContext, RootBootstrap};
 /// the thread and let the waker unpark it. Parking here is a test-only host
 /// wait and is outside the production source the host-blocking-authority
 /// gate inspects.
-pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
     struct ThreadWaker(std::thread::Thread);
     impl Wake for ThreadWaker {
         fn wake(self: Arc<Self>) {
@@ -79,11 +79,11 @@ pub fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
     Kernel::bootstrap_root(input).expect("kernel")
 }
 
-pub fn task_state(context: &KernelContext, marker: u64) -> MigratableTaskState {
+pub(crate) fn task_state(context: &KernelContext, marker: u64) -> MigratableTaskState {
     task_state_with_asid(context, marker, context.shared().mm().id().raw())
 }
 
-pub fn task_state_with_asid(
+pub(crate) fn task_state_with_asid(
     context: &KernelContext,
     marker: u64,
     asid_generation: u64,
@@ -137,7 +137,7 @@ pub fn publish(context: &KernelContext, marker: u64) -> ExecutionGeneration {
         .expect("publish task state")
 }
 
-pub fn request(number: u64) -> SyscallRequest {
+pub(crate) fn request(number: u64) -> SyscallRequest {
     SyscallRequest::new(
         number,
         SyscallArgs([0x1100, 0x2200, 0x3300, 0x4400, 0x5500, 0x6600]),
