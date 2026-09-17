@@ -59,6 +59,23 @@ jobs:
       - name: Support matrix drift check
         run: just check-matrix
 
+      # These two sit between `check-matrix` and `check`, the same place they
+      # occupy in the justfile's `ci` recipe. The layering gate walks the
+      # dependency closures with `cargo metadata | jq` — the hosted macos-14
+      # image ships jq (1.8.2 on image 20260831), so no install step is
+      # needed; if a future image drops it the gate fails loudly on the
+      # missing binary rather than passing vacuously. The portable check
+      # cross-compiles carrick-kernel for aarch64-unknown-linux-gnu, a target
+      # rust-toolchain.toml already declares on the pinned 1.96.0 toolchain,
+      # so rustup installs it with the toolchain and this needs no `targets:`
+      # of its own (adding one to dtolnay/rust-toolchain@stable would land it
+      # on the sibling `stable` toolchain the toolchain file then overrides).
+      - name: Layering gate (crate closures + product feature closure)
+        run: just check-layering
+
+      - name: Portable kernel compile (aarch64-linux, no HVF)
+        run: just check-kernel-portable
+
       - name: Build
         run: just check --workspace
 
