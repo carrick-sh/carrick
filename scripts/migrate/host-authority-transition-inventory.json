@@ -539,6 +539,33 @@
   },
   {
     "catalog_id": "HA-CATALOG-PROCESS-GETPID",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "the carrier identity the reaper checks before it may end this process"
+    },
+    "expansion": null,
+    "operation": "libc::getpid",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:447, `libc::getpid` reads only this carrier own identity, which the reaper must match before acting; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000665",
+    "source": {
+      "byte_end": 16531,
+      "byte_start": 16519,
+      "column": 33,
+      "column_end": 45,
+      "column_start": 33,
+      "file": "crates/carrick-kernel/src/wedge_capture.rs",
+      "line": 447,
+      "line_end": 447,
+      "line_start": 447
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-PROCESS-GETPID",
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
@@ -1033,33 +1060,6 @@
       "line": 133,
       "line_end": 133,
       "line_start": 133
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-PROCESS-GETPID",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
-      "resource": "the carrier identity the reaper checks before it may end this process"
-    },
-    "expansion": null,
-    "operation": "libc::getpid",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:447, `libc::getpid` reads only this carrier own identity, which the reaper must match before acting; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
-    "review_id": "HA-000665",
-    "source": {
-      "byte_end": 16531,
-      "byte_start": 16519,
-      "column": 33,
-      "column_end": 45,
-      "column_start": 33,
-      "file": "crates/carrick-kernel/src/wedge_capture.rs",
-      "line": 447,
-      "line_end": 447,
-      "line_start": 447
     }
   },
   {
@@ -1815,6 +1815,33 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "the wedge-capture backtrace artifact the debugger stdout is captured into"
+    },
+    "expansion": null,
+    "operation": "std::fs::File::create",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:388, `std::fs::File::create` creates only the backtrace artifact inside this carrier own capture directory; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000663",
+    "source": {
+      "byte_end": 14163,
+      "byte_start": 14142,
+      "column": 45,
+      "column_end": 66,
+      "column_start": 45,
+      "file": "crates/carrick-kernel/src/wedge_capture.rs",
+      "line": 388,
+      "line_end": 388,
+      "line_start": 388
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-FILE-CREATE",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "scratch filesystem case-sensitivity probe object used by `probe_case_sensitive`"
     },
     "expansion": null,
@@ -1862,33 +1889,6 @@
       "line": 248,
       "line_end": 248,
       "line_start": 248
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-FS-FILE-CREATE",
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
-      "resource": "the wedge-capture backtrace artifact the debugger stdout is captured into"
-    },
-    "expansion": null,
-    "operation": "std::fs::File::create",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:388, `std::fs::File::create` creates only the backtrace artifact inside this carrier own capture directory; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
-    "review_id": "HA-000663",
-    "source": {
-      "byte_end": 14163,
-      "byte_start": 14142,
-      "column": 45,
-      "column_end": 66,
-      "column_start": 45,
-      "file": "crates/carrick-kernel/src/wedge_capture.rs",
-      "line": 388,
-      "line_end": 388,
-      "line_start": 388
     }
   },
   {
@@ -2537,6 +2537,33 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "the wedge-capture manifest backing opened by `write_manifest`"
+    },
+    "expansion": null,
+    "operation": "std::fs::OpenOptions::new",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:339, `std::fs::OpenOptions::new` opens only the wedge-capture manifest inside this carrier own capture directory; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000661",
+    "source": {
+      "byte_end": 12507,
+      "byte_start": 12482,
+      "column": 20,
+      "column_end": 45,
+      "column_start": 20,
+      "file": "crates/carrick-kernel/src/wedge_capture.rs",
+      "line": 339,
+      "line_end": 339,
+      "line_start": 339
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-NEW",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "active capability-rooted hostfs backing tree used by `discover_orphans_after_root_lock`"
     },
     "expansion": null,
@@ -2720,33 +2747,6 @@
       "line": 142,
       "line_end": 142,
       "line_start": 142
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-NEW",
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
-      "resource": "the wedge-capture manifest backing opened by `write_manifest`"
-    },
-    "expansion": null,
-    "operation": "std::fs::OpenOptions::new",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:339, `std::fs::OpenOptions::new` opens only the wedge-capture manifest inside this carrier own capture directory; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
-    "review_id": "HA-000661",
-    "source": {
-      "byte_end": 12507,
-      "byte_start": 12482,
-      "column": 20,
-      "column_end": 45,
-      "column_start": 20,
-      "file": "crates/carrick-kernel/src/wedge_capture.rs",
-      "line": 339,
-      "line_end": 339,
-      "line_start": 339
     }
   },
   {
@@ -3099,6 +3099,33 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "the wedge-capture manifest file this carrier writes its own provenance into"
+    },
+    "expansion": null,
+    "operation": "std::fs::OpenOptions::open",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:344, `std::fs::OpenOptions::open` writes only this carrier own capture provenance into its capture directory; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000662",
+    "source": {
+      "byte_end": 12611,
+      "byte_start": 12607,
+      "column": 10,
+      "column_end": 14,
+      "column_start": 10,
+      "file": "crates/carrick-kernel/src/wedge_capture.rs",
+      "line": 344,
+      "line_end": 344,
+      "line_start": 344
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-OPEN",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "active capability-rooted hostfs backing tree used by `discover_orphans_after_root_lock`"
     },
     "expansion": null,
@@ -3282,33 +3309,6 @@
       "line": 147,
       "line_end": 147,
       "line_start": 147
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-OPEN",
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
-      "resource": "the wedge-capture manifest file this carrier writes its own provenance into"
-    },
-    "expansion": null,
-    "operation": "std::fs::OpenOptions::open",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:344, `std::fs::OpenOptions::open` writes only this carrier own capture provenance into its capture directory; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
-    "review_id": "HA-000662",
-    "source": {
-      "byte_end": 12611,
-      "byte_start": 12607,
-      "column": 10,
-      "column_end": 14,
-      "column_start": 10,
-      "file": "crates/carrick-kernel/src/wedge_capture.rs",
-      "line": 344,
-      "line_end": 344,
-      "line_start": 344
     }
   },
   {
@@ -4136,6 +4136,33 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "the wedge-capture root this carrier creates before taking ownership of it"
+    },
+    "expansion": null,
+    "operation": "std::fs::create_dir_all",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:315, `std::fs::create_dir_all` creates only the wedge-capture root this carrier then ownership-checks; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000660",
+    "source": {
+      "byte_end": 11680,
+      "byte_start": 11657,
+      "column": 9,
+      "column_end": 32,
+      "column_start": 9,
+      "file": "crates/carrick-kernel/src/wedge_capture.rs",
+      "line": 315,
+      "line_end": 315,
+      "line_start": 315
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-CREATE-DIR-ALL",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "configured debug-state artifact used by `write_to`"
     },
     "expansion": null,
@@ -4318,33 +4345,6 @@
       "line": 234,
       "line_end": 234,
       "line_start": 234
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-FS-CREATE-DIR-ALL",
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
-      "resource": "the wedge-capture root this carrier creates before taking ownership of it"
-    },
-    "expansion": null,
-    "operation": "std::fs::create_dir_all",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:315, `std::fs::create_dir_all` creates only the wedge-capture root this carrier then ownership-checks; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
-    "review_id": "HA-000660",
-    "source": {
-      "byte_end": 11680,
-      "byte_start": 11657,
-      "column": 9,
-      "column_end": 32,
-      "column_start": 9,
-      "file": "crates/carrick-kernel/src/wedge_capture.rs",
-      "line": 315,
-      "line_end": 315,
-      "line_start": 315
     }
   },
   {
@@ -9229,6 +9229,33 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "the wedge-capture artifact this carrier just wrote, sized by `require_evidence`"
+    },
+    "expansion": null,
+    "operation": "std::fs::symlink_metadata",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:259, `std::fs::symlink_metadata` sizes only the wedge-capture artifact this carrier just wrote under its own capture directory; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000658",
+    "source": {
+      "byte_end": 9867,
+      "byte_start": 9842,
+      "column": 17,
+      "column_end": 42,
+      "column_start": 17,
+      "file": "crates/carrick-kernel/src/wedge_capture.rs",
+      "line": 259,
+      "line_end": 259,
+      "line_start": 259
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-SYMLINK-METADATA",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2152"
     },
     "expansion": null,
@@ -9438,33 +9465,6 @@
       "line": 758,
       "line_end": 758,
       "line_start": 758
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-FS-SYMLINK-METADATA",
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
-      "resource": "the wedge-capture artifact this carrier just wrote, sized by `require_evidence`"
-    },
-    "expansion": null,
-    "operation": "std::fs::symlink_metadata",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:259, `std::fs::symlink_metadata` sizes only the wedge-capture artifact this carrier just wrote under its own capture directory; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
-    "review_id": "HA-000658",
-    "source": {
-      "byte_end": 9867,
-      "byte_start": 9842,
-      "column": 17,
-      "column_end": 42,
-      "column_start": 17,
-      "file": "crates/carrick-kernel/src/wedge_capture.rs",
-      "line": 259,
-      "line_end": 259,
-      "line_start": 259
     }
   },
   {
@@ -14250,6 +14250,33 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
+      "resource": "the wedge reaper thread that ends this carrier after its capture"
+    },
+    "expansion": null,
+    "operation": "std::thread::Builder::new",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:455, `std::thread::Builder::new` creates only the reaper thread that ends this carrier after its own capture; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000666",
+    "source": {
+      "byte_end": 16805,
+      "byte_start": 16780,
+      "column": 9,
+      "column_end": 34,
+      "column_start": 9,
+      "file": "crates/carrick-kernel/src/wedge_capture.rs",
+      "line": 455,
+      "line_end": 455,
+      "line_start": 455
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
       "resource": "failure-only process-retirement coordinator owned by the current carrier"
     },
     "expansion": null,
@@ -14408,33 +14435,6 @@
       "line": 424,
       "line_end": 424,
       "line_start": 424
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
-      "resource": "the wedge reaper thread that ends this carrier after its capture"
-    },
-    "expansion": null,
-    "operation": "std::thread::Builder::new",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:455, `std::thread::Builder::new` creates only the reaper thread that ends this carrier after its own capture; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
-    "review_id": "HA-000666",
-    "source": {
-      "byte_end": 16805,
-      "byte_start": 16780,
-      "column": 9,
-      "column_end": 34,
-      "column_start": 9,
-      "file": "crates/carrick-kernel/src/wedge_capture.rs",
-      "line": 455,
-      "line_end": 455,
-      "line_start": 455
     }
   },
   {
@@ -14971,6 +14971,60 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
+      "resource": "the capture step poll cadence bounding one debugger invocation in `LldbCaptureRunner`"
+    },
+    "expansion": null,
+    "operation": "std::thread::sleep",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:427, `std::thread::sleep` paces only the capture step poll that bounds one debugger invocation; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000664",
+    "source": {
+      "byte_end": 15641,
+      "byte_start": 15623,
+      "column": 13,
+      "column_end": 31,
+      "column_start": 13,
+      "file": "crates/carrick-kernel/src/wedge_capture.rs",
+      "line": 427,
+      "line_end": 427,
+      "line_start": 427
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-SLEEP",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "the reaper grace that lets the named wedge failure reach the log first"
+    },
+    "expansion": null,
+    "operation": "std::thread::sleep",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:458, `std::thread::sleep` waits only the reaper grace that lets the named failure reach the log; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
+    "review_id": "HA-000667",
+    "source": {
+      "byte_end": 16924,
+      "byte_start": 16906,
+      "column": 17,
+      "column_end": 35,
+      "column_start": 17,
+      "file": "crates/carrick-kernel/src/wedge_capture.rs",
+      "line": 458,
+      "line_end": 458,
+      "line_start": 458
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-SLEEP",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
       "resource": "current carrier vCPU worker used by `capture_core_for_publication`"
     },
     "expansion": null,
@@ -15215,60 +15269,6 @@
       "line": 708,
       "line_end": 708,
       "line_start": 708
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-THREAD-SLEEP",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
-      "resource": "the capture step poll cadence bounding one debugger invocation in `LldbCaptureRunner`"
-    },
-    "expansion": null,
-    "operation": "std::thread::sleep",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:427, `std::thread::sleep` paces only the capture step poll that bounds one debugger invocation; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
-    "review_id": "HA-000664",
-    "source": {
-      "byte_end": 15641,
-      "byte_start": 15623,
-      "column": 13,
-      "column_end": 31,
-      "column_start": 13,
-      "file": "crates/carrick-kernel/src/wedge_capture.rs",
-      "line": 427,
-      "line_end": 427,
-      "line_start": 427
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-THREAD-SLEEP",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
-      "resource": "the reaper grace that lets the named wedge failure reach the log first"
-    },
-    "expansion": null,
-    "operation": "std::thread::sleep",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/wedge_capture.rs:458, `std::thread::sleep` waits only the reaper grace that lets the named failure reach the log; no guest identity selects its host target, and the directory is owner- and permission-checked before anything is written into it.",
-    "review_id": "HA-000667",
-    "source": {
-      "byte_end": 16924,
-      "byte_start": 16906,
-      "column": 17,
-      "column_end": 35,
-      "column_start": 17,
-      "file": "crates/carrick-kernel/src/wedge_capture.rs",
-      "line": 458,
-      "line_end": 458,
-      "line_start": 458
     }
   },
   {
