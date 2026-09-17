@@ -22,6 +22,9 @@ variant.
   values saved earlier in the task and are inherited by fork children.
 - `Bytes` and `CStr` allocate input memory; `Out` allocates a zeroed output;
   `InOut` initializes memory and captures its final contents.
+- `Layout` relocates typed scalars and nested buffers into guest structures;
+  `TaggedOut` and tagged layouts capture nested outputs such as `recvmsg`
+  control messages. Offsets and integer ranges are checked before dispatch.
 - `Save::Ret` saves a successful return; `Save::OutI32` saves an element from
   an output buffer, such as a descriptor returned by `pipe2`.
 - `Expect::Ret`, `Errno`, and `Death` assert the syscall's outcome. `Any`
