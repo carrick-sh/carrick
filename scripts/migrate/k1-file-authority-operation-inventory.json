@@ -9297,7 +9297,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 3723,
+      "line": 3725,
       "categories": [
         "description_guard"
       ],
@@ -9306,7 +9306,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 3732,
+      "line": 3734,
       "categories": [
         "description_guard"
       ],
@@ -9315,7 +9315,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 3822,
+      "line": 3824,
       "categories": [
         "description_guard"
       ],
@@ -9324,7 +9324,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 3927,
+      "line": 3929,
       "categories": [
         "description_guard"
       ],
@@ -9450,7 +9450,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
-      "line": 885,
+      "line": 886,
       "categories": [
         "mapping"
       ],
@@ -9459,7 +9459,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
-      "line": 912,
+      "line": 913,
       "categories": [
         "description_guard"
       ],
@@ -9468,7 +9468,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
-      "line": 1104,
+      "line": 1105,
       "categories": [
         "description_guard"
       ],
@@ -9477,7 +9477,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
-      "line": 1297,
+      "line": 1298,
       "categories": [
         "description_guard"
       ],
@@ -9486,7 +9486,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
-      "line": 1410,
+      "line": 1411,
       "categories": [
         "stream"
       ],
@@ -9495,7 +9495,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
-      "line": 1544,
+      "line": 1545,
       "categories": [
         "description_guard"
       ],
@@ -9504,7 +9504,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
-      "line": 1791,
+      "line": 1794,
       "categories": [
         "description_guard"
       ],
