@@ -51,7 +51,7 @@ impl ChildExit {
     }
 
     /// Record one stopped child transition, deriving the encoded Linux stop
-    /// status (`(signal << 8) | 0x7f`) from the underlying [`carrick_abi::LinuxSignal`]
+    /// status (`(signal << 8) | 0x7f`) from the underlying [`crate::kernel::LinuxSignal`]
     /// and preserving the exact [`StopKind`].
     pub const fn stopped(
         pid: crate::kernel::TaskId,

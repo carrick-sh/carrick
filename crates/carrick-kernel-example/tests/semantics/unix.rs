@@ -214,11 +214,11 @@ fn scm_credentials_tracks_multiple_forked_senders_and_preserves_so_peercred() {
         Step::Sys(sys::close(slot(1)).ret(0)),
         // Verify SO_PEERCRED before any recvmsg returns creator PID 1
         Step::Sys(sys::getsockopt_so_peercred(slot(0)).ret(0)),
-        // Parent receives first message (from child 1, PID 2)
+        // Parent receives the first message (either child may send first)
         Step::Sys(sys::recvmsg_stream(slot(0), 1, 32, 0).ret(1)),
         // Verify SO_PEERCRED between recvmsgs still returns creator PID 1
         Step::Sys(sys::getsockopt_so_peercred(slot(0)).ret(0)),
-        // Parent receives second message (from child 2, PID 3)
+        // Parent receives the second message (from the other child)
         Step::Sys(sys::recvmsg_stream(slot(0), 1, 32, 0).ret(1)),
         // Verify SO_PEERCRED after all recvmsgs still returns creator PID 1
         Step::Sys(sys::getsockopt_so_peercred(slot(0)).ret(0)),
