@@ -11149,8 +11149,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2038 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
     "review_id": "HA-000498",
     "source": {
-      "byte_end": 81784,
-      "byte_start": 81768,
+      "byte_end": 81795,
+      "byte_start": 81779,
       "column": 39,
       "column_end": 55,
       "column_start": 39,
@@ -11176,8 +11176,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2253 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
     "review_id": "HA-000499",
     "source": {
-      "byte_end": 90395,
-      "byte_start": 90379,
+      "byte_end": 90406,
+      "byte_start": 90390,
       "column": 47,
       "column_end": 63,
       "column_start": 47,
@@ -11416,18 +11416,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/signal.rs:1723 in `kill`, the host result from `std::process::id` determines the guest self-signal target decision used by `kill`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/signal.rs:1713 in `kill`, the host result from `std::process::id` determines the guest self-signal target decision used by `kill`.",
     "review_id": "HA-000509",
     "source": {
-      "byte_end": 72170,
-      "byte_start": 72154,
+      "byte_end": 71702,
+      "byte_start": 71686,
       "column": 51,
       "column_end": 67,
       "column_start": 51,
       "file": "crates/carrick-kernel/src/dispatch/signal.rs",
-      "line": 1723,
-      "line_end": 1723,
-      "line_start": 1723
+      "line": 1713,
+      "line_end": 1713,
+      "line_start": 1713
     }
   },
   {
@@ -11443,18 +11443,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/signal.rs:2530 in `sigqueueinfo_common`, the host result from `std::process::id` determines the guest signal sender and recipient identity used by `sigqueueinfo_common`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/signal.rs:2520 in `sigqueueinfo_common`, the host result from `std::process::id` determines the guest signal sender and recipient identity used by `sigqueueinfo_common`.",
     "review_id": "HA-000510",
     "source": {
-      "byte_end": 112354,
-      "byte_start": 112338,
+      "byte_end": 111886,
+      "byte_start": 111870,
       "column": 24,
       "column_end": 40,
       "column_start": 24,
       "file": "crates/carrick-kernel/src/dispatch/signal.rs",
-      "line": 2530,
-      "line_end": 2530,
-      "line_start": 2530
+      "line": 2520,
+      "line_end": 2520,
+      "line_start": 2520
     }
   },
   {
@@ -11470,18 +11470,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/signal.rs:3452 in `bootstrap_signal_send_as`, the host result from `std::process::id` determines the guest signal recipient identity used by `bootstrap_signal_send_as`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/signal.rs:3442 in `bootstrap_signal_send_as`, the host result from `std::process::id` determines the guest signal recipient identity used by `bootstrap_signal_send_as`.",
     "review_id": "HA-000512",
     "source": {
-      "byte_end": 144641,
-      "byte_start": 144625,
+      "byte_end": 144173,
+      "byte_start": 144157,
       "column": 20,
       "column_end": 36,
       "column_start": 20,
       "file": "crates/carrick-kernel/src/dispatch/signal.rs",
-      "line": 3452,
-      "line_end": 3452,
-      "line_start": 3452
+      "line": 3442,
+      "line_end": 3442,
+      "line_start": 3442
     }
   },
   {
