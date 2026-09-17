@@ -492,9 +492,6 @@ pub(crate) struct KernelState {
     /// Runtime-only task-generation to wake-endpoint directory shared by every
     /// Linux process multiplexed in one HVPatch host process.
     hvpatch_runtime: Option<Arc<HvpatchRuntimeDirectory>>,
-    /// Signal requested by this process's creating clone/fork operation.
-    /// Parent selection itself is resolved from the Kernel graph at exit.
-    child_exit_signal: Option<i32>,
     /// Terminal result published by whichever HVPatch thread owns process
     /// teardown. The main loop consumes it after sibling-driven exit_group.
     process_terminal: Mutex<Option<Result<RunResult, ()>>>,
@@ -515,7 +512,6 @@ impl KernelState {
         signal_arrival: Arc<dyn carrick_hal::SignalArrival>,
         hvpatch_process: Option<crate::hvpatch::ProcessContext>,
         inherited_hvpatch_runtime: Option<Arc<HvpatchRuntimeDirectory>>,
-        child_exit_signal: Option<i32>,
     ) -> Self {
         let process_fork_barrier = hvpatch_process.as_ref().map(|_| dispatcher.fork_quiesce());
         let crash_capture = hvpatch_process
@@ -536,7 +532,6 @@ impl KernelState {
             crash_capture,
             clone_admission: Arc::new(CloneAdmissionGate::default()),
             hvpatch_runtime,
-            child_exit_signal,
             process_terminal: Mutex::new(None),
             process_terminal_ready: Condvar::new(),
             process_physical_retirement: ProcessPhysicalRetirement::default(),
@@ -725,7 +720,7 @@ impl KernelState {
     fn notify_hvpatch_parent_exit(&self, parent: Option<carrick_kernel::kernel::TaskKey>) {
         match (parent, self.hvpatch_runtime.as_ref()) {
             (Some(parent), Some(directory)) => {
-                directory.notify_child_exit(parent, self.child_exit_signal);
+                directory.notify_child_exit(parent);
             }
             (Some(parent), None) => tracing::error!(
                 parent = ?parent,
@@ -3196,7 +3191,6 @@ pub(crate) mod tests {
                 Arc::new(EndpointTestSignalPump),
                 Arc::new(EndpointTestSignalArrival),
                 Some(process.clone()),
-                None,
                 None,
             ));
             let runtime = Arc::clone(kernel.hvpatch_runtime.as_ref().unwrap());

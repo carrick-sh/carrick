@@ -785,6 +785,32 @@ impl Kernel {
         // immediately would see TaskBusy in wait_child_matching and park in
         // BlockedContinuation having already consumed this exit's wake edge,
         // wedging forever.
+        if let Some(parent_key) = prepared.result_zombie.parent {
+            if let Some(parent_task) = self
+                .registry()
+                .state
+                .read()
+                .tasks
+                .get(&parent_key.id)
+                .filter(|record| record.task.key() == parent_key)
+                .map(|record| Arc::clone(&record.task))
+            {
+                let posted = match prepared.result_zombie.exit_signal {
+                    crate::kernel::ids::ChildExitSignal::Signal(signal) => {
+                        if child_exit_signal_needs_notification(&parent_task, signal) {
+                            let siginfo = exit_siginfo_for_zombie(&prepared.result_zombie);
+                            self.post_signal_to_task_key(parent_key, signal, siginfo)
+                        } else {
+                            false
+                        }
+                    }
+                    crate::kernel::ids::ChildExitSignal::None => false,
+                };
+                if !posted {
+                    parent_task.wake();
+                }
+            }
+        }
         notify_parent(prepared.result_zombie.parent);
         for tracee in released_tracees {
             tracee.wake();
@@ -882,14 +908,14 @@ impl Kernel {
                 Err(KernelOperationError::TaskBusy(_)) => {
                     self.wait_for_reservation_change(observed);
                 }
-                Err(KernelOperationError::UnknownTask(_)) => {
+                Err(KernelOperationError::UnknownTask(id)) => {
                     let state = self.registry().state.read();
-                    if let Some(zombie) = state
+                    if let Some(record) = state
                         .zombies
-                        .get(&task.id)
+                        .get(&id)
                         .filter(|record| record.zombie.key == task)
                     {
-                        return Ok(zombie.zombie.clone());
+                        return Ok(record.zombie.clone());
                     }
                     if state
                         .tasks
@@ -908,6 +934,47 @@ impl Kernel {
             }
         }
     }
+}
+
+fn child_exit_signal_needs_notification(
+    parent: &crate::kernel::objects::Task,
+    signal: crate::kernel::ids::LinuxSignal,
+) -> bool {
+    let signum = signal.raw();
+    if signum == 0 {
+        return false;
+    }
+    let action = parent.shared().sighand().action(signal);
+    let handler = action.sa_handler;
+    if handler == carrick_abi::LINUX_SIG_IGN {
+        return false;
+    }
+    if handler == carrick_abi::LINUX_SIG_DFL || handler == 0 {
+        let any_thread_blocks = parent
+            .threads()
+            .iter()
+            .any(|thread| thread.signal_state.lock().blocked().contains(signum));
+        return any_thread_blocks
+            || !crate::kernel::objects::signal::is_default_ignore_signal(signum);
+    }
+    true
+}
+
+fn exit_siginfo_for_zombie(zombie: &Zombie) -> Option<carrick_abi::LinuxSiginfo> {
+    let signal = match zombie.exit_signal {
+        crate::kernel::ids::ChildExitSignal::None => return None,
+        crate::kernel::ids::ChildExitSignal::Signal(signal) => signal,
+    };
+    let (si_code, si_status) =
+        crate::dispatch::proc::hvpatch_waitid_exit_fields(zombie.status.raw());
+    let internal_pid = i32::try_from(zombie.namespace_pid).unwrap_or(0);
+    Some(carrick_abi::LinuxSiginfo::child_exit(
+        signal.raw(),
+        internal_pid,
+        zombie.ruid.raw(),
+        si_code,
+        si_status,
+    ))
 }
 
 #[cfg(test)]
@@ -1619,5 +1686,254 @@ mod tests {
         ));
         kernel.sweep_retired_threads();
         assert!(!kernel.ids().is_reserved_number(grandchild_id.raw()));
+    }
+
+    #[test]
+    fn child_exit_posts_sigchld_with_siginfo_to_parent_when_blocked() {
+        let (kernel, root) = bootstrap(19_600);
+        root.signal_authority()
+            .set_blocked(carrick_abi::SigSet::EMPTY.with(carrick_abi::LINUX_SIGCHLD));
+
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let child = kernel
+            .fork_task(
+                &root,
+                plan,
+                ThreadId::synthetic_for_tests(19_601),
+                "child".to_string(),
+                None,
+            )
+            .expect("fork child");
+        let child_key = child.task().key();
+        let child_pid = child_key.id.raw();
+
+        let zombie = kernel
+            .exit_task_key_eventually(child_key, LinuxWaitStatus::from_wait_encoding(42 << 8))
+            .expect("exit child");
+        assert_eq!(zombie.parent, Some(root.task().key()));
+
+        let pending = root
+            .task()
+            .shared()
+            .pending_signals()
+            .take_lowest_in(carrick_abi::SigSet::EMPTY.with(carrick_abi::LINUX_SIGCHLD))
+            .expect("parent receives pending SIGCHLD");
+        assert_eq!(pending.signal.raw(), carrick_abi::LINUX_SIGCHLD);
+        let info = pending.siginfo.expect("child exit siginfo");
+        let si_signo = info.si_signo;
+        let si_code = info.si_code;
+        let si_addr = info.si_addr;
+        let si_status = i32::from_le_bytes(info._pad[0..4].try_into().unwrap());
+        assert_eq!(si_signo, carrick_abi::LINUX_SIGCHLD);
+        assert_eq!(si_code, libc::CLD_EXITED);
+        assert_eq!((si_addr & 0xffff_ffff) as i32, child_pid);
+        assert_eq!((si_addr >> 32) as u32, 0);
+        assert_eq!(si_status, 42);
+    }
+
+    #[test]
+    fn child_signaled_exit_posts_cld_killed_to_parent() {
+        let (kernel, root) = bootstrap(19_610);
+        root.signal_authority()
+            .set_blocked(carrick_abi::SigSet::EMPTY.with(carrick_abi::LINUX_SIGCHLD));
+
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let child = kernel
+            .fork_task(
+                &root,
+                plan,
+                ThreadId::synthetic_for_tests(19_611),
+                "child".to_string(),
+                None,
+            )
+            .expect("fork child");
+        let child_key = child.task().key();
+        let child_pid = child_key.id.raw();
+
+        let zombie = kernel
+            .exit_task_key_eventually(child_key, LinuxWaitStatus::from_wait_encoding(9))
+            .expect("exit child");
+        assert_eq!(zombie.parent, Some(root.task().key()));
+
+        let pending = root
+            .task()
+            .shared()
+            .pending_signals()
+            .take_lowest_in(carrick_abi::SigSet::EMPTY.with(carrick_abi::LINUX_SIGCHLD))
+            .expect("parent receives pending SIGCHLD");
+        let info = pending.siginfo.expect("child exit siginfo");
+        let si_signo = info.si_signo;
+        let si_code = info.si_code;
+        let si_addr = info.si_addr;
+        let si_status = i32::from_le_bytes(info._pad[0..4].try_into().unwrap());
+        assert_eq!(si_signo, carrick_abi::LINUX_SIGCHLD);
+        assert_eq!(si_code, libc::CLD_KILLED);
+        assert_eq!((si_addr & 0xffff_ffff) as i32, child_pid);
+        assert_eq!((si_addr >> 32) as u32, 0);
+        assert_eq!(si_status, 9);
+    }
+
+    #[test]
+    fn child_exit_with_default_ignore_unblocked_does_not_post_to_parent() {
+        let (kernel, root) = bootstrap(19_615);
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let child = kernel
+            .fork_task(
+                &root,
+                plan,
+                ThreadId::synthetic_for_tests(19_616),
+                "child-unblocked".to_string(),
+                None,
+            )
+            .expect("fork child");
+        let child_key = child.task().key();
+
+        kernel
+            .exit_task_key_eventually(child_key, LinuxWaitStatus::from_wait_encoding(0))
+            .expect("exit child");
+
+        assert_eq!(
+            root.task().shared().pending_signals().present(),
+            carrick_abi::SigSet::EMPTY
+        );
+    }
+
+    #[test]
+    fn child_exit_with_none_signal_does_not_post_to_parent() {
+        let (kernel, root) = bootstrap(19_620);
+        root.signal_authority()
+            .set_blocked(carrick_abi::SigSet::EMPTY.with(carrick_abi::LINUX_SIGCHLD));
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::empty())
+            .expect("fork plan")
+            .with_exit_signal(crate::kernel::ids::ChildExitSignal::None);
+        let child = kernel
+            .fork_task(
+                &root,
+                plan,
+                ThreadId::synthetic_for_tests(19_621),
+                "child-no-signal".to_string(),
+                None,
+            )
+            .expect("fork child");
+        let child_key = child.task().key();
+
+        kernel
+            .exit_task_key_eventually(child_key, LinuxWaitStatus::from_wait_encoding(0))
+            .expect("exit child");
+
+        assert_eq!(
+            root.task().shared().pending_signals().present(),
+            carrick_abi::SigSet::EMPTY
+        );
+    }
+
+    #[test]
+    fn child_exit_with_ignored_signal_does_not_post_to_parent() {
+        let (kernel, root) = bootstrap(19_630);
+        let mut ign_action = carrick_abi::LinuxSigaction::empty();
+        ign_action.sa_handler = carrick_abi::LINUX_SIG_IGN;
+        root.task()
+            .shared()
+            .sighand()
+            .install_action(crate::kernel::ids::LinuxSignal::SIGCHLD, ign_action);
+
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let child = kernel
+            .fork_task(
+                &root,
+                plan,
+                ThreadId::synthetic_for_tests(19_631),
+                "child-ignored".to_string(),
+                None,
+            )
+            .expect("fork child");
+        let child_key = child.task().key();
+
+        kernel
+            .exit_task_key_eventually(child_key, LinuxWaitStatus::from_wait_encoding(0))
+            .expect("exit child");
+
+        assert_eq!(
+            root.task().shared().pending_signals().present(),
+            carrick_abi::SigSet::EMPTY,
+            "explicitly ignored SIGCHLD must not leave pending state behind"
+        );
+    }
+
+    #[test]
+    fn child_exit_wakes_enrolled_parent_even_when_signal_is_none_or_ignored() {
+        let (kernel, root) = bootstrap(19_640);
+        let mut ign_action = carrick_abi::LinuxSigaction::empty();
+        ign_action.sa_handler = carrick_abi::LINUX_SIG_IGN;
+        root.task()
+            .shared()
+            .sighand()
+            .install_action(crate::kernel::ids::LinuxSignal::SIGCHLD, ign_action);
+
+        let wake_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake_count_cb = Arc::clone(&wake_count);
+        let current_gen = root.task().wake_generation();
+        let _subscription = root.task().subscribe_wake(
+            current_gen,
+            Arc::new(move |_gen| {
+                wake_count_cb.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        // Child 1: exit_signal = None
+        let plan_none = ClonePlan::from_flags(LinuxCloneFlags::empty())
+            .expect("fork plan")
+            .with_exit_signal(crate::kernel::ids::ChildExitSignal::None);
+        let child_none = kernel
+            .fork_task(
+                &root,
+                plan_none,
+                ThreadId::synthetic_for_tests(19_641),
+                "child-none".to_string(),
+                None,
+            )
+            .expect("fork child none");
+        kernel
+            .exit_task_key_eventually(
+                child_none.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+            )
+            .expect("exit child none");
+        assert!(
+            wake_count.load(Ordering::SeqCst) >= 1,
+            "parent must be woken on ChildExitSignal::None exit"
+        );
+
+        // Re-subscribe for Child 2: exit_signal = SIGCHLD (ignored)
+        let wake_count_before_2 = wake_count.load(Ordering::SeqCst);
+        let current_gen_2 = root.task().wake_generation();
+        let wake_count_cb2 = Arc::clone(&wake_count);
+        let _subscription_2 = root.task().subscribe_wake(
+            current_gen_2,
+            Arc::new(move |_gen| {
+                wake_count_cb2.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        let plan_ign = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let child_ign = kernel
+            .fork_task(
+                &root,
+                plan_ign,
+                ThreadId::synthetic_for_tests(19_642),
+                "child-ign".to_string(),
+                None,
+            )
+            .expect("fork child ign");
+        kernel
+            .exit_task_key_eventually(
+                child_ign.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+            )
+            .expect("exit child ign");
+        assert!(
+            wake_count.load(Ordering::SeqCst) > wake_count_before_2,
+            "parent must be woken on SIG_IGN child exit"
+        );
     }
 }

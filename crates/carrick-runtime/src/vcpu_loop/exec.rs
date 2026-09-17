@@ -2599,7 +2599,6 @@ pub(crate) mod tests {
             Arc::new(EndpointTestSignalArrival),
             Some(process.clone()),
             None,
-            None,
         ));
         let this_tid = ThreadId::synthetic_for_tests(pid);
         let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);

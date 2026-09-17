@@ -824,7 +824,6 @@ mod tests {
             Arc::new(EndpointTestSignalArrival),
             None,
             None,
-            None,
         );
         let clone = kernel
             .clone_admission
@@ -874,7 +873,6 @@ mod tests {
             SyscallDispatcher::new(),
             Arc::new(EndpointTestSignalPump),
             Arc::new(EndpointTestSignalArrival),
-            None,
             None,
             None,
         );

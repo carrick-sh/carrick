@@ -4330,7 +4330,7 @@ impl SyscallDispatcher {
 
 /// Decode the Linux wait-status word stored by the in-process process table
 /// into the `si_code`/`si_status` pair returned by `waitid(2)`.
-fn hvpatch_waitid_exit_fields(wait_status: i32) -> (i32, i32) {
+pub(crate) fn hvpatch_waitid_exit_fields(wait_status: i32) -> (i32, i32) {
     // Job-control statuses are decoded FIRST: their encodings collide with the
     // exited/killed ones. A stop is `(signal << 8) | 0x7f` and a continue is
     // 0xffff (see `ProcessContext::wait_child_with_job_control`), so a stopped

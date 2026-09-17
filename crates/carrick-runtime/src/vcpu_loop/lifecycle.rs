@@ -1122,7 +1122,6 @@ pub(crate) mod tests {
                 Arc::new(EndpointTestSignalArrival),
                 Some(process.clone()),
                 None,
-                None,
             ));
             let runtime = kernel.hvpatch_runtime.as_ref().unwrap();
             let (scheduler, _) = runtime.continuation_services(root.kernel());
@@ -1553,7 +1552,6 @@ pub(crate) mod tests {
                 Arc::new(EndpointTestSignalArrival),
                 Some(process.clone()),
                 None,
-                None,
             ));
             let runtime = Arc::clone(kernel.hvpatch_runtime.as_ref().unwrap());
             let (scheduler, _) = runtime.continuation_services(root.kernel());
@@ -1619,7 +1617,6 @@ pub(crate) mod tests {
                 Arc::new(EndpointTestSignalPump),
                 Arc::new(EndpointTestSignalArrival),
                 Some(process.clone()),
-                None,
                 None,
             ));
             let runtime = kernel.hvpatch_runtime.as_ref().unwrap();

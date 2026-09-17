@@ -978,22 +978,11 @@ impl HvpatchRuntimeDirectory {
         result.map_err(RuntimeError::CarrierFailed)
     }
 
-    pub(crate) fn notify_child_exit(
-        &self,
-        parent: carrick_kernel::kernel::TaskKey,
-        signal: Option<i32>,
-    ) {
+    pub(crate) fn notify_child_exit(&self, parent: carrick_kernel::kernel::TaskKey) {
         let Some(endpoint) = self.endpoints.lock().get(&parent).cloned() else {
             tracing::error!(
                 parent = ?parent,
                 "child exit notification dropped: no runtime endpoint for the parent"
-            );
-            return;
-        };
-        let Some(parent_kernel) = endpoint.kernel.upgrade() else {
-            tracing::error!(
-                parent = ?parent,
-                "child exit notification dropped: parent KernelState already dropped"
             );
             return;
         };
@@ -1009,15 +998,6 @@ impl HvpatchRuntimeDirectory {
             }
         };
         let signal_context = signal_snapshot.context();
-        if let Some(signal) = signal
-            && parent_kernel
-                .dispatcher
-                .child_exit_signal_snapshot_needs_pump(&signal_snapshot, signal as u32)
-        {
-            parent_kernel
-                .dispatcher
-                .mark_in_process_signal_pending(signal_context, signal);
-        }
         // Child waitability is independent of SIGCHLD disposition. The Kernel
         // zombie is durable, but a parent can be between its initial wait query
         // and host-wait enrollment when publication occurs; always nudge every
@@ -1509,7 +1489,6 @@ mod tests {
             Arc::new(EndpointTestSignalArrival),
             None,
             None,
-            None,
         ));
         directory.register(
             task,
@@ -1520,9 +1499,36 @@ mod tests {
             },
         );
 
+        let child =
+            pre_exec
+                .kernel()
+                .reserve_fork(
+                    &pre_exec,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::empty(),
+                    )
+                    .expect("fork plan"),
+                    "child".to_string(),
+                    None,
+                )
+                .expect("reserve child")
+                .prepare_reference(carrick_hal::ThreadId::synthetic_for_tests(19_499))
+                .expect("prepare child")
+                .commit()
+                .expect("commit child")
+                .start_child()
+                .expect("start child")
+                .into_parts()
+                .0;
+        let child_key = child.task().key();
+
+        let parent_pre_exec = kernel
+            .dispatcher
+            .capture_one_task_context()
+            .expect("parent pre-exec context");
         let prepared = kernel
             .dispatcher
-            .prepare_one_task_kernel_exec(&pre_exec)
+            .prepare_one_task_kernel_exec(&parent_pre_exec)
             .expect("prepare exec");
         let post_exec = kernel
             .dispatcher
@@ -1562,13 +1568,22 @@ mod tests {
             post_exec.shared().sighand().disposition(signal),
             carrick_kernel::kernel::SignalDisposition::Caught
         );
-        directory.notify_child_exit(task, Some(chld));
+
+        post_exec
+            .kernel()
+            .exit_task_key_eventually(
+                child_key,
+                carrick_kernel::kernel::objects::LinuxWaitStatus::from_wait_encoding(0),
+            )
+            .expect("child exit");
         assert!(
             post_exec
                 .shared()
                 .pending_signals()
                 .present()
-                .contains(chld)
+                .contains(chld),
+            "post-exec parent with caught SIGCHLD receives pending SIGCHLD upon child exit"
         );
+        directory.notify_child_exit(task);
     }
 }

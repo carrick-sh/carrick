@@ -1332,9 +1332,6 @@ where
         if external_exec.is_some() {
             child_dispatcher.init_external_exec_stdio();
         }
-        let child_exit_signal = i32::try_from(request.exit_signal)
-            .ok()
-            .filter(|signal| *signal != 0);
         let child_registry = Arc::new(ThreadRegistry::new(child_tid));
         let child_futex = Arc::new(crate::thread::FutexTable::new());
         let child_platform_futex = (self.platform_futex_factory)(Arc::clone(&child_futex));
@@ -1532,7 +1529,6 @@ where
             Arc::clone(&kernel.signal_arrival),
             Some(child_process.clone()),
             kernel.hvpatch_runtime.clone(),
-            child_exit_signal,
         ));
         if let Some(work) = external_exec {
             child_kernel.install_external_exec_work(work)?;

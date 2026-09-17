@@ -1061,7 +1061,6 @@ mod tests {
             Arc::new(EndpointTestSignalArrival),
             Some(process.clone()),
             None,
-            None,
         ));
         let barrier = kernel
             .process_fork_barrier
@@ -1164,7 +1163,6 @@ mod tests {
             Arc::new(EndpointTestSignalPump),
             Arc::new(EndpointTestSignalArrival),
             Some(process.clone()),
-            None,
             None,
         ));
         let barrier = kernel
@@ -1352,7 +1350,6 @@ mod tests {
             Arc::new(EndpointTestSignalPump),
             Arc::new(EndpointTestSignalArrival),
             Some(process.clone()),
-            None,
             None,
         ));
         let barrier = kernel
