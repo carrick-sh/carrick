@@ -1708,19 +1708,23 @@ mod tests {
         assert!(Arc::ptr_eq(&child_rows[0].description, &description));
     }
 
-    #[test]
-    fn host_fork_observes_shared_queue_bytes() {
-        let (_description, backing) = test_description();
-        let tail = backing.layout.sq_off.tail as u64;
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0);
-        if pid == 0 {
-            let _ = backing.store_u32(tail, 0x51, Ordering::Release);
-            unsafe { libc::_exit(0) };
+    mod serial_host {
+        use super::*;
+
+        #[test]
+        fn host_fork_observes_shared_queue_bytes() {
+            let (_description, backing) = test_description();
+            let tail = backing.layout.sq_off.tail as u64;
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let _ = backing.store_u32(tail, 0x51, Ordering::Release);
+                unsafe { libc::_exit(0) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert_eq!(backing.load_u32(tail, Ordering::Acquire), Some(0x51));
         }
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        assert_eq!(backing.load_u32(tail, Ordering::Acquire), Some(0x51));
     }
 
     #[test]

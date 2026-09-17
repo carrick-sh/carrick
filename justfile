@@ -141,6 +141,7 @@ lint-domains:
     python3 scripts/migrate/check-mm-authority.py --self-test
     python3 scripts/migrate/check-dispatch-lock-authority.py --self-test
     python3 scripts/migrate/check-k1-burndown.py --self-test
+    python3 scripts/migrate/check-serial-host-tests.py --self-test
     # The two inventory-maintenance tools carry their own unittest files
     # rather than a `--self-test` flag, and until now no gate executed
     # them -- a test no gate runs is not a test. They belong here for the
@@ -162,6 +163,7 @@ lint-domains:
     python3 scripts/migrate/check-k1-file-authority-inventory.py
     python3 scripts/migrate/check-k1-file-authority-taxonomy.py
     python3 scripts/migrate/check-k1-burndown.py
+    python3 scripts/migrate/check-serial-host-tests.py
 
 # Re-bind the line-pinned `lint-domains` inventories (runtime-abort
 # fingerprints, host-authority spans, dispatch-lock lines, K1 operation
@@ -317,28 +319,16 @@ test *ARGS:
         # completed after a debugger attach resumed it — an indefinite gate
         # hang, not a slow test.
         env RUST_TEST_THREADS=1 cargo test -p carrick-host --lib {{ARGS}}
-        # carrick-vfs is serial because the filesystem layer it was extracted
-        # from always ran inside carrick-runtime's serial slot, and its state is
-        # process-wide by construction: the host backend's marker-directory set,
-        # stat cache and scratch-cleanup queue, `HOST_XATTR_READS`, and the
-        # `fs_resolve_cache` generation words are one process's worth of state
-        # shared by every test in it. The amplification cases assert on exact
-        # host-`openat` counts, so a sibling test's churn on those globals is
-        # directly visible: on parallel harness threads
-        # `dir_cache_survives_a_file_create_and_unlink_storm` measured 47 opens
-        # against an expected 15, and
-        # `fast_readonly_open_uses_the_immutable_lower_when_the_sparse_upper_is_absent`
-        # lost its fast path. Serial: 282/282, same coverage as before the move.
-        env RUST_TEST_THREADS=1 cargo test -p carrick-vfs --lib {{ARGS}}
-        # carrick-kernel forks from the harness for the same reason
-        # carrick-runtime does: `dispatch/tests.rs` and the process/wait
-        # suites it inherited from the runtime `libc::fork()` and drive a
-        # real stop/exit handshake with the child. Child reaping is
-        # PROCESS-wide, so a fork test on a sibling harness thread can
-        # consume a stop another module is mid-handshake with and the
-        # rightful parent blocks forever. `test-support` is on because the
-        # kernel's own unit tests are the consumers of its test doubles.
-        env RUST_TEST_THREADS=1 cargo test -p carrick-kernel --lib --features test-support {{ARGS}}
+        # Parallel cache churn previously measured 47 host opens against an
+        # expected 15; exact budgets and process-wide state stay serial.
+        # carrick-vfs runs parallel tests with --skip serial_host, followed by
+        # its process-global and budget tests serially under RUST_TEST_THREADS=1.
+        cargo test -p carrick-vfs --lib {{ARGS}} -- --skip serial_host
+        env RUST_TEST_THREADS=1 cargo test -p carrick-vfs --lib {{ARGS}} serial_host
+        # carrick-kernel runs parallel tests with --skip serial_host, followed by
+        # its harness-fork and shared-state tests serially under RUST_TEST_THREADS=1.
+        cargo test -p carrick-kernel --lib --features test-support {{ARGS}} -- --skip serial_host
+        env RUST_TEST_THREADS=1 cargo test -p carrick-kernel --lib --features test-support {{ARGS}} serial_host
         env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib {{ARGS}}
         # carrick-vmm-hvf is serial for a THIRD reason, and it is structural
         # rather than a test-hygiene lapse: the carrier is process-global by

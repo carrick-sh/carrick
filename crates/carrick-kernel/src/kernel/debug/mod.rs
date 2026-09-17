@@ -154,56 +154,6 @@ mod tests {
         server.shutdown();
     }
 
-    /// `carrick debug abort --run-id` over the existing socket: the runtime
-    /// acknowledges and LATCHES one abort for its runner to execute. This
-    /// replaces the host-wide shell watchdog's `lldb` step.
-    #[test]
-    fn an_abort_request_is_acknowledged_and_latched_exactly_once() {
-        let (_temp, endpoint) = scoped_endpoint("k1-debug-abort");
-        let kernel = kernel_with_root();
-        let mut server =
-            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
-        // A prior test's latch would make this prove nothing.
-        let _ = post_mortem::take_abort_request();
-
-        let ack = abort_at(&endpoint, "k1-debug-abort").expect("abort request");
-        assert_eq!(ack.schema, KERNEL_DEBUG_RESPONSE_SCHEMA);
-
-        let latched = post_mortem::take_abort_request().expect("the runner must find the request");
-        assert!(
-            matches!(latched, AbortReason::DebugRequest { .. }),
-            "{latched:?}"
-        );
-        assert!(
-            post_mortem::take_abort_request().is_none(),
-            "one request must produce exactly one abort"
-        );
-        server.shutdown();
-    }
-
-    /// A bare request still asks for a snapshot: the read path is the default
-    /// and cannot be reached into an abort by omission.
-    #[test]
-    fn a_request_without_an_action_reads_rather_than_aborts() {
-        let (_temp, endpoint) = scoped_endpoint("k1-debug-default-action");
-        let kernel = kernel_with_root();
-        let mut server =
-            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
-        let _ = post_mortem::take_abort_request();
-
-        let snapshot = fetch_at(&endpoint, None).expect("fetch snapshot");
-        assert!(snapshot.tasks.is_some_and(|tasks| !tasks.is_empty()));
-        assert!(
-            post_mortem::take_abort_request().is_none(),
-            "a read must never latch an abort"
-        );
-        assert_eq!(
-            KernelDebugRequest::for_tables(None).action,
-            KernelDebugAction::Snapshot
-        );
-        server.shutdown();
-    }
-
     #[test]
     fn the_client_reports_a_named_error_when_no_run_is_listening() {
         let (_temp, endpoint) = scoped_endpoint("k1-debug-not-listening");
@@ -628,6 +578,59 @@ mod tests {
             executors: None,
             executor_receipts: None,
             executor_receipt_summary: None,
+        }
+    }
+    mod serial_host {
+        use super::*;
+        /// `carrick debug abort --run-id` over the existing socket: the runtime
+        /// acknowledges and LATCHES one abort for its runner to execute. This
+        /// replaces the host-wide shell watchdog's `lldb` step.
+        #[test]
+        fn an_abort_request_is_acknowledged_and_latched_exactly_once() {
+            let (_temp, endpoint) = scoped_endpoint("k1-debug-abort");
+            let kernel = kernel_with_root();
+            let mut server =
+                KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+            // A prior test's latch would make this prove nothing.
+            let _ = post_mortem::take_abort_request();
+
+            let ack = abort_at(&endpoint, "k1-debug-abort").expect("abort request");
+            assert_eq!(ack.schema, KERNEL_DEBUG_RESPONSE_SCHEMA);
+
+            let latched =
+                post_mortem::take_abort_request().expect("the runner must find the request");
+            assert!(
+                matches!(latched, AbortReason::DebugRequest { .. }),
+                "{latched:?}"
+            );
+            assert!(
+                post_mortem::take_abort_request().is_none(),
+                "one request must produce exactly one abort"
+            );
+            server.shutdown();
+        }
+
+        /// A bare request still asks for a snapshot: the read path is the default
+        /// and cannot be reached into an abort by omission.
+        #[test]
+        fn a_request_without_an_action_reads_rather_than_aborts() {
+            let (_temp, endpoint) = scoped_endpoint("k1-debug-default-action");
+            let kernel = kernel_with_root();
+            let mut server =
+                KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+            let _ = post_mortem::take_abort_request();
+
+            let snapshot = fetch_at(&endpoint, None).expect("fetch snapshot");
+            assert!(snapshot.tasks.is_some_and(|tasks| !tasks.is_empty()));
+            assert!(
+                post_mortem::take_abort_request().is_none(),
+                "a read must never latch an abort"
+            );
+            assert_eq!(
+                KernelDebugRequest::for_tables(None).action,
+                KernelDebugAction::Snapshot
+            );
+            server.shutdown();
         }
     }
 }

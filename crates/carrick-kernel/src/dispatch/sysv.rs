@@ -4896,30 +4896,6 @@ mod ipc_set_tests {
     use super::*;
     use std::path::PathBuf;
 
-    #[test]
-    fn msg_queue_wait_outcome_owns_send_state_without_executor_tls() {
-        fn assert_send_static<T: Send + 'static>(_: &T) {}
-
-        let wait = SysvWaitState::for_tests(0x5a5a).expect("owned SysV wait state");
-        assert_send_static(&wait);
-        let owned_fd = wait.wait_word_fd();
-        let outcome = wait.wait_outcome();
-        match outcome {
-            DispatchOutcome::WaitOnSharedWord {
-                waiter_key,
-                sysv: Some(wait),
-                ..
-            } => {
-                assert_eq!(waiter_key, 0x5a5a);
-                assert_eq!(wait.blocked_id(), 0x5a5a);
-                assert!(wait.wait_word_fd() >= 0);
-            }
-            other => panic!("expected owned SysV continuation outcome, got {other:?}"),
-        }
-        assert_eq!(unsafe { libc::fcntl(owned_fd, libc::F_GETFD) }, -1);
-        assert!(SyscallDispatcher::sysv_executor_boundary_state_is_clear_for_test());
-    }
-
     struct FailingUnmapMemory {
         inner: LinearMemory,
         set_unmapped_calls: Vec<(u64, usize, bool)>,
@@ -5815,62 +5791,6 @@ mod ipc_set_tests {
     }
 
     #[test]
-    fn shmdt_ambiguous_backend_unmap_failure_aborts_with_sigabrt() {
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork shmdt failure child");
-        if pid == 0 {
-            let no_core = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
-            let dispatcher = SyscallDispatcher::new();
-            let shmid = 4240;
-            let addr = crate::memory::LINUX_HIGH_VA_THRESHOLD;
-            dispatcher.sysv.state.lock().segments.insert(
-                shmid,
-                ShmSegment {
-                    path: PathBuf::from("/tmp/carrick-shm/test-failing-shmdt"),
-                    nattch_path: PathBuf::from("/tmp/carrick-shm/test-failing-shmdt.nattch"),
-                    key: 0,
-                    size: LINUX_PAGE_SIZE as usize,
-                    mode: ShmPermMode::requested(0o600),
-                    uid: NsUid::ROOT,
-                    gid: NsGid::ROOT,
-                    cuid: NsUid::ROOT,
-                    cgid: NsGid::ROOT,
-                    nattch: 7,
-                    ctime: 1,
-                    atime: 2,
-                    dtime: 3,
-                    cpid: 4,
-                    lpid: 5,
-                    removed: false,
-                    pending_attaches: 0,
-                },
-            );
-            dispatcher
-                .sysv_process
-                .lock()
-                .attachments
-                .insert(addr, shmid);
-            let mut memory = FailingUnmapMemory::new(0x1000, 0x1000);
-            let _ = dispatcher.dispatch_normalized_mutation_for_test(
-                &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(197, SyscallArgs::from([addr, 0, 0, 0, 0, 0])),
-                &mut memory,
-                &CompatReporter::default(),
-                None,
-            );
-            unsafe { libc::_exit(111) };
-        }
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        assert!(libc::WIFSIGNALED(status));
-        assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
-    }
-
-    #[test]
     fn shmdt_success_retires_all_committed_mmap_metadata_before_attachment() {
         let dispatcher = SyscallDispatcher::new();
         let shmid = 4245;
@@ -6242,329 +6162,6 @@ mod ipc_set_tests {
         assert_eq!(sysv_scope(), "unscoped-sysv");
     }
 
-    fn run_proc_sysvipc_concurrency_worker() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
-
-        let dispatcher = Arc::new(SyscallDispatcher::new());
-        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
-            100,
-            crate::thread::ThreadId::synthetic_for_tests(100),
-            "sysv-proc-race".to_owned(),
-        )
-        .expect("bootstrap root for /proc race");
-        let (_binding, context) =
-            crate::kernel::Kernel::bootstrap_root(bootstrap).expect("bootstrap /proc race root");
-        let context = Arc::new(context);
-        let shmid_1 = 5101;
-        let shmid_2 = 5102;
-        let _backing1 = insert_test_shm_segment(&dispatcher, shmid_1, LINUX_PAGE_SIZE as usize);
-        let _backing2 = insert_test_shm_segment(&dispatcher, shmid_2, LINUX_PAGE_SIZE as usize);
-
-        let running = Arc::new(AtomicBool::new(true));
-        let mut handles = Vec::new();
-
-        // Thread 1: /proc/sysvipc table renderers acquiring proc lock first
-        {
-            let d = Arc::clone(&dispatcher);
-            let context = Arc::clone(&context);
-            let r = Arc::clone(&running);
-            handles.push(std::thread::spawn(move || {
-                while r.load(Ordering::Relaxed) {
-                    let proc = d.synthetic_proc_context(&context);
-                    assert!(proc.sysvipc_shm.contains("key"));
-                    assert!(proc.sysvipc_sem.contains("key"));
-                    assert!(proc.sysvipc_msg.contains("key"));
-                    std::thread::yield_now();
-                }
-            }));
-        }
-
-        // Thread 2: attachment cleanup & exit racing
-        {
-            let d = Arc::clone(&dispatcher);
-            let r = Arc::clone(&running);
-            handles.push(std::thread::spawn(move || {
-                let va_base = crate::memory::LINUX_HIGH_VA_THRESHOLD;
-                while r.load(Ordering::Relaxed) {
-                    let child = d.fork_clone_in_process(
-                        crate::thread::ThreadId::synthetic_for_tests(20),
-                        crate::thread::ThreadId::synthetic_for_tests(21),
-                        20,
-                        21,
-                    );
-                    child.with_sysv_process_mut(|proc| {
-                        proc.attachments.insert(va_base, shmid_1);
-                        proc.inheritance_committed = true;
-                    });
-                    child.sysv.with_state_mut(|state| {
-                        if let Some(seg) = state.segments.get_mut(&shmid_1) {
-                            seg.nattch = seg.nattch.saturating_add(1);
-                        }
-                    });
-                    child.cleanup_sysv_shm_attachments_on_process_exit();
-                    std::thread::yield_now();
-                }
-            }));
-        }
-
-        // Thread 3: paired fork inheritance commit
-        {
-            let d = Arc::clone(&dispatcher);
-            let r = Arc::clone(&running);
-            handles.push(std::thread::spawn(move || {
-                let va_base = crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x10000;
-                while r.load(Ordering::Relaxed) {
-                    let child = d.fork_clone_in_process(
-                        crate::thread::ThreadId::synthetic_for_tests(10),
-                        crate::thread::ThreadId::synthetic_for_tests(11),
-                        10,
-                        11,
-                    );
-                    child.with_sysv_process_mut(|proc| {
-                        proc.attachments.insert(va_base, shmid_2);
-                    });
-                    child.commit_sysv_fork_inheritance();
-                    child.cleanup_sysv_shm_attachments_on_process_exit();
-                    std::thread::yield_now();
-                }
-            }));
-        }
-
-        // Thread 4: paired remap & validate_shmdt with seeded attachment
-        {
-            let d = Arc::clone(&dispatcher);
-            let r = Arc::clone(&running);
-            handles.push(std::thread::spawn(move || {
-                let remapped_va = crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x20000;
-                let detachable_va = crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x30000;
-                while r.load(Ordering::Relaxed) {
-                    let child = d.fork_clone_in_process(
-                        crate::thread::ThreadId::synthetic_for_tests(30),
-                        crate::thread::ThreadId::synthetic_for_tests(31),
-                        30,
-                        31,
-                    );
-                    child.with_sysv_process_mut(|proc| {
-                        proc.attachments.insert(remapped_va, shmid_1);
-                        proc.attachments.insert(detachable_va, shmid_1);
-                    });
-                    let remapped =
-                        child.note_sysv_remap_file_pages(remapped_va, remapped_va + 4096);
-                    assert_eq!(remapped, Ok(true));
-                    assert_eq!(
-                        child.lock_sysv_process().first_remapped_attachment(),
-                        Some(remapped_va)
-                    );
-                    assert_eq!(
-                        child.lock_sysv_process().validate_shmdt(detachable_va),
-                        Ok((shmid_1, carrick_guest_mem::HOST_PAGE_GRANULE as usize))
-                    );
-                    child.cleanup_sysv_shm_attachments_on_process_exit();
-                    std::thread::yield_now();
-                }
-            }));
-        }
-
-        std::thread::sleep(Duration::from_millis(250));
-        running.store(false, Ordering::Relaxed);
-
-        for h in handles {
-            h.join().expect("worker thread join");
-        }
-    }
-
-    #[test]
-    fn proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock() {
-        if std::env::var_os("CARRICK_SYSVIPC_TEST_CHILD").is_some() {
-            run_proc_sysvipc_concurrency_worker();
-            return;
-        }
-
-        let mut child = std::process::Command::new(std::env::current_exe().expect("test exe path"))
-            .env("CARRICK_SYSVIPC_TEST_CHILD", "1")
-            .arg("--exact")
-            .arg("dispatch::sysv::ipc_set_tests::proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock")
-            .arg("--nocapture")
-            .spawn()
-            .expect("spawn concurrency test child process");
-
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(10);
-        let mut exited = false;
-        while start.elapsed() < timeout {
-            if child.try_wait().expect("child try_wait").is_some() {
-                exited = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-
-        if !exited {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "proc_sysvipc deadlock regression timed out after 10s (killed deadlocked child subprocess)"
-            );
-        }
-
-        let status = child.wait().expect("child wait");
-        assert!(
-            status.success(),
-            "child worker failed or crashed during concurrency race"
-        );
-    }
-
-    #[test]
-    fn watchdog_kills_and_reaps_on_deadlock_timeout() {
-        if std::env::var_os("CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK").is_some() {
-            loop {
-                std::thread::park();
-            }
-        }
-
-        let mut child = std::process::Command::new(std::env::current_exe().expect("test exe path"))
-            .env("CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK", "1")
-            .arg("--exact")
-            .arg("dispatch::sysv::ipc_set_tests::watchdog_kills_and_reaps_on_deadlock_timeout")
-            .arg("--nocapture")
-            .spawn()
-            .expect("spawn deadlocked child process");
-
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_millis(200);
-        let mut exited = false;
-        while start.elapsed() < timeout {
-            if child.try_wait().expect("child try_wait").is_some() {
-                exited = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-
-        assert!(
-            !exited,
-            "deadlocked child exited unexpectedly before timeout"
-        );
-        let _ = child.kill();
-        let status = child.wait().expect("child wait after kill");
-        assert!(
-            !status.success(),
-            "killed deadlocked child should report non-zero / terminated status"
-        );
-    }
-
-    fn run_remapped_shmat_same_shmid_worker() {
-        let dispatcher = SyscallDispatcher::new();
-        let shmid = 5544;
-        let _file = insert_test_shm_segment(&dispatcher, shmid, LINUX_PAGE_SIZE as usize);
-        let va = crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x40000;
-
-        // Seed initial attachment at `va` for `shmid`
-        dispatcher.with_sysv_process_mut(|proc| {
-            proc.attachments.insert(va, shmid);
-        });
-        dispatcher.sysv.with_state_mut(|state| {
-            if let Some(seg) = state.segments.get_mut(&shmid) {
-                seg.nattch = 1;
-            }
-        });
-
-        // Note remap covering `va`
-        let remapped = dispatcher.note_sysv_remap_file_pages(va, va + 4096);
-        assert_eq!(remapped, Ok(true));
-
-        // Create a pending reservation for the same shmid
-        let reservation = PendingShmat {
-            namespace: Arc::clone(&dispatcher.sysv),
-            shmid,
-            path: PathBuf::from("/tmp/carrick-shm/test-same-shmid"),
-            armed: true,
-        };
-        dispatcher.sysv.with_state_mut(|state| {
-            if let Some(seg) = state.segments.get_mut(&shmid) {
-                seg.pending_attaches = 1;
-                seg.path = PathBuf::from("/tmp/carrick-shm/test-same-shmid");
-            }
-        });
-
-        assert_eq!(
-            dispatcher
-                .sysv
-                .with_state(|state| state.segments.get(&shmid).map(|s| s.pending_attaches)),
-            Some(1)
-        );
-
-        // Commit remapped shmat with the same shmid.
-        let mut process = dispatcher.lock_sysv_process();
-        let committed_va = process.commit_remapped_shmat(shmid, 1234, reservation);
-        drop(process);
-
-        assert_eq!(committed_va, va);
-
-        // Assert accounting is preserved: nattch is still 1, pending_attaches is disarmed (0).
-        let (nattch, pending_attaches) = dispatcher
-            .sysv
-            .with_state(|state| {
-                state
-                    .segments
-                    .get(&shmid)
-                    .map(|s| (s.nattch, s.pending_attaches))
-            })
-            .expect("segment exists");
-        assert_eq!(
-            nattch, 1,
-            "nattch must remain 1 on same-shmid remapped attach"
-        );
-        assert_eq!(
-            pending_attaches, 0,
-            "pending_attaches must be reset to 0 after same-shmid commit"
-        );
-        let tracked_shmid = dispatcher.with_sysv_process(|p| p.attachments.get(&va).copied());
-        assert_eq!(tracked_shmid, Some(shmid));
-    }
-
-    #[test]
-    fn remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting() {
-        if std::env::var_os("CARRICK_SAME_SHMID_TEST_CHILD").is_some() {
-            run_remapped_shmat_same_shmid_worker();
-            return;
-        }
-
-        let mut child = std::process::Command::new(std::env::current_exe().expect("test exe path"))
-            .env("CARRICK_SAME_SHMID_TEST_CHILD", "1")
-            .arg("--exact")
-            .arg("dispatch::sysv::ipc_set_tests::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting")
-            .arg("--nocapture")
-            .spawn()
-            .expect("spawn same-shmid test child process");
-
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(5);
-        let mut exited = false;
-        while start.elapsed() < timeout {
-            if child.try_wait().expect("child try_wait").is_some() {
-                exited = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-
-        if !exited {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "same-shmid remapped shmat deadlock regression timed out after 5s (killed deadlocked child subprocess)"
-            );
-        }
-
-        let status = child.wait().expect("child wait");
-        assert!(
-            status.success(),
-            "child worker failed during same-shmid remapped shmat execution"
-        );
-    }
-
     #[test]
     #[ignore = "controller receipt documenting pre-fix commit 560ce940e timeout vs fixed execution"]
     fn receipt_same_shmid_deadlock_reproducer_evidence() {
@@ -6576,219 +6173,629 @@ mod ipc_set_tests {
         // Fixed behavior: Same-shmid remap cancels reservation before acquiring paired authority; child completes in 0.01s with status code 0; nattch==1, pending_attaches==0.
     }
 
-    #[test]
-    fn semctl_setall_witness_revalidates_permissions_and_fails_eacces_when_mode_revoked() {
-        use carrick_abi::{NsGid, NsUid};
+    mod serial_host {
+        use super::*;
 
-        let dispatcher = Arc::new(SyscallDispatcher::new());
-        let semid_raw = 8899;
-        let guest_semid = GuestSemId(semid_raw);
-        let nsems = 2;
-        let mut fixture = InMemSemFixture::new(nsems);
-        // Semaphore set owned by uid 1000 with mode 0666 (other-writable)
-        fixture.set.cuid = NsUid(1000);
-        fixture.set.cgid = NsGid(1000);
-        fixture.set.uid = NsUid(1000);
-        fixture.set.gid = NsGid(1000);
-        fixture.set.mode = ShmPermMode::requested(0o666);
-        *fixture.set.values.lock() = vec![0, 0];
-        dispatcher.sysv.with_state_mut(|state| {
-            state.semaphores.insert(guest_semid, fixture.set);
-        });
+        #[test]
+        fn msg_queue_wait_outcome_owns_send_state_without_executor_tls() {
+            fn assert_send_static<T: Send + 'static>(_: &T) {}
 
-        let mut memory = LinearMemory::new(0x2000, vec![0; 0x1000]);
-        let mem_addr = 0x2000;
-        let vals: Vec<u16> = vec![111, 222];
-        let mut bytes = Vec::new();
-        for v in &vals {
-            bytes.extend_from_slice(&v.to_le_bytes());
+            let wait = SysvWaitState::for_tests(0x5a5a).expect("owned SysV wait state");
+            assert_send_static(&wait);
+            let owned_fd = wait.wait_word_fd();
+            let outcome = wait.wait_outcome();
+            match outcome {
+                DispatchOutcome::WaitOnSharedWord {
+                    waiter_key,
+                    sysv: Some(wait),
+                    ..
+                } => {
+                    assert_eq!(waiter_key, 0x5a5a);
+                    assert_eq!(wait.blocked_id(), 0x5a5a);
+                    assert!(wait.wait_word_fd() >= 0);
+                }
+                other => panic!("expected owned SysV continuation outcome, got {other:?}"),
+            }
+            assert_eq!(unsafe { libc::fcntl(owned_fd, libc::F_GETFD) }, -1);
+            assert!(SyscallDispatcher::sysv_executor_boundary_state_is_clear_for_test());
         }
-        memory.write_bytes(mem_addr, &bytes).unwrap();
 
-        let mut cx = SyscallCtx {
-            kernel: &dispatcher.capture_one_task_context().unwrap(),
-            request: SyscallRequest::new(146, SyscallArgs::from([1001, 0, 0, 0, 0, 0])),
-            memory: &mut memory,
-            reporter: &CompatReporter::default(),
-            thread: None,
-            execution_lease: None,
-            mm_executor: None,
-        };
+        #[test]
+        fn shmdt_ambiguous_backend_unmap_failure_aborts_with_sigabrt() {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork shmdt failure child");
+            if pid == 0 {
+                let no_core = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
+                let dispatcher = SyscallDispatcher::new();
+                let shmid = 4240;
+                let addr = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+                dispatcher.sysv.state.lock().segments.insert(
+                    shmid,
+                    ShmSegment {
+                        path: PathBuf::from("/tmp/carrick-shm/test-failing-shmdt"),
+                        nattch_path: PathBuf::from("/tmp/carrick-shm/test-failing-shmdt.nattch"),
+                        key: 0,
+                        size: LINUX_PAGE_SIZE as usize,
+                        mode: ShmPermMode::requested(0o600),
+                        uid: NsUid::ROOT,
+                        gid: NsGid::ROOT,
+                        cuid: NsUid::ROOT,
+                        cgid: NsGid::ROOT,
+                        nattch: 7,
+                        ctime: 1,
+                        atime: 2,
+                        dtime: 3,
+                        cpid: 4,
+                        lpid: 5,
+                        removed: false,
+                        pending_attaches: 0,
+                    },
+                );
+                dispatcher
+                    .sysv_process
+                    .lock()
+                    .attachments
+                    .insert(addr, shmid);
+                let mut memory = FailingUnmapMemory::new(0x1000, 0x1000);
+                let _ = dispatcher.dispatch_normalized_mutation_for_test(
+                    &dispatcher.capture_one_task_context().unwrap(),
+                    SyscallRequest::new(197, SyscallArgs::from([addr, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &CompatReporter::default(),
+                    None,
+                );
+                unsafe { libc::_exit(111) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFSIGNALED(status));
+            assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
+        }
 
-        // Transition dispatcher credentials to non-root uid 1001
-        let outcome = dispatcher.setuid(&mut cx).expect("setuid succeeds");
-        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
-        let creds = dispatcher.cred_snapshot();
+        fn run_proc_sysvipc_concurrency_worker() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::time::Duration;
 
-        cx.request = SyscallRequest::new(
-            195,
-            SyscallArgs::from([semid_raw as u64, 0, LINUX_SETALL, mem_addr, 0, 0]),
-        );
+            let dispatcher = Arc::new(SyscallDispatcher::new());
+            let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+                100,
+                crate::thread::ThreadId::synthetic_for_tests(100),
+                "sysv-proc-race".to_owned(),
+            )
+            .expect("bootstrap root for /proc race");
+            let (_binding, context) = crate::kernel::Kernel::bootstrap_root(bootstrap)
+                .expect("bootstrap /proc race root");
+            let context = Arc::new(context);
+            let shmid_1 = 5101;
+            let shmid_2 = 5102;
+            let _backing1 = insert_test_shm_segment(&dispatcher, shmid_1, LINUX_PAGE_SIZE as usize);
+            let _backing2 = insert_test_shm_segment(&dispatcher, shmid_2, LINUX_PAGE_SIZE as usize);
 
-        // Install interleaving hook that revokes other-write permission between prepare and finalize
-        let d_hook = Arc::clone(&dispatcher);
-        let _guard = SetallInterleavingGuard::set(move |target_semid| {
-            d_hook.sysv.with_state_mut(|state| {
-                if let Some(meta) = state.semaphores.get_mut(&target_semid) {
-                    meta.mode = ShmPermMode::requested(0o664); // Revoke other write
+            let running = Arc::new(AtomicBool::new(true));
+            let mut handles = Vec::new();
+
+            // Thread 1: /proc/sysvipc table renderers acquiring proc lock first
+            {
+                let d = Arc::clone(&dispatcher);
+                let context = Arc::clone(&context);
+                let r = Arc::clone(&running);
+                handles.push(std::thread::spawn(move || {
+                    while r.load(Ordering::Relaxed) {
+                        let proc = d.synthetic_proc_context(&context);
+                        assert!(proc.sysvipc_shm.contains("key"));
+                        assert!(proc.sysvipc_sem.contains("key"));
+                        assert!(proc.sysvipc_msg.contains("key"));
+                        std::thread::yield_now();
+                    }
+                }));
+            }
+
+            // Thread 2: attachment cleanup & exit racing
+            {
+                let d = Arc::clone(&dispatcher);
+                let r = Arc::clone(&running);
+                handles.push(std::thread::spawn(move || {
+                    let va_base = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+                    while r.load(Ordering::Relaxed) {
+                        let child = d.fork_clone_in_process(
+                            crate::thread::ThreadId::synthetic_for_tests(20),
+                            crate::thread::ThreadId::synthetic_for_tests(21),
+                            20,
+                            21,
+                        );
+                        child.with_sysv_process_mut(|proc| {
+                            proc.attachments.insert(va_base, shmid_1);
+                            proc.inheritance_committed = true;
+                        });
+                        child.sysv.with_state_mut(|state| {
+                            if let Some(seg) = state.segments.get_mut(&shmid_1) {
+                                seg.nattch = seg.nattch.saturating_add(1);
+                            }
+                        });
+                        child.cleanup_sysv_shm_attachments_on_process_exit();
+                        std::thread::yield_now();
+                    }
+                }));
+            }
+
+            // Thread 3: paired fork inheritance commit
+            {
+                let d = Arc::clone(&dispatcher);
+                let r = Arc::clone(&running);
+                handles.push(std::thread::spawn(move || {
+                    let va_base = crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x10000;
+                    while r.load(Ordering::Relaxed) {
+                        let child = d.fork_clone_in_process(
+                            crate::thread::ThreadId::synthetic_for_tests(10),
+                            crate::thread::ThreadId::synthetic_for_tests(11),
+                            10,
+                            11,
+                        );
+                        child.with_sysv_process_mut(|proc| {
+                            proc.attachments.insert(va_base, shmid_2);
+                        });
+                        child.commit_sysv_fork_inheritance();
+                        child.cleanup_sysv_shm_attachments_on_process_exit();
+                        std::thread::yield_now();
+                    }
+                }));
+            }
+
+            // Thread 4: paired remap & validate_shmdt with seeded attachment
+            {
+                let d = Arc::clone(&dispatcher);
+                let r = Arc::clone(&running);
+                handles.push(std::thread::spawn(move || {
+                    let remapped_va = crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x20000;
+                    let detachable_va = crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x30000;
+                    while r.load(Ordering::Relaxed) {
+                        let child = d.fork_clone_in_process(
+                            crate::thread::ThreadId::synthetic_for_tests(30),
+                            crate::thread::ThreadId::synthetic_for_tests(31),
+                            30,
+                            31,
+                        );
+                        child.with_sysv_process_mut(|proc| {
+                            proc.attachments.insert(remapped_va, shmid_1);
+                            proc.attachments.insert(detachable_va, shmid_1);
+                        });
+                        let remapped =
+                            child.note_sysv_remap_file_pages(remapped_va, remapped_va + 4096);
+                        assert_eq!(remapped, Ok(true));
+                        assert_eq!(
+                            child.lock_sysv_process().first_remapped_attachment(),
+                            Some(remapped_va)
+                        );
+                        assert_eq!(
+                            child.lock_sysv_process().validate_shmdt(detachable_va),
+                            Ok((shmid_1, carrick_guest_mem::HOST_PAGE_GRANULE as usize))
+                        );
+                        child.cleanup_sysv_shm_attachments_on_process_exit();
+                        std::thread::yield_now();
+                    }
+                }));
+            }
+
+            std::thread::sleep(Duration::from_millis(250));
+            running.store(false, Ordering::Relaxed);
+
+            for h in handles {
+                h.join().expect("worker thread join");
+            }
+        }
+
+        #[test]
+        fn proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock() {
+            if std::env::var_os("CARRICK_SYSVIPC_TEST_CHILD").is_some() {
+                run_proc_sysvipc_concurrency_worker();
+                return;
+            }
+
+            let mut child = std::process::Command::new(std::env::current_exe().expect("test exe path"))
+                .env("CARRICK_SYSVIPC_TEST_CHILD", "1")
+                .arg("--exact")
+                .arg("dispatch::sysv::ipc_set_tests::serial_host::proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock")
+                .arg("--nocapture")
+                .spawn()
+                .expect("spawn concurrency test child process");
+
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_secs(10);
+            let mut exited = false;
+            while start.elapsed() < timeout {
+                if child.try_wait().expect("child try_wait").is_some() {
+                    exited = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            if !exited {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "proc_sysvipc deadlock regression timed out after 10s (killed deadlocked child subprocess)"
+                );
+            }
+
+            let status = child.wait().expect("child wait");
+            assert!(
+                status.success(),
+                "child worker failed or crashed during concurrency race"
+            );
+        }
+
+        #[test]
+        fn watchdog_kills_and_reaps_on_deadlock_timeout() {
+            if std::env::var_os("CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK").is_some() {
+                loop {
+                    std::thread::park();
+                }
+            }
+
+            let mut child = std::process::Command::new(std::env::current_exe().expect("test exe path"))
+                .env("CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK", "1")
+                .arg("--exact")
+                .arg("dispatch::sysv::ipc_set_tests::serial_host::watchdog_kills_and_reaps_on_deadlock_timeout")
+                .arg("--nocapture")
+                .spawn()
+                .expect("spawn deadlocked child process");
+
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_millis(200);
+            let mut exited = false;
+            while start.elapsed() < timeout {
+                if child.try_wait().expect("child try_wait").is_some() {
+                    exited = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+
+            assert!(
+                !exited,
+                "deadlocked child exited unexpectedly before timeout"
+            );
+            let _ = child.kill();
+            let status = child.wait().expect("child wait after kill");
+            assert!(
+                !status.success(),
+                "killed deadlocked child should report non-zero / terminated status"
+            );
+        }
+
+        fn run_remapped_shmat_same_shmid_worker() {
+            let dispatcher = SyscallDispatcher::new();
+            let shmid = 5544;
+            let _file = insert_test_shm_segment(&dispatcher, shmid, LINUX_PAGE_SIZE as usize);
+            let va = crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x40000;
+
+            // Seed initial attachment at `va` for `shmid`
+            dispatcher.with_sysv_process_mut(|proc| {
+                proc.attachments.insert(va, shmid);
+            });
+            dispatcher.sysv.with_state_mut(|state| {
+                if let Some(seg) = state.segments.get_mut(&shmid) {
+                    seg.nattch = 1;
                 }
             });
-        });
 
-        let outcome = dispatcher.sysv_semctl(&mut cx, semid_raw, 0, LINUX_SETALL, mem_addr, &creds);
-        assert_eq!(
-            outcome.expect("outcome"),
-            DispatchOutcome::errno(LINUX_EACCES)
-        );
+            // Note remap covering `va`
+            let remapped = dispatcher.note_sysv_remap_file_pages(va, va + 4096);
+            assert_eq!(remapped, Ok(true));
 
-        // Verify values were NOT mutated
-        let current_vals = dispatcher
-            .sysv
-            .with_state(|state| {
-                state
-                    .semaphores
-                    .get(&guest_semid)
-                    .map(|s| s.values.lock().clone())
-            })
-            .expect("semaphore set exists");
-        assert_eq!(
-            current_vals,
-            vec![0, 0],
-            "values must not be mutated after EACCES"
-        );
-    }
-
-    #[test]
-    fn semctl_setall_witness_revalidates_identity_and_fails_eidrm_when_removed() {
-        let dispatcher = Arc::new(SyscallDispatcher::new());
-        let semid_raw = 8898;
-        let guest_semid = GuestSemId(semid_raw);
-        let nsems = 2;
-        let mut fixture = InMemSemFixture::new(nsems);
-        fixture.set.mode = ShmPermMode::requested(0o666);
-        *fixture.set.values.lock() = vec![0, 0];
-        dispatcher.sysv.with_state_mut(|state| {
-            state.semaphores.insert(guest_semid, fixture.set);
-        });
-
-        let creds = dispatcher.cred_snapshot();
-
-        let mut memory = LinearMemory::new(0x2000, vec![0; 0x1000]);
-        let mem_addr = 0x2000;
-        let vals: Vec<u16> = vec![111, 222];
-        let mut bytes = Vec::new();
-        for v in &vals {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        memory.write_bytes(mem_addr, &bytes).unwrap();
-
-        let mut cx = SyscallCtx {
-            kernel: &dispatcher.capture_one_task_context().unwrap(),
-            request: SyscallRequest::new(
-                195,
-                SyscallArgs::from([semid_raw as u64, 0, LINUX_SETALL, mem_addr, 0, 0]),
-            ),
-            memory: &mut memory,
-            reporter: &CompatReporter::default(),
-            thread: None,
-            execution_lease: None,
-            mm_executor: None,
-        };
-
-        // Install interleaving hook that marks the semaphore set removed between prepare and finalize
-        let d_hook = Arc::clone(&dispatcher);
-        let _guard = SetallInterleavingGuard::set(move |target_semid| {
-            d_hook.sysv.with_state_mut(|state| {
-                if let Some(meta) = state.semaphores.get_mut(&target_semid) {
-                    meta.removed
-                        .store(true, std::sync::atomic::Ordering::Release);
+            // Create a pending reservation for the same shmid
+            let reservation = PendingShmat {
+                namespace: Arc::clone(&dispatcher.sysv),
+                shmid,
+                path: PathBuf::from("/tmp/carrick-shm/test-same-shmid"),
+                armed: true,
+            };
+            dispatcher.sysv.with_state_mut(|state| {
+                if let Some(seg) = state.segments.get_mut(&shmid) {
+                    seg.pending_attaches = 1;
+                    seg.path = PathBuf::from("/tmp/carrick-shm/test-same-shmid");
                 }
             });
-        });
 
-        let outcome = dispatcher.sysv_semctl(&mut cx, semid_raw, 0, LINUX_SETALL, mem_addr, &creds);
-        assert_eq!(
-            outcome.expect("outcome"),
-            DispatchOutcome::errno(crate::linux_abi::LINUX_EIDRM)
-        );
+            assert_eq!(
+                dispatcher
+                    .sysv
+                    .with_state(|state| state.segments.get(&shmid).map(|s| s.pending_attaches)),
+                Some(1)
+            );
 
-        // Verify values were NOT mutated
-        let current_vals = dispatcher
-            .sysv
-            .with_state(|state| {
-                state
-                    .semaphores
-                    .get(&guest_semid)
-                    .map(|s| s.values.lock().clone())
-            })
-            .expect("semaphore set exists");
-        assert_eq!(
-            current_vals,
-            vec![0, 0],
-            "values must not be mutated after EIDRM"
-        );
-    }
+            // Commit remapped shmat with the same shmid.
+            let mut process = dispatcher.lock_sysv_process();
+            let committed_va = process.commit_remapped_shmat(shmid, 1234, reservation);
+            drop(process);
 
-    #[test]
-    fn semctl_setall_witness_succeeds_and_updates_values_when_valid() {
-        let dispatcher = Arc::new(SyscallDispatcher::new());
-        let semid_raw = 8897;
-        let guest_semid = GuestSemId(semid_raw);
-        let nsems = 2;
-        let mut fixture = InMemSemFixture::new(nsems);
-        fixture.set.mode = ShmPermMode::requested(0o666);
-        *fixture.set.values.lock() = vec![0, 0];
-        dispatcher.sysv.with_state_mut(|state| {
-            state.semaphores.insert(guest_semid, fixture.set);
-        });
+            assert_eq!(committed_va, va);
 
-        let creds = dispatcher.cred_snapshot();
-
-        let mut memory = LinearMemory::new(0x2000, vec![0; 0x1000]);
-        let mem_addr = 0x2000;
-        let vals: Vec<u16> = vec![111, 222];
-        let mut bytes = Vec::new();
-        for v in &vals {
-            bytes.extend_from_slice(&v.to_le_bytes());
+            // Assert accounting is preserved: nattch is still 1, pending_attaches is disarmed (0).
+            let (nattch, pending_attaches) = dispatcher
+                .sysv
+                .with_state(|state| {
+                    state
+                        .segments
+                        .get(&shmid)
+                        .map(|s| (s.nattch, s.pending_attaches))
+                })
+                .expect("segment exists");
+            assert_eq!(
+                nattch, 1,
+                "nattch must remain 1 on same-shmid remapped attach"
+            );
+            assert_eq!(
+                pending_attaches, 0,
+                "pending_attaches must be reset to 0 after same-shmid commit"
+            );
+            let tracked_shmid = dispatcher.with_sysv_process(|p| p.attachments.get(&va).copied());
+            assert_eq!(tracked_shmid, Some(shmid));
         }
-        memory.write_bytes(mem_addr, &bytes).unwrap();
 
-        let mut cx = SyscallCtx {
-            kernel: &dispatcher.capture_one_task_context().unwrap(),
-            request: SyscallRequest::new(
+        #[test]
+        fn remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting() {
+            if std::env::var_os("CARRICK_SAME_SHMID_TEST_CHILD").is_some() {
+                run_remapped_shmat_same_shmid_worker();
+                return;
+            }
+
+            let mut child = std::process::Command::new(std::env::current_exe().expect("test exe path"))
+                .env("CARRICK_SAME_SHMID_TEST_CHILD", "1")
+                .arg("--exact")
+                .arg("dispatch::sysv::ipc_set_tests::serial_host::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting")
+                .arg("--nocapture")
+                .spawn()
+                .expect("spawn same-shmid test child process");
+
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_secs(5);
+            let mut exited = false;
+            while start.elapsed() < timeout {
+                if child.try_wait().expect("child try_wait").is_some() {
+                    exited = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+
+            if !exited {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "same-shmid remapped shmat deadlock regression timed out after 5s (killed deadlocked child subprocess)"
+                );
+            }
+
+            let status = child.wait().expect("child wait");
+            assert!(
+                status.success(),
+                "child worker failed during same-shmid remapped shmat execution"
+            );
+        }
+
+        #[test]
+        fn semctl_setall_witness_revalidates_permissions_and_fails_eacces_when_mode_revoked() {
+            use carrick_abi::{NsGid, NsUid};
+
+            let dispatcher = Arc::new(SyscallDispatcher::new());
+            let semid_raw = 8899;
+            let guest_semid = GuestSemId(semid_raw);
+            let nsems = 2;
+            let mut fixture = InMemSemFixture::new(nsems);
+            // Semaphore set owned by uid 1000 with mode 0666 (other-writable)
+            fixture.set.cuid = NsUid(1000);
+            fixture.set.cgid = NsGid(1000);
+            fixture.set.uid = NsUid(1000);
+            fixture.set.gid = NsGid(1000);
+            fixture.set.mode = ShmPermMode::requested(0o666);
+            *fixture.set.values.lock() = vec![0, 0];
+            dispatcher.sysv.with_state_mut(|state| {
+                state.semaphores.insert(guest_semid, fixture.set);
+            });
+
+            let mut memory = LinearMemory::new(0x2000, vec![0; 0x1000]);
+            let mem_addr = 0x2000;
+            let vals: Vec<u16> = vec![111, 222];
+            let mut bytes = Vec::new();
+            for v in &vals {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            memory.write_bytes(mem_addr, &bytes).unwrap();
+
+            let mut cx = SyscallCtx {
+                kernel: &dispatcher.capture_one_task_context().unwrap(),
+                request: SyscallRequest::new(146, SyscallArgs::from([1001, 0, 0, 0, 0, 0])),
+                memory: &mut memory,
+                reporter: &CompatReporter::default(),
+                thread: None,
+                execution_lease: None,
+                mm_executor: None,
+            };
+
+            // Transition dispatcher credentials to non-root uid 1001
+            let outcome = dispatcher.setuid(&mut cx).expect("setuid succeeds");
+            assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+            let creds = dispatcher.cred_snapshot();
+
+            cx.request = SyscallRequest::new(
                 195,
                 SyscallArgs::from([semid_raw as u64, 0, LINUX_SETALL, mem_addr, 0, 0]),
-            ),
-            memory: &mut memory,
-            reporter: &CompatReporter::default(),
-            thread: None,
-            execution_lease: None,
-            mm_executor: None,
-        };
+            );
 
-        // Success control: hook does not mutate permissions or remove set
-        let _guard = SetallInterleavingGuard::set(|_| {});
+            // Install interleaving hook that revokes other-write permission between prepare and finalize
+            let d_hook = Arc::clone(&dispatcher);
+            let _guard = SetallInterleavingGuard::set(move |target_semid| {
+                d_hook.sysv.with_state_mut(|state| {
+                    if let Some(meta) = state.semaphores.get_mut(&target_semid) {
+                        meta.mode = ShmPermMode::requested(0o664); // Revoke other write
+                    }
+                });
+            });
 
-        let outcome = dispatcher.sysv_semctl(&mut cx, semid_raw, 0, LINUX_SETALL, mem_addr, &creds);
-        assert_eq!(
-            outcome.expect("outcome"),
-            DispatchOutcome::Returned { value: 0 }
-        );
+            let outcome =
+                dispatcher.sysv_semctl(&mut cx, semid_raw, 0, LINUX_SETALL, mem_addr, &creds);
+            assert_eq!(
+                outcome.expect("outcome"),
+                DispatchOutcome::errno(LINUX_EACCES)
+            );
 
-        // Verify values were updated
-        let current_vals = dispatcher
-            .sysv
-            .with_state(|state| {
-                state
-                    .semaphores
-                    .get(&guest_semid)
-                    .map(|s| s.values.lock().clone())
-            })
-            .expect("semaphore set exists");
-        assert_eq!(
-            current_vals,
-            vec![111, 222],
-            "values must be updated on success"
-        );
+            // Verify values were NOT mutated
+            let current_vals = dispatcher
+                .sysv
+                .with_state(|state| {
+                    state
+                        .semaphores
+                        .get(&guest_semid)
+                        .map(|s| s.values.lock().clone())
+                })
+                .expect("semaphore set exists");
+            assert_eq!(
+                current_vals,
+                vec![0, 0],
+                "values must not be mutated after EACCES"
+            );
+        }
+
+        #[test]
+        fn semctl_setall_witness_revalidates_identity_and_fails_eidrm_when_removed() {
+            let dispatcher = Arc::new(SyscallDispatcher::new());
+            let semid_raw = 8898;
+            let guest_semid = GuestSemId(semid_raw);
+            let nsems = 2;
+            let mut fixture = InMemSemFixture::new(nsems);
+            fixture.set.mode = ShmPermMode::requested(0o666);
+            *fixture.set.values.lock() = vec![0, 0];
+            dispatcher.sysv.with_state_mut(|state| {
+                state.semaphores.insert(guest_semid, fixture.set);
+            });
+
+            let creds = dispatcher.cred_snapshot();
+
+            let mut memory = LinearMemory::new(0x2000, vec![0; 0x1000]);
+            let mem_addr = 0x2000;
+            let vals: Vec<u16> = vec![111, 222];
+            let mut bytes = Vec::new();
+            for v in &vals {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            memory.write_bytes(mem_addr, &bytes).unwrap();
+
+            let mut cx = SyscallCtx {
+                kernel: &dispatcher.capture_one_task_context().unwrap(),
+                request: SyscallRequest::new(
+                    195,
+                    SyscallArgs::from([semid_raw as u64, 0, LINUX_SETALL, mem_addr, 0, 0]),
+                ),
+                memory: &mut memory,
+                reporter: &CompatReporter::default(),
+                thread: None,
+                execution_lease: None,
+                mm_executor: None,
+            };
+
+            // Install interleaving hook that marks the semaphore set removed between prepare and finalize
+            let d_hook = Arc::clone(&dispatcher);
+            let _guard = SetallInterleavingGuard::set(move |target_semid| {
+                d_hook.sysv.with_state_mut(|state| {
+                    if let Some(meta) = state.semaphores.get_mut(&target_semid) {
+                        meta.removed
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
+                });
+            });
+
+            let outcome =
+                dispatcher.sysv_semctl(&mut cx, semid_raw, 0, LINUX_SETALL, mem_addr, &creds);
+            assert_eq!(
+                outcome.expect("outcome"),
+                DispatchOutcome::errno(crate::linux_abi::LINUX_EIDRM)
+            );
+
+            // Verify values were NOT mutated
+            let current_vals = dispatcher
+                .sysv
+                .with_state(|state| {
+                    state
+                        .semaphores
+                        .get(&guest_semid)
+                        .map(|s| s.values.lock().clone())
+                })
+                .expect("semaphore set exists");
+            assert_eq!(
+                current_vals,
+                vec![0, 0],
+                "values must not be mutated after EIDRM"
+            );
+        }
+
+        #[test]
+        fn semctl_setall_witness_succeeds_and_updates_values_when_valid() {
+            let dispatcher = Arc::new(SyscallDispatcher::new());
+            let semid_raw = 8897;
+            let guest_semid = GuestSemId(semid_raw);
+            let nsems = 2;
+            let mut fixture = InMemSemFixture::new(nsems);
+            fixture.set.mode = ShmPermMode::requested(0o666);
+            *fixture.set.values.lock() = vec![0, 0];
+            dispatcher.sysv.with_state_mut(|state| {
+                state.semaphores.insert(guest_semid, fixture.set);
+            });
+
+            let creds = dispatcher.cred_snapshot();
+
+            let mut memory = LinearMemory::new(0x2000, vec![0; 0x1000]);
+            let mem_addr = 0x2000;
+            let vals: Vec<u16> = vec![111, 222];
+            let mut bytes = Vec::new();
+            for v in &vals {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            memory.write_bytes(mem_addr, &bytes).unwrap();
+
+            let mut cx = SyscallCtx {
+                kernel: &dispatcher.capture_one_task_context().unwrap(),
+                request: SyscallRequest::new(
+                    195,
+                    SyscallArgs::from([semid_raw as u64, 0, LINUX_SETALL, mem_addr, 0, 0]),
+                ),
+                memory: &mut memory,
+                reporter: &CompatReporter::default(),
+                thread: None,
+                execution_lease: None,
+                mm_executor: None,
+            };
+
+            // Success control: hook does not mutate permissions or remove set
+            let _guard = SetallInterleavingGuard::set(|_| {});
+
+            let outcome =
+                dispatcher.sysv_semctl(&mut cx, semid_raw, 0, LINUX_SETALL, mem_addr, &creds);
+            assert_eq!(
+                outcome.expect("outcome"),
+                DispatchOutcome::Returned { value: 0 }
+            );
+
+            // Verify values were updated
+            let current_vals = dispatcher
+                .sysv
+                .with_state(|state| {
+                    state
+                        .semaphores
+                        .get(&guest_semid)
+                        .map(|s| s.values.lock().clone())
+                })
+                .expect("semaphore set exists");
+            assert_eq!(
+                current_vals,
+                vec![111, 222],
+                "values must be updated on success"
+            );
+        }
     }
 }

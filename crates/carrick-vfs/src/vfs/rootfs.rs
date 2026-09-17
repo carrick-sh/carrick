@@ -2324,256 +2324,309 @@ mod tests {
         RootFs::from_layers(std::iter::once(LayerSource::Tar(buf))).unwrap()
     }
 
-    #[cfg(target_os = "macos")]
-    fn host_lower_vfs(lower: &std::path::Path, upper: &std::path::Path) -> RootFsVfs {
-        let rootfs = RootFs::from_immutable_host_dir(lower).unwrap();
-        let mut overlay = HostFsBackend::from_path(upper).unwrap();
-        overlay.enable_sparse_upper_fast_miss();
-        let mut vfs = RootFsVfs::with_rootfs(rootfs);
-        vfs.set_overlay(Box::new(overlay));
-        vfs
-    }
+    mod serial_host {
+        use super::*;
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn immutable_host_lower_merges_shadows_and_tombstones_without_mutation() {
-        let lower = tempfile::TempDir::new().unwrap();
-        let upper = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(lower.path().join("etc/sub")).unwrap();
-        std::fs::write(lower.path().join("etc/hosts"), b"lower-hosts\n").unwrap();
-        std::fs::write(lower.path().join("etc/sub/lower"), b"lower\n").unwrap();
-        std::os::unix::fs::symlink("hosts", lower.path().join("etc/current")).unwrap();
+        #[cfg(target_os = "macos")]
+        fn host_lower_vfs(lower: &std::path::Path, upper: &std::path::Path) -> RootFsVfs {
+            let rootfs = RootFs::from_immutable_host_dir(lower).unwrap();
+            let mut overlay = HostFsBackend::from_path(upper).unwrap();
+            overlay.enable_sparse_upper_fast_miss();
+            let mut vfs = RootFsVfs::with_rootfs(rootfs);
+            vfs.set_overlay(Box::new(overlay));
+            vfs
+        }
 
-        let vfs = host_lower_vfs(lower.path(), upper.path());
-        assert_eq!(vfs.lookup("/etc/hosts").unwrap().kind, EntryKind::File);
-        assert_eq!(
-            vfs.lookup_nofollow("/etc/current").unwrap().kind,
-            EntryKind::Symlink
-        );
-        assert_eq!(
-            vfs.readlink("/etc/current").unwrap(),
-            std::path::Path::new("hosts")
-        );
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn immutable_host_lower_merges_shadows_and_tombstones_without_mutation() {
+            let lower = tempfile::TempDir::new().unwrap();
+            let upper = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(lower.path().join("etc/sub")).unwrap();
+            std::fs::write(lower.path().join("etc/hosts"), b"lower-hosts\n").unwrap();
+            std::fs::write(lower.path().join("etc/sub/lower"), b"lower\n").unwrap();
+            std::os::unix::fs::symlink("hosts", lower.path().join("etc/current")).unwrap();
 
-        let initial: std::collections::BTreeSet<_> = vfs
-            .readdir("/etc")
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect();
-        assert_eq!(
-            initial,
-            ["current", "hosts", "sub"]
+            let vfs = host_lower_vfs(lower.path(), upper.path());
+            assert_eq!(vfs.lookup("/etc/hosts").unwrap().kind, EntryKind::File);
+            assert_eq!(
+                vfs.lookup_nofollow("/etc/current").unwrap().kind,
+                EntryKind::Symlink
+            );
+            assert_eq!(
+                vfs.readlink("/etc/current").unwrap(),
+                std::path::Path::new("hosts")
+            );
+
+            let initial: std::collections::BTreeSet<_> = vfs
+                .readdir("/etc")
+                .unwrap()
                 .into_iter()
-                .map(str::to_owned)
-                .collect()
-        );
+                .map(|entry| entry.name)
+                .collect();
+            assert_eq!(
+                initial,
+                ["current", "hosts", "sub"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            );
 
-        vfs.overlay
-            .set_file_contents("/etc/hosts", b"upper-hosts\n".to_vec())
-            .unwrap();
-        vfs.overlay
-            .set_file_contents("/etc/upper", b"upper\n".to_vec())
-            .unwrap();
-        match vfs
-            .open_for_dispatch("/etc/hosts", false, false, false, false)
-            .unwrap()
-        {
-            OpenDispatchResult::HostFile { host_fd, .. } => {
-                let mut bytes = [0_u8; 32];
-                let count = unsafe { libc::read(host_fd, bytes.as_mut_ptr().cast(), bytes.len()) };
-                unsafe { libc::close(host_fd) };
-                assert_eq!(&bytes[..count as usize], b"upper-hosts\n");
+            vfs.overlay
+                .set_file_contents("/etc/hosts", b"upper-hosts\n".to_vec())
+                .unwrap();
+            vfs.overlay
+                .set_file_contents("/etc/upper", b"upper\n".to_vec())
+                .unwrap();
+            match vfs
+                .open_for_dispatch("/etc/hosts", false, false, false, false)
+                .unwrap()
+            {
+                OpenDispatchResult::HostFile { host_fd, .. } => {
+                    let mut bytes = [0_u8; 32];
+                    let count =
+                        unsafe { libc::read(host_fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+                    unsafe { libc::close(host_fd) };
+                    assert_eq!(&bytes[..count as usize], b"upper-hosts\n");
+                }
+                _ => panic!("host upper shadow must return a host fd"),
             }
-            _ => panic!("host upper shadow must return a host fd"),
+
+            vfs.unlink("/etc/sub/lower").unwrap();
+            assert!(vfs.lookup("/etc/sub/lower").is_err());
+            assert_eq!(
+                vfs.lookup_nofollow("/etc/sub/lower"),
+                Err(LINUX_ENOENT),
+                "a sparse-upper whiteout must hide the immutable lower from lstat"
+            );
+            assert_eq!(
+                std::fs::read(lower.path().join("etc/sub/lower")).unwrap(),
+                b"lower\n",
+                "deleting the layered path must not mutate the immutable cache lower"
+            );
+            assert!(
+                vfs.readdir("/etc/sub").unwrap().is_empty(),
+                "the sparse upper tombstone must filter the lower directory entry"
+            );
         }
 
-        vfs.unlink("/etc/sub/lower").unwrap();
-        assert!(vfs.lookup("/etc/sub/lower").is_err());
-        assert_eq!(
-            vfs.lookup_nofollow("/etc/sub/lower"),
-            Err(LINUX_ENOENT),
-            "a sparse-upper whiteout must hide the immutable lower from lstat"
-        );
-        assert_eq!(
-            std::fs::read(lower.path().join("etc/sub/lower")).unwrap(),
-            b"lower\n",
-            "deleting the layered path must not mutate the immutable cache lower"
-        );
-        assert!(
-            vfs.readdir("/etc/sub").unwrap().is_empty(),
-            "the sparse upper tombstone must filter the lower directory entry"
-        );
-    }
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn sparse_upper_ancestor_whiteout_hides_the_immutable_lower_subtree() {
+            let lower = tempfile::TempDir::new().unwrap();
+            let upper = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(lower.path().join("etc/sub")).unwrap();
+            std::fs::write(lower.path().join("etc/sub/lower"), b"lower").unwrap();
+            let vfs = host_lower_vfs(lower.path(), upper.path());
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn sparse_upper_ancestor_whiteout_hides_the_immutable_lower_subtree() {
-        let lower = tempfile::TempDir::new().unwrap();
-        let upper = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(lower.path().join("etc/sub")).unwrap();
-        std::fs::write(lower.path().join("etc/sub/lower"), b"lower").unwrap();
-        let vfs = host_lower_vfs(lower.path(), upper.path());
+            vfs.overlay.mark_deleted("/etc").unwrap();
 
-        vfs.overlay.mark_deleted("/etc").unwrap();
-
-        assert_eq!(
-            vfs.lookup_nofollow("/etc/sub/lower"),
-            Err(LINUX_ENOENT),
-            "a deleted lower directory must hide every descendant"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn writable_host_lower_open_copies_up_to_a_fork_coherent_host_file() {
-        let lower = tempfile::TempDir::new().unwrap();
-        let upper = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(lower.path().join("work")).unwrap();
-        std::fs::write(lower.path().join("work/data"), b"lower-data\n").unwrap();
-
-        let first = host_lower_vfs(lower.path(), upper.path());
-        let host_fd = match first
-            .open_for_dispatch("/work/data", false, false, false, true)
-            .unwrap()
-        {
-            OpenDispatchResult::HostFile {
-                host_fd,
-                writable: true,
-                ..
-            } => host_fd,
-            _ => panic!("writable copy-up must return a real host file"),
-        };
-        assert_eq!(
-            unsafe { libc::write(host_fd, b"UPPER".as_ptr().cast(), 5) },
-            5
-        );
-        unsafe { libc::close(host_fd) };
-
-        let second = host_lower_vfs(lower.path(), upper.path());
-        let contents = second.overlay.file_contents("/work/data").unwrap();
-        assert_eq!(contents, b"UPPER-data\n");
-        assert_eq!(
-            std::fs::read(lower.path().join("work/data")).unwrap(),
-            b"lower-data\n"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn readonly_immutable_host_lower_open_keeps_a_real_host_file() {
-        let lower = tempfile::TempDir::new().unwrap();
-        let upper = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(lower.path().join("usr/lib")).unwrap();
-        std::fs::write(lower.path().join("usr/lib/cache"), b"host-cache\n").unwrap();
-
-        let vfs = host_lower_vfs(lower.path(), upper.path());
-        match vfs
-            .open_for_dispatch("/usr/lib/cache", false, false, false, false)
-            .unwrap()
-        {
-            OpenDispatchResult::HostFile {
-                host_fd,
-                writable: false,
-                ..
-            } => unsafe {
-                libc::close(host_fd);
-            },
-            _ => panic!("immutable host lower reads must preserve the host fd"),
+            assert_eq!(
+                vfs.lookup_nofollow("/etc/sub/lower"),
+                Err(LINUX_ENOENT),
+                "a deleted lower directory must hide every descendant"
+            );
         }
-        assert!(
-            !upper.path().join("usr/lib/cache").exists(),
-            "a read-only open must not copy the immutable lower into the sparse upper"
-        );
-    }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn fast_readonly_open_uses_the_immutable_lower_when_the_sparse_upper_is_absent() {
-        use std::io::Read as _;
-        use std::os::fd::AsRawFd as _;
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn writable_host_lower_open_copies_up_to_a_fork_coherent_host_file() {
+            let lower = tempfile::TempDir::new().unwrap();
+            let upper = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(lower.path().join("work")).unwrap();
+            std::fs::write(lower.path().join("work/data"), b"lower-data\n").unwrap();
 
-        let lower = tempfile::TempDir::new().unwrap();
-        let upper = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(lower.path().join("usr/lib")).unwrap();
-        std::fs::write(lower.path().join("usr/lib/cache"), b"lower-cache").unwrap();
-        let vfs = host_lower_vfs(lower.path(), upper.path());
+            let first = host_lower_vfs(lower.path(), upper.path());
+            let host_fd = match first
+                .open_for_dispatch("/work/data", false, false, false, true)
+                .unwrap()
+            {
+                OpenDispatchResult::HostFile {
+                    host_fd,
+                    writable: true,
+                    ..
+                } => host_fd,
+                _ => panic!("writable copy-up must return a real host file"),
+            };
+            assert_eq!(
+                unsafe { libc::write(host_fd, b"UPPER".as_ptr().cast(), 5) },
+                5
+            );
+            unsafe { libc::close(host_fd) };
 
-        let ImmutableHostFileOpen::Served { mut file, metadata } =
-            vfs.open_immutable_lower_readonly("/usr/lib/cache")
-        else {
-            panic!("upper-absent lower file should open directly");
-        };
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, b"lower-cache");
-        assert_eq!(metadata.kind, RootFsEntryKind::File);
-        assert_eq!(metadata.size, 11);
-        assert_eq!(
-            metadata.path,
-            std::path::Path::new("/usr/lib/cache"),
-            "a served HostFile's metadata path is the GUEST-ABSOLUTE path the fd \
+            let second = host_lower_vfs(lower.path(), upper.path());
+            let contents = second.overlay.file_contents("/work/data").unwrap();
+            assert_eq!(contents, b"UPPER-data\n");
+            assert_eq!(
+                std::fs::read(lower.path().join("work/data")).unwrap(),
+                b"lower-data\n"
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn readonly_immutable_host_lower_open_keeps_a_real_host_file() {
+            let lower = tempfile::TempDir::new().unwrap();
+            let upper = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(lower.path().join("usr/lib")).unwrap();
+            std::fs::write(lower.path().join("usr/lib/cache"), b"host-cache\n").unwrap();
+
+            let vfs = host_lower_vfs(lower.path(), upper.path());
+            match vfs
+                .open_for_dispatch("/usr/lib/cache", false, false, false, false)
+                .unwrap()
+            {
+                OpenDispatchResult::HostFile {
+                    host_fd,
+                    writable: false,
+                    ..
+                } => unsafe {
+                    libc::close(host_fd);
+                },
+                _ => panic!("immutable host lower reads must preserve the host fd"),
+            }
+            assert!(
+                !upper.path().join("usr/lib/cache").exists(),
+                "a read-only open must not copy the immutable lower into the sparse upper"
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn fast_readonly_open_uses_the_immutable_lower_when_the_sparse_upper_is_absent() {
+            use std::io::Read as _;
+            use std::os::fd::AsRawFd as _;
+
+            let lower = tempfile::TempDir::new().unwrap();
+            let upper = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(lower.path().join("usr/lib")).unwrap();
+            std::fs::write(lower.path().join("usr/lib/cache"), b"lower-cache").unwrap();
+            let vfs = host_lower_vfs(lower.path(), upper.path());
+
+            let ImmutableHostFileOpen::Served { mut file, metadata } =
+                vfs.open_immutable_lower_readonly("/usr/lib/cache")
+            else {
+                panic!("upper-absent lower file should open directly");
+            };
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"lower-cache");
+            assert_eq!(metadata.kind, RootFsEntryKind::File);
+            assert_eq!(metadata.size, 11);
+            assert_eq!(
+                metadata.path,
+                std::path::Path::new("/usr/lib/cache"),
+                "a served HostFile's metadata path is the GUEST-ABSOLUTE path the fd \
              was opened at (OpenDescription::open_path feeds it to execveat \
              AT_EMPTY_PATH); the sandbox-relative `normalize` form made fexecve \
              re-resolve against the caller's cwd"
-        );
-        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-        assert_ne!(flags, -1);
-        assert_eq!(
-            flags & libc::O_ACCMODE,
-            libc::O_RDONLY,
-            "an immutable-lower file is served with the guest's read-only access mode"
-        );
-    }
+            );
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            assert_ne!(flags, -1);
+            assert_eq!(
+                flags & libc::O_ACCMODE,
+                libc::O_RDONLY,
+                "an immutable-lower file is served with the guest's read-only access mode"
+            );
+        }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn fast_readonly_open_refuses_an_upper_shadow() {
-        let lower = tempfile::TempDir::new().unwrap();
-        let upper = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(lower.path().join("usr/lib")).unwrap();
-        std::fs::write(lower.path().join("usr/lib/cache"), b"lower-cache").unwrap();
-        let vfs = host_lower_vfs(lower.path(), upper.path());
-        vfs.overlay
-            .set_file_contents("/usr/lib/cache", b"upper-cache".to_vec())
-            .unwrap();
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn fast_readonly_open_refuses_an_upper_shadow() {
+            let lower = tempfile::TempDir::new().unwrap();
+            let upper = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(lower.path().join("usr/lib")).unwrap();
+            std::fs::write(lower.path().join("usr/lib/cache"), b"lower-cache").unwrap();
+            let vfs = host_lower_vfs(lower.path(), upper.path());
+            vfs.overlay
+                .set_file_contents("/usr/lib/cache", b"upper-cache".to_vec())
+                .unwrap();
 
-        assert!(
-            matches!(
-                vfs.open_immutable_lower_readonly("/usr/lib/cache"),
+            assert!(
+                matches!(
+                    vfs.open_immutable_lower_readonly("/usr/lib/cache"),
+                    ImmutableHostFileOpen::Fallback
+                ),
+                "a direct lower open must never bypass the writable shadow"
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn fast_readonly_open_proves_a_missing_leaf_below_a_contained_lower_directory() {
+            let lower = tempfile::TempDir::new().unwrap();
+            let upper = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(lower.path().join("usr/lib/locale")).unwrap();
+            let vfs = host_lower_vfs(lower.path(), upper.path());
+
+            assert!(matches!(
+                vfs.open_immutable_lower_readonly("/usr/lib/locale/C.UTF-8/LC_CTYPE"),
+                ImmutableHostFileOpen::Missing
+            ));
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn fast_readonly_open_does_not_infer_a_miss_through_a_lower_symlink() {
+            let lower = tempfile::TempDir::new().unwrap();
+            let upper = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(lower.path().join("real")).unwrap();
+            std::os::unix::fs::symlink("/real", lower.path().join("jump")).unwrap();
+            let vfs = host_lower_vfs(lower.path(), upper.path());
+
+            assert!(matches!(
+                vfs.open_immutable_lower_readonly("/jump/missing"),
                 ImmutableHostFileOpen::Fallback
-            ),
-            "a direct lower open must never bypass the writable shadow"
-        );
-    }
+            ));
+        }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn fast_readonly_open_proves_a_missing_leaf_below_a_contained_lower_directory() {
-        let lower = tempfile::TempDir::new().unwrap();
-        let upper = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(lower.path().join("usr/lib/locale")).unwrap();
-        let vfs = host_lower_vfs(lower.path(), upper.path());
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn rename_between_shared_lower_upper_hardlinks_keeps_both_dentries() {
+            let shared = tempfile::tempdir().unwrap();
+            std::fs::write(shared.path().join("first-link"), b"payload").unwrap();
+            std::fs::hard_link(
+                shared.path().join("first-link"),
+                shared.path().join("second-link"),
+            )
+            .unwrap();
+            let vfs = host_lower_vfs(shared.path(), shared.path());
+            let before = vfs.dentry_stat("/first-link", false).unwrap();
 
-        assert!(matches!(
-            vfs.open_immutable_lower_readonly("/usr/lib/locale/C.UTF-8/LC_CTYPE"),
-            ImmutableHostFileOpen::Missing
-        ));
-    }
+            vfs.rename_with_flags("/first-link", "/second-link", false)
+                .unwrap();
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn fast_readonly_open_does_not_infer_a_miss_through_a_lower_symlink() {
-        let lower = tempfile::TempDir::new().unwrap();
-        let upper = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(lower.path().join("real")).unwrap();
-        std::os::unix::fs::symlink("/real", lower.path().join("jump")).unwrap();
-        let vfs = host_lower_vfs(lower.path(), upper.path());
+            for path in ["/first-link", "/second-link"] {
+                let after = vfs.dentry_stat(path, false).unwrap_or_else(|errno| {
+                    panic!("{path} disappeared after no-op rename: {errno:?}")
+                });
+                assert_eq!(after.ino, before.ino);
+                assert_eq!(after.nlink, 2);
+            }
+        }
 
-        assert!(matches!(
-            vfs.open_immutable_lower_readonly("/jump/missing"),
-            ImmutableHostFileOpen::Fallback
-        ));
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn lower_layer_xattr_returns_enodata() {
+            let lower = tempfile::TempDir::new().unwrap();
+            let upper = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(lower.path().join("usr/lib")).unwrap();
+            std::fs::write(lower.path().join("usr/lib/libtest.so"), b"elf").unwrap();
+
+            let vfs = host_lower_vfs(lower.path(), upper.path());
+            assert_eq!(
+                vfs.get_xattr("/usr/lib", "user.x", true),
+                Err(carrick_abi::LINUX_ENODATA)
+            );
+            assert_eq!(
+                vfs.get_xattr("/usr/lib/libtest.so", "user.x", true),
+                Err(carrick_abi::LINUX_ENODATA)
+            );
+            assert_eq!(
+                vfs.list_xattr("/usr/lib", true).unwrap(),
+                Vec::<String>::new()
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -3366,31 +3419,6 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn rename_between_shared_lower_upper_hardlinks_keeps_both_dentries() {
-        let shared = tempfile::tempdir().unwrap();
-        std::fs::write(shared.path().join("first-link"), b"payload").unwrap();
-        std::fs::hard_link(
-            shared.path().join("first-link"),
-            shared.path().join("second-link"),
-        )
-        .unwrap();
-        let vfs = host_lower_vfs(shared.path(), shared.path());
-        let before = vfs.dentry_stat("/first-link", false).unwrap();
-
-        vfs.rename_with_flags("/first-link", "/second-link", false)
-            .unwrap();
-
-        for path in ["/first-link", "/second-link"] {
-            let after = vfs
-                .dentry_stat(path, false)
-                .unwrap_or_else(|errno| panic!("{path} disappeared after no-op rename: {errno:?}"));
-            assert_eq!(after.ino, before.ino);
-            assert_eq!(after.nlink, 2);
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
     fn rename_noreplace_between_host_hardlinks_returns_eexist_without_mutation() {
         let scratch = tempfile::tempdir().unwrap();
         let mut vfs = RootFsVfs::new();
@@ -3488,29 +3516,6 @@ mod tests {
             "contender entered during publication"
         );
         assert!(vfs.lookup("/tmp/other-renamed").is_ok());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn lower_layer_xattr_returns_enodata() {
-        let lower = tempfile::TempDir::new().unwrap();
-        let upper = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(lower.path().join("usr/lib")).unwrap();
-        std::fs::write(lower.path().join("usr/lib/libtest.so"), b"elf").unwrap();
-
-        let vfs = host_lower_vfs(lower.path(), upper.path());
-        assert_eq!(
-            vfs.get_xattr("/usr/lib", "user.x", true),
-            Err(carrick_abi::LINUX_ENODATA)
-        );
-        assert_eq!(
-            vfs.get_xattr("/usr/lib/libtest.so", "user.x", true),
-            Err(carrick_abi::LINUX_ENODATA)
-        );
-        assert_eq!(
-            vfs.list_xattr("/usr/lib", true).unwrap(),
-            Vec::<String>::new()
-        );
     }
 
     #[cfg(target_os = "macos")]

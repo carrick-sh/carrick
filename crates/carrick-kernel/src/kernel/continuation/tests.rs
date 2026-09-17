@@ -15,16 +15,6 @@ use super::test_support::*;
 use super::*;
 use crate::dispatch::SharedFutexTarget;
 
-#[cfg(test)]
-fn spawn_contained_test_child(test_name: &str, marker: &str) -> std::process::Child {
-    std::process::Command::new(std::env::current_exe().expect("test executable"))
-        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-        .env(marker, "1")
-        .stdin(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn contained test child")
-}
-
 fn block_on_timeout<F: std::future::Future>(future: F, timeout: Duration) -> Option<F::Output> {
     struct ThreadWaker(std::thread::Thread);
     impl Wake for ThreadWaker {
@@ -1816,30 +1806,6 @@ fn stale_task_mm_fd_and_registration_generations_never_wake_successors() {
             ..
         }
     ));
-}
-
-#[test]
-fn fd_wait_pins_exact_open_description_until_cleanup_and_rejects_reuse() {
-    let (_kernel, context) = bootstrap(15_225);
-    let generation = publish(&context, 0x551);
-    let authority = install_test_fd_authority(&context, 0);
-    let fds = pipe_pair();
-    let continuation = BlockedContinuation::from_dispatch_outcome(
-        DispatchOutcome::WaitOnFds {
-            fds: WaitFds::raw(vec![(fds[0], libc::POLLIN)]).with_slot_authorities(vec![authority]),
-            timeout: None,
-            sig_mask: WaitSigMask::NONE,
-            completion: FdWaitCompletion::Fd { on_timeout: 0 },
-        },
-        capture(&context, generation),
-    )
-    .expect("pin exact open description");
-    let pinned = continuation.pinned_fds_for_test();
-    assert_eq!(pinned.len(), 1);
-    close_pair(fds);
-    assert_ne!(unsafe { libc::fcntl(pinned[0], libc::F_GETFD) }, -1);
-    drop(continuation);
-    assert_eq!(unsafe { libc::fcntl(pinned[0], libc::F_GETFD) }, -1);
 }
 
 #[test]
@@ -4029,186 +3995,360 @@ fn replaced_task_waker_drops_outside_registration_locks() {
     );
 }
 
-#[test]
-fn event_future_cancelled_observation_drains_inflight_operation_safely() {
-    // A broken production lock order can deadlock irrecoverably. Contain
-    // that interleaving in an owned child so the regression itself fails
-    // with an assertion and leaves no live blocked test threads.
-    const CHILD_MARKER: &str = "CARRICK_WAIT_TERMINAL_TEST_CHILD";
-    if std::env::var_os(CHILD_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
-        let mut child = spawn_contained_test_child(
-            "kernel::continuation::tests::event_future_cancelled_observation_drains_inflight_operation_safely",
-            CHILD_MARKER,
-        );
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let status = loop {
-            if let Some(status) = child.try_wait().expect("read child status") {
-                break Some(status);
-            }
-            if Instant::now() >= deadline {
-                child.kill().expect("reap deadlocked child");
-                let status = child.wait().expect("wait for killed child");
-                eprintln!(
-                    "contained terminal-retirement child {} reaped with {status}",
-                    child.id()
-                );
-                break None;
-            }
-            thread::sleep(Duration::from_millis(10));
-        };
-        assert!(
-            status.is_some_and(|status| status.success()),
-            "production terminal-retirement child must complete successfully within its bound; child was reaped"
-        );
-        return;
+mod serial_host {
+    use super::*;
+
+    #[test]
+    fn fd_wait_pins_exact_open_description_until_cleanup_and_rejects_reuse() {
+        let (_kernel, context) = bootstrap(15_225);
+        let generation = publish(&context, 0x551);
+        let authority = install_test_fd_authority(&context, 0);
+        let fds = pipe_pair();
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::raw(vec![(fds[0], libc::POLLIN)])
+                    .with_slot_authorities(vec![authority]),
+                timeout: None,
+                sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
+            },
+            capture(&context, generation),
+        )
+        .expect("pin exact open description");
+        let pinned = continuation.pinned_fds_for_test();
+        assert_eq!(pinned.len(), 1);
+        close_pair(fds);
+        assert_ne!(unsafe { libc::fcntl(pinned[0], libc::F_GETFD) }, -1);
+        drop(continuation);
+        assert_eq!(unsafe { libc::fcntl(pinned[0], libc::F_GETFD) }, -1);
     }
-    let (kernel, context) = bootstrap(15_382);
-    let generation = publish(&context, 0x722);
-    let scheduler = Arc::new(Scheduler::new(kernel));
-    let service = CarrierWaitService::new(scheduler);
 
-    let pipe = pipe_pair();
-    let dummy = fill_pipe(pipe[1]);
+    fn spawn_contained_test_child(test_name: &str, marker: &str) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env(marker, "1")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn contained test child")
+    }
 
-    let payload = vec![9, 8, 7, 6];
-    let write = BlockingWrite::for_tests(
-        pipe[1],
-        payload.clone(),
-        0,
-        context.thread().registry_id(),
-        false,
-    )
-    .expect("write state");
-    let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        DispatchOutcome::BlockingWrite(write),
-        capture(&context, generation),
-    )
-    .expect("write continuation");
-    let mut registration = service.prepare_registration(&continuation);
-    let token = registration.wake_token();
-    service.enroll(&mut registration).expect("enroll write");
-    continuation
-        .attach_registration(registration)
-        .expect("attach registration");
+    #[test]
+    fn event_future_cancelled_observation_drains_inflight_operation_safely() {
+        // A broken production lock order can deadlock irrecoverably. Contain
+        // that interleaving in an owned child so the regression itself fails
+        // with an assertion and leaves no live blocked test threads.
+        const CHILD_MARKER: &str = "CARRICK_WAIT_TERMINAL_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let mut child = spawn_contained_test_child(
+                "kernel::continuation::tests::serial_host::event_future_cancelled_observation_drains_inflight_operation_safely",
+                CHILD_MARKER,
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("read child status") {
+                    break Some(status);
+                }
+                if Instant::now() >= deadline {
+                    child.kill().expect("reap deadlocked child");
+                    let status = child.wait().expect("wait for killed child");
+                    eprintln!(
+                        "contained terminal-retirement child {} reaped with {status}",
+                        child.id()
+                    );
+                    break None;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            assert!(
+                status.is_some_and(|status| status.success()),
+                "production terminal-retirement child must complete successfully within its bound; child was reaped"
+            );
+            return;
+        }
+        let (kernel, context) = bootstrap(15_382);
+        let generation = publish(&context, 0x722);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let service = CarrierWaitService::new(scheduler);
 
-    let (drive_started_tx, drive_started_rx) = std::sync::mpsc::sync_channel(1);
-    let (cancel_started_tx, cancel_started_rx) = std::sync::mpsc::sync_channel(1);
-    let cancel_started_rx = Arc::new(std::sync::Mutex::new(cancel_started_rx));
+        let pipe = pipe_pair();
+        let dummy = fill_pipe(pipe[1]);
 
-    service.set_inside_host_write_hook(move || {
-        let _ = drive_started_tx.send(());
-        let _ = cancel_started_rx
-            .lock()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(5));
-    });
+        let payload = vec![9, 8, 7, 6];
+        let write = BlockingWrite::for_tests(
+            pipe[1],
+            payload.clone(),
+            0,
+            context.thread().registry_id(),
+            false,
+        )
+        .expect("write state");
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::BlockingWrite(write),
+            capture(&context, generation),
+        )
+        .expect("write continuation");
+        let mut registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+        service.enroll(&mut registration).expect("enroll write");
+        continuation
+            .attach_registration(registration)
+            .expect("attach registration");
 
-    // Drain dummy bytes to wake reactor
-    drain_pipe(pipe[0], dummy.len());
-    service.nudge_reactor_for_test();
+        let (drive_started_tx, drive_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (cancel_started_tx, cancel_started_rx) = std::sync::mpsc::sync_channel(1);
+        let cancel_started_rx = Arc::new(std::sync::Mutex::new(cancel_started_rx));
 
-    drive_started_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("reactor started drive");
+        service.set_inside_host_write_hook(move || {
+            let _ = drive_started_tx.send(());
+            let _ = cancel_started_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+        });
 
-    // Cancel registration while reactor is inside hook
-    let (cancel_done_tx, cancel_done_rx) = std::sync::mpsc::sync_channel(1);
-    let cancel_thread = thread::spawn(move || {
-        let receipt = continuation.cancel(CancellationCause::ProcessExit);
-        cancel_done_tx.send(receipt).expect("send receipt");
-    });
+        // Drain dummy bytes to wake reactor
+        drain_pipe(pipe[0], dummy.len());
+        service.nudge_reactor_for_test();
 
-    // 1. Wait for bounded acknowledgment of the cancellation transition in service.state
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let gate = loop {
-        let state = service.inner.state.lock();
-        if let Some(entry) = state.entries.get(&token.continuation) {
-            if entry.state == RegistrationState::Cancelled(CancellationCause::ProcessExit) {
-                break Arc::clone(&entry.operation_gate);
+        drive_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reactor started drive");
+
+        // Cancel registration while reactor is inside hook
+        let (cancel_done_tx, cancel_done_rx) = std::sync::mpsc::sync_channel(1);
+        let cancel_thread = thread::spawn(move || {
+            let receipt = continuation.cancel(CancellationCause::ProcessExit);
+            cancel_done_tx.send(receipt).expect("send receipt");
+        });
+
+        // 1. Wait for bounded acknowledgment of the cancellation transition in service.state
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let gate = loop {
+            let state = service.inner.state.lock();
+            if let Some(entry) = state.entries.get(&token.continuation) {
+                if entry.state == RegistrationState::Cancelled(CancellationCause::ProcessExit) {
+                    break Arc::clone(&entry.operation_gate);
+                }
             }
+            if Instant::now() > deadline {
+                panic!("timed out waiting for cancellation to linearize in service.state");
+            }
+            std::thread::yield_now();
+        };
+
+        // 2. Cancellation has linearized, but cancel thread is STILL blocked on drain because reactor holds claim
+        assert!(
+            cancel_done_rx.try_recv().is_err(),
+            "cancel must block on drain while in-flight operation is active"
+        );
+
+        // 3. Verify cancellation linearization point: admission is closed, no new claims admitted
+        assert!(
+            gate.try_claim(token).is_none(),
+            "no fresh claim admitted after cancellation linearization point"
+        );
+
+        // 3. Verify event future poll is non-blocking and returns Pending while in-flight operation active
+        let mut event_future = service.event(token);
+        let noop_waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(noop_waker);
+        let poll_result = Pin::new(&mut event_future).poll(&mut cx);
+        assert!(
+            poll_result.is_pending(),
+            "poll must return Pending without blocking while in-flight operation is active"
+        );
+
+        // 4. Verify unrelated waiter progress during in-flight operation
+        let unrelated_continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_millis(1),
+                remaining: None,
+            },
+            capture(&context, generation),
+        )
+        .expect("sleep continuation");
+        let mut unrelated_reg = service.prepare_registration(&unrelated_continuation);
+        let unrelated_token = unrelated_reg.wake_token();
+        service
+            .enroll(&mut unrelated_reg)
+            .expect("enroll unrelated");
+        assert_eq!(
+            await_event(&service, unrelated_token).expect("unrelated event"),
+            ContinuationEvent::Timeout
+        );
+
+        // 5. Release hook so claim drops
+        cancel_started_tx.send(()).expect("unblock reactor drive");
+
+        let cancel_receipt = cancel_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancel completed");
+        assert_eq!(cancel_receipt.cause(), CancellationCause::ProcessExit);
+        cancel_thread.join().expect("cancel thread join");
+
+        // 6. Polling event future now returns Cancelled and removes the registration
+        let poll_result_2 = Pin::new(&mut event_future).poll(&mut cx);
+        assert!(matches!(
+            poll_result_2,
+            Poll::Ready(Err(WaitServiceError::Cancelled(
+                CancellationCause::ProcessExit
+            )))
+        ));
+        assert!(
+            !service
+                .inner
+                .state
+                .lock()
+                .entries
+                .contains_key(&token.continuation),
+            "registration removed only after quiescence"
+        );
+
+        // 7. Verify payload was written before cancel completed
+        let mut buf = vec![0u8; payload.len()];
+        let read_bytes = unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(read_bytes as usize, payload.len());
+        assert_eq!(buf, payload);
+
+        service.clear_test_hooks();
+        close_pair(pipe);
+    }
+
+    #[test]
+    fn lock_ordering_opposing_locks_rendezvous_completes_without_deadlock() {
+        // A broken production lock order can deadlock irrecoverably. Contain
+        // that interleaving in an owned child so the regression itself fails
+        // with an assertion and leaves no live blocked test threads.
+        const CHILD_MARKER: &str = "CARRICK_WAIT_LOCK_ORDER_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let mut child = spawn_contained_test_child(
+                "kernel::continuation::tests::serial_host::lock_ordering_opposing_locks_rendezvous_completes_without_deadlock",
+                CHILD_MARKER,
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("read child status") {
+                    break Some(status);
+                }
+                if Instant::now() >= deadline {
+                    child.kill().expect("reap deadlocked child");
+                    let status = child.wait().expect("wait for killed child");
+                    eprintln!(
+                        "contained lock-order child {} reaped with {status}",
+                        child.id()
+                    );
+                    break None;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            assert!(
+                status.is_some_and(|status| status.success()),
+                "production lock-order child must complete successfully within its bound; child was reaped"
+            );
+            return;
         }
-        if Instant::now() > deadline {
-            panic!("timed out waiting for cancellation to linearize in service.state");
-        }
-        std::thread::yield_now();
-    };
+        let (kernel, context) = bootstrap(15_388);
+        let generation = publish(&context, 0x728);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let service = CarrierWaitService::new(scheduler);
 
-    // 2. Cancellation has linearized, but cancel thread is STILL blocked on drain because reactor holds claim
-    assert!(
-        cancel_done_rx.try_recv().is_err(),
-        "cancel must block on drain while in-flight operation is active"
-    );
+        let pipe = pipe_pair();
+        let dummy = fill_pipe(pipe[1]);
 
-    // 3. Verify cancellation linearization point: admission is closed, no new claims admitted
-    assert!(
-        gate.try_claim(token).is_none(),
-        "no fresh claim admitted after cancellation linearization point"
-    );
+        let payload = vec![1, 2, 3, 4];
+        let write = BlockingWrite::for_tests(
+            pipe[1],
+            payload.clone(),
+            0,
+            context.thread().registry_id(),
+            false,
+        )
+        .expect("write state");
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::BlockingWrite(write),
+            capture(&context, generation),
+        )
+        .expect("write continuation");
+        let mut registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
 
-    // 3. Verify event future poll is non-blocking and returns Pending while in-flight operation active
-    let mut event_future = service.event(token);
-    let noop_waker = std::task::Waker::noop();
-    let mut cx = Context::from_waker(noop_waker);
-    let poll_result = Pin::new(&mut event_future).poll(&mut cx);
-    assert!(
-        poll_result.is_pending(),
-        "poll must return Pending without blocking while in-flight operation is active"
-    );
+        service.enroll(&mut registration).expect("enroll write");
+        continuation
+            .attach_registration(registration)
+            .expect("attach registration");
 
-    // 4. Verify unrelated waiter progress during in-flight operation
-    let unrelated_continuation = BlockedContinuation::from_dispatch_outcome(
-        DispatchOutcome::WaitOnSleep {
-            duration: Duration::from_millis(1),
-            remaining: None,
-        },
-        capture(&context, generation),
-    )
-    .expect("sleep continuation");
-    let mut unrelated_reg = service.prepare_registration(&unrelated_continuation);
-    let unrelated_token = unrelated_reg.wake_token();
-    service
-        .enroll(&mut unrelated_reg)
-        .expect("enroll unrelated");
-    assert_eq!(
-        await_event(&service, unrelated_token).expect("unrelated event"),
-        ContinuationEvent::Timeout
-    );
+        let (reactor_reached_tx, reactor_reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (reactor_unblock_tx, reactor_unblock_rx) = std::sync::mpsc::sync_channel(1);
+        let reactor_unblock_rx = Arc::new(std::sync::Mutex::new(reactor_unblock_rx));
 
-    // 5. Release hook so claim drops
-    cancel_started_tx.send(()).expect("unblock reactor drive");
+        let (recheck_reached_tx, recheck_reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (recheck_unblock_tx, recheck_unblock_rx) = std::sync::mpsc::sync_channel(1);
+        let recheck_unblock_rx = Arc::new(std::sync::Mutex::new(recheck_unblock_rx));
 
-    let cancel_receipt = cancel_done_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("cancel completed");
-    assert_eq!(cancel_receipt.cause(), CancellationCause::ProcessExit);
-    cancel_thread.join().expect("cancel thread join");
+        // 1. Real reactor hook inside drive_blocking_write while holding write lock & claim
+        service.set_inside_host_write_hook(move || {
+            let _ = reactor_reached_tx.send(());
+            let _ = reactor_unblock_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+        });
 
-    // 6. Polling event future now returns Cancelled and removes the registration
-    let poll_result_2 = Pin::new(&mut event_future).poll(&mut cx);
-    assert!(matches!(
-        poll_result_2,
-        Poll::Ready(Err(WaitServiceError::Cancelled(
-            CancellationCause::ProcessExit
-        )))
-    ));
-    assert!(
-        !service
-            .inner
-            .state
-            .lock()
-            .entries
-            .contains_key(&token.continuation),
-        "registration removed only after quiescence"
-    );
+        // 2. Recheck hook after acquiring claim, before probing write lock
+        service.set_after_recheck_claim_hook(move || {
+            let _ = recheck_reached_tx.send(());
+            let _ = recheck_unblock_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+        });
 
-    // 7. Verify payload was written before cancel completed
-    let mut buf = vec![0u8; payload.len()];
-    let read_bytes = unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) };
-    assert_eq!(read_bytes as usize, payload.len());
-    assert_eq!(buf, payload);
+        // Drain pipe so real reactor wakes and executes drive_blocking_write
+        drain_pipe(pipe[0], dummy.len());
+        service.nudge_reactor_for_test();
 
-    service.clear_test_hooks();
-    close_pair(pipe);
+        // Wait until real reactor thread is inside write lock holding OperationClaimGuard
+        reactor_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("real reactor reached inside drive hook");
+
+        // Concurrent thread runs recheck_registration while reactor is inside drive hook
+        let service_for_recheck = service.clone();
+        let recheck_thread = thread::spawn(move || {
+            let reg = ContinuationRegistration {
+                token,
+                service: Arc::downgrade(&service_for_recheck.inner),
+                enrolled: true,
+                settled: true,
+            };
+            service_for_recheck.recheck_registration(&reg)
+        });
+
+        // Acknowledge that recheck reached its claim point without deadlocking on service.state
+        recheck_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("recheck reached claim hook concurrently");
+
+        // Unblock both threads in defined order
+        recheck_unblock_tx.send(()).expect("unblock recheck");
+        reactor_unblock_tx.send(()).expect("unblock reactor");
+
+        let recheck_result = recheck_thread.join().expect("recheck join");
+        assert!(recheck_result.is_ok());
+
+        assert_eq!(
+            await_event(&service, token).expect("ready event"),
+            ContinuationEvent::Ready
+        );
+
+        let mut buf = vec![0u8; payload.len()];
+        let read_bytes = unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(read_bytes as usize, payload.len());
+        assert_eq!(buf, payload);
+
+        service.clear_test_hooks();
+        close_pair(pipe);
+    }
 }
 
 #[test]
@@ -4605,142 +4745,6 @@ fn unrelated_waiter_progress_during_concurrent_host_write() {
 
     barrier_finish.wait();
     locker_thread.join().expect("locker thread join");
-    close_pair(pipe);
-}
-
-#[test]
-fn lock_ordering_opposing_locks_rendezvous_completes_without_deadlock() {
-    // A broken production lock order can deadlock irrecoverably. Contain
-    // that interleaving in an owned child so the regression itself fails
-    // with an assertion and leaves no live blocked test threads.
-    const CHILD_MARKER: &str = "CARRICK_WAIT_LOCK_ORDER_TEST_CHILD";
-    if std::env::var_os(CHILD_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
-        let mut child = spawn_contained_test_child(
-            "kernel::continuation::tests::lock_ordering_opposing_locks_rendezvous_completes_without_deadlock",
-            CHILD_MARKER,
-        );
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let status = loop {
-            if let Some(status) = child.try_wait().expect("read child status") {
-                break Some(status);
-            }
-            if Instant::now() >= deadline {
-                child.kill().expect("reap deadlocked child");
-                let status = child.wait().expect("wait for killed child");
-                eprintln!(
-                    "contained lock-order child {} reaped with {status}",
-                    child.id()
-                );
-                break None;
-            }
-            thread::sleep(Duration::from_millis(10));
-        };
-        assert!(
-            status.is_some_and(|status| status.success()),
-            "production lock-order child must complete successfully within its bound; child was reaped"
-        );
-        return;
-    }
-    let (kernel, context) = bootstrap(15_388);
-    let generation = publish(&context, 0x728);
-    let scheduler = Arc::new(Scheduler::new(kernel));
-    let service = CarrierWaitService::new(scheduler);
-
-    let pipe = pipe_pair();
-    let dummy = fill_pipe(pipe[1]);
-
-    let payload = vec![1, 2, 3, 4];
-    let write = BlockingWrite::for_tests(
-        pipe[1],
-        payload.clone(),
-        0,
-        context.thread().registry_id(),
-        false,
-    )
-    .expect("write state");
-    let mut continuation = BlockedContinuation::from_dispatch_outcome(
-        DispatchOutcome::BlockingWrite(write),
-        capture(&context, generation),
-    )
-    .expect("write continuation");
-    let mut registration = service.prepare_registration(&continuation);
-    let token = registration.wake_token();
-
-    service.enroll(&mut registration).expect("enroll write");
-    continuation
-        .attach_registration(registration)
-        .expect("attach registration");
-
-    let (reactor_reached_tx, reactor_reached_rx) = std::sync::mpsc::sync_channel(1);
-    let (reactor_unblock_tx, reactor_unblock_rx) = std::sync::mpsc::sync_channel(1);
-    let reactor_unblock_rx = Arc::new(std::sync::Mutex::new(reactor_unblock_rx));
-
-    let (recheck_reached_tx, recheck_reached_rx) = std::sync::mpsc::sync_channel(1);
-    let (recheck_unblock_tx, recheck_unblock_rx) = std::sync::mpsc::sync_channel(1);
-    let recheck_unblock_rx = Arc::new(std::sync::Mutex::new(recheck_unblock_rx));
-
-    // 1. Real reactor hook inside drive_blocking_write while holding write lock & claim
-    service.set_inside_host_write_hook(move || {
-        let _ = reactor_reached_tx.send(());
-        let _ = reactor_unblock_rx
-            .lock()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(5));
-    });
-
-    // 2. Recheck hook after acquiring claim, before probing write lock
-    service.set_after_recheck_claim_hook(move || {
-        let _ = recheck_reached_tx.send(());
-        let _ = recheck_unblock_rx
-            .lock()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(5));
-    });
-
-    // Drain pipe so real reactor wakes and executes drive_blocking_write
-    drain_pipe(pipe[0], dummy.len());
-    service.nudge_reactor_for_test();
-
-    // Wait until real reactor thread is inside write lock holding OperationClaimGuard
-    reactor_reached_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("real reactor reached inside drive hook");
-
-    // Concurrent thread runs recheck_registration while reactor is inside drive hook
-    let service_for_recheck = service.clone();
-    let recheck_thread = thread::spawn(move || {
-        let reg = ContinuationRegistration {
-            token,
-            service: Arc::downgrade(&service_for_recheck.inner),
-            enrolled: true,
-            settled: true,
-        };
-        service_for_recheck.recheck_registration(&reg)
-    });
-
-    // Acknowledge that recheck reached its claim point without deadlocking on service.state
-    recheck_reached_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("recheck reached claim hook concurrently");
-
-    // Unblock both threads in defined order
-    recheck_unblock_tx.send(()).expect("unblock recheck");
-    reactor_unblock_tx.send(()).expect("unblock reactor");
-
-    let recheck_result = recheck_thread.join().expect("recheck join");
-    assert!(recheck_result.is_ok());
-
-    assert_eq!(
-        await_event(&service, token).expect("ready event"),
-        ContinuationEvent::Ready
-    );
-
-    let mut buf = vec![0u8; payload.len()];
-    let read_bytes = unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) };
-    assert_eq!(read_bytes as usize, payload.len());
-    assert_eq!(buf, payload);
-
-    service.clear_test_hooks();
     close_pair(pipe);
 }
 

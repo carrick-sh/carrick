@@ -4055,366 +4055,6 @@ mod tests {
     }
 
     #[test]
-    fn queued_signal_nonpositive_target_errno_depends_on_syscall_shape() {
-        use zerocopy::IntoBytes;
-
-        let _lane = crate::dispatch::HvpatchLaneScope::force(true);
-        let d = SyscallDispatcher::new();
-        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
-        let usr1 = crate::linux_abi::LINUX_SIGUSR1;
-        let siginfo = LinuxSiginfo::rt_queue(usr1, std::process::id() as i32, 0, 0x5eed_cafe);
-        memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
-        let reporter = crate::compat::CompatReporter::default();
-        let kernel = d.capture_one_task_context().unwrap();
-        let cx = crate::dispatch::SyscallCtx {
-            kernel: &kernel,
-            request: crate::dispatch::SyscallRequest::new(
-                138,
-                crate::dispatch::SyscallArgs::from([0, 0, 0, 0, 0, 0]),
-            ),
-            memory: &mut memory,
-            reporter: &reporter,
-            thread: None,
-            execution_lease: None,
-            mm_executor: None,
-        };
-
-        for tgid in [0, -1, -2] {
-            assert_eq!(
-                d.sigqueueinfo_common(&cx, tgid, tgid, usr1 as u64, GuestPtr(0x400), false,),
-                DispatchOutcome::errno(LINUX_ESRCH),
-                "rt_sigqueueinfo tgid {tgid} names no thread group"
-            );
-        }
-
-        assert_eq!(
-            d.sigqueueinfo_common(&cx, -1, -1, 65, GuestPtr(0x400), false,),
-            DispatchOutcome::errno(LINUX_ESRCH),
-            "missing rt_sigqueueinfo target must precede signal validation"
-        );
-        let absent_positive = i64::from(i32::MAX - 1);
-        assert_eq!(
-            d.sigqueueinfo_common(
-                &cx,
-                absent_positive,
-                absent_positive,
-                65,
-                GuestPtr(0x400),
-                false,
-            ),
-            DispatchOutcome::errno(LINUX_ESRCH),
-            "absent positive rt_sigqueueinfo target must precede signal validation"
-        );
-
-        let valid_id = i64::from(d.identity_pid());
-        assert_eq!(
-            d.sigqueueinfo_common(&cx, valid_id, valid_id, 65, GuestPtr(0x400), false,),
-            DispatchOutcome::errno(LINUX_EINVAL),
-            "a live rt_sigqueueinfo target must validate the signal"
-        );
-        assert_eq!(
-            d.sigqueueinfo_common(&cx, valid_id, 0, usr1 as u64, GuestPtr(0x400), true,),
-            DispatchOutcome::errno(LINUX_EINVAL),
-            "rt_tgsigqueueinfo must reject an invalid tgid independently"
-        );
-        assert_eq!(
-            d.sigqueueinfo_common(&cx, 0, valid_id, usr1 as u64, GuestPtr(0x400), true,),
-            DispatchOutcome::errno(LINUX_EINVAL),
-            "rt_tgsigqueueinfo must reject an invalid tid independently"
-        );
-    }
-
-    #[test]
-    fn queued_signal_copies_siginfo_before_validating_selector() {
-        let _lane = crate::dispatch::HvpatchLaneScope::force(true);
-        let d = SyscallDispatcher::new();
-        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
-        let reporter = crate::compat::CompatReporter::default();
-        let kernel = d.capture_one_task_context().unwrap();
-        let cx = crate::dispatch::SyscallCtx {
-            kernel: &kernel,
-            request: crate::dispatch::SyscallRequest::new(
-                138,
-                crate::dispatch::SyscallArgs::from([0, 0, 0, 0, 0, 0]),
-            ),
-            memory: &mut memory,
-            reporter: &reporter,
-            thread: None,
-            execution_lease: None,
-            mm_executor: None,
-        };
-        let bad_info = GuestPtr(0x4000);
-        let usr1 = crate::linux_abi::LINUX_SIGUSR1 as u64;
-
-        assert_eq!(
-            d.sigqueueinfo_common(&cx, -1, -1, usr1, bad_info, false),
-            DispatchOutcome::errno(LINUX_EFAULT)
-        );
-        assert_eq!(
-            d.sigqueueinfo_common(&cx, 0, 0, usr1, bad_info, true),
-            DispatchOutcome::errno(LINUX_EFAULT)
-        );
-        assert_eq!(
-            d.sigqueueinfo_common(&cx, 1, 1, 65, bad_info, false),
-            DispatchOutcome::errno(LINUX_EFAULT)
-        );
-        assert_eq!(
-            d.sigqueueinfo_common(&cx, -1, -1, usr1, GuestPtr(0), false),
-            DispatchOutcome::errno(LINUX_EFAULT)
-        );
-        assert_eq!(
-            d.sigqueueinfo_common(&cx, 0, 0, usr1, GuestPtr(0), true),
-            DispatchOutcome::errno(LINUX_EFAULT)
-        );
-    }
-
-    #[test]
-    fn retired_cross_process_sigqueue_transport_returns_esrch_without_host_fallback() {
-        use zerocopy::IntoBytes;
-
-        // `bootstrap_signal_send_as` is the subject here, and
-        // `sigqueueinfo_common` only reaches it while no HVPatch process is
-        // bound. The flag is carrier-global and never clears, so pin it rather
-        // than inherit whatever an earlier test in this binary left behind.
-        let _lane = crate::dispatch::HvpatchLaneScope::force(false);
-        let _g = XSIG_RING_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert!(
-            !crate::namespace::pid::enabled(),
-            "the regression is the ordinary non-namespaced route"
-        );
-
-        carrick_signal_core::xsig::xsig_init();
-        let me = std::process::id() as i32;
-        let usr1 = crate::linux_abi::LINUX_SIGUSR1;
-        let _ = carrick_signal_core::xsig::xsig_drain_for_self();
-        // Fill with null signals so parallel signal-wait tests cannot observe
-        // this capacity fixture as deliverable pending work.
-        for slot in 0..256 {
-            assert!(
-                carrick_signal_core::xsig::xsig_enqueue(
-                    me,
-                    0,
-                    crate::linux_abi::LINUX_SI_QUEUE,
-                    slot,
-                    0,
-                    i64::from(slot),
-                    0,
-                ),
-                "ring slot {slot} must be available"
-            );
-        }
-        assert!(
-            !carrick_signal_core::xsig::xsig_enqueue(
-                me,
-                0,
-                crate::linux_abi::LINUX_SI_QUEUE,
-                999,
-                0,
-                0,
-                0,
-            ),
-            "the regression requires a full ring"
-        );
-
-        let child_pid = i64::from(i32::MAX - 1);
-        assert!(
-            !should_route_specific_xsig(child_pid as i32, usr1),
-            "plain kill policy deliberately keeps ordinary SIGUSR1 off the ring"
-        );
-
-        let d = SyscallDispatcher::new();
-        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
-        let reporter = crate::compat::CompatReporter::default();
-        let siginfo = LinuxSiginfo::rt_queue(usr1, me, 0, 0x5eed_cafe);
-        memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
-        let kernel = d.capture_one_task_context().unwrap();
-        let cx = crate::dispatch::SyscallCtx {
-            kernel: &kernel,
-            request: crate::dispatch::SyscallRequest::new(
-                138,
-                crate::dispatch::SyscallArgs::from([child_pid as u64, usr1 as u64, 0x400, 0, 0, 0]),
-            ),
-            memory: &mut memory,
-            reporter: &reporter,
-            thread: None,
-            execution_lease: None,
-            mm_executor: None,
-        };
-        let outcome = d.sigqueueinfo_common(
-            &cx,
-            child_pid,
-            child_pid,
-            usr1 as u64,
-            GuestPtr(0x400),
-            false,
-        );
-
-        let _ = carrick_signal_core::xsig::xsig_drain_for_self();
-
-        assert_eq!(
-            outcome,
-            DispatchOutcome::errno(LINUX_ESRCH),
-            "an unresolved logical task must never fall back to a host process transport"
-        );
-    }
-
-    #[test]
-    fn cross_process_sigqueue_checks_guest_credentials_before_ring_capacity() {
-        use std::os::unix::fs::PermissionsExt as _;
-        use zerocopy::IntoBytes;
-
-        // `bootstrap_signal_send_as` is the subject here, and
-        // `sigqueueinfo_common` only reaches it while no HVPatch process is
-        // bound. The flag is carrier-global and never clears, so pin it rather
-        // than inherit whatever an earlier test in this binary left behind.
-        let _lane = crate::dispatch::HvpatchLaneScope::force(false);
-        let _g = XSIG_RING_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert!(
-            !crate::namespace::pid::enabled(),
-            "the regression is the ordinary non-namespaced route"
-        );
-
-        carrick_signal_core::xsig::xsig_init();
-        let me = std::process::id() as i32;
-        let usr1 = crate::linux_abi::LINUX_SIGUSR1;
-        let _ = carrick_signal_core::xsig::xsig_drain_for_self();
-        // Null-signal entries consume capacity without waking parallel waiters.
-        for slot in 0..256 {
-            assert!(carrick_signal_core::xsig::xsig_enqueue(
-                me,
-                0,
-                crate::linux_abi::LINUX_SI_QUEUE,
-                slot,
-                0,
-                i64::from(slot),
-                0,
-            ));
-        }
-
-        // Reuse the already-existing test harness parent as a liveness witness;
-        // this regression must not create a host child merely to exercise the
-        // retired test-only credential adapter.
-        let child_pid = i64::from(unsafe { libc::getppid() });
-        let target_euid = carrick_abi::NsUid::new(2000);
-        let cred_path = std::path::PathBuf::from(format!("/tmp/carrick-cred-{child_pid}"));
-        let _ = std::fs::remove_file(&cred_path);
-        std::fs::write(&cred_path, target_euid.raw().to_le_bytes())
-            .expect("publish target guest euid");
-        let mut permissions = std::fs::metadata(&cred_path)
-            .expect("read target cred metadata")
-            .permissions();
-        permissions.set_mode(0o600);
-        std::fs::set_permissions(&cred_path, permissions).expect("secure target cred fixture");
-        let published_euid = crate::cred_ipc::read_target(child_pid as i32);
-
-        let d = SyscallDispatcher::new();
-        d.set_credentials(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000));
-        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
-        let reporter = crate::compat::CompatReporter::default();
-        let siginfo = LinuxSiginfo::rt_queue(usr1, me, 1000, 0x5eed_cafe);
-        memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
-        let kernel = d.capture_one_task_context().unwrap();
-        let cx = crate::dispatch::SyscallCtx {
-            kernel: &kernel,
-            request: crate::dispatch::SyscallRequest::new(
-                138,
-                crate::dispatch::SyscallArgs::from([child_pid as u64, usr1 as u64, 0x400, 0, 0, 0]),
-            ),
-            memory: &mut memory,
-            reporter: &reporter,
-            thread: None,
-            execution_lease: None,
-            mm_executor: None,
-        };
-        let outcome = d.sigqueueinfo_common(
-            &cx,
-            child_pid,
-            child_pid,
-            usr1 as u64,
-            GuestPtr(0x400),
-            false,
-        );
-
-        let _ = std::fs::remove_file(cred_path);
-        let _ = carrick_signal_core::xsig::xsig_drain_for_self();
-
-        assert_eq!(published_euid, Some(target_euid));
-        assert_eq!(
-            outcome,
-            DispatchOutcome::errno(LINUX_EPERM),
-            "guest credential denial must precede ring-full EAGAIN"
-        );
-    }
-
-    #[test]
-    fn cross_process_sigqueue_signal_zero_checks_guest_credentials() {
-        use std::os::unix::fs::PermissionsExt as _;
-        use zerocopy::IntoBytes;
-
-        // `bootstrap_signal_send_as` is the subject here, and
-        // `sigqueueinfo_common` only reaches it while no HVPatch process is
-        // bound. The flag is carrier-global and never clears, so pin it rather
-        // than inherit whatever an earlier test in this binary left behind.
-        let _lane = crate::dispatch::HvpatchLaneScope::force(false);
-        let _g = XSIG_RING_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        assert!(
-            !crate::namespace::pid::enabled(),
-            "the regression is the ordinary non-namespaced route"
-        );
-
-        // Reuse the already-existing test harness parent as a liveness witness;
-        // no Carrick-created host child belongs in this retired adapter test.
-        let child_pid = i64::from(unsafe { libc::getppid() });
-        let target_euid = carrick_abi::NsUid::new(2000);
-        let cred_path = std::path::PathBuf::from(format!("/tmp/carrick-cred-{child_pid}"));
-        let _ = std::fs::remove_file(&cred_path);
-        std::fs::write(&cred_path, target_euid.raw().to_le_bytes())
-            .expect("publish target guest euid");
-        let mut permissions = std::fs::metadata(&cred_path)
-            .expect("read target cred metadata")
-            .permissions();
-        permissions.set_mode(0o600);
-        std::fs::set_permissions(&cred_path, permissions).expect("secure target cred fixture");
-        let published_euid = crate::cred_ipc::read_target(child_pid as i32);
-
-        let d = SyscallDispatcher::new();
-        d.set_credentials(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000));
-        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
-        let siginfo = LinuxSiginfo::rt_queue(0, std::process::id() as i32, 1000, 0);
-        memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
-        let reporter = crate::compat::CompatReporter::default();
-        let kernel = d.capture_one_task_context().unwrap();
-        let cx = crate::dispatch::SyscallCtx {
-            kernel: &kernel,
-            request: crate::dispatch::SyscallRequest::new(
-                138,
-                crate::dispatch::SyscallArgs::from([child_pid as u64, 0, 0, 0, 0, 0]),
-            ),
-            memory: &mut memory,
-            reporter: &reporter,
-            thread: None,
-            execution_lease: None,
-            mm_executor: None,
-        };
-        let outcome = d.sigqueueinfo_common(&cx, child_pid, child_pid, 0, GuestPtr(0x400), false);
-
-        let _ = std::fs::remove_file(cred_path);
-        assert_eq!(published_euid, Some(target_euid));
-        assert_eq!(
-            outcome,
-            DispatchOutcome::errno(LINUX_EPERM),
-            "signal 0 must apply the guest credential permission check"
-        );
-    }
-
-    #[test]
     fn rt_signals_queue_while_standard_signals_coalesce() {
         let d = SyscallDispatcher::new();
         let tid = d.capture_one_task_context().unwrap().thread().registry_id();
@@ -5509,59 +5149,6 @@ mod tests {
     }
 
     #[test]
-    fn sigqueueinfo_payload_uses_resolved_guest_main_thread_key() {
-        use zerocopy::IntoBytes;
-        // `bootstrap_signal_send_as` is the subject here, and
-        // `sigqueueinfo_common` only reaches it while no HVPatch process is
-        // bound. The flag is carrier-global and never clears, so pin it rather
-        // than inherit whatever an earlier test in this binary left behind.
-        let _lane = crate::dispatch::HvpatchLaneScope::force(false);
-        let d = SyscallDispatcher::new();
-        let kernel = d.capture_one_task_context().unwrap();
-        let main = kernel.thread().registry_id();
-        let registry = crate::thread::ThreadRegistry::new(main);
-        let caller = registry.register_child(0);
-        d.register_one_task_thread(&kernel, caller).unwrap();
-        let futex = crate::thread::FutexTable::new();
-        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
-        let reporter = crate::compat::CompatReporter::default();
-        let guest_main_tid = i64::from(std::process::id());
-        let siginfo = LinuxSiginfo::rt_queue(34, 1234, 0, 0x00ca_fe42);
-        memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
-        let cx = crate::dispatch::SyscallCtx {
-            kernel: &kernel,
-            request: crate::dispatch::SyscallRequest::new(
-                129,
-                crate::dispatch::SyscallArgs::from([guest_main_tid as u64, 34, 0x400, 0, 0, 0]),
-            ),
-            memory: &mut memory,
-            reporter: &reporter,
-            thread: Some(crate::dispatch::ThreadCtx {
-                tid: caller,
-                registry: &registry,
-                futex: &futex,
-            }),
-            execution_lease: None,
-            mm_executor: None,
-        };
-        let routed = d.sigqueueinfo_common(
-            &cx,
-            guest_main_tid,
-            guest_main_tid,
-            34,
-            GuestPtr(0x400),
-            false,
-        );
-        assert!(
-            matches!(routed, crate::dispatch::DispatchOutcome::SignalThread { tid, signum, .. } if tid == main && signum == 34)
-        );
-        let queued = d
-            .take_pending_siginfo(&d.exact_signal_context_for_test(), main, 34)
-            .unwrap();
-        assert_eq!(queued._pad[0..8], siginfo._pad[0..8]);
-    }
-
-    #[test]
     fn clone_thread_inherits_signal_mask_without_pending_or_altstack() {
         let d = SyscallDispatcher::new();
         let parent_context = d.capture_one_task_context().unwrap();
@@ -5838,5 +5425,437 @@ mod tests {
             context.thread().signal_state().armed_restore_mask(),
             Some(original)
         );
+    }
+
+    mod serial_host {
+        use super::*;
+
+        #[test]
+        fn queued_signal_nonpositive_target_errno_depends_on_syscall_shape() {
+            use zerocopy::IntoBytes;
+
+            let _lane = crate::dispatch::HvpatchLaneScope::force(true);
+            let d = SyscallDispatcher::new();
+            let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
+            let usr1 = crate::linux_abi::LINUX_SIGUSR1;
+            let siginfo = LinuxSiginfo::rt_queue(usr1, std::process::id() as i32, 0, 0x5eed_cafe);
+            memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
+            let reporter = crate::compat::CompatReporter::default();
+            let kernel = d.capture_one_task_context().unwrap();
+            let cx = crate::dispatch::SyscallCtx {
+                kernel: &kernel,
+                request: crate::dispatch::SyscallRequest::new(
+                    138,
+                    crate::dispatch::SyscallArgs::from([0, 0, 0, 0, 0, 0]),
+                ),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: None,
+                mm_executor: None,
+            };
+
+            for tgid in [0, -1, -2] {
+                assert_eq!(
+                    d.sigqueueinfo_common(&cx, tgid, tgid, usr1 as u64, GuestPtr(0x400), false,),
+                    DispatchOutcome::errno(LINUX_ESRCH),
+                    "rt_sigqueueinfo tgid {tgid} names no thread group"
+                );
+            }
+
+            assert_eq!(
+                d.sigqueueinfo_common(&cx, -1, -1, 65, GuestPtr(0x400), false,),
+                DispatchOutcome::errno(LINUX_ESRCH),
+                "missing rt_sigqueueinfo target must precede signal validation"
+            );
+            let absent_positive = i64::from(i32::MAX - 1);
+            assert_eq!(
+                d.sigqueueinfo_common(
+                    &cx,
+                    absent_positive,
+                    absent_positive,
+                    65,
+                    GuestPtr(0x400),
+                    false,
+                ),
+                DispatchOutcome::errno(LINUX_ESRCH),
+                "absent positive rt_sigqueueinfo target must precede signal validation"
+            );
+
+            let valid_id = i64::from(d.identity_pid());
+            assert_eq!(
+                d.sigqueueinfo_common(&cx, valid_id, valid_id, 65, GuestPtr(0x400), false,),
+                DispatchOutcome::errno(LINUX_EINVAL),
+                "a live rt_sigqueueinfo target must validate the signal"
+            );
+            assert_eq!(
+                d.sigqueueinfo_common(&cx, valid_id, 0, usr1 as u64, GuestPtr(0x400), true,),
+                DispatchOutcome::errno(LINUX_EINVAL),
+                "rt_tgsigqueueinfo must reject an invalid tgid independently"
+            );
+            assert_eq!(
+                d.sigqueueinfo_common(&cx, 0, valid_id, usr1 as u64, GuestPtr(0x400), true,),
+                DispatchOutcome::errno(LINUX_EINVAL),
+                "rt_tgsigqueueinfo must reject an invalid tid independently"
+            );
+        }
+
+        #[test]
+        fn queued_signal_copies_siginfo_before_validating_selector() {
+            let _lane = crate::dispatch::HvpatchLaneScope::force(true);
+            let d = SyscallDispatcher::new();
+            let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
+            let reporter = crate::compat::CompatReporter::default();
+            let kernel = d.capture_one_task_context().unwrap();
+            let cx = crate::dispatch::SyscallCtx {
+                kernel: &kernel,
+                request: crate::dispatch::SyscallRequest::new(
+                    138,
+                    crate::dispatch::SyscallArgs::from([0, 0, 0, 0, 0, 0]),
+                ),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: None,
+                mm_executor: None,
+            };
+            let bad_info = GuestPtr(0x4000);
+            let usr1 = crate::linux_abi::LINUX_SIGUSR1 as u64;
+
+            assert_eq!(
+                d.sigqueueinfo_common(&cx, -1, -1, usr1, bad_info, false),
+                DispatchOutcome::errno(LINUX_EFAULT)
+            );
+            assert_eq!(
+                d.sigqueueinfo_common(&cx, 0, 0, usr1, bad_info, true),
+                DispatchOutcome::errno(LINUX_EFAULT)
+            );
+            assert_eq!(
+                d.sigqueueinfo_common(&cx, 1, 1, 65, bad_info, false),
+                DispatchOutcome::errno(LINUX_EFAULT)
+            );
+            assert_eq!(
+                d.sigqueueinfo_common(&cx, -1, -1, usr1, GuestPtr(0), false),
+                DispatchOutcome::errno(LINUX_EFAULT)
+            );
+            assert_eq!(
+                d.sigqueueinfo_common(&cx, 0, 0, usr1, GuestPtr(0), true),
+                DispatchOutcome::errno(LINUX_EFAULT)
+            );
+        }
+
+        #[test]
+        fn retired_cross_process_sigqueue_transport_returns_esrch_without_host_fallback() {
+            use zerocopy::IntoBytes;
+
+            // `bootstrap_signal_send_as` is the subject here, and
+            // `sigqueueinfo_common` only reaches it while no HVPatch process is
+            // bound. The flag is carrier-global and never clears, so pin it rather
+            // than inherit whatever an earlier test in this binary left behind.
+            let _lane = crate::dispatch::HvpatchLaneScope::force(false);
+            let _g = XSIG_RING_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !crate::namespace::pid::enabled(),
+                "the regression is the ordinary non-namespaced route"
+            );
+
+            carrick_signal_core::xsig::xsig_init();
+            let me = std::process::id() as i32;
+            let usr1 = crate::linux_abi::LINUX_SIGUSR1;
+            let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+            // Fill with null signals so parallel signal-wait tests cannot observe
+            // this capacity fixture as deliverable pending work.
+            for slot in 0..256 {
+                assert!(
+                    carrick_signal_core::xsig::xsig_enqueue(
+                        me,
+                        0,
+                        crate::linux_abi::LINUX_SI_QUEUE,
+                        slot,
+                        0,
+                        i64::from(slot),
+                        0,
+                    ),
+                    "ring slot {slot} must be available"
+                );
+            }
+            assert!(
+                !carrick_signal_core::xsig::xsig_enqueue(
+                    me,
+                    0,
+                    crate::linux_abi::LINUX_SI_QUEUE,
+                    999,
+                    0,
+                    0,
+                    0,
+                ),
+                "the regression requires a full ring"
+            );
+
+            let child_pid = i64::from(i32::MAX - 1);
+            assert!(
+                !should_route_specific_xsig(child_pid as i32, usr1),
+                "plain kill policy deliberately keeps ordinary SIGUSR1 off the ring"
+            );
+
+            let d = SyscallDispatcher::new();
+            let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
+            let reporter = crate::compat::CompatReporter::default();
+            let siginfo = LinuxSiginfo::rt_queue(usr1, me, 0, 0x5eed_cafe);
+            memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
+            let kernel = d.capture_one_task_context().unwrap();
+            let cx = crate::dispatch::SyscallCtx {
+                kernel: &kernel,
+                request: crate::dispatch::SyscallRequest::new(
+                    138,
+                    crate::dispatch::SyscallArgs::from([
+                        child_pid as u64,
+                        usr1 as u64,
+                        0x400,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: None,
+                mm_executor: None,
+            };
+            let outcome = d.sigqueueinfo_common(
+                &cx,
+                child_pid,
+                child_pid,
+                usr1 as u64,
+                GuestPtr(0x400),
+                false,
+            );
+
+            let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+
+            assert_eq!(
+                outcome,
+                DispatchOutcome::errno(LINUX_ESRCH),
+                "an unresolved logical task must never fall back to a host process transport"
+            );
+        }
+
+        #[test]
+        fn cross_process_sigqueue_checks_guest_credentials_before_ring_capacity() {
+            use std::os::unix::fs::PermissionsExt as _;
+            use zerocopy::IntoBytes;
+
+            // `bootstrap_signal_send_as` is the subject here, and
+            // `sigqueueinfo_common` only reaches it while no HVPatch process is
+            // bound. The flag is carrier-global and never clears, so pin it rather
+            // than inherit whatever an earlier test in this binary left behind.
+            let _lane = crate::dispatch::HvpatchLaneScope::force(false);
+            let _g = XSIG_RING_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !crate::namespace::pid::enabled(),
+                "the regression is the ordinary non-namespaced route"
+            );
+
+            carrick_signal_core::xsig::xsig_init();
+            let me = std::process::id() as i32;
+            let usr1 = crate::linux_abi::LINUX_SIGUSR1;
+            let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+            // Null-signal entries consume capacity without waking parallel waiters.
+            for slot in 0..256 {
+                assert!(carrick_signal_core::xsig::xsig_enqueue(
+                    me,
+                    0,
+                    crate::linux_abi::LINUX_SI_QUEUE,
+                    slot,
+                    0,
+                    i64::from(slot),
+                    0,
+                ));
+            }
+
+            // Reuse the already-existing test harness parent as a liveness witness;
+            // this regression must not create a host child merely to exercise the
+            // retired test-only credential adapter.
+            let child_pid = i64::from(unsafe { libc::getppid() });
+            let target_euid = carrick_abi::NsUid::new(2000);
+            let cred_path = std::path::PathBuf::from(format!("/tmp/carrick-cred-{child_pid}"));
+            let _ = std::fs::remove_file(&cred_path);
+            std::fs::write(&cred_path, target_euid.raw().to_le_bytes())
+                .expect("publish target guest euid");
+            let mut permissions = std::fs::metadata(&cred_path)
+                .expect("read target cred metadata")
+                .permissions();
+            permissions.set_mode(0o600);
+            std::fs::set_permissions(&cred_path, permissions).expect("secure target cred fixture");
+            let published_euid = crate::cred_ipc::read_target(child_pid as i32);
+
+            let d = SyscallDispatcher::new();
+            d.set_credentials(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000));
+            let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
+            let reporter = crate::compat::CompatReporter::default();
+            let siginfo = LinuxSiginfo::rt_queue(usr1, me, 1000, 0x5eed_cafe);
+            memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
+            let kernel = d.capture_one_task_context().unwrap();
+            let cx = crate::dispatch::SyscallCtx {
+                kernel: &kernel,
+                request: crate::dispatch::SyscallRequest::new(
+                    138,
+                    crate::dispatch::SyscallArgs::from([
+                        child_pid as u64,
+                        usr1 as u64,
+                        0x400,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: None,
+                mm_executor: None,
+            };
+            let outcome = d.sigqueueinfo_common(
+                &cx,
+                child_pid,
+                child_pid,
+                usr1 as u64,
+                GuestPtr(0x400),
+                false,
+            );
+
+            let _ = std::fs::remove_file(cred_path);
+            let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+
+            assert_eq!(published_euid, Some(target_euid));
+            assert_eq!(
+                outcome,
+                DispatchOutcome::errno(LINUX_EPERM),
+                "guest credential denial must precede ring-full EAGAIN"
+            );
+        }
+
+        #[test]
+        fn cross_process_sigqueue_signal_zero_checks_guest_credentials() {
+            use std::os::unix::fs::PermissionsExt as _;
+            use zerocopy::IntoBytes;
+
+            // `bootstrap_signal_send_as` is the subject here, and
+            // `sigqueueinfo_common` only reaches it while no HVPatch process is
+            // bound. The flag is carrier-global and never clears, so pin it rather
+            // than inherit whatever an earlier test in this binary left behind.
+            let _lane = crate::dispatch::HvpatchLaneScope::force(false);
+            let _g = XSIG_RING_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            assert!(
+                !crate::namespace::pid::enabled(),
+                "the regression is the ordinary non-namespaced route"
+            );
+
+            // Reuse the already-existing test harness parent as a liveness witness;
+            // no Carrick-created host child belongs in this retired adapter test.
+            let child_pid = i64::from(unsafe { libc::getppid() });
+            let target_euid = carrick_abi::NsUid::new(2000);
+            let cred_path = std::path::PathBuf::from(format!("/tmp/carrick-cred-{child_pid}"));
+            let _ = std::fs::remove_file(&cred_path);
+            std::fs::write(&cred_path, target_euid.raw().to_le_bytes())
+                .expect("publish target guest euid");
+            let mut permissions = std::fs::metadata(&cred_path)
+                .expect("read target cred metadata")
+                .permissions();
+            permissions.set_mode(0o600);
+            std::fs::set_permissions(&cred_path, permissions).expect("secure target cred fixture");
+            let published_euid = crate::cred_ipc::read_target(child_pid as i32);
+
+            let d = SyscallDispatcher::new();
+            d.set_credentials(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000));
+            let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
+            let siginfo = LinuxSiginfo::rt_queue(0, std::process::id() as i32, 1000, 0);
+            memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
+            let reporter = crate::compat::CompatReporter::default();
+            let kernel = d.capture_one_task_context().unwrap();
+            let cx = crate::dispatch::SyscallCtx {
+                kernel: &kernel,
+                request: crate::dispatch::SyscallRequest::new(
+                    138,
+                    crate::dispatch::SyscallArgs::from([child_pid as u64, 0, 0, 0, 0, 0]),
+                ),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: None,
+                mm_executor: None,
+            };
+            let outcome =
+                d.sigqueueinfo_common(&cx, child_pid, child_pid, 0, GuestPtr(0x400), false);
+
+            let _ = std::fs::remove_file(cred_path);
+            assert_eq!(published_euid, Some(target_euid));
+            assert_eq!(
+                outcome,
+                DispatchOutcome::errno(LINUX_EPERM),
+                "signal 0 must apply the guest credential permission check"
+            );
+        }
+
+        #[test]
+        fn sigqueueinfo_payload_uses_resolved_guest_main_thread_key() {
+            use zerocopy::IntoBytes;
+            // `bootstrap_signal_send_as` is the subject here, and
+            // `sigqueueinfo_common` only reaches it while no HVPatch process is
+            // bound. The flag is carrier-global and never clears, so pin it rather
+            // than inherit whatever an earlier test in this binary left behind.
+            let _lane = crate::dispatch::HvpatchLaneScope::force(false);
+            let d = SyscallDispatcher::new();
+            let kernel = d.capture_one_task_context().unwrap();
+            let main = kernel.thread().registry_id();
+            let registry = crate::thread::ThreadRegistry::new(main);
+            let caller = registry.register_child(0);
+            d.register_one_task_thread(&kernel, caller).unwrap();
+            let futex = crate::thread::FutexTable::new();
+            let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
+            let reporter = crate::compat::CompatReporter::default();
+            let guest_main_tid = i64::from(std::process::id());
+            let siginfo = LinuxSiginfo::rt_queue(34, 1234, 0, 0x00ca_fe42);
+            memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
+            let cx = crate::dispatch::SyscallCtx {
+                kernel: &kernel,
+                request: crate::dispatch::SyscallRequest::new(
+                    129,
+                    crate::dispatch::SyscallArgs::from([guest_main_tid as u64, 34, 0x400, 0, 0, 0]),
+                ),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: Some(crate::dispatch::ThreadCtx {
+                    tid: caller,
+                    registry: &registry,
+                    futex: &futex,
+                }),
+                execution_lease: None,
+                mm_executor: None,
+            };
+            let routed = d.sigqueueinfo_common(
+                &cx,
+                guest_main_tid,
+                guest_main_tid,
+                34,
+                GuestPtr(0x400),
+                false,
+            );
+            assert!(
+                matches!(routed, crate::dispatch::DispatchOutcome::SignalThread { tid, signum, .. } if tid == main && signum == 34)
+            );
+            let queued = d
+                .take_pending_siginfo(&d.exact_signal_context_for_test(), main, 34)
+                .unwrap();
+            assert_eq!(queued._pad[0..8], siginfo._pad[0..8]);
+        }
     }
 }

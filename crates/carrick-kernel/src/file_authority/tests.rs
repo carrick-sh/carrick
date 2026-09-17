@@ -1880,42 +1880,6 @@ fn direct_transports_transfer_scoped_host_capability_leases() {
     host_capability_lease_model(Harness::new(), CapabilityLeaseDisposition::Abort);
 }
 
-fn rejected_host_adoption_closes_transferred_capability(mut harness: Harness) {
-    let table = harness.create_table();
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let owned: OwnedFd = std::fs::File::open(directory.path())
-        .expect("open directory")
-        .into();
-    let raw = owned.as_raw_fd();
-    let request = harness.request(
-        Command::AdoptHostFileAndInstall {
-            table,
-            minimum: fd(3),
-            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
-            descriptor_flags: DescriptorFlags::NONE,
-            access_mode: AccessMode::ReadOnly,
-            status_flags: StatusFlags::default(),
-            writable: false,
-            path: None,
-        },
-        ObjectGeneration::INITIAL,
-    );
-    let reply = harness
-        .transact(request, vec![owned])
-        .expect("rejected adoption response");
-    assert_eq!(
-        reply.response.outcome,
-        Outcome::Rejected(AuthorityError::HostBackingTypeMismatch)
-    );
-    assert!(reply.capabilities.is_empty());
-    assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
-}
-
-#[test]
-fn rejected_direct_adoptions_close_transferred_capabilities() {
-    rejected_host_adoption_closes_transferred_capability(Harness::new());
-}
-
 fn client_exit_reclaims_owned_capability_leases(mut owner: Harness) {
     let mut observer = owner.peer(2, 1002, 1);
     let table = owner.create_table();
@@ -4153,4 +4117,44 @@ fn canonical_pipe_capacity_outcome_carries_exact_description_id_and_published_re
     );
     assert_eq!(desc.revision_for_test(), description_revision);
     assert_eq!(fixture.capacity(), 262_144);
+}
+
+mod serial_host {
+    use super::*;
+
+    fn rejected_host_adoption_closes_transferred_capability(mut harness: Harness) {
+        let table = harness.create_table();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let owned: OwnedFd = std::fs::File::open(directory.path())
+            .expect("open directory")
+            .into();
+        let raw = owned.as_raw_fd();
+        let request = harness.request(
+            Command::AdoptHostFileAndInstall {
+                table,
+                minimum: fd(3),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+                descriptor_flags: DescriptorFlags::NONE,
+                access_mode: AccessMode::ReadOnly,
+                status_flags: StatusFlags::default(),
+                writable: false,
+                path: None,
+            },
+            ObjectGeneration::INITIAL,
+        );
+        let reply = harness
+            .transact(request, vec![owned])
+            .expect("rejected adoption response");
+        assert_eq!(
+            reply.response.outcome,
+            Outcome::Rejected(AuthorityError::HostBackingTypeMismatch)
+        );
+        assert!(reply.capabilities.is_empty());
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+    }
+
+    #[test]
+    fn rejected_direct_adoptions_close_transferred_capabilities() {
+        rejected_host_adoption_closes_transferred_capability(Harness::new());
+    }
 }

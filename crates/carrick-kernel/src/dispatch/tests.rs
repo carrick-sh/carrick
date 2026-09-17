@@ -378,21 +378,6 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         assert!(write.sigpipe_on_epipe());
     }
 
-    fn child_can_acquire_classic_write_lock(host_fd: i32) -> bool {
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork lock observer");
-        if child == 0 {
-            let mut lock = unsafe { std::mem::zeroed::<libc::flock>() };
-            lock.l_type = libc::F_WRLCK as _;
-            lock.l_whence = libc::SEEK_SET as _;
-            let result = unsafe { libc::fcntl(host_fd, libc::F_SETLK, &raw mut lock) };
-            unsafe { libc::_exit(i32::from(result < 0)) };
-        }
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
-    }
-
     #[test]
     fn kernel_exec_publication_filters_cloexec_descriptors() {
         let dispatcher = SyscallDispatcher::new();
@@ -424,51 +409,142 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         assert!(!dispatcher.fd_is_valid(cloexec_fd));
     }
 
-    #[test]
-    fn non_cloexec_classic_record_lock_survives_exec_transfer() {
-        let dispatcher = SyscallDispatcher::new();
-        let named = tempfile::NamedTempFile::new().unwrap();
-        let host_fd = std::os::fd::IntoRawFd::into_raw_fd(named.reopen().unwrap());
-        let observer_fd = std::os::fd::IntoRawFd::into_raw_fd(named.reopen().unwrap());
-        let mut lock = unsafe { std::mem::zeroed::<libc::flock>() };
-        lock.l_type = libc::F_WRLCK as _;
-        lock.l_whence = libc::SEEK_SET as _;
-        assert_eq!(
-            unsafe { libc::fcntl(host_fd, libc::F_SETLK, &raw mut lock) },
-            0
-        );
-        let description = kernel_file_description(
-            Arc::new(RwLock::new(OpenDescription::HostFile {
-                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
-                host_fd: HostFdRef::new(host_fd),
-                metadata: RootFsMetadata {
-                    path: std::path::PathBuf::from("/tmp/exec-lock"),
-                    kind: RootFsEntryKind::File,
-                    mode: 0o600,
-                    size: 0,
-                },
-                writable: true,
-            })),
-            crate::linux_abi::LINUX_O_RDWR,
-        );
-        let fd = dispatcher
-            .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), 0))
-            .unwrap();
-        assert!(!child_can_acquire_classic_write_lock(observer_fd));
+    mod serial_host {
+        use super::*;
 
-        let context = dispatcher.capture_one_task_context().unwrap();
-        let prepared = dispatcher.prepare_one_task_kernel_exec(&context).unwrap();
-        dispatcher.commit_one_task_kernel_exec(prepared).unwrap();
-        assert!(!child_can_acquire_classic_write_lock(observer_fd));
+        fn child_can_acquire_classic_write_lock(host_fd: i32) -> bool {
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0, "fork lock observer");
+            if child == 0 {
+                let mut lock = unsafe { std::mem::zeroed::<libc::flock>() };
+                lock.l_type = libc::F_WRLCK as _;
+                lock.l_whence = libc::SEEK_SET as _;
+                let result = unsafe { libc::fcntl(host_fd, libc::F_SETLK, &raw mut lock) };
+                unsafe { libc::_exit(i32::from(result < 0)) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+        }
 
-        let removed = dispatcher
-            .captured_file_table()
-            .write_open_files()
-            .remove(&fd)
-            .expect("surviving lock fd");
-        dispatcher.close_open_file_and_free_pty(&removed);
-        assert!(child_can_acquire_classic_write_lock(observer_fd));
-        unsafe { libc::close(observer_fd) };
+        #[test]
+        fn non_cloexec_classic_record_lock_survives_exec_transfer() {
+            let dispatcher = SyscallDispatcher::new();
+            let named = tempfile::NamedTempFile::new().unwrap();
+            let host_fd = std::os::fd::IntoRawFd::into_raw_fd(named.reopen().unwrap());
+            let observer_fd = std::os::fd::IntoRawFd::into_raw_fd(named.reopen().unwrap());
+            let mut lock = unsafe { std::mem::zeroed::<libc::flock>() };
+            lock.l_type = libc::F_WRLCK as _;
+            lock.l_whence = libc::SEEK_SET as _;
+            assert_eq!(
+                unsafe { libc::fcntl(host_fd, libc::F_SETLK, &raw mut lock) },
+                0
+            );
+            let description = kernel_file_description(
+                Arc::new(RwLock::new(OpenDescription::HostFile {
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+                    host_fd: HostFdRef::new(host_fd),
+                    metadata: RootFsMetadata {
+                        path: std::path::PathBuf::from("/tmp/exec-lock"),
+                        kind: RootFsEntryKind::File,
+                        mode: 0o600,
+                        size: 0,
+                    },
+                    writable: true,
+                })),
+                crate::linux_abi::LINUX_O_RDWR,
+            );
+            let fd = dispatcher
+                .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), 0))
+                .unwrap();
+            assert!(!child_can_acquire_classic_write_lock(observer_fd));
+
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let prepared = dispatcher.prepare_one_task_kernel_exec(&context).unwrap();
+            dispatcher.commit_one_task_kernel_exec(prepared).unwrap();
+            assert!(!child_can_acquire_classic_write_lock(observer_fd));
+
+            let removed = dispatcher
+                .captured_file_table()
+                .write_open_files()
+                .remove(&fd)
+                .expect("surviving lock fd");
+            dispatcher.close_open_file_and_free_pty(&removed);
+            assert!(child_can_acquire_classic_write_lock(observer_fd));
+            unsafe { libc::close(observer_fd) };
+        }
+
+        #[test]
+        fn epoll_et_repolls_host_level_when_mux_misses_wake() {
+            let mut h = Harness::new();
+            let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;
+
+            let pair_addr = h.reserve(8);
+            assert_eq!(
+                returned(h.call(
+                    199,
+                    [
+                        LINUX_AF_UNIX as u64,
+                        LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
+                        0,
+                        pair_addr,
+                        0,
+                        0,
+                    ],
+                )),
+                0
+            );
+            let pair = h.memory.read_bytes(pair_addr, 8).unwrap();
+            let reader = i32::from_le_bytes(pair[0..4].try_into().unwrap());
+            let writer = i32::from_le_bytes(pair[4..8].try_into().unwrap());
+
+            let ev_addr = h.reserve(16);
+            let mut ev = [0u8; 16];
+            ev[0..4].copy_from_slice(&(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes());
+            ev[8..16].copy_from_slice(&(reader as u64).to_le_bytes());
+            h.memory.write_bytes(ev_addr, &ev).unwrap();
+            assert_eq!(
+                returned(h.call(
+                    21,
+                    [epfd, LINUX_EPOLL_CTL_ADD, reader as u64, ev_addr, 0, 0],
+                )),
+                0
+            );
+
+            let byte_addr = h.put_bytes(b"x");
+            assert_eq!(
+                returned(h.call(64, [writer as u64, byte_addr, 1, 0, 0, 0])),
+                1
+            );
+
+            let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
+            {
+                let open = epoll_open.description.read().expect("open description");
+                let OpenDescription::Epoll { kqueue, .. } = &*open else {
+                    panic!("epfd should be an epoll description");
+                };
+                let host_fd = h
+                    .dispatcher
+                    .host_fd_for_poll(reader)
+                    .expect("reader should be host-backed");
+                kqueue.with_mux(|mux| {
+                    mux.deregister(host_fd.get())
+                        .expect("test setup should remove host wake filter");
+                });
+            }
+
+            let out_addr = h.reserve(16);
+            let n = returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0]));
+            assert_eq!(
+                n, 1,
+                "epoll_pwait must resample host fd levels when the host wake edge is stale"
+            );
+            let out = h.memory.read_bytes(out_addr, 16).unwrap();
+            let events = u32::from_le_bytes(out[0..4].try_into().unwrap());
+            let data = u64::from_le_bytes(out[8..16].try_into().unwrap());
+            assert_ne!(events & LINUX_EPOLLIN, 0);
+            assert_eq!(data, reader as u64);
+        }
     }
 
     #[test]
@@ -868,79 +944,6 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         assert!(dispatcher.try_set_cwd("/test_dir").is_ok());
         assert_eq!(dispatcher.try_cwd().unwrap(), "/test_dir");
         assert!(dispatcher.try_mem_snapshot().is_ok());
-    }
-
-
-    #[test]
-    fn epoll_et_repolls_host_level_when_mux_misses_wake() {
-        let mut h = Harness::new();
-        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;
-
-        let pair_addr = h.reserve(8);
-        assert_eq!(
-            returned(h.call(
-                199,
-                [
-                    LINUX_AF_UNIX as u64,
-                    LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
-                    0,
-                    pair_addr,
-                    0,
-                    0,
-                ],
-            )),
-            0
-        );
-        let pair = h.memory.read_bytes(pair_addr, 8).unwrap();
-        let reader = i32::from_le_bytes(pair[0..4].try_into().unwrap());
-        let writer = i32::from_le_bytes(pair[4..8].try_into().unwrap());
-
-        let ev_addr = h.reserve(16);
-        let mut ev = [0u8; 16];
-        ev[0..4].copy_from_slice(&(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes());
-        ev[8..16].copy_from_slice(&(reader as u64).to_le_bytes());
-        h.memory.write_bytes(ev_addr, &ev).unwrap();
-        assert_eq!(
-            returned(h.call(
-                21,
-                [epfd, LINUX_EPOLL_CTL_ADD, reader as u64, ev_addr, 0, 0],
-            )),
-            0
-        );
-
-        let byte_addr = h.put_bytes(b"x");
-        assert_eq!(
-            returned(h.call(64, [writer as u64, byte_addr, 1, 0, 0, 0])),
-            1
-        );
-
-        let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-        {
-            let open = epoll_open.description.read().expect("open description");
-            let OpenDescription::Epoll { kqueue, .. } = &*open else {
-                panic!("epfd should be an epoll description");
-            };
-            let host_fd = h
-                .dispatcher
-                .host_fd_for_poll(reader)
-                .expect("reader should be host-backed");
-            kqueue.with_mux(|mux| {
-                mux.deregister(host_fd.get())
-                    .expect("test setup should remove host wake filter");
-            });
-        }
-
-        let out_addr = h.reserve(16);
-        let n = returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0]));
-        assert_eq!(
-            n, 1,
-            "epoll_pwait must resample host fd levels when the host wake edge is stale"
-        );
-        let out = h.memory.read_bytes(out_addr, 16).unwrap();
-        let events = u32::from_le_bytes(out[0..4].try_into().unwrap());
-        let data = u64::from_le_bytes(out[8..16].try_into().unwrap());
-        assert_ne!(events & LINUX_EPOLLIN, 0);
-        assert_eq!(data, reader as u64);
     }
 
     #[test]
@@ -5418,31 +5421,6 @@ mod container_policy_dispatch_tests {
     }
 
     #[test]
-    fn policy_is_inherited_by_forked_children() {
-        // The runtime's guest fork is a host fork: the child inherits the
-        // dispatcher (and thus the policy table) via the process memory copy.
-        // Prove it with a real fork — the child dispatches add_key and reports
-        // the outcome through its exit code.
-        let mut dispatcher = confined_dispatcher();
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork failed");
-        if child == 0 {
-            let denied = matches!(
-                dispatch_one(&mut dispatcher, SYS_ADD_KEY),
-                DispatchOutcome::Errno { errno } if errno == LINUX_EPERM
-            );
-            // SAFETY: _exit is async-signal-safe; no cleanup wanted post-fork.
-            unsafe { libc::_exit(if denied { 0 } else { 1 }) };
-        }
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-        assert!(
-            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            "forked child must inherit the deny table (status {status:#x})"
-        );
-    }
-
-    #[test]
     fn docker_default_policy_keeps_identity_fast_path() {
         // The Docker default model never denies identity syscalls, so a
         // container run must NOT lose the EL1-shim fast path.
@@ -5459,6 +5437,35 @@ mod container_policy_dispatch_tests {
             }])
             .expect("install guest seccomp filter");
         assert!(!dispatcher.identity_fast_path_enabled());
+    }
+
+    mod serial_host {
+        use super::*;
+
+        #[test]
+        fn policy_is_inherited_by_forked_children() {
+            // The runtime's guest fork is a host fork: the child inherits the
+            // dispatcher (and thus the policy table) via the process memory copy.
+            // Prove it with a real fork — the child dispatches add_key and reports
+            // the outcome through its exit code.
+            let mut dispatcher = confined_dispatcher();
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0, "fork failed");
+            if child == 0 {
+                let denied = matches!(
+                    dispatch_one(&mut dispatcher, SYS_ADD_KEY),
+                    DispatchOutcome::Errno { errno } if errno == LINUX_EPERM
+                );
+                // SAFETY: _exit is async-signal-safe; no cleanup wanted post-fork.
+                unsafe { libc::_exit(if denied { 0 } else { 1 }) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "forked child must inherit the deny table (status {status:#x})"
+            );
+        }
     }
 
     #[test]
@@ -9163,346 +9170,350 @@ mod inzone_tcp {
         assert!(accepted_fd >= 3, "accept must succeed");
     }
 
-    #[test]
-    fn inzone_tcp_disconnect_rebind_lifecycle() {
-        const SYS_DUP: u64 = 23;
-        let mut g = InZoneGuest::new();
+    mod serial_host {
+        use super::*;
 
-        // 1. Create listener 1
-        let listen1_fd = g.ok(
-            SYS_SOCKET,
-            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
-        ) as i32;
-        g.make_sockaddr_in(ADDR_SCRATCH, 0, [127, 0, 0, 1]);
-        assert_eq!(
-            g.ok(SYS_BIND, [listen1_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
-            0
-        );
-        assert_eq!(
-            g.ok(SYS_LISTEN, [listen1_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
-        assert_eq!(
-            g.ok(
-                SYS_GETSOCKNAME,
+        #[test]
+        fn inzone_tcp_disconnect_rebind_lifecycle() {
+            const SYS_DUP: u64 = 23;
+            let mut g = InZoneGuest::new();
+
+            // 1. Create listener 1
+            let listen1_fd = g.ok(
+                SYS_SOCKET,
+                [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+            ) as i32;
+            g.make_sockaddr_in(ADDR_SCRATCH, 0, [127, 0, 0, 1]);
+            assert_eq!(
+                g.ok(SYS_BIND, [listen1_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+                0
+            );
+            assert_eq!(
+                g.ok(SYS_LISTEN, [listen1_fd as u64, 16, 0, 0, 0, 0]),
+                0
+            );
+            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            assert_eq!(
+                g.ok(
+                    SYS_GETSOCKNAME,
+                    [listen1_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+                ),
+                0
+            );
+            let (listen1_port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+
+            // 2. Client connects to listener 1
+            let client_fd = g.ok(
+                SYS_SOCKET,
+                [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+            ) as i32;
+            g.make_sockaddr_in(ADDR_SCRATCH, listen1_port, [127, 0, 0, 1]);
+            assert_eq!(
+                g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+                0
+            );
+
+            // Accept on server
+            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            let server1_fd = g.ok(
+                SYS_ACCEPT,
                 [listen1_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
-            ),
-            0
-        );
-        let (listen1_port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+            ) as i32;
+            assert!(server1_fd >= 0);
 
-        // 2. Client connects to listener 1
-        let client_fd = g.ok(
-            SYS_SOCKET,
-            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
-        ) as i32;
-        g.make_sockaddr_in(ADDR_SCRATCH, listen1_port, [127, 0, 0, 1]);
-        assert_eq!(
-            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
-            0
-        );
+            // Record client's initial ephemeral port
+            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            assert_eq!(
+                g.ok(
+                    SYS_GETSOCKNAME,
+                    [client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+                ),
+                0
+            );
+            let (client_port_before, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+            assert_ne!(client_port_before, 0);
 
-        // Accept on server
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
-        let server1_fd = g.ok(
-            SYS_ACCEPT,
-            [listen1_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
-        ) as i32;
-        assert!(server1_fd >= 0);
+            // Create dup alias
+            let dup_client_fd = g.ok(SYS_DUP, [client_fd as u64, 0, 0, 0, 0, 0]) as i32;
+            assert!(dup_client_fd >= 0);
 
-        // Record client's initial ephemeral port
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
-        assert_eq!(
-            g.ok(
-                SYS_GETSOCKNAME,
+            // 3. Disconnect client via connect(AF_UNSPEC)
+            let mut unspec = vec![0u8; 16];
+            unspec[0..2].copy_from_slice(&(LINUX_AF_UNSPEC as u16).to_ne_bytes());
+            g.mem.write_bytes(ADDR_SCRATCH, &unspec).unwrap();
+            assert_eq!(
+                g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+                0
+            );
+
+            // 4. Rebind client to wildcard (0.0.0.0:0)
+            g.make_sockaddr_in(ADDR_SCRATCH, 0, [0, 0, 0, 0]);
+            assert_eq!(
+                g.ok(SYS_BIND, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+                0
+            );
+
+            // Check getsockname on client: leased new port, not retained
+            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            assert_eq!(
+                g.ok(
+                    SYS_GETSOCKNAME,
+                    [client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+                ),
+                0
+            );
+            let (client_port_after, client_ip_after) = g.read_sockaddr_in(ADDR_SCRATCH);
+            assert_ne!(client_port_after, 0);
+            assert_ne!(client_port_after, client_port_before, "port should not be retained");
+            assert_eq!(client_ip_after, [0, 0, 0, 0], "bound to wildcard");
+
+            // Dup alias observes the new local address
+            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            assert_eq!(
+                g.ok(
+                    SYS_GETSOCKNAME,
+                    [dup_client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+                ),
+                0
+            );
+            let (dup_port, dup_ip) = g.read_sockaddr_in(ADDR_SCRATCH);
+            assert_eq!(dup_port, client_port_after, "alias port matches");
+            assert_eq!(dup_ip, client_ip_after, "alias ip matches");
+
+            // Second bind on client_fd returns EINVAL
+            g.make_sockaddr_in(ADDR_SCRATCH, 0, [0, 0, 0, 0]);
+            assert_eq!(
+                g.call(SYS_BIND, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+                DispatchOutcome::errno(LINUX_EINVAL)
+            );
+
+            // Verify old port can be rebound by another socket
+            let probe_fd = g.ok(
+                SYS_SOCKET,
+                [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+            ) as i32;
+            g.make_sockaddr_in(ADDR_SCRATCH, client_port_before, [127, 0, 0, 1]);
+            assert_eq!(
+                g.ok(SYS_BIND, [probe_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+                0,
+                "previous port lease was freed"
+            );
+            assert_eq!(g.ok(SYS_CLOSE, [probe_fd as u64, 0, 0, 0, 0, 0]), 0);
+
+            // 5. Subsequent listen on re-bound client_fd
+            assert_eq!(
+                g.ok(SYS_LISTEN, [client_fd as u64, 16, 0, 0, 0, 0]),
+                0
+            );
+
+            // Connect a new peer to client_fd (which is now listening on client_port_after)
+            let peer_fd = g.ok(
+                SYS_SOCKET,
+                [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+            ) as i32;
+            g.make_sockaddr_in(ADDR_SCRATCH, client_port_after, [127, 0, 0, 1]);
+            assert_eq!(
+                g.ok(SYS_CONNECT, [peer_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+                0
+            );
+
+            // Accept on client_fd
+            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            let accepted2_fd = g.ok(
+                SYS_ACCEPT,
                 [client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
-            ),
-            0
-        );
-        let (client_port_before, _) = g.read_sockaddr_in(ADDR_SCRATCH);
-        assert_ne!(client_port_before, 0);
+            ) as i32;
+            assert!(accepted2_fd >= 0);
 
-        // Create dup alias
-        let dup_client_fd = g.ok(SYS_DUP, [client_fd as u64, 0, 0, 0, 0, 0]) as i32;
-        assert!(dup_client_fd >= 0);
+            // Echo transfer between peer_fd and accepted2_fd
+            g.mem.write_bytes(DATA_SCRATCH, b"hello-rebind").unwrap();
+            assert_eq!(
+                g.ok(SYS_WRITE, [peer_fd as u64, DATA_SCRATCH, 12, 0, 0, 0]),
+                12
+            );
+            let recv_scratch = DATA_SCRATCH + 0x40;
+            assert_eq!(
+                g.ok(SYS_READ, [accepted2_fd as u64, recv_scratch, 12, 0, 0, 0]),
+                12
+            );
+            let read_back = g.mem.read_bytes(recv_scratch, 12).unwrap();
+            assert_eq!(read_back, b"hello-rebind");
 
-        // 3. Disconnect client via connect(AF_UNSPEC)
-        let mut unspec = vec![0u8; 16];
-        unspec[0..2].copy_from_slice(&(LINUX_AF_UNSPEC as u16).to_ne_bytes());
-        g.mem.write_bytes(ADDR_SCRATCH, &unspec).unwrap();
-        assert_eq!(
-            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
-            0
-        );
+            assert_eq!(g.ok(SYS_CLOSE, [listen1_fd as u64, 0, 0, 0, 0, 0]), 0);
+            assert_eq!(g.ok(SYS_CLOSE, [server1_fd as u64, 0, 0, 0, 0, 0]), 0);
+            assert_eq!(g.ok(SYS_CLOSE, [client_fd as u64, 0, 0, 0, 0, 0]), 0);
+            assert_eq!(g.ok(SYS_CLOSE, [dup_client_fd as u64, 0, 0, 0, 0, 0]), 0);
+            assert_eq!(g.ok(SYS_CLOSE, [peer_fd as u64, 0, 0, 0, 0, 0]), 0);
+            assert_eq!(g.ok(SYS_CLOSE, [accepted2_fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
 
-        // 4. Rebind client to wildcard (0.0.0.0:0)
-        g.make_sockaddr_in(ADDR_SCRATCH, 0, [0, 0, 0, 0]);
-        assert_eq!(
-            g.ok(SYS_BIND, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
-            0
-        );
+        #[test]
+        fn inzone_tcp_disconnect_rebind_and_reconnect() {
+            let mut g = InZoneGuest::new();
 
-        // Check getsockname on client: leased new port, not retained
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
-        assert_eq!(
-            g.ok(
-                SYS_GETSOCKNAME,
-                [client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
-            ),
-            0
-        );
-        let (client_port_after, client_ip_after) = g.read_sockaddr_in(ADDR_SCRATCH);
-        assert_ne!(client_port_after, 0);
-        assert_ne!(client_port_after, client_port_before, "port should not be retained");
-        assert_eq!(client_ip_after, [0, 0, 0, 0], "bound to wildcard");
+            // 1. Create listener 1
+            let listen1_fd = g.ok(
+                SYS_SOCKET,
+                [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+            ) as i32;
+            g.make_sockaddr_in(ADDR_SCRATCH, 0, [127, 0, 0, 1]);
+            assert_eq!(
+                g.ok(SYS_BIND, [listen1_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+                0
+            );
+            assert_eq!(
+                g.ok(SYS_LISTEN, [listen1_fd as u64, 16, 0, 0, 0, 0]),
+                0
+            );
+            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            assert_eq!(
+                g.ok(
+                    SYS_GETSOCKNAME,
+                    [listen1_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+                ),
+                0
+            );
+            let (listen1_port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
 
-        // Dup alias observes the new local address
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
-        assert_eq!(
-            g.ok(
-                SYS_GETSOCKNAME,
-                [dup_client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
-            ),
-            0
-        );
-        let (dup_port, dup_ip) = g.read_sockaddr_in(ADDR_SCRATCH);
-        assert_eq!(dup_port, client_port_after, "alias port matches");
-        assert_eq!(dup_ip, client_ip_after, "alias ip matches");
-
-        // Second bind on client_fd returns EINVAL
-        g.make_sockaddr_in(ADDR_SCRATCH, 0, [0, 0, 0, 0]);
-        assert_eq!(
-            g.call(SYS_BIND, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
-            DispatchOutcome::errno(LINUX_EINVAL)
-        );
-
-        // Verify old port can be rebound by another socket
-        let probe_fd = g.ok(
-            SYS_SOCKET,
-            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
-        ) as i32;
-        g.make_sockaddr_in(ADDR_SCRATCH, client_port_before, [127, 0, 0, 1]);
-        assert_eq!(
-            g.ok(SYS_BIND, [probe_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
-            0,
-            "previous port lease was freed"
-        );
-        assert_eq!(g.ok(SYS_CLOSE, [probe_fd as u64, 0, 0, 0, 0, 0]), 0);
-
-        // 5. Subsequent listen on re-bound client_fd
-        assert_eq!(
-            g.ok(SYS_LISTEN, [client_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
-
-        // Connect a new peer to client_fd (which is now listening on client_port_after)
-        let peer_fd = g.ok(
-            SYS_SOCKET,
-            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
-        ) as i32;
-        g.make_sockaddr_in(ADDR_SCRATCH, client_port_after, [127, 0, 0, 1]);
-        assert_eq!(
-            g.ok(SYS_CONNECT, [peer_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
-            0
-        );
-
-        // Accept on client_fd
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
-        let accepted2_fd = g.ok(
-            SYS_ACCEPT,
-            [client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
-        ) as i32;
-        assert!(accepted2_fd >= 0);
-
-        // Echo transfer between peer_fd and accepted2_fd
-        g.mem.write_bytes(DATA_SCRATCH, b"hello-rebind").unwrap();
-        assert_eq!(
-            g.ok(SYS_WRITE, [peer_fd as u64, DATA_SCRATCH, 12, 0, 0, 0]),
-            12
-        );
-        let recv_scratch = DATA_SCRATCH + 0x40;
-        assert_eq!(
-            g.ok(SYS_READ, [accepted2_fd as u64, recv_scratch, 12, 0, 0, 0]),
-            12
-        );
-        let read_back = g.mem.read_bytes(recv_scratch, 12).unwrap();
-        assert_eq!(read_back, b"hello-rebind");
-
-        assert_eq!(g.ok(SYS_CLOSE, [listen1_fd as u64, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(g.ok(SYS_CLOSE, [server1_fd as u64, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(g.ok(SYS_CLOSE, [client_fd as u64, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(g.ok(SYS_CLOSE, [dup_client_fd as u64, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(g.ok(SYS_CLOSE, [peer_fd as u64, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(g.ok(SYS_CLOSE, [accepted2_fd as u64, 0, 0, 0, 0, 0]), 0);
-    }
-
-    #[test]
-    fn inzone_tcp_disconnect_rebind_and_reconnect() {
-        let mut g = InZoneGuest::new();
-
-        // 1. Create listener 1
-        let listen1_fd = g.ok(
-            SYS_SOCKET,
-            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
-        ) as i32;
-        g.make_sockaddr_in(ADDR_SCRATCH, 0, [127, 0, 0, 1]);
-        assert_eq!(
-            g.ok(SYS_BIND, [listen1_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
-            0
-        );
-        assert_eq!(
-            g.ok(SYS_LISTEN, [listen1_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
-        assert_eq!(
-            g.ok(
-                SYS_GETSOCKNAME,
+            // 2. Client connects to listener 1
+            let client_fd = g.ok(
+                SYS_SOCKET,
+                [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+            ) as i32;
+            g.make_sockaddr_in(ADDR_SCRATCH, listen1_port, [127, 0, 0, 1]);
+            assert_eq!(
+                g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+                0
+            );
+            let server1_fd = g.ok(
+                SYS_ACCEPT,
                 [listen1_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
-            ),
-            0
-        );
-        let (listen1_port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+            ) as i32;
 
-        // 2. Client connects to listener 1
-        let client_fd = g.ok(
-            SYS_SOCKET,
-            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
-        ) as i32;
-        g.make_sockaddr_in(ADDR_SCRATCH, listen1_port, [127, 0, 0, 1]);
-        assert_eq!(
-            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
-            0
-        );
-        let server1_fd = g.ok(
-            SYS_ACCEPT,
-            [listen1_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
-        ) as i32;
+            // Disconnect client
+            let mut unspec = vec![0u8; 16];
+            unspec[0..2].copy_from_slice(&(LINUX_AF_UNSPEC as u16).to_ne_bytes());
+            g.mem.write_bytes(ADDR_SCRATCH, &unspec).unwrap();
+            assert_eq!(
+                g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+                0
+            );
 
-        // Disconnect client
-        let mut unspec = vec![0u8; 16];
-        unspec[0..2].copy_from_slice(&(LINUX_AF_UNSPEC as u16).to_ne_bytes());
-        g.mem.write_bytes(ADDR_SCRATCH, &unspec).unwrap();
-        assert_eq!(
-            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
-            0
-        );
+            // Rebind client to wildcard
+            g.make_sockaddr_in(ADDR_SCRATCH, 0, [0, 0, 0, 0]);
+            assert_eq!(
+                g.ok(SYS_BIND, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+                0
+            );
 
-        // Rebind client to wildcard
-        g.make_sockaddr_in(ADDR_SCRATCH, 0, [0, 0, 0, 0]);
-        assert_eq!(
-            g.ok(SYS_BIND, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
-            0
-        );
+            // Reconnect client to listener 1
+            g.make_sockaddr_in(ADDR_SCRATCH, listen1_port, [127, 0, 0, 1]);
+            assert_eq!(
+                g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+                0
+            );
 
-        // Reconnect client to listener 1
-        g.make_sockaddr_in(ADDR_SCRATCH, listen1_port, [127, 0, 0, 1]);
-        assert_eq!(
-            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
-            0
-        );
+            // Accept second connection on listener 1
+            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            let server2_fd = g.ok(
+                SYS_ACCEPT,
+                [listen1_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+            ) as i32;
+            assert!(server2_fd >= 0);
 
-        // Accept second connection on listener 1
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
-        let server2_fd = g.ok(
-            SYS_ACCEPT,
-            [listen1_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
-        ) as i32;
-        assert!(server2_fd >= 0);
+            // Data transfer
+            g.mem.write_bytes(DATA_SCRATCH, b"reconnect-ok").unwrap();
+            assert_eq!(
+                g.ok(SYS_WRITE, [client_fd as u64, DATA_SCRATCH, 12, 0, 0, 0]),
+                12
+            );
+            let recv_scratch = DATA_SCRATCH + 0x40;
+            assert_eq!(
+                g.ok(SYS_READ, [server2_fd as u64, recv_scratch, 12, 0, 0, 0]),
+                12
+            );
+            let read_back = g.mem.read_bytes(recv_scratch, 12).unwrap();
+            assert_eq!(read_back, b"reconnect-ok");
 
-        // Data transfer
-        g.mem.write_bytes(DATA_SCRATCH, b"reconnect-ok").unwrap();
-        assert_eq!(
-            g.ok(SYS_WRITE, [client_fd as u64, DATA_SCRATCH, 12, 0, 0, 0]),
-            12
-        );
-        let recv_scratch = DATA_SCRATCH + 0x40;
-        assert_eq!(
-            g.ok(SYS_READ, [server2_fd as u64, recv_scratch, 12, 0, 0, 0]),
-            12
-        );
-        let read_back = g.mem.read_bytes(recv_scratch, 12).unwrap();
-        assert_eq!(read_back, b"reconnect-ok");
+            assert_eq!(g.ok(SYS_CLOSE, [listen1_fd as u64, 0, 0, 0, 0, 0]), 0);
+            assert_eq!(g.ok(SYS_CLOSE, [server1_fd as u64, 0, 0, 0, 0, 0]), 0);
+            assert_eq!(g.ok(SYS_CLOSE, [server2_fd as u64, 0, 0, 0, 0, 0]), 0);
+            assert_eq!(g.ok(SYS_CLOSE, [client_fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
 
-        assert_eq!(g.ok(SYS_CLOSE, [listen1_fd as u64, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(g.ok(SYS_CLOSE, [server1_fd as u64, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(g.ok(SYS_CLOSE, [server2_fd as u64, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(g.ok(SYS_CLOSE, [client_fd as u64, 0, 0, 0, 0, 0]), 0);
-    }
+        #[test]
+        fn inzone_tcp_disconnect_rebind_accepted_stream() {
+            let (mut g, client_fd, accepted_fd) = inzone_connected_pair();
 
-    #[test]
-    fn inzone_tcp_disconnect_rebind_accepted_stream() {
-        let (mut g, client_fd, accepted_fd) = inzone_connected_pair();
+            // Disconnect accepted_fd
+            let mut unspec = vec![0u8; 16];
+            unspec[0..2].copy_from_slice(&(LINUX_AF_UNSPEC as u16).to_ne_bytes());
+            g.mem.write_bytes(ADDR_SCRATCH, &unspec).unwrap();
+            assert_eq!(
+                g.ok(SYS_CONNECT, [accepted_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+                0
+            );
 
-        // Disconnect accepted_fd
-        let mut unspec = vec![0u8; 16];
-        unspec[0..2].copy_from_slice(&(LINUX_AF_UNSPEC as u16).to_ne_bytes());
-        g.mem.write_bytes(ADDR_SCRATCH, &unspec).unwrap();
-        assert_eq!(
-            g.ok(SYS_CONNECT, [accepted_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
-            0
-        );
+            // Rebind accepted_fd
+            g.make_sockaddr_in(ADDR_SCRATCH, 0, [0, 0, 0, 0]);
+            assert_eq!(
+                g.ok(SYS_BIND, [accepted_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+                0
+            );
 
-        // Rebind accepted_fd
-        g.make_sockaddr_in(ADDR_SCRATCH, 0, [0, 0, 0, 0]);
-        assert_eq!(
-            g.ok(SYS_BIND, [accepted_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
-            0
-        );
+            // Listen on accepted_fd
+            assert_eq!(
+                g.ok(SYS_LISTEN, [accepted_fd as u64, 16, 0, 0, 0, 0]),
+                0
+            );
 
-        // Listen on accepted_fd
-        assert_eq!(
-            g.ok(SYS_LISTEN, [accepted_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
+            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            assert_eq!(
+                g.ok(
+                    SYS_GETSOCKNAME,
+                    [accepted_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+                ),
+                0
+            );
+            let (new_port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
 
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
-        assert_eq!(
-            g.ok(
-                SYS_GETSOCKNAME,
+            // Connect to new_port
+            let new_client = g.ok(
+                SYS_SOCKET,
+                [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+            ) as i32;
+            g.make_sockaddr_in(ADDR_SCRATCH, new_port, [127, 0, 0, 1]);
+            assert_eq!(
+                g.ok(SYS_CONNECT, [new_client as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+                0
+            );
+
+            // Accept
+            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            let new_server = g.ok(
+                SYS_ACCEPT,
                 [accepted_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
-            ),
-            0
-        );
-        let (new_port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+            ) as i32;
+            assert!(new_server >= 0);
 
-        // Connect to new_port
-        let new_client = g.ok(
-            SYS_SOCKET,
-            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
-        ) as i32;
-        g.make_sockaddr_in(ADDR_SCRATCH, new_port, [127, 0, 0, 1]);
-        assert_eq!(
-            g.ok(SYS_CONNECT, [new_client as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
-            0
-        );
+            // Transfer
+            g.mem.write_bytes(DATA_SCRATCH, b"accepted-rebind").unwrap();
+            assert_eq!(
+                g.ok(SYS_WRITE, [new_client as u64, DATA_SCRATCH, 15, 0, 0, 0]),
+                15
+            );
+            let recv_scratch = DATA_SCRATCH + 0x40;
+            assert_eq!(
+                g.ok(SYS_READ, [new_server as u64, recv_scratch, 15, 0, 0, 0]),
+                15
+            );
+            let read_back = g.mem.read_bytes(recv_scratch, 15).unwrap();
+            assert_eq!(read_back, b"accepted-rebind");
 
-        // Accept
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
-        let new_server = g.ok(
-            SYS_ACCEPT,
-            [accepted_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
-        ) as i32;
-        assert!(new_server >= 0);
-
-        // Transfer
-        g.mem.write_bytes(DATA_SCRATCH, b"accepted-rebind").unwrap();
-        assert_eq!(
-            g.ok(SYS_WRITE, [new_client as u64, DATA_SCRATCH, 15, 0, 0, 0]),
-            15
-        );
-        let recv_scratch = DATA_SCRATCH + 0x40;
-        assert_eq!(
-            g.ok(SYS_READ, [new_server as u64, recv_scratch, 15, 0, 0, 0]),
-            15
-        );
-        let read_back = g.mem.read_bytes(recv_scratch, 15).unwrap();
-        assert_eq!(read_back, b"accepted-rebind");
-
-        assert_eq!(g.ok(SYS_CLOSE, [client_fd as u64, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(g.ok(SYS_CLOSE, [accepted_fd as u64, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(g.ok(SYS_CLOSE, [new_client as u64, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(g.ok(SYS_CLOSE, [new_server as u64, 0, 0, 0, 0, 0]), 0);
+            assert_eq!(g.ok(SYS_CLOSE, [client_fd as u64, 0, 0, 0, 0, 0]), 0);
+            assert_eq!(g.ok(SYS_CLOSE, [accepted_fd as u64, 0, 0, 0, 0, 0]), 0);
+            assert_eq!(g.ok(SYS_CLOSE, [new_client as u64, 0, 0, 0, 0, 0]), 0);
+            assert_eq!(g.ok(SYS_CLOSE, [new_server as u64, 0, 0, 0, 0, 0]), 0);
+        }
     }
 }

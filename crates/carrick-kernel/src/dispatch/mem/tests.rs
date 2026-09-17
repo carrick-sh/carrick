@@ -2583,54 +2583,6 @@ fn concurrent_exec_mmap_does_not_commit_consumed_protection_failure_outside_aren
 }
 
 #[test]
-fn shared_anon_persistent_rollback_failure_aborts_concurrent_exec_backend() {
-    const SYS_MMAP: u64 = 222;
-    const LENGTH: u64 = 4096;
-    const MAPPED_LENGTH: usize = carrick_guest_mem::HOST_PAGE_GRANULE as usize;
-
-    // SAFETY: the child owns an isolated dispatcher and intentionally takes
-    // the fail-stop abort after two injected host-unmap failures.
-    let pid = unsafe { libc::fork() };
-    assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
-    if pid == 0 {
-        let no_core = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
-        let dispatcher = SyscallDispatcher::new();
-        let registry =
-            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1080));
-        let reporter = CompatReporter::default();
-        let mut memory =
-            DeferredSetterFailureMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, MAPPED_LENGTH)
-                .fail_unmaps(2);
-        let _ = threaded_memory_call(
-            &dispatcher,
-            &mut memory,
-            &registry,
-            &reporter,
-            SyscallRequest::new(
-                SYS_MMAP,
-                SyscallArgs([
-                    0,
-                    LENGTH,
-                    LINUX_PROT_READ | LINUX_PROT_WRITE,
-                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
-                    u64::MAX,
-                    0,
-                ]),
-            ),
-        );
-        unsafe { libc::_exit(92) };
-    }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-    assert!(libc::WIFSIGNALED(status));
-    assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
-}
-
-#[test]
 fn native16k_rejects_multithreaded_write_exec_mmap() {
     const SYS_MMAP: u64 = 222;
     const PAGE_SIZE: u64 = 16 * 1024;
@@ -6182,74 +6134,204 @@ fn large_vma_mmap_overlapping_hint_and_fixed_replacement() {
 /// risk reads run in a forked child so a regression reports as a failed
 /// assertion, not a dead test harness (`just test` runs this crate
 /// single-threaded, the house fork-in-test precondition).
-#[test]
-#[cfg(target_os = "macos")]
-fn darwin_private_file_mapping_detaches_from_truncate() {
-    use std::os::fd::AsRawFd;
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-    let file = tempfile::tempfile().expect("backing file");
-    let fd = file.as_raw_fd();
-    let content = vec![0xabu8; 2 * page];
-    assert_eq!(
-        unsafe { libc::pwrite(fd, content.as_ptr().cast(), content.len(), 0) },
-        content.len() as isize
-    );
-    let child = unsafe { libc::fork() };
-    if child == 0 {
-        let exit = unsafe {
-            let p = libc::mmap(
-                core::ptr::null_mut(),
-                2 * page,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE,
-                fd,
-                0,
+mod serial_host {
+    use super::*;
+
+    #[test]
+    fn shared_anon_persistent_rollback_failure_aborts_concurrent_exec_backend() {
+        const SYS_MMAP: u64 = 222;
+        const LENGTH: u64 = 4096;
+        const MAPPED_LENGTH: usize = carrick_guest_mem::HOST_PAGE_GRANULE as usize;
+
+        // SAFETY: the child owns an isolated dispatcher and intentionally takes
+        // the fail-stop abort after two injected host-unmap failures.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
+            let dispatcher = SyscallDispatcher::new();
+            let registry = crate::thread::ThreadRegistry::new(
+                crate::thread::ThreadId::synthetic_for_tests(1080),
             );
-            if p == libc::MAP_FAILED {
-                10
-            } else {
-                let p = p.cast::<u8>();
-                *p = 0x55; // COW page 0
-                if libc::ftruncate(fd, 1) != 0 {
-                    11
-                } else if *p != 0x55 {
-                    12 // written page must survive truncate
-                } else if *p.add(page) != 0xab {
-                    13 // untouched page must stay readable with map-time content
-                } else {
-                    0
-                }
-            }
-        };
-        unsafe { libc::_exit(exit) };
+            let reporter = CompatReporter::default();
+            let mut memory = DeferredSetterFailureMemory::new(
+                crate::memory::LINUX_SHARED_FILE_BASE,
+                MAPPED_LENGTH,
+            )
+            .fail_unmaps(2);
+            let _ = threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        0,
+                        LENGTH,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+            );
+            unsafe { libc::_exit(92) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFSIGNALED(status));
+        assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
     }
-    assert!(child > 0, "fork failed");
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "Darwin private-file truncate detachment regressed: the E1 \
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn darwin_private_file_mapping_detaches_from_truncate() {
+        use std::os::fd::AsRawFd;
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let file = tempfile::tempfile().expect("backing file");
+        let fd = file.as_raw_fd();
+        let content = vec![0xabu8; 2 * page];
+        assert_eq!(
+            unsafe { libc::pwrite(fd, content.as_ptr().cast(), content.len(), 0) },
+            content.len() as isize
+        );
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            let exit = unsafe {
+                let p = libc::mmap(
+                    core::ptr::null_mut(),
+                    2 * page,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE,
+                    fd,
+                    0,
+                );
+                if p == libc::MAP_FAILED {
+                    10
+                } else {
+                    let p = p.cast::<u8>();
+                    *p = 0x55; // COW page 0
+                    if libc::ftruncate(fd, 1) != 0 {
+                        11
+                    } else if *p != 0x55 {
+                        12 // written page must survive truncate
+                    } else if *p.add(page) != 0xab {
+                        13 // untouched page must stay readable with map-time content
+                    } else {
+                        0
+                    }
+                }
+            };
+            unsafe { libc::_exit(exit) };
+        }
+        assert!(child > 0, "fork failed");
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "Darwin private-file truncate detachment regressed: the E1 \
              file-backed lowering relies on it (status {status:#x}); if this \
              ever fires, the lowering must re-snapshot or be gated off"
-    );
-}
+        );
+    }
 
-#[test]
-fn indeterminate_private_repoint_failure_fails_stopped() {
-    const SYS_MMAP: u64 = 222;
-    const LENGTH: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
+    #[test]
+    fn indeterminate_private_repoint_failure_fails_stopped() {
+        const SYS_MMAP: u64 = 222;
+        const LENGTH: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
 
-    let child = unsafe { libc::fork() };
-    assert!(child >= 0, "fork indeterminate-repoint child failed");
-    if child == 0 {
-        let no_core = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork indeterminate-repoint child failed");
+        if child == 0 {
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
+            let dispatcher = SyscallDispatcher::new();
+            let registry = crate::thread::ThreadRegistry::new(
+                crate::thread::ThreadId::synthetic_for_tests(1165),
+            );
+            let reporter = CompatReporter::default();
+            let mut memory = ProtectionTrackingMemory::new(
+                crate::memory::LINUX_SHARED_FILE_BASE,
+                LENGTH as usize,
+            );
+            let source = returned(threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        0,
+                        LENGTH,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+            )) as u64;
+            let _ = returned(threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        source,
+                        LENGTH,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+            ));
+            memory.fail_repoint_indeterminate = true;
+            let _ = threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        source,
+                        LENGTH,
+                        LINUX_PROT_READ,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+            );
+            unsafe { libc::_exit(93) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFSIGNALED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
+    }
+
+    fn assert_partial_private_overlay_replacement(replace_offset: u64) {
+        const SYS_MMAP: u64 = 222;
+        const GRANULE: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
+        const LENGTH: u64 = 3 * GRANULE;
+
         let dispatcher = SyscallDispatcher::new();
         let registry =
-            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1165));
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(
+                1160 + i32::try_from(replace_offset / GRANULE).unwrap(),
+            ));
         let reporter = CompatReporter::default();
         let mut memory =
             ProtectionTrackingMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, LENGTH as usize);
@@ -6270,7 +6352,7 @@ fn indeterminate_private_repoint_failure_fails_stopped() {
                 ]),
             ),
         )) as u64;
-        let _ = returned(threaded_memory_call(
+        let first = returned(threaded_memory_call(
             &dispatcher,
             &mut memory,
             &registry,
@@ -6282,253 +6364,23 @@ fn indeterminate_private_repoint_failure_fails_stopped() {
                     LENGTH,
                     LINUX_PROT_READ | LINUX_PROT_WRITE,
                     LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
-                    u64::MAX,
-                    0,
-                ]),
-            ),
-        ));
-        memory.fail_repoint_indeterminate = true;
-        let _ = threaded_memory_call(
-            &dispatcher,
-            &mut memory,
-            &registry,
-            &reporter,
-            SyscallRequest::new(
-                SYS_MMAP,
-                SyscallArgs([
-                    source,
-                    LENGTH,
-                    LINUX_PROT_READ,
-                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
-                    u64::MAX,
-                    0,
-                ]),
-            ),
-        );
-        unsafe { libc::_exit(93) };
-    }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-    assert!(libc::WIFSIGNALED(status), "child status was 0x{status:x}");
-    assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
-}
-
-fn assert_partial_private_overlay_replacement(replace_offset: u64) {
-    const SYS_MMAP: u64 = 222;
-    const GRANULE: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
-    const LENGTH: u64 = 3 * GRANULE;
-
-    let dispatcher = SyscallDispatcher::new();
-    let registry =
-        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(
-            1160 + i32::try_from(replace_offset / GRANULE).unwrap(),
-        ));
-    let reporter = CompatReporter::default();
-    let mut memory =
-        ProtectionTrackingMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, LENGTH as usize);
-    let source = returned(threaded_memory_call(
-        &dispatcher,
-        &mut memory,
-        &registry,
-        &reporter,
-        SyscallRequest::new(
-            SYS_MMAP,
-            SyscallArgs([
-                0,
-                LENGTH,
-                LINUX_PROT_READ | LINUX_PROT_WRITE,
-                LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
-                u64::MAX,
-                0,
-            ]),
-        ),
-    )) as u64;
-    let first = returned(threaded_memory_call(
-        &dispatcher,
-        &mut memory,
-        &registry,
-        &reporter,
-        SyscallRequest::new(
-            SYS_MMAP,
-            SyscallArgs([
-                source,
-                LENGTH,
-                LINUX_PROT_READ | LINUX_PROT_WRITE,
-                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
-                u64::MAX,
-                0,
-            ]),
-        ),
-    )) as u64;
-    assert_eq!(first, source);
-    let old_overlay = dispatcher
-        .mem()
-        .lock()
-        .overlay
-        .translate_source_range(source, LENGTH)
-        .expect("whole initial overlay");
-
-    memory.inner.bytes[..GRANULE as usize].fill(0x11);
-    memory.inner.bytes[GRANULE as usize..(2 * GRANULE) as usize].fill(0x22);
-    memory.inner.bytes[(2 * GRANULE) as usize..].fill(0x33);
-    let replaced = returned(threaded_memory_call(
-        &dispatcher,
-        &mut memory,
-        &registry,
-        &reporter,
-        SyscallRequest::new(
-            SYS_MMAP,
-            SyscallArgs([
-                source + replace_offset,
-                GRANULE,
-                LINUX_PROT_READ | LINUX_PROT_WRITE,
-                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
-                u64::MAX,
-                0,
-            ]),
-        ),
-    )) as u64;
-    assert_eq!(replaced, source + replace_offset);
-
-    let replaced_index = usize::try_from(replace_offset).unwrap();
-    assert!(
-        memory.inner.bytes[replaced_index..replaced_index + GRANULE as usize]
-            .iter()
-            .all(|byte| *byte == 0),
-        "replacement payload must touch only the replaced source interval"
-    );
-    if replace_offset != 0 {
-        assert!(
-            memory.inner.bytes[..replaced_index]
-                .iter()
-                .all(|byte| *byte != 0)
-        );
-    }
-    let replacement_end = replaced_index + GRANULE as usize;
-    if replacement_end < LENGTH as usize {
-        assert!(
-            memory.inner.bytes[replacement_end..]
-                .iter()
-                .all(|byte| *byte != 0)
-        );
-    }
-
-    let mem_authority_105 = dispatcher.mem();
-
-    let mut mem = mem_authority_105.lock();
-    let replacement_overlay = mem
-        .overlay
-        .translate_source_range(source + replace_offset, GRANULE)
-        .expect("replacement overlay translation");
-    assert_ne!(replacement_overlay, old_overlay + replace_offset);
-    if replace_offset != 0 {
-        assert_eq!(
-            mem.overlay.translate_source_range(source, replace_offset),
-            Some(old_overlay)
-        );
-    }
-    let suffix_start = replace_offset + GRANULE;
-    if suffix_start < LENGTH {
-        assert_eq!(
-            mem.overlay
-                .translate_source_range(source + suffix_start, LENGTH - suffix_start),
-            Some(old_overlay + suffix_start)
-        );
-    }
-    let reused = mem
-        .overlay
-        .alloc(GRANULE, crate::shared_aperture::BackingObject::PrivateAnon)
-        .expect("only overwritten overlay storage is reusable");
-    assert_eq!(reused, old_overlay + replace_offset);
-    let after_reuse = mem
-        .overlay
-        .alloc(GRANULE, crate::shared_aperture::BackingObject::PrivateAnon)
-        .expect("preserved storage remains unavailable");
-    assert!(
-        after_reuse >= replacement_overlay + GRANULE,
-        "preserved prefix/suffix must not be reallocated"
-    );
-    drop(mem);
-
-    // The mapped bytes survive a real fork snapshot. Child mutations to the
-    // private replacement model cannot bleed back into the parent, while the
-    // parent retains every preserved prefix/suffix byte.
-    let child = unsafe { libc::fork() };
-    assert!(child >= 0, "fork partial-overlay snapshot failed");
-    if child == 0 {
-        if memory.inner.bytes[replaced_index] != 0 {
-            unsafe { libc::_exit(81) };
-        }
-        memory.inner.bytes.fill(0x7e);
-        unsafe { libc::_exit(0) };
-    }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-    assert!(libc::WIFEXITED(status));
-    assert_eq!(libc::WEXITSTATUS(status), 0);
-    assert_eq!(memory.inner.bytes[replaced_index], 0);
-    if replace_offset != 0 {
-        assert_ne!(memory.inner.bytes[0], 0x7e);
-    }
-    if replacement_end < LENGTH as usize {
-        assert_ne!(memory.inner.bytes[replacement_end], 0x7e);
-    }
-}
-
-#[test]
-fn private_overlay_prefix_replacement_carves_exact_storage() {
-    assert_partial_private_overlay_replacement(0);
-}
-
-#[test]
-fn private_overlay_middle_replacement_carves_exact_storage() {
-    assert_partial_private_overlay_replacement(carrick_guest_mem::HOST_PAGE_GRANULE);
-}
-
-#[test]
-fn private_overlay_suffix_replacement_carves_exact_storage() {
-    assert_partial_private_overlay_replacement(2 * carrick_guest_mem::HOST_PAGE_GRANULE);
-}
-
-#[test]
-fn post_repoint_protection_failure_aborts_instead_of_publishing_split_ownership() {
-    const SYS_MMAP: u64 = 222;
-    const LENGTH: u64 = 4096;
-    const MAPPED_LENGTH: usize = carrick_guest_mem::HOST_PAGE_GRANULE as usize;
-
-    let child = unsafe { libc::fork() };
-    assert!(child >= 0, "fork protection-failure child failed");
-    if child == 0 {
-        let no_core = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
-        let dispatcher = SyscallDispatcher::new();
-        let registry =
-            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1063));
-        let reporter = CompatReporter::default();
-        let mut memory =
-            ProtectionTrackingMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, MAPPED_LENGTH);
-        let shared = returned(threaded_memory_call(
-            &dispatcher,
-            &mut memory,
-            &registry,
-            &reporter,
-            SyscallRequest::new(
-                SYS_MMAP,
-                SyscallArgs([
-                    0,
-                    LENGTH,
-                    LINUX_PROT_READ | LINUX_PROT_WRITE,
-                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
                     u64::MAX,
                     0,
                 ]),
             ),
         )) as u64;
-        memory.fail_protect = true;
-        let _ = threaded_memory_call(
+        assert_eq!(first, source);
+        let old_overlay = dispatcher
+            .mem()
+            .lock()
+            .overlay
+            .translate_source_range(source, LENGTH)
+            .expect("whole initial overlay");
+
+        memory.inner.bytes[..GRANULE as usize].fill(0x11);
+        memory.inner.bytes[GRANULE as usize..(2 * GRANULE) as usize].fill(0x22);
+        memory.inner.bytes[(2 * GRANULE) as usize..].fill(0x33);
+        let replaced = returned(threaded_memory_call(
             &dispatcher,
             &mut memory,
             &registry,
@@ -6536,19 +6388,178 @@ fn post_repoint_protection_failure_aborts_instead_of_publishing_split_ownership(
             SyscallRequest::new(
                 SYS_MMAP,
                 SyscallArgs([
-                    shared,
-                    LENGTH,
-                    LINUX_PROT_READ,
+                    source + replace_offset,
+                    GRANULE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
                     LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
                     u64::MAX,
                     0,
                 ]),
             ),
+        )) as u64;
+        assert_eq!(replaced, source + replace_offset);
+
+        let replaced_index = usize::try_from(replace_offset).unwrap();
+        assert!(
+            memory.inner.bytes[replaced_index..replaced_index + GRANULE as usize]
+                .iter()
+                .all(|byte| *byte == 0),
+            "replacement payload must touch only the replaced source interval"
         );
-        unsafe { libc::_exit(92) };
+        if replace_offset != 0 {
+            assert!(
+                memory.inner.bytes[..replaced_index]
+                    .iter()
+                    .all(|byte| *byte != 0)
+            );
+        }
+        let replacement_end = replaced_index + GRANULE as usize;
+        if replacement_end < LENGTH as usize {
+            assert!(
+                memory.inner.bytes[replacement_end..]
+                    .iter()
+                    .all(|byte| *byte != 0)
+            );
+        }
+
+        let mem_authority_105 = dispatcher.mem();
+
+        let mut mem = mem_authority_105.lock();
+        let replacement_overlay = mem
+            .overlay
+            .translate_source_range(source + replace_offset, GRANULE)
+            .expect("replacement overlay translation");
+        assert_ne!(replacement_overlay, old_overlay + replace_offset);
+        if replace_offset != 0 {
+            assert_eq!(
+                mem.overlay.translate_source_range(source, replace_offset),
+                Some(old_overlay)
+            );
+        }
+        let suffix_start = replace_offset + GRANULE;
+        if suffix_start < LENGTH {
+            assert_eq!(
+                mem.overlay
+                    .translate_source_range(source + suffix_start, LENGTH - suffix_start),
+                Some(old_overlay + suffix_start)
+            );
+        }
+        let reused = mem
+            .overlay
+            .alloc(GRANULE, crate::shared_aperture::BackingObject::PrivateAnon)
+            .expect("only overwritten overlay storage is reusable");
+        assert_eq!(reused, old_overlay + replace_offset);
+        let after_reuse = mem
+            .overlay
+            .alloc(GRANULE, crate::shared_aperture::BackingObject::PrivateAnon)
+            .expect("preserved storage remains unavailable");
+        assert!(
+            after_reuse >= replacement_overlay + GRANULE,
+            "preserved prefix/suffix must not be reallocated"
+        );
+        drop(mem);
+
+        // The mapped bytes survive a real fork snapshot. Child mutations to the
+        // private replacement model cannot bleed back into the parent, while the
+        // parent retains every preserved prefix/suffix byte.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork partial-overlay snapshot failed");
+        if child == 0 {
+            if memory.inner.bytes[replaced_index] != 0 {
+                unsafe { libc::_exit(81) };
+            }
+            memory.inner.bytes.fill(0x7e);
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        assert_eq!(memory.inner.bytes[replaced_index], 0);
+        if replace_offset != 0 {
+            assert_ne!(memory.inner.bytes[0], 0x7e);
+        }
+        if replacement_end < LENGTH as usize {
+            assert_ne!(memory.inner.bytes[replacement_end], 0x7e);
+        }
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-    assert!(libc::WIFSIGNALED(status), "child status was 0x{status:x}");
-    assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
+
+    #[test]
+    fn private_overlay_prefix_replacement_carves_exact_storage() {
+        assert_partial_private_overlay_replacement(0);
+    }
+
+    #[test]
+    fn private_overlay_middle_replacement_carves_exact_storage() {
+        assert_partial_private_overlay_replacement(carrick_guest_mem::HOST_PAGE_GRANULE);
+    }
+
+    #[test]
+    fn private_overlay_suffix_replacement_carves_exact_storage() {
+        assert_partial_private_overlay_replacement(2 * carrick_guest_mem::HOST_PAGE_GRANULE);
+    }
+
+    #[test]
+    fn post_repoint_protection_failure_aborts_instead_of_publishing_split_ownership() {
+        const SYS_MMAP: u64 = 222;
+        const LENGTH: u64 = 4096;
+        const MAPPED_LENGTH: usize = carrick_guest_mem::HOST_PAGE_GRANULE as usize;
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork protection-failure child failed");
+        if child == 0 {
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
+            let dispatcher = SyscallDispatcher::new();
+            let registry = crate::thread::ThreadRegistry::new(
+                crate::thread::ThreadId::synthetic_for_tests(1063),
+            );
+            let reporter = CompatReporter::default();
+            let mut memory =
+                ProtectionTrackingMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, MAPPED_LENGTH);
+            let shared = returned(threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        0,
+                        LENGTH,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+            )) as u64;
+            memory.fail_protect = true;
+            let _ = threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        shared,
+                        LENGTH,
+                        LINUX_PROT_READ,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+            );
+            unsafe { libc::_exit(92) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFSIGNALED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
+    }
 }
