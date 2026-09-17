@@ -697,6 +697,44 @@ impl<'a> NetView<'a> {
     }
 
     /// Return the host fd backing a guest fd for ppoll's fast path.
+    pub(super) fn description_host_fd_for_poll(
+        desc: &Arc<crate::kernel::FileDescription>,
+    ) -> Option<HostFd> {
+        let open = desc.read()?;
+        match &*open {
+            OpenDescription::HostPipe { host_fd, .. }
+            | OpenDescription::HostFile { host_fd, .. } => Some(host_fd.view()),
+            OpenDescription::HostSocket { host_fd, base, .. } => {
+                if base.pending_socket_error().is_some() {
+                    None
+                } else {
+                    Some(host_fd.view())
+                }
+            }
+            OpenDescription::PipeReader { pipe, .. } => pipe.read_poll_fd().map(|fd| fd.view()),
+            OpenDescription::PipeWriter { pipe, .. } => pipe.write_poll_fd().map(|fd| fd.view()),
+            OpenDescription::EventFd { state, .. } => state.read_fd.as_ref().map(|fd| fd.view()),
+            // A pidfd is read-ready when its process exits; the backing
+            // multiplexer's poll fd (the kqueue fd on macOS, the
+            // pidfd-bearing epoll fd on Linux) is what poll/epoll watch.
+            OpenDescription::Pidfd { kqueue, .. } => Some(HostFd(kqueue.poll_fd())),
+            // inotify readiness is the backing kqueue's fd, so poll/epoll/
+            // blocking-read wait on it natively.
+            OpenDescription::Inotify { state, .. } => Some(HostFd(state.poll_fd())),
+            // fanotify readiness is the group's readiness pipe: readable iff
+            // an event is queued, so poll/epoll and a blocking read all
+            // park on one real host fd. If the pipe could not be created
+            // the group has no host fd at all — report `None` so the caller
+            // falls through to the synthetic in-memory readiness below,
+            // rather than polling fd -1 forever.
+            OpenDescription::Fanotify { group, .. } => match group.poll_fd() {
+                fd if fd >= 0 => Some(HostFd(fd)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// `Some(host_fd)` means we can hand this off to libc::poll.
     /// `None` means it's synthetic (epoll/eventfd/timerfd/in-memory pipe)
     /// and ppoll has to fall back to the per-fd readiness loop.
@@ -707,43 +745,7 @@ impl<'a> NetView<'a> {
             return Some(HostFd(fd));
         }
         if let Some(open_file) = self.open_file(fd) {
-            let open = open_file.description.read()?;
-            return match &*open {
-                OpenDescription::HostPipe { host_fd, .. }
-                | OpenDescription::HostFile { host_fd, .. } => Some(host_fd.view()),
-                OpenDescription::HostSocket { host_fd, base, .. } => {
-                    if base.pending_socket_error().is_some() {
-                        None
-                    } else {
-                        Some(host_fd.view())
-                    }
-                }
-                OpenDescription::PipeReader { pipe, .. } => pipe.read_poll_fd().map(|fd| fd.view()),
-                OpenDescription::PipeWriter { pipe, .. } => {
-                    pipe.write_poll_fd().map(|fd| fd.view())
-                }
-                OpenDescription::EventFd { state, .. } => {
-                    state.read_fd.as_ref().map(|fd| fd.view())
-                }
-                // A pidfd is read-ready when its process exits; the backing
-                // multiplexer's poll fd (the kqueue fd on macOS, the
-                // pidfd-bearing epoll fd on Linux) is what poll/epoll watch.
-                OpenDescription::Pidfd { kqueue, .. } => Some(HostFd(kqueue.poll_fd())),
-                // inotify readiness is the backing kqueue's fd, so poll/epoll/
-                // blocking-read wait on it natively.
-                OpenDescription::Inotify { state, .. } => Some(HostFd(state.poll_fd())),
-                // fanotify readiness is the group's readiness pipe: readable iff
-                // an event is queued, so poll/epoll and a blocking read all
-                // park on one real host fd. If the pipe could not be created
-                // the group has no host fd at all — report `None` so the caller
-                // falls through to the synthetic in-memory readiness below,
-                // rather than polling fd -1 forever.
-                OpenDescription::Fanotify { group, .. } => match group.poll_fd() {
-                    fd if fd >= 0 => Some(HostFd(fd)),
-                    _ => None,
-                },
-                _ => None,
-            };
+            return Self::description_host_fd_for_poll(&open_file.description);
         }
         if is_stdio_fd(fd) {
             return Some(HostFd(fd));

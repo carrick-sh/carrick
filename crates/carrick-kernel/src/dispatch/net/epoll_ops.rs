@@ -388,12 +388,105 @@ impl<'a> NetView<'a> {
         });
     }
 
+    pub(super) fn interest_host_fd(&self, slot: &EpollInterest, fd: i32) -> Option<HostFd> {
+        if let Some(target) = &slot.target {
+            if target.fd_ref_count() == 0 {
+                return None;
+            }
+            Self::description_host_fd_for_poll(target)
+        } else {
+            self.host_fd_for_poll(fd)
+        }
+    }
+
+    pub(super) fn epoll_ready_events_for_interest(
+        &self,
+        slot: &EpollInterest,
+        fd: i32,
+        requested_events: u32,
+    ) -> u32 {
+        let interest = carrick_abi::LinuxEpollEvents::from_bits_retain(requested_events);
+        if let Some(target) = &slot.target {
+            if target.fd_ref_count() == 0 {
+                return 0;
+            }
+            target.readiness(interest, self).bits()
+        } else {
+            let Some(open_file) = self.open_file(fd) else {
+                return 0;
+            };
+            open_file.description.readiness(interest, self).bits()
+        }
+    }
+
     pub(super) fn epoll_ready_events(&self, fd: i32, requested_events: u32) -> u32 {
         let Some(open_file) = self.open_file(fd) else {
             return 0;
         };
         let interest = carrick_abi::LinuxEpollEvents::from_bits_retain(requested_events);
         open_file.description.readiness(interest, self).bits()
+    }
+
+    pub(super) fn host_read_avail_for_interest(&self, slot: &EpollInterest, fd: i32) -> u64 {
+        let mut synthetic_bytes = 0u64;
+        if let Some(target) = &slot.target {
+            if target.fd_ref_count() == 0 {
+                return 0;
+            }
+            if let Some(open) = target.read() {
+                match &*open {
+                    OpenDescription::PipeReader { pipe, .. } => {
+                        return pipe.buffered_bytes() as u64;
+                    }
+                    OpenDescription::InMemorySocket { socket, .. } => {
+                        return socket.buffered_bytes() as u64;
+                    }
+                    OpenDescription::HostSocket { synthetic_recv, .. } => {
+                        synthetic_bytes = synthetic_recv
+                            .iter()
+                            .map(|(payload, _source)| payload.len() as u64)
+                            .sum();
+                    }
+                    _ => {}
+                }
+            }
+        } else if let Some(open_file) = self.open_file(fd) {
+            if let Some(open) = open_file.description.read() {
+                match &*open {
+                    OpenDescription::PipeReader { pipe, .. } => {
+                        return pipe.buffered_bytes() as u64;
+                    }
+                    OpenDescription::InMemorySocket { socket, .. } => {
+                        return socket.buffered_bytes() as u64;
+                    }
+                    OpenDescription::HostSocket { synthetic_recv, .. } => {
+                        synthetic_bytes = synthetic_recv
+                            .iter()
+                            .map(|(payload, _source)| payload.len() as u64)
+                            .sum();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let host_fd = self.interest_host_fd(slot, fd);
+        let Some(host_fd) = host_fd else {
+            return synthetic_bytes;
+        };
+        let mut avail: libc::c_int = 0;
+        let rc = unsafe { libc::ioctl(host_fd.get(), libc::FIONREAD, &mut avail) };
+        let host = if rc == 0 && avail > 0 {
+            avail as u64
+        } else {
+            0
+        };
+        let staged_bytes = if let Some(target) = &slot.target {
+            self.staged_splice_description_bytes(target.id()) as u64
+        } else {
+            self.staged_splice_pipe_bytes(fd) as u64
+        };
+        host.saturating_add(staged_bytes)
+            .saturating_add(synthetic_bytes)
     }
 
     pub(super) fn host_read_avail_for_poll(&self, fd: i32) -> u64 {
@@ -432,6 +525,24 @@ impl<'a> NetView<'a> {
         };
         host.saturating_add(self.staged_splice_pipe_bytes(fd) as u64)
             .saturating_add(synthetic_bytes)
+    }
+
+    fn listening_socket_readiness_sample_for_interest(
+        &self,
+        slot: &EpollInterest,
+        fd: i32,
+        requested: u32,
+    ) -> Option<crate::kernel::objects::ListenerReadinessSample> {
+        let events = carrick_abi::LinuxEpollEvents::from_bits_retain(requested);
+        if let Some(target) = &slot.target {
+            if target.fd_ref_count() == 0 {
+                return None;
+            }
+            target.listener_readiness(events)
+        } else {
+            let open_file = self.open_file(fd)?;
+            open_file.description.listener_readiness(events)
+        }
     }
 
     fn listening_socket_readiness_sample_for_poll(
@@ -574,17 +685,20 @@ impl<'a> NetView<'a> {
                                 .open_file(*fd)
                                 .map(|file| Arc::clone(&file.description));
                             let matching_fds = interest
-                                .keys()
-                                .copied()
-                                .filter(|candidate| {
-                                    *candidate == *fd
-                                        || target_host_fd.is_some()
-                                            && self.host_fd_for_poll(*candidate) == target_host_fd
-                                        || target_description.as_ref().is_some_and(|target| {
-                                            self.open_file(*candidate).is_some_and(|candidate| {
-                                                Arc::ptr_eq(&candidate.description, target)
-                                            })
-                                        })
+                                .iter()
+                                .filter_map(|(candidate, slot)| {
+                                    let matches = match (&slot.target, &target_description) {
+                                        (Some(registered), Some(target)) => {
+                                            Arc::ptr_eq(registered, target)
+                                        }
+                                        _ => {
+                                            *candidate == *fd
+                                                || (target_host_fd.is_some()
+                                                    && self.interest_host_fd(slot, *candidate)
+                                                        == target_host_fd)
+                                        }
+                                    };
+                                    matches.then_some(*candidate)
                                 })
                                 .collect::<Vec<_>>();
                             for matching_fd in matching_fds {
@@ -1056,7 +1170,7 @@ impl<'a> NetView<'a> {
                             let mut rev: HashMap<i32, Vec<i32>> = HashMap::new();
                             if let OpenDescription::Epoll { interest, .. } = &*open {
                                 for (gfd, slot) in interest.iter() {
-                                    if let Some(hfd) = this.host_fd_for_poll(*gfd) {
+                                    if let Some(hfd) = this.interest_host_fd(slot, *gfd) {
                                         info.insert(
                                             *gfd,
                                             (
@@ -1155,10 +1269,27 @@ impl<'a> NetView<'a> {
                             )) = gfd_info.get(&gfd)
                             {
                                 host_ready_sampled.insert(gfd);
-                                let listener_sample =
-                                    this.listening_socket_readiness_sample_for_poll(gfd, requested);
+                                let slot =
+                                    interests.iter().find(|(fd, _)| *fd == gfd).map(|(_, s)| s);
+                                let listener_sample = slot
+                                    .and_then(|s| {
+                                        this.listening_socket_readiness_sample_for_interest(
+                                            s, gfd, requested,
+                                        )
+                                    })
+                                    .or_else(|| {
+                                        this.listening_socket_readiness_sample_for_poll(
+                                            gfd, requested,
+                                        )
+                                    });
                                 let mut raw = listener_sample.as_ref().map_or_else(
-                                    || this.epoll_ready_events(gfd, requested),
+                                    || {
+                                        if let Some(s) = slot {
+                                            this.epoll_ready_events_for_interest(s, gfd, requested)
+                                        } else {
+                                            this.epoll_ready_events(gfd, requested)
+                                        }
+                                    },
                                     |sample| sample.ready.bits(),
                                 );
                                 let terminal_edge = edge_bits
@@ -1168,7 +1299,11 @@ impl<'a> NetView<'a> {
                                     raw |= LINUX_EPOLLIN;
                                 }
                                 let read_avail = if raw & READ_READY_BITS != 0 {
-                                    this.host_read_avail_for_poll(gfd)
+                                    if let Some(s) = slot {
+                                        this.host_read_avail_for_interest(s, gfd)
+                                    } else {
+                                        this.host_read_avail_for_poll(gfd)
+                                    }
                                 } else {
                                     0
                                 };
@@ -1306,19 +1441,20 @@ impl<'a> NetView<'a> {
             // from a drained mux event so a missed/stale edge cannot park an
             // epoll waiter while the host fd is already readable/writable.
             for (fd, interest) in &interests {
-                if host_ready_sampled.contains(fd) || this.host_fd_for_poll(*fd).is_none() {
+                if host_ready_sampled.contains(fd) || this.interest_host_fd(interest, *fd).is_none()
+                {
                     continue;
                 }
                 host_ready_sampled.insert(*fd);
                 let requested = interest.event.events;
                 let listener_sample =
-                    this.listening_socket_readiness_sample_for_poll(*fd, requested);
+                    this.listening_socket_readiness_sample_for_interest(interest, *fd, requested);
                 let raw_ready = listener_sample.as_ref().map_or_else(
-                    || this.epoll_ready_events(*fd, requested),
+                    || this.epoll_ready_events_for_interest(interest, *fd, requested),
                     |sample| sample.ready.bits(),
                 );
                 let read_avail = if raw_ready & READ_READY_BITS != 0 {
-                    this.host_read_avail_for_poll(*fd)
+                    this.host_read_avail_for_interest(interest, *fd)
                 } else {
                     0
                 };
@@ -1425,7 +1561,7 @@ impl<'a> NetView<'a> {
                         interest.last_ready as i32,
                     );
                     let host_fd = this
-                        .host_fd_for_poll(*fd)
+                        .interest_host_fd(interest, *fd)
                         .map_or(-1, |host_fd| host_fd.get());
                     crate::event_ring::rec(crate::event_ring::EPMASKFD, 2, *fd, host_fd);
                     crate::probes::epoll_masked(crate::probes::EpollMaskedProbe {
@@ -1455,20 +1591,20 @@ impl<'a> NetView<'a> {
                 // report that (dispatch::fifo_beacon decides it via a kernel
                 // beacon pipe), so recompute it here so the notify_inmem_epoll
                 // wake on writer-close surfaces EOF instead of blocking forever.
-                if let Some(hfd) = this.host_fd_for_poll(*fd)
+                if let Some(hfd) = this.interest_host_fd(interest, *fd)
                     && !crate::dispatch::fifo_beacon::read_end_at_eof(hfd.get())
                 {
                     continue;
                 }
                 let requested = interest.event.events;
                 let listener_sample =
-                    this.listening_socket_readiness_sample_for_poll(*fd, requested);
+                    this.listening_socket_readiness_sample_for_interest(interest, *fd, requested);
                 let raw_ready = listener_sample.as_ref().map_or_else(
-                    || this.epoll_ready_events(*fd, requested),
+                    || this.epoll_ready_events_for_interest(interest, *fd, requested),
                     |sample| sample.ready.bits(),
                 );
                 let read_avail = if raw_ready & READ_READY_BITS != 0 {
-                    this.host_read_avail_for_poll(*fd)
+                    this.host_read_avail_for_interest(interest, *fd)
                 } else {
                     0
                 };
@@ -1616,7 +1752,7 @@ impl<'a> NetView<'a> {
                                         raw,
                                         clear_write_backpressure,
                                     )
-                                    && let Some(host_fd) = this.host_fd_for_poll(fd)
+                                    && let Some(host_fd) = this.interest_host_fd(slot, fd)
                                 {
                                     host_rearms.push(host_fd.get());
                                 }
@@ -1655,7 +1791,12 @@ impl<'a> NetView<'a> {
             // the next epoll_wait (the same shape as the events=0 fix above,
             // applied to the freshly-disarmed ONESHOT slot).
             for fd in &oneshot_fds {
-                if let Some(host_fd) = this.host_fd_for_poll(*fd) {
+                let host_fd = interests
+                    .iter()
+                    .find(|(ifd, _)| ifd == fd)
+                    .and_then(|(_, s)| this.interest_host_fd(s, *fd))
+                    .or_else(|| this.host_fd_for_poll(*fd));
+                if let Some(host_fd) = host_fd {
                     kq.with_mux(|mux| {
                         let _ = mux.deregister(host_fd.get());
                     });

@@ -115,13 +115,11 @@ fn edge_triggered_reports_once_until_new_data_arrives() {
 }
 
 #[test]
-#[ignore = "defect: epoll detaches on local fd close even when alias or fork copy remains alive"]
 fn closing_an_inherited_descriptor_keeps_the_epoll_registration_until_the_child_closes_it() {
-    // man 7 epoll Q&A 6: "Will closing a file descriptor cause it to be removed from all epoll interest lists?"
-    // Yes, but only when all file descriptors referring to the underlying open file description have been closed.
-    // An inherited fork alias retains the registration until the last descriptor closes.
+    // man 7 epoll Q&A 6: An open file description remains in the epoll set as long as any file descriptor
+    // referring to that description is open.
     let script = vec![
-        // Data pipe: slot 0 (read end), slot 1 (write end)
+        // Data pipe: slot 0 (read), slot 1 (write)
         Step::Sys(
             sys::pipe2(0)
                 .ret(0)
@@ -181,7 +179,6 @@ fn closing_an_inherited_descriptor_keeps_the_epoll_registration_until_the_child_
 }
 
 #[test]
-#[ignore = "defect: epoll detaches on local fd close even when alias or fork copy remains alive"]
 fn closing_a_duplicated_descriptor_in_the_same_process_keeps_the_epoll_registration_until_both_close()
  {
     // man 7 epoll Q&A 6: An open file description remains in the epoll set as long as any duplicate fd is open.
@@ -210,6 +207,61 @@ fn closing_a_duplicated_descriptor_in_the_same_process_keeps_the_epoll_registrat
         // epoll_pwait must return 0 because the registration was automatically removed when slot 3 closed
         Step::Sys(sys::epoll_pwait(slot(2), 1, 10, 0).ret(0)),
         Step::Sys(sys::close(slot(1)).ret(0)),
+        Step::Sys(sys::close(slot(2)).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+}
+
+#[test]
+fn reused_numeric_descriptor_does_not_trigger_or_mask_epoll_for_original_description() {
+    // man 7 epoll: An epoll registration is bound to the open file description, not the numeric fd.
+    // Reusing the numeric fd for a different file must not trigger or mask the original registration.
+    let script = vec![
+        // Pipe A: slot 0 (read), slot 1 (write)
+        Step::Sys(
+            sys::pipe2(0)
+                .ret(0)
+                .save_out_i32(0, 0, 0)
+                .save_out_i32(0, 1, 1),
+        ),
+        // Epoll instance: slot 2
+        Step::Sys(sys::epoll_create1(0).save(2)),
+        // Register pipe A (slot 0) in epoll with data 0x1111
+        Step::Sys(sys::epoll_ctl_add(slot(2), slot(0), LINUX_EPOLLIN as u32, 0x1111u64).ret(0)),
+        // Duplicate slot 0 -> slot 3 (keeps pipe A OFD alive)
+        Step::Sys(sys::dup(slot(0)).save(3)),
+        // Close slot 0: numeric fd 0 is now free for allocation
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        // Create Pipe B: allocates numeric fd 0 for read end, slot 4 for write end
+        Step::Sys(
+            sys::pipe2(0)
+                .ret(0)
+                .save_out_i32(0, 0, 0)
+                .save_out_i32(0, 1, 4),
+        ),
+        // Write to Pipe B (slot 4): numeric fd 0 is now readable for Pipe B, but epoll watched Pipe A
+        Step::Sys(sys::write(slot(4), b"pipe_B").ret(6)),
+        // epoll_pwait on slot 2 must NOT fire for Pipe B -> timeout (ret 0)
+        Step::Sys(sys::epoll_pwait(slot(2), 1, 10, 0).ret(0)),
+        // Write to Pipe A (slot 1): Pipe A becomes readable (watched description)
+        Step::Sys(sys::write(slot(1), b"pipe_A").ret(6)),
+        // epoll_pwait on slot 2 MUST fire for Pipe A (data 0x1111)
+        Step::Sys(sys::epoll_pwait(slot(2), 1, 5000, 0).ret(1)),
+        // Drain data from Pipe A via slot 3
+        Step::Sys(sys::read(slot(3), 6).ret(6)),
+        // Drain data from Pipe B via slot 0
+        Step::Sys(sys::read(slot(0), 6).ret(6)),
+        // Close Pipe A alias (slot 3): now Pipe A is completely closed -> auto-detached from epoll
+        Step::Sys(sys::close(slot(3)).ret(0)),
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        // Clean up Pipe B
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::close(slot(4)).ret(0)),
         Step::Sys(sys::close(slot(2)).ret(0)),
         Step::Sys(sys::exit_group(0)),
     ];
