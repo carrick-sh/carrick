@@ -571,15 +571,18 @@ fn retire_execution_authority_for_exec(
     thread: &std::sync::Arc<carrick_kernel::kernel::Thread>,
     lease_slot: &super::ExecutionLeaseCell,
 ) -> Result<(), carrick_kernel::kernel::objects::ThreadExecutionError> {
-    let lease = lease_slot.lock().take().ok_or_else(|| {
+    let mut guard = lease_slot.lock();
+    let lease = guard.take_lease().ok_or_else(|| {
         carrick_kernel::kernel::objects::ThreadExecutionError::InvalidTransition {
             operation: "retire_execution_authority_for_exec_without_lease",
             state: thread.execution_state(),
         }
     })?;
-    thread
-        .exit_from_executor(lease)
-        .map_err(|(error, _lease)| error)
+    let consumed = thread
+        .exit_predecessor_for_exec(lease)
+        .map_err(|(error, _lease)| error)?;
+    guard.consume_predecessor_for_exec(consumed);
+    Ok(())
 }
 
 fn publish_execution_authority_after_exec(
@@ -590,8 +593,9 @@ fn publish_execution_authority_after_exec(
 ) -> Result<(), carrick_kernel::kernel::objects::ThreadExecutionError> {
     replacement.publish_initial_task_state(state)?;
     let lease = replacement.claim_runnable(executor)?;
-    debug_assert!(lease_slot.lock().is_none());
-    *lease_slot.lock() = Some(lease);
+    let mut guard = lease_slot.lock();
+    debug_assert!(guard.as_ref().is_none());
+    guard.set_lease(lease);
     Ok(())
 }
 
@@ -838,7 +842,7 @@ mod exec_image_verification_tests {
             .claim_blocked_for_transitional_executor(executor)
             .unwrap();
         let lease_slot = crate::vcpu_loop::ExecutionLeaseCell::owned();
-        *lease_slot.lock() = Some(active);
+        lease_slot.lock().set_lease(active);
 
         retire_execution_authority_for_exec(&old_thread, &lease_slot).unwrap();
         let prepared = kernel.prepare_exec(&context, None).unwrap();
@@ -858,7 +862,7 @@ mod exec_image_verification_tests {
         )
         .unwrap();
 
-        let mut replacement_lease = lease_slot.lock().take().unwrap();
+        let mut replacement_lease = lease_slot.lock().take_lease().unwrap();
         replacement_lease
             .replace_task_state(replacement_state.clone())
             .unwrap();
@@ -953,7 +957,7 @@ mod exec_image_verification_tests {
             )
             .unwrap();
         let slot = crate::vcpu_loop::ExecutionLeaseCell::owned();
-        *slot.lock() = Some(lease);
+        slot.lock().set_lease(lease);
         let prepared = kernel.prepare_exec(&context, None).unwrap();
         let _replacement = kernel.commit_exec(prepared, None).unwrap();
         let destructive_calls = std::cell::Cell::new(0);
@@ -2133,38 +2137,7 @@ where
                 .map(Some);
             }
         };
-        let replacement_state = carrick_kernel::kernel::objects::MigratableTaskState {
-            cpu: replacement_cpu,
-            mm: committed_mm,
-            asid_generation: committed_asid_generation,
-        };
-        if let Err(error) = publish_execution_authority_after_exec(
-            committed_context.thread(),
-            worker_executor,
-            replacement_state,
-            &self.execution_lease,
-        ) {
-            return Self::exec_failed_past_no_return(
-                kernel,
-                engine,
-                &format!("publish replacement execution lease after exec: {error}"),
-            )
-            .map(Some);
-        }
-        if let Some(committed) = committed_transition {
-            let (transition, replacement_mm, retired_mm) = committed.into_parts();
-            let replacement = super::executor::PendingExecReplacement {
-                transition,
-                replacement_mm,
-                retired_mm,
-            };
-            if self.pending_exec_replacement.replace(replacement).is_some() {
-                carrick_fatal!(
-                    "hvpatch::exec_replacement",
-                    "duplicate pending exec replacement would overwrite Kernel transition and MM retirement authority"
-                );
-            }
-        }
+
         // `exec` publishes a new Mm generation while keeping this host
         // engine/vCPU.  Frame-COW callbacks must therefore move from
         // the retired mm to the committed replacement before any
@@ -2376,6 +2349,38 @@ where
         if let Some(fd) = self.vfork_release_fd.take() {
             let _ = unsafe { libc::write(fd, [0u8; 1].as_ptr().cast(), 1) };
             unsafe { libc::close(fd) };
+        }
+        let replacement_state = carrick_kernel::kernel::objects::MigratableTaskState {
+            cpu: replacement_cpu,
+            mm: committed_mm,
+            asid_generation: committed_asid_generation,
+        };
+        if let Err(error) = publish_execution_authority_after_exec(
+            committed_context.thread(),
+            worker_executor,
+            replacement_state,
+            &self.execution_lease,
+        ) {
+            return Self::exec_failed_past_no_return(
+                kernel,
+                engine,
+                &format!("publish replacement execution lease after exec: {error}"),
+            )
+            .map(Some);
+        }
+        if let Some(committed) = committed_transition {
+            let (transition, replacement_mm, retired_mm) = committed.into_parts();
+            let replacement = super::executor::PendingExecReplacement {
+                transition,
+                replacement_mm,
+                retired_mm,
+            };
+            if self.pending_exec_replacement.replace(replacement).is_some() {
+                carrick_fatal!(
+                    "hvpatch::exec_replacement",
+                    "duplicate pending exec replacement would overwrite Kernel transition and MM retirement authority"
+                );
+            }
         }
         stop_after_traced_exec(&kernel.dispatcher);
         Ok(None)
@@ -2763,7 +2768,10 @@ pub(crate) mod tests {
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
         );
-        *state.execution_lease.lock() = Some(root_running.take_lease());
+        state
+            .execution_lease
+            .lock()
+            .set_lease(root_running.take_lease());
         let mm_executor = kernel
             .dispatcher
             .enter_mm_executor_for_thread(Some(Arc::clone(root.thread())), kicker, this_tid)
@@ -2802,7 +2810,7 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&root_authority),
-            lease: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::default(),
             exec_replacement: None,
         };
         let mut parent_control =
@@ -2886,7 +2894,9 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&child_authority),
-            lease: Some(child_running.take_lease()),
+            authority: executor::ExecutionLeaseAuthoritySlot::from(Some(
+                child_running.take_lease(),
+            )),
             exec_replacement: None,
         };
         let (first, second) = {
@@ -2903,7 +2913,12 @@ pub(crate) mod tests {
         assert!(matches!(first, executor::ExecutorExit::Syscall));
         assert!(matches!(second, executor::ExecutorExit::Syscall));
         child_running
-            .restore_lease(child_submission.lease.take().expect("returned child lease"))
+            .restore_lease(
+                child_submission
+                    .authority
+                    .take_lease()
+                    .expect("returned child lease"),
+            )
             .expect("restore child lease");
         scheduler
             .settle_runnable(child_running)
@@ -2913,7 +2928,7 @@ pub(crate) mod tests {
                 job.state
                     .execution_lease
                     .lock()
-                    .take()
+                    .take_lease()
                     .expect("returned parent lease"),
             )
             .expect("restore parent lease");
@@ -3001,7 +3016,10 @@ pub(crate) mod tests {
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
         );
-        *state.execution_lease.lock() = Some(root_running.take_lease());
+        state
+            .execution_lease
+            .lock()
+            .set_lease(root_running.take_lease());
         state.guest_execution = Some(
             kernel
                 .dispatcher
@@ -3064,7 +3082,7 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&root_authority),
-            lease: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::default(),
             exec_replacement: None,
         };
         let mut parent_control =
@@ -3134,7 +3152,9 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&child_authority),
-            lease: Some(child_running.take_lease()),
+            authority: executor::ExecutionLeaseAuthoritySlot::from(Some(
+                child_running.take_lease(),
+            )),
             exec_replacement: None,
         };
         let (first, second) = {
@@ -3151,7 +3171,12 @@ pub(crate) mod tests {
         assert!(matches!(first, executor::ExecutorExit::Syscall));
         assert!(matches!(second, executor::ExecutorExit::Syscall));
         child_running
-            .restore_lease(child_submission.lease.take().expect("returned child lease"))
+            .restore_lease(
+                child_submission
+                    .authority
+                    .take_lease()
+                    .expect("returned child lease"),
+            )
             .expect("restore child lease");
         scheduler
             .settle_runnable(child_running)
@@ -3161,7 +3186,7 @@ pub(crate) mod tests {
                 job.state
                     .execution_lease
                     .lock()
-                    .take()
+                    .take_lease()
                     .expect("returned parent lease"),
             )
             .expect("restore parent lease");
@@ -3326,7 +3351,9 @@ pub(crate) mod tests {
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: Some(&root_authority),
-                lease: Some(root_running.take_lease()),
+                authority: executor::ExecutionLeaseAuthoritySlot::from(Some(
+                    root_running.take_lease(),
+                )),
                 exec_replacement: None,
             };
             let blocked_exit = {
@@ -3348,7 +3375,12 @@ pub(crate) mod tests {
                 .enroll(&mut registration)
                 .expect("enroll real wait-service continuation");
             root_running
-                .restore_lease(submission.lease.take().expect("returned blocked lease"))
+                .restore_lease(
+                    submission
+                        .authority
+                        .take_lease()
+                        .expect("returned blocked lease"),
+                )
                 .expect("restore blocked lease");
             scheduler
                 .settle_blocked_continuation(root_running, *continuation, registration)
@@ -3399,7 +3431,9 @@ pub(crate) mod tests {
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: Some(&root_authority),
-                lease: Some(resumed_running.take_lease()),
+                authority: executor::ExecutionLeaseAuthoritySlot::from(Some(
+                    resumed_running.take_lease(),
+                )),
                 exec_replacement: None,
             };
             let resumed = {
@@ -3414,8 +3448,8 @@ pub(crate) mod tests {
             resumed_running
                 .restore_lease(
                     resumed_submission
-                        .lease
-                        .take()
+                        .authority
+                        .take_lease()
                         .expect("returned resumed lease"),
                 )
                 .expect("restore resumed lease");
@@ -3559,7 +3593,7 @@ pub(crate) mod tests {
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: Some(&root_authority),
-                lease: Some(running.take_lease()),
+                authority: executor::ExecutionLeaseAuthoritySlot::from(Some(running.take_lease())),
                 exec_replacement: None,
             };
             let mut next_exit = {
@@ -3584,7 +3618,12 @@ pub(crate) mod tests {
                     .enroll(&mut registration)
                     .expect("enroll readiness continuation");
                 running
-                    .restore_lease(submission.lease.take().expect("returned blocked lease"))
+                    .restore_lease(
+                        submission
+                            .authority
+                            .take_lease()
+                            .expect("returned blocked lease"),
+                    )
                     .expect("restore blocked lease");
                 scheduler
                     .settle_blocked_continuation(running, *continuation, registration)
@@ -3606,7 +3645,7 @@ pub(crate) mod tests {
                     );
                     std::thread::yield_now();
                 };
-                submission.lease = Some(running.take_lease());
+                submission.authority.set_lease(running.take_lease());
                 next_exit = {
                     let mut control =
                         executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
@@ -3638,8 +3677,8 @@ pub(crate) mod tests {
             running
                 .restore_lease(
                     submission
-                        .lease
-                        .take()
+                        .authority
+                        .take_lease()
                         .expect("returned final blocked lease"),
                 )
                 .expect("restore final blocked lease");
@@ -3656,7 +3695,7 @@ pub(crate) mod tests {
                 assert!(Instant::now() < deadline, "final timer did not wake");
                 std::thread::yield_now();
             };
-            submission.lease = Some(running.take_lease());
+            submission.authority.set_lease(running.take_lease());
             let final_exit = {
                 let mut control =
                     executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
@@ -3665,7 +3704,12 @@ pub(crate) mod tests {
             };
             assert!(matches!(final_exit, executor::ExecutorExit::Syscall));
             running
-                .restore_lease(submission.lease.take().expect("returned final lease"))
+                .restore_lease(
+                    submission
+                        .authority
+                        .take_lease()
+                        .expect("returned final lease"),
+                )
                 .expect("restore final lease");
             scheduler
                 .settle_runnable(running)
@@ -3797,7 +3841,7 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&root_authority),
-            lease: Some(running.take_lease()),
+            authority: executor::ExecutionLeaseAuthoritySlot::from(Some(running.take_lease())),
             exec_replacement: None,
         };
         let blocked_exit = {
@@ -3824,7 +3868,12 @@ pub(crate) mod tests {
             .enroll(&mut registration)
             .expect("enroll blocking-write driver");
         running
-            .restore_lease(submission.lease.take().expect("returned blocked lease"))
+            .restore_lease(
+                submission
+                    .authority
+                    .take_lease()
+                    .expect("returned blocked lease"),
+            )
             .expect("restore blocked lease");
         scheduler
             .settle_blocked_continuation(running, *continuation, registration)
@@ -3843,7 +3892,7 @@ pub(crate) mod tests {
             );
             std::thread::yield_now();
         };
-        submission.lease = Some(running.take_lease());
+        submission.authority.set_lease(running.take_lease());
         let final_exit = {
             let mut control =
                 executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
@@ -3852,7 +3901,12 @@ pub(crate) mod tests {
         };
         assert!(matches!(final_exit, executor::ExecutorExit::Syscall));
         running
-            .restore_lease(submission.lease.take().expect("returned final lease"))
+            .restore_lease(
+                submission
+                    .authority
+                    .take_lease()
+                    .expect("returned final lease"),
+            )
             .expect("restore final lease");
         scheduler
             .settle_runnable(running)
@@ -4374,7 +4428,7 @@ pub(crate) mod tests {
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
         );
-        *state.execution_lease.lock() = Some(running.take_lease());
+        state.execution_lease.lock().set_lease(running.take_lease());
         state.service_kernel_context = Some(context.retain_exact());
         state.guest_execution = Some(
             kernel
@@ -4495,7 +4549,7 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
-            lease: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::default(),
             exec_replacement: None,
         };
         let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
@@ -4601,7 +4655,7 @@ pub(crate) mod tests {
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
-                lease: None,
+                authority: executor::ExecutionLeaseAuthoritySlot::default(),
                 exec_replacement: None,
             };
             let mut control =
@@ -4796,7 +4850,7 @@ pub(crate) mod tests {
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
-                lease: None,
+                authority: executor::ExecutionLeaseAuthoritySlot::default(),
                 exec_replacement: None,
             };
             let mut control =
@@ -4868,7 +4922,7 @@ pub(crate) mod tests {
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
-                lease: None,
+                authority: executor::ExecutionLeaseAuthoritySlot::default(),
                 exec_replacement: None,
             };
             let mut control =
@@ -4939,7 +4993,7 @@ pub(crate) mod tests {
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
-                lease: None,
+                authority: executor::ExecutionLeaseAuthoritySlot::default(),
                 exec_replacement: None,
             };
             let mut control =
@@ -4999,7 +5053,7 @@ pub(crate) mod tests {
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
-                lease: None,
+                authority: executor::ExecutionLeaseAuthoritySlot::default(),
                 exec_replacement: None,
             };
             let mut control =
@@ -5069,7 +5123,7 @@ pub(crate) mod tests {
                     scheduler: &scheduler,
                     publish_test_descendant: &|_, _| unreachable!(),
                     current: None,
-                    lease: None,
+                    authority: executor::ExecutionLeaseAuthoritySlot::default(),
                     exec_replacement: None,
                 };
                 let mut control =
@@ -5155,7 +5209,7 @@ pub(crate) mod tests {
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
-                lease: None,
+                authority: executor::ExecutionLeaseAuthoritySlot::default(),
                 exec_replacement: None,
             };
             let mut control =
@@ -5213,7 +5267,7 @@ pub(crate) mod tests {
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
-                lease: None,
+                authority: executor::ExecutionLeaseAuthoritySlot::default(),
                 exec_replacement: None,
             };
 
@@ -5367,7 +5421,7 @@ pub(crate) mod tests {
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
-                lease: None,
+                authority: executor::ExecutionLeaseAuthoritySlot::default(),
                 exec_replacement: None,
             };
             let contender = ThreadId::synthetic_for_tests(pid + 2_000);
@@ -5481,7 +5535,7 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
-            lease: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::default(),
             exec_replacement: None,
         };
         let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
@@ -5550,7 +5604,7 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
-            lease: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::default(),
             exec_replacement: None,
         };
         let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
@@ -5619,7 +5673,7 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
-            lease: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::default(),
             exec_replacement: None,
         };
         let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
@@ -5713,7 +5767,7 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
-            lease: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::default(),
             exec_replacement: None,
         };
         let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
@@ -5786,7 +5840,7 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
-            lease: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::default(),
             exec_replacement: None,
         };
         let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
@@ -5893,7 +5947,7 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
-            lease: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::default(),
             exec_replacement: None,
         };
         let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
@@ -5992,7 +6046,7 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
-            lease: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::default(),
             exec_replacement: None,
         };
         let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
@@ -6037,7 +6091,7 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
-            lease: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::default(),
             exec_replacement: None,
         };
         let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
@@ -6147,7 +6201,7 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&root_authority),
-            lease: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::default(),
             exec_replacement: None,
         };
         let mut parent_control =
@@ -6220,7 +6274,9 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&child_authority),
-            lease: Some(child_running.take_lease()),
+            authority: executor::ExecutionLeaseAuthoritySlot::from(Some(
+                child_running.take_lease(),
+            )),
             exec_replacement: None,
         };
         let exit = {
@@ -6231,7 +6287,12 @@ pub(crate) mod tests {
                 .poll_quantum_with_engine(&mut engine, &mut child_control)
         };
         child_running
-            .restore_lease(child_submission.lease.take().expect("returned child lease"))
+            .restore_lease(
+                child_submission
+                    .authority
+                    .take_lease()
+                    .expect("returned child lease"),
+            )
             .expect("restore child lease");
         match exit {
             executor::ExecutorExit::Blocked(reason) => {

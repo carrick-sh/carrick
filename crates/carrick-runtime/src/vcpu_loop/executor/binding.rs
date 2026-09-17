@@ -212,6 +212,102 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
     }
 }
 
+#[derive(Debug, Default)]
+enum AuthoritySlotState {
+    #[default]
+    Empty,
+    Live(ThreadExecutionLease),
+    PredecessorConsumed(carrick_kernel::kernel::objects::ExecConsumedPredecessorAuthority),
+}
+
+#[derive(Debug, Default)]
+pub struct ExecutionLeaseAuthoritySlot {
+    state: AuthoritySlotState,
+}
+
+impl ExecutionLeaseAuthoritySlot {
+    #[allow(dead_code)]
+    pub(crate) fn empty() -> Self {
+        Self {
+            state: AuthoritySlotState::Empty,
+        }
+    }
+
+    pub(crate) fn new(lease: Option<ThreadExecutionLease>) -> Self {
+        Self {
+            state: match lease {
+                Some(l) => AuthoritySlotState::Live(l),
+                None => AuthoritySlotState::Empty,
+            },
+        }
+    }
+
+    pub(crate) fn as_ref(&self) -> Option<&ThreadExecutionLease> {
+        match &self.state {
+            AuthoritySlotState::Live(lease) => Some(lease),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_mut(&mut self) -> Option<&mut ThreadExecutionLease> {
+        match &mut self.state {
+            AuthoritySlotState::Live(lease) => Some(lease),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn take_lease(&mut self) -> Option<ThreadExecutionLease> {
+        match std::mem::replace(&mut self.state, AuthoritySlotState::Empty) {
+            AuthoritySlotState::Live(lease) => Some(lease),
+            AuthoritySlotState::PredecessorConsumed(consumed) => {
+                self.state = AuthoritySlotState::PredecessorConsumed(consumed);
+                None
+            }
+            AuthoritySlotState::Empty => None,
+        }
+    }
+
+    pub(crate) fn set_lease(&mut self, lease: ThreadExecutionLease) {
+        self.state = AuthoritySlotState::Live(lease);
+    }
+
+    pub(crate) fn consume_predecessor_for_exec(
+        &mut self,
+        consumed: carrick_kernel::kernel::objects::ExecConsumedPredecessorAuthority,
+    ) {
+        self.state = AuthoritySlotState::PredecessorConsumed(consumed);
+    }
+
+    pub(crate) fn take_authority(&mut self) -> Result<TakenExecutionAuthority, TrapError> {
+        match std::mem::replace(&mut self.state, AuthoritySlotState::Empty) {
+            AuthoritySlotState::Live(lease) => Ok(TakenExecutionAuthority::Live(lease)),
+            AuthoritySlotState::PredecessorConsumed(consumed) => {
+                Ok(TakenExecutionAuthority::PredecessorConsumed(consumed))
+            }
+            AuthoritySlotState::Empty => Err(TrapError::Hypervisor(
+                "quantum returned without execution lease authority".to_owned(),
+            )),
+        }
+    }
+}
+
+impl From<Option<ThreadExecutionLease>> for ExecutionLeaseAuthoritySlot {
+    fn from(lease: Option<ThreadExecutionLease>) -> Self {
+        Self::new(lease)
+    }
+}
+
+impl From<ThreadExecutionLease> for ExecutionLeaseAuthoritySlot {
+    fn from(lease: ThreadExecutionLease) -> Self {
+        Self::new(Some(lease))
+    }
+}
+
+pub(crate) enum TakenExecutionAuthority {
+    Live(ThreadExecutionLease),
+    PredecessorConsumed(carrick_kernel::kernel::objects::ExecConsumedPredecessorAuthority),
+}
+
 pub struct ExecutorSubmissionContext<'a> {
     pub(crate) scheduler: &'a Scheduler,
     #[cfg(test)]
@@ -223,9 +319,9 @@ pub struct ExecutorSubmissionContext<'a> {
     // The worker lends ownership, not an alias, for exactly one resident poll.
     // This lets the HVPatch logical state machine consume and replace exec
     // authority while making it impossible to retain a borrow across a
-    // Pending boundary. The worker takes the exact lease back before it saves
-    // or settles the task.
-    pub(crate) lease: Option<ThreadExecutionLease>,
+    // Pending boundary. The worker takes the exact authority back before it
+    // saves or settles the task.
+    pub(crate) authority: ExecutionLeaseAuthoritySlot,
     pub(crate) exec_replacement: Option<PendingExecReplacement>,
 }
 
@@ -297,8 +393,8 @@ impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
         self.submission.execution_lease_mut()
     }
 
-    pub(crate) const fn execution_lease_slot_mut(&mut self) -> &mut Option<ThreadExecutionLease> {
-        self.submission.execution_lease_slot_mut()
+    pub(crate) fn authority_slot_mut(&mut self) -> &mut ExecutionLeaseAuthoritySlot {
+        self.submission.authority_slot_mut()
     }
 
     pub(crate) fn publish_exec_replacement(
@@ -333,17 +429,24 @@ impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
 
 impl ExecutorSubmissionContext<'_> {
     pub(crate) fn execution_lease_mut(&mut self) -> Result<&mut ThreadExecutionLease, TrapError> {
-        self.lease.as_mut().ok_or_else(|| {
+        self.authority.as_mut().ok_or_else(|| {
             TrapError::Hypervisor("quantum has no mutable execution lease authority".to_owned())
         })
     }
 
-    pub(crate) const fn execution_lease_slot_mut(&mut self) -> &mut Option<ThreadExecutionLease> {
-        &mut self.lease
+    pub(crate) fn authority_slot_mut(&mut self) -> &mut ExecutionLeaseAuthoritySlot {
+        &mut self.authority
     }
 
+    pub(crate) fn take_execution_authority(
+        &mut self,
+    ) -> Result<TakenExecutionAuthority, TrapError> {
+        self.authority.take_authority()
+    }
+
+    #[cfg(test)]
     pub(crate) fn take_execution_lease(&mut self) -> Result<ThreadExecutionLease, TrapError> {
-        self.lease.take().ok_or_else(|| {
+        self.authority.take_lease().ok_or_else(|| {
             TrapError::Hypervisor("quantum returned without execution lease authority".to_owned())
         })
     }

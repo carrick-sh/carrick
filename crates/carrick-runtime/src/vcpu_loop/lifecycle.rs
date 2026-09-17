@@ -1240,7 +1240,7 @@ pub(crate) mod tests {
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: Some(&root_authority),
-                lease: None,
+                authority: executor::ExecutionLeaseAuthoritySlot::default(),
                 exec_replacement: None,
             };
             let mut control =
@@ -1711,7 +1711,7 @@ pub(crate) mod tests {
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: Some(&root_authority),
-                lease: None,
+                authority: executor::ExecutionLeaseAuthoritySlot::default(),
                 exec_replacement: None,
             };
             let mut control =
@@ -1825,7 +1825,7 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&root_authority),
-            lease: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::default(),
             exec_replacement: None,
         };
         let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
@@ -1904,7 +1904,7 @@ pub(crate) mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&root_authority),
-            lease: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::default(),
             exec_replacement: None,
         };
         let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);

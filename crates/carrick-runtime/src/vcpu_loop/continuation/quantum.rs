@@ -1115,7 +1115,7 @@ mod tests {
             scheduler: &scheduler,
             publish_test_descendant: &reject_descendant,
             current: None,
-            lease: None,
+            authority: crate::vcpu_loop::executor::ExecutionLeaseAuthoritySlot::default(),
             exec_replacement: None,
         };
         let need_resched = AtomicBool::new(false);

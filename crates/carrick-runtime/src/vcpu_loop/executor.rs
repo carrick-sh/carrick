@@ -430,9 +430,14 @@ where
             }
         }
 
+        enum SettlementAuthority {
+            Live,
+            PredecessorConsumed(carrick_kernel::kernel::objects::ExecConsumedPredecessorAuthority),
+        }
+
         let mut pending_exec_retirement = None;
         let mut pending_exec_cleanup = false;
-        let exit = loop {
+        let (exit, settlement_authority) = 'quantum: loop {
             let lease = running.take_lease();
             #[cfg(test)]
             let publish_test_descendant = |child, child_generation| {
@@ -448,15 +453,15 @@ where
                 #[cfg(test)]
                 publish_test_descendant: &publish_test_descendant,
                 current: submission_authority.as_ref(),
-                lease: Some(lease),
+                authority: ExecutionLeaseAuthoritySlot::from(Some(lease)),
                 exec_replacement: None,
             };
             let attempted = catch_unwind(AssertUnwindSafe(|| {
                 backend.run_until_boundary(&kick.need_resched, &mut submission)
             }));
             let exec_replacement = submission.exec_replacement.take();
-            let lease = match submission.take_execution_lease() {
-                Ok(lease) => lease,
+            let authority = match submission.take_execution_authority() {
+                Ok(authority) => authority,
                 Err(error) => {
                     let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                         resolver.as_ref(),
@@ -468,128 +473,193 @@ where
                     return Err(with_settlement_error(error.to_string(), settlement));
                 }
             };
-            if let Some(replacement) = exec_replacement {
-                let PendingExecReplacement {
-                    transition,
-                    replacement_mm,
-                    retired_mm,
-                } = replacement;
-                let predecessor_thread = thread;
-                let predecessor_generation = generation;
-                let successor_generation = lease.generation();
-                let authority = submission_authority.take();
-                let replacement_record =
-                    scheduler.retarget_running_exec(&mut running, transition, lease, |committed| {
-                        backend.validate_loaded_hardware_identity()?;
-                        let identity = TaskLoadIdentity {
-                            abi: binding.load_identity().abi,
-                            version: binding.load_identity().version,
-                            mm: committed.successor_mm,
-                            asid_generation: committed.successor_asid_generation,
-                        };
-                        let replacement_record = resolver.replace_exec(
-                            scheduler,
-                            ExecBindingTransition {
-                                predecessor_thread,
-                                predecessor_generation,
-                                successor_thread: committed.successor_thread,
-                                successor_generation,
-                                identity,
-                                replacement_mm: Some(Arc::clone(&replacement_mm)),
-                                authority,
+            let (settlement_auth, is_consumed) = match authority {
+                TakenExecutionAuthority::Live(lease) => {
+                    if let Some(replacement) = exec_replacement {
+                        let PendingExecReplacement {
+                            transition,
+                            replacement_mm,
+                            retired_mm,
+                        } = replacement;
+                        let predecessor_thread = thread;
+                        let predecessor_generation = generation;
+                        let successor_generation = lease.generation();
+                        let authority = submission_authority.take();
+                        let replacement_record = scheduler.retarget_running_exec(
+                            &mut running,
+                            transition,
+                            lease,
+                            |committed| {
+                                backend.validate_loaded_hardware_identity()?;
+                                let identity = TaskLoadIdentity {
+                                    abi: binding.load_identity().abi,
+                                    version: binding.load_identity().version,
+                                    mm: committed.successor_mm,
+                                    asid_generation: committed.successor_asid_generation,
+                                };
+                                let replacement_record = resolver.replace_exec(
+                                    scheduler,
+                                    ExecBindingTransition {
+                                        predecessor_thread,
+                                        predecessor_generation,
+                                        successor_thread: committed.successor_thread,
+                                        successor_generation,
+                                        identity,
+                                        replacement_mm: Some(Arc::clone(&replacement_mm)),
+                                        authority,
+                                    },
+                                )?;
+                                binding.mark_exec_transferred()?;
+                                if backend
+                                    .retarget_loaded_task(Arc::clone(&replacement_record.binding))
+                                    .is_err()
+                                {
+                                    // The combined record now names the replacement;
+                                    // allowing the old Arc to receive saved state would
+                                    // split immutable MM/ASID identity.
+                                    carrick_fatal!(
+                                        "vcpu_loop::executor_exec_transfer",
+                                        "backend task retarget failed during exec transfer: executor_id={:?}",
+                                        executor_id
+                                    );
+                                }
+                                Ok(replacement_record)
                             },
-                        )?;
-                        binding.mark_exec_transferred()?;
-                        if backend
-                            .retarget_loaded_task(Arc::clone(&replacement_record.binding))
-                            .is_err()
-                        {
-                            // The combined record now names the replacement;
-                            // allowing the old Arc to receive saved state would
-                            // split immutable MM/ASID identity.
-                            carrick_fatal!(
-                                "vcpu_loop::executor_exec_transfer",
-                                "backend task retarget failed during exec transfer: executor_id={:?}",
-                                executor_id
-                            );
-                        }
-                        Ok(replacement_record)
-                    });
-                let replacement_record = match replacement_record {
-                    Ok(replacement) => replacement,
-                    Err(error) => {
-                        // Kernel exec has already published the replacement
-                        // image/thread. Returning through predecessor failure
-                        // cleanup would orphan the active successor and its
-                        // authority. This is a split-authority invariant loss,
-                        // so fail-stop the carrier rather than resume either
-                        // image.
-                        carrick_fatal!(
-                            "vcpu_loop::executor_exec_transfer",
-                            "worker-owned exec retarget failed after kernel published successor image: executor_id={:?}, error={error}",
-                            executor_id
                         );
+                        let replacement_record = match replacement_record {
+                            Ok(replacement) => replacement,
+                            Err(error) => {
+                                // Kernel exec has already published the replacement
+                                // image/thread. Returning through predecessor failure
+                                // cleanup would orphan the active successor and its
+                                // authority. This is a split-authority invariant loss,
+                                // so fail-stop the carrier rather than resume either
+                                // image.
+                                carrick_fatal!(
+                                    "vcpu_loop::executor_exec_transfer",
+                                    "worker-owned exec retarget failed after kernel published successor image: executor_id={:?}, error={error}",
+                                    executor_id
+                                );
+                            }
+                        };
+                        binding = replacement_record.binding;
+                        pending_exec_retirement = retired_mm;
+                        pending_exec_cleanup = true;
+                        submission_authority = replacement_record.authority;
+                        thread = running.thread_key();
+                        generation = successor_generation;
+                        asid_generation = binding.load_identity().asid_generation;
+                    } else if let Err((error, lease)) = running.restore_lease(lease) {
+                        let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            ExecutionFailure::SnapshotRestoreFailed,
+                            receipts,
+                        );
+                        drop(lease);
+                        return Err(with_settlement_error(error.to_string(), settlement));
                     }
-                };
-                binding = replacement_record.binding;
-                pending_exec_retirement = retired_mm;
-                pending_exec_cleanup = true;
-                submission_authority = replacement_record.authority;
-                thread = running.thread_key();
-                generation = successor_generation;
-                asid_generation = binding.load_identity().asid_generation;
-            } else if let Err((error, lease)) = running.restore_lease(lease) {
-                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                    resolver.as_ref(),
-                    scheduler,
-                    running,
-                    ExecutionFailure::SnapshotRestoreFailed,
-                    receipts,
-                );
-                drop(lease);
-                return Err(with_settlement_error(error.to_string(), settlement));
-            }
+                    (SettlementAuthority::Live, false)
+                }
+                TakenExecutionAuthority::PredecessorConsumed(consumed) => {
+                    if exec_replacement.is_some() {
+                        let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            ExecutionFailure::SnapshotRestoreFailed,
+                            receipts,
+                        );
+                        return Err(with_settlement_error(
+                            "quantum returned both an exec replacement and consumed predecessor authority".to_owned(),
+                            settlement,
+                        ));
+                    }
+                    if consumed.thread_key() != running.thread_key()
+                        || consumed.generation() != running.generation()
+                        || consumed.executor() != running.executor()
+                        || consumed.executor_epoch() != running.executor_epoch()
+                    {
+                        let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            ExecutionFailure::SnapshotRestoreFailed,
+                            receipts,
+                        );
+                        return Err(with_settlement_error(
+                            "consumed predecessor authority does not match running thread"
+                                .to_owned(),
+                            settlement,
+                        ));
+                    }
+                    (SettlementAuthority::PredecessorConsumed(consumed), true)
+                }
+            };
             let cpu = backend.take_cpu_receipt();
             running.thread().charge_user_ns(cpu.user_ns);
             running.thread().charge_system_ns(cpu.system_ns);
             let exit = match attempted {
                 Ok(Ok(exit)) => exit,
                 Ok(Err(error)) => {
-                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                        resolver.as_ref(),
-                        scheduler,
-                        running,
-                        ExecutionFailure::SnapshotRestoreFailed,
-                        receipts,
-                    );
+                    let settlement = match settlement_auth {
+                        SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            ExecutionFailure::SnapshotRestoreFailed,
+                            receipts,
+                        ),
+                        SettlementAuthority::PredecessorConsumed(consumed) => {
+                            settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                                resolver.as_ref(),
+                                scheduler,
+                                running,
+                                consumed,
+                                receipts,
+                            )
+                        }
+                    };
                     return Err(with_settlement_error(error.to_string(), settlement));
                 }
                 Err(_) => {
-                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                        resolver.as_ref(),
-                        scheduler,
-                        running,
-                        ExecutionFailure::SnapshotRestoreFailed,
-                        receipts,
-                    );
+                    let settlement = match settlement_auth {
+                        SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            ExecutionFailure::SnapshotRestoreFailed,
+                            receipts,
+                        ),
+                        SettlementAuthority::PredecessorConsumed(consumed) => {
+                            settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                                resolver.as_ref(),
+                                scheduler,
+                                running,
+                                consumed,
+                                receipts,
+                            )
+                        }
+                    };
                     return Err(with_settlement_error(
                         "backend run panicked after publishing its exact CPU receipt".to_owned(),
                         settlement,
                     ));
                 }
             };
-            if matches!(exit, ExecutorExit::Syscall) {
+            if !is_consumed && matches!(exit, ExecutorExit::Syscall) {
                 scheduler.note_syscall_boundary(&running);
                 receipts.record(
                     executor_id,
                     ExecutorPoolEvent::OrdinarySyscall { thread, generation },
                 );
                 if scheduler.need_resched() {
-                    break ExecutorExit::Preempted;
+                    break 'quantum (ExecutorExit::Preempted, settlement_auth);
                 }
-                continue;
+                continue 'quantum;
             }
-            break exit;
+            break 'quantum (exit, settlement_auth);
         };
         // The residency is over: commit the system CPU this host thread burned
         // servicing the loaded logical thread before anything downstream can
@@ -608,36 +678,32 @@ where
             );
         }
         if matches!(exit, ExecutorExit::InvalidState) {
-            let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                resolver.as_ref(),
-                scheduler,
-                running,
-                ExecutionFailure::SnapshotRestoreFailed,
-                receipts,
-            );
+            let settlement = match settlement_authority {
+                SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
+                ),
+                SettlementAuthority::PredecessorConsumed(consumed) => {
+                    settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        consumed,
+                        receipts,
+                    )
+                }
+            };
             return Err(with_settlement_error(
                 "backend returned invalid executor state".to_owned(),
                 settlement,
             ));
         }
-        if let Err(error) = scheduler.begin_switch_out(&running) {
-            let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                resolver.as_ref(),
-                scheduler,
-                running,
-                ExecutionFailure::SnapshotSaveFailed,
-                receipts,
-            );
-            return Err(with_settlement_error(error.to_string(), settlement));
-        }
-        let lease = running.take_lease();
-        let saved = match backend.save(lease) {
-            Ok(saved) => saved,
-            Err(error) => {
-                let (source, lease) = error.into_parts();
-                if let Err((restore_error, lease)) =
-                    scheduler.restore_saved_lease(&mut running, lease)
-                {
+        match settlement_authority {
+            SettlementAuthority::Live => {
+                if let Err(error) = scheduler.begin_switch_out(&running) {
                     let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                         resolver.as_ref(),
                         scheduler,
@@ -645,60 +711,118 @@ where
                         ExecutionFailure::SnapshotSaveFailed,
                         receipts,
                     );
-                    drop(lease);
-                    return Err(with_settlement_error(
-                        format!("{source}; lease restore failed: {restore_error}"),
-                        settlement,
-                    ));
+                    return Err(with_settlement_error(error.to_string(), settlement));
                 }
-                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                let lease = running.take_lease();
+                let saved = match backend.save(lease) {
+                    Ok(saved) => saved,
+                    Err(error) => {
+                        let (source, lease) = error.into_parts();
+                        if let Err((restore_error, lease)) =
+                            scheduler.restore_saved_lease(&mut running, lease)
+                        {
+                            let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                                resolver.as_ref(),
+                                scheduler,
+                                running,
+                                ExecutionFailure::SnapshotSaveFailed,
+                                receipts,
+                            );
+                            drop(lease);
+                            return Err(with_settlement_error(
+                                format!("{source}; lease restore failed: {restore_error}"),
+                                settlement,
+                            ));
+                        }
+                        let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            ExecutionFailure::SnapshotSaveFailed,
+                            receipts,
+                        );
+                        return Err(with_settlement_error(source.to_string(), settlement));
+                    }
+                };
+                receipts.record(executor_id, ExecutorPoolEvent::Saved { thread, generation });
+                probe_executor_lifecycle(
+                    executor_id,
+                    crate::probes::HvpatchExecutorLifecyclePhase::Save,
+                    Some(thread),
+                    Some(generation),
+                    asid_generation,
+                );
+                if let Err((error, lease)) =
+                    scheduler.restore_saved_lease(&mut running, saved.into_lease())
+                {
+                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    );
+                    drop(lease);
+                    return Err(with_settlement_error(error.to_string(), settlement));
+                }
+            }
+            SettlementAuthority::PredecessorConsumed(_) => {
+                if let Err(error) = backend.detach_loaded_task() {
+                    let SettlementAuthority::PredecessorConsumed(consumed) = settlement_authority
+                    else {
+                        unreachable!()
+                    };
+                    let settlement = settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        consumed,
+                        receipts,
+                    );
+                    return Err(with_settlement_error(error.to_string(), settlement));
+                }
+            }
+        }
+        if let Err(error) = boundary.audit_runtime(backend) {
+            let settlement = match settlement_authority {
+                SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
                     resolver.as_ref(),
                     scheduler,
                     running,
-                    ExecutionFailure::SnapshotSaveFailed,
+                    ExecutionFailure::SnapshotRestoreFailed,
                     receipts,
-                );
-                return Err(with_settlement_error(source.to_string(), settlement));
-            }
-        };
-        receipts.record(executor_id, ExecutorPoolEvent::Saved { thread, generation });
-        probe_executor_lifecycle(
-            executor_id,
-            crate::probes::HvpatchExecutorLifecyclePhase::Save,
-            Some(thread),
-            Some(generation),
-            asid_generation,
-        );
-        if let Err((error, lease)) = scheduler.restore_saved_lease(&mut running, saved.into_lease())
-        {
-            let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                resolver.as_ref(),
-                scheduler,
-                running,
-                ExecutionFailure::SnapshotRestoreFailed,
-                receipts,
-            );
-            drop(lease);
-            return Err(with_settlement_error(error.to_string(), settlement));
-        }
-        if let Err(error) = boundary.audit_runtime(backend) {
-            let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                resolver.as_ref(),
-                scheduler,
-                running,
-                ExecutionFailure::SnapshotRestoreFailed,
-                receipts,
-            );
+                ),
+                SettlementAuthority::PredecessorConsumed(consumed) => {
+                    settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        consumed,
+                        receipts,
+                    )
+                }
+            };
             return Err(with_settlement_error(error.to_string(), settlement));
         }
         if let Err(error) = audit_backend_hardware(backend, kick) {
-            let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                resolver.as_ref(),
-                scheduler,
-                running,
-                ExecutionFailure::SnapshotRestoreFailed,
-                receipts,
-            );
+            let settlement = match settlement_authority {
+                SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
+                ),
+                SettlementAuthority::PredecessorConsumed(consumed) => {
+                    settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        consumed,
+                        receipts,
+                    )
+                }
+            };
             return Err(with_settlement_error(error.to_string(), settlement));
         }
         let terminal_retirement = binding.take_address_space_retirement();
@@ -721,13 +845,24 @@ where
             ) {
                 Ok(stop_seen) => deferred_stop |= stop_seen,
                 Err(error) => {
-                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                        resolver.as_ref(),
-                        scheduler,
-                        running,
-                        ExecutionFailure::SnapshotRestoreFailed,
-                        receipts,
-                    );
+                    let settlement = match settlement_authority {
+                        SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            ExecutionFailure::SnapshotRestoreFailed,
+                            receipts,
+                        ),
+                        SettlementAuthority::PredecessorConsumed(consumed) => {
+                            settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                                resolver.as_ref(),
+                                scheduler,
+                                running,
+                                consumed,
+                                receipts,
+                            )
+                        }
+                    };
                     return Err(with_settlement_error(
                         format!("exec predecessor ASID retirement failed: {error}"),
                         settlement,
@@ -737,13 +872,24 @@ where
             let root_ticket = match retirement.take_root_retirement_ticket() {
                 Ok(ticket) => ticket,
                 Err(error) => {
-                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                        resolver.as_ref(),
-                        scheduler,
-                        running,
-                        ExecutionFailure::SnapshotRestoreFailed,
-                        receipts,
-                    );
+                    let settlement = match settlement_authority {
+                        SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            ExecutionFailure::SnapshotRestoreFailed,
+                            receipts,
+                        ),
+                        SettlementAuthority::PredecessorConsumed(consumed) => {
+                            settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                                resolver.as_ref(),
+                                scheduler,
+                                running,
+                                consumed,
+                                receipts,
+                            )
+                        }
+                    };
                     return Err(with_settlement_error(
                         format!("exec predecessor root retirement ticket failed: {error}"),
                         settlement,
@@ -753,13 +899,24 @@ where
             let root_receipt = match binding.retire_detached_exec_predecessor(root_ticket) {
                 Ok(receipt) => receipt,
                 Err(error) => {
-                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                        resolver.as_ref(),
-                        scheduler,
-                        running,
-                        ExecutionFailure::SnapshotRestoreFailed,
-                        receipts,
-                    );
+                    let settlement = match settlement_authority {
+                        SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            ExecutionFailure::SnapshotRestoreFailed,
+                            receipts,
+                        ),
+                        SettlementAuthority::PredecessorConsumed(consumed) => {
+                            settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                                resolver.as_ref(),
+                                scheduler,
+                                running,
+                                consumed,
+                                receipts,
+                            )
+                        }
+                    };
                     return Err(with_settlement_error(
                         format!("exec detached predecessor cleanup failed: {error}"),
                         settlement,
@@ -767,13 +924,24 @@ where
                 }
             };
             if let Err(error) = retirement.complete(root_receipt) {
-                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                    resolver.as_ref(),
-                    scheduler,
-                    running,
-                    ExecutionFailure::SnapshotRestoreFailed,
-                    receipts,
-                );
+                let settlement = match settlement_authority {
+                    SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    ),
+                    SettlementAuthority::PredecessorConsumed(consumed) => {
+                        settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            consumed,
+                            receipts,
+                        )
+                    }
+                };
                 return Err(with_settlement_error(
                     format!("exec predecessor ASID/root release failed: {error}"),
                     settlement,
@@ -792,13 +960,24 @@ where
                     );
                 }
                 Err(error) => {
-                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                        resolver.as_ref(),
-                        scheduler,
-                        running,
-                        ExecutionFailure::SnapshotRestoreFailed,
-                        receipts,
-                    );
+                    let settlement = match settlement_authority {
+                        SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            ExecutionFailure::SnapshotRestoreFailed,
+                            receipts,
+                        ),
+                        SettlementAuthority::PredecessorConsumed(consumed) => {
+                            settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                                resolver.as_ref(),
+                                scheduler,
+                                running,
+                                consumed,
+                                receipts,
+                            )
+                        }
+                    };
                     return Err(with_settlement_error(
                         format!("shared-MM exec detached predecessor cleanup failed: {error}"),
                         settlement,
@@ -812,13 +991,24 @@ where
             // now, while no topology guard or task binding is loaded, so an
             // all-idle executor pool cannot strand its retry request forever.
             if let Err(error) = boundary.audit_runtime(backend) {
-                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                    resolver.as_ref(),
-                    scheduler,
-                    running,
-                    ExecutionFailure::SnapshotRestoreFailed,
-                    receipts,
-                );
+                let settlement = match settlement_authority {
+                    SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    ),
+                    SettlementAuthority::PredecessorConsumed(consumed) => {
+                        settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            consumed,
+                            receipts,
+                        )
+                    }
+                };
                 return Err(with_settlement_error(
                     format!("post-exec-cleanup executor audit failed: {error}"),
                     settlement,
@@ -842,13 +1032,26 @@ where
                 ) {
                     Ok(stop_seen) => deferred_stop |= stop_seen,
                     Err(error) => {
-                        let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                            resolver.as_ref(),
-                            scheduler,
-                            running,
-                            ExecutionFailure::SnapshotRestoreFailed,
-                            receipts,
-                        );
+                        let settlement = match settlement_authority {
+                            SettlementAuthority::Live => {
+                                fail_running_and_retire::<F::TaskBinding, _>(
+                                    resolver.as_ref(),
+                                    scheduler,
+                                    running,
+                                    ExecutionFailure::SnapshotRestoreFailed,
+                                    receipts,
+                                )
+                            }
+                            SettlementAuthority::PredecessorConsumed(consumed) => {
+                                settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                                    resolver.as_ref(),
+                                    scheduler,
+                                    running,
+                                    consumed,
+                                    receipts,
+                                )
+                            }
+                        };
                         return Err(with_settlement_error(
                             format!("terminal ASID retirement failed: {error}"),
                             settlement,
@@ -859,13 +1062,24 @@ where
             let root_ticket = match retirement.take_root_retirement_ticket() {
                 Ok(ticket) => ticket,
                 Err(error) => {
-                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                        resolver.as_ref(),
-                        scheduler,
-                        running,
-                        ExecutionFailure::SnapshotRestoreFailed,
-                        receipts,
-                    );
+                    let settlement = match settlement_authority {
+                        SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            ExecutionFailure::SnapshotRestoreFailed,
+                            receipts,
+                        ),
+                        SettlementAuthority::PredecessorConsumed(consumed) => {
+                            settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                                resolver.as_ref(),
+                                scheduler,
+                                running,
+                                consumed,
+                                receipts,
+                            )
+                        }
+                    };
                     return Err(with_settlement_error(
                         format!("terminal root retirement ticket failed: {error}"),
                         settlement,
@@ -880,13 +1094,24 @@ where
             let root_receipt = match cleanup {
                 Ok(receipt) => receipt,
                 Err(error) => {
-                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                        resolver.as_ref(),
-                        scheduler,
-                        running,
-                        ExecutionFailure::SnapshotRestoreFailed,
-                        receipts,
-                    );
+                    let settlement = match settlement_authority {
+                        SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            ExecutionFailure::SnapshotRestoreFailed,
+                            receipts,
+                        ),
+                        SettlementAuthority::PredecessorConsumed(consumed) => {
+                            settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                                resolver.as_ref(),
+                                scheduler,
+                                running,
+                                consumed,
+                                receipts,
+                            )
+                        }
+                    };
                     return Err(with_settlement_error(
                         format!("terminal detached address-space cleanup failed: {error}"),
                         settlement,
@@ -894,13 +1119,24 @@ where
                 }
             };
             if let Err(error) = retirement.complete(root_receipt) {
-                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                    resolver.as_ref(),
-                    scheduler,
-                    running,
-                    ExecutionFailure::SnapshotRestoreFailed,
-                    receipts,
-                );
+                let settlement = match settlement_authority {
+                    SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    ),
+                    SettlementAuthority::PredecessorConsumed(consumed) => {
+                        settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            consumed,
+                            receipts,
+                        )
+                    }
+                };
                 return Err(with_settlement_error(
                     format!("terminal ASID/root release failed: {error}"),
                     settlement,
@@ -911,13 +1147,24 @@ where
             // Drop and under that guard, so service its custody-local request
             // immediately after releasing topology authority.
             if let Err(error) = boundary.audit_runtime(backend) {
-                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                    resolver.as_ref(),
-                    scheduler,
-                    running,
-                    ExecutionFailure::SnapshotRestoreFailed,
-                    receipts,
-                );
+                let settlement = match settlement_authority {
+                    SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    ),
+                    SettlementAuthority::PredecessorConsumed(consumed) => {
+                        settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            consumed,
+                            receipts,
+                        )
+                    }
+                };
                 return Err(with_settlement_error(
                     format!("post-terminal-cleanup executor audit failed: {error}"),
                     settlement,
@@ -927,21 +1174,24 @@ where
         if let Some(authority) = submission_authority.take() {
             if let Err(authority) = resolver.restore_submission_authority(authority) {
                 drop(authority);
-                // The only error return in this quantum tail that dropped
-                // `running` without settling it. `RunnableThread::drop` runs
-                // `finish_claim` and nothing else, so the thread stayed in
-                // whatever state `begin_switch_out` published, its job kept no
-                // publisher, and the claim count went back to zero with no
-                // record anywhere -- the exact stranded shape the round-7
-                // `claim-dropped-unsettled` probe was added to name. Settle it
-                // the way every sibling error path in this function does.
-                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                    resolver.as_ref(),
-                    scheduler,
-                    running,
-                    ExecutionFailure::SnapshotRestoreFailed,
-                    receipts,
-                );
+                let settlement = match settlement_authority {
+                    SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    ),
+                    SettlementAuthority::PredecessorConsumed(consumed) => {
+                        settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            consumed,
+                            receipts,
+                        )
+                    }
+                };
                 return Err(with_settlement_error(
                     "combined task resolver rejected worker-held authority restoration".to_owned(),
                     settlement,
@@ -954,33 +1204,33 @@ where
         // published HERE. Recorded by the arms below and acted on once, after
         // the settlement succeeds.
         let mut reaped_settlement = false;
-        let settlement = match exit {
-            ExecutorExit::Blocked(reason) => {
+        let settlement = match settlement_authority {
+            SettlementAuthority::PredecessorConsumed(consumed) => {
                 drop(submission_authority);
-                scheduler
-                    .settle_blocked(running, reason)
-                    .map(|disposition| {
-                        reaped_settlement = disposition == SettlementDisposition::TargetReaped;
-                        ExecutorPoolEvent::SettledBlocked { thread, generation }
-                    })
-            }
-            ExecutorExit::BlockedContinuation {
-                continuation,
-                vfork_activation,
-            } => {
-                let mut registration = control.wait_service.prepare_registration(&continuation);
-                if let Err(error) = control.wait_service.enroll(&mut registration) {
-                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                        resolver.as_ref(),
-                        scheduler,
-                        running,
-                        ExecutionFailure::SnapshotRestoreFailed,
-                        receipts,
-                    );
-                    return Err(with_settlement_error(error.to_string(), settlement));
+                let settled = scheduler
+                    .settle_exec_consumed_exited(running, consumed)
+                    .map(|()| ExecutorPoolEvent::SettledExited { thread, generation });
+                if settled.is_ok() {
+                    resolver.retire(thread, generation);
                 }
-                if let Some(activation) = vfork_activation {
-                    if let Err(error) = activation.activate() {
+                settled
+            }
+            SettlementAuthority::Live => match exit {
+                ExecutorExit::Blocked(reason) => {
+                    drop(submission_authority);
+                    scheduler
+                        .settle_blocked(running, reason)
+                        .map(|disposition| {
+                            reaped_settlement = disposition == SettlementDisposition::TargetReaped;
+                            ExecutorPoolEvent::SettledBlocked { thread, generation }
+                        })
+                }
+                ExecutorExit::BlockedContinuation {
+                    continuation,
+                    vfork_activation,
+                } => {
+                    let mut registration = control.wait_service.prepare_registration(&continuation);
+                    if let Err(error) = control.wait_service.enroll(&mut registration) {
                         let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                             resolver.as_ref(),
                             scheduler,
@@ -990,42 +1240,54 @@ where
                         );
                         return Err(with_settlement_error(error.to_string(), settlement));
                     }
+                    if let Some(activation) = vfork_activation {
+                        if let Err(error) = activation.activate() {
+                            let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                                resolver.as_ref(),
+                                scheduler,
+                                running,
+                                ExecutionFailure::SnapshotRestoreFailed,
+                                receipts,
+                            );
+                            return Err(with_settlement_error(error.to_string(), settlement));
+                        }
+                    }
+                    drop(submission_authority);
+                    scheduler
+                        .settle_blocked_continuation(running, *continuation, registration)
+                        .map(|disposition| {
+                            reaped_settlement = disposition == SettlementDisposition::TargetReaped;
+                            ExecutorPoolEvent::SettledBlocked { thread, generation }
+                        })
                 }
-                drop(submission_authority);
-                scheduler
-                    .settle_blocked_continuation(running, *continuation, registration)
-                    .map(|disposition| {
-                        reaped_settlement = disposition == SettlementDisposition::TargetReaped;
-                        ExecutorPoolEvent::SettledBlocked { thread, generation }
-                    })
-            }
-            ExecutorExit::Yielded | ExecutorExit::Preempted => {
-                let disposition = scheduler
-                    .settle_runnable_successor(running)
-                    .map_err(|error| error.to_string())?;
-                reaped_settlement = disposition == SettlementDisposition::TargetReaped;
-                Ok(ExecutorPoolEvent::SettledRunnable { thread, generation })
-            }
-            ExecutorExit::Quiesced => {
-                drop(submission_authority);
-                scheduler
-                    .settle_blocked(running, BlockedReason::HostWait)
-                    .map(|disposition| {
-                        reaped_settlement = disposition == SettlementDisposition::TargetReaped;
-                        ExecutorPoolEvent::SettledBlocked { thread, generation }
-                    })
-            }
-            ExecutorExit::Exited => {
-                drop(submission_authority);
-                let settled = scheduler
-                    .settle_exited(running)
-                    .map(|()| ExecutorPoolEvent::SettledExited { thread, generation });
-                if settled.is_ok() {
-                    resolver.retire(thread, generation);
+                ExecutorExit::Yielded | ExecutorExit::Preempted => {
+                    let disposition = scheduler
+                        .settle_runnable_successor(running)
+                        .map_err(|error| error.to_string())?;
+                    reaped_settlement = disposition == SettlementDisposition::TargetReaped;
+                    Ok(ExecutorPoolEvent::SettledRunnable { thread, generation })
                 }
-                settled
-            }
-            ExecutorExit::Syscall | ExecutorExit::InvalidState => unreachable!(),
+                ExecutorExit::Quiesced => {
+                    drop(submission_authority);
+                    scheduler
+                        .settle_blocked(running, BlockedReason::HostWait)
+                        .map(|disposition| {
+                            reaped_settlement = disposition == SettlementDisposition::TargetReaped;
+                            ExecutorPoolEvent::SettledBlocked { thread, generation }
+                        })
+                }
+                ExecutorExit::Exited => {
+                    drop(submission_authority);
+                    let settled = scheduler
+                        .settle_exited(running)
+                        .map(|()| ExecutorPoolEvent::SettledExited { thread, generation });
+                    if settled.is_ok() {
+                        resolver.retire(thread, generation);
+                    }
+                    settled
+                }
+                ExecutorExit::Syscall | ExecutorExit::InvalidState => unreachable!(),
+            },
         };
         // A guest `sched_yield` (or a preemption tick) requeued this task at
         // the TAIL of its own guest CPU, which is the fairness mechanism; the
