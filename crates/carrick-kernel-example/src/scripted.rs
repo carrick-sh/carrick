@@ -264,7 +264,35 @@ impl Task {
                             self.finish_syscall(syscall, Ok(child_pid as i64), outs, shared)?;
                         }
                         InternalCompletion::Exit(code) => {
+                            let pid = self.process.pid();
+                            shared.ledger.lock().completions.push(Completion {
+                                pid,
+                                label: syscall.label,
+                                result: Ok(code as i64),
+                            });
+                            let expectation_check = match &syscall.expect {
+                                Expect::Any => Ok(()),
+                                Expect::Ret(expected) => Err(ExampleError::Expectation {
+                                    pid,
+                                    label: syscall.label,
+                                    expected: format!("return value {expected}"),
+                                    actual: format!("exit code {code}"),
+                                }),
+                                Expect::Errno(expected) => Err(ExampleError::Expectation {
+                                    pid,
+                                    label: syscall.label,
+                                    expected: format!("errno {}", expected.get()),
+                                    actual: format!("exit code {code}"),
+                                }),
+                                Expect::Death(sig) => Err(ExampleError::Expectation {
+                                    pid,
+                                    label: syscall.label,
+                                    expected: format!("death by signal {sig}"),
+                                    actual: format!("exit code {code}"),
+                                }),
+                            };
                             self.on_exit(code)?;
+                            expectation_check?;
                             return Ok(code);
                         }
                         InternalCompletion::Returned(value) => {
@@ -359,18 +387,92 @@ impl Task {
             ledger.outputs.extend(captured_outputs);
         }
 
+        // Validate expectations before applying any saves so a failed syscall cannot contaminate state.
+        match &syscall.expect {
+            Expect::Any => {
+                if let Err(errno) = result {
+                    return Err(ExampleError::Errno {
+                        syscall: syscall.label,
+                        errno,
+                    });
+                }
+            }
+            Expect::Ret(expected) => match result {
+                Ok(val) if val == *expected => {}
+                Ok(val) => {
+                    return Err(ExampleError::Expectation {
+                        pid,
+                        label: syscall.label,
+                        expected: format!("return value {expected}"),
+                        actual: format!("return value {val}"),
+                    });
+                }
+                Err(errno) => {
+                    return Err(ExampleError::Expectation {
+                        pid,
+                        label: syscall.label,
+                        expected: format!("return value {expected}"),
+                        actual: format!("errno {}", errno.get()),
+                    });
+                }
+            },
+            Expect::Errno(expected) => match result {
+                Err(errno) if errno == *expected => {}
+                Err(errno) => {
+                    return Err(ExampleError::Expectation {
+                        pid,
+                        label: syscall.label,
+                        expected: format!("errno {}", expected.get()),
+                        actual: format!("errno {}", errno.get()),
+                    });
+                }
+                Ok(val) => {
+                    return Err(ExampleError::Expectation {
+                        pid,
+                        label: syscall.label,
+                        expected: format!("errno {}", expected.get()),
+                        actual: format!("return value {val}"),
+                    });
+                }
+            },
+            Expect::Death(sig) => {
+                return Err(ExampleError::Expectation {
+                    pid,
+                    label: syscall.label,
+                    expected: format!("death by signal {sig}"),
+                    actual: format!("{result:?}"),
+                });
+            }
+        }
+
         for save in &syscall.saves {
             match save {
-                Save::Ret(slot) => {
-                    if let Ok(val) = result {
-                        self.save_slot(*slot, val);
+                Save::Ret(slot) => match result {
+                    Ok(val) => self.save_slot(*slot, val),
+                    Err(errno) => {
+                        return Err(ExampleError::Script(format!(
+                            "cannot save return value on failed syscall {} ({errno:?})",
+                            syscall.label
+                        )));
                     }
-                }
+                },
                 Save::OutI32 { arg, index, slot } => {
                     let out = outs.iter().find(|(a, _, _)| a == arg).ok_or_else(|| {
                         ExampleError::Script(format!("no out buffer for arg {arg}"))
                     })?;
-                    let offset = out.1 + (*index as u64) * 4;
+                    let byte_offset = index
+                        .checked_mul(4)
+                        .ok_or_else(|| ExampleError::Script("out_i32 index overflow".to_owned()))?;
+                    let end_offset = byte_offset
+                        .checked_add(4)
+                        .ok_or_else(|| ExampleError::Script("out_i32 index overflow".to_owned()))?;
+                    if end_offset > out.2 {
+                        return Err(ExampleError::Script(format!(
+                            "out_i32 index {index} (byte range {byte_offset}..{end_offset}) exceeds out buffer len {}",
+                            out.2
+                        )));
+                    }
+                    let offset = out.1 + byte_offset as u64;
                     let bytes = self.memory.read(offset, 4)?;
                     let word = <[u8; 4]>::try_from(bytes.as_slice())
                         .map_err(|_| ExampleError::Script("invalid i32 slice".to_owned()))?;
@@ -380,53 +482,7 @@ impl Task {
             }
         }
 
-        match &syscall.expect {
-            Expect::Any => {
-                if let Err(errno) = result {
-                    return Err(ExampleError::Errno {
-                        syscall: syscall.label,
-                        errno,
-                    });
-                }
-                Ok(())
-            }
-            Expect::Ret(expected) => match result {
-                Ok(val) if val == *expected => Ok(()),
-                Ok(val) => Err(ExampleError::Expectation {
-                    pid,
-                    label: syscall.label,
-                    expected: format!("return value {expected}"),
-                    actual: format!("return value {val}"),
-                }),
-                Err(errno) => Err(ExampleError::Expectation {
-                    pid,
-                    label: syscall.label,
-                    expected: format!("return value {expected}"),
-                    actual: format!("errno {}", errno.get()),
-                }),
-            },
-            Expect::Errno(expected) => match result {
-                Err(errno) if errno == *expected => Ok(()),
-                Err(errno) => Err(ExampleError::Expectation {
-                    pid,
-                    label: syscall.label,
-                    expected: format!("errno {}", expected.get()),
-                    actual: format!("errno {}", errno.get()),
-                }),
-                Ok(val) => Err(ExampleError::Expectation {
-                    pid,
-                    label: syscall.label,
-                    expected: format!("errno {}", expected.get()),
-                    actual: format!("return value {val}"),
-                }),
-            },
-            Expect::Death(sig) => Err(ExampleError::Expectation {
-                pid,
-                label: syscall.label,
-                expected: format!("death by signal {sig}"),
-                actual: format!("{result:?}"),
-            }),
-        }
+        Ok(())
     }
 
     /// Issue one syscall and interpret its outcome until it completes.
