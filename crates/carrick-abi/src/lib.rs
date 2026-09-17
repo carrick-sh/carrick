@@ -774,6 +774,23 @@ impl LinuxWinsize {
 /// etc. Use [`LINUX_TERMIOS_KERNEL_SIZE`] explicitly for those ioctls.
 pub const LINUX_TERMIOS_KERNEL_SIZE: usize = 36;
 
+/// `c_cflag` character-size mask, from Linux's asm-generic `termbits.h`
+/// (`CSIZE` = `0o000060`; the values inside it are CS5 = `0`, CS6 = `0o000020`,
+/// CS7 = `0o000040`, CS8 = `0o000060`). aarch64 uses the asm-generic table, so
+/// this is what a guest sees on every arch carrick emulates.
+pub const LINUX_CSIZE: u32 = 0o000060;
+/// `c_cflag` 8-bit character size (`CS8` = `0o000060` = the whole
+/// [`LINUX_CSIZE`] mask).
+///
+/// This pair lives in the ABI crate rather than in a host termios translation
+/// table because forcing CS8 at store time is *guest* semantics, not a
+/// Linux↔Darwin bit translation: Linux's pty line discipline has no UART and
+/// never stores CS5-CS7, so the readback must report CS8 whatever the guest
+/// asked for, on every host carrick runs on. The Darwin-side CSIZE/CS6/CS7/CS8
+/// bit positions differ and stay in the macOS-only translation table in
+/// `carrick-kernel`'s `host_tty`.
+pub const LINUX_CS8: u32 = 0o000060;
+
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,

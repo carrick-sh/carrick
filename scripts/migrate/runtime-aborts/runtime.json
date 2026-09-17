@@ -83,6 +83,17 @@
       "domain": "dispatch::fd_table"
     },
     {
+      "file": "crates/carrick-kernel/src/dispatch/io_buffers.rs",
+      "function": "random_device_bytes",
+      "ordinal_in_function": 1,
+      "fingerprint": "380563e88ed9ee5d4bdd0e6edf6d31e2993cd823b3fe2ac7ed9f962dd02135e4",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::random_device",
+      "rationale": "A guest read of /dev/random or /dev/urandom has no Linux failure mode to report once the pool is seeded, so there is no honest errno to hand back; continuing would deliver the zero-filled buffer as if it were entropy and silently break every consumer that seeds a CSPRNG, an ASLR offset or a TLS nonce from it.",
+      "sink": "fatal",
+      "domain": "dispatch::random_device"
+    },
+    {
       "file": "crates/carrick-kernel/src/dispatch/mem.rs",
       "function": "MemAuthority::bump_revision",
       "ordinal_in_function": 1,

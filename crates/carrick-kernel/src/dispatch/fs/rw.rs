@@ -810,11 +810,7 @@ impl<'a> FsView<'a> {
                         }
                         carrick_vfs::SyntheticDeviceKind::Random
                         | carrick_vfs::SyntheticDeviceKind::Urandom => {
-                            let mut buf = vec![0u8; length];
-                            unsafe {
-                                libc::arc4random_buf(buf.as_mut_ptr().cast(), length);
-                            }
-                            (length, buf)
+                            (length, random_device_bytes(length))
                         }
                     };
                     (read_len, bytes)
@@ -1505,11 +1501,7 @@ impl<'a> FsView<'a> {
                         | carrick_vfs::SyntheticDeviceKind::Full => vec![0u8; length],
                         carrick_vfs::SyntheticDeviceKind::Random
                         | carrick_vfs::SyntheticDeviceKind::Urandom => {
-                            let mut buf = vec![0u8; length];
-                            unsafe {
-                                libc::arc4random_buf(buf.as_mut_ptr().cast(), length);
-                            }
-                            buf
+                            random_device_bytes(length)
                         }
                     }
                 }
