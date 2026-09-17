@@ -797,3 +797,16 @@ test-kernel *ARGS:
   before acceptance. Token-level comparison helper:
   `/tmp/kernel-harness-compare-partition.py` (literals require ordinary diff
   review because the reused lexer skips them).
+
+### Inner-loop documentation draft
+
+- Prepared Task 13 documentation in AGENTS.md, the crate map, the harness
+  README, and conformance-testing.md while workers finish code. These describe
+  the intended integrated interface; Task 13 remains unaccepted until the
+  recipe, Phase B/D support, and final timing are verified against the docs.
+- Phase A candidate `03f197a5b` is under revision: the carrier did not yet call
+  its new full signal-action helper, and synchronous SIGPIPE needs same-call
+  death coverage. Review brief `/tmp/kernel-harness-phase-a-review-notes.md`.
+- Shared exit final review is running; pending partition cleanup review remains
+  `/tmp/kernel-harness-partition-review.md` and must be sent when the worker
+  becomes terminal. Do not accept a stale earlier scanner result.
