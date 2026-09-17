@@ -1036,6 +1036,7 @@ impl<'a> FsView<'a> {
                         "/proc/self/ns/user",
                         Vec::new(),
                         LINUX_O_RDONLY | LINUX_O_CLOEXEC,
+                        &mut None,
                     ),
                     _ => {
                         cx.reporter

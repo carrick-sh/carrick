@@ -79,6 +79,10 @@ impl<'a> FsView<'a> {
         let want_create = open_flags.contains(LinuxOpenFlags::CREAT);
         let want_excl = open_flags.contains(LinuxOpenFlags::EXCL);
         let want_trunc = open_flags.contains(LinuxOpenFlags::TRUNC);
+        let mut reservation = Some(match self.reserve_slot_at_or_above(0) {
+            Ok(res) => res,
+            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+        });
 
         // O_TMPFILE: `pathname` names a directory; the result is an unnamed,
         // writable regular file. It's never linked anywhere — exactly the
@@ -120,10 +124,11 @@ impl<'a> FsView<'a> {
                     status,
                     linux_fd_flags_from_open_flags(flags),
                 );
-                return match self.install_fd_at_or_above(0, open_file) {
-                    Ok(fd) => Ok(DispatchOutcome::returned_i32(fd)),
-                    Err(_) => Ok(DispatchOutcome::errno(linux_errno::EMFILE)),
+                let fd = match self.install_admitted_open_file(&mut reservation, open_file) {
+                    Ok(fd) => fd,
+                    Err(e) => return Ok(DispatchOutcome::errno(e)),
                 };
+                return Ok(DispatchOutcome::returned_i32(fd));
             }
             let description = OpenDescription::File {
                 path: "/__carrick_o_tmpfile".to_string(),
@@ -138,7 +143,17 @@ impl<'a> FsView<'a> {
                 base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                 writable: true,
             };
-            return Ok(self.install_fd(description, linux_fd_flags_from_open_flags(flags)));
+            let status = flags & !LINUX_O_CLOEXEC;
+            let open_file = OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(description)),
+                status,
+                linux_fd_flags_from_open_flags(flags),
+            );
+            let fd = match self.install_admitted_open_file(&mut reservation, open_file) {
+                Ok(fd) => fd,
+                Err(e) => return Ok(DispatchOutcome::errno(e)),
+            };
+            return Ok(DispatchOutcome::returned_i32(fd));
         }
 
         if false {
@@ -157,6 +172,7 @@ impl<'a> FsView<'a> {
                 writable_request,
                 flags,
                 reporter,
+                reservation: &mut reservation,
             },
         )?;
         let _ = lookup.fast_path();
@@ -216,7 +232,7 @@ impl<'a> FsView<'a> {
             && !writable_request
             && open_flags.contains(LinuxOpenFlags::DIRECTORY)
             && self.cred_snapshot().euid.is_root()
-            && let Some(outcome) = self.try_open_trusted_dir(&path, flags)
+            && let Some(outcome) = self.try_open_trusted_dir(&path, flags, &mut reservation)
         {
             return Ok(outcome);
         }
@@ -230,8 +246,15 @@ impl<'a> FsView<'a> {
                 _ => {}
             }
         }
-        let vfs_outcome =
-            self.try_vfs_open(context, registry, &path, access, flags, vfs_create_mode);
+        let vfs_outcome = self.try_vfs_open(
+            context,
+            registry,
+            &path,
+            access,
+            flags,
+            vfs_create_mode,
+            &mut reservation,
+        );
         match vfs_outcome {
             VfsOpenAttempt::Installed(fd) => {
                 // VFS mounts return before the overlay/rootfs O_DIRECTORY gate
@@ -380,36 +403,38 @@ impl<'a> FsView<'a> {
                             .ok_or(linux_errno::EIO)?;
                     let token =
                         crate::dispatch::fifo_beacon::ParkedOpenerToken::new_reader(host_fd, id);
-                    // When the wait finishes or is interrupted, the WaitFdGuard drops the token,
-                    // unregistering the parked reader from fifo_beacon and closing host_fd.
-                    // On readiness, the runtime re-dispatches openat from scratch and re-opens
-                    // the host FIFO.
-                    return Ok(DispatchOutcome::WaitOnFds {
-                        fds: WaitFds::anchored_parked_opener(
-                            writers_present_read_fd,
-                            libc::POLLIN,
-                            token,
-                        ),
-                        timeout: None,
-                        sig_mask: carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::EMPTY),
-                        completion: FdWaitCompletion::Fd { on_timeout: 0 },
-                    });
+                    if let Some(res) = reservation.take() {
+                        let blocking_open =
+                            crate::dispatch::retained_open::BlockingOpen::new_fifo_reader(
+                                res,
+                                id,
+                                path.clone(),
+                                flags,
+                                access_idx,
+                                token,
+                                writers_present_read_fd,
+                            );
+                        return Ok(DispatchOutcome::BlockingOpen(blocking_open));
+                    }
                 }
             } else if !is_nonblock && access_idx == 1 && host_fd_opt.is_none() {
                 // Blocking writer without reader on host: park until a reader arrives.
                 let (readers_present_read_fd, token) =
                     crate::dispatch::fifo_beacon::ParkedOpenerToken::new_writer(id)
                         .ok_or(linux_errno::EIO)?;
-                return Ok(DispatchOutcome::WaitOnFds {
-                    fds: WaitFds::anchored_parked_opener(
-                        readers_present_read_fd,
-                        libc::POLLIN,
-                        token,
-                    ),
-                    timeout: None,
-                    sig_mask: carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::EMPTY),
-                    completion: FdWaitCompletion::Fd { on_timeout: 0 },
-                });
+                if let Some(res) = reservation.take() {
+                    let blocking_open =
+                        crate::dispatch::retained_open::BlockingOpen::new_fifo_writer(
+                            res,
+                            id,
+                            path.clone(),
+                            flags,
+                            access_idx,
+                            token,
+                            readers_present_read_fd,
+                        );
+                    return Ok(DispatchOutcome::BlockingOpen(blocking_open));
+                }
             }
 
             match host_fd_opt {
@@ -440,8 +465,9 @@ impl<'a> FsView<'a> {
                         status,
                         linux_fd_flags_from_open_flags(flags),
                     );
-                    let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
-                        return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
+                    let fd = match self.install_admitted_open_file(&mut reservation, open_file) {
+                        Ok(fd) => fd,
+                        Err(e) => return Ok(DispatchOutcome::errno(e)),
                     };
                     self.record_fd_open_path(fd, path.clone());
                     return Ok(DispatchOutcome::returned_i32(fd));
@@ -718,8 +744,9 @@ impl<'a> FsView<'a> {
             status,
             linux_fd_flags_from_open_flags(flags),
         );
-        let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
-            return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
+        let fd = match self.install_admitted_open_file(&mut reservation, open_file) {
+            Ok(fd) => fd,
+            Err(e) => return Ok(DispatchOutcome::errno(e)),
         };
         // Always record the path for the inotify AND fanotify read/write/close
         // hooks, even for in-memory File/Directory descriptions (they otherwise
@@ -853,6 +880,7 @@ impl<'a> FsView<'a> {
         dirfd: u64,
         path: &str,
         flags: u64,
+        reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
     ) -> Option<DispatchOutcome> {
         use std::os::fd::IntoRawFd as _;
 
@@ -918,8 +946,9 @@ impl<'a> FsView<'a> {
             status,
             linux_fd_flags_from_open_flags(flags),
         );
-        let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
-            return Some(DispatchOutcome::errno(linux_errno::EMFILE));
+        let fd = match self.install_admitted_open_file(reservation, open_file) {
+            Ok(fd) => fd,
+            Err(e) => return Some(DispatchOutcome::errno(e)),
         };
         self.record_fd_open_path(fd, path.to_owned());
         Some(DispatchOutcome::returned_i32(fd))
@@ -935,7 +964,12 @@ impl<'a> FsView<'a> {
     /// [`Self::try_trusted_dirfd_openat`], which keeps every served child
     /// directory on the lane. Every dispatch-level gate (DAC, O_NOATIME, the
     /// FIFO interception) has already run when this is consulted.
-    fn try_open_trusted_dir(&self, path: &str, flags: u64) -> Option<DispatchOutcome> {
+    fn try_open_trusted_dir(
+        &self,
+        path: &str,
+        flags: u64,
+        reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
+    ) -> Option<DispatchOutcome> {
         use std::os::fd::IntoRawFd;
         // Default ON with an exact `=0` escape hatch (AGENTS.md): this is the
         // SEED of the whole trusted-dirfd lane — with no directory ever
@@ -1026,8 +1060,9 @@ impl<'a> FsView<'a> {
             status,
             linux_fd_flags_from_open_flags(flags),
         );
-        let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
-            return Some(DispatchOutcome::errno(linux_errno::EMFILE));
+        let fd = match self.install_admitted_open_file(reservation, open_file) {
+            Ok(fd) => fd,
+            Err(e) => return Some(DispatchOutcome::errno(e)),
         };
         Some(DispatchOutcome::returned_i32(fd))
     }
@@ -1038,6 +1073,7 @@ impl<'a> FsView<'a> {
         flags: u64,
         access: u64,
         writable_request: bool,
+        reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
     ) -> Option<DispatchOutcome> {
         let open_flags = LinuxOpenFlags::from_bits_retain(flags);
         if open_flags.intersects(
@@ -1085,12 +1121,12 @@ impl<'a> FsView<'a> {
                     status,
                     linux_fd_flags_from_open_flags(flags),
                 );
-                if let Ok(fd) = self.install_fd_at_or_above(0, open_file) {
-                    self.record_fd_open_path(fd, canonical_path);
-                    Some(DispatchOutcome::returned_i32(fd))
-                } else {
-                    Some(DispatchOutcome::errno(linux_errno::EMFILE))
-                }
+                let fd = match self.install_admitted_open_file(reservation, open_file) {
+                    Ok(fd) => fd,
+                    Err(e) => return Some(DispatchOutcome::errno(e)),
+                };
+                self.record_fd_open_path(fd, canonical_path);
+                Some(DispatchOutcome::returned_i32(fd))
             }
             Err(LINUX_ENOENT) => Some(DispatchOutcome::errno(LINUX_ENOENT)),
             Err(LINUX_EISDIR) if writable_request => Some(DispatchOutcome::errno(LINUX_EISDIR)),
@@ -1110,6 +1146,7 @@ impl<'a> FsView<'a> {
         dirfd: u64,
         path: &str,
         flags: u64,
+        reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
     ) -> Option<DispatchOutcome> {
         use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
         let open_flags = LinuxOpenFlags::from_bits_retain(flags);
@@ -1240,8 +1277,9 @@ impl<'a> FsView<'a> {
                 status,
                 linux_fd_flags_from_open_flags(flags),
             );
-            let Ok(new_fd) = self.install_fd_at_or_above(0, open_file) else {
-                return Some(DispatchOutcome::errno(linux_errno::EMFILE));
+            let new_fd = match self.install_admitted_open_file(reservation, open_file) {
+                Ok(fd) => fd,
+                Err(e) => return Some(DispatchOutcome::errno(e)),
             };
             return Some(DispatchOutcome::returned_i32(new_fd));
         }
@@ -1299,8 +1337,9 @@ impl<'a> FsView<'a> {
             status,
             linux_fd_flags_from_open_flags(flags),
         );
-        let Ok(new_fd) = self.install_fd_at_or_above(0, open_file) else {
-            return Some(DispatchOutcome::errno(linux_errno::EMFILE));
+        let new_fd = match self.install_admitted_open_file(reservation, open_file) {
+            Ok(fd) => fd,
+            Err(e) => return Some(DispatchOutcome::errno(e)),
         };
         // readlink(/proc/self/fd/N) recovers the guest path from
         // fd_open_paths for host-fd-backed descriptions (slow-arm parity).
@@ -1313,6 +1352,7 @@ impl<'a> FsView<'a> {
     /// mount explicitly failed, and `FallThrough` when no mount
     /// claimed the path (or the claiming mount returned ENOSYS). The
     /// caller wraps the legacy lookup chain inside `FallThrough`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn try_vfs_open(
         &self,
         context: &crate::kernel::KernelContext,
@@ -1321,6 +1361,7 @@ impl<'a> FsView<'a> {
         access: u64,
         flags: u64,
         create_mode: u32,
+        reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
     ) -> VfsOpenAttempt {
         let Some(m) = self.fs.vfs_mounts.resolve(path) else {
             return VfsOpenAttempt::FallThrough;
@@ -1560,11 +1601,10 @@ impl<'a> FsView<'a> {
                     description_status_flags,
                     linux_fd_flags_from_open_flags(flags),
                 );
-                let new_fd = match self.install_fd_at_or_above(0, open_file) {
-                    Ok(fd) => fd,
-                    Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
-                };
-                VfsOpenAttempt::Installed(new_fd)
+                match self.install_admitted_open_file(reservation, open_file) {
+                    Ok(new_fd) => VfsOpenAttempt::Installed(new_fd),
+                    Err(e) => VfsOpenAttempt::Errno(e),
+                }
             }
             carrick_vfs::VfsHandle::SyntheticDevice { kind, status_flags } => {
                 let status = ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC;
@@ -1576,12 +1616,13 @@ impl<'a> FsView<'a> {
                     status,
                     linux_fd_flags_from_open_flags(flags),
                 );
-                let new_fd = match self.install_fd_at_or_above(0, open_file) {
-                    Ok(fd) => fd,
-                    Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
-                };
-                self.record_fd_open_path(new_fd, kind.as_str().to_string());
-                VfsOpenAttempt::Installed(new_fd)
+                match self.install_admitted_open_file(reservation, open_file) {
+                    Ok(new_fd) => {
+                        self.record_fd_open_path(new_fd, kind.as_str().to_string());
+                        VfsOpenAttempt::Installed(new_fd)
+                    }
+                    Err(e) => VfsOpenAttempt::Errno(e),
+                }
             }
             carrick_vfs::VfsHandle::VirtualConsole {
                 console,
@@ -1596,12 +1637,13 @@ impl<'a> FsView<'a> {
                     status,
                     linux_fd_flags_from_open_flags(flags),
                 );
-                let new_fd = match self.install_fd_at_or_above(0, open_file) {
-                    Ok(fd) => fd,
-                    Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
-                };
-                self.record_fd_open_path(new_fd, "/dev/tty0".to_string());
-                VfsOpenAttempt::Installed(new_fd)
+                match self.install_admitted_open_file(reservation, open_file) {
+                    Ok(new_fd) => {
+                        self.record_fd_open_path(new_fd, "/dev/tty0".to_string());
+                        VfsOpenAttempt::Installed(new_fd)
+                    }
+                    Err(e) => VfsOpenAttempt::Errno(e),
+                }
             }
             carrick_vfs::VfsHandle::Bytes {
                 path,
@@ -1619,11 +1661,10 @@ impl<'a> FsView<'a> {
                     status,
                     linux_fd_flags_from_open_flags(flags),
                 );
-                let new_fd = match self.install_fd_at_or_above(0, open_file) {
-                    Ok(fd) => fd,
-                    Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
-                };
-                VfsOpenAttempt::Installed(new_fd)
+                match self.install_admitted_open_file(reservation, open_file) {
+                    Ok(new_fd) => VfsOpenAttempt::Installed(new_fd),
+                    Err(e) => VfsOpenAttempt::Errno(e),
+                }
             }
             carrick_vfs::VfsHandle::Pty {
                 host_fd,
@@ -1667,15 +1708,13 @@ impl<'a> FsView<'a> {
                         &open_file.description,
                     );
                 }
-                let new_fd = match self.install_fd_at_or_above(0, open_file) {
-                    Ok(fd) => fd,
-                    Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
-                };
-                // Record the open path (/dev/ptmx or /dev/pts/N) so
-                // readlink(/proc/self/fd/<fd>) resolves it — glibc's ttyname_r
-                // needs this to reopen a pty slave.
-                self.record_fd_open_path(new_fd, path.to_string());
-                VfsOpenAttempt::Installed(new_fd)
+                match self.install_admitted_open_file(reservation, open_file) {
+                    Ok(new_fd) => {
+                        self.record_fd_open_path(new_fd, path.to_string());
+                        VfsOpenAttempt::Installed(new_fd)
+                    }
+                    Err(e) => VfsOpenAttempt::Errno(e),
+                }
             }
             carrick_vfs::VfsHandle::Directory {
                 path,
@@ -1738,11 +1777,10 @@ impl<'a> FsView<'a> {
                     status,
                     linux_fd_flags_from_open_flags(flags),
                 );
-                let new_fd = match self.install_fd_at_or_above(0, open_file) {
-                    Ok(fd) => fd,
-                    Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
-                };
-                VfsOpenAttempt::Installed(new_fd)
+                match self.install_admitted_open_file(reservation, open_file) {
+                    Ok(new_fd) => VfsOpenAttempt::Installed(new_fd),
+                    Err(e) => VfsOpenAttempt::Errno(e),
+                }
             }
             carrick_vfs::VfsHandle::InMemoryFile {
                 path,
@@ -1764,12 +1802,13 @@ impl<'a> FsView<'a> {
                     status,
                     linux_fd_flags_from_open_flags(flags),
                 );
-                let new_fd = match self.install_fd_at_or_above(0, open_file) {
-                    Ok(fd) => fd,
-                    Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
-                };
-                self.record_fd_open_path(new_fd, path);
-                VfsOpenAttempt::Installed(new_fd)
+                match self.install_admitted_open_file(reservation, open_file) {
+                    Ok(new_fd) => {
+                        self.record_fd_open_path(new_fd, path);
+                        VfsOpenAttempt::Installed(new_fd)
+                    }
+                    Err(e) => VfsOpenAttempt::Errno(e),
+                }
             }
         }
     }
@@ -2086,6 +2125,10 @@ impl<'a> FsView<'a> {
             if !terminated {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            let reservation = match this.reserve_slot_at_or_above(0) {
+                Ok(res) => res,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
             let name = String::from_utf8_lossy(&name_bytes).into_owned();
             let path = format!("/memfd:{name}");
             // Every memfd supports the sealing API. With MFD_ALLOW_SEALING the
@@ -2134,7 +2177,16 @@ impl<'a> FsView<'a> {
             } else {
                 0
             };
-            Ok(this.install_fd_with_common(description, common, fd_flags))
+            let open_file = OpenFile::from_open_description_with_common(
+                Arc::new(RwLock::new(description)),
+                common,
+                fd_flags,
+            );
+            let fd = match this.install_reserved_fd(reservation, open_file) {
+                Ok(fd) => fd,
+                Err(e) => return Ok(DispatchOutcome::errno(e)),
+            };
+            Ok(DispatchOutcome::returned_i32(fd))
         }
 
         fn memfd_secret(this, cx, flags: u64) {
@@ -2161,6 +2213,10 @@ impl<'a> FsView<'a> {
             if flags & !LINUX_O_CLOEXEC != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            let reservation = match this.reserve_slot_at_or_above(0) {
+                Ok(res) => res,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
             let path = "/secretmem".to_string();
             // No sealing support: seals stay None (F_GET_SEALS/F_ADD_SEALS →
             // EINVAL), unlike memfd_create.
@@ -2185,7 +2241,16 @@ impl<'a> FsView<'a> {
             } else {
                 0
             };
-            Ok(this.install_fd_with_common(description, common, fd_flags))
+            let open_file = OpenFile::from_open_description_with_common(
+                Arc::new(RwLock::new(description)),
+                common,
+                fd_flags,
+            );
+            let fd = match this.install_reserved_fd(reservation, open_file) {
+                Ok(fd) => fd,
+                Err(e) => return Ok(DispatchOutcome::errno(e)),
+            };
+            Ok(DispatchOutcome::returned_i32(fd))
         }
     }
 }

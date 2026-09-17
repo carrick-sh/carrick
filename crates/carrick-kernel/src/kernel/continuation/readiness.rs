@@ -3,7 +3,7 @@
 //! Owns [`ReadinessProbe`], [`SignalReadinessProbe`], [`ReservedSignal`],
 //! [`ResumeContext`], [`StaleThreadCause`], and [`ContinuationWakeToken`].
 
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
@@ -597,6 +597,37 @@ impl ReadinessProbe {
                         caller_deadline: wait.caller_deadline(),
                         timer_sources: wait.timer_sources(),
                         timerfd_admission_stale: false,
+                    }
+                } else {
+                    Self::Passive {
+                        deadline: Some(Instant::now()),
+                    }
+                }
+            }
+            ContinuationDetail::BlockingOpen(open) => {
+                let open_guard = open.lock();
+                if let Some(open) = open_guard.as_ref() {
+                    let fd = open.registration_fd();
+                    let owned = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+                    if owned >= 0 {
+                        Self::Fds {
+                            registrations: vec![OwnedFdRegistration {
+                                fd: Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(owned) }),
+                                events: libc::POLLIN,
+                                generation: super::next_nonzero(&super::NEXT_RESOURCE_GENERATION),
+                            }],
+                            file_table: Arc::clone(&state.authority.file_table),
+                            fd_authority: WaitFdAuthority::internal(
+                                crate::dispatch::InternalWaitKind::CarrierControl,
+                            ),
+                            caller_deadline: None,
+                            timer_sources: Vec::new(),
+                            timerfd_admission_stale: false,
+                        }
+                    } else {
+                        Self::Passive {
+                            deadline: Some(Instant::now()),
+                        }
                     }
                 } else {
                     Self::Passive {

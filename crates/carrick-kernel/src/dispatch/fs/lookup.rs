@@ -36,6 +36,7 @@ pub(in crate::dispatch) enum LookupIntent<'a> {
         writable_request: bool,
         flags: u64,
         reporter: &'a CompatReporter,
+        reservation: &'a mut Option<crate::kernel::objects::FileSlotReservation>,
     },
 }
 
@@ -97,7 +98,7 @@ impl<'a> FsView<'a> {
         dirfd: u64,
         path: &str,
         at_flags: carrick_abi::LinuxAtFlags,
-        intent: LookupIntent<'_>,
+        mut intent: LookupIntent<'_>,
     ) -> Result<PathLookup, LinuxErrno> {
         // 1. Empty pathname checks
         if path.is_empty() {
@@ -132,7 +133,7 @@ impl<'a> FsView<'a> {
         let mut dentry_attempted = false;
         let mut dentry_fast_open_attempted = false;
 
-        match &intent {
+        match &mut intent {
             LookupIntent::Stat { .. } | LookupIntent::Statx { .. } => {
                 // `--fs host` trusted-dirfd fast lane: `newfstatat(dirfd, name)` on
                 // getdents output served straight off the trusted host dirfd.
@@ -150,6 +151,7 @@ impl<'a> FsView<'a> {
                 access,
                 writable_request,
                 flags,
+                reservation,
                 ..
             } => {
                 let want_create = open_flags.contains(LinuxOpenFlags::CREAT);
@@ -161,9 +163,13 @@ impl<'a> FsView<'a> {
                     && path.starts_with('/')
                 {
                     dentry_fast_open_attempted = true;
-                    if let Some(outcome) =
-                        self.try_dentry_fast_open(path, *flags, *access, *writable_request)
-                    {
+                    if let Some(outcome) = self.try_dentry_fast_open(
+                        path,
+                        *flags,
+                        *access,
+                        *writable_request,
+                        reservation,
+                    ) {
                         return Ok(PathLookup {
                             resolved_path: path.to_string(),
                             fast_path: FastPathKind::DentryCache,
@@ -172,7 +178,9 @@ impl<'a> FsView<'a> {
                     }
                 }
 
-                if let Some(outcome) = self.try_immutable_lower_absolute_open(dirfd, path, *flags) {
+                if let Some(outcome) =
+                    self.try_immutable_lower_absolute_open(dirfd, path, *flags, reservation)
+                {
                     return Ok(PathLookup {
                         resolved_path: path.to_string(),
                         fast_path: FastPathKind::ImmutableLower,
@@ -180,7 +188,9 @@ impl<'a> FsView<'a> {
                     });
                 }
 
-                if let Some(outcome) = self.try_trusted_dirfd_openat(dirfd, path, *flags) {
+                if let Some(outcome) =
+                    self.try_trusted_dirfd_openat(dirfd, path, *flags, reservation)
+                {
                     return Ok(PathLookup {
                         resolved_path: path.to_string(),
                         fast_path: FastPathKind::TrustedDirfd,
@@ -371,8 +381,9 @@ impl<'a> FsView<'a> {
             access,
             writable_request,
             flags,
+            reservation,
             ..
-        } = &intent
+        } = &mut intent
         {
             let want_create = open_flags.contains(LinuxOpenFlags::CREAT);
             let want_trunc = open_flags.contains(LinuxOpenFlags::TRUNC);
@@ -382,9 +393,13 @@ impl<'a> FsView<'a> {
                 && !ends_with_dot
                 && !had_trailing_slash
             {
-                if let Some(outcome) =
-                    self.try_dentry_fast_open(&resolved, *flags, *access, *writable_request)
-                {
+                if let Some(outcome) = self.try_dentry_fast_open(
+                    &resolved,
+                    *flags,
+                    *access,
+                    *writable_request,
+                    reservation,
+                ) {
                     return Ok(PathLookup {
                         resolved_path: resolved,
                         fast_path: FastPathKind::DentryCache,
@@ -402,6 +417,7 @@ impl<'a> FsView<'a> {
                 open_flags,
                 flags,
                 reporter,
+                reservation,
                 ..
             } => {
                 // Trace every open attempt
@@ -409,8 +425,15 @@ impl<'a> FsView<'a> {
 
                 let visible_self = proc_visible_self(context);
                 if let Some(n) = proc_self_fd_number(&resolved, visible_self) {
-                    let outcome =
-                        self.reopen_proc_self_fd(context, registry, n, flags, &resolved, reporter)?;
+                    let outcome = self.reopen_proc_self_fd(
+                        context,
+                        registry,
+                        n,
+                        flags,
+                        &resolved,
+                        reporter,
+                        reservation,
+                    )?;
                     return Ok(PathLookup {
                         resolved_path: resolved,
                         fast_path: FastPathKind::None,
@@ -420,7 +443,9 @@ impl<'a> FsView<'a> {
 
                 if let Some(n) = proc_self_fdinfo_number(&resolved, visible_self) {
                     let outcome = match self.fdinfo_bytes(n) {
-                        Some(bytes) => self.install_proc_synthetic_bytes(&resolved, bytes, flags),
+                        Some(bytes) => {
+                            self.install_proc_synthetic_bytes(&resolved, bytes, flags, reservation)
+                        }
                         None => DispatchOutcome::errno(LINUX_ENOENT),
                     };
                     return Ok(PathLookup {
@@ -446,6 +471,7 @@ impl<'a> FsView<'a> {
                             &resolved,
                             Vec::new(),
                             flags,
+                            reservation,
                         )),
                     });
                 }
@@ -454,7 +480,8 @@ impl<'a> FsView<'a> {
                     && !open_flags.contains(LinuxOpenFlags::NOFOLLOW)
                     && let Some(current) = self.cross.current_executable()
                 {
-                    let outcome = self.install_proc_executable_source(&resolved, current, flags);
+                    let outcome =
+                        self.install_proc_executable_source(&resolved, current, flags, reservation);
                     return Ok(PathLookup {
                         resolved_path: resolved,
                         fast_path: FastPathKind::None,
@@ -524,14 +551,17 @@ impl<'a> FsView<'a> {
                                 status,
                                 linux_fd_flags_from_open_flags(flags),
                             );
-                            let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
-                                return Ok(PathLookup {
-                                    resolved_path: path,
-                                    fast_path: FastPathKind::None,
-                                    target: LookupTarget::OpenOutcome(DispatchOutcome::errno(
-                                        linux_errno::EMFILE,
-                                    )),
-                                });
+                            let fd = match self.install_admitted_open_file(reservation, open_file) {
+                                Ok(fd) => fd,
+                                Err(errno) => {
+                                    return Ok(PathLookup {
+                                        resolved_path: path,
+                                        fast_path: FastPathKind::None,
+                                        target: LookupTarget::OpenOutcome(DispatchOutcome::errno(
+                                            errno,
+                                        )),
+                                    });
+                                }
                             };
                             self.record_fd_open_path(fd, path.clone());
                             return Ok(PathLookup {

@@ -499,6 +499,7 @@ fn detail_diagnostic(detail: &ContinuationDetail) -> String {
             fd_authority_diagnostic(fd_authority)
         ),
         ContinuationDetail::BlockingWrite(_) => "blocking-write".to_owned(),
+        ContinuationDetail::BlockingOpen(_) => "blocking-open".to_owned(),
         ContinuationDetail::TimerFdRead(_) => "timerfd-read".to_owned(),
         ContinuationDetail::Semop(_) => "sysv-semop".to_owned(),
         ContinuationDetail::Mqueue(_) => "posix-mqueue".to_owned(),
@@ -747,6 +748,7 @@ pub enum ContinuationDetail {
         timerfd_admission_stale: bool,
     },
     BlockingWrite(Arc<Mutex<BlockingWrite>>),
+    BlockingOpen(Arc<Mutex<Option<crate::dispatch::retained_open::BlockingOpen>>>),
     TimerFdRead(Arc<Mutex<Option<BlockingTimerFdRead>>>),
     Semop(Arc<Mutex<Option<BlockingSemop>>>),
     Mqueue(Arc<Mutex<Option<BlockingMqueue>>>),
@@ -846,6 +848,7 @@ pub enum BlockedContinuation {
     WaitOnFdsSelect(ContinuationState),
     WaitOnPollFds(ContinuationState),
     BlockingWrite(ContinuationState),
+    BlockingOpen(ContinuationState),
     TimerFdRead(ContinuationState),
     Semop(ContinuationState),
     Mqueue(ContinuationState),
@@ -868,6 +871,7 @@ pub enum ContinuationFamily {
     WaitOnFdsSelect,
     WaitOnPollFds,
     BlockingWrite,
+    BlockingOpen,
     TimerFdRead,
     Semop,
     Mqueue,
@@ -893,6 +897,7 @@ impl ContinuationFamily {
             Self::WaitOnFdsSelect => 7,
             Self::WaitOnPollFds => 8,
             Self::BlockingWrite => 9,
+            Self::BlockingOpen => 21,
             Self::TimerFdRead => 10,
             Self::Semop => 19,
             Self::Mqueue => 20,
@@ -919,6 +924,7 @@ impl ContinuationFamily {
             Self::WaitOnFdsSelect => "wait-on-fds-select",
             Self::WaitOnPollFds => "wait-on-poll-fds",
             Self::BlockingWrite => "blocking-write",
+            Self::BlockingOpen => "blocking-open",
             Self::TimerFdRead => "timerfd-read",
             Self::Semop => "sysv-semop",
             Self::Mqueue => "posix-mqueue",
@@ -956,6 +962,7 @@ pub const fn is_blocking_dispatch_outcome(outcome: &DispatchOutcome) -> bool {
             | DispatchOutcome::WaitOnSharedWord { .. }
             | DispatchOutcome::WaitOnFds { .. }
             | DispatchOutcome::BlockingWrite(_)
+            | DispatchOutcome::BlockingOpen(_)
             | DispatchOutcome::BlockingTimerFdRead(_)
             | DispatchOutcome::BlockingSemop(_)
             | DispatchOutcome::BlockingMqueue(_)
@@ -1298,6 +1305,12 @@ impl BlockedContinuation {
                     ContinuationDetail::Sleep,
                 ))
             }
+            DispatchOutcome::BlockingOpen(open) => Self::BlockingOpen(new_state(
+                None,
+                Vec::new(),
+                Some(WaitSigMask::NONE),
+                ContinuationDetail::BlockingOpen(Arc::new(Mutex::new(Some(open)))),
+            )),
             DispatchOutcome::Returned { .. }
             | DispatchOutcome::SchedulerYield
             | DispatchOutcome::Errno { .. }
@@ -1366,6 +1379,7 @@ impl BlockedContinuation {
             | Self::WaitOnFdsSelect(state)
             | Self::WaitOnPollFds(state)
             | Self::BlockingWrite(state)
+            | Self::BlockingOpen(state)
             | Self::TimerFdRead(state)
             | Self::Semop(state)
             | Self::Mqueue(state)
@@ -1389,6 +1403,7 @@ impl BlockedContinuation {
             | Self::WaitOnFdsSelect(state)
             | Self::WaitOnPollFds(state)
             | Self::BlockingWrite(state)
+            | Self::BlockingOpen(state)
             | Self::TimerFdRead(state)
             | Self::Semop(state)
             | Self::Mqueue(state)
@@ -1412,6 +1427,7 @@ impl BlockedContinuation {
             Self::WaitOnFdsSelect(_) => ContinuationFamily::WaitOnFdsSelect,
             Self::WaitOnPollFds(_) => ContinuationFamily::WaitOnPollFds,
             Self::BlockingWrite(_) => ContinuationFamily::BlockingWrite,
+            Self::BlockingOpen(_) => ContinuationFamily::BlockingOpen,
             Self::TimerFdRead(_) => ContinuationFamily::TimerFdRead,
             Self::Semop(_) => ContinuationFamily::Semop,
             Self::Mqueue(_) => ContinuationFamily::Mqueue,
@@ -1614,6 +1630,9 @@ impl BlockedContinuation {
             ContinuationDetail::BlockingWrite(write) => {
                 let write = write.lock();
                 fingerprint ^= write.poll_fd() as u64 ^ write.offset() as u64;
+            }
+            ContinuationDetail::BlockingOpen(open) => {
+                fingerprint ^= Arc::as_ptr(open) as usize as u64;
             }
             ContinuationDetail::TimerFdRead(read) => {
                 if let Some(read) = read.lock().as_ref() {
@@ -1921,6 +1940,14 @@ impl BlockedContinuation {
                             _ => 0,
                         };
                         ContinuationCompletion::RedispatchWithPartial(offset)
+                    }
+                    ContinuationFamily::BlockingOpen => {
+                        let open = match &self.state().detail {
+                            ContinuationDetail::BlockingOpen(open) => open.lock().take(),
+                            _ => None,
+                        }
+                        .ok_or(ContinuationResumeError::MissingContinuation)?;
+                        ContinuationCompletion::BlockingOpen(open)
                     }
                     ContinuationFamily::TimerFdRead => {
                         let read = match &self.state().detail {
@@ -2272,6 +2299,7 @@ pub enum ContinuationCompletion {
         write: BlockingWrite,
         outcome: BlockingWriteOutcome,
     },
+    BlockingOpen(crate::dispatch::retained_open::BlockingOpen),
     TimerFdRead(BlockingTimerFdRead),
     Semop(BlockingSemop),
     Mqueue(BlockingMqueue),
@@ -2410,6 +2438,12 @@ pub fn fold_continuation_completion<M: CurrentMmMemory>(
                 dispatcher, context, &write, outcome,
             ))
         }
+        ContinuationCompletion::BlockingOpen(open) => match open.complete(dispatcher) {
+            crate::dispatch::retained_open::BlockingOpenStep::Done(outcome) => Some(outcome),
+            crate::dispatch::retained_open::BlockingOpenStep::Wait(open) => {
+                Some(DispatchOutcome::BlockingOpen(open))
+            }
+        },
         ContinuationCompletion::TimerFdRead(read) => match read.complete(memory) {
             crate::dispatch::format_time::TimerFdReadStep::Done(outcome) => Some(outcome),
             crate::dispatch::format_time::TimerFdReadStep::Wait(read) => {

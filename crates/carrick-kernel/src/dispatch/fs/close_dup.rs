@@ -158,6 +158,14 @@ impl<'a> FsView<'a> {
             None => return DispatchOutcome::errno(LINUX_EBADF),
         };
 
+        let exact_reservation = match self
+            .captured_file_table()
+            .reserve_exact_target(new_fd, nofile_cur)
+        {
+            Ok(reservation) => reservation,
+            Err(errno) => return DispatchOutcome::errno(errno),
+        };
+
         // dup2/dup3 closes `new_fd` before installing the duplicate.  Carrick's
         // epoll emulation keys its interest map by guest-fd number, so the
         // detach must happen while that slot still names the DISPLACED open-file
@@ -165,31 +173,24 @@ impl<'a> FsView<'a> {
         // replacement and can tear down the parent's inherited registration
         // for the old description (the HvPatch Go os/exec two-pipe hang).
         //
-        // Linux attaches epoll interest to the open-file description.  A forked
-        // parent's reference therefore keeps the registration alive when the
-        // child replaces its numeric slot; only the final logical fd reference
-        // is allowed to trigger automatic close-detach.
+        // Because `exact_reservation` is held, no open allocator can claim
+        // `new_fd` during detach, and an EBUSY loser above never reaches here.
         self.detach_fd_from_epolls(new_fd);
         self.discard_splice_pushback_if_final(new_fd);
 
-        let replaced = {
-            let files = self.captured_file_table();
-            let mut table = files.write_open_files();
-            let replaced = table.remove(&new_fd).map(|replaced| {
-                // Only an mqueue description needs the alias walk (see
-                // `mqueue_owner_alias_closed`); for everything else the
-                // observation is unused and the walk is O(table) per dup2.
-                let alias_remains = Self::close_needs_mqueue_alias_scan(&replaced)
-                    && table
-                        .values()
-                        .any(|slot| Arc::ptr_eq(&slot.description, &replaced.description));
-                (Arc::clone(&files), replaced, alias_remains)
-            });
-            retain_open_file(&description);
-            table.insert(new_fd, OpenFile::new(description, fd_flags));
-            replaced
+        let files = self.captured_file_table();
+        retain_open_file(&description);
+        let replaced = match exact_reservation.commit(OpenFile::new(description, fd_flags)) {
+            Ok(replaced) => replaced,
+            Err(errno) => return DispatchOutcome::errno(errno),
         };
-        if let Some((files, replaced, alias_remains)) = replaced {
+
+        if let Some(replaced) = replaced {
+            let alias_remains = Self::close_needs_mqueue_alias_scan(&replaced)
+                && files
+                    .read_open_files()
+                    .values()
+                    .any(|slot| Arc::ptr_eq(&slot.description, &replaced.description));
             self.mqueue_owner_alias_closed_known(files.id(), &replaced, alias_remains);
             let pid = self.event_ring_guest_pid();
             self.record_fd_close_owner(new_fd, pid, &replaced);

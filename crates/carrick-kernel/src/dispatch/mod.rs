@@ -657,7 +657,7 @@ pub(crate) use epoll_shim::{
     register_epoll_kqueue, unregister_epoll_kqueue,
 };
 pub(crate) mod fd_table;
-mod fifo_beacon;
+pub(crate) mod fifo_beacon;
 pub(crate) mod ioring;
 #[macro_use]
 pub mod fs;
@@ -791,6 +791,8 @@ pub use seccomp_observer::check_syscall_flags;
 pub mod format_stat;
 pub(in crate::dispatch) use format_stat::*;
 pub mod fd_wait;
+pub mod retained_open;
+pub use retained_open::{BlockingOpen, BlockingOpenKind, BlockingOpenStep};
 pub mod format_time;
 pub use format_time::*;
 pub mod rootfs_helpers;

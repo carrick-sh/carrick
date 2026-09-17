@@ -23,6 +23,7 @@ pub(in crate::dispatch) fn event_ring_host_fd(open_file: &OpenFile) -> i32 {
 impl<'a> FsView<'a> {
     fn first_free_fd<S: std::hash::BuildHasher>(
         table: &HashMap<i32, OpenFile, S>,
+        reserved_slots: &HashMap<i32, u64>,
         min_fd: i32,
         reserved: Option<i32>,
         closed_stdio: &[bool; 3],
@@ -38,7 +39,11 @@ impl<'a> FsView<'a> {
             // guest explicitly closed it — then POSIX lets the lowest-free open/dup
             // land there. A caller wanting "anything but stdio" passes min_fd = 3.
             let reserved_stdio = (0..3).contains(&fd) && !closed_stdio[fd as usize];
-            if Some(fd) != reserved && !table.contains_key(&fd) && !reserved_stdio {
+            if Some(fd) != reserved
+                && !table.contains_key(&fd)
+                && !reserved_slots.contains_key(&fd)
+                && !reserved_stdio
+            {
                 break;
             }
             fd = fd.checked_add(1)?;
@@ -85,6 +90,44 @@ impl<'a> FsView<'a> {
         self.captured_file_table().lock_closed_stdio()[fd as usize]
     }
 
+    pub(in crate::dispatch) fn reserve_slot_at_or_above(
+        &self,
+        min_fd: i32,
+    ) -> Result<crate::kernel::objects::FileSlotReservation, LinuxErrno> {
+        let files = self.captured_file_table();
+        let limit = self.nofile_limit();
+        files.reserve_slot_at_or_above(min_fd, limit)
+    }
+
+    pub(in crate::dispatch) fn install_reserved_fd(
+        &self,
+        reservation: crate::kernel::objects::FileSlotReservation,
+        open_file: OpenFile,
+    ) -> Result<i32, LinuxErrno> {
+        let fd = reservation.fd();
+        let host_fd = event_ring_host_fd(&open_file);
+        retain_open_file(&open_file.description);
+        if let Err(errno) = reservation.commit(open_file.clone()) {
+            open_file.description.release_fd_ref();
+            return Err(errno);
+        }
+        crate::event_ring::rec(crate::event_ring::FDOPEN, fd, host_fd, 0);
+        Ok(fd)
+    }
+
+    pub(in crate::dispatch) fn install_admitted_open_file(
+        &self,
+        reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
+        open_file: OpenFile,
+    ) -> Result<i32, LinuxErrno> {
+        if let Some(res) = reservation.take() {
+            self.install_reserved_fd(res, open_file)
+        } else {
+            self.install_fd_at_or_above(0, open_file)
+                .map_err(|_| linux_errno::EMFILE)
+        }
+    }
+
     pub(in crate::dispatch) fn install_fd_at_or_above(
         &self,
         min_fd: i32,
@@ -94,11 +137,12 @@ impl<'a> FsView<'a> {
         let limit = self.nofile_limit();
         let mut table = files.write_open_files();
         let mut next_fd = files.lock_next_fd();
-        // Lock order: open_files → closed_stdio (the close path never holds both).
+        let reserved_slots = files.lock_reserved_slots();
+        // Lock order: open_files → next_fd → reserved_slots → closed_stdio.
         let fd = {
             let closed = files.lock_closed_stdio();
             let start = if min_fd <= *next_fd { *next_fd } else { min_fd };
-            match Self::first_free_fd(&table, start, None, &closed, limit) {
+            match Self::first_free_fd(&table, &reserved_slots, start, None, &closed, limit) {
                 Some(fd) => fd,
                 None => return Err(open_file),
             }
@@ -110,8 +154,15 @@ impl<'a> FsView<'a> {
         self.clear_closed_stdio(fd);
         if fd == *next_fd {
             let closed = files.lock_closed_stdio();
-            *next_fd = Self::first_free_fd(&table, fd.saturating_add(1), None, &closed, limit)
-                .unwrap_or(limit);
+            *next_fd = Self::first_free_fd(
+                &table,
+                &reserved_slots,
+                fd.saturating_add(1),
+                None,
+                &closed,
+                limit,
+            )
+            .unwrap_or(limit);
         }
         Ok(fd)
     }
@@ -126,14 +177,18 @@ impl<'a> FsView<'a> {
         let limit = self.nofile_limit();
         let mut table = files.write_open_files();
         let mut next_fd = files.lock_next_fd();
+        let reserved_slots = files.lock_reserved_slots();
         let (first_fd, second_fd) = {
             let closed = files.lock_closed_stdio();
             let start = if min_fd <= *next_fd { *next_fd } else { min_fd };
-            let Some(first_fd) = Self::first_free_fd(&table, start, None, &closed, limit) else {
+            let Some(first_fd) =
+                Self::first_free_fd(&table, &reserved_slots, start, None, &closed, limit)
+            else {
                 return Err((first, second));
             };
             let Some(second_fd) = Self::first_free_fd(
                 &table,
+                &reserved_slots,
                 first_fd.saturating_add(1),
                 Some(first_fd),
                 &closed,
@@ -155,9 +210,15 @@ impl<'a> FsView<'a> {
         self.clear_closed_stdio(second_fd);
         if first_fd == *next_fd {
             let closed = files.lock_closed_stdio();
-            *next_fd =
-                Self::first_free_fd(&table, second_fd.saturating_add(1), None, &closed, limit)
-                    .unwrap_or(limit);
+            *next_fd = Self::first_free_fd(
+                &table,
+                &reserved_slots,
+                second_fd.saturating_add(1),
+                None,
+                &closed,
+                limit,
+            )
+            .unwrap_or(limit);
         }
         Ok((first_fd, second_fd))
     }

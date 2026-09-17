@@ -209,12 +209,13 @@ pub struct ParkedOpenerToken(#[allow(dead_code)] std::sync::Arc<ParkedOpenerInne
 
 #[derive(Debug)]
 struct ParkedOpenerInner {
-    kind: ParkedOpenerKind,
+    kind: Mutex<ParkedOpenerKind>,
 }
 
 #[derive(Debug)]
 enum ParkedOpenerKind {
     Reader { host_fd: i32, id: (u64, u64) },
+    TakenReader { id: (u64, u64) },
     Writer { token_id: u64, id: (u64, u64) },
 }
 
@@ -230,8 +231,23 @@ impl ParkedOpenerToken {
         let beacon = beacons.entry(id).or_insert_with(Beacon::new_for_identity);
         beacon.readers_present.set_asserted(true);
         Self(std::sync::Arc::new(ParkedOpenerInner {
-            kind: ParkedOpenerKind::Reader { host_fd, id },
+            kind: Mutex::new(ParkedOpenerKind::Reader { host_fd, id }),
         }))
+    }
+
+    /// Extract the opened reader host fd on successful completion so the resulting
+    /// open description can own it without a double close when the token is dropped.
+    pub(crate) fn take_reader_host_fd(&self) -> Option<i32> {
+        let mut kind = self.0.kind.lock().unwrap_or_else(|e| e.into_inner());
+        match &*kind {
+            ParkedOpenerKind::Reader { host_fd, id } => {
+                let fd = *host_fd;
+                let id = *id;
+                *kind = ParkedOpenerKind::TakenReader { id };
+                Some(fd)
+            }
+            _ => None,
+        }
     }
 
     /// Create a parked writer token waiting for a reader. Asserts `writers_present`
@@ -257,7 +273,7 @@ impl ParkedOpenerToken {
         Some((
             readers_present_read_fd,
             Self(std::sync::Arc::new(ParkedOpenerInner {
-                kind: ParkedOpenerKind::Writer { token_id, id },
+                kind: Mutex::new(ParkedOpenerKind::Writer { token_id, id }),
             })),
         ))
     }
@@ -265,48 +281,65 @@ impl ParkedOpenerToken {
 
 impl Drop for ParkedOpenerInner {
     fn drop(&mut self) {
-        match self.kind {
+        let kind = self.kind.lock().unwrap_or_else(|e| e.into_inner());
+        match &*kind {
             ParkedOpenerKind::Reader { host_fd, id } => {
                 let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-                st.read_ends.remove(&host_fd);
-                let has_readers = st.read_ends.values().any(|&r_id| r_id == id);
+                st.read_ends.remove(host_fd);
+                let has_readers = st.read_ends.values().any(|&r_id| r_id == *id);
                 let has_writers = st
                     .beacons
-                    .get(&id)
+                    .get(id)
                     .is_some_and(|b| !b.writer_bw.is_empty() || !b.parked_writers.is_empty());
 
-                if let Some(b) = st.beacons.get_mut(&id) {
+                if let Some(b) = st.beacons.get_mut(id) {
                     b.readers_present.set_asserted(has_readers);
                     b.writers_present.set_asserted(has_writers);
                 }
 
                 if !has_readers && !has_writers {
-                    st.beacons.remove(&id);
+                    st.beacons.remove(id);
                 }
-                drop(st);
                 unsafe {
-                    libc::close(host_fd);
+                    libc::close(*host_fd);
+                }
+            }
+            ParkedOpenerKind::TakenReader { id } => {
+                let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+                let has_readers = st.read_ends.values().any(|&r_id| r_id == *id);
+                let has_writers = st
+                    .beacons
+                    .get(id)
+                    .is_some_and(|b| !b.writer_bw.is_empty() || !b.parked_writers.is_empty());
+
+                if let Some(b) = st.beacons.get_mut(id) {
+                    b.readers_present.set_asserted(has_readers);
+                    b.writers_present.set_asserted(has_writers);
+                }
+
+                if !has_readers && !has_writers {
+                    st.beacons.remove(id);
                 }
             }
             ParkedOpenerKind::Writer { token_id, id } => {
                 let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-                st.parked_writers.remove(&token_id);
-                if let Some(b) = st.beacons.get_mut(&id) {
-                    b.parked_writers.remove(&token_id);
+                st.parked_writers.remove(token_id);
+                if let Some(b) = st.beacons.get_mut(id) {
+                    b.parked_writers.remove(token_id);
                 }
-                let has_readers = st.read_ends.values().any(|&r_id| r_id == id);
+                let has_readers = st.read_ends.values().any(|&r_id| r_id == *id);
                 let has_writers = st
                     .beacons
-                    .get(&id)
+                    .get(id)
                     .is_some_and(|b| !b.writer_bw.is_empty() || !b.parked_writers.is_empty());
 
-                if let Some(b) = st.beacons.get_mut(&id) {
+                if let Some(b) = st.beacons.get_mut(id) {
                     b.readers_present.set_asserted(has_readers);
                     b.writers_present.set_asserted(has_writers);
                 }
 
                 if !has_readers && !has_writers {
-                    st.beacons.remove(&id);
+                    st.beacons.remove(id);
                 }
             }
         }

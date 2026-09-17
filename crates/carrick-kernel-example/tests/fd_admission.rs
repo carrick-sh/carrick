@@ -17,8 +17,8 @@
 //!   - Reference run recorded in `target/conformance/eco-fd-exec-20260917/nofile-red.jsonl`.
 
 use carrick_abi::{
-    LINUX_AT_FDCWD, LINUX_EBUSY, LINUX_EMFILE, LINUX_ENOENT, LINUX_O_CREAT, LINUX_O_RDONLY,
-    LINUX_O_RDWR, LINUX_O_TRUNC, LINUX_O_WRONLY, LINUX_RLIMIT_NOFILE,
+    LINUX_AT_FDCWD, LINUX_EBUSY, LINUX_EMFILE, LINUX_ENOENT, LINUX_EPOLLIN, LINUX_O_CREAT,
+    LINUX_O_RDONLY, LINUX_O_RDWR, LINUX_O_TRUNC, LINUX_O_WRONLY, LINUX_RLIMIT_NOFILE,
 };
 use carrick_kernel_example::{ScriptedBackend, Step, await_parked, last_child, slot, sys};
 use carrick_vfs::fs_backend::HostFsBackend;
@@ -28,6 +28,15 @@ fn rlimit_payload(cur: u64, max: u64) -> [u8; 16] {
     b[0..8].copy_from_slice(&cur.to_le_bytes());
     b[8..16].copy_from_slice(&max.to_le_bytes());
     b
+}
+
+fn pipe_to_slots(read_slot: usize, write_slot: usize) -> Step {
+    Step::Sys(
+        sys::pipe2(0)
+            .ret(0)
+            .save_out_i32(0, 0, read_slot)
+            .save_out_i32(0, 1, write_slot),
+    )
 }
 
 // ============================================================================
@@ -533,21 +542,29 @@ fn test_fifo_open_parks_with_reserved_slot_and_rejects_dup2_ebusy() {
     let host_backend = HostFsBackend::new_in(scratch.path()).unwrap();
 
     let script = vec![
-        // 1. Create a FIFO
+        // 1. Sync pipe: read end in slot 1 (fd 3), write end in slot 2 (fd 4)
+        pipe_to_slots(1, 2),
+        // 2. Create a FIFO
         Step::Sys(sys::mkfifo("/test_fifo", 0o666).ret(0)),
-        // 2. Spawn sibling thread (tid 2)
-        Step::Sys(sys::clone_thread(0).save(2)),
+        // 3. Spawn sibling thread (tid 2)
+        Step::Sys(sys::clone_thread(0)),
         Step::ChildMarker(vec![
-            // Sibling thread opens FIFO for read (blocks awaiting peer writer) -> expects fd 3
-            Step::Sys(sys::openat(LINUX_AT_FDCWD, "/test_fifo", LINUX_O_RDONLY as i32, 0).ret(3)),
-            Step::Sys(sys::close(3).ret(0)),
+            // Sibling thread opens FIFO for read (blocks awaiting peer writer) -> expects fd 5
+            Step::Sys(sys::openat(LINUX_AT_FDCWD, "/test_fifo", LINUX_O_RDONLY as i32, 0).ret(5)),
+            // Read 5 bytes payload sent by writer through admitted fd 5
+            Step::Sys(sys::read(5, 5).ret(5)),
+            // Close fd 5
+            Step::Sys(sys::close(5).ret(0)),
+            // Signal leader via sync pipe that reader completed
+            Step::Sys(sys::write(slot(2), b"done").ret(4)),
+            Step::Sys(sys::close(slot(2)).ret(0)),
             Step::Sys(sys::exit_thread(0)),
         ]),
-        // 3. Leader awaits sibling thread parking on openat
+        // 4. Leader awaits sibling thread parking on openat
         await_parked(2, "openat"),
-        // 4. Leader attempts dup3 to slot 3 -> must fail with EBUSY (16)
-        Step::Sys(sys::dup3(0, 3, 0).errno(LINUX_EBUSY)),
-        // 5. Leader opens regular file -> must skip reserved slot 3 and allocate slot 4
+        // 5. Leader attempts dup3 to slot 5 -> must fail with EBUSY (16)
+        Step::Sys(sys::dup3(slot(1), 5, 0).errno(LINUX_EBUSY)),
+        // 6. Leader opens regular file -> must skip reserved slot 5 and allocate slot 6
         Step::Sys(
             sys::openat(
                 LINUX_AT_FDCWD,
@@ -555,13 +572,30 @@ fn test_fifo_open_parks_with_reserved_slot_and_rejects_dup2_ebusy() {
                 (LINUX_O_CREAT | LINUX_O_RDWR) as i32,
                 0o644,
             )
-            .ret(4),
+            .ret(6),
         ),
-        // 6. Leader opens FIFO for writing -> wakes sibling, leader gets slot 5
-        Step::Sys(sys::openat(LINUX_AT_FDCWD, "/test_fifo", LINUX_O_WRONLY as i32, 0).ret(5)),
-        // 7. Cleanup
-        Step::Sys(sys::close(4).ret(0)),
-        Step::Sys(sys::close(5).ret(0)),
+        // 7. Leader opens FIFO for writing -> wakes sibling, leader gets slot 7
+        Step::Sys(sys::openat(LINUX_AT_FDCWD, "/test_fifo", LINUX_O_WRONLY as i32, 0).ret(7)),
+        // 8. Leader writes 5 bytes into FIFO for reader
+        Step::Sys(sys::write(7, b"hello").ret(5)),
+        // 9. Leader waits for sibling to complete read and close fd 5
+        Step::Sys(sys::read(slot(1), 4).ret(4)),
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        // 10. Leader closes write end (fd 7)
+        Step::Sys(sys::close(7).ret(0)),
+        // 11. Leader closes regular file (fd 6)
+        Step::Sys(sys::close(6).ret(0)),
+        // 12. Leader opens a new file, which must reuse freed lowest slot (fd 3)
+        Step::Sys(
+            sys::openat(
+                LINUX_AT_FDCWD,
+                "/reused_after_fifo.txt",
+                (LINUX_O_CREAT | LINUX_O_RDWR) as i32,
+                0o644,
+            )
+            .ret(3),
+        ),
+        Step::Sys(sys::close(3).ret(0)),
         Step::Sys(sys::exit_group(0)),
     ];
 
@@ -668,6 +702,70 @@ fn test_fork_during_pending_fifo_open_allows_child_to_allocate_uncommitted_slot(
         // 7. Leader opens FIFO for write -> wakes sibling, leader gets slot 4
         Step::Sys(sys::openat(LINUX_AT_FDCWD, "/fifo_fork", LINUX_O_WRONLY as i32, 0).ret(4)),
         Step::Sys(sys::close(4).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+
+    let run = ScriptedBackend::new()
+        .with_fs_backend(Box::new(host_backend))
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+}
+
+/// Linux `dup3(2)` returning `EBUSY` leaves target descriptor and epoll registration untouched.
+///
+/// Authority: Linux descriptor and epoll semantics.
+///
+/// When `dup3(oldfd, target, 0)` fails with `EBUSY` because `target` is held by an
+/// uncommitted open reservation, `dup3` must have no side effects:
+/// 1. `target` remains reserved by the in-flight open.
+/// 2. Epoll registrations on other descriptors remain completely untouched and operational.
+#[test]
+fn test_dup3_ebusy_loser_preserves_target_and_epoll_registration() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let host_backend = HostFsBackend::new_in(scratch.path()).unwrap();
+
+    let script = vec![
+        // 1. Create a FIFO
+        Step::Sys(sys::mkfifo("/fifo_epoll", 0o666).ret(0)),
+        // 2. Sync pipe between sibling and leader: read end in slot 1 (fd 3), write end in slot 2 (fd 4)
+        pipe_to_slots(1, 2),
+        // 3. Epoll target pipe: read end in slot 3 (fd 5), write end in slot 4 (fd 6)
+        pipe_to_slots(3, 4),
+        // 4. Open an epoll instance in leader (fd 7)
+        Step::Sys(sys::epoll_create1(0).ret(7)),
+        // 5. Register pipe read end (fd 5) in epoll fd 7
+        Step::Sys(sys::epoll_ctl_add(7, slot(3), LINUX_EPOLLIN as u32, 42).ret(0)),
+        // 6. Spawn sibling thread (tid 2) to park on FIFO open (reserves fd 8)
+        Step::Sys(sys::clone_thread(0)),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::openat(LINUX_AT_FDCWD, "/fifo_epoll", LINUX_O_RDONLY as i32, 0).ret(8)),
+            Step::Sys(sys::read(8, 5).ret(5)),
+            Step::Sys(sys::close(8).ret(0)),
+            Step::Sys(sys::write(slot(2), b"done").ret(4)),
+            Step::Sys(sys::close(slot(2)).ret(0)),
+            Step::Sys(sys::exit_thread(0)),
+        ]),
+        // 7. Leader awaits sibling thread parking on FIFO open
+        await_parked(2, "openat"),
+        // 8. Leader attempts dup3 to the reserved slot 8 -> fails EBUSY (loser)
+        Step::Sys(sys::dup3(slot(3), 8, 0).errno(LINUX_EBUSY)),
+        // 9. Write into pipe write end (fd 6), waking epoll interest on fd 5
+        Step::Sys(sys::write(slot(4), b"test").ret(4)),
+        // 10. Verify that epoll fd 7 is ready and unperturbed
+        Step::Sys(sys::epoll_pwait(7, 1, 1000, 0).ret(1)),
+        // 11. Read from pipe read end (fd 5)
+        Step::Sys(sys::read(slot(3), 4).ret(4)),
+        // 12. Leader opens FIFO for write (wakes sibling, gets fd 9)
+        Step::Sys(sys::openat(LINUX_AT_FDCWD, "/fifo_epoll", LINUX_O_WRONLY as i32, 0).ret(9)),
+        Step::Sys(sys::write(9, b"hello").ret(5)),
+        // 13. Leader awaits sibling completion via sync pipe
+        Step::Sys(sys::read(slot(1), 4).ret(4)),
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        Step::Sys(sys::close(9).ret(0)),
+        Step::Sys(sys::close(slot(3)).ret(0)),
+        Step::Sys(sys::close(slot(4)).ret(0)),
+        Step::Sys(sys::close(7).ret(0)),
         Step::Sys(sys::exit_group(0)),
     ];
 

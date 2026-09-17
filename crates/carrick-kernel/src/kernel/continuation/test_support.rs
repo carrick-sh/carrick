@@ -154,7 +154,7 @@ pub fn capture(context: &KernelContext, generation: ExecutionGeneration) -> Cont
     .expect("capture exact continuation authority")
 }
 
-pub const DISPATCH_FAMILIES: [ContinuationFamily; 17] = [
+pub const DISPATCH_FAMILIES: [ContinuationFamily; 18] = [
     ContinuationFamily::FutexWait,
     ContinuationFamily::FutexWaitv,
     ContinuationFamily::SharedFutexWait,
@@ -164,6 +164,7 @@ pub const DISPATCH_FAMILIES: [ContinuationFamily; 17] = [
     ContinuationFamily::WaitOnFdsSelect,
     ContinuationFamily::WaitOnPollFds,
     ContinuationFamily::BlockingWrite,
+    ContinuationFamily::BlockingOpen,
     ContinuationFamily::TimerFdRead,
     ContinuationFamily::Semop,
     ContinuationFamily::Mqueue,
