@@ -559,69 +559,28 @@ impl Task {
                     buffer.len()
                 )));
             }
+            let range_error = |_| {
+                ExampleError::Script(format!(
+                    "relocation value {val} does not fit in width {:?}",
+                    reloc.width
+                ))
+            };
             match reloc.width {
-                RelocWidth::U8 => {
-                    let u8_val = if val <= u8::MAX as u64 {
-                        val as u8
-                    } else if (val as i64) >= i8::MIN as i64 && (val as i64) <= i8::MAX as i64 {
-                        (val as i64) as u8
-                    } else {
-                        return Err(ExampleError::Script(format!(
-                            "relocation value {val} does not fit in width U8"
-                        )));
-                    };
-                    buffer[reloc.offset] = u8_val;
-                }
-                RelocWidth::U16 => {
-                    let u16_val = if val <= u16::MAX as u64 {
-                        val as u16
-                    } else if (val as i64) >= i16::MIN as i64 && (val as i64) <= i16::MAX as i64 {
-                        (val as i64) as u16
-                    } else {
-                        return Err(ExampleError::Script(format!(
-                            "relocation value {val} does not fit in width U16"
-                        )));
-                    };
-                    buffer[reloc.offset..end].copy_from_slice(&u16_val.to_le_bytes());
-                }
-                RelocWidth::I16 => {
-                    let i16_val = if ((val as i64) >= i16::MIN as i64
-                        && (val as i64) <= i16::MAX as i64)
-                        || val <= u16::MAX as u64
-                    {
-                        val as i16
-                    } else {
-                        return Err(ExampleError::Script(format!(
-                            "relocation value {val} does not fit in width I16"
-                        )));
-                    };
-                    buffer[reloc.offset..end].copy_from_slice(&i16_val.to_le_bytes());
-                }
-                RelocWidth::U32 => {
-                    let u32_val = if val <= u32::MAX as u64 {
-                        val as u32
-                    } else if (val as i64) >= i32::MIN as i64 && (val as i64) <= i32::MAX as i64 {
-                        (val as i64) as u32
-                    } else {
-                        return Err(ExampleError::Script(format!(
-                            "relocation value {val} does not fit in width U32"
-                        )));
-                    };
-                    buffer[reloc.offset..end].copy_from_slice(&u32_val.to_le_bytes());
-                }
-                RelocWidth::I32 => {
-                    let i32_val = if ((val as i64) >= i32::MIN as i64
-                        && (val as i64) <= i32::MAX as i64)
-                        || val <= u32::MAX as u64
-                    {
-                        val as i32
-                    } else {
-                        return Err(ExampleError::Script(format!(
-                            "relocation value {val} does not fit in width I32"
-                        )));
-                    };
-                    buffer[reloc.offset..end].copy_from_slice(&i32_val.to_le_bytes());
-                }
+                RelocWidth::U8 => buffer[reloc.offset] = u8::try_from(val).map_err(range_error)?,
+                RelocWidth::U16 => buffer[reloc.offset..end]
+                    .copy_from_slice(&u16::try_from(val).map_err(range_error)?.to_le_bytes()),
+                RelocWidth::I16 => buffer[reloc.offset..end].copy_from_slice(
+                    &i16::try_from(val as i64)
+                        .map_err(range_error)?
+                        .to_le_bytes(),
+                ),
+                RelocWidth::U32 => buffer[reloc.offset..end]
+                    .copy_from_slice(&u32::try_from(val).map_err(range_error)?.to_le_bytes()),
+                RelocWidth::I32 => buffer[reloc.offset..end].copy_from_slice(
+                    &i32::try_from(val as i64)
+                        .map_err(range_error)?
+                        .to_le_bytes(),
+                ),
                 RelocWidth::U64 | RelocWidth::I64 => {
                     buffer[reloc.offset..end].copy_from_slice(&val.to_le_bytes());
                 }
