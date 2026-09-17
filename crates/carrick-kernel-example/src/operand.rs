@@ -35,11 +35,11 @@ pub enum Save {
 /// The expected outcome of a syscall.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expect {
-    /// Any outcome is accepted (unless a default errno check fails).
+    /// Any successful outcome is accepted: return values or process exits. Fails if an unexpected errno is returned.
     Any,
-    /// Expect a successful return value `v`.
+    /// Expect a successful return value `v`. Fails on errno, exit, or mismatching return value.
     Ret(i64),
-    /// Expect an errno `e`.
+    /// Expect an errno `e`. Fails on normal return, exit, or mismatching errno.
     Errno(LinuxErrno),
     /// Expect the task to die by signal `signal` while inside this syscall.
     Death(i32),

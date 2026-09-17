@@ -7,6 +7,7 @@
 
 use std::time::Instant;
 
+use carrick_abi::{LINUX_EBADF, LINUX_EINVAL};
 use carrick_kernel_example::{
     ExampleError, ScriptedBackend, Step, WAIT_BOUND, last_child, slot, sys,
 };
@@ -119,4 +120,135 @@ fn a_lost_wake_fails_inside_the_bound() {
         elapsed >= WAIT_BOUND && elapsed < WAIT_BOUND * 3,
         "the bound fired at {elapsed:?}"
     );
+}
+
+#[test]
+fn successful_errno_expectation_matches() {
+    let script = vec![
+        Step::Sys(sys::close(999).errno(LINUX_EBADF)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("errno expectation should match");
+    assert_eq!(run.exit_code(), 0);
+    assert_eq!(run.completions().len(), 2);
+    assert_eq!(run.completions()[0].label, "close");
+    assert_eq!(run.completions()[0].result, Err(LINUX_EBADF));
+}
+
+#[test]
+fn wrong_return_diagnostic_reports_label_pid_and_values() {
+    let script = vec![
+        Step::Sys(sys::getpid().ret(9999)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let err = ScriptedBackend::new()
+        .run_root(script)
+        .expect_err("wrong return value must fail");
+    assert!(
+        matches!(
+            err,
+            ExampleError::Expectation {
+                pid: 1,
+                label: "getpid",
+                ref expected,
+                ref actual,
+            } if expected == "return value 9999" && actual == "return value 1"
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn wrong_errno_diagnostic_reports_label_pid_and_errnos() {
+    let script = vec![
+        Step::Sys(sys::close(999).errno(LINUX_EINVAL)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let err = ScriptedBackend::new()
+        .run_root(script)
+        .expect_err("wrong errno must fail");
+    assert!(
+        matches!(
+            err,
+            ExampleError::Expectation {
+                pid: 1,
+                label: "close",
+                ref expected,
+                ref actual,
+            } if expected == "errno 22" && actual == "errno 9"
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn exit_expectation_mismatch_fails() {
+    let script = vec![Step::Sys(sys::exit_group(0).ret(999))];
+    let err = ScriptedBackend::new()
+        .run_root(script)
+        .expect_err("exit expectation mismatch must fail");
+    assert!(
+        matches!(
+            err,
+            ExampleError::Expectation {
+                pid: 1,
+                label: "exit_group",
+                ref expected,
+                ref actual,
+            } if expected == "return value 999" && actual == "exit code 0"
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn saved_return_reused_as_operand() {
+    let script = vec![
+        Step::Sys(
+            sys::pipe2(0)
+                .ret(0)
+                .save_out_i32(0, 0, 0)
+                .save_out_i32(0, 1, 1),
+        ),
+        Step::Sys(sys::getpid().save(2)),
+        Step::Sys(sys::write(slot(1), b"ping").ret(4)),
+        Step::Sys(sys::read(slot(0), 4).ret(4)),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        Step::Sys(sys::wait4(slot(2), 1).errno(carrick_abi::LINUX_ECHILD)), // cannot wait on self
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("reused slot should succeed");
+    assert_eq!(run.exit_code(), 0);
+    assert_eq!(run.output("read"), b"ping");
+}
+
+#[test]
+fn save_ret_on_failed_syscall_rejects() {
+    let script = vec![
+        Step::Sys(sys::close(999).errno(LINUX_EBADF).save(0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let err = ScriptedBackend::new()
+        .run_root(script)
+        .expect_err("cannot save return on errno");
+    assert!(
+        matches!(err, ExampleError::Script(msg) if msg.contains("cannot save return value on failed syscall close"))
+    );
+}
+
+#[test]
+fn save_out_i32_out_of_bounds_rejects() {
+    let script = vec![
+        Step::Sys(sys::pipe2(0).ret(0).save_out_i32(0, 2, 0)), // pipe2 only has 8 bytes (indices 0 and 1)
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let err = ScriptedBackend::new()
+        .run_root(script)
+        .expect_err("out of bounds save_out_i32 must fail");
+    assert!(matches!(err, ExampleError::Script(msg) if msg.contains("exceeds out buffer len 8")));
 }

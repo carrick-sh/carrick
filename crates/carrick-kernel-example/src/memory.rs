@@ -27,9 +27,29 @@ impl TaskMemory {
 
     /// Allocate `n` bytes aligned to 16 bytes.
     pub fn alloc(&mut self, n: usize) -> Result<u64, MemoryError> {
-        let addr = (self.cursor + 15) & !15;
-        let next_cursor = addr + n as u64;
-        if next_cursor > GUEST_BASE + GUEST_LEN as u64 {
+        let addr = (self
+            .cursor
+            .checked_add(15)
+            .ok_or(MemoryError::OutOfBounds {
+                address: self.cursor,
+                length: n,
+            })?)
+            & !15;
+        let n_u64 = u64::try_from(n).map_err(|_| MemoryError::OutOfBounds {
+            address: addr,
+            length: n,
+        })?;
+        let next_cursor = addr.checked_add(n_u64).ok_or(MemoryError::OutOfBounds {
+            address: addr,
+            length: n,
+        })?;
+        let limit = GUEST_BASE
+            .checked_add(GUEST_LEN as u64)
+            .ok_or(MemoryError::OutOfBounds {
+                address: addr,
+                length: n,
+            })?;
+        if next_cursor > limit {
             return Err(MemoryError::OutOfBounds {
                 address: addr,
                 length: n,
@@ -63,5 +83,20 @@ impl TaskMemory {
 impl Default for TaskMemory {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alloc_bounds_overflow_does_not_advance_cursor() {
+        let mut mem = TaskMemory::new();
+        assert!(mem.alloc(usize::MAX).is_err());
+        assert_eq!(mem.cursor, GUEST_BASE);
+        let first = mem.alloc(16).expect("in bounds");
+        assert_eq!(first, GUEST_BASE);
+        assert_eq!(mem.cursor, GUEST_BASE + 16);
     }
 }
