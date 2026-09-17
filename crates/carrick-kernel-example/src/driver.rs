@@ -22,12 +22,12 @@
 //! ## Adapter Lifetime & Continuation Ownership
 //!
 //! In this VM-less backend, continuations are built from the kernel's `BlockedContinuation`
-//! and parked on the shared [`CarrierWaitService`]. The continuation remains owned by
+//! and parked on the shared [`CarrierWaitService`](carrick_kernel::kernel::continuation::CarrierWaitService). The continuation remains owned by
 //! the backend host thread driving this task.
 //!
 //! When a sibling thread issues `exit_group` or process terminal exit occurs:
 //! - Terminal exit publication is serialized under the per-process `dispatcher` lock.
-//! - After releasing the dispatcher lock, [`Shared::wake_active_tokens_for_task`] calls
+//! - After releasing the dispatcher lock, `Shared::wake_active_tokens_for_task` calls
 //!   `wait_service.publish_ready(token)` as a **transport-level wakeup notification**
 //!   to prompt the waiting host thread loop to wake.
 //! - Upon waking (or immediately if terminal exit occurs before parking), the thread

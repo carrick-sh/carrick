@@ -55,10 +55,8 @@ fn futex_wait_with_a_stale_value_is_eagain() {
 fn futex_wake_returns_the_number_woken() {
     let script = vec![
         alloc_word(0, 42),
-        // Pipe for waiter 1 ack: read slot 1, write slot 2.
+        // Shared acknowledgment pipe: FUTEX_WAKE makes no waiter-order guarantee.
         pipe_to_slots(1, 2),
-        // Pipe for waiter 2 ack: read slot 3, write slot 4.
-        pipe_to_slots(3, 4),
         // No waiters: returns 0.
         Step::Sys(sys::futex_wake_labeled("wake_empty_initial", slot(0), 5).ret(0)),
         Step::Sys(sys::clone_thread(0).save(5)),
@@ -71,18 +69,18 @@ fn futex_wake_returns_the_number_woken() {
         Step::Sys(sys::clone_thread(0).save(6)),
         Step::ChildMarker(vec![
             Step::Sys(sys::futex_wait_labeled("wait2", slot(0), 42).ret(0)),
-            Step::Sys(sys::write(slot(4), b"2").ret(1)),
+            Step::Sys(sys::write(slot(2), b"2").ret(1)),
             Step::Sys(sys::exit_thread(0)),
         ]),
         await_parked(slot(6), "wait2"),
         // Wake 1 of 2 waiters -> returns 1.
         Step::Sys(sys::futex_wake_labeled("wake_first", slot(0), 1).ret(1)),
-        // Await waiter 1 completion via pipe byte.
+        // Await either selected waiter before waking the remaining one.
         Step::Sys(sys::read(slot(1), 1).ret(1)),
         // Wake remaining 1 waiter -> returns 1.
         Step::Sys(sys::futex_wake_labeled("wake_second", slot(0), 1).ret(1)),
-        // Await waiter 2 completion via pipe byte.
-        Step::Sys(sys::read(slot(3), 1).ret(1)),
+        // Await the other waiter; no FIFO selection assumption.
+        Step::Sys(sys::read(slot(1), 1).ret(1)),
         // No remaining waiters -> returns 0.
         Step::Sys(sys::futex_wake_labeled("wake_empty", slot(0), 1).ret(0)),
         Step::Sys(sys::exit_group(0)),
