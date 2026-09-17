@@ -4023,6 +4023,7 @@ mod serial_host {
         assert_eq!(unsafe { libc::fcntl(pinned[0], libc::F_GETFD) }, -1);
     }
 
+    #[cfg(test)]
     fn spawn_contained_test_child(test_name: &str, marker: &str) -> std::process::Child {
         std::process::Command::new(std::env::current_exe().expect("test executable"))
             .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
