@@ -2031,37 +2031,8 @@ impl PendingSignalAction {
     }
 }
 
-/// Linux aarch64 syscall numbers that auto-restart when interrupted by an
-/// SA_RESTART handler (the kernel's `ERESTARTSYS` set), per `signal(7)`
-/// "Interruption of system calls and library functions by signal handlers".
-///
-/// This listed only `waitid`/`wait4` for a long time, which meant EVERY other
-/// blocking call surfaced `EINTR` to a guest that had explicitly asked, via
-/// `SA_RESTART`, not to see it. libuv's `eintr_handling` is the reduced case:
-/// a thread `kill(getpid(), SIGUSR1)`s while the main thread is blocked in a
-/// synchronous `read(2)` on an empty pipe, and libuv installs its signal
-/// handlers with `SA_RESTART`, so Linux resumes the read and returns the 13
-/// bytes. Carrick returned `-EINTR` (the test reports `-4 == 13`).
-///
-/// The `signal(7)` "never restarted" list is deliberately EXCLUDED, so those
-/// keep surfacing `EINTR` as Linux does: `poll`/`ppoll`, `select`/`pselect6`,
-/// `epoll_wait`/`epoll_pwait`, `nanosleep`/`clock_nanosleep`, `io_getevents`,
-/// `msgrcv`/`msgsnd`, `semop`/`semtimedop`, and the `sigsuspend`/
-/// `rt_sigtimedwait` family.
-///
-/// Socket calls (`accept`, `connect`, the `recv`/`send` families) are also
-/// absent, and that is a KNOWN REMAINING GAP rather than a judgement that they
-/// do not restart — they do, but only when the socket carries no
+/// Syscall restart policies are defined in `carrick_kernel`.
 pub(super) use carrick_kernel::kernel::continuation::is_restartable_syscall;
-pub(super) fn is_default_stop_signal(signum: i32) -> bool {
-    matches!(
-        signum,
-        crate::linux_abi::LINUX_SIGSTOP
-            | crate::linux_abi::LINUX_SIGTSTP
-            | crate::linux_abi::LINUX_SIGTTIN
-            | crate::linux_abi::LINUX_SIGTTOU
-    )
-}
 
 /// Run signal delivery for one iteration of the multi-threaded vCPU loop. Returns
 /// `Some(outcome)` when a default-action (terminate) signal fires and the process

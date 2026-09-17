@@ -121,6 +121,34 @@ pub(crate) fn block_on_timeout<F: std::future::Future>(
     }
 }
 
+fn check_deliverable_signals(
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+    context: &KernelContext,
+    tid: carrick_kernel::thread::ThreadId,
+) -> Result<Option<InternalCompletion>, ExampleError> {
+    while let Some(pending) = dispatcher.take_deliverable_pending_from(context, tid) {
+        let action = dispatcher.signal_action(context, pending.signum);
+        match carrick_kernel::kernel::evaluate_signal_delivery_action(pending.signum, action) {
+            carrick_kernel::kernel::SignalDeliveryAction::Ignore => {}
+            carrick_kernel::kernel::SignalDeliveryAction::Terminate => {
+                return Ok(Some(InternalCompletion::Death(pending.signum)));
+            }
+            carrick_kernel::kernel::SignalDeliveryAction::Stop => {
+                return Err(ExampleError::Unsupported(format!(
+                    "job control stop signal {} not supported in scripted backend",
+                    pending.signum
+                )));
+            }
+            carrick_kernel::kernel::SignalDeliveryAction::Handler { address } => {
+                return Err(ExampleError::Unsupported(format!(
+                    "guest signal handler at {address:#x} not supported in scripted backend"
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Drive a syscall to completion by dispatching and parking blocked outcomes on the shared wait service.
 pub(crate) fn drive(
     task: &mut Task,
@@ -128,8 +156,16 @@ pub(crate) fn drive(
     args: [u64; 6],
     shared: &Arc<Shared>,
 ) -> Result<InternalCompletion, ExampleError> {
+    let deadline = Instant::now() + WAIT_BOUND;
     loop {
         let context = task.dispatcher.capture_one_task_context()?;
+        let tid = context.thread().registry_id();
+
+        // Deliverable signals check at syscall entry.
+        if let Some(death) = check_deliverable_signals(&task.dispatcher, &context, tid)? {
+            return Ok(death);
+        }
+
         shared.dispatches.fetch_add(1, Ordering::SeqCst);
         shared
             .ledger
@@ -145,9 +181,23 @@ pub(crate) fn drive(
         loop {
             match outcome {
                 DispatchOutcome::Returned { value } => {
+                    let fresh_context = task.dispatcher.capture_one_task_context()?;
+                    if let Some(death) =
+                        check_deliverable_signals(&task.dispatcher, &fresh_context, tid)?
+                    {
+                        return Ok(death);
+                    }
                     return Ok(InternalCompletion::Returned(value));
                 }
-                DispatchOutcome::Errno { errno } => return Ok(InternalCompletion::Errno(errno)),
+                DispatchOutcome::Errno { errno } => {
+                    let fresh_context = task.dispatcher.capture_one_task_context()?;
+                    if let Some(death) =
+                        check_deliverable_signals(&task.dispatcher, &fresh_context, tid)?
+                    {
+                        return Ok(death);
+                    }
+                    return Ok(InternalCompletion::Errno(errno));
+                }
                 DispatchOutcome::Exit { code } => return Ok(InternalCompletion::Exit(code)),
                 DispatchOutcome::SignalDeath { signum } => {
                     return Ok(InternalCompletion::Death(signum));
@@ -217,8 +267,14 @@ pub(crate) fn drive(
                     // Notify listeners that this task is now parked/enrolled.
                     shared.notify_parked(task.process.pid(), syscall.label);
 
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        let _ = continuation.cancel(CancellationCause::ServiceShutdown);
+                        return Err(ExampleError::WaitTimedOut(syscall.label));
+                    }
+
                     let event_result =
-                        block_on_timeout(shared.wait_service.event(token), WAIT_BOUND);
+                        block_on_timeout(shared.wait_service.event(token), remaining);
                     let Some(event_result) = event_result else {
                         let _ = continuation.cancel(CancellationCause::ServiceShutdown);
                         return Err(ExampleError::WaitTimedOut(syscall.label));
@@ -229,10 +285,43 @@ pub(crate) fn drive(
                     })?;
 
                     let fresh_context = task.dispatcher.capture_one_task_context()?;
-                    let result: ContinuationResult =
+                    let mut result: ContinuationResult =
                         continuation.resume(event, &fresh_context).map_err(|e| {
                             ExampleError::Unsupported(format!("continuation resume failed: {e:?}"))
                         })?;
+
+                    if let Some(reserved) = result.take_reserved_signal() {
+                        if !reserved.consume() {
+                            return Err(ExampleError::Unsupported(
+                                "reserved signal was already consumed".to_owned(),
+                            ));
+                        }
+                        let action = reserved.action();
+                        match carrick_kernel::kernel::evaluate_signal_delivery_action(
+                            reserved.signum(),
+                            action,
+                        ) {
+                            carrick_kernel::kernel::SignalDeliveryAction::Ignore => {
+                                reserved.restore_persistent_after_default_action();
+                            }
+                            carrick_kernel::kernel::SignalDeliveryAction::Terminate => {
+                                reserved.restore_persistent_after_default_action();
+                                return Ok(InternalCompletion::Death(reserved.signum()));
+                            }
+                            carrick_kernel::kernel::SignalDeliveryAction::Stop => {
+                                reserved.restore_persistent_after_default_action();
+                                return Err(ExampleError::Unsupported(format!(
+                                    "job control stop signal {} not supported in scripted backend",
+                                    reserved.signum()
+                                )));
+                            }
+                            carrick_kernel::kernel::SignalDeliveryAction::Handler { address } => {
+                                return Err(ExampleError::Unsupported(format!(
+                                    "guest signal handler at {address:#x} not supported in scripted backend"
+                                )));
+                            }
+                        }
+                    }
 
                     match fold_continuation_completion(
                         result.completion,

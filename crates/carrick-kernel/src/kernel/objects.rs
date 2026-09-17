@@ -31,9 +31,10 @@ pub use self::process::{
 };
 pub use self::session::{ProcessGroup, Session};
 pub use self::signal::{
-    HandlerFrameState, PendingQueue, PendingSignal, Sighand, SignalAuthority, SignalDequeue,
-    SignalDisposition, SignalPendingOwner, SignalReservationOrigin, SignalWaitReservation,
-    TaskPendingSignals, ThreadSignalState,
+    HandlerFrameState, PendingQueue, PendingSignal, Sighand, SignalAuthority, SignalDeliveryAction,
+    SignalDequeue, SignalDisposition, SignalPendingOwner, SignalReservationOrigin,
+    SignalWaitReservation, TaskPendingSignals, ThreadSignalState, evaluate_signal_delivery_action,
+    is_default_ignore_signal, is_default_stop_signal,
 };
 pub use self::task::JobControlStopInvalidationGeneration;
 pub(in crate::kernel) use self::task::PreparedThreadSet;

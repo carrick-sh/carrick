@@ -100,10 +100,11 @@ pub use objects::{
     FileDescriptionBackingSnapshot, FileSlot, FileTable, FsContext, HandlerFrameState,
     LinuxWaitStatus, Mm, ObjectGraphError, OpenDescriptionBackingSnapshot, PendingQueue,
     PendingSignal, PidfdTarget, ProcessGroup, RlimitSet, RunnerDirective, Session, Sighand,
-    SignalAuthority, SignalDequeue, SignalDisposition, SignalPendingOwner, SocketCork,
-    SocketPeerCred, Task, TaskKey, TaskLifecycle, TaskParticipantError, TaskPendingSignals,
-    TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, TaskWaker, Thread, ThreadKey, ThreadRef,
-    ThreadResources, ThreadRunner, ThreadSignalState, Zombie,
+    SignalAuthority, SignalDeliveryAction, SignalDequeue, SignalDisposition, SignalPendingOwner,
+    SocketCork, SocketPeerCred, Task, TaskKey, TaskLifecycle, TaskParticipantError,
+    TaskPendingSignals, TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, TaskWaker, Thread,
+    ThreadKey, ThreadRef, ThreadResources, ThreadRunner, ThreadSignalState, Zombie,
+    evaluate_signal_delivery_action, is_default_ignore_signal, is_default_stop_signal,
 };
 #[allow(unused_imports)]
 pub(crate) use objects::{

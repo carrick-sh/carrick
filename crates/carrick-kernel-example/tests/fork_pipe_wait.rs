@@ -9,8 +9,7 @@ use std::time::Instant;
 
 use carrick_abi::{LINUX_EBADF, LINUX_EINVAL};
 use carrick_kernel_example::{
-    ExampleError, ScriptedBackend, Step, WAIT_BOUND, await_parked, host_sleep_ms, in_out,
-    last_child, slot, sys,
+    ExampleError, ScriptedBackend, Step, WAIT_BOUND, await_parked, in_out, last_child, slot, sys,
 };
 
 #[test]
@@ -286,15 +285,6 @@ fn a_blocked_read_is_dispatched_exactly_twice_when_the_writer_arrives() {
 }
 
 #[test]
-fn host_sleep_step_executes() {
-    let script = vec![host_sleep_ms(1), Step::Sys(sys::exit_group(0))];
-    let run = ScriptedBackend::new()
-        .run_root(script)
-        .expect("backend ran");
-    assert_eq!(run.exit_code(), 0);
-}
-
-#[test]
 fn blocking_write_over_pipe_capacity_completes_byte_exact() {
     let payload: Vec<u8> = (0..131072).map(|i| (i % 251) as u8).collect();
     let script = vec![
@@ -307,8 +297,9 @@ fn blocking_write_over_pipe_capacity_completes_byte_exact() {
         Step::Sys(sys::fork()),
         Step::ChildMarker(vec![
             await_parked(1, "write"),
-            Step::Sys(sys::read(slot(0), 65536).ret(65536)),
-            Step::Sys(sys::read(slot(0), 65536).ret(65536)),
+            // Drain pipe dynamically without hardcoding specific chunk size
+            Step::Sys(sys::read(slot(0), 131072)),
+            Step::Sys(sys::read(slot(0), 131072)),
             Step::Sys(sys::exit_group(0)),
         ]),
         Step::Sys(sys::write(slot(1), &payload).ret(131072)),
@@ -320,10 +311,14 @@ fn blocking_write_over_pipe_capacity_completes_byte_exact() {
         .expect("backend ran");
     assert_eq!(run.exit_code(), 0);
     let mut received = Vec::new();
-    for output in run.outputs() {
-        if output.label == "read" {
-            received.extend_from_slice(&output.bytes);
-        }
+    for (completion, output) in run
+        .completions()
+        .iter()
+        .filter(|c| c.label == "read")
+        .zip(run.outputs().iter().filter(|o| o.label == "read"))
+    {
+        let bytes_read = completion.result.expect("read succeeded") as usize;
+        received.extend_from_slice(&output.bytes[..bytes_read]);
     }
     assert_eq!(received.len(), 131072);
     assert_eq!(received, payload);
@@ -354,4 +349,270 @@ fn pselect6_timeout_zeroes_non_null_fd_set() {
         .expect("backend ran");
     assert_eq!(run.exit_code(), 0);
     assert_eq!(run.output("pselect6"), &[0u8; 8]);
+}
+
+#[test]
+fn sigkill_from_the_parent_terminates_the_child_and_wait4_reports_the_signal() {
+    let script = vec![
+        Step::Sys(
+            sys::pipe2(0)
+                .ret(0)
+                .save_out_i32(0, 0, 0)
+                .save_out_i32(0, 1, 1),
+        ),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![Step::Sys(sys::read(slot(0), 10).death(9))]),
+        await_parked(last_child(), "read"),
+        Step::Sys(sys::kill(last_child(), 9).ret(0)),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+    assert_eq!(run.deaths(), &[(2, 9)]);
+    // man 2 wait4: WIFSIGNALED(status) is true and WTERMSIG(status) == 9 (encoded in status & 0x7f)
+    assert_eq!(run.output("wait4")[0..4], 9u32.to_le_bytes());
+}
+
+#[test]
+fn sig_ign_drops_signal_without_terminating() {
+    let script = vec![
+        Step::Sys(
+            sys::pipe2(0)
+                .ret(0)
+                .save_out_i32(0, 0, 0)
+                .save_out_i32(0, 1, 1),
+        ),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            // man 2 rt_sigaction: set SIGUSR1 (10) disposition to SIG_IGN
+            Step::Sys(sys::rt_sigaction_ign(10).ret(0)),
+            Step::Sys(sys::read(slot(0), 2).ret(2)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        await_parked(last_child(), "read"),
+        Step::Sys(sys::kill(last_child(), 10).ret(0)),
+        Step::Sys(sys::write(slot(1), b"ok").ret(2)),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+    assert_eq!(run.output("read"), b"ok");
+    // man 2 wait4: child exited normally with exit code 0
+    assert_eq!(run.output("wait4")[0..4], 0u32.to_le_bytes());
+}
+
+#[test]
+fn sigprocmask_blocked_signal_received_by_sigtimedwait() {
+    let sigusr1_mask = 1u64 << 9; // SIGUSR1 is signal 10, bit 9
+    let script = vec![
+        // Block SIGUSR1 on the parent before fork (child inherits mask)
+        Step::Sys(sys::rt_sigprocmask_block(sigusr1_mask).ret(0)),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            // Child waits synchronously for SIGUSR1
+            Step::Sys(
+                sys::rt_sigtimedwait(sigusr1_mask.to_le_bytes().as_slice(), 0, 0, 8).ret(10), // man 2 rt_sigtimedwait: returns signal number on success
+            ),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        await_parked(last_child(), "rt_sigtimedwait"),
+        Step::Sys(sys::kill(last_child(), 10).ret(0)),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+    assert_eq!(run.output("wait4")[0..4], 0u32.to_le_bytes());
+}
+
+#[test]
+fn sigprocmask_blocked_signal_received_by_signalfd4() {
+    let sigusr1_mask = 1u64 << 9; // SIGUSR1 is signal 10, bit 9
+    let script = vec![
+        // Block SIGUSR1
+        Step::Sys(sys::rt_sigprocmask_block(sigusr1_mask).ret(0)),
+        Step::Sys(
+            sys::signalfd4(-1, sigusr1_mask.to_le_bytes().as_slice(), 8, 0)
+                .ret(3)
+                .save(0),
+        ),
+        // Send SIGUSR1 to self (it remains pending because it is blocked)
+        Step::Sys(sys::kill(1, 10).ret(0)),
+        // Drain the pending blocked signal from the signalfd
+        Step::Sys(sys::read(slot(0), 128).ret(128)),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+    let sfd_bytes = run.output("read");
+    assert_eq!(sfd_bytes.len(), 128);
+    let ssi_signo = u32::from_le_bytes(sfd_bytes[0..4].try_into().unwrap());
+    assert_eq!(ssi_signo, 10); // man 2 signalfd: ssi_signo is signal number
+}
+
+#[test]
+fn nanosleep_completes_after_its_interval_with_zero_remaining() {
+    let start = Instant::now();
+    let script = vec![
+        Step::Sys(sys::nanosleep_ms(10).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+    assert!(
+        start.elapsed() >= std::time::Duration::from_millis(9),
+        "nanosleep should sleep for at least requested duration"
+    );
+}
+
+#[test]
+fn clock_nanosleep_completes_after_its_interval() {
+    let start = Instant::now();
+    let script = vec![
+        Step::Sys(sys::clock_nanosleep_ms(carrick_abi::LINUX_CLOCK_MONOTONIC as i32, 0, 10).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+    assert!(
+        start.elapsed() >= std::time::Duration::from_millis(9),
+        "clock_nanosleep should sleep for at least requested duration"
+    );
+}
+
+#[test]
+fn a_timerfd_read_parks_until_the_timer_fires() {
+    let script = vec![
+        Step::Sys(
+            sys::timerfd_create(carrick_abi::LINUX_CLOCK_MONOTONIC as i32, 0)
+                .ret(3)
+                .save(0),
+        ),
+        Step::Sys(sys::timerfd_settime_ms(slot(0), 0, 10).ret(0)),
+        Step::Sys(sys::read(slot(0), 8).ret(8)), // man 2 timerfd_create: read returns an 8-byte unsigned integer
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+    let count_bytes = run.output("read");
+    assert_eq!(count_bytes.len(), 8);
+    let expirations = u64::from_le_bytes(count_bytes[0..8].try_into().unwrap());
+    assert!(expirations >= 1, "at least one expiration occurred");
+}
+
+#[test]
+fn child_write_to_broken_pipe_terminates_with_sigpipe() {
+    let script = vec![
+        Step::Sys(
+            sys::pipe2(0)
+                .ret(0)
+                .save_out_i32(0, 0, 0)
+                .save_out_i32(0, 1, 1),
+        ),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            // Child closes its inherited read end, then writes to write end after parent closed reader
+            Step::Sys(sys::close(slot(0)).ret(0)),
+            Step::Sys(sys::write(slot(1), b"hello").death(carrick_abi::LINUX_SIGPIPE)),
+        ]),
+        // Parent closes both ends immediately so child's write is against a broken pipe
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+    // Child terminated with SIGPIPE (13); wait status for WTERMSIG is (13 & 0x7f) = 13
+    assert_eq!(
+        run.output("wait4")[0..4],
+        (carrick_abi::LINUX_SIGPIPE as u32).to_le_bytes()
+    );
+}
+
+#[test]
+fn sigprocmask_blocked_sigchld_received_by_sigtimedwait_with_pid_and_status() {
+    const CLD_EXITED: i32 = 1;
+    let sigchld_mask = 1u64 << (carrick_abi::LINUX_SIGCHLD - 1);
+    let script = vec![
+        // Block SIGCHLD on parent
+        Step::Sys(sys::rt_sigprocmask_block(sigchld_mask).ret(0)),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![Step::Sys(sys::exit_group(42))]),
+        // Parent waits synchronously for SIGCHLD via rt_sigtimedwait
+        Step::Sys(
+            sys::rt_sigtimedwait_siginfo(sigchld_mask).ret(carrick_abi::LINUX_SIGCHLD as i64),
+        ),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+    let siginfo_bytes = run.output("rt_sigtimedwait");
+    assert_eq!(siginfo_bytes.len(), 128);
+    let si_signo = i32::from_le_bytes(siginfo_bytes[0..4].try_into().unwrap());
+    let si_code = i32::from_le_bytes(siginfo_bytes[8..12].try_into().unwrap());
+    let si_pid = i32::from_le_bytes(siginfo_bytes[16..20].try_into().unwrap());
+    let si_status = i32::from_le_bytes(siginfo_bytes[24..28].try_into().unwrap());
+    assert_eq!(si_signo, carrick_abi::LINUX_SIGCHLD);
+    assert_eq!(si_code, CLD_EXITED);
+    assert_eq!(si_pid, 2); // child pid is 2
+    assert_eq!(si_status, 42); // child exited with code 42
+}
+
+#[test]
+fn sigprocmask_blocked_sigchld_received_by_signalfd4_with_pid_and_status() {
+    const CLD_EXITED: i32 = 1;
+    let sigchld_mask = 1u64 << (carrick_abi::LINUX_SIGCHLD - 1);
+    let script = vec![
+        // Block SIGCHLD on parent
+        Step::Sys(sys::rt_sigprocmask_block(sigchld_mask).ret(0)),
+        Step::Sys(
+            sys::signalfd4(-1, sigchld_mask.to_le_bytes().as_slice(), 8, 0)
+                .ret(3)
+                .save(0),
+        ),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![Step::Sys(sys::exit_group(42))]),
+        // Reap child first so child has exited and exit signal/info is published to parent
+        Step::Sys(sys::wait4(last_child(), 0)),
+        // Drain the pending blocked SIGCHLD from the signalfd
+        Step::Sys(sys::read(slot(0), 128).ret(128)),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+    let sfd_bytes = run.output("read");
+    assert_eq!(sfd_bytes.len(), 128);
+    let ssi_signo = u32::from_le_bytes(sfd_bytes[0..4].try_into().unwrap());
+    let ssi_code = i32::from_le_bytes(sfd_bytes[8..12].try_into().unwrap());
+    let ssi_pid = u32::from_le_bytes(sfd_bytes[12..16].try_into().unwrap());
+    assert_eq!(ssi_signo, carrick_abi::LINUX_SIGCHLD as u32); // 17
+    assert_eq!(ssi_code, CLD_EXITED);
+    assert_eq!(ssi_pid, 2); // child pid is 2
 }

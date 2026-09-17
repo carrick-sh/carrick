@@ -421,6 +421,7 @@ pub struct ThreadSignalState {
     altstack: Option<LinuxSigaltstack>,
     handler_frames: Vec<HandlerFrameState>,
     armed_restore_mask: Option<SigSet>,
+    active_wait_set: Option<SigSet>,
     routed_siginfos: BTreeMap<LinuxSignal, VecDeque<LinuxSiginfo>>,
     pending_actions: BTreeMap<LinuxSignal, VecDeque<LinuxSigaction>>,
 }
@@ -458,6 +459,7 @@ impl ThreadSignalState {
                 handler_frame_depth
             ],
             armed_restore_mask: None,
+            active_wait_set: None,
             routed_siginfos: BTreeMap::new(),
             pending_actions: BTreeMap::new(),
         }
@@ -470,6 +472,7 @@ impl ThreadSignalState {
             altstack: caller.altstack,
             handler_frames: caller.handler_frames.clone(),
             armed_restore_mask: caller.armed_restore_mask,
+            active_wait_set: None,
             routed_siginfos: BTreeMap::new(),
             pending_actions: BTreeMap::new(),
         }
@@ -482,6 +485,7 @@ impl ThreadSignalState {
             altstack: None,
             handler_frames: Vec::new(),
             armed_restore_mask: None,
+            active_wait_set: None,
             routed_siginfos: BTreeMap::new(),
             pending_actions: BTreeMap::new(),
         }
@@ -494,6 +498,7 @@ impl ThreadSignalState {
             altstack: None,
             handler_frames: Vec::new(),
             armed_restore_mask: None,
+            active_wait_set: None,
             routed_siginfos: caller.routed_siginfos.clone(),
             pending_actions: BTreeMap::new(),
         }
@@ -594,6 +599,14 @@ impl ThreadSignalState {
 
     pub fn arm_restore_mask(&mut self, restore_mask: Option<SigSet>) {
         self.armed_restore_mask = restore_mask;
+    }
+
+    pub const fn active_wait_set(&self) -> Option<SigSet> {
+        self.active_wait_set
+    }
+
+    pub fn set_active_wait_set(&mut self, wait_set: Option<SigSet>) {
+        self.active_wait_set = wait_set;
     }
 
     pub fn record_routed_siginfo(&mut self, signal: LinuxSignal, siginfo: LinuxSiginfo) {
@@ -727,6 +740,52 @@ pub fn child_exit_signal_needs_notification(
     }
 }
 
+/// Signals whose Linux DEFAULT disposition is "stop" (`Stop`): job control stop signals.
+pub fn is_default_stop_signal(signum: i32) -> bool {
+    matches!(
+        signum,
+        crate::linux_abi::LINUX_SIGSTOP
+            | crate::linux_abi::LINUX_SIGTSTP
+            | crate::linux_abi::LINUX_SIGTTIN
+            | crate::linux_abi::LINUX_SIGTTOU
+    )
+}
+
+/// Linux action to take upon signal delivery under a given `LinuxSigaction`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalDeliveryAction {
+    /// The signal is dropped (SIG_IGN, SIGCONT on delivery, or default ignore signals SIGCHLD/SIGURG/SIGWINCH).
+    Ignore,
+    /// Default stop action (SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU).
+    Stop,
+    /// Default terminate action (SIGKILL, SIGTERM, SIGINT, SIGSEGV, SIGPIPE, etc.).
+    Terminate,
+    /// A user-registered guest handler exists at the given address.
+    Handler { address: u64 },
+}
+
+/// Evaluate the Linux delivery action for a signal under `action`.
+pub fn evaluate_signal_delivery_action(
+    signum: i32,
+    action: carrick_abi::LinuxSigaction,
+) -> SignalDeliveryAction {
+    if action.sa_handler == carrick_abi::LINUX_SIG_IGN {
+        SignalDeliveryAction::Ignore
+    } else if action.sa_handler == carrick_abi::LINUX_SIG_DFL {
+        if signum == crate::linux_abi::LINUX_SIGCONT || is_default_ignore_signal(signum) {
+            SignalDeliveryAction::Ignore
+        } else if is_default_stop_signal(signum) {
+            SignalDeliveryAction::Stop
+        } else {
+            SignalDeliveryAction::Terminate
+        }
+    } else {
+        SignalDeliveryAction::Handler {
+            address: action.sa_handler,
+        }
+    }
+}
+
 /// Upgrade `SEGV_MAPERR` to `SEGV_ACCERR` when Carrick's protection metadata
 /// says the faulting VA belongs to a live mapping that denies the access.
 /// Linux reports ACCERR there because the VMA exists. Carrick can otherwise
@@ -830,8 +889,24 @@ impl SignalAuthority {
     /// Whether this thread authority observes a queued or delivered child-exit signal.
     pub fn child_exit_signal_needs_notification(&self, signal: LinuxSignal) -> bool {
         let action = self.sighand.action_entry(signal);
-        let blocked = self.blocked().contains(signal.raw());
+        let blocked = {
+            let state = self.thread.signal_state.lock();
+            state.blocked().contains(signal.raw())
+                || state
+                    .active_wait_set()
+                    .is_some_and(|set| set.contains(signal.raw()))
+        };
         child_exit_signal_needs_notification(signal, action, blocked)
+    }
+
+    pub fn active_wait_set(&self) -> Option<SigSet> {
+        self.thread.signal_state.lock().active_wait_set()
+    }
+
+    pub fn set_active_wait_set(&self, wait_set: Option<SigSet>) {
+        let mut state = self.thread.signal_state.lock();
+        state.set_active_wait_set(wait_set);
+        self.thread.publish_signal_state(&state);
     }
 
     pub fn action_generation(&self) -> u64 {
