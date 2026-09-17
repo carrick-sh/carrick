@@ -138,3 +138,5 @@ and retains its recorded SHA-256. Both Antigravity workers are finished; their
 logs are copied into the evidence directory. The clean integrated worktree was
 removed normally, with its branch preserved. Unrelated user plans remain
 untouched. Changes are committed locally; nothing was pushed.
+
+Follow-up: [non-ASCII pathname amplification](2026-09-17-unicode-path-amplification.md) records the next red-first kernel coverage batch, controlled 72.7x reduction, full ledger, and unresolved descriptor-exhaustion/exec-retirement evidence.
