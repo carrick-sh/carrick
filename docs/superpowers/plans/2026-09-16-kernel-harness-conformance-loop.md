@@ -839,3 +839,87 @@ test-kernel *ARGS:
 - Task 14/15 source and topology notes extended in
   `/tmp/kernel-harness-thread-notes.md`; distinguish process pid and thread tid
   in reports, and count all actors in a parent/child/thread script.
+
+### Integrated Phase A/B review checkpoint
+
+- Integrated Phase A candidate `b4c6c51d5` (worker `42dc17828`), orphan-adopter
+  wiring `614dd627b`, and wait/group/pipe suites `a185a2801` + `f59c31764`.
+  Director review adds deterministic SIGPIPE ordering, a parked SIGCHLD waiter,
+  signal-wait versus temporary-mask coverage, and sleep dispatch-count checks.
+- A missing harness bootstrap step was exposed by `F_SETPIPE_SZ`: the dispatcher
+  had no active FileAuthority. The harness now activates the same public run
+  authority over the root context's file table. This is harness support, not an
+  ignored syscall defect. Red receipt: `/tmp/kernel-harness-pipe-nonblock-red.log`;
+  green full suite: `/tmp/kernel-harness-integrated-phase-ab-green.log`.
+- The plan's illustrative timerfd dispatch count of two is superseded by the
+  shared continuation contract: owned `TimerFdRead` completes in one dispatch,
+  just as FutexWait does. Redispatch would restart an already-owned operation.
+- IPC worker is reviewing Tasks 8–10 via `/tmp/kernel-harness-ipc-review.md`.
+  Thread/futex Tasks 14–15 and final product/inventory/gate acceptance remain open.
+
+### Defect: explicit SIGCHLD ignore does not autoreap
+
+- Retained `wait::sigchld_set_to_sig_ign_autoreaps_and_wait4_reports_echild` with
+  an explicit defect ignore. Linux authority: `wait(2)` notes for SIG_IGN.
+- Kernel child-exit publication suppresses the signal, but zombie creation and
+  identity/parent retirement still retain a reapable child. This requires a
+  kernel lifecycle transaction change, outside a two-file syscall-dispatch fix.
+- The test is not weakened; the director's explicit ignored-test receipt is
+  `/tmp/kernel-harness-autoreap-defect.log`.
+
+### Partition director takeover
+
+- After three bounded partition attempts, director took over the remaining
+  mechanical classification. Exact original names reconcile after removing only
+  `serial_host`: 2084 kernel and 283 VFS tests. Bodies are preserved apart from
+  rustfmt's equivalent trailing commas/block formatting.
+- Added closed-host-descriptor observations to serial isolation: any concurrently
+  opening test can reuse a closed raw descriptor number. The ratchet checks
+  closed-fd equality assertions and retains live-fd assertions in the parallel lane.
+- The process-global post-mortem abort latch also collided: the debug read/abort
+  tests and scheduler lost-transition test now share the serial lane. The ratchet
+  covers `take_abort_request` to prevent reintroducing this collision.
+- A host control test spun in its admission loop after its submitter returned
+  UnexpectedEof. LLDB evidence: `/tmp/kernel-harness-partition-23826-sudo.lldb.txt`,
+  `/tmp/kernel-harness-partition-packet-deep.txt`,
+  `/tmp/kernel-harness-partition-io-error.txt`; modified-memory core
+  `/tmp/kernel-harness-partition-23826.core`. It is moved unchanged to serial_host.
+  The exact source of host-socket interference is not established; no runtime fix
+  or broader correctness claim is made from that classification.
+- Earlier ten-run worker receipts were superseded by further failures. Final
+  director qualification is still pending; see the latest
+  `/tmp/kernel-harness-director-partition-qualified-v3.log`.
+
+### Defect: concurrent consuming wait observes exit reservation
+
+- Existing `wait_consume_never_returns_unconsumed_zombie_under_interleaved_exit`
+  failed with `Err(TaskBusy(TaskId(285)))`, not a consumed zombie, in a kernel
+  owned by that test. Receipt: `/tmp/kernel-harness-director-partition-final.log`.
+- `wait_child_matching` checks a selected zombie's reservation before consuming
+  it; exit publishes its zombie before releasing that reservation. The test's
+  wait contract does not tolerate this transitional result. This is kernel
+  lifecycle/API scope, not a two-file syscall-dispatch fix or process-global test
+  collision. Preserve the test body with a named defect ignore under the global
+  deferral rule; do not serialize it and call the race fixed.
+- This adds one disclosed ignore to the original kernel population. Original
+  test names and bodies remain; no 100% conformance claim is made.
+
+- Director Phase A follow-up `174789695`: 45 dispatch-signal tests, 77
+  continuation tests, and 309 runtime vcpu_loop tests passed (one existing
+  runtime ignore). Signal-interest red/green receipts are
+  `/tmp/kernel-harness-signal-interest-{red,green}.log`.
+- IPC candidate integrated as `ff8ea2d76`; director integrated suite reports
+  1 lib + 28 driver + 34 enabled semantics tests passing, four disclosed
+  semantics ignores. Epoll ignored tests still receive review corrections;
+  candidate integration alone is not final acceptance.
+- Partition final worker commit `f11a69254` passed director ten-run qualification:
+  kernel parallel 1999 pass / 2 ignore, serial 83 pass; VFS parallel 251 pass,
+  serial 32 pass. Receipt `/tmp/kernel-harness-director-partition-qualified-v5.log`.
+  Exact names remain 2084 + 283. Reuseport GROUPS/reset hook is also serial.
+  Kernel/VFS Clippy and 19 ratchet fixtures passed. Final integrated recipe and
+  clean-tree inventories remain pending.
+- Thread/futex worker `threads` starts at `174789695`, worktree
+  `/Users/tjfontaine/.codex/worktrees/kernel-harness-threads`, brief
+  `/tmp/kernel-harness-threads.md`. It intentionally lacks IPC candidate changes;
+  director must reconcile shared harness files and preserve checked layouts,
+  authority bootstrap, and exact thread context semantics during integration.

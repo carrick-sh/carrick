@@ -257,6 +257,12 @@ fmt-check:
 fmt:
     cargo fmt --all
 
+# The kernel semantics inner loop: no VM, codesign, or Docker. Full `just test`
+# also runs the serial host tests; run it and the signed gates before pushing.
+test-kernel *ARGS:
+    cargo test -p carrick-kernel --lib --features test-support {{ARGS}} -- --skip serial_host
+    cargo test -p carrick-kernel-example --tests {{ARGS}}
+
 # Host unit/integration tests that do NOT need the HVF runtime or Docker.
 test *ARGS:
     #!/usr/bin/env bash
