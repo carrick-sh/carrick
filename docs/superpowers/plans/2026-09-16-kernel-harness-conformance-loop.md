@@ -951,3 +951,26 @@ test-kernel *ARGS:
 - Phase A/B and partition code are integrated and independently checked.
   Epoll review, thread/futex integration, final plan/doc reconciliation,
   warm timing, product closure, and final lint gates remain open.
+
+### Epoll and inventory acceptance
+
+- Integrated `0fc900b20` + `a68254ea5`: epoll readiness follows the retained
+  open description after local close, fork inheritance, duplicate retention,
+  and numeric slot reuse. Both alias defects are now enabled. The new reuse
+  witness proves the recycled fd number, event payload, and enrolled wake.
+  Original red receipt: `/tmp/kernel-harness-ipc-defects.log`; integrated green:
+  `/tmp/kernel-harness-epoll-integrated.log` (37 semantics pass, two ignores).
+- Director strengthened SCM_RIGHTS coverage in `66fe091de`: send fd 10, receive
+  fd 3 after closing inherited aliases. This now distinguishes transferred
+  open-description identity from copying the sender's integer.
+- K1 inventory reconciliation correctly refused two removed direct
+  `.description.read()` sites. Reviewed removals are `net.rs::host_fd_for_poll`
+  and `epoll_ops.rs::host_read_avail_for_poll`: their bodies now delegate to
+  description-owned helpers, which still acquire read guards. Removed exactly
+  those two syntactic callsites and their taxonomy rows, retaining every other
+  row/classification. This is factoring, not a claim of two fewer runtime locks.
+- Preserved the original `cfg(test)` attribute on the moved subprocess helper
+  (`15e4ea804`). Two existing bounded subprocess watchdog loops have explicit
+  Semgrep exceptions (`b0dcc8dde`); their sleeps only pace external child-status
+  observation and do not arrange the tested interleaving. No test body or
+  deadline was changed.
