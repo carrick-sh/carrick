@@ -11847,7 +11847,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/wait_queue_fixture.rs",
-      "line": 121,
+      "line": 130,
       "categories": [
         "epoll"
       ],
@@ -11856,7 +11856,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/wait_queue_fixture.rs",
-      "line": 287,
+      "line": 296,
       "categories": [
         "epoll"
       ],
@@ -11865,7 +11865,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/wait_queue_fixture.rs",
-      "line": 291,
+      "line": 300,
       "categories": [
         "epoll"
       ],
@@ -11874,7 +11874,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/wait_queue_fixture.rs",
-      "line": 308,
+      "line": 317,
       "categories": [
         "epoll"
       ],
@@ -11883,7 +11883,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/wait_queue_fixture.rs",
-      "line": 311,
+      "line": 320,
       "categories": [
         "epoll"
       ],
