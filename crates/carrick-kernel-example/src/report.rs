@@ -5,8 +5,10 @@ use carrick_abi::LinuxErrno;
 /// Record of a completed syscall.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Completion {
-    /// The Linux PID of the task that issued the syscall.
+    /// The Linux PID of the process that issued the syscall.
     pub pid: i32,
+    /// The Linux TID of the exact thread that issued the syscall.
+    pub tid: i32,
     /// The diagnostic label of the syscall.
     pub label: &'static str,
     /// The outcome: Ok(return_value) or Err(errno).
@@ -16,8 +18,10 @@ pub struct Completion {
 /// Record of an output buffer captured after a syscall completed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Output {
-    /// The Linux PID of the task.
+    /// The Linux PID of the process.
     pub pid: i32,
+    /// The Linux TID of the exact thread.
+    pub tid: i32,
     /// The diagnostic label of the syscall.
     pub label: &'static str,
     /// The argument index (0..5) of the operand.
@@ -37,7 +41,7 @@ pub struct RunReport {
     pub(crate) deaths: Vec<(i32, i32)>,
     pub(crate) tasks_started: usize,
     pub(crate) dispatches: usize,
-    pub(crate) dispatch_events: Vec<(i32, &'static str)>,
+    pub(crate) dispatch_events: Vec<(i32, i32, &'static str)>,
 }
 
 impl RunReport {
@@ -71,11 +75,27 @@ impl RunReport {
         self.dispatches
     }
 
-    /// Total number of `dispatcher.dispatch` calls for a specific task `pid` and syscall `label`.
-    pub fn dispatches_for(&self, pid: i32, label: &str) -> usize {
+    /// Total number of `dispatcher.dispatch` calls for a specific task `id` (matching pid or tid) and syscall `label`.
+    pub fn dispatches_for(&self, id: i32, label: &str) -> usize {
         self.dispatch_events
             .iter()
-            .filter(|(p, l)| *p == pid && *l == label)
+            .filter(|(p, t, l)| (*p == id || *t == id) && *l == label)
+            .count()
+    }
+
+    /// Total number of `dispatcher.dispatch` calls for a specific thread `tid` and syscall `label`.
+    pub fn dispatches_for_tid(&self, tid: i32, label: &str) -> usize {
+        self.dispatch_events
+            .iter()
+            .filter(|(_, t, l)| *t == tid && *l == label)
+            .count()
+    }
+
+    /// Total number of `dispatcher.dispatch` calls for a specific process `pid` and syscall `label`.
+    pub fn dispatches_for_pid(&self, pid: i32, label: &str) -> usize {
+        self.dispatch_events
+            .iter()
+            .filter(|(p, _, l)| *p == pid && *l == label)
             .count()
     }
 

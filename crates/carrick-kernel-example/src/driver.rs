@@ -18,6 +18,21 @@
 //! | `BlockingMqueue` | `BlockedContinuation::from_dispatch_outcome` | `ReadinessProbe::Mqueue` | `RestartClass::Never` |
 //! | `BlockingFdWait` | `BlockedContinuation::from_dispatch_outcome` | `ReadinessProbe::FdWait` | `RestartClass::Never` |
 //! | `BlockingRecordLock` | `BlockedContinuation::from_dispatch_outcome` | `ReadinessProbe::RecordLock` (retry tick) | `RestartClass::Never` |
+//!
+//! ## Adapter Lifetime & Continuation Ownership
+//!
+//! In this VM-less backend, continuations are built from the kernel's `BlockedContinuation`
+//! and parked on the shared [`CarrierWaitService`]. The continuation remains owned by
+//! the backend host thread driving this task.
+//!
+//! When a sibling thread issues `exit_group` or process terminal exit occurs:
+//! - Terminal exit publication is serialized under the per-process `dispatcher` lock.
+//! - After releasing the dispatcher lock, [`Shared::wake_active_tokens_for_task`] calls
+//!   `wait_service.publish_ready(token)` as a **transport-level wakeup notification**
+//!   to prompt the waiting host thread loop to wake.
+//! - Upon waking (or immediately if terminal exit occurs before parking), the thread
+//!   observes that its exact thread/process is no longer live, cancels its own backend-owned
+//!   continuation with [`CancellationCause::ProcessExit`], and unwinds cleanly.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -26,10 +41,11 @@ use std::time::{Duration, Instant};
 
 use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 use carrick_kernel::compat::SyscallArgs;
-use carrick_kernel::dispatch::{DispatchOutcome, SyscallRequest};
+use carrick_kernel::dispatch::{DispatchOutcome, SyscallRequest, ThreadCtx};
 use carrick_kernel::kernel::continuation::{
     BlockedContinuation, CancellationCause, ContinuationCapture, ContinuationResult, RestartClass,
-    fold_continuation_completion, is_blocking_dispatch_outcome, is_restartable_syscall,
+    WaitServiceError, fold_continuation_completion, is_blocking_dispatch_outcome,
+    is_restartable_syscall,
 };
 use carrick_kernel::kernel::objects::{ExecutionGeneration, MigratableTaskState};
 use carrick_kernel::kernel::{CarrierProcess, KernelContext};
@@ -158,47 +174,101 @@ pub(crate) fn drive(
 ) -> Result<InternalCompletion, ExampleError> {
     let deadline = Instant::now() + WAIT_BOUND;
     loop {
-        let context = task.dispatcher.capture_one_task_context()?;
-        let tid = context.thread().registry_id();
-
-        // Deliverable signals check at syscall entry.
-        if let Some(death) = check_deliverable_signals(&task.dispatcher, &context, tid)? {
-            return Ok(death);
+        let is_live = task.context.exact_thread_is_live()
+            && task
+                .process
+                .kernel_graph()
+                .task_is_live(task.process.task_id());
+        if !is_live {
+            return Ok(InternalCompletion::Cancelled(
+                CancellationCause::ProcessExit,
+            ));
         }
+        let tid = task.context.thread().registry_id();
 
-        shared.dispatches.fetch_add(1, Ordering::SeqCst);
-        shared
-            .ledger
-            .lock()
-            .dispatch_events
-            .push((task.process.pid(), syscall.label));
+        let (mut outcome, request) = {
+            let disp = task.dispatcher.lock();
+            if !task.context.exact_thread_is_live()
+                || !task
+                    .process
+                    .kernel_graph()
+                    .task_is_live(task.process.task_id())
+            {
+                return Ok(InternalCompletion::Cancelled(
+                    CancellationCause::ProcessExit,
+                ));
+            }
 
-        let request = SyscallRequest::new(syscall.nr.raw(), SyscallArgs::from(args));
-        let mut outcome =
-            task.dispatcher
-                .dispatch(&context, request, &mut task.memory.linear, &task.reporter)?;
+            // Deliverable signals check at syscall entry.
+            if let Some(death) = check_deliverable_signals(&disp, &task.context, tid)? {
+                return Ok(death);
+            }
+
+            shared.dispatches.fetch_add(1, Ordering::SeqCst);
+            shared.ledger.lock().dispatch_events.push((
+                task.process.pid(),
+                task.tid,
+                syscall.label,
+            ));
+
+            let request = SyscallRequest::new(syscall.nr.raw(), SyscallArgs::from(args));
+            let thread_ctx = ThreadCtx::new(tid, &task.thread_registry, &task.futex_table);
+
+            let mut mem = task.memory.lock();
+            let mut executor = disp
+                .enter_mm_executor()
+                .map_err(carrick_kernel::dispatch::DispatchError::MmExecutorAdmission)?;
+            let outcome = disp.dispatch_threaded_with_mm_executor(
+                &mut executor,
+                &task.context,
+                request,
+                &mut mem.linear,
+                &task.reporter,
+                thread_ctx,
+            )?;
+            (outcome, request)
+        };
 
         loop {
             match outcome {
                 DispatchOutcome::Returned { value } => {
-                    let fresh_context = task.dispatcher.capture_one_task_context()?;
-                    if let Some(death) =
-                        check_deliverable_signals(&task.dispatcher, &fresh_context, tid)?
-                    {
+                    let is_live = task.context.exact_thread_is_live()
+                        && task
+                            .process
+                            .kernel_graph()
+                            .task_is_live(task.process.task_id());
+                    if !is_live {
+                        return Ok(InternalCompletion::Cancelled(
+                            CancellationCause::ProcessExit,
+                        ));
+                    }
+                    let disp = task.dispatcher.lock();
+                    if let Some(death) = check_deliverable_signals(&disp, &task.context, tid)? {
                         return Ok(death);
                     }
                     return Ok(InternalCompletion::Returned(value));
                 }
                 DispatchOutcome::Errno { errno } => {
-                    let fresh_context = task.dispatcher.capture_one_task_context()?;
-                    if let Some(death) =
-                        check_deliverable_signals(&task.dispatcher, &fresh_context, tid)?
-                    {
+                    let is_live = task.context.exact_thread_is_live()
+                        && task
+                            .process
+                            .kernel_graph()
+                            .task_is_live(task.process.task_id());
+                    if !is_live {
+                        return Ok(InternalCompletion::Cancelled(
+                            CancellationCause::ProcessExit,
+                        ));
+                    }
+                    let disp = task.dispatcher.lock();
+                    if let Some(death) = check_deliverable_signals(&disp, &task.context, tid)? {
                         return Ok(death);
                     }
                     return Ok(InternalCompletion::Errno(errno));
                 }
                 DispatchOutcome::Exit { code } => return Ok(InternalCompletion::Exit(code)),
+                DispatchOutcome::ThreadExit { code } => {
+                    return Ok(InternalCompletion::ThreadExit(code));
+                }
                 DispatchOutcome::SignalDeath { signum } => {
                     return Ok(InternalCompletion::Death(signum));
                 }
@@ -226,6 +296,24 @@ pub(crate) fn drive(
                     }
                     return Ok(InternalCompletion::Fork { flags, exit_signal });
                 }
+                DispatchOutcome::CloneThread {
+                    flags,
+                    clear_child_tid_addr,
+                    parent_tid_addr,
+                    child_tid_addr,
+                    tls,
+                    ..
+                } => {
+                    if parent_tid_addr != 0 || child_tid_addr != 0 || tls.is_some() {
+                        return Err(ExampleError::Unsupported(
+                            "clone_thread does not support parent_tid_addr, child_tid_addr, or tls in scripted backend".to_owned(),
+                        ));
+                    }
+                    return Ok(InternalCompletion::CloneThread {
+                        flags,
+                        clear_child_tid_addr,
+                    });
+                }
                 DispatchOutcome::SchedulerYield => {
                     std::thread::yield_now();
                     return Ok(InternalCompletion::Returned(0));
@@ -237,7 +325,7 @@ pub(crate) fn drive(
                         RestartClass::Never
                     };
                     let capture = ContinuationCapture::new(
-                        &context,
+                        &task.context,
                         task.execution_generation,
                         request,
                         restart,
@@ -251,7 +339,8 @@ pub(crate) fn drive(
                             .map_err(|e| {
                                 ExampleError::Unsupported(format!("continuation build failed: {e}"))
                             })?;
-                    continuation.install_temporary_signal_mask(&context);
+                    continuation.install_temporary_signal_mask(&task.context);
+                    continuation.bind_product_futex(&task.futex_table);
 
                     let mut registration = shared.wait_service.prepare_registration(&continuation);
                     shared.wait_service.enroll(&mut registration).map_err(|e| {
@@ -264,31 +353,90 @@ pub(crate) fn drive(
                             ExampleError::Unsupported(format!("attach registration failed: {e}"))
                         })?;
 
-                    // Notify listeners that this task is now parked/enrolled.
-                    shared.notify_parked(task.process.pid(), syscall.label);
+                    // Serialize active token registration and exact liveness re-check under
+                    // the per-process dispatcher mutex. If process terminal exit retired the
+                    // task before registration, we detect it immediately, cancel the
+                    // continuation, and return without parking for WAIT_BOUND.
+                    {
+                        let disp = task.dispatcher.lock();
+                        let is_live = task.context.exact_thread_is_live()
+                            && task
+                                .process
+                                .kernel_graph()
+                                .task_is_live(task.process.task_id());
+                        if !is_live {
+                            drop(disp);
+                            let _ = continuation.cancel(CancellationCause::ProcessExit);
+                            return Ok(InternalCompletion::Cancelled(
+                                CancellationCause::ProcessExit,
+                            ));
+                        }
+                        shared.register_active_token(task.context.task().key(), token);
+                    }
+                    // Notify listeners that this task thread is now parked/enrolled.
+                    shared.notify_parked(task.tid, syscall.label);
 
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
+                        shared.unregister_active_token(token);
                         let _ = continuation.cancel(CancellationCause::ServiceShutdown);
                         return Err(ExampleError::WaitTimedOut(syscall.label));
                     }
 
+                    // Drive wait service event on host thread. Note: `shared.wake_active_tokens_for_task`
+                    // calling `publish_ready` for a retired task is transport notification only:
+                    // it prompts this host thread loop to wake and observe exact liveness/retirement.
                     let event_result =
                         block_on_timeout(shared.wait_service.event(token), remaining);
+                    shared.unregister_active_token(token);
                     let Some(event_result) = event_result else {
                         let _ = continuation.cancel(CancellationCause::ServiceShutdown);
                         return Err(ExampleError::WaitTimedOut(syscall.label));
                     };
 
-                    let event = event_result.map_err(|e| {
-                        ExampleError::Unsupported(format!("wait service event error: {e}"))
-                    })?;
+                    let event = match event_result {
+                        Ok(event) => event,
+                        Err(WaitServiceError::Cancelled(cause)) => {
+                            return Ok(InternalCompletion::Cancelled(cause));
+                        }
+                        Err(e) => {
+                            return Err(ExampleError::Unsupported(format!(
+                                "wait service event error: {e}"
+                            )));
+                        }
+                    };
 
-                    let fresh_context = task.dispatcher.capture_one_task_context()?;
-                    let mut result: ContinuationResult =
-                        continuation.resume(event, &fresh_context).map_err(|e| {
-                            ExampleError::Unsupported(format!("continuation resume failed: {e:?}"))
-                        })?;
+                    let is_live = task.context.exact_thread_is_live()
+                        && task
+                            .process
+                            .kernel_graph()
+                            .task_is_live(task.process.task_id());
+                    if !is_live {
+                        let _ = continuation.cancel(CancellationCause::ProcessExit);
+                        return Ok(InternalCompletion::Cancelled(
+                            CancellationCause::ProcessExit,
+                        ));
+                    }
+
+                    let mut result: ContinuationResult = match continuation
+                        .resume(event, &task.context)
+                    {
+                        Ok(result) => result,
+                        Err(
+                            carrick_kernel::kernel::continuation::ContinuationResumeError::StaleThread(
+                                _,
+                            ),
+                        ) => {
+                            return Ok(InternalCompletion::Cancelled(
+                                CancellationCause::ProcessExit,
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(ExampleError::Unsupported(format!(
+                                "continuation resume failed: {e:?}"
+                            )));
+                        }
+                    };
 
                     if let Some(reserved) = result.take_reserved_signal() {
                         if !reserved.consume() {
@@ -323,12 +471,18 @@ pub(crate) fn drive(
                         }
                     }
 
-                    match fold_continuation_completion(
-                        result.completion,
-                        &task.dispatcher,
-                        &fresh_context,
-                        &mut task.memory.linear,
-                    ) {
+                    let fold_result = {
+                        let disp = task.dispatcher.lock();
+                        let mut mem = task.memory.lock();
+                        fold_continuation_completion(
+                            result.completion,
+                            &disp,
+                            &task.context,
+                            &mut mem.linear,
+                        )
+                    };
+
+                    match fold_result {
                         Ok(Some(next_outcome)) => {
                             outcome = next_outcome;
                             continue;

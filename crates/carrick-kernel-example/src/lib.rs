@@ -45,8 +45,9 @@ pub mod sys;
 
 pub use memory::{GUEST_BASE, GUEST_LEN, TaskMemory};
 pub use operand::{
-    Expect, Layout, Operand, RelocWidth, Relocation, Save, Step, Syscall, await_parked, in_out,
-    last_child, negated, slot, tagged_in_out, tagged_out,
+    Expect, Layout, Operand, RelocWidth, Relocation, Save, Step, Syscall, alloc_buffer, alloc_word,
+    await_parked, in_out, last_child, negated, slot, tagged_in_out, tagged_out, write_buffer,
+    write_word,
 };
 pub use process::{
     AddressSpace, AddressSpaceError, AsidAllocator, ExampleInstallPermit, ExampleMmBackend,
