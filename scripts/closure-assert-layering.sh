@@ -11,8 +11,13 @@
 #   carrick-vmm-*          : carrick-kernel
 # Product-closure feature rule (selection : forbidden feature):
 #   the argument-less selection (root `default-members`, what the signed
-#   product build in scripts/build-signed.sh resolves) : carrick-kernel and
-#   carrick-hal `test-support`
+#   product build in scripts/build-signed.sh resolves) : the `test-support`
+#   feature of carrick-kernel, carrick-hal and carrick-vfs. All three declare
+#   a feature by that name gating test-only surface, and carrick-vfs's is the
+#   one with a per-call cost: its counters are compiled INTO the host
+#   `openat`/`fstatat`/`fstat`/`open` and xattr macros in
+#   `fs_backend/host.rs`, so leaking the feature into the shipped binary adds
+#   a thread-local increment to every host filesystem call the guest makes.
 # A crate that does not exist yet is skipped (the gate lands before the
 # crates it guards, so Phase 0 passes trivially).
 set -euo pipefail
@@ -111,10 +116,10 @@ done
 # package selection is the root manifest's `default-members`. Under
 # resolver 2 a NORMAL dependency's features unify across every package in
 # one selection, so a non-product member that enables `test-support` on
-# carrick-kernel / carrick-hal (carrick-kernel-example does, for the Null
-# bridges its backend boots on) compiles that test-only surface --
-# `SyscallDispatcher::new()`, the Null bridges, the CarrierProcess doubles
-# -- into `carrick` the moment it shares the product's selection. That is
+# carrick-kernel / carrick-hal / carrick-vfs compiles that test-only surface
+# -- `SyscallDispatcher::new()`, the Null bridges, the CarrierProcess
+# doubles, and carrick-vfs's per-host-call `openat`/`stat` counters -- into
+# `carrick` the moment it shares the product's selection. That is
 # exactly what a whole-workspace selection did while the root manifest had
 # no `default-members` (found in review of the example crate, 2026-09-16).
 # This rule resolves the SAME argument-less selection the product build
@@ -148,4 +153,5 @@ product_feature_rule() {
 }
 product_feature_rule carrick-kernel
 product_feature_rule carrick-hal
+product_feature_rule carrick-vfs
 exit $fail
