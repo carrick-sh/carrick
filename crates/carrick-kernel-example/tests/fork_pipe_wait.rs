@@ -588,6 +588,10 @@ fn sigprocmask_blocked_sigchld_received_by_sigtimedwait_with_pid_and_status() {
         .run_root(script)
         .expect("backend ran");
     assert_eq!(run.exit_code(), 0);
+    // sigaction(2): SIGCHLD carries the child pid, CLD_EXITED and exit status.
+    // Raw aarch64 si_code/si_pid offsets are also exercised by
+    // conformance-probes/src/bin/sigtimedwaitintr.rs:100-101 and committed
+    // probe-oracle/arm64-musl/sigtimedwaitintr lines 5-6 and 11-12.
     let siginfo_bytes = run.output("rt_sigtimedwait");
     assert_eq!(siginfo_bytes.len(), 128);
     let si_signo = i32::from_le_bytes(siginfo_bytes[0..4].try_into().unwrap());
@@ -601,7 +605,7 @@ fn sigprocmask_blocked_sigchld_received_by_sigtimedwait_with_pid_and_status() {
 }
 
 #[test]
-fn sigprocmask_blocked_sigchld_received_by_signalfd4_with_pid_and_status() {
+fn sigprocmask_blocked_sigchld_received_by_signalfd4_with_pid() {
     const CLD_EXITED: i32 = 1;
     let sigchld_mask = 1u64 << (carrick_abi::LINUX_SIGCHLD - 1);
     let script = vec![
@@ -625,6 +629,8 @@ fn sigprocmask_blocked_sigchld_received_by_signalfd4_with_pid_and_status() {
         .run_root(script)
         .expect("backend ran");
     assert_eq!(run.exit_code(), 0);
+    // signalfd(2), struct signalfd_siginfo: 128-byte record, signal number,
+    // CLD_EXITED code, and sender pid. This case checks identity, not ssi_status.
     let sfd_bytes = run.output("read");
     assert_eq!(sfd_bytes.len(), 128);
     let ssi_signo = u32::from_le_bytes(sfd_bytes[0..4].try_into().unwrap());

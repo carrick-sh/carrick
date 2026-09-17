@@ -1,7 +1,7 @@
 //! # Continuation outcome driver
 //!
 //! Replaces the polling re-dispatch wait loop with kernel-owned continuations
-//! parked on [`CarrierWaitService`].
+//! parked on [`CarrierWaitService`](carrick_kernel::kernel::continuation::CarrierWaitService).
 //!
 //! | DispatchOutcome Variant | Kernel Continuation Mapping | Wait Service Probe | Restart Policy |
 //! |---|---|---|---|
