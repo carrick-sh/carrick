@@ -805,6 +805,9 @@ impl<'a> FsView<'a> {
                                     tid,
                                     sigpipe_on_epipe: true,
                                     authority: wait_authority,
+                                    socket_flow: None,
+                                    socket_cred: None,
+                                    is_stream: false,
                                 },
                             );
                             match res {
@@ -827,13 +830,21 @@ impl<'a> FsView<'a> {
                             }
                         };
                     }
-                    OpenDescription::HostSocket { host_fd, .. } => {
+                    OpenDescription::HostSocket { host_fd, type_, .. } => {
                         let Some(wait_authority) = self
                             .captured_slot_authority(fd)
                             .map(WaitFdAuthority::logical)
                         else {
                             return DispatchOutcome::errno(LINUX_EBADF);
                         };
+                        let outbound_flow = open_file.description.common().outbound_flow();
+                        let creds = self.cred_snapshot();
+                        let my_cred = crate::kernel::SocketPeerCred {
+                            pid: crate::dispatch::abi_args::NsPid(self.identity_pid() as i32),
+                            uid: creds.ruid,
+                            gid: creds.rgid,
+                        };
+                        let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
                         return write_host_pipe_owned(
                             bytes.to_vec(),
                             HostPipeWriteTarget {
@@ -846,6 +857,9 @@ impl<'a> FsView<'a> {
                                 tid,
                                 sigpipe_on_epipe: false,
                                 authority: wait_authority,
+                                socket_flow: outbound_flow,
+                                socket_cred: Some(my_cred),
+                                is_stream,
                             },
                         );
                     }
@@ -911,6 +925,9 @@ impl<'a> FsView<'a> {
                                 tid,
                                 sigpipe_on_epipe: false,
                                 authority: wait_authority,
+                                socket_flow: None,
+                                socket_cred: None,
+                                is_stream: false,
                             },
                         );
                     }
@@ -1227,6 +1244,10 @@ impl<'a> FsView<'a> {
                 if let Some(errno) = this.splice_output_errno(out_fd.0) {
                     return Ok(DispatchOutcome::errno(errno));
                 }
+                let in_open_file = this.open_file(in_fd.0);
+                let inbound_flow = in_open_file.as_ref().and_then(|f| f.description.common().inbound_flow());
+                let is_stream = this.socket_guest_type(in_fd.0) == Some(carrick_abi::LINUX_SOCK_STREAM);
+
                 if off_out_address == 0
                     && splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
                     && let Some((pipe_read_fd, room)) =
@@ -1237,16 +1258,35 @@ impl<'a> FsView<'a> {
                     }
                     let want = count.min(room).min(1 << 20);
                     let mut buf = vec![0u8; want];
-                    let n = unsafe {
-                        // BLOCKING-IO-OK: MSG_DONTWAIT is passed on this recv.
-                        libc::recv(
-                            host_fd.get(),
-                            buf.as_mut_ptr() as *mut _,
-                            want,
-                            libc::MSG_DONTWAIT,
-                        )
+                    let n = if let Some(flow) = &inbound_flow {
+                        let mut ledger = flow.lock_ledger();
+                        let res = unsafe {
+                            // BLOCKING-IO-OK: MSG_DONTWAIT is passed on this recv.
+                            libc::recv(
+                                host_fd.get(),
+                                buf.as_mut_ptr() as *mut _,
+                                want,
+                                libc::MSG_DONTWAIT,
+                            )
+                        };
+                        let n_res = res.host_syscall_errno();
+                        if let Ok(got) = n_res && got > 0 {
+                            ledger.consume_bytes(got as usize, is_stream);
+                        }
+                        n_res
+                    } else {
+                        let res = unsafe {
+                            // BLOCKING-IO-OK: MSG_DONTWAIT is passed on this recv.
+                            libc::recv(
+                                host_fd.get(),
+                                buf.as_mut_ptr() as *mut _,
+                                want,
+                                libc::MSG_DONTWAIT,
+                            )
+                        };
+                        res.host_syscall_errno()
                     };
-                    let n = match n.host_syscall_errno() {
+                    let n = match n {
                         Ok(v) => v,
                         // A socket that STRUCTURALLY cannot serve as a splice
                         // source — unconnected (ENOTCONN) or a family without a
@@ -1326,15 +1366,34 @@ impl<'a> FsView<'a> {
                     // Non-blocking drain (MSG_DONTWAIT below): the bytes are known
                     // to be present (we just peeked them), so this never blocks
                     // under the dispatcher lock.
-                    let cn = unsafe {
-                        libc::recv(
-                            host_fd.get(),
-                            buf.as_mut_ptr().add(consumed) as *mut _,
-                            written - consumed,
-                            libc::MSG_DONTWAIT,
-                        )
+                    let to_recv = written - consumed;
+                    let cn_res = if let Some(flow) = &inbound_flow {
+                        let mut ledger = flow.lock_ledger();
+                        let cn = unsafe {
+                            libc::recv(
+                                host_fd.get(),
+                                buf.as_mut_ptr().add(consumed) as *mut _,
+                                to_recv,
+                                libc::MSG_DONTWAIT,
+                            )
+                        };
+                        let cn_res = cn.host_syscall_errno();
+                        if let Ok(c) = cn_res && c > 0 {
+                            ledger.consume_bytes(c as usize, is_stream);
+                        }
+                        cn_res
+                    } else {
+                        let cn = unsafe {
+                            libc::recv(
+                                host_fd.get(),
+                                buf.as_mut_ptr().add(consumed) as *mut _,
+                                to_recv,
+                                libc::MSG_DONTWAIT,
+                            )
+                        };
+                        cn.host_syscall_errno()
                     };
-                    match cn.host_syscall_errno() {
+                    match cn_res {
                         Ok(c) if c > 0 => consumed += c as usize,
                         // 0 (peer gone) or EAGAIN: the peeked bytes should be
                         // present, but never spin — stop draining to avoid a hang.
@@ -1667,16 +1726,16 @@ impl<'a> FsView<'a> {
                     let bytes = &bytes[..room.map_or(bytes.len(), |room| bytes.len().min(room))];
                     Ok(this.splice_write_out(fd.0, 0, bytes, memory, tid, nonblocking))
                 }
-                VmDir::ReadHost(hfd, owner) => Ok(Self::read_host_pipe_iovecs(
-                    memory,
-                    &iovecs,
-                    hfd.get(),
-                    owner,
+                VmDir::ReadHost(hfd, owner) => Ok(Self::read_host_pipe_iovecs(memory, &iovecs, HostPipeReadTarget {
+                    host_fd: hfd.get(),
+                    host_fd_owner: owner,
                     nonblocking,
-                    WaitFdAuthority::logical(
+                    authority: WaitFdAuthority::logical(
                         this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
                     ),
-                )),
+                    socket_flow: None,
+                    is_stream: false,
+                })),
                 VmDir::ReadMem => {
                     let Some((pipe, status_flags)) = this.pipe_reader(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));

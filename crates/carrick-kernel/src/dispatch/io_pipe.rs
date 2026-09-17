@@ -5,6 +5,7 @@
 //! write forensics.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use carrick_abi::{LINUX_EAGAIN, LINUX_EFAULT, LINUX_EINTR, LinuxErrno};
 use carrick_guest_mem::CurrentMmMemory;
@@ -19,6 +20,17 @@ use carrick_vfs::errno::HostSyscallResult as _;
 pub(crate) const MAX_RW_COUNT: usize = 0x7fff_f000;
 const SMALL_HOST_READ_BUF: usize = 8192;
 
+/// Captured host-read endpoint, readiness authority, and optional UNIX flow.
+#[derive(Clone)]
+pub(crate) struct HostPipeReadTarget<'a> {
+    pub host_fd: i32,
+    pub host_fd_owner: Option<HostFdRef>,
+    pub nonblocking: bool,
+    pub authority: WaitFdAuthority,
+    pub socket_flow: Option<&'a Arc<crate::kernel::UnixFlow>>,
+    pub is_stream: bool,
+}
+
 /// read(2) on a host-backed fd (pipe/socket/file). Host-backed descriptions are
 /// adopted non-blocking at creation time, so EAGAIN means a blocking-mode guest
 /// fd hands off to the runtime's lockless kqueue wait via WaitOnFds while a
@@ -27,15 +39,34 @@ const SMALL_HOST_READ_BUF: usize = 8192;
 pub(crate) fn read_host_pipe_into(
     memory: &mut impl CurrentMmMemory,
     guest_addr: u64,
-    host_fd: i32,
-    host_fd_owner: Option<HostFdRef>,
-    nonblocking: bool,
     buf: &mut [u8],
-    authority: WaitFdAuthority,
+    target: HostPipeReadTarget<'_>,
 ) -> DispatchOutcome {
+    let HostPipeReadTarget {
+        host_fd,
+        host_fd_owner,
+        nonblocking,
+        authority,
+        socket_flow,
+        is_stream,
+    } = target;
     // BLOCKING-IO-OK: host-backed descriptions are made O_NONBLOCK at creation
     // or adoption sites; EAGAIN becomes WaitOnFds for blocking guest fds.
-    let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+    let n = if let Some(flow) = socket_flow {
+        let mut ledger = flow.lock_ledger();
+        let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        if n > 0 {
+            if is_stream {
+                ledger.consume_stream(n as usize);
+            } else {
+                ledger.consume_dgram();
+            }
+        }
+        drop(ledger);
+        n
+    } else {
+        unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, buf.len()) }
+    };
     crate::probes::host_pipe_io(host_fd, 0, n as i64);
     if let Err(e) = n.host_syscall_errno() {
         // EINTR: interrupted by a HOST signal. Don't surface it to the guest —
@@ -82,10 +113,7 @@ pub(crate) fn read_host_pipe(
     memory: &mut impl CurrentMmMemory,
     guest_addr: u64,
     length: usize,
-    host_fd: i32,
-    host_fd_owner: Option<HostFdRef>,
-    nonblocking: bool,
-    authority: WaitFdAuthority,
+    target: HostPipeReadTarget<'_>,
 ) -> DispatchOutcome {
     if length == 0 {
         return DispatchOutcome::Returned { value: 0 };
@@ -95,26 +123,10 @@ pub(crate) fn read_host_pipe(
     let length = length.min(MAX_RW_COUNT);
     if length <= SMALL_HOST_READ_BUF {
         let mut buf = [0u8; SMALL_HOST_READ_BUF];
-        read_host_pipe_into(
-            memory,
-            guest_addr,
-            host_fd,
-            host_fd_owner,
-            nonblocking,
-            &mut buf[..length],
-            authority,
-        )
+        read_host_pipe_into(memory, guest_addr, &mut buf[..length], target)
     } else {
         let mut buf = vec![0u8; length];
-        read_host_pipe_into(
-            memory,
-            guest_addr,
-            host_fd,
-            host_fd_owner,
-            nonblocking,
-            &mut buf,
-            authority,
-        )
+        read_host_pipe_into(memory, guest_addr, &mut buf, target)
     }
 }
 
@@ -136,6 +148,9 @@ pub struct HostPipeWriteTarget<'a> {
     /// The carrier's host-signal bridge: a pending unblocked signal ends a
     /// partially completed blocking write with the bytes so far.
     pub(crate) host_signal: &'a dyn carrick_hal::HostSignalBridge,
+    pub(crate) socket_flow: Option<Arc<crate::kernel::UnixFlow>>,
+    pub(crate) socket_cred: Option<crate::kernel::SocketPeerCred>,
+    pub(crate) is_stream: bool,
 }
 
 impl<'a> HostWritePayload<'a> {
@@ -206,6 +221,9 @@ fn write_host_pipe_payload(
         sigpipe_on_epipe,
         authority,
         host_signal,
+        socket_flow,
+        socket_cred,
+        is_stream,
     } = target;
 
     // Always-on, near-zero-cost detector for archive corruption. The predicate
@@ -357,7 +375,21 @@ fn write_host_pipe_payload(
             }
             // BLOCKING-IO-OK: host_fd was adopted O_NONBLOCK; EAGAIN routes to
             // the lockless wait path below.
-            unsafe { libc::write(host_fd, bytes[offset..].as_ptr() as *const _, len) }
+            if let (Some(flow), Some(cred)) = (&socket_flow, socket_cred) {
+                let mut ledger = flow.lock_ledger();
+                let n = unsafe { libc::write(host_fd, bytes[offset..].as_ptr() as *const _, len) };
+                if n > 0 {
+                    if is_stream {
+                        ledger.push_stream(n as usize, cred);
+                    } else {
+                        ledger.push_dgram(n as usize, cred);
+                    }
+                }
+                drop(ledger);
+                n
+            } else {
+                unsafe { libc::write(host_fd, bytes[offset..].as_ptr() as *const _, len) }
+            }
         };
         #[cfg(feature = "trace-tty")]
         if payload.as_slice().contains(&0x0a) {
@@ -394,7 +426,13 @@ fn write_host_pipe_payload(
                     && nonblocking
                     && offset == 0
                     && write_kind != HostWriteKind::RegularFile
-                    && let Some(result) = try_small_nonblocking_write(host_fd, payload.as_slice())
+                    && let Some(result) = try_small_nonblocking_write(
+                        host_fd,
+                        payload.as_slice(),
+                        socket_flow.as_ref(),
+                        socket_cred,
+                        is_stream,
+                    )
                 {
                     return match result {
                         Ok(written) => DispatchOutcome::returned_len_or_errno(written),
@@ -459,7 +497,13 @@ fn write_host_pipe_payload(
     }
 }
 
-fn try_small_nonblocking_write(host_fd: i32, bytes: &[u8]) -> Option<Result<usize, LinuxErrno>> {
+fn try_small_nonblocking_write(
+    host_fd: i32,
+    bytes: &[u8],
+    socket_flow: Option<&Arc<crate::kernel::UnixFlow>>,
+    socket_cred: Option<crate::kernel::SocketPeerCred>,
+    is_stream: bool,
+) -> Option<Result<usize, LinuxErrno>> {
     if bytes.len() <= 1 {
         return None;
     }
@@ -473,7 +517,21 @@ fn try_small_nonblocking_write(host_fd: i32, bytes: &[u8]) -> Option<Result<usiz
         // same fd returned EAGAIN (see the caller's `e == LINUX_EAGAIN &&
         // nonblocking` guard), so host_fd is non-blocking and libc::write cannot
         // block — the loop treats EAGAIN as "retry a smaller chunk".
-        let n = unsafe { libc::write(host_fd, bytes.as_ptr().cast(), len) };
+        let n = if let (Some(flow), Some(cred)) = (socket_flow, socket_cred) {
+            let mut ledger = flow.lock_ledger();
+            let n = unsafe { libc::write(host_fd, bytes.as_ptr().cast(), len) };
+            if n > 0 {
+                if is_stream {
+                    ledger.push_stream(n as usize, cred);
+                } else {
+                    ledger.push_dgram(n as usize, cred);
+                }
+            }
+            drop(ledger);
+            n
+        } else {
+            unsafe { libc::write(host_fd, bytes.as_ptr().cast(), len) }
+        };
         match n.host_syscall_errno() {
             Ok(value) if value > 0 => return Some(Ok(value as usize)),
             Ok(_) => continue,

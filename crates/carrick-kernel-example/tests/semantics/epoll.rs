@@ -252,13 +252,18 @@ fn reused_numeric_descriptor_does_not_trigger_or_mask_epoll_for_original_descrip
                 .save_out_i32(0, 0, 0)
                 .save_out_i32(0, 1, 4),
         ),
+        // Make the reused descriptor readable before polling. This directly
+        // proves the unrelated description cannot produce an epoll event.
+        Step::Sys(sys::write(slot(4), b"pipe_B").ret(6)),
+        Step::Sys({
+            let mut poll = sys::epoll_pwait(slot(2), 1, 0, 0).ret(0);
+            poll.label = "poll_reused_descriptor";
+            poll
+        }),
         Step::Sys(sys::fork()),
         Step::ChildMarker(vec![
-            // Await parent parking on epoll_pwait
+            // Pipe B remains readable while parent parks on Pipe A.
             await_parked(1, "epoll_pwait"),
-            // Child writes to Pipe B (slot 4 / Linux fd 7): numeric fd 3 is readable for Pipe B,
-            // but epoll watches Pipe A's open file description so parent must remain parked.
-            Step::Sys(sys::write(slot(4), b"pipe_B").ret(6)),
             // Child writes to Pipe A (slot 1 / Linux fd 4): Pipe A becomes readable, waking parent's epoll_pwait.
             Step::Sys(sys::write(slot(1), b"pipe_A").ret(6)),
             Step::Sys(sys::close(slot(0)).ret(0)),
@@ -304,16 +309,17 @@ fn reused_numeric_descriptor_does_not_trigger_or_mask_epoll_for_original_descrip
         "numeric file descriptor integers must match"
     );
 
-    // Parent issued two epoll_pwait syscalls: the first parked and completed on kernel wake (2 dispatches),
-    // and the second timed out after auto-detachment (1 dispatch), for 3 total dispatches.
-    assert_eq!(
-        run.dispatches_for(1, "epoll_pwait"),
-        3,
-        "parked epoll_pwait (2 dispatches) plus immediate timeout epoll_pwait (1 dispatch)"
-    );
+    // Enrollment was proved by await_parked above. Readiness notifications can
+    // cause an internal redispatch without yielding a guest-visible event; the
+    // zero-time poll and exact event data are the Linux-facing assertions.
 
     // Verify returned event data is 0x1111 (matching Pipe A registration)
-    let events_bytes = run.output_tagged("events");
+    let event_outputs = run.outputs_for("epoll_pwait");
+    let events_bytes = &event_outputs
+        .iter()
+        .find(|o| o.tag == Some("events"))
+        .unwrap()
+        .bytes;
     let event_mask = u32::from_le_bytes(events_bytes[0..4].try_into().unwrap());
     let event_data = u64::from_le_bytes(events_bytes[8..16].try_into().unwrap());
     assert_ne!(

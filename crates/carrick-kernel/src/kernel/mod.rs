@@ -101,10 +101,11 @@ pub use objects::{
     LinuxWaitStatus, Mm, ObjectGraphError, OpenDescriptionBackingSnapshot, PendingQueue,
     PendingSignal, PidfdTarget, ProcessGroup, RlimitSet, RunnerDirective, Session, Sighand,
     SignalAuthority, SignalDeliveryAction, SignalDequeue, SignalDisposition, SignalPendingOwner,
-    SocketCork, SocketPeerCred, Task, TaskKey, TaskLifecycle, TaskParticipantError,
+    SocketCork, SocketFlows, SocketPeerCred, Task, TaskKey, TaskLifecycle, TaskParticipantError,
     TaskPendingSignals, TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, TaskWaker, Thread,
-    ThreadKey, ThreadRef, ThreadResources, ThreadRunner, ThreadSignalState, Zombie,
-    evaluate_signal_delivery_action, is_default_ignore_signal, is_default_stop_signal,
+    ThreadKey, ThreadRef, ThreadResources, ThreadRunner, ThreadSignalState, UnixDgramCred,
+    UnixFlow, UnixLedger, UnixStreamCred, Zombie, evaluate_signal_delivery_action,
+    is_default_ignore_signal, is_default_stop_signal,
 };
 #[allow(unused_imports)]
 pub(crate) use objects::{

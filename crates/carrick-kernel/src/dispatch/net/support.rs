@@ -1437,7 +1437,7 @@ fn unix_socket_host_path(sun_path: &[u8]) -> Option<std::path::PathBuf> {
         key.to_vec()
     };
     if let Ok(mut map) = unix_path_registry().lock() {
-        map.insert(host.clone(), stored);
+        map.paths.insert(host.clone(), stored);
     }
     Some(host)
 }
@@ -1464,7 +1464,7 @@ pub(super) fn autobind_unix_host_path() -> std::path::PathBuf {
     }
     let host = base.join(format!("{hash:016x}.sock"));
     if let Ok(mut map) = unix_path_registry().lock() {
-        map.insert(host.clone(), sun);
+        map.paths.insert(host.clone(), sun);
     }
     host
 }
@@ -1509,6 +1509,17 @@ fn nul_trimmed_slice(path: &[u8]) -> &[u8] {
     &path[..nul]
 }
 
+struct PendingUnixClient {
+    cred: SocketPeerCred,
+    flows: Option<crate::kernel::SocketFlows>,
+}
+
+#[derive(Default)]
+struct UnixPathRegistry {
+    paths: std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
+    pending_clients: std::collections::HashMap<i32, std::collections::VecDeque<PendingUnixClient>>,
+}
+
 pub(super) fn register_unix_listener(host_path: &[u8], host_fd: i32, cred: SocketPeerCred) {
     let path = nul_trimmed_slice(host_path);
     use std::os::unix::ffi::OsStrExt;
@@ -1517,63 +1528,66 @@ pub(super) fn register_unix_listener(host_path: &[u8], host_fd: i32, cred: Socke
         let mut val = Vec::with_capacity(16);
         val.extend_from_slice(&host_fd.to_ne_bytes());
         val.extend_from_slice(&encode_peer_cred(cred));
-        reg.insert(
+        reg.paths.insert(
             std::path::PathBuf::from(format!("@listener:{path_str}")),
             val,
         );
-        reg.insert(
+        reg.paths.insert(
             std::path::PathBuf::from(format!("@listener_fd:{host_fd}")),
             path.to_vec(),
         );
-        reg.insert(
-            std::path::PathBuf::from(format!("@pending:{host_fd}")),
-            Vec::new(),
-        );
+        reg.pending_clients
+            .insert(host_fd, std::collections::VecDeque::new());
     }
 }
 
 pub(crate) fn unregister_unix_listener(host_fd: i32) {
     if let Ok(mut reg) = unix_path_registry().lock() {
-        if let Some(path) = reg.remove(&std::path::PathBuf::from(format!("@listener_fd:{host_fd}")))
+        if let Some(path) = reg
+            .paths
+            .remove(&std::path::PathBuf::from(format!("@listener_fd:{host_fd}")))
         {
             use std::os::unix::ffi::OsStrExt;
             let path_str = std::ffi::OsStr::from_bytes(&path).to_string_lossy();
-            reg.remove(&std::path::PathBuf::from(format!("@listener:{path_str}")));
+            reg.paths
+                .remove(&std::path::PathBuf::from(format!("@listener:{path_str}")));
         }
-        reg.remove(&std::path::PathBuf::from(format!("@pending:{host_fd}")));
+        reg.pending_clients.remove(&host_fd);
     }
 }
 
 pub(super) fn lookup_and_queue_unix_connect(
     host_path: &[u8],
     client_cred: SocketPeerCred,
+    client_flows: Option<crate::kernel::SocketFlows>,
 ) -> Option<SocketPeerCred> {
     let path = nul_trimmed_slice(host_path);
     use std::os::unix::ffi::OsStrExt;
     let path_str = std::ffi::OsStr::from_bytes(path).to_string_lossy();
     let mut reg = unix_path_registry().lock().ok()?;
-    let val = reg.get(&std::path::PathBuf::from(format!("@listener:{path_str}")))?;
+    let val = reg
+        .paths
+        .get(&std::path::PathBuf::from(format!("@listener:{path_str}")))?;
     if val.len() < 16 {
         return None;
     }
     let listener_fd = i32::from_ne_bytes(val[0..4].try_into().ok()?);
     let server_cred = decode_peer_cred(&val[4..16])?;
-    let pending_key = std::path::PathBuf::from(format!("@pending:{listener_fd}"));
-    let pending = reg.entry(pending_key).or_default();
-    pending.extend_from_slice(&encode_peer_cred(client_cred));
+    let q = reg.pending_clients.get_mut(&listener_fd)?;
+    q.push_back(PendingUnixClient {
+        cred: client_cred,
+        flows: client_flows,
+    });
     Some(server_cred)
 }
 
-pub(super) fn pop_pending_unix_client(listener_host_fd: i32) -> Option<SocketPeerCred> {
+pub(super) fn pop_pending_unix_client(
+    listener_host_fd: i32,
+) -> Option<(SocketPeerCred, Option<crate::kernel::SocketFlows>)> {
     let mut reg = unix_path_registry().lock().ok()?;
-    let pending_key = std::path::PathBuf::from(format!("@pending:{listener_host_fd}"));
-    let pending = reg.get_mut(&pending_key)?;
-    if pending.len() < 12 {
-        return None;
-    }
-    let cred = decode_peer_cred(&pending[0..12])?;
-    pending.drain(0..12);
-    Some(cred)
+    let q = reg.pending_clients.get_mut(&listener_host_fd)?;
+    let client = q.pop_front()?;
+    Some((client.cred, client.flows))
 }
 
 /// Process-global host-socket-path → original-guest-`sun_path` map, populated by
@@ -1581,12 +1595,10 @@ pub(super) fn pop_pending_unix_client(listener_host_fd: i32) -> Option<SocketPee
 /// by `host_to_linux_sockaddr` to undo the hash. Process-global (not fork-shared):
 /// a socket's own address is recorded by the process that bound/connected it,
 /// which is the same process that later calls getsockname/getpeername on it.
-fn unix_path_registry()
--> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>> {
-    static REG: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
-    > = std::sync::OnceLock::new();
-    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+fn unix_path_registry() -> &'static std::sync::Mutex<UnixPathRegistry> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<UnixPathRegistry>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(UnixPathRegistry::default()))
 }
 
 /// The original guest `sun_path` bytes for a carrick host socket path, if known.
@@ -1597,7 +1609,7 @@ fn guest_unix_path_for(host_path: &[u8]) -> Option<Vec<u8>> {
         .unwrap_or(host_path.len());
     use std::os::unix::ffi::OsStringExt;
     let key = std::path::PathBuf::from(std::ffi::OsString::from_vec(host_path[..nul].to_vec()));
-    unix_path_registry().lock().ok()?.get(&key).cloned()
+    unix_path_registry().lock().ok()?.paths.get(&key).cloned()
 }
 
 /// NUL-trim a host path and turn it into a C string (`Vec<u8>` ending in NUL)
@@ -2000,7 +2012,7 @@ pub(in crate::dispatch) fn parse_linux_scm_rights_fds(control: &[u8]) -> Vec<i32
         let level = i32::from_ne_bytes(control[off + 8..off + 12].try_into().unwrap_or([0; 4]));
         let ctype = i32::from_ne_bytes(control[off + 12..off + 16].try_into().unwrap_or([0; 4]));
         // A malformed/zero cmsg_len would loop forever; bail.
-        if cmsg_len < LINUX_CMSGHDR_LEN || off + cmsg_len > control.len() {
+        if cmsg_len < LINUX_CMSGHDR_LEN || cmsg_len > control.len().saturating_sub(off) {
             break;
         }
         if level == LINUX_SOL_SOCKET && ctype == LINUX_SCM_RIGHTS {
@@ -2012,6 +2024,81 @@ pub(in crate::dispatch) fn parse_linux_scm_rights_fds(control: &[u8]) -> Vec<i32
         off += linux_cmsg_align(cmsg_len);
     }
     fds
+}
+
+/// Parse Linux `SCM_CREDENTIALS` ancillary message from guest `control` buffer.
+pub(in crate::dispatch) fn parse_linux_scm_credentials(control: &[u8]) -> Option<SocketPeerCred> {
+    let mut off = 0usize;
+    while off + LINUX_CMSGHDR_LEN <= control.len() {
+        let cmsg_len =
+            u64::from_ne_bytes(control[off..off + 8].try_into().unwrap_or([0; 8])) as usize;
+        let level = i32::from_ne_bytes(control[off + 8..off + 12].try_into().unwrap_or([0; 4]));
+        let ctype = i32::from_ne_bytes(control[off + 12..off + 16].try_into().unwrap_or([0; 4]));
+        if cmsg_len < LINUX_CMSGHDR_LEN || cmsg_len > control.len().saturating_sub(off) {
+            break;
+        }
+        if level == LINUX_SOL_SOCKET && ctype == LINUX_SCM_CREDENTIALS {
+            let data = &control[off + LINUX_CMSGHDR_LEN..off + cmsg_len];
+            if data.len() >= 12 {
+                let pid = i32::from_ne_bytes(data[0..4].try_into().unwrap_or([0; 4]));
+                let uid = u32::from_ne_bytes(data[4..8].try_into().unwrap_or([0; 4]));
+                let gid = u32::from_ne_bytes(data[8..12].try_into().unwrap_or([0; 4]));
+                return Some(SocketPeerCred {
+                    pid: crate::dispatch::abi_args::NsPid(pid),
+                    uid: carrick_abi::NsUid::new(uid),
+                    gid: carrick_abi::NsGid::new(gid),
+                });
+            }
+        }
+        off += linux_cmsg_align(cmsg_len);
+    }
+    None
+}
+
+/// Validate explicit `SCM_CREDENTIALS` from guest `control` buffer per `man 7 unix`.
+/// Returns `Ok(Some(cred))` if valid explicit credentials were provided,
+/// `Ok(None)` if no SCM_CREDENTIALS were present, or `Err(LINUX_EPERM)` if
+/// forged credentials were provided without the requisite capabilities.
+pub(in crate::dispatch) fn validate_and_extract_scm_credentials(
+    control: &[u8],
+    kernel: &crate::kernel::KernelContext,
+    creds: &crate::kernel::Credentials,
+) -> Result<Option<SocketPeerCred>, carrick_abi::LinuxErrno> {
+    if let Some(cred) = parse_linux_scm_credentials(control) {
+        let task_id = u32::try_from(kernel.task().key().id.raw()).unwrap_or(0);
+        let caller_pid = crate::namespace::pid::ns_self_pid_for(kernel, task_id) as i32;
+        if cred.pid.0 != caller_pid
+            && !crate::dispatch::creds::has_effective_capability(
+                kernel,
+                crate::namespace::process::CAP_SYS_ADMIN,
+            )
+        {
+            return Err(carrick_abi::LINUX_EPERM);
+        }
+        if cred.uid.raw() != creds.ruid.raw()
+            && cred.uid.raw() != creds.euid.raw()
+            && cred.uid.raw() != creds.suid.raw()
+            && !crate::dispatch::creds::has_effective_capability(
+                kernel,
+                crate::namespace::process::CAP_SETUID,
+            )
+        {
+            return Err(carrick_abi::LINUX_EPERM);
+        }
+        if cred.gid.raw() != creds.rgid.raw()
+            && cred.gid.raw() != creds.egid.raw()
+            && cred.gid.raw() != creds.sgid.raw()
+            && !crate::dispatch::creds::has_effective_capability(
+                kernel,
+                crate::namespace::process::CAP_SETGID,
+            )
+        {
+            return Err(carrick_abi::LINUX_EPERM);
+        }
+        Ok(Some(cred))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Build a GUEST (Linux-layout) `msg_control` buffer carrying a single
@@ -2201,7 +2288,7 @@ pub(in crate::dispatch) fn parse_guest_ipv6_cmsgs(control: &[u8]) -> Vec<(i32, V
             u64::from_ne_bytes(control[off..off + 8].try_into().unwrap_or([0; 8])) as usize;
         let level = i32::from_ne_bytes(control[off + 8..off + 12].try_into().unwrap_or([0; 4]));
         let ctype = i32::from_ne_bytes(control[off + 12..off + 16].try_into().unwrap_or([0; 4]));
-        if cmsg_len < LINUX_CMSGHDR_LEN || off + cmsg_len > control.len() {
+        if cmsg_len < LINUX_CMSGHDR_LEN || cmsg_len > control.len().saturating_sub(off) {
             break;
         }
         if level == LINUX_IPPROTO_IPV6
@@ -3026,6 +3113,16 @@ mod tests {
         // Too small a budget → truncated, nothing emitted.
         let (small, trunc2) = build_linux_scm_creds(1, 2, 3, 16);
         assert!(small.is_empty() && trunc2);
+    }
+
+    #[test]
+    fn scm_credentials_parse_roundtrips() {
+        let (buf, trunc) = build_linux_scm_creds(42, 1000, 1001, 64);
+        assert!(!trunc);
+        let cred = parse_linux_scm_credentials(&buf).expect("parsed cred");
+        assert_eq!(cred.pid.0, 42);
+        assert_eq!(cred.uid.raw(), 1000);
+        assert_eq!(cred.gid.raw(), 1001);
     }
 
     #[test]

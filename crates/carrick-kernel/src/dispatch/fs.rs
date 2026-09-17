@@ -1519,10 +1519,7 @@ impl<'a> FsView<'a> {
     pub(super) fn read_host_pipe_iovecs<M: CurrentMmMemory>(
         memory: &mut M,
         iovecs: &[LinuxIovec],
-        host_fd: i32,
-        host_fd_owner: Option<HostFdRef>,
-        nonblocking: bool,
-        authority: WaitFdAuthority,
+        target: HostPipeReadTarget<'_>,
     ) -> DispatchOutcome {
         let mut total = 0i64;
         for iov in iovecs {
@@ -1533,15 +1530,7 @@ impl<'a> FsView<'a> {
             if len == 0 {
                 continue;
             }
-            match read_host_pipe(
-                memory,
-                iov.iov_base,
-                len,
-                host_fd,
-                host_fd_owner.clone(),
-                nonblocking,
-                authority.clone(),
-            ) {
+            match read_host_pipe(memory, iov.iov_base, len, target.clone()) {
                 DispatchOutcome::Returned { value } => {
                     total += value;
                     if value == 0 || (value as usize) < len {

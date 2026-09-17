@@ -677,15 +677,14 @@ impl<'a> FsView<'a> {
             // process's stdin is — file, pipe, or terminal).
             if fd.0 == 0 && !this.fd_table_contains(0) {
                 crate::dispatch::net::set_host_nonblocking(0);
-                return Ok(read_host_pipe(
-                    memory,
-                    address,
-                    length,
-                    0,
-                    None,
+                return Ok(read_host_pipe(memory, address, length, HostPipeReadTarget {
+                    host_fd: 0,
+                    host_fd_owner: None,
                     nonblocking,
-                    WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
-                ));
+                    authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+                    socket_flow: None,
+                    is_stream: false,
+                }));
             }
             let Ok(number) = FileSlotNumber::for_open_fd(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -969,17 +968,16 @@ impl<'a> FsView<'a> {
                         }
                         return Ok(DispatchOutcome::returned_len_or_errno(staged.len()));
                     }
-                    let outcome = read_host_pipe(
-                        memory,
-                        address,
-                        length,
-                        host_fd_raw,
-                        Some(host_fd_owner),
+                    let outcome = read_host_pipe(memory, address, length, HostPipeReadTarget {
+                        host_fd: host_fd_raw,
+                        host_fd_owner: Some(host_fd_owner),
                         nonblocking,
-                        WaitFdAuthority::logical(
+                        authority: WaitFdAuthority::logical(
                             this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
                         ),
-                    );
+                        socket_flow: None,
+                        is_stream: false,
+                    });
                     // Darwin reports EOF when the last pty slave closes;
                     // Linux's master read contract is EIO after any rescued
                     // tail has drained. Keep ordinary pipes and slave EOFs
@@ -1027,18 +1025,20 @@ impl<'a> FsView<'a> {
                 | OpenDescription::BpfProg { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                OpenDescription::HostSocket { host_fd, .. } => {
-                    return Ok(read_host_pipe(
-                        memory,
-                        address,
-                        length,
-                        host_fd.raw(),
-                        Some(host_fd.clone()),
+                OpenDescription::HostSocket { host_fd, type_, .. } => {
+                    let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
+                    let flows = open_file.description.common().socket_flows();
+                    let res = read_host_pipe(memory, address, length, HostPipeReadTarget {
+                        host_fd: host_fd.raw(),
+                        host_fd_owner: Some(host_fd.clone()),
                         nonblocking,
-                        WaitFdAuthority::logical(
+                        authority: WaitFdAuthority::logical(
                             this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
                         ),
-                    ));
+                        socket_flow: flows.as_ref().map(|f| &f.inbound),
+                        is_stream,
+                    });
+                    return Ok(res);
                 }
                 OpenDescription::InMemorySocket { socket, .. } => {
                     let socket = Arc::clone(socket);
@@ -1086,17 +1086,16 @@ impl<'a> FsView<'a> {
                 // (shared across fork). read_host_pipe is just a
                 // memory-into-guest read(2) wrapper.
                 OpenDescription::HostFile { host_fd, .. } => {
-                    return Ok(read_host_pipe(
-                        memory,
-                        address,
-                        length,
-                        host_fd.raw(),
-                        Some(host_fd.clone()),
+                    return Ok(read_host_pipe(memory, address, length, HostPipeReadTarget {
+                        host_fd: host_fd.raw(),
+                        host_fd_owner: Some(host_fd.clone()),
                         nonblocking,
-                        WaitFdAuthority::logical(
+                        authority: WaitFdAuthority::logical(
                             this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
                         ),
-                    ));
+                        socket_flow: None,
+                        is_stream: false,
+                    }));
                 }
             };
             memory.write_bytes(address, &bytes)?;
@@ -1161,15 +1160,14 @@ impl<'a> FsView<'a> {
                     if len == 0 {
                         continue;
                     }
-                    match read_host_pipe(
-                        memory,
-                        iov.iov_base,
-                        len,
-                        hfd,
-                        None,
-                        /*nonblocking=*/ false,
-                        WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
-                    ) {
+                    match read_host_pipe(memory, iov.iov_base, len, HostPipeReadTarget {
+                        host_fd: hfd,
+                        host_fd_owner: None,
+                        nonblocking: /*nonblocking=*/ false,
+                        authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+                        socket_flow: None,
+                        is_stream: false,
+                    }) {
                         DispatchOutcome::Returned { value } => {
                             total += value;
                             if (value as usize) < len {
@@ -1215,16 +1213,16 @@ impl<'a> FsView<'a> {
                         }
                         return Ok(DispatchOutcome::returned_len_or_errno(read_len));
                     }
-                    let outcome = Self::read_host_pipe_iovecs(
-                        memory,
-                        &iovecs,
-                        hfd,
-                        owner,
+                    let outcome = Self::read_host_pipe_iovecs(memory, &iovecs, HostPipeReadTarget {
+                        host_fd: hfd,
+                        host_fd_owner: owner,
                         nonblocking,
-                        WaitFdAuthority::logical(
+                        authority: WaitFdAuthority::logical(
                             this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
                         ),
-                    );
+                        socket_flow: None,
+                        is_stream: false,
+                    });
                     return Ok(match (pty_role, outcome) {
                         (
                             Some(crate::vfs::PtyRole {
@@ -1235,20 +1233,23 @@ impl<'a> FsView<'a> {
                         (_, outcome) => outcome,
                     });
                 }
-                OpenDescription::HostSocket { host_fd, .. } => {
+                OpenDescription::HostSocket { host_fd, type_, .. } => {
+                    let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
                     let hfd = host_fd.raw();
                     let owner = Some(host_fd.clone());
                     drop(open);
-                    return Ok(Self::read_host_pipe_iovecs(
-                        memory,
-                        &iovecs,
-                        hfd,
-                        owner,
+                    let flows = open_file.description.common().socket_flows();
+                    let res = Self::read_host_pipe_iovecs(memory, &iovecs, HostPipeReadTarget {
+                        host_fd: hfd,
+                        host_fd_owner: owner,
                         nonblocking,
-                        WaitFdAuthority::logical(
+                        authority: WaitFdAuthority::logical(
                             this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
                         ),
-                    ));
+                        socket_flow: flows.as_ref().map(|f| &f.inbound),
+                        is_stream,
+                    });
+                    return Ok(res);
                 }
                 OpenDescription::InMemorySocket { socket, .. } => {
                     let socket = Arc::clone(socket);
@@ -2511,6 +2512,9 @@ impl<'a> FsView<'a> {
                                         tid: cx.tid(),
                                         sigpipe_on_epipe: true,
                                         authority: wait_authority,
+                                        socket_flow: None,
+                                        socket_cred: None,
+                                        is_stream: false,
                                     },
                                 );
                                 match res {
@@ -2545,7 +2549,7 @@ impl<'a> FsView<'a> {
                             this.fasync_notify_after_write(cx.kernel, key_fd, written);
                             return Ok(this.raise_sigpipe_on_epipe(cx, out));
                         }
-                        OpenDescription::HostSocket { host_fd, .. } => {
+                        OpenDescription::HostSocket { host_fd, type_, .. } => {
                             // write(2) on a connected socket maps directly to a
                             // host write(2). Unconnected sockets will surface
                             // their own ENOTCONN via the host.
@@ -2556,6 +2560,16 @@ impl<'a> FsView<'a> {
                                 drop(open);
                                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
                             };
+                            let outbound_flow = open_file.description.common().outbound_flow();
+                            let creds = this.cred_snapshot();
+                            let task_id = u32::try_from(cx.kernel.task().key().id.raw()).unwrap_or(0);
+                            let pid = crate::namespace::pid::ns_self_pid_for(cx.kernel, task_id) as i32;
+                            let my_cred = crate::kernel::SocketPeerCred {
+                                pid: crate::dispatch::abi_args::NsPid(pid),
+                                uid: creds.ruid,
+                                gid: creds.rgid,
+                            };
+                            let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
                             let out = write_host_pipe_owned(
                                 bytes,
                                 HostPipeWriteTarget {
@@ -2568,6 +2582,9 @@ impl<'a> FsView<'a> {
                                     tid: cx.tid(),
                                     sigpipe_on_epipe: false,
                                     authority: wait_authority,
+                                    socket_flow: outbound_flow,
+                                    socket_cred: Some(my_cred),
+                                    is_stream,
                                 },
                             );
                             // Signal-driven I/O readiness edge on the socket peer.
@@ -2677,6 +2694,9 @@ impl<'a> FsView<'a> {
                                     tid: cx.tid(),
                                     sigpipe_on_epipe: false,
                                     authority: wait_authority,
+                                    socket_flow: None,
+                                    socket_cred: None,
+                                    is_stream: false,
                                 },
                             );
                             if let DispatchOutcome::Returned { value } = out && value > 0 {
@@ -2921,6 +2941,9 @@ impl<'a> FsView<'a> {
                 pipe_state: Option<(i64, usize)>,
                 sigpipe_on_epipe: bool,
                 append: bool,
+                socket_flow: Option<Arc<crate::kernel::UnixFlow>>,
+                socket_cred: Option<crate::kernel::SocketPeerCred>,
+                is_stream: bool,
             }
 
             let host_target = if let Some(open_file) = this.open_file(fd) {
@@ -2954,16 +2977,34 @@ impl<'a> FsView<'a> {
                             ),
                             sigpipe_on_epipe: true,
                             append: false,
+                            socket_flow: None,
+                            socket_cred: None,
+                            is_stream: false,
                         })
                     }
-                    Some(OpenDescription::HostSocket { host_fd, .. }) => Some(HostWritevTarget {
-                        host_fd: host_fd.raw(),
-                        host_fd_owner: Some(host_fd.clone()),
-                        write_kind: HostWriteKind::SocketLike,
-                        pipe_state: None,
-                        sigpipe_on_epipe: false,
-                        append: false,
-                    }),
+                    Some(OpenDescription::HostSocket { host_fd, type_, .. }) => {
+                        let outbound_flow = open_file.description.common().outbound_flow();
+                        let creds = this.cred_snapshot();
+                        let task_id = u32::try_from(cx.kernel.task().key().id.raw()).unwrap_or(0);
+                        let pid = crate::namespace::pid::ns_self_pid_for(cx.kernel, task_id) as i32;
+                        let my_cred = crate::kernel::SocketPeerCred {
+                            pid: crate::dispatch::abi_args::NsPid(pid),
+                            uid: creds.ruid,
+                            gid: creds.rgid,
+                        };
+                        let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
+                        Some(HostWritevTarget {
+                            host_fd: host_fd.raw(),
+                            host_fd_owner: Some(host_fd.clone()),
+                            write_kind: HostWriteKind::SocketLike,
+                            pipe_state: None,
+                            sigpipe_on_epipe: false,
+                            append: false,
+                            socket_flow: outbound_flow,
+                            socket_cred: Some(my_cred),
+                            is_stream,
+                        })
+                    }
                     Some(OpenDescription::HostFile {
                         host_fd, writable, ..
                     }) => {
@@ -2980,6 +3021,9 @@ impl<'a> FsView<'a> {
                                 open_file.description.common().status_flags(),
                             )
                             .contains(LinuxOpenFlags::APPEND),
+                            socket_flow: None,
+                            socket_cred: None,
+                            is_stream: false,
                         })
                     }
                     _ => None,
@@ -3038,6 +3082,9 @@ impl<'a> FsView<'a> {
                         tid: cx.tid(),
                         sigpipe_on_epipe: target.sigpipe_on_epipe,
                         authority: wait_authority,
+                        socket_flow: target.socket_flow,
+                        socket_cred: target.socket_cred,
+                        is_stream: target.is_stream,
                     },
                 );
                 if let DispatchOutcome::Returned { value } = outcome && value > 0 {
@@ -3222,6 +3269,9 @@ impl<'a> FsView<'a> {
                                             tid: cx.tid(),
                                             sigpipe_on_epipe: true,
                                             authority: wait_authority,
+                                            socket_flow: None,
+                                            socket_cred: None,
+                                            is_stream: false,
                                         },
                                     );
                                     match res {
@@ -3245,13 +3295,23 @@ impl<'a> FsView<'a> {
                                 };
                                 writeback = None;
                             }
-                            OpenDescription::HostSocket { host_fd, .. } => {
+                            OpenDescription::HostSocket { host_fd, type_, .. } => {
                                 let Some(wait_authority) = this
                                     .captured_slot_authority(fd)
                                     .map(WaitFdAuthority::logical)
                                 else {
                                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                                 };
+                                let outbound_flow = open_file.description.common().outbound_flow();
+                                let creds = this.cred_snapshot();
+                                let task_id = u32::try_from(cx.kernel.task().key().id.raw()).unwrap_or(0);
+                                let pid = crate::namespace::pid::ns_self_pid_for(cx.kernel, task_id) as i32;
+                                let my_cred = crate::kernel::SocketPeerCred {
+                                    pid: crate::dispatch::abi_args::NsPid(pid),
+                                    uid: creds.ruid,
+                                    gid: creds.rgid,
+                                };
+                                let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
                                 outcome = write_host_pipe_owned(
                                     bytes,
                                     HostPipeWriteTarget {
@@ -3264,6 +3324,9 @@ impl<'a> FsView<'a> {
                                         tid: cx.tid(),
                                         sigpipe_on_epipe: false,
                                         authority: wait_authority,
+                                        socket_flow: outbound_flow,
+                                        socket_cred: Some(my_cred),
+                                        is_stream,
                                     },
                                 );
                                 writeback = None;
@@ -3326,6 +3389,9 @@ impl<'a> FsView<'a> {
                                         tid: cx.tid(),
                                         sigpipe_on_epipe: false,
                                         authority: wait_authority,
+                                        socket_flow: None,
+                                        socket_cred: None,
+                                        is_stream: false,
                                     },
                                 );
                                 if let DispatchOutcome::Returned { value } = outcome && value > 0 {
