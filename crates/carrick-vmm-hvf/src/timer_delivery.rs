@@ -2,9 +2,9 @@
 //! armed on the signal-pump kqueue (so a busy in-guest vCPU is kicked on
 //! expiry); `arm_itimer` returns `true` when it owns delivery and `false` (no
 //! pump kq yet — e.g. a fresh fork child) so the caller spawns the shared
-//! wall-clock fallback thread. POSIX per-process timers delegate to the existing
-//! HVF `posix_timer::arm` (its own firing thread). The neutral slot mutation is
-//! the timer-core's; this struct only owns the kqueue glue.
+//! wall-clock fallback thread. POSIX per-process timers get their own firing
+//! thread from [`HvfTimerFiring::spawn_posix_firing`]. The neutral slot
+//! mutation is the timer-core's; this struct only owns the kqueue glue.
 //!
 //! The registered-backend handle the dispatch arm reads
 //! (`GuestTimerBridge::delivery`) is the process-global seam in
@@ -13,83 +13,71 @@
 //! there.
 use std::sync::Arc;
 
+use carrick_hal::guest_timer_bridge::{TimerCoreBridge, TimerFiring};
 use carrick_hal::{GuestTimerBridge, PosixTimerSpec, TimerArm, TimerDelivery, TimerSpecNs};
+use carrick_timer_core::posix::PosixArm;
 use carrick_timer_core::{CpuNs, WallNs};
 
 pub struct HvfTimerDelivery;
 
-/// HVF's [`GuestTimerBridge`]: the neutral timer-core registry plus this
-/// lane's firing glue (`itimer::spawn_fallback_timer`, `posix_timer::arm`) and
-/// the hal-wide registered-backend seam, reached by the dispatcher only
-/// through the trait.
+/// HVF's [`TimerFiring`]: the lane half of the shared
+/// [`TimerCoreBridge`] body. The neutral slot/spec/remaining/overrun
+/// bookkeeping is the timer-core's and identical on every lane; only these
+/// four items differ, which is exactly what the seam was introduced for
+/// (b15efe531, "one body; the lanes are instantiations").
 #[derive(Debug, Default, Clone, Copy)]
-pub struct HvfGuestTimers;
+pub struct HvfTimerFiring;
 
-impl GuestTimerBridge for HvfGuestTimers {
-    fn itimer_arm(&self, which: usize, spec: TimerSpecNs, needs_periodic: bool) -> u64 {
-        crate::itimer::arm(which, spec, needs_periodic)
-    }
-
-    fn itimer_disarm(&self, which: usize) {
-        crate::itimer::disarm(which);
-    }
-
-    fn itimer_signum_for(&self, which: usize) -> i32 {
-        crate::itimer::signum_for(which)
-    }
-
-    fn itimer_spawn_fallback_timer(&self, which: usize, generation: u64, spec: TimerSpecNs) {
+impl TimerFiring for HvfTimerFiring {
+    fn spawn_itimer_fallback(which: usize, generation: u64, spec: TimerSpecNs) {
         crate::itimer::spawn_fallback_timer(which, generation, spec);
     }
 
-    fn posix_create_with_target_and_value(
-        &self,
-        clock_id: i32,
-        signum: i32,
-        target_tid: Option<i32>,
-        si_value: i64,
-    ) -> i32 {
-        crate::posix_timer::create_with_target_and_value(clock_id, signum, target_tid, si_value)
-    }
-
-    fn posix_arm(&self, id: i32, spec: TimerSpecNs) -> Option<PosixTimerSpec> {
-        crate::posix_timer::arm(id, spec)
-    }
-
-    fn posix_remaining(&self, id: i32) -> Option<TimerSpecNs> {
-        crate::posix_timer::remaining(id)
-    }
-
-    fn posix_getoverrun(&self, id: i32) -> Option<u32> {
-        crate::posix_timer::getoverrun(id)
-    }
-
-    fn posix_seed_overrun(&self, id: i32, count: u32) {
-        crate::posix_timer::seed_overrun(id, count);
-    }
-
-    fn posix_exists(&self, id: i32) -> bool {
-        crate::posix_timer::exists(id)
-    }
-
-    fn posix_clock_id(&self, id: i32) -> i32 {
-        crate::posix_timer::clock_id(id)
-    }
-
-    fn posix_delete(&self, id: i32) -> bool {
-        crate::posix_timer::delete(id)
+    /// Spawn the firing thread for POSIX timer `id`: the shared timer-core
+    /// loop, publishing after `spec.value` then every `spec.interval` until
+    /// the timer is re-armed or deleted (generation bump).
+    ///
+    /// HVF honours `target_tid`: with `SIGEV_THREAD_ID` the expiry is
+    /// THREAD-directed through `publish_pending_for`, and only an unspecified
+    /// target falls back to the process-directed publication. The kqueue
+    /// signal pump then kicks the targeted or in-guest vCPU. The thread name
+    /// is the lane's existing fixed `carrick-posix-timer` (not per-`id`), so
+    /// `_id` stays unused and every existing trace/debugger filter keeps
+    /// matching.
+    fn spawn_posix_firing(_id: i32, armed: &PosixArm, spec: TimerSpecNs) {
+        let signum = armed.signum;
+        let generation = armed.generation;
+        let slot = armed.slot.clone();
+        let target_tid = armed.target_tid;
+        let on_fire = move || {
+            if let Some(tid) = target_tid {
+                crate::host_signal::publish_pending_for(tid, signum);
+            } else {
+                crate::host_signal::publish_process_signal(signum);
+            }
+        };
+        let _ = std::thread::Builder::new()
+            .name("carrick-posix-timer".to_owned())
+            .spawn(move || {
+                carrick_timer_core::posix::run_fallback(slot, generation, spec, on_fire);
+            });
     }
 
     /// Publish a process-directed signal from a host-side producer: the
     /// kqueue signal pump wakes parked waiters and kicks any in-guest vCPU.
-    fn deliver(&self, signum: i32) {
+    fn deliver(signum: i32) {
         crate::host_signal::publish_process_signal(signum);
     }
 
-    fn delivery(&self) -> Option<Arc<dyn TimerDelivery>> {
+    fn delivery() -> Option<Arc<dyn TimerDelivery>> {
         carrick_hal::guest_timer_bridge::delivery()
     }
 }
+
+/// HVF's [`GuestTimerBridge`]: the shared [`TimerCoreBridge`] body over this
+/// lane's [`HvfTimerFiring`], reached by the dispatcher only through the
+/// trait.
+pub type HvfGuestTimers = TimerCoreBridge<HvfTimerFiring>;
 
 impl TimerDelivery for HvfTimerDelivery {
     /// Arm `which` as an `EVFILT_TIMER` on the pump kqueue. The neutral slot
@@ -169,14 +157,15 @@ impl TimerDelivery for HvfTimerDelivery {
     }
 
     fn arm_posix(&self, id: i32, spec: TimerSpecNs) -> Option<PosixTimerSpec> {
-        // The HVF posix arm already spawns its own wall-clock firing thread
-        // (publish_process_signal on each expiry) and returns the previous spec.
-        crate::posix_timer::arm(id, spec)
+        // Through the bridge, not a second arm path: the arm mutates the
+        // neutral slot, spawns `HvfTimerFiring`'s firing thread and returns
+        // the previous spec, exactly as the dispatch arm would.
+        HvfGuestTimers::new().posix_arm(id, spec)
     }
 
     fn disarm_posix(&self, id: i32) {
         // A zero-value arm disarms (generation bump retires the firing thread).
-        let _ = crate::posix_timer::arm(id, TimerSpecNs::DISARM);
+        let _ = HvfGuestTimers::new().posix_arm(id, TimerSpecNs::DISARM);
     }
 
     fn current_arm(&self, which: usize) -> Option<TimerArm> {
