@@ -497,6 +497,22 @@ check-matrix:
 check-layering:
     ./scripts/closure-assert-layering.sh
 
+# VMM-less compile of the Carrick kernel: the public crate must build for a
+# target that has no Hypervisor.framework at all
+# (docs/superpowers/plans/2026-09-13-extract-carrick-vfs-and-carrick-kernel.md, Task 2.10).
+#
+# NOT in `ci` yet, and that is the only thing still missing from Task 2.10:
+# this recipe is RED on six pre-existing off-macOS errors in `carrick-kernel`
+# that no task has been briefed to fix (`F_WRLCK`/`F_UNLCK` `i16`-vs-`i32` in
+# `dispatch/ioring.rs`; `reexec_kind_name`, `check_exec_source` and
+# `check_exec_target` gated `cfg(target_os = "macos")` beneath ungated callers;
+# one `isize`/`usize` `?` in the never-compiled `cfg(target_os = "linux")` `tee`
+# arm). Wiring `j check-kernel-portable` into `ci` after `j check-layering` is a
+# one-line change and must happen in the same commit that clears those six --
+# landing it while the recipe is red would create a permanently-failing gate.
+check-kernel-portable:
+    cargo check -p carrick-kernel --features test-support --target aarch64-unknown-linux-gnu
+
 # Deterministic, line-exact ABI probe gate vs Docker (the precise gate; self-skips).
 # On the x86_64 fleet the AMD64 probe sets are built NATIVELY here (cheap: host
 # rustc, no Docker/QEMU) so the gate has binaries to run; on macOS the aarch64 +
