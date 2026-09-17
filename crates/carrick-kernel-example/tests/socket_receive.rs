@@ -290,6 +290,118 @@ fn sctp_recvmsg_preserves_source_address() {
 }
 
 #[test]
+fn tcp_recvfrom_ignores_source_pointer_for_payload_and_eof() {
+    let mut script = setup_tcp_pair(0, 1);
+    script.extend([
+        Step::Sys(sys::write(slot(1), b"abc").ret(3)),
+        Step::Sys(
+            recvfrom_with_addr(
+                "payload",
+                slot(0),
+                8,
+                0,
+                1,
+                Operand::TaggedInOut("payload_len", 128u32.to_ne_bytes().to_vec()),
+            )
+            .ret(3),
+        ),
+        Step::Sys(sys::shutdown(slot(1), 1).ret(0)),
+        Step::Sys(
+            recvfrom_with_addr(
+                "eof",
+                slot(0),
+                8,
+                0,
+                1,
+                Operand::TaggedInOut("eof_len", 128u32.to_ne_bytes().to_vec()),
+            )
+            .ret(0),
+        ),
+        Step::Sys(sys::exit_group(0)),
+    ]);
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("TCP source pointer");
+    assert_eq!(&run.output("payload")[..3], b"abc");
+    assert_eq!(run.output_tagged("payload_len"), &0u32.to_ne_bytes());
+    assert_eq!(run.output_tagged("eof_len"), &0u32.to_ne_bytes());
+}
+
+#[test]
+fn tcp_recvmsg_ignores_source_pointer() {
+    let mut script = setup_tcp_pair(0, 1);
+    let iov = Layout::new(16)
+        .with_reloc(0, RelocWidth::U64, Operand::TaggedOut("payload", 8))
+        .with_u64(8, 8);
+    let header = Layout::new(56)
+        .with_u64(0, 1)
+        .with_u32(8, 128)
+        .with_reloc(16, RelocWidth::U64, iov)
+        .with_u64(24, 1)
+        .with_capture(true)
+        .with_tag("header");
+    script.extend([
+        Step::Sys(sys::write(slot(1), b"abc").ret(3)),
+        Step::Sys(sys::recvmsg(slot(0), header, 0).ret(3)),
+        Step::Sys(sys::exit_group(0)),
+    ]);
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("TCP recvmsg source pointer");
+    assert_eq!(&run.output_tagged("payload")[..3], b"abc");
+    assert_eq!(&run.output_tagged("header")[8..12], &0u32.to_ne_bytes());
+}
+
+#[test]
+fn sctp_connect_preserves_client_and_accepted_protocol_identity() {
+    let mut script = setup_stream_pair(0, 1, LINUX_IPPROTO_SCTP);
+    for (fd, tag) in [(0, "accepted_protocol"), (1, "client_protocol")] {
+        script.push(Step::Sys(
+            Syscall::new(
+                "protocol",
+                nr::GETSOCKOPT,
+                [
+                    slot(fd),
+                    1.into(),
+                    38.into(),
+                    Operand::TaggedOut(tag, 4),
+                    Operand::InOut(4u32.to_ne_bytes().to_vec()),
+                    0.into(),
+                ],
+            )
+            .ret(0),
+        ));
+    }
+    script.push(Step::Sys(sys::exit_group(0)));
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("SCTP identity");
+    for tag in ["accepted_protocol", "client_protocol"] {
+        assert_eq!(run.output_tagged(tag), &LINUX_IPPROTO_SCTP.to_ne_bytes());
+    }
+}
+
+#[test]
+fn sctp_unread_close_preserves_peer_reset() {
+    // Both native Linux and the previous transport return ECONNRESET here.
+    // Retaining SCTP identity must not switch its carrier to Unix close rules.
+    let mut script = setup_stream_pair(0, 1, LINUX_IPPROTO_SCTP);
+    script.extend([
+        Step::Sys(sys::write(slot(1), b"unread").ret(6)),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(
+            recvfrom_labeled("reset", slot(1), 8, LINUX_MSG_DONTWAIT)
+                .errno(carrick_abi::LINUX_ECONNRESET),
+        ),
+        Step::Sys(sys::exit_group(0)),
+    ]);
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("SCTP unread close");
+    assert_eq!(run.exit_code(), 0);
+}
+
+#[test]
 fn tcp_recv_empty_errqueue_returns_eagain_and_preserves_stream_payload() {
     // man 7 ip / man 2 recv / target/conformance/eco-20260917/socket-contract-oracle.txt:
     // On TCP (AF_INET), MSG_ERRQUEUE returns EAGAIN when error queue is empty.

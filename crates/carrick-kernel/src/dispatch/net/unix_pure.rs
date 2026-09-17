@@ -24,7 +24,7 @@ use crate::linux_abi::{
     LINUX_SOCK_DGRAM, LINUX_SOCK_SEQPACKET, LINUX_SOCK_STREAM, LinuxErrno,
 };
 use crate::network::interposer::{ConnectionRecordState, MockService};
-use carrick_abi::{LINUX_AF_INET, LINUX_AF_INET6, LINUX_IPPROTO_TCP};
+use carrick_abi::{LINUX_AF_INET, LINUX_AF_INET6, LINUX_IPPROTO_SCTP, LINUX_IPPROTO_TCP};
 
 pub const LINUX_SHUT_RD: i32 = 0;
 pub const LINUX_SHUT_WR: i32 = 1;
@@ -311,8 +311,12 @@ impl PureSocketInner {
         {
             let mut s1 = first.state.lock();
             let mut s2 = second.state.lock();
-            let tcp_pair =
-                protocol == LINUX_IPPROTO_TCP && matches!(family, LINUX_AF_INET | LINUX_AF_INET6);
+            // SCTP currently uses this byte-stream transport too. Preserve its
+            // logical protocol without changing the existing transport lifecycle;
+            // record boundaries and MSG_EOR remain a separate conformance gap.
+            let tcp_pair = socket_type == LINUX_SOCK_STREAM
+                && matches!(protocol, LINUX_IPPROTO_TCP | LINUX_IPPROTO_SCTP)
+                && matches!(family, LINUX_AF_INET | LINUX_AF_INET6);
             s1.tcp_pair = tcp_pair;
             s2.tcp_pair = tcp_pair;
             s1.phase = PureSocketPhase::Connected;
@@ -366,7 +370,7 @@ impl PureSocketInner {
 
     pub(crate) fn disconnect_tcp_reset(&self) -> Result<(), LinuxErrno> {
         if self.socket_type != LINUX_SOCK_STREAM
-            || self.protocol != LINUX_IPPROTO_TCP
+            || !matches!(self.protocol, LINUX_IPPROTO_TCP | LINUX_IPPROTO_SCTP)
             || !matches!(self.family(), LINUX_AF_INET | LINUX_AF_INET6)
         {
             return Err(LINUX_EINVAL);
@@ -414,7 +418,7 @@ impl PureSocketInner {
         creds: LinuxUcred,
     ) -> Result<Arc<PureSocketInner>, LinuxErrno> {
         if self.socket_type != LINUX_SOCK_STREAM
-            || self.protocol != LINUX_IPPROTO_TCP
+            || !matches!(self.protocol, LINUX_IPPROTO_TCP | LINUX_IPPROTO_SCTP)
             || !matches!(self.family(), LINUX_AF_INET | LINUX_AF_INET6)
         {
             return Err(LINUX_EINVAL);
