@@ -26,25 +26,7 @@ pub(crate) fn signal_wait_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|target| Instant::now() >= target)
 }
 
-pub(crate) fn raise_sigpipe_for_blocking_write(
-    dispatcher: &SyscallDispatcher,
-    context: &carrick_kernel::kernel::KernelContext,
-    write: &carrick_kernel::dispatch::BlockingWrite,
-    outcome: DispatchOutcome,
-) -> DispatchOutcome {
-    if write.sigpipe_on_epipe()
-        && matches!(
-            &outcome,
-            DispatchOutcome::Errno {
-                errno: crate::linux_abi::LINUX_EPIPE
-            }
-        )
-        && !dispatcher.signal_is_ignored(context, crate::linux_abi::LINUX_SIGPIPE)
-    {
-        dispatcher.mark_signal_pending(context, write.tid(), crate::linux_abi::LINUX_SIGPIPE);
-    }
-    outcome
-}
+pub(crate) use carrick_kernel::kernel::continuation::raise_sigpipe_for_blocking_write;
 
 pub(crate) fn partial_write_interrupt_outcome(
     write: &carrick_kernel::dispatch::BlockingWrite,

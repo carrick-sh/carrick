@@ -1333,85 +1333,13 @@ where
         };
         self.reserved_signal = result.take_reserved_signal();
 
-        use carrick_kernel::kernel::continuation::ContinuationCompletion as Completion;
-        Ok(match result.completion {
-            Completion::Return(value) => Some(DispatchOutcome::Returned { value }),
-            Completion::Errno(errno) => Some(DispatchOutcome::Errno { errno }),
-            Completion::Redispatch => None,
-            Completion::RedispatchWithPartial(value) => Some(DispatchOutcome::Returned { value }),
-            Completion::ReturnWithGuestWrites(value, writes) => {
-                for range in writes {
-                    engine
-                        .zero_guest_range(range.start().raw(), range.len())
-                        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-                }
-                Some(DispatchOutcome::Returned { value })
-            }
-            Completion::ErrnoWithGuestWrites(errno, writes) => {
-                for range in writes {
-                    engine
-                        .zero_guest_range(range.start().raw(), range.len())
-                        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-                }
-                Some(DispatchOutcome::Errno { errno })
-            }
-            Completion::BlockingWrite { write, outcome } => {
-                let outcome = match outcome {
-                    carrick_kernel::kernel::continuation::BlockingWriteOutcome::Return(value) => {
-                        DispatchOutcome::Returned { value }
-                    }
-                    carrick_kernel::kernel::continuation::BlockingWriteOutcome::Errno(errno) => {
-                        DispatchOutcome::Errno { errno }
-                    }
-                };
-                Some(raise_sigpipe_for_blocking_write(
-                    &kernel.dispatcher,
-                    context,
-                    &write,
-                    outcome,
-                ))
-            }
-            Completion::TimerFdRead(read) => match read.complete(engine) {
-                carrick_kernel::dispatch::format_time::TimerFdReadStep::Done(outcome) => {
-                    Some(outcome)
-                }
-                carrick_kernel::dispatch::format_time::TimerFdReadStep::Wait(read) => {
-                    Some(DispatchOutcome::BlockingTimerFdRead(read))
-                }
-            },
-            Completion::Semop(semop) => match semop.complete() {
-                carrick_kernel::dispatch::BlockingSemopStep::Done(outcome) => Some(outcome),
-                carrick_kernel::dispatch::BlockingSemopStep::Wait(semop) => {
-                    Some(DispatchOutcome::BlockingSemop(semop))
-                }
-            },
-            Completion::Mqueue(mqueue) => {
-                match mqueue.complete(&kernel.dispatcher, context, engine) {
-                    carrick_kernel::dispatch::BlockingMqueueStep::Done(outcome) => Some(outcome),
-                    carrick_kernel::dispatch::BlockingMqueueStep::Wait(mqueue) => {
-                        Some(DispatchOutcome::BlockingMqueue(mqueue))
-                    }
-                }
-            }
-            Completion::FdWait { wait, sig_mask } => {
-                match wait.complete(engine, &kernel.dispatcher) {
-                    carrick_kernel::dispatch::fd_wait::BlockingFdWaitStep::Done(outcome) => {
-                        Some(outcome)
-                    }
-                    carrick_kernel::dispatch::fd_wait::BlockingFdWaitStep::Wait(wait) => {
-                        Some(DispatchOutcome::BlockingFdWait { wait, sig_mask })
-                    }
-                }
-            }
-            Completion::InterruptedSleep { remaining } => {
-                Some(carrick_kernel::dispatch::complete_interrupted_sleep(
-                    engine,
-                    remaining
-                        .map(|(range, _)| carrick_kernel::dispatch::GuestPtr(range.start().raw())),
-                    remaining.map_or(Duration::ZERO, |(_, duration)| duration),
-                ))
-            }
-        })
+        carrick_kernel::kernel::continuation::fold_continuation_completion(
+            result.completion,
+            &kernel.dispatcher,
+            context,
+            engine,
+        )
+        .map_err(|error| RuntimeError::Configuration(error.to_string()))
     }
 
     fn with_mm_mutation_authority<T>(
@@ -2129,41 +2057,7 @@ impl PendingSignalAction {
 /// Socket calls (`accept`, `connect`, the `recv`/`send` families) are also
 /// absent, and that is a KNOWN REMAINING GAP rather than a judgement that they
 /// do not restart — they do, but only when the socket carries no
-/// `SO_RCVTIMEO`/`SO_SNDTIMEO`. This decision point sees only the syscall
-/// NUMBER, not the fd, so honouring that exclusion needs the timeout plumbed
-/// through first; restarting unconditionally would re-block a timeout socket
-/// that Linux would have failed with `EINTR`.
-pub(super) fn is_restartable_syscall(nr: u64) -> bool {
-    matches!(
-        nr,
-        // Reads and writes on "slow" devices — pipes, terminals, sockets. On a
-        // regular file these never return EINTR, so listing them is harmless.
-        63  // read
-        | 64  // write
-        | 65  // readv
-        | 66  // writev
-        | 67  // pread64
-        | 68  // pwrite64
-        | 69  // preadv
-        | 70  // pwritev
-        | 286 // preadv2
-        | 287 // pwritev2
-        | 29  // ioctl (on a slow device)
-        | 56  // openat (blocks opening a FIFO)
-        // Advisory file locking: flock, and fcntl's F_SETLKW. fcntl is listed
-        // whole because the blocking lock commands are the only ones that can
-        // return EINTR.
-        | 32  // flock
-        | 25  // fcntl
-        // POSIX message queues.
-        | 182 // mq_timedsend
-        | 183 // mq_timedreceive
-        | 278 // getrandom
-        // Waits.
-        | 95  // waitid
-        | 260 // wait4
-    )
-}
+pub(super) use carrick_kernel::kernel::continuation::is_restartable_syscall;
 pub(super) fn is_default_stop_signal(signum: i32) -> bool {
     matches!(
         signum,

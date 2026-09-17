@@ -137,3 +137,26 @@ pub fn getppid() -> Syscall {
         [0.into(), 0.into(), 0.into(), 0.into(), 0.into(), 0.into()],
     )
 }
+
+/// `pselect6(2)` with a timespec timeout and optional sigmask.
+pub fn pselect6(
+    nfds: i32,
+    readfds: impl Into<Operand>,
+    writefds: impl Into<Operand>,
+    exceptfds: impl Into<Operand>,
+    timeout: impl Into<Operand>,
+    sigmask: impl Into<Operand>,
+) -> Syscall {
+    call(
+        "pselect6",
+        nr::PSELECT6,
+        [
+            (nfds as i64).into(),
+            readfds.into(),
+            writefds.into(),
+            exceptfds.into(),
+            timeout.into(),
+            sigmask.into(),
+        ],
+    )
+}

@@ -107,6 +107,11 @@ impl AddressSpace {
     pub fn mm_backend(&self) -> Arc<dyn MmBackend> {
         Arc::clone(&self.backend) as Arc<dyn MmBackend>
     }
+
+    /// The ASID generation of this address space.
+    pub fn asid_generation(&self) -> u64 {
+        self.stage1.asid_generation()
+    }
 }
 
 /// The stage-1 identity of one address space, with no page tables behind it.
@@ -140,6 +145,13 @@ impl ExampleStage1Projection {
     /// of the same address space snapshots under it.
     pub const fn binding(&self) -> MmBinding {
         self.binding
+    }
+
+    /// The raw ASID generation this projection binds.
+    pub fn asid_generation(&self) -> u64 {
+        ForeignAsidGeneration::from_runtime_binding(self.foreign_asid(), NonZeroU64::MIN)
+            .generation()
+            .get()
     }
 
     fn foreign_asid(&self) -> ForeignAsid {
@@ -320,6 +332,11 @@ impl ExampleProcess {
     /// surface right after `SyscallDispatcher::bind_hvpatch_process`.
     pub fn take_bind_failure(&self) -> Option<KernelError> {
         self.bind_failure.lock().take()
+    }
+
+    /// The ASID generation of this process's address space.
+    pub fn asid_generation(&self) -> u64 {
+        self.space.asid_generation()
     }
 }
 
