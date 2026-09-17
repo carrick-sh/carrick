@@ -163,7 +163,24 @@ surfaces exposed by `carrick-hal`; `carrick-runtime` selects the backend and
 supplies those implementations. A layering gate (`just check-layering`, run by
 `just ci`) asserts the direction: no `carrick-runtime`, `carrick-vmm-*` or
 `applevisor*` in the `carrick-vfs` or `carrick-kernel` closures, and no
-`carrick-kernel` in any `carrick-vmm-*` closure.
+`carrick-kernel` in any `carrick-vmm-*` closure. `just check-kernel-portable`
+(also in `just ci`) proves the converse for one concrete target: `cargo check
+-p carrick-kernel --features test-support --target aarch64-unknown-linux-gnu`
+compiles the kernel with no `Hypervisor.framework` binding in reach at all.
+
+## Kernel Bridge Traits
+
+`carrick-kernel` reaches the execution lane through three object-safe
+`carrick-hal` traits, plus one kernel-defined handle the carrier implements.
+Dispatch and the kernel graph hold `Arc<dyn Trait>` in every case; no backend's
+concrete lease, glue or process type crosses into `carrick-kernel`.
+
+| Trait | Owning crate | What crosses the seam | Implementors |
+| --- | --- | --- | --- |
+| `Stage1MmProjection` (+ `ForeignMmInstaller` companion) | `carrick-hal` | The stage-1 address space as the kernel sees it — 3 methods (`foreign_mm_binding`, `foreign_stage1_identity`, `publish_foreign_cow_invalidation`) that authenticate and address one foreign-COW invalidation without naming a page-table manager or hypervisor VM. | HVF `Stage1MmLease` (`carrick-runtime`); `carrick-kernel-example`'s `ExampleStage1Projection`; the kernel's own `TestStage1MmProjection` test double. The kick+futex lanes (KVM, bhyve, NVMM) do not implement it today — no stage-1 authority crosses that boundary on those lanes. |
+| `HostSignalBridge` | `carrick-hal` | Host-signal capture, self-raise, host-disposition mirroring and the cross-process xsignal-ring — 17 methods. | HVF `HvfHostSignal`; KVM `KvmHostSignal` (`GenericHostSignalBridge<KvmGlue>`, the shared body every kick+futex lane — KVM, bhyve, NVMM, native BSD — instantiates over its own glue); `NullHostSignalBridge` (the example backend and bridge-less unit tests). |
+| `GuestTimerBridge` | `carrick-hal` | The neutral interval/POSIX timer registry plus the backend's firing mechanism — 14 methods. | HVF `HvfGuestTimers`; `KickerGuestTimers` (KVM and every other kick+futex lane, over the shared `TimerCoreBridge`); `NullGuestTimerBridge` (the example backend and bridge-less unit tests). |
+| `CarrierProcess` | `carrick-kernel` | Defined in the kernel, implemented by the carrier: "the process this dispatcher is bound to" — 8 required + 14 provided methods (22 total), including the one place the kernel reaches a `Stage1MmProjection` from. | HVPatch `ProcessContext` (`carrick-runtime`); `carrick-kernel-example`'s `ExampleProcess`; the kernel's own `TestCarrierProcess` test double. |
 
 ## HAL Contract Classification
 

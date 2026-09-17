@@ -237,6 +237,27 @@ Cross-compiling a backend proves source and feature closure. It does not prove
 that a guest executed. Runtime claims require real target hardware and the
 named VMM capability.
 
+The product path is a three-crate layering:
+`carrick-runtime -> carrick-kernel -> carrick-vfs`. `carrick-vfs` owns the
+filesystem model (the `Vfs` trait, the mount table, the dentry cache and the
+OCI rootfs) and names no kernel, carrier, or VMM type. `carrick-kernel` owns
+Linux behavior above it — the kernel object graph, syscall dispatch, the
+process/credential/namespace models, and the kernel-view filesystems over
+`carrick-vfs` — and **the kernel names no VMM type**; `just check-layering`
+enforces that rule mechanically (no `carrick-runtime` or `carrick-vmm-*` in
+the `carrick-vfs` or `carrick-kernel` dependency closures, and no
+`carrick-vmm-*` closure reaching back into `carrick-kernel`). `carrick-runtime`
+owns the execution lane — the VM carrier, the vCPU/threaded loops, and the
+platform-selected backend — and supplies the kernel's three execution-lane
+seams: `Stage1MmProjection` (the stage-1 address space as the kernel sees it),
+`HostSignalBridge` (host-signal capture, self-raise, and disposition
+mirroring), and `GuestTimerBridge` (guest-visible interval-timer delivery).
+An execution backend is a `carrick-hal` implementor driving `carrick-kernel`;
+`carrick-kernel-example` is the template — a VM-less backend that runs
+scripted Linux tasks on host threads over `Vec`-backed guest memory against
+`carrick-kernel`'s public surface alone. See [hal.md](hal.md) for the full
+trait table and implementor list.
+
 ## 8. Embedding and Conformance
 
 `carrick-embed` is the library front door to the same kernel architecture used
