@@ -361,8 +361,7 @@ impl<'a> FsView<'a> {
     /// that a non-executable `#!` script is EACCES rather than a followed
     /// interpreter (matching Linux). The ELF/shebang FORMAT check (ENOEXEC) is
     /// left to image-load time. (execve03 / execveat02 / execve02.)
-    // Called from `runtime/exec.rs` (the macOS/HVF execve path).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    // Called from the carrier's execve path.
     pub(crate) fn check_exec_source(
         &self,
         _path: &str,
@@ -372,7 +371,6 @@ impl<'a> FsView<'a> {
         source.exec_access_errno(uid, gid)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn check_exec_target(&self, path: &str) -> Result<(), LinuxErrno> {
         let host_fallback = self.exec_host_fs_fallback();
         if self.read_exec_file_head(path, 1).is_some()
@@ -401,7 +399,6 @@ impl<'a> FsView<'a> {
     /// metadata mode + tracked owner (`--fs memory`). Even root fails a regular
     /// file that carries NO execute bit — `dac_check` encodes the one case where
     /// `CAP_DAC_OVERRIDE` does not apply (`mode & 0o111 == 0 -> EACCES`).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn exec_access_errno(&self, path: &str) -> Option<LinuxErrno> {
         let (fsuid, fsgid) = self.dac_identity();
         if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(path, true) {
