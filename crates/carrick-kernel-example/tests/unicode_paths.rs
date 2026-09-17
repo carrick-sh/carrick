@@ -18,13 +18,16 @@
 //! - macOS single-leaf query bounds: `getattrlistat(2)` (`ATTR_CMN_NAME`, `FSOPT_NOFOLLOW`)
 //!   queries stored leaf bytes directly in O(1) without directory scans.
 
+#[cfg(target_os = "macos")]
 use std::sync::atomic::Ordering;
 
 use carrick_abi::{
     LINUX_AT_FDCWD, LINUX_ENOENT, LINUX_O_CREAT, LINUX_O_RDONLY, LINUX_O_RDWR, LINUX_O_WRONLY,
 };
 use carrick_kernel_example::{ScriptedBackend, Step, slot, sys};
-use carrick_vfs::fs_backend::{FsBackend, HostFsBackend};
+#[cfg(target_os = "macos")]
+use carrick_vfs::fs_backend::FsBackend;
+use carrick_vfs::fs_backend::HostFsBackend;
 
 /// Linux `openat(2)`, `write(2)`, `read(2)`, `unlinkat(2)`.
 ///
