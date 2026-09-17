@@ -288,7 +288,7 @@ Add `Step::HostSleepMs(u64)` to `Step` in this task (a host-side `std::thread::s
 - Produces: `sys::kill(pid, sig)`, `sys::tgkill(tgid, tid, sig)`, `sys::rt_sigprocmask_block(sigs: &[i32])` (SIG_BLOCK with a 64-bit mask built from the list, `Out(8)` old set), `sys::rt_sigtimedwait(sigs: &[i32], timeout_ms: Option<u64>)` (mask in `Bytes`, `siginfo_t` as `Out(128)`, timespec in `Bytes`; returns the signal number), `sys::rt_sigaction_ign(sig)` / `sys::rt_sigaction_dfl(sig)` (a `Bytes` `struct sigaction` with `sa_handler = SIG_IGN (1)` / `SIG_DFL (0)`, `sa_flags = 0`, `sa_mask = 0`, sigsetsize 8), `sys::signalfd4(sigs: &[i32], flags)`. Wait status helpers in `tests/semantics/mod.rs` (Task 5) decode the `wait4` out buffer.
 - Driver contract: before every dispatch and after every wake, `drive` asks the kernel whether the current task has a deliverable signal whose disposition is default-terminate (the same kernel query the carrier uses); if so it records `(pid, signal)` in `report.deaths`, retires the task through the existing exit path with status `signal` (Linux wait encoding `WIFSIGNALED`: `status & 0x7f == signal`), and the task's thread ends. A `DispatchOutcome::SignalDeath { signal, .. }` from `dispatch` itself is handled the same way. `Expect::Death(sig)` matches either. `WaitOnSignals` parks like any other family (Task 2) and completes with the outcome's completion value.
 
-- [ ] **Step 1: Write the failing tests**:
+- [x] **Step 1: Write the failing tests**:
 
 ```rust
 #[test]
@@ -330,13 +330,13 @@ fn sigchld_is_pending_in_the_parent_after_the_child_exits() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail** — the first fails with `ExampleError::Unsupported("SignalDeath…")` or a `WaitTimedOut("read")`; the second fails because the child exit never posts SIGCHLD (`rt_sigtimedwait` returns `EAGAIN`).
+- [x] **Step 2: Run to verify they fail** — the first fails with `ExampleError::Unsupported("SignalDeath…")` or a `WaitTimedOut("read")`; the second fails because the child exit never posts SIGCHLD (`rt_sigtimedwait` returns `EAGAIN`).
 
-- [ ] **Step 3: Implement.** In `on_exit`, the kernel's exit path already posts SIGCHLD to the parent when the carrier calls it (find it: `grep -rn "SIGCHLD" crates/carrick-kernel/src/kernel/operations/exit.rs`); if the harness's `exit_task_key_eventually` path does not post it, the harness is calling the wrong kernel function — switch to the one the carrier calls (`grep -rn "exit_task_key_eventually\|fn exit_task" crates/carrick-runtime/src/vcpu_loop`), never post the signal from the harness. Implement the deliverable-signal check in `drive` per the contract; implement the constructors in `sys.rs` (`siginfo_t` is 128 bytes; `sigset_t` is 8 bytes with bit `sig-1`).
+- [x] **Step 3: Implement.** In `on_exit`, the kernel's exit path already posts SIGCHLD to the parent when the carrier calls it (find it: `grep -rn "SIGCHLD" crates/carrick-kernel/src/kernel/operations/exit.rs`); if the harness's `exit_task_key_eventually` path does not post it, the harness is calling the wrong kernel function — switch to the one the carrier calls (`grep -rn "exit_task_key_eventually\|fn exit_task" crates/carrick-runtime/src/vcpu_loop`), never post the signal from the harness. Implement the deliverable-signal check in `drive` per the contract; implement the constructors in `sys.rs` (`siginfo_t` is 128 bytes; `sigset_t` is 8 bytes with bit `sig-1`).
 
-- [ ] **Step 4: Run** — `cargo test -p carrick-kernel-example --tests` → green. Cross-check the two `siginfo` offsets against the committed oracle for the `sigchld` probe (`crates/carrick-cli/tests/probe-oracle/arm64-musl/sigchld`) and its source (`conformance-probes/src/bin/sigchld.rs`); cite the probe in the assertion comment.
+- [x] **Step 4: Run** — `cargo test -p carrick-kernel-example --tests` → green. Cross-check raw `siginfo` offsets against `conformance-probes/src/bin/sigtimedwaitintr.rs:100-101` and committed `probe-oracle/arm64-musl/sigtimedwaitintr` lines 5–6 and 11–12; cite the probe in the assertion comment. The illustrative `sigchld` oracle path does not exist in this extraction.
 
-- [ ] **Step 5: Commit** — `git commit -m "feat(kernel-example): deliver default-action and waited signals without a guest handler"`.
+- [x] **Step 5: Commit** — `git commit -m "feat(kernel-example): deliver default-action and waited signals without a guest handler"`.
 
 ### Task 4: Sleep and timer completion
 
@@ -350,7 +350,7 @@ fn sigchld_is_pending_in_the_parent_after_the_child_exits() {
 - Produces: `sys::nanosleep_ms(ms)` (a `Bytes` timespec, `Out(16)` remaining), `sys::clock_nanosleep_ms(clock, flags, ms)`, `sys::timerfd_create(clock, flags)`, `sys::timerfd_settime_ms(fd, flags, initial_ms, interval_ms)`.
 - Driver: `WaitOnSleep` → sleep the host thread until the outcome's deadline (bounded by `WAIT_BOUND`), then return the outcome's completion value directly — do NOT re-dispatch (a re-dispatch restarts the full interval). A signal that becomes deliverable during the sleep (Task 3's check, evaluated after the host sleep ends) takes precedence exactly as Linux does: death for default-terminate.
 
-- [ ] **Step 1: Failing tests**:
+- [x] **Step 1: Failing tests**:
 
 ```rust
 #[test]
@@ -377,9 +377,9 @@ fn a_timerfd_read_parks_until_the_timer_fires() {
 }
 ```
 
-- [ ] **Step 2: Verify they fail** (`Unsupported("WaitOnSleep…")`; the timerfd read either times out or is `Unsupported`).
-- [ ] **Step 3: Implement** per the driver contract. If the timerfd firing needs the timer bridge to tick (the Null bridge never fires), the kernel-owned timerfd path must not depend on a host timer at all — read `crates/carrick-kernel/src/dispatch/time.rs` for how `timerfd` readiness is computed and, if it is bridge-driven, say so in the commit and register a `TimerFiring` implementation in the harness that fires on a host thread (one body: `carrick_hal::TimerCoreBridge<HarnessTimerFiring>`).
-- [ ] **Step 4: Run** → green. **Step 5: Commit** — `git commit -m "feat(kernel-example): complete sleeps and timers from the kernel outcome"`.
+- [x] **Step 2: Qualify existing completion support (adjusted)** — Task 2 already implemented the generic sleep/timer continuation mapping, so these new tests passed immediately. No separate Task 4 red-first failure is claimed. Director verified elapsed-time and one-dispatch owned-completion assertions; see the execution decisions and receipts below.
+- [x] **Step 3: Implement** per the driver contract. If the timerfd firing needs the timer bridge to tick (the Null bridge never fires), the kernel-owned timerfd path must not depend on a host timer at all — read `crates/carrick-kernel/src/dispatch/time.rs` for how `timerfd` readiness is computed and, if it is bridge-driven, say so in the commit and register a `TimerFiring` implementation in the harness that fires on a host thread (one body: `carrick_hal::TimerCoreBridge<HarnessTimerFiring>`).
+- [x] **Step 4: Run** → green. **Step 5: Commit** — `git commit -m "feat(kernel-example): complete sleeps and timers from the kernel outcome"`.
 
 ---
 
@@ -591,8 +591,8 @@ cargo test -p carrick-kernel --lib --features test-support {{ARGS}} -- --skip se
 env RUST_TEST_THREADS=1 cargo test -p carrick-kernel --lib --features test-support {{ARGS}} serial_host
 ```
 
-- [ ] **Step 1: Baseline** — `time just test 2>&1 | tee /tmp/just-test-before.log`; record wall time and, per crate, the `test result:` line, in the plan ledger (`### Lane timing` at the end of this file).
-- [ ] **Step 2: Write the ratchet, red first** — `scripts/migrate/check-serial-host-tests.py`:
+- [x] **Step 1: Baseline** — `time just test 2>&1 | tee /tmp/just-test-before.log`; record wall time and, per crate, the `test result:` line, in the plan ledger (`### Lane timing` at the end of this file).
+- [x] **Step 2: Write the ratchet, red first** — `scripts/migrate/check-serial-host-tests.py`:
 
 ```python
 #!/usr/bin/env python3
@@ -633,10 +633,10 @@ if __name__ == "__main__": sys.exit(main(sys.argv[1:]))
 ```
 Note: the scanner treats a call as test code when it is inside any `fn` that follows a `#[test]` attribute; helper functions called from tests (e.g. `child_can_acquire_classic_write_lock`, `spawn_contained_test_child`, `assert_partial_private_overlay_replacement`) also contain the calls — extend `CALLS` handling so an unattributed `fn` inside a `#[cfg(test)]` module counts too (set `fn_is_test = True` for every fn while inside a `mod tests`/`cfg(test)` block), so helpers move into `serial_host` with their callers. Run `python3 scripts/migrate/check-serial-host-tests.py --self-test` (ok) and `python3 scripts/migrate/check-serial-host-tests.py` → exit 1 listing every site from the audit (≈30 lines). That list IS the move list; reconcile it against the file list above.
 
-- [ ] **Step 3: Move the tests** into `mod serial_host { use super::*; … }` blocks (pure cut/paste; keep `#[test]` attributes; `cargo test -p carrick-kernel --lib --features test-support serial_host -- --list | wc -l` equals the number moved). Re-run the ratchet → exit 0.
-- [ ] **Step 4: Prove the parallel lane** — run `cargo test -p carrick-kernel --lib --features test-support -- --skip serial_host` **10 times** in a row (`for i in $(seq 10); do … || break; done`), all green. Any failure is a process-global collision: move that test into `serial_host` too (name the static it collides with in the commit body) — never add a sleep or a retry. Then `RUST_TEST_THREADS=1 cargo test -p carrick-kernel --lib --features test-support serial_host` green.
-- [ ] **Step 5: Wire the justfile** (recipe lines above; `lint-domains` gets `python3 scripts/migrate/check-serial-host-tests.py --self-test` and `python3 scripts/migrate/check-serial-host-tests.py` next to the other `--self-test` lines). Reconcile line-pinned inventories on the clean tree (`python3 scripts/migrate/reconcile-line-pinned-inventories.py`; the moves shift positions), `just lint-domains`, `just test`.
-- [ ] **Step 6: Commit** — `git commit -m "test(kernel): run the fork-free kernel lane in parallel; serial_host keeps the forking tests alone"` (+ the `chore(migrate):` reconcile commit).
+- [x] **Step 3: Move the tests** into `mod serial_host { use super::*; … }` blocks (pure cut/paste; keep `#[test]` attributes; `cargo test -p carrick-kernel --lib --features test-support serial_host -- --list | wc -l` equals the number moved). Re-run the ratchet → exit 0.
+- [x] **Step 4: Prove the parallel lane** — run `cargo test -p carrick-kernel --lib --features test-support -- --skip serial_host` **10 times** in a row (`for i in $(seq 10); do … || break; done`), all green. Any failure is a process-global collision: move that test into `serial_host` too (name the static it collides with in the commit body) — never add a sleep or a retry. Then `RUST_TEST_THREADS=1 cargo test -p carrick-kernel --lib --features test-support serial_host` green.
+- [x] **Step 5: Wire the justfile** (recipe lines above; `lint-domains` gets `python3 scripts/migrate/check-serial-host-tests.py --self-test` and `python3 scripts/migrate/check-serial-host-tests.py` next to the other `--self-test` lines). Reconcile line-pinned inventories on the clean tree (`python3 scripts/migrate/reconcile-line-pinned-inventories.py`; the moves shift positions), `just lint-domains`, `just test`.
+- [x] **Step 6: Commit** — `git commit -m "test(kernel): run the fork-free kernel lane in parallel; serial_host keeps the forking tests alone"` (+ the `chore(migrate):` reconcile commit).
 
 ### Task 12: partition the carrick-vfs lane
 
@@ -648,7 +648,7 @@ Steps mirror Task 11 (ratchet red → move → 10× parallel green → serial la
 
 **Files:** Modify `justfile` (new recipe), `AGENTS.md` (Commands table row + "Where key subsystems live" pointer), `crates/carrick-kernel-example/README.md`, `crates/README.md` (crate row), `docs/conformance-testing.md` (a "Kernel semantics suite" section).
 
-- [ ] **Step 1: Recipe**:
+- [x] **Step 1: Recipe**:
 
 ```make
 # The conformance inner loop: no VM, no codesign, no Docker. Runs the
@@ -660,9 +660,9 @@ test-kernel *ARGS:
     cargo test -p carrick-kernel --lib --features test-support {{ARGS}} -- --skip serial_host
     cargo test -p carrick-kernel-example --tests {{ARGS}}
 ```
-- [ ] **Step 2: Docs** — AGENTS.md Commands table gains `just test-kernel` with that one-line purpose; the `just test` row names the `serial_host` convention and the ratchet; `crates/carrick-kernel-example/README.md` describes the vocabulary (Operand/Save/Expect, `dispatches_for`, `HostSleepMs`), the parking driver, what it cannot do (no exec, no guest code, no handlers, threads per Task 14), and the citation rule for expectations; `docs/conformance-testing.md` gains the section with the loop: write the semantics test (cite the man page or oracle) → `just test-kernel` → fix in `carrick-kernel` → `just test` → the signed gates before push.
+- [x] **Step 2: Docs** — AGENTS.md Commands table gains `just test-kernel` with that one-line purpose; the `just test` row names the `serial_host` convention and the ratchet; `crates/carrick-kernel-example/README.md` describes the vocabulary (Operand/Save/Expect, `dispatches_for`, `HostSleepMs`), the parking driver, what it cannot do (no exec, no guest code, no handlers, threads per Task 14), and the citation rule for expectations; `docs/conformance-testing.md` gains the section with the loop: write the semantics test (cite the man page or oracle) → `just test-kernel` → fix in `carrick-kernel` → `just test` → the signed gates before push.
 - [ ] **Step 3: Timing** — `time just test` after; append the before/after table to `### Lane timing` in this plan and to the commit body.
-- [ ] **Step 4: Commit** — `git commit -m "docs: the kernel-semantics inner loop (just test-kernel)"`.
+- [x] **Step 4: Commit** — `git commit -m "docs: the kernel-semantics inner loop (just test-kernel)"`.
 
 ---
 
@@ -974,3 +974,28 @@ test-kernel *ARGS:
   Semgrep exceptions (`b0dcc8dde`); their sleeps only pace external child-status
   observation and do not arrange the tested interleaving. No test body or
   deadline was changed.
+
+### Director acceptance status
+
+| Tasks | Result |
+|---|---|
+| 1–2 | Generic checked vocabulary and shared kernel continuation completion accepted. |
+| 3–4 | Shared signal policy/child notification and sleep/timer completion accepted; Task 4 red-first deviation disclosed above. |
+| 5–7 | 20 wait/group/pipe tests pass; SIGCHLD autoreap test retained as a named defect. |
+| 8–10 | 17 IPC/epoll/pidfd tests pass; SCM_CREDENTIALS test retained as a named defect. Epoll alias defects fixed. |
+| 11–12 | Parallel/serial partition and ratchet accepted after ten-run qualification and exact name reconciliation. |
+| 13 | Recipe/docs implemented; final warm timing awaits thread integration. |
+| 14–15 | Thread/futex candidate under final lifecycle review; not accepted yet. |
+
+- Integrated kernel test inventory: 2092 names (2084 original plus eight
+  signal/exit regressions), with zero original names lost. VFS: 283 names,
+  unchanged. Receipts: `/tmp/kernel-harness-{kernel,vfs}-tests-final.txt`.
+- `just ci` passed through Clippy, lint-domains, deny, matrix, layering,
+  portability and workspace compile, then caught an unresolved harness rustdoc
+  link. The link is fixed and `just doc` now passes; final host tests and
+  integration acceptance follow the thread merge. Do not call the interrupted
+  aggregate command green.
+- `just build` produced a signed product from `a68254ea5`; all three forbidden
+  test-double string counts are zero. SHA-256, CDHash, UUID, entitlement and DOF
+  receipts: `/tmp/kernel-harness-product-receipt.json`. This proves build and
+  product closure only. No signed guest conformance run or push is claimed.
