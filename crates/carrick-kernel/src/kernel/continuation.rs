@@ -1226,18 +1226,28 @@ impl BlockedContinuation {
                             .ok_or(ContinuationBuildError::StaleChildSelector)?;
                         // A child may finish exiting and transition from `state.tasks` to
                         // `state.zombies` in the race window between wait4 returning StillRunning
-                        // and continuation enrollment; checking `zombie(id)` prevents a spurious
+                        // and continuation enrollment; checking `zombies` prevents a spurious
                         // StaleChildSelector error when building WaitOnHvpatchChild.
-                        let (child_key, parent) = if let Ok(identity) = kernel.task_identity(id) {
-                            (identity.task, identity.parent)
-                        } else if let Some(zombie) = kernel.registry().zombie(id) {
-                            (zombie.key, zombie.parent)
+                        // For live tasks, the waiting process may be either the parent or an
+                        // attached ptrace tracer. For zombies, ptrace has already detached at exit
+                        // so only the parent may reap.
+                        let state = kernel.registry().state.read();
+                        let child_key = if let Some(record) = state.tasks.get(&id) {
+                            let child_key = record.task.key();
+                            let parent = record.task.parent();
+                            let tracer = record.task.ptrace_tracer();
+                            if parent != Some(parent_task) && tracer != Some(parent_task) {
+                                return Err(ContinuationBuildError::StaleChildSelector);
+                            }
+                            child_key
+                        } else if let Some(record) = state.zombies.get(&id) {
+                            if record.zombie.parent != Some(parent_task) {
+                                return Err(ContinuationBuildError::StaleChildSelector);
+                            }
+                            record.zombie.key
                         } else {
                             return Err(ContinuationBuildError::StaleChildSelector);
                         };
-                        if parent != Some(parent_task) {
-                            return Err(ContinuationBuildError::StaleChildSelector);
-                        }
                         ChildSelector::Exact(child_key)
                     }
                 };

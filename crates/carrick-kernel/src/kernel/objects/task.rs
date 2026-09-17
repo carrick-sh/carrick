@@ -302,11 +302,12 @@ enum DefaultStopGeneration {
     Cancelled,
 }
 
+use crate::kernel::StopKind;
+
 #[derive(Debug, Default)]
 struct TaskJobControl {
     stopped_by: Option<LinuxSignal>,
-    pending_stop: Option<LinuxSignal>,
-    pending_stop_is_ptrace: bool,
+    pending_stop: Option<(LinuxSignal, StopKind)>,
     stopped_by_ptrace: bool,
     ptrace_tracer: Option<TaskKey>,
     ptrace_stop_settled: bool,
@@ -376,7 +377,7 @@ fn advance_ptrace_stop_generation(state: &mut TaskJobControl) {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskJobControlEvent {
-    Stopped(LinuxSignal),
+    Stopped { signal: LinuxSignal, kind: StopKind },
     Continued,
 }
 
@@ -1468,8 +1469,7 @@ impl Task {
         }
         advance_ptrace_stop_generation(&mut state);
         state.stopped_by = Some(signal);
-        state.pending_stop = Some(signal);
-        state.pending_stop_is_ptrace = true;
+        state.pending_stop = Some((signal, StopKind::Ptrace));
         state.stopped_by_ptrace = true;
         clear_ptrace_transient_state(&mut state);
         state.ptrace_stopped_fault = fault.map(|fault| BoundPtraceSynchronousFault {
@@ -1732,8 +1732,7 @@ impl Task {
             return true;
         }
         state.stopped_by = Some(signal);
-        state.pending_stop = Some(signal);
-        state.pending_stop_is_ptrace = false;
+        state.pending_stop = Some((signal, StopKind::JobControl));
         state.stopped_by_ptrace = false;
         clear_ptrace_transient_state(&mut state);
         true
@@ -1782,14 +1781,13 @@ impl Task {
         consume: bool,
     ) -> Option<TaskJobControlEvent> {
         let mut state = self.job_control.lock();
-        if (include_stopped || state.pending_stop_is_ptrace)
-            && let Some(signal) = state.pending_stop
-        {
-            if consume {
-                state.pending_stop = None;
-                state.pending_stop_is_ptrace = false;
+        if let Some((signal, kind)) = state.pending_stop {
+            if include_stopped || kind == StopKind::Ptrace {
+                if consume {
+                    state.pending_stop = None;
+                }
+                return Some(TaskJobControlEvent::Stopped { signal, kind });
             }
-            return Some(TaskJobControlEvent::Stopped(signal));
         }
         if include_continued && state.pending_continue {
             if consume {

@@ -8,6 +8,15 @@
 //! their first caller; `dispatch/proc.rs`, `dispatch/mqueue.rs`,
 //! `kernel/operations/session.rs` and `vcpu_loop/threads.rs` name them too.
 
+/// The origin of a task stop event: ordinary job control vs ptrace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StopKind {
+    /// An ordinary job-control stop (`SIGSTOP`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU`).
+    JobControl,
+    /// A ptrace-induced stop (`PTRACE_ATTACH`, `PTRACE_TRACEME`, or signal interception).
+    Ptrace,
+}
+
 /// What a single reaped or observed child transition reports to `wait`.
 ///
 /// `visible_pid` is the PID-namespace identity the guest is owed, captured at
@@ -19,6 +28,7 @@ pub struct ChildExit {
     visible_pid: i32,
     ruid: carrick_abi::NsUid,
     status: i32,
+    stop_kind: Option<StopKind>,
 }
 
 impl ChildExit {
@@ -36,7 +46,37 @@ impl ChildExit {
             visible_pid,
             ruid,
             status,
+            stop_kind: None,
         }
+    }
+
+    /// Record one stopped child transition, deriving the encoded Linux stop
+    /// status (`(signal << 8) | 0x7f`) from the underlying [`carrick_abi::LinuxSignal`]
+    /// and preserving the exact [`StopKind`].
+    pub const fn stopped(
+        pid: crate::kernel::TaskId,
+        visible_pid: i32,
+        ruid: carrick_abi::NsUid,
+        signal: crate::kernel::LinuxSignal,
+        kind: StopKind,
+    ) -> Self {
+        Self {
+            pid,
+            visible_pid,
+            ruid,
+            status: (signal.raw() << 8) | 0x7f,
+            stop_kind: Some(kind),
+        }
+    }
+
+    /// The stop kind if this event represents a stopped child transition.
+    pub const fn stop_kind(self) -> Option<StopKind> {
+        self.stop_kind
+    }
+
+    /// Whether this child state change is a ptrace stop.
+    pub const fn is_ptrace_stop(self) -> bool {
+        matches!(self.stop_kind, Some(StopKind::Ptrace))
     }
 
     /// The reaped child's kernel task id — the graph identity, not the

@@ -1094,6 +1094,7 @@ mod tests {
     use carrick_hal::ThreadId;
 
     use super::*;
+    use crate::kernel::StopKind;
     use crate::kernel::clone_plan::ClonePlan;
     use crate::kernel::objects::{LinuxWaitStatus, PtraceSynchronousFault};
     use crate::kernel::operations::tests::{bootstrap, fork_child};
@@ -1654,6 +1655,7 @@ mod tests {
 
         assert!(kernel.stop_task_for_job_control(child_id, sigstop, None));
         assert!(kernel.task_is_job_control_stopped(child_id));
+
         assert_eq!(
             kernel
                 .wait_child_with_job_control(
@@ -1669,6 +1671,7 @@ mod tests {
                 task: child_id,
                 signal: sigstop,
                 ruid: child_ruid,
+                kind: StopKind::JobControl,
             }
         );
 
@@ -1724,6 +1727,7 @@ mod tests {
                 task: child_id,
                 signal,
                 ruid: child_ruid,
+                kind: StopKind::Ptrace,
             }
         );
         assert!(!kernel.resume_task_from_ptrace(child.task().key(), child_id, None,));
@@ -1843,6 +1847,7 @@ mod tests {
                 task: tracee_id,
                 signal: sigstop,
                 ruid: tracee_ruid,
+                kind: StopKind::Ptrace,
             }
         );
         assert!(tracee.task().is_job_control_stopped());
@@ -2232,6 +2237,7 @@ mod tests {
                 task: child_id,
                 signal: sigstop,
                 ruid: child_ruid,
+                kind: StopKind::JobControl,
             },
             "only an intervening SIGCONT invalidates dequeued stop work",
         );
