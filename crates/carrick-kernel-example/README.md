@@ -31,12 +31,18 @@ variant.
   accepts a successful return, not an unexpected errno. Failures identify the
   task and syscall label.
 - A fork syscall is followed by `Step::ChildMarker` with the child's script.
-  `await_parked(pid, label)` establishes that another task enrolled its wait
+  `await_parked(tid, label)` establishes that another task enrolled its wait
   before the next action. Do not sleep to arrange execution order.
+
+Use `alloc_word`/`write_word` or `alloc_buffer`/`write_buffer` for persistent
+memory referenced through slots, including futex words shared by sibling threads.
+Fork copies this memory; clone threads share it. Completions and outputs carry
+both pid and tid. Park notifications retain enrollment history, so use unique
+labels for separate synchronization edges.
 
 Give separate labels to calls whose outputs you need to distinguish.
 `RunReport` exposes completions, output bytes, deaths, task counts, and
-`dispatches_for(pid, label)`. A blocked read awakened by a writer dispatches
+`dispatches_for(pid, label)` and `dispatches_for_tid(tid, label)`. A blocked read awakened by a writer dispatches
 exactly twice. A continuation that returns its result directly, such as a
 successful futex wait, must not redispatch the original request.
 

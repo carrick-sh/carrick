@@ -985,7 +985,7 @@ test-kernel *ARGS:
 | 8–10 | 17 IPC/epoll/pidfd tests pass; SCM_CREDENTIALS test retained as a named defect. Epoll alias defects fixed. |
 | 11–12 | Parallel/serial partition and ratchet accepted after ten-run qualification and exact name reconciliation. |
 | 13 | Recipe/docs implemented; final warm timing awaits thread integration. |
-| 14–15 | Thread/futex candidate under final lifecycle review; not accepted yet. |
+| 14–15 | Thread/futex implementation accepted; integrated host gates below remain the final closure check. |
 
 - Integrated kernel test inventory: 2092 names (2084 original plus eight
   signal/exit regressions), with zero original names lost. VFS: 283 names,
@@ -999,3 +999,25 @@ test-kernel *ARGS:
   test-double string counts are zero. SHA-256, CDHash, UUID, entitlement and DOF
   receipts: `/tmp/kernel-harness-product-receipt.json`. This proves build and
   product closure only. No signed guest conformance run or push is claimed.
+
+### Thread and futex acceptance
+
+- Integrated worker `e79901b3c` as `8e892b8ce`, preserving IPC checked layouts,
+  tagged outputs and exact thread contexts. Threads share dispatcher, memory,
+  descriptor authority and the process-local futex table. Fork copies memory
+  and allocates a separate futex table. Exit versus exit_group, root/sibling
+  cancellation, clear_child_tid, wake counts, requeue and private fork isolation
+  are covered without sleep-based ordering.
+- Director added exact-thread signal wake routing, matching the carrier's
+  already-posted signal protocol. Red: `/tmp/kernel-harness-thread-signal-red.log`
+  (`WaitTimedOut("wait4")`); green: `/tmp/kernel-harness-thread-final-green.log`.
+  Initial new dispatch-count assertion was corrected from one to two:
+  WaitOnSignals redispatches to consume the pending signal. Futex completion
+  instead returns directly and dispatches once; Task 15's illustrative count
+  of two would duplicate a successful wait and is intentionally not followed.
+- Serialized clone/fork reservations and terminal publication in the same
+  per-process lock order. Thread retirement releases that lock before waiting
+  on reservation events; terminal reporting uses the committed zombie status.
+- Final targeted verification: 1 library + 29 driver + 48 semantics pass,
+  two named semantics defects ignored; targeted Clippy passes. Receipts:
+  `/tmp/kernel-harness-thread-final-{green,clippy}.log`.

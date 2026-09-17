@@ -974,6 +974,7 @@ impl Task {
         child_script: &[Step],
         shared: &Arc<Shared>,
     ) -> Result<i32, ExampleError> {
+        let mut dispatcher = self.dispatcher.lock();
         let parent = &self.context;
         let plan = ClonePlan::from_flags(LinuxCloneFlags::from_bits_retain(flags))?
             .with_exit_signal(ChildExitSignal::for_clone_request(exit_signal));
@@ -991,26 +992,20 @@ impl Task {
 
         let parent_mm_id = parent.shared().mm().id();
         let child_mm_id = prepared.child_mm_id();
-        let prepared_mm = self.dispatcher.lock().prepare_fork_mm(
-            parent_mm_id,
-            child_mm_id,
-            CloneObjectMode::Copy,
-        )?;
+        let prepared_mm =
+            dispatcher.prepare_fork_mm(parent_mm_id, child_mm_id, CloneObjectMode::Copy)?;
         let (parent_guest_pid, child_guest_pid) = (guest_pid(parent_pid)?, guest_pid(child_pid)?);
-        let child_dispatcher =
-            self.dispatcher
-                .lock()
-                .with_mm_executor_mutation(|dispatcher, guard| {
-                    let permit = guard.host_alias_permit();
-                    dispatcher.fork_clone_with_prepared_mm_authorized(
-                        parent_mm_id,
-                        child_mm_id,
-                        parent_guest_pid,
-                        child_guest_pid,
-                        prepared_mm,
-                        &permit,
-                    )
-                })??;
+        let child_dispatcher = dispatcher.with_mm_executor_mutation(|dispatcher, guard| {
+            let permit = guard.host_alias_permit();
+            dispatcher.fork_clone_with_prepared_mm_authorized(
+                parent_mm_id,
+                child_mm_id,
+                parent_guest_pid,
+                child_guest_pid,
+                prepared_mm,
+                &permit,
+            )
+        })??;
 
         let published = prepared.commit()?;
         let (child_context, _vfork_parent_wait) = published.into_parts()?;
@@ -1060,6 +1055,7 @@ impl Task {
         child_script: &[Step],
         shared: &Arc<Shared>,
     ) -> Result<i32, ExampleError> {
+        let _dispatcher = self.dispatcher.lock();
         let parent = &self.context;
         let plan = ClonePlan::from_flags(LinuxCloneFlags::from_bits_retain(flags))?;
         let reservation = parent.kernel().reserve_thread_clone(parent, plan, None)?;
@@ -1122,13 +1118,13 @@ impl Task {
         }
         disp.retire_hvpatch_process_fds(&self.context);
         let adopter = disp.hvpatch_orphan_adopter();
-        self.context.kernel().exit_task_key_eventually_notifying(
+        let zombie = self.context.kernel().exit_task_key_eventually_notifying(
             task_key,
             status,
             adopter,
             |_| {},
         )?;
-        let raw = status.raw();
+        let raw = zombie.status.raw();
         let winning_code = if (raw & 0x7f) != 0 {
             raw & 0x7f
         } else {
@@ -1161,10 +1157,11 @@ impl Task {
         let linux_tid = self.context.thread().key().tid;
         let deadline = Instant::now() + WAIT_BOUND;
         loop {
+            let dispatcher = self.dispatcher.lock();
             let res = self.process.exit_thread(linux_tid)?;
             match res {
                 carrick_kernel::kernel::ProcessThreadExit::Retired(retired) => {
-                    self.dispatcher.lock().close_draining_file_table(
+                    dispatcher.close_draining_file_table(
                         self.context.kernel(),
                         &retired.files(),
                         Some(retired.owner()),
@@ -1176,10 +1173,12 @@ impl Task {
                     break;
                 }
                 carrick_kernel::kernel::ProcessThreadExit::LastThread => {
+                    drop(dispatcher);
                     self.on_exit(code, shared)?;
                     break;
                 }
                 carrick_kernel::kernel::ProcessThreadExit::Busy { observed_epoch } => {
+                    drop(dispatcher);
                     let now = Instant::now();
                     if now >= deadline {
                         return Err(ExampleError::WaitTimedOut("reservation busy epoch change"));

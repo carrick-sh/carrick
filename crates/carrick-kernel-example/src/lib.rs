@@ -8,9 +8,9 @@
 //!   ([`ScriptedBackend::run_root`], [`ExampleProcess::boot_root`]);
 //! - translate its trap source into `SyscallRequest`s (here, a script of
 //!   [`Step`]s);
-//! - interpret every `DispatchOutcome` it meets (`Task::issue` in
-//!   `scripted.rs`: `Returned`, `Errno`, `Exit`, `Fork`, `WaitOnHvpatchChild`,
-//!   `WaitOnFds`, `SchedulerYield`; anything else is refused by name);
+//! - interpret outcomes in `driver::drive`: returns, process/thread exit,
+//!   fork/clone, exact-thread signals, and shared kernel continuations;
+//!   unsupported outcomes are refused by name;
 //! - implement the process seams the dispatcher binds to
 //!   ([`ExampleProcess`] as `CarrierProcess`, [`ExampleMmBackend`] as
 //!   `MmBackend`, [`ExampleStage1Projection`] as `Stage1MmProjection`).

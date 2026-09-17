@@ -314,6 +314,26 @@ pub(crate) fn drive(
                         clear_child_tid_addr,
                     });
                 }
+                DispatchOutcome::SignalThread {
+                    tid: target,
+                    kernel_target,
+                    ..
+                } => {
+                    let exact = kernel_target.ok_or_else(|| {
+                        ExampleError::Unsupported(
+                            "legacy host thread signal routing is not a scripted kernel operation"
+                                .to_owned(),
+                        )
+                    })?;
+                    if exact.tid.raw() != target.raw() {
+                        return Err(ExampleError::Script(
+                            "thread signal target identity mismatch".to_owned(),
+                        ));
+                    }
+                    // Dispatch already authorized and posted this exact-thread signal.
+                    shared.wait_service.publish_signal_for_thread(exact);
+                    outcome = DispatchOutcome::Returned { value: 0 };
+                }
                 DispatchOutcome::SchedulerYield => {
                     std::thread::yield_now();
                     return Ok(InternalCompletion::Returned(0));
