@@ -92,6 +92,7 @@ compile/lint/test only.
 | `just check [ARGS]` | Fast **unsigned** `cargo build` — compile-check only, cannot run a guest. |
 | `just test` | Host lib and harness tests (no HVF/Docker). **Use the recipe, never a bare `cargo test --workspace --lib`.** Kernel and VFS run their parallel tests with `--skip serial_host`, then run the `serial_host` modules under `RUST_TEST_THREADS=1`. `scripts/migrate/check-serial-host-tests.py` ratchets this partition: host fork/spawn, environment/rlimit/umask mutation, and exact process-wide filesystem counters stay serial. Child reaping is process-wide; a module-local lock cannot protect sibling tests. `carrick-host`, `carrick-runtime`, and `carrick-vmm-hvf` retain their serial lanes; the justfile explains each reason. |
 | `just test-kernel [ARGS]` | VM-free conformance inner loop: parallel kernel lib tests plus the scripted kernel-semantics integration suites. No codesign or Docker; run `just test` and the signed gates before push. |
+| `just test-kernel-semantics [ARGS]` | The semantics suites alone (`crates/carrick-kernel-example`); host-portable, so hosted CI runs them natively on a Linux aarch64 runner (`kernel-linux-native`) as the fast independent signal. |
 | `just test-integration` | Host integration suites (`carrick-runtime`/`engine`/`image`; no HVF). |
 | `just clippy` | `cargo clippy --workspace --all-targets -- -D warnings` (no-panic gate). |
 | `just fmt` / `just fmt-check` | Apply / check formatting. |

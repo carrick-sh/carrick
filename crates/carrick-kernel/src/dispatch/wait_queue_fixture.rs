@@ -81,7 +81,16 @@ fn listener_key(port: u16) -> InZoneListenerKey {
 fn loopback_sockaddr(port: u16) -> libc::sockaddr_in {
     let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     addr.sin_family = libc::AF_INET as libc::sa_family_t;
-    addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+    }
     addr.sin_port = port.to_be();
     addr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
     addr

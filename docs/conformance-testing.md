@@ -31,6 +31,11 @@ how-to-run-and-interpret companion.
 ## Kernel semantics suite
 
 `just test-kernel` is the VM-free inner loop for a kernel conformance defect.
+The semantics suites it runs are host-portable: hosted CI runs them natively on a
+Linux aarch64 runner (`kernel-linux-native`, `just test-kernel-semantics`) with no
+VMM, so a semantics regression is reported within minutes of a push, independent
+of the macOS job, and `just check-kernel-portable` compiles the kernel's tests and
+the suites for the Linux target on every `just ci`.
 It runs the kernel lib tests outside `serial_host` and the integration suites in
 [`carrick-kernel-example`](../crates/carrick-kernel-example/README.md). Scripts
 exercise the public syscall dispatcher and kernel-owned waits, process identity,
