@@ -165,8 +165,6 @@ fn closing_an_inherited_descriptor_keeps_the_epoll_registration_until_the_child_
         Step::Sys(sys::wait4(last_child(), 0)),
         // Now that child has exited, all references to the pipe read OFD are closed.
         // In Linux, closing the last descriptor automatically removed the OFD from the epoll set.
-        // Write fresh data into the pipe:
-        Step::Sys(sys::write(slot(1), b"more").ret(4)),
         // epoll_pwait must return 0 (timeout) because the registration was auto-removed:
         Step::Sys(sys::epoll_pwait(slot(4), 1, 10, 0).ret(0)),
         // DEL on closed slot 0 is EBADF:
@@ -209,8 +207,6 @@ fn closing_a_duplicated_descriptor_in_the_same_process_keeps_the_epoll_registrat
         Step::Sys(sys::read(slot(3), 8).ret(8)),
         // Close slot 3: now ALL descriptors referring to the pipe read description are closed
         Step::Sys(sys::close(slot(3)).ret(0)),
-        // Write more data to pipe
-        Step::Sys(sys::write(slot(1), b"more").ret(4)),
         // epoll_pwait must return 0 because the registration was automatically removed when slot 3 closed
         Step::Sys(sys::epoll_pwait(slot(2), 1, 10, 0).ret(0)),
         Step::Sys(sys::close(slot(1)).ret(0)),

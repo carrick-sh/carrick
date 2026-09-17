@@ -837,3 +837,188 @@ pub fn waitid(idtype: i32, id: impl Into<Operand>, options: i32) -> Syscall {
         ],
     )
 }
+
+/// `waitid(2)` with a custom diagnostic label.
+pub fn waitid_labeled(
+    label: &'static str,
+    idtype: impl Into<Operand>,
+    id: impl Into<Operand>,
+    options: i32,
+) -> Syscall {
+    call(
+        label,
+        nr::WAITID,
+        [
+            idtype.into(),
+            id.into(),
+            Operand::Out(128),
+            (options as i64).into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `wait4(2)` with a custom diagnostic label and 4-byte `wstatus` buffer at arg 1.
+pub fn wait4_labeled(label: &'static str, pid: impl Into<Operand>, options: i32) -> Syscall {
+    call(
+        label,
+        nr::WAIT4,
+        [
+            pid.into(),
+            Operand::Out(4),
+            (options as i64).into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `prctl(2)`: operations on a process.
+pub fn prctl(option: i32, arg2: impl Into<Operand>) -> Syscall {
+    call(
+        "prctl",
+        nr::PRCTL,
+        [
+            (option as i64).into(),
+            arg2.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `setpgid(2)`: set process group ID.
+pub fn setpgid(pid: impl Into<Operand>, pgid: impl Into<Operand>) -> Syscall {
+    call(
+        "setpgid",
+        nr::SETPGID,
+        [
+            pid.into(),
+            pgid.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `getpgid(2)`: get process group ID.
+pub fn getpgid(pid: impl Into<Operand>) -> Syscall {
+    call(
+        "getpgid",
+        nr::GETPGID,
+        [pid.into(), 0.into(), 0.into(), 0.into(), 0.into(), 0.into()],
+    )
+}
+
+/// `getpgrp(2)`: get process group ID of calling process.
+pub fn getpgrp() -> Syscall {
+    getpgid(0)
+}
+
+/// `setsid(2)`: create a new session and set process group ID.
+pub fn setsid() -> Syscall {
+    call(
+        "setsid",
+        nr::SETSID,
+        [0.into(), 0.into(), 0.into(), 0.into(), 0.into(), 0.into()],
+    )
+}
+
+/// `getsid(2)`: get session ID.
+pub fn getsid(pid: impl Into<Operand>) -> Syscall {
+    call(
+        "getsid",
+        nr::GETSID,
+        [pid.into(), 0.into(), 0.into(), 0.into(), 0.into(), 0.into()],
+    )
+}
+
+/// `fcntl(2)`: manipulate file descriptor.
+pub fn fcntl(fd: impl Into<Operand>, cmd: i32, arg: impl Into<Operand>) -> Syscall {
+    call(
+        "fcntl",
+        nr::FCNTL,
+        [
+            fd.into(),
+            (cmd as i64).into(),
+            arg.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `fcntl(fd, F_SETFL, flags)`.
+pub fn fcntl_setfl(fd: impl Into<Operand>, flags: i32) -> Syscall {
+    fcntl(fd, carrick_abi::LINUX_F_SETFL as i32, flags)
+}
+
+/// `fcntl(fd, F_SETPIPE_SZ, size)`.
+pub fn fcntl_setpipe_sz(fd: impl Into<Operand>, size: i32) -> Syscall {
+    fcntl(fd, carrick_abi::LINUX_F_SETPIPE_SZ as i32, size as i64)
+}
+
+/// `fcntl(fd, F_GETPIPE_SZ, 0)`.
+pub fn fcntl_getpipe_sz(fd: impl Into<Operand>) -> Syscall {
+    fcntl(fd, carrick_abi::LINUX_F_GETPIPE_SZ as i32, 0)
+}
+
+/// `ioctl(2)`: control device / descriptor.
+pub fn ioctl(fd: impl Into<Operand>, request: u64, arg: impl Into<Operand>) -> Syscall {
+    call(
+        "ioctl",
+        nr::IOCTL,
+        [
+            fd.into(),
+            (request as i64).into(),
+            arg.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `ioctl(fd, FIONREAD, &mut bytes_ready)` with a custom diagnostic label.
+pub fn ioctl_fionread_labeled(label: &'static str, fd: impl Into<Operand>) -> Syscall {
+    call(
+        label,
+        nr::IOCTL,
+        [
+            fd.into(),
+            (carrick_abi::LINUX_FIONREAD as i64).into(),
+            Operand::Out(4),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `ioctl(fd, FIONREAD, &mut bytes_ready)`.
+pub fn ioctl_fionread(fd: impl Into<Operand>) -> Syscall {
+    ioctl_fionread_labeled("ioctl_fionread", fd)
+}
+
+/// `dup3(2)`: duplicate a file descriptor.
+pub fn dup3(oldfd: impl Into<Operand>, newfd: impl Into<Operand>, flags: i32) -> Syscall {
+    call(
+        "dup3",
+        nr::DUP3,
+        [
+            oldfd.into(),
+            newfd.into(),
+            (flags as i64).into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}

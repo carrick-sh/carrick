@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use carrick_abi::{LINUX_EBADF, LINUX_EINVAL};
 use carrick_kernel_example::{
-    ExampleError, Layout, Operand, RelocWidth, ScriptedBackend, Step, WAIT_BOUND, await_parked,
-    in_out, last_child, slot, sys, tagged_out,
+    ExampleError, Layout, RelocWidth, ScriptedBackend, Step, WAIT_BOUND, await_parked, in_out,
+    last_child, slot, sys, tagged_out,
 };
 
 #[test]
@@ -756,5 +756,28 @@ fn duplicate_capture_tags_in_one_syscall_rejects() {
             "unexpected error message: {msg}"
         ),
         other => panic!("expected ExampleError::Script, got {other:?}"),
+    }
+}
+
+#[test]
+fn layout_integer_signedness_is_checked_before_dispatch() {
+    for (width, value) in [
+        (RelocWidth::U8, -1i64),
+        (RelocWidth::U16, -1),
+        (RelocWidth::U32, -1),
+        (RelocWidth::I16, i16::MAX as i64 + 1),
+        (RelocWidth::I32, i32::MAX as i64 + 1),
+    ] {
+        let error = ScriptedBackend::new()
+            .run_root(vec![Step::Sys(sys::sendmsg(
+                1,
+                Layout::new(8).with_reloc(0, width, value),
+                0,
+            ))])
+            .expect_err("out-of-range typed integer must fail before syscall dispatch");
+        assert!(
+            matches!(error, ExampleError::Script(ref message) if message.contains("does not fit in width")),
+            "{width:?}: {error}"
+        );
     }
 }
