@@ -13,3 +13,10 @@ mod pgrp;
 mod pipe;
 #[path = "semantics/wait.rs"]
 mod wait;
+
+#[path = "semantics/epoll.rs"]
+mod epoll;
+#[path = "semantics/pidfd.rs"]
+mod pidfd;
+#[path = "semantics/unix.rs"]
+mod unix;

@@ -20,8 +20,10 @@ pub struct Output {
     pub pid: i32,
     /// The diagnostic label of the syscall.
     pub label: &'static str,
-    /// The argument index (0..5) of the `Out` operand.
+    /// The argument index (0..5) of the operand.
     pub arg: usize,
+    /// An optional diagnostic / indexing tag.
+    pub tag: Option<&'static str>,
     /// The captured bytes.
     pub bytes: Vec<u8>,
 }
@@ -77,6 +79,11 @@ impl RunReport {
             .count()
     }
 
+    /// Return all captured outputs for a given syscall `label`.
+    pub fn outputs_for(&self, label: &str) -> Vec<&Output> {
+        self.outputs.iter().filter(|o| o.label == label).collect()
+    }
+
     /// The bytes of the first output captured for `label` (panics if none).
     #[allow(clippy::panic)]
     pub fn output(&self, label: &str) -> &[u8] {
@@ -85,6 +92,16 @@ impl RunReport {
             .find(|o| o.label == label)
             .map(|o| o.bytes.as_slice())
             .unwrap_or_else(|| panic!("no output captured for label {label}"))
+    }
+
+    /// The bytes of the first output captured with `tag` (panics if none).
+    #[allow(clippy::panic)]
+    pub fn output_tagged(&self, tag: &str) -> &[u8] {
+        self.outputs
+            .iter()
+            .find(|o| o.tag == Some(tag))
+            .map(|o| o.bytes.as_slice())
+            .unwrap_or_else(|| panic!("no output captured for tag {tag}"))
     }
 
     /// The return value of the first completion for `label` (panics if none or errno).

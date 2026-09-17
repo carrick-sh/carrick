@@ -9,7 +9,8 @@ use std::time::Instant;
 
 use carrick_abi::{LINUX_EBADF, LINUX_EINVAL};
 use carrick_kernel_example::{
-    ExampleError, ScriptedBackend, Step, WAIT_BOUND, await_parked, in_out, last_child, slot, sys,
+    ExampleError, Layout, Operand, RelocWidth, ScriptedBackend, Step, WAIT_BOUND, await_parked,
+    in_out, last_child, slot, sys, tagged_out,
 };
 
 #[test]
@@ -632,4 +633,128 @@ fn sigprocmask_blocked_sigchld_received_by_signalfd4_with_pid_and_status() {
     assert_eq!(ssi_signo, carrick_abi::LINUX_SIGCHLD as u32); // 17
     assert_eq!(ssi_code, CLD_EXITED);
     assert_eq!(ssi_pid, 2); // child pid is 2
+}
+
+#[test]
+fn layout_relocation_offset_overflow_rejects() {
+    let script = vec![
+        Step::Sys(sys::sendmsg(1, Layout::new(16).with_u32(usize::MAX, 42), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let err = ScriptedBackend::new()
+        .run_root(script)
+        .expect_err("offset overflow must return Script error");
+    match err {
+        ExampleError::Script(msg) => assert!(
+            msg.contains("offset overflow"),
+            "unexpected error message: {msg}"
+        ),
+        other => panic!("expected ExampleError::Script, got {other:?}"),
+    }
+}
+
+#[test]
+fn layout_write_outside_layout_bounds_rejects() {
+    let script = vec![
+        Step::Sys(sys::sendmsg(1, Layout::new(8).with_u32(10, 42), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let err = ScriptedBackend::new()
+        .run_root(script)
+        .expect_err("OOB write must return Script error");
+    match err {
+        ExampleError::Script(msg) => assert!(
+            msg.contains("exceeds layout size"),
+            "unexpected error message: {msg}"
+        ),
+        other => panic!("expected ExampleError::Script, got {other:?}"),
+    }
+}
+
+#[test]
+fn layout_narrow_integer_overflow_rejects() {
+    let script = vec![
+        Step::Sys(sys::sendmsg(
+            1,
+            Layout::new(8).with_reloc(0, RelocWidth::U8, 300),
+            0,
+        )),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let err = ScriptedBackend::new()
+        .run_root(script)
+        .expect_err("narrow integer overflow must return Script error");
+    match err {
+        ExampleError::Script(msg) => assert!(
+            msg.contains("does not fit in width"),
+            "unexpected error message: {msg}"
+        ),
+        other => panic!("expected ExampleError::Script, got {other:?}"),
+    }
+}
+
+#[test]
+fn tagged_save_out_of_bounds_rejects() {
+    let script = vec![
+        Step::Sys(
+            sys::pipe2(0)
+                .ret(0)
+                .save_tagged_out_i32("missing_tag", 0, 0),
+        ),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let err = ScriptedBackend::new()
+        .run_root(script)
+        .expect_err("missing tag must return Script error");
+    match err {
+        ExampleError::Script(msg) => assert!(
+            msg.contains("no out buffer with tag"),
+            "unexpected error message: {msg}"
+        ),
+        other => panic!("expected ExampleError::Script, got {other:?}"),
+    }
+
+    let script_oob = vec![
+        Step::Sys(
+            sys::pselect6(0, 0, 0, 0, tagged_out("timespec", 16), 0)
+                .ret(0)
+                .save_tagged_out_i32("timespec", 32, 0),
+        ),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let err_oob = ScriptedBackend::new()
+        .run_root(script_oob)
+        .expect_err("tagged out OOB offset must return Script error");
+    match err_oob {
+        ExampleError::Script(msg) => assert!(
+            msg.contains("exceeds out buffer len"),
+            "unexpected error message: {msg}"
+        ),
+        other => panic!("expected ExampleError::Script, got {other:?}"),
+    }
+}
+
+#[test]
+fn duplicate_capture_tags_in_one_syscall_rejects() {
+    let script = vec![
+        Step::Sys(sys::pselect6(
+            0,
+            tagged_out("dup_tag", 8),
+            tagged_out("dup_tag", 8),
+            0,
+            0,
+            0,
+        )),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let err = ScriptedBackend::new()
+        .run_root(script)
+        .expect_err("duplicate capture tag in one syscall must return Script error");
+    match err {
+        ExampleError::Script(msg) => assert!(
+            msg.contains("duplicate capture tag 'dup_tag'"),
+            "unexpected error message: {msg}"
+        ),
+        other => panic!("expected ExampleError::Script, got {other:?}"),
+    }
 }
