@@ -491,7 +491,9 @@ check-matrix:
 
 # Layering gate: carrick-vfs / carrick-kernel never depend upward; no VMM
 # depends on the kernel
-# (docs/superpowers/plans/2026-09-13-extract-carrick-vfs-and-carrick-kernel.md).
+# (docs/superpowers/plans/2026-09-13-extract-carrick-vfs-and-carrick-kernel.md);
+# and the product selection (root `default-members`, what `just build`
+# resolves) enables no `test-support` on carrick-kernel / carrick-hal.
 check-layering:
     ./scripts/closure-assert-layering.sh
 

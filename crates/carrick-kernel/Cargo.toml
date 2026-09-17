@@ -30,8 +30,11 @@ event-ring-dump = []
 # dispatcher on them, `process_context_for_tests`, and the `CarrierProcess`
 # test doubles. Enabled for this crate's own test targets through the self
 # dev-dependency below (a unit test sees `cfg(test)`, an integration test does
-# not); a product build never compiles it. `carrick-kernel-example` enables it
-# to build its backend from the doubles.
+# not). `carrick-kernel-example` enables it through a normal dependency to
+# build its backend from the doubles, which under resolver 2 unifies it into
+# every package sharing that selection; the product build never does (root
+# `default-members` = carrick-cli, and `just check-layering` fails if that
+# selection enables `test-support`).
 test-support = ["carrick-hal/test-support"]
 
 # NOTE: no `platform-*` features. This crate selects no VMM and no host

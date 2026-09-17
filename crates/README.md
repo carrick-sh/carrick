@@ -1,6 +1,6 @@
 # Carrick Crate Map
 
-Carrick is a 31-crate Cargo workspace. The product path is:
+Carrick is a 32-crate Cargo workspace. The product path is:
 
 ```text
 carrick-cli   -> carrick-engine -> { carrick-image, carrick-runtime -> carrick-kernel -> carrick-vfs } -> carrick-spec
@@ -27,7 +27,7 @@ Platform code is selected by Cargo features. The default feature is
 | `carrick-image` | OCI reference parsing, pull/cache, config and layer resolution. |
 | `carrick-runtime` | The execution lane: the HVPatch VM carrier, the vCPU and threaded loops, image preparation and the run lifecycle, the interactive/pty supervisors, the `carrick-hal` bridge implementations, and the platform-selected backend bins. It no longer contains the kernel. |
 | `carrick-kernel` | The Carrick kernel: the kernel object graph, syscall dispatch and its subsystems, namespaces, credentials, sockets, IPC, the in-zone network, the file authority, the kernel-view filesystems (procfs/sysfs/`/dev`/devpts) and the container/run state. Names no carrier and no VMM crate; reaches the execution lane only through `carrick-hal` traits. |
-| `carrick-kernel-example` | The bring-your-own-execution-backend template: a VM-less backend that runs scripted Linux tasks on host threads over `Vec`-backed guest memory against `carrick-kernel`'s public surface alone (Null `carrick-hal` bridges, its own `CarrierProcess`/`MmBackend`/`Stage1MmProjection`). Not on the product path; `just check-layering` keeps `carrick-runtime` and every VMM crate out of its closure. |
+| `carrick-kernel-example` | The bring-your-own-execution-backend template: a VM-less backend that runs scripted Linux tasks on host threads over `Vec`-backed guest memory against `carrick-kernel`'s public surface alone (Null `carrick-hal` bridges, its own `CarrierProcess`/`MmBackend`/`Stage1MmProjection`). Not on the product path: the root `default-members` keeps the product build to `carrick-cli`'s closure (its `test-support` dependency would otherwise unify into `carrick`), and `just check-layering` keeps `carrick-runtime` and every VMM crate out of its closure and `test-support` out of the product selection. |
 | `carrick-vfs` | The filesystem model below the kernel: the `Vfs` trait and mount table, dentry cache, host and in-memory backends, the OCI rootfs with its overlay and layer cache, the path codec, and the bind/resolv.conf/services mounts. Names no kernel, carrier or VMM type. |
 | `carrick-spec` | Shared vocabulary types: `RunSpec`, `ContainerSpec`, `ImageConfig`, mounts, namespace config, platform requests. |
 

@@ -28,7 +28,9 @@
 //! of those items regresses to `pub(crate)`.
 //!
 //! **Status:** experimental, like the kernel it drives. It is not on the
-//! product path and `carrick` ships none of it.
+//! product path and `carrick` ships none of it: the root manifest's
+//! `default-members` keeps the product build to `carrick-cli`'s closure, and
+//! `just check-layering` fails if that selection enables `test-support`.
 
 pub mod process;
 pub mod scripted;

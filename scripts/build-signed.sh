@@ -62,6 +62,12 @@ else
     source_state=dirty
 fi
 
+# No package flag on purpose: the selection is the root manifest's
+# `default-members` (carrick-cli), i.e. the shipped binary's closure and
+# nothing else. Do not add --workspace here: under resolver 2 that unifies
+# every member's normal-dependency features into the product -- for one,
+# carrick-kernel-example's `test-support` on carrick-kernel/carrick-hal.
+# `just check-layering` asserts the argument-less selection stays clean.
 # shellcheck disable=SC2086
 CARRICK_BUILD_SOURCE_HEAD="$source_head" \
     CARRICK_BUILD_SOURCE_TREE="$source_tree" \

@@ -9,6 +9,10 @@
 #   carrick-kernel         : carrick-runtime carrick-vmm-* applevisor*
 #   carrick-kernel-example : carrick-runtime carrick-vmm-* applevisor*
 #   carrick-vmm-*          : carrick-kernel
+# Product-closure feature rule (selection : forbidden feature):
+#   the argument-less selection (root `default-members`, what the signed
+#   product build in scripts/build-signed.sh resolves) : carrick-kernel and
+#   carrick-hal `test-support`
 # A crate that does not exist yet is skipped (the gate lands before the
 # crates it guards, so Phase 0 passes trivially).
 set -euo pipefail
@@ -101,4 +105,47 @@ for vmm in $(grep -E '^carrick-vmm-' <<<"$members"); do
   fi
   check "$vmm" "--target $target --all-features" 'carrick-kernel'
 done
+
+# Product-closure feature rule. The shipped binary is built by an
+# argument-less `cargo build --release` (scripts/build-signed.sh), whose
+# package selection is the root manifest's `default-members`. Under
+# resolver 2 a NORMAL dependency's features unify across every package in
+# one selection, so a non-product member that enables `test-support` on
+# carrick-kernel / carrick-hal (carrick-kernel-example does, for the Null
+# bridges its backend boots on) compiles that test-only surface --
+# `SyscallDispatcher::new()`, the Null bridges, the CarrierProcess doubles
+# -- into `carrick` the moment it shares the product's selection. That is
+# exactly what a whole-workspace selection did while the root manifest had
+# no `default-members` (found in review of the example crate, 2026-09-16).
+# This rule resolves the SAME argument-less selection the product build
+# uses (no -p, no --workspace) and fails closed: an unresolvable package or
+# a closure that does not even contain the crate is a FAIL, never an "ok"
+# that checked nothing. A `--workspace` selection (clippy, doc, test) does
+# unify the feature, on purpose: that is what lints and renders the gated
+# surface.
+default_members="$(cargo metadata --no-deps --format-version 1 | jq -r '.workspace_default_members[]' | sed -E 's#^(path\+file://)?##; s#\#.*$##' | xargs -n1 basename | sort | paste -sd ' ' -)"
+echo "layering: product selection (default-members) = ${default_members}"
+product_feature_rule() {
+  local crate="$1" tree
+  if ! tree="$(cargo tree --edges normal,features --invert "$crate" --prefix none 2>&1)"; then
+    echo "layering FAIL: cargo tree could not resolve $crate in the product selection:"
+    head -5 <<<"$tree"
+    fail=1
+    return
+  fi
+  if ! grep -Eq "^${crate} v" <<<"$tree"; then
+    echo "layering FAIL: $crate is not in the product selection's closure -- this rule would check nothing"
+    fail=1
+    return
+  fi
+  if grep -Eq "^${crate} feature \"test-support\"$" <<<"$tree"; then
+    echo "layering FAIL: the product selection enables $crate feature \"test-support\" (test-only surface in the shipped binary); enabled through:"
+    cargo tree --edges normal,features --invert "$crate" 2>/dev/null | grep -E -A3 "^.*${crate} feature \"test-support\"" | head -12 || true
+    fail=1
+    return
+  fi
+  echo "layering: product selection enables no $crate test-support ok"
+}
+product_feature_rule carrick-kernel
+product_feature_rule carrick-hal
 exit $fail
