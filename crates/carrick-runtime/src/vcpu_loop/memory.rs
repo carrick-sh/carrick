@@ -722,7 +722,7 @@ mod tests {
     };
 
     use carrick_kernel::kernel::mm_access::ProjectedForeignMmSnapshot;
-    use carrick_kernel::kernel::mm_access::tests::{
+    use carrick_kernel::kernel::mm_access::test_support::{
         MockCowCounters, MockCowFault, MockCowReceipt, MockCowTransport, bootstrap, cow_fixture,
         execution_lease, fixture_backend, foreign_mm, fork_with_backend, publish_cow_mapping,
         with_foreign_mutation,

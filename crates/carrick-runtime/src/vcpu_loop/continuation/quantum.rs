@@ -946,7 +946,7 @@ mod tests {
     use carrick_kernel::kernel::Scheduler;
 
     use super::*;
-    use carrick_kernel::kernel::continuation::tests::bootstrap;
+    use carrick_kernel::kernel::continuation::test_support::bootstrap;
     #[test]
     fn hvpatch_persistent_quantum_and_binding_exclude_executor_authority() {
         fn assert_send<T: Send>() {}

@@ -10,7 +10,7 @@ use carrick_hal::ThreadId;
 
 use crate::compat::SyscallArgs;
 use carrick_kernel::dispatch::{DispatchOutcome, FdWaitCompletion, SyscallRequest, WaitFds};
-use carrick_kernel::kernel::continuation::tests::{
+use carrick_kernel::kernel::continuation::test_support::{
     DISPATCH_FAMILIES, await_event, bootstrap, capture, publish,
 };
 use carrick_kernel::kernel::continuation::*;

@@ -4270,7 +4270,7 @@ impl BlockingSemop {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub fn blocking_semop_for_continuation_test() -> BlockingSemop {
     let set = SemSet {
         key: LINUX_IPC_PRIVATE,
