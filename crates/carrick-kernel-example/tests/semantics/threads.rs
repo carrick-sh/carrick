@@ -249,3 +249,42 @@ fn root_leader_parked_and_sibling_exit_group_terminates_with_exit_code() {
     assert_eq!(run.tasks_started(), 2);
     assert_eq!(run.dispatches_for_tid(1, "never_reached_sentinel"), 0);
 }
+
+#[test]
+fn tgkill_wakes_the_exact_sibling_signal_waiter() {
+    // tgkill(2), sigwaitinfo(2): the signal is directed to the named thread,
+    // and a blocked signal in its wait set is synchronously consumed there.
+    let mask = 1u64 << (LINUX_SIGUSR1 - 1);
+    let run = run(vec![
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            pipe_to_slots(0, 1),
+            Step::Sys(sys::getpid().save(3)),
+            Step::Sys(sys::clone_thread(0).save(2)),
+            Step::ChildMarker(vec![
+                Step::Sys(sys::rt_sigprocmask_block(mask).ret(0)),
+                Step::Sys(sys::rt_sigtimedwait_siginfo(mask).ret(LINUX_SIGUSR1 as i64)),
+                Step::Sys(sys::write(slot(1), b"signal").ret(6)),
+                Step::Sys(sys::exit_thread(0)),
+            ]),
+            await_parked(slot(2), "rt_sigtimedwait"),
+            Step::Sys(sys::tgkill(slot(3), slot(2), LINUX_SIGUSR1).ret(0)),
+            Step::Sys(sys::read(slot(0), 6).ret(6)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ]);
+    assert_eq!(run.output("read"), b"signal");
+    // WaitOnSignals resumes by redispatching to consume the pending signal.
+    assert_eq!(run.dispatches_for_tid(3, "rt_sigtimedwait"), 2);
+    let received = run
+        .completions()
+        .iter()
+        .find(|c| c.label == "rt_sigtimedwait")
+        .unwrap();
+    assert_eq!(
+        (received.pid, received.tid, received.result),
+        (2, 3, Ok(LINUX_SIGUSR1 as i64))
+    );
+}
