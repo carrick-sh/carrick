@@ -35,6 +35,7 @@
 //! `default-members` keeps the product build to `carrick-cli`'s closure, and
 //! `just check-layering` fails if that selection enables `test-support`.
 
+pub mod driver;
 pub mod memory;
 pub mod operand;
 pub mod process;
@@ -43,7 +44,9 @@ pub mod scripted;
 pub mod sys;
 
 pub use memory::{GUEST_BASE, GUEST_LEN, TaskMemory};
-pub use operand::{Expect, Operand, Save, Step, Syscall, last_child, slot};
+pub use operand::{
+    Expect, Operand, Save, Step, Syscall, await_parked, host_sleep_ms, last_child, slot,
+};
 pub use process::{
     AddressSpace, AddressSpaceError, AsidAllocator, ExampleInstallPermit, ExampleMmBackend,
     ExampleProcess, ExampleStage1Projection,

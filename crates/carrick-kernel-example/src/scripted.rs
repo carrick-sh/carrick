@@ -12,6 +12,7 @@
 //! `WaitOnFds` outcome is re-dispatched after a `yield_now`, bounded by
 //! [`WAIT_BOUND`] so a lost wake is a failed run, not a hang.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
@@ -20,17 +21,17 @@ use std::time::{Duration, Instant};
 use carrick_abi::{LINUX_BOOTSTRAP_PID, LinuxCloneFlags, LinuxErrno};
 use carrick_guest_mem::MemoryError;
 use carrick_hal::{NullGuestTimerBridge, NullHostSignalBridge};
-use carrick_kernel::compat::{CompatReporter, SyscallArgs};
+use carrick_kernel::compat::CompatReporter;
 use carrick_kernel::dispatch::mm_authority::PrepareDispatchMmForkError;
-use carrick_kernel::dispatch::{
-    CarrierBridges, DispatchError, DispatchOutcome, SyscallDispatcher, SyscallRequest,
-};
+use carrick_kernel::dispatch::{CarrierBridges, DispatchError, SyscallDispatcher};
+use carrick_kernel::kernel::continuation::CarrierWaitService;
+use carrick_kernel::kernel::objects::ExecutionGeneration;
 use carrick_kernel::kernel::{
     CarrierProcess, ChildExitSignal, CloneObjectMode, ClonePlan, ClonePlanError, KernelError,
-    KernelOperationError, LinuxWaitStatus, SnapshotError,
+    KernelOperationError, KernelTaskBinding, LinuxWaitStatus, Scheduler, SnapshotError, TaskKey,
 };
 use carrick_kernel::thread::ThreadId;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::memory::TaskMemory;
 use crate::operand::{Expect, Operand, Save, Step, Syscall};
@@ -127,25 +128,40 @@ impl ScriptedBackend {
     /// bound to the root's [`ExampleProcess`] so child waits resolve in the
     /// kernel graph.
     pub fn run_root(self, script: Vec<Step>) -> Result<RunReport, ExampleError> {
-        let shared = Arc::new(Shared {
-            asids: AsidAllocator::new(),
-            ledger: Mutex::new(Ledger::default()),
-            children: Mutex::new(Vec::new()),
-            dispatches: AtomicUsize::new(0),
-        });
-        let space = AddressSpace::allocate(&shared.asids)?;
-        let (process, _root) = ExampleProcess::boot_root(
+        let asids = AsidAllocator::new();
+        let space = AddressSpace::allocate(&asids)?;
+        let (process, root_context) = ExampleProcess::boot_root(
             ROOT_PID,
             "example-root",
             Arc::clone(&self.bridges.host_signal),
             space,
         )?;
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(root_context.kernel())));
+        let wait_service = CarrierWaitService::try_new(scheduler).map_err(|e| {
+            ExampleError::Unsupported(format!("carrier wait service init failed: {e}"))
+        })?;
+
+        let shared = Arc::new(Shared {
+            asids,
+            ledger: Mutex::new(Ledger::default()),
+            children: Mutex::new(Vec::new()),
+            dispatches: AtomicUsize::new(0),
+            parked_notifications: Mutex::new(HashSet::new()),
+            parked_condvar: Condvar::new(),
+            wait_service,
+            process_bindings: Mutex::new(HashMap::new()),
+        });
+        shared
+            .process_bindings
+            .lock()
+            .insert(process.task_key(), process.task_binding());
         let process = Arc::new(process);
         let dispatcher = SyscallDispatcher::with_bridges(self.bridges);
         dispatcher.bind_hvpatch_process(Arc::clone(&process) as Arc<dyn CarrierProcess>);
         if let Some(failure) = process.take_bind_failure() {
             return Err(failure.into());
         }
+        let root_generation = crate::driver::seed_initial_task_state(&root_context)?;
         let mut root = Task {
             dispatcher,
             process,
@@ -153,6 +169,7 @@ impl ScriptedBackend {
             slots: Vec::new(),
             last_child: None,
             reporter: CompatReporter::default(),
+            execution_generation: root_generation,
         };
         shared.ledger.lock().tasks_started = 1;
         let root_exit = root.run(&script, &shared);
@@ -201,40 +218,78 @@ impl ScriptedBackend {
 }
 
 /// State every task of a run shares.
-struct Shared {
-    asids: AsidAllocator,
-    ledger: Mutex<Ledger>,
-    children: Mutex<Vec<JoinHandle<()>>>,
-    dispatches: AtomicUsize,
+pub(crate) struct Shared {
+    pub(crate) asids: AsidAllocator,
+    pub(crate) ledger: Mutex<Ledger>,
+    pub(crate) children: Mutex<Vec<JoinHandle<()>>>,
+    pub(crate) dispatches: AtomicUsize,
+    pub(crate) parked_notifications: Mutex<HashSet<(i32, &'static str)>>,
+    pub(crate) parked_condvar: Condvar,
+    pub(crate) wait_service: CarrierWaitService,
+    pub(crate) process_bindings: Mutex<HashMap<TaskKey, KernelTaskBinding>>,
+}
+
+impl Shared {
+    pub(crate) fn notify_parked(&self, pid: i32, label: &'static str) {
+        self.parked_notifications.lock().insert((pid, label));
+        self.parked_condvar.notify_all();
+    }
+
+    pub(crate) fn await_parked(
+        &self,
+        pid: i32,
+        label: &'static str,
+        timeout: Duration,
+    ) -> Result<(), ExampleError> {
+        let deadline = Instant::now() + timeout;
+        let mut parked = self.parked_notifications.lock();
+        while !parked.contains(&(pid, label)) {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(ExampleError::WaitTimedOut(label));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let timed_out = self
+                .parked_condvar
+                .wait_for(&mut parked, remaining)
+                .timed_out();
+            if timed_out && !parked.contains(&(pid, label)) {
+                return Err(ExampleError::WaitTimedOut(label));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
-struct Ledger {
-    completions: Vec<Completion>,
-    outputs: Vec<Output>,
-    deaths: Vec<(i32, i32)>,
-    dispatch_events: Vec<(i32, &'static str)>,
-    tasks_started: usize,
-    task_failures: Vec<(i32, ExampleError)>,
+pub(crate) struct Ledger {
+    pub(crate) completions: Vec<Completion>,
+    pub(crate) outputs: Vec<Output>,
+    pub(crate) deaths: Vec<(i32, i32)>,
+    pub(crate) dispatch_events: Vec<(i32, &'static str)>,
+    pub(crate) tasks_started: usize,
+    pub(crate) task_failures: Vec<(i32, ExampleError)>,
 }
 
 /// How one issued syscall ended internally.
 #[derive(Debug)]
-enum InternalCompletion {
+pub(crate) enum InternalCompletion {
     Returned(i64),
     Errno(LinuxErrno),
     Exit(i32),
+    Death(i32),
     Fork { flags: u64, exit_signal: u32 },
 }
 
 /// One Linux task: a host thread's worth of backend state.
-struct Task {
-    dispatcher: SyscallDispatcher,
-    process: Arc<ExampleProcess>,
-    memory: TaskMemory,
-    slots: Vec<i64>,
-    last_child: Option<i32>,
-    reporter: CompatReporter,
+pub(crate) struct Task {
+    pub(crate) dispatcher: SyscallDispatcher,
+    pub(crate) process: Arc<ExampleProcess>,
+    pub(crate) memory: TaskMemory,
+    pub(crate) slots: Vec<i64>,
+    pub(crate) last_child: Option<i32>,
+    pub(crate) reporter: CompatReporter,
+    pub(crate) execution_generation: ExecutionGeneration,
 }
 
 impl Task {
@@ -248,9 +303,15 @@ impl Task {
                         "child_marker without a preceding fork".to_owned(),
                     ));
                 }
+                Step::HostSleepMs(ms) => {
+                    thread::sleep(Duration::from_millis(*ms));
+                }
+                Step::AwaitParked { pid, label } => {
+                    shared.await_parked(*pid, label, WAIT_BOUND)?;
+                }
                 Step::Sys(syscall) => {
                     let (args, outs) = self.resolve(syscall)?;
-                    let completion = self.issue(syscall.label, syscall.nr.raw(), args, shared)?;
+                    let completion = crate::driver::drive(self, syscall, args, shared)?;
                     match completion {
                         InternalCompletion::Fork { flags, exit_signal } => {
                             let Some(Step::ChildMarker(child_script)) = steps.next() else {
@@ -291,9 +352,38 @@ impl Task {
                                     actual: format!("exit code {code}"),
                                 }),
                             };
-                            self.on_exit(code)?;
+                            self.on_exit(code, shared)?;
                             expectation_check?;
                             return Ok(code);
+                        }
+                        InternalCompletion::Death(sig) => {
+                            let pid = self.process.pid();
+                            shared.ledger.lock().deaths.push((pid, sig));
+                            let expectation_check = match &syscall.expect {
+                                Expect::Any => Ok(()),
+                                Expect::Death(expected) if *expected == sig => Ok(()),
+                                Expect::Death(expected) => Err(ExampleError::Expectation {
+                                    pid,
+                                    label: syscall.label,
+                                    expected: format!("death by signal {expected}"),
+                                    actual: format!("death by signal {sig}"),
+                                }),
+                                Expect::Ret(expected) => Err(ExampleError::Expectation {
+                                    pid,
+                                    label: syscall.label,
+                                    expected: format!("return value {expected}"),
+                                    actual: format!("death by signal {sig}"),
+                                }),
+                                Expect::Errno(expected) => Err(ExampleError::Expectation {
+                                    pid,
+                                    label: syscall.label,
+                                    expected: format!("errno {}", expected.get()),
+                                    actual: format!("death by signal {sig}"),
+                                }),
+                            };
+                            self.on_exit(sig, shared)?;
+                            expectation_check?;
+                            return Ok(sig);
                         }
                         InternalCompletion::Returned(value) => {
                             self.finish_syscall(syscall, Ok(value), outs, shared)?;
@@ -485,87 +575,6 @@ impl Task {
         Ok(())
     }
 
-    /// Issue one syscall and interpret its outcome until it completes.
-    ///
-    /// The arms are the backend contract stated on each `DispatchOutcome`
-    /// variant. `Returned`/`Errno` complete the call; `Exit` and `Fork` hand
-    /// the work only the execution lane can do back to the run loop
-    /// (`on_exit`, `on_fork`); `SchedulerYield` completes with 0 and yields
-    /// the host thread (the only lease a VM-less backend holds); the two wait
-    /// outcomes a scripted task can meet are re-dispatched after a yield,
-    /// bounded by [`WAIT_BOUND`], because this backend has no continuation
-    /// reactor to park them on. Every other outcome is refused by name.
-    fn issue(
-        &mut self,
-        syscall: &'static str,
-        number: u64,
-        args: [u64; 6],
-        shared: &Arc<Shared>,
-    ) -> Result<InternalCompletion, ExampleError> {
-        let deadline = Instant::now() + WAIT_BOUND;
-        loop {
-            // The context is captured per dispatch through the process
-            // binding, as the carrier does at every syscall boundary: a fork
-            // or an exit moves the task's revision, and a stale context is
-            // refused by the kernel operations that check it.
-            let context = self.dispatcher.capture_one_task_context()?;
-            shared.dispatches.fetch_add(1, Ordering::SeqCst);
-            shared
-                .ledger
-                .lock()
-                .dispatch_events
-                .push((self.process.pid(), syscall));
-            let outcome = self.dispatcher.dispatch(
-                &context,
-                SyscallRequest::new(number, SyscallArgs::from(args)),
-                &mut self.memory.linear,
-                &self.reporter,
-            )?;
-            match outcome {
-                DispatchOutcome::Returned { value } => {
-                    return Ok(InternalCompletion::Returned(value));
-                }
-                DispatchOutcome::Errno { errno } => return Ok(InternalCompletion::Errno(errno)),
-                DispatchOutcome::Exit { code } => return Ok(InternalCompletion::Exit(code)),
-                DispatchOutcome::Fork {
-                    flags,
-                    pidfd_out,
-                    clone_parent,
-                    parent_tid_addr,
-                    child_tid_addr,
-                    exit_signal,
-                    child_stack,
-                    vfork,
-                } => {
-                    let plain = pidfd_out.is_none()
-                        && !clone_parent
-                        && parent_tid_addr.is_none()
-                        && child_tid_addr.is_none()
-                        && child_stack == 0
-                        && vfork.is_none();
-                    if !plain {
-                        return Err(ExampleError::Unsupported(format!(
-                            "clone flags {flags:#x}: only a plain fork (no CLONE_PIDFD, \
-                             CLONE_PARENT, tid stores, child stack or vfork) runs here"
-                        )));
-                    }
-                    return Ok(InternalCompletion::Fork { flags, exit_signal });
-                }
-                DispatchOutcome::SchedulerYield => {
-                    thread::yield_now();
-                    return Ok(InternalCompletion::Returned(0));
-                }
-                DispatchOutcome::WaitOnHvpatchChild { .. } | DispatchOutcome::WaitOnFds { .. } => {
-                    if Instant::now() >= deadline {
-                        return Err(ExampleError::WaitTimedOut(syscall));
-                    }
-                    thread::yield_now();
-                }
-                other => return Err(ExampleError::Unsupported(format!("{other:?}"))),
-            }
-        }
-    }
-
     /// The `Fork` arm, mirroring the carrier's in-process fork through the
     /// public kernel operations only:
     ///
@@ -638,6 +647,11 @@ impl Task {
             return Err(failure.into());
         }
 
+        let child_generation = crate::driver::seed_initial_task_state(&child_context)?;
+        shared
+            .process_bindings
+            .lock()
+            .insert(child_process.task_key(), child_process.task_binding());
         let child = Task {
             dispatcher: child_dispatcher,
             process: child_process,
@@ -645,6 +659,7 @@ impl Task {
             slots: self.slots.clone(),
             last_child: None,
             reporter: CompatReporter::default(),
+            execution_generation: child_generation,
         };
         let script = child_script.to_vec();
         let shared_for_child = Arc::clone(shared);
@@ -666,13 +681,23 @@ impl Task {
     /// form `RunResult::wait_status_encoding` produces for the carrier.
     /// `SIGCHLD` is not posted to the parent: a scripted task has no signal
     /// delivery, and the parent's `wait4` observes the zombie directly.
-    fn on_exit(&mut self, code: i32) -> Result<(), ExampleError> {
+    fn on_exit(&mut self, code: i32, shared: &Arc<Shared>) -> Result<(), ExampleError> {
         let context = self.dispatcher.capture_one_task_context()?;
         self.dispatcher.retire_hvpatch_process_fds(&context);
         let status = LinuxWaitStatus::from_wait_encoding((code & 0xff) << 8);
-        context
-            .kernel()
-            .exit_task_key_eventually(context.task().key(), status)?;
+        context.kernel().exit_task_key_eventually_notifying(
+            context.task().key(),
+            status,
+            None,
+            |parent| {
+                if let Some(parent_key) = parent
+                    && let Some(binding) = shared.process_bindings.lock().get(&parent_key)
+                    && let Ok(snapshot) = binding.capture_signal_snapshot()
+                {
+                    let _ = snapshot.context().task().publish_wake_subscriptions();
+                }
+            },
+        )?;
         Ok(())
     }
 }
