@@ -267,7 +267,7 @@ fn a_blocked_read_is_dispatched_exactly_twice_when_the_writer_arrives() {
 ```
 Add `Step::HostSleepMs(u64)` to `Step` in this task (a host-side `std::thread::sleep` between steps, used only to order two tasks; it is not a syscall and does not count as a dispatch). Root pid is `1` (`ROOT_PID = LINUX_BOOTSTRAP_PID`; confirm and use the constant in the assertion instead of the literal if it differs).
 
-- [ ] **Step 2: Run it to verify it fails** — `cargo test -p carrick-kernel-example --tests a_blocked_read` → FAIL: `dispatches_for == N` with N ≫ 2 (the poll loop).
+- [x] **Step 2: Run it to verify it fails** — `cargo test -p carrick-kernel-example --tests a_blocked_read` → FAIL: `dispatches_for == N` with N ≫ 2 (the poll loop).
 
 - [x] **Step 3: Implement `driver.rs`** as specified above; delete the yield/re-dispatch arms from `Task::issue`. Write the family mapping as a table at the top of `driver.rs` (one row per `DispatchOutcome` wait variant: which kernel registration call, which restart class), so the next reader does not re-derive it.
 
@@ -784,3 +784,16 @@ test-kernel *ARGS:
   final review must ensure the parent registry read guard is released before
   callbacks and child-exit suppression policy has one implementation.
 - Tasks 3–15 remain unaccepted; the overall goal is active.
+
+- Task 2 red-first receipt recovered from worker step404: the blocked-read
+  assertion failed with 10,242 dispatches versus 2 before continuation parking.
+  Extracted log: `/tmp/kernel-harness-task2-red-receipt.txt`; Task 2 is accepted.
+- Director additionally ran `RUST_TEST_THREADS=1 cargo test -p carrick-runtime
+  --lib vcpu_loop`: 309 passed, 1 pre-existing ignore, exit 0; log
+  `/tmp/kernel-harness-task2-runtime-tests.log`.
+- Final shared-exit review sent as `/tmp/kernel-harness-exit-review-final.md`.
+  Partition review pending `/tmp/kernel-harness-partition-review.md` identifies
+  a dropped `close_pair(pipe)` cleanup in the moved continuation test; restore
+  before acceptance. Token-level comparison helper:
+  `/tmp/kernel-harness-compare-partition.py` (literals require ordinary diff
+  review because the reused lexer skips them).
