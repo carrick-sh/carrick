@@ -1329,12 +1329,15 @@ pub fn pending_adopted_child(waiter_pid: u32, target_pid: i32) -> Option<u32> {
 
 /// Park target for a blocking `wait4(-1)`.
 ///
-/// Returns `-1` whenever ANY direct child exists — the io_wait `-1` branch
-/// (`wait_proc_exit_any_kqueue`) arms one `NOTE_EXIT` watch PER direct child.
-/// Never substitutes a single child pid for `-1`: the single-pid slice loop
-/// re-polls `child_status_ready` for ONLY the watched pid, so parking on the
-/// first-listed child misses a sibling's exit (Linux returns the sibling
+/// Returns `-1` whenever ANY direct child exists, because an any-child wait
+/// arms one `NOTE_EXIT` watch PER direct child. Never substitutes a single child
+/// pid for `-1`: a single-pid park re-polls only the watched pid, so parking on
+/// the first-listed child misses a sibling's exit (Linux returns the sibling
 /// immediately; a first-child park blocks until the watched child dies).
+///
+/// The HVF consumer of this (`io_wait`'s host-process wait family) is retired —
+/// under HVPatch a guest `fork` creates no host process — so this has no
+/// in-tree caller today.
 /// With no direct children, an adopted child that is not yet exit-ready is a
 /// concrete watchable pid (`EVFILT_PROC` watches non-children). With neither,
 /// `None`: the caller reports `ECHILD` instead of parking forever.

@@ -600,9 +600,9 @@ fn spawn_signal_pump_inner(
                             // asked for NO exit notification; publishing a
                             // default-ignore SIGCHLD anyway would wrongly
                             // satisfy a sigtimedwait({SIGCHLD}). The wait4/waitid
-                            // wake does not depend on this publish (wait_proc_exit
-                            // owns its own EVFILT_PROC + 50ms re-poll), so
-                            // suppressing it is hang-free and more faithful.
+                            // wake does not depend on this publish (under HVPatch
+                            // the kernel graph resolves the logical child wait),
+                            // so suppressing it is hang-free and more faithful.
                             if exit_signal != 0 {
                                 crate::host_signal::publish_pending_for(parent_tid, exit_signal);
                             }
