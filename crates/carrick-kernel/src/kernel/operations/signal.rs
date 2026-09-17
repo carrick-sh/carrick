@@ -827,10 +827,10 @@ impl Kernel {
     /// reaped), and enqueuing onto it would strand the signal in a queue no
     /// one will drain.
     ///
-    /// [`take_lowest_in`]: super::objects::TaskPendingSignals::take_lowest_in
+    /// [`take_lowest_in`]: crate::kernel::objects::TaskPendingSignals::take_lowest_in
     ///
     /// The signal is made pending and then the target is WOKEN through its
-    /// lane-supplied [`TaskWaker`](super::objects::TaskWaker), because enqueuing
+    /// lane-supplied [`TaskWaker`](crate::kernel::objects::TaskWaker), because enqueuing
     /// alone reaches only a task that gets back to a syscall or trap boundary —
     /// one parked in a host wait watches pipes, futexes and kqueues, none of
     /// which observe the kernel's queues. A task with no waker published is not an error: it still notices
