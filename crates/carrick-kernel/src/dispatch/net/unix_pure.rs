@@ -1276,7 +1276,7 @@ impl PureSocketInner {
                     mask |= LINUX_EPOLLOUT;
                 }
             }
-            if peer_shut_wr {
+            if peer_shut_wr || state.shutdown_read {
                 mask |= LINUX_EPOLLRDHUP;
             }
             let tcp_hup = state.tcp_pair
@@ -1568,6 +1568,52 @@ mod tests {
         assert_eq!(
             read_eof, 0,
             "subsequent read after draining buffer must return 0 (EOF)"
+        );
+    }
+
+    #[test]
+    fn inet_stream_local_shut_rd_poll_mask_epollrdhup() {
+        let (s1, _s2) = PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+        s1.shutdown(LINUX_SHUT_RD).unwrap();
+        let mask = s1.poll_mask();
+        assert_eq!(mask & LINUX_EPOLLIN, LINUX_EPOLLIN, "must be readable");
+        assert_eq!(
+            mask & LINUX_EPOLLRDHUP,
+            LINUX_EPOLLRDHUP,
+            "must report local shutdown(SHUT_RD)"
+        );
+        assert_eq!(
+            mask & LINUX_EPOLLHUP,
+            0,
+            "local shutdown(SHUT_RD) is half-close, not HUP"
+        );
+    }
+
+    #[test]
+    fn unix_stream_local_shut_rd_poll_mask_epollrdhup() {
+        let (s1, _s2) = PureSocketInner::pair(
+            LINUX_SOCK_STREAM,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+        s1.shutdown(LINUX_SHUT_RD).unwrap();
+        let mask = s1.poll_mask();
+        assert_eq!(mask & LINUX_EPOLLIN, LINUX_EPOLLIN, "must be readable");
+        assert_eq!(
+            mask & LINUX_EPOLLRDHUP,
+            LINUX_EPOLLRDHUP,
+            "must report local shutdown(SHUT_RD)"
+        );
+        assert_eq!(
+            mask & LINUX_EPOLLHUP,
+            0,
+            "local shutdown(SHUT_RD) is half-close, not HUP"
         );
     }
 
