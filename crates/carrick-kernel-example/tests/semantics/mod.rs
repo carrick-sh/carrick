@@ -225,6 +225,11 @@ pub fn fcntl_setfl(fd: impl Into<carrick_kernel_example::Operand>, flags: i32) -
     fcntl(fd, LINUX_F_SETFL, flags)
 }
 
+/// `fcntl(fd, F_SETPIPE_SZ, size)`.
+pub fn fcntl_setpipe_sz(fd: impl Into<carrick_kernel_example::Operand>, size: i32) -> Syscall {
+    fcntl(fd, LINUX_F_SETPIPE_SZ, size as i64)
+}
+
 /// `fcntl(fd, F_GETPIPE_SZ, 0)`.
 pub fn fcntl_getpipe_sz(fd: impl Into<carrick_kernel_example::Operand>) -> Syscall {
     fcntl(fd, LINUX_F_GETPIPE_SZ, 0)

@@ -177,7 +177,8 @@ fn o_nonblock_read_on_an_empty_pipe_is_eagain_and_write_to_a_full_pipe_is_eagain
 
     let run = run(vec![
         pipe(),
-        Step::Sys(fcntl_getpipe_sz(slot(0)).ret(65536).save(2)),
+        Step::Sys(fcntl_setpipe_sz(slot(0), 65536).ret(65536)),
+        Step::Sys(fcntl_getpipe_sz(slot(0)).ret(65536)),
         Step::Sys(fcntl_setfl(slot(0), LINUX_O_NONBLOCK).ret(0)),
         Step::Sys(sys::read(slot(0), 10).errno(LINUX_EAGAIN)),
         Step::Sys(fcntl_setfl(slot(1), LINUX_O_NONBLOCK).ret(0)),
