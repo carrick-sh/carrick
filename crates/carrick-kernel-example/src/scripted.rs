@@ -697,9 +697,12 @@ impl Task {
         let context = self.dispatcher.capture_one_task_context()?;
         self.dispatcher.retire_hvpatch_process_fds(&context);
         let status = LinuxWaitStatus::from_wait_encoding((code & 0xff) << 8);
-        context
-            .kernel()
-            .exit_task_key_eventually(context.task().key(), status)?;
+        context.kernel().exit_task_key_eventually_notifying(
+            context.task().key(),
+            status,
+            self.dispatcher.hvpatch_orphan_adopter(),
+            |_| {},
+        )?;
         Ok(())
     }
 
@@ -709,9 +712,12 @@ impl Task {
         self.dispatcher.retire_hvpatch_process_fds(&context);
         // man 2 wait4: WTERMSIG is encoded as (sig & 0x7f).
         let status = LinuxWaitStatus::from_wait_encoding(sig & 0x7f);
-        context
-            .kernel()
-            .exit_task_key_eventually(context.task().key(), status)?;
+        context.kernel().exit_task_key_eventually_notifying(
+            context.task().key(),
+            status,
+            self.dispatcher.hvpatch_orphan_adopter(),
+            |_| {},
+        )?;
         Ok(())
     }
 }
