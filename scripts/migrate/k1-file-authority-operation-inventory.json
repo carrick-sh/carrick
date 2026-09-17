@@ -841,7 +841,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 191,
+      "line": 195,
       "categories": [
         "table_guard"
       ],
@@ -850,7 +850,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 269,
+      "line": 273,
       "categories": [
         "table_guard"
       ],
@@ -859,7 +859,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 281,
+      "line": 285,
       "categories": [
         "epoll"
       ],
@@ -868,7 +868,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 294,
+      "line": 298,
       "categories": [
         "table_guard"
       ],
@@ -877,7 +877,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 345,
+      "line": 349,
       "categories": [
         "table_guard"
       ],
@@ -886,7 +886,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 352,
+      "line": 356,
       "categories": [
         "table_guard"
       ],
@@ -895,7 +895,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 369,
+      "line": 373,
       "categories": [
         "table_guard"
       ],
@@ -15195,7 +15195,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread.rs",
-      "line": 2584,
+      "line": 2635,
       "categories": [
         "lifecycle"
       ],
@@ -15492,7 +15492,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2091,
+      "line": 2095,
       "categories": [
         "table_guard"
       ],
@@ -15501,7 +15501,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2092,
+      "line": 2096,
       "categories": [
         "table_guard"
       ],
@@ -15510,7 +15510,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2094,
+      "line": 2098,
       "categories": [
         "table_guard"
       ],
@@ -15519,7 +15519,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2190,
+      "line": 2194,
       "categories": [
         "table_guard"
       ],
@@ -15528,7 +15528,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2207,
+      "line": 2215,
       "categories": [
         "table_guard"
       ],
@@ -15537,7 +15537,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2208,
+      "line": 2216,
       "categories": [
         "table_guard"
       ],
@@ -15546,7 +15546,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2223,
+      "line": 2231,
       "categories": [
         "table_guard"
       ],
@@ -15555,29 +15555,11 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2228,
+      "line": 2236,
       "categories": [
         "table_guard"
       ],
       "text": "let closed = self.lock_closed_stdio();",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2254,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "let mut open_files = self.write_open_files();",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2255,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "let mut next_fd = self.lock_next_fd();",
       "scope_kind": "test_or_definition"
     },
     {
@@ -15586,12 +15568,30 @@
       "categories": [
         "table_guard"
       ],
+      "text": "let mut open_files = self.write_open_files();",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects.rs",
+      "line": 2267,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let mut next_fd = self.lock_next_fd();",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects.rs",
+      "line": 2278,
+      "categories": [
+        "table_guard"
+      ],
       "text": "self.lock_closed_stdio()[fd as usize] = false;",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2271,
+      "line": 2283,
       "categories": [
         "table_guard"
       ],
@@ -15600,7 +15600,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2344,
+      "line": 2356,
       "categories": [
         "table_guard"
       ],
@@ -15609,7 +15609,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2494,
+      "line": 2506,
       "categories": [
         "table_guard"
       ],
@@ -15618,7 +15618,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2498,
+      "line": 2510,
       "categories": [
         "table_guard"
       ],
@@ -15627,7 +15627,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2512,
+      "line": 2524,
       "categories": [
         "table_guard"
       ],
@@ -15636,7 +15636,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2516,
+      "line": 2528,
       "categories": [
         "table_guard"
       ],
@@ -15645,7 +15645,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2520,
+      "line": 2532,
       "categories": [
         "table_guard"
       ],
@@ -15654,7 +15654,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2528,
+      "line": 2540,
       "categories": [
         "table_guard"
       ],
@@ -15663,7 +15663,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2532,
+      "line": 2544,
       "categories": [
         "table_guard"
       ],
@@ -15672,7 +15672,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2537,
+      "line": 2549,
       "categories": [
         "table_guard"
       ],
@@ -15681,7 +15681,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2541,
+      "line": 2553,
       "categories": [
         "table_guard"
       ],
@@ -15690,7 +15690,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2554,
+      "line": 2566,
       "categories": [
         "table_guard"
       ],
@@ -15699,7 +15699,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2558,
+      "line": 2570,
       "categories": [
         "table_guard"
       ],
@@ -15708,7 +15708,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2562,
+      "line": 2574,
       "categories": [
         "table_guard"
       ],
@@ -15717,7 +15717,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2563,
+      "line": 2575,
       "categories": [
         "table_guard"
       ],
@@ -15726,7 +15726,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2569,
+      "line": 2581,
       "categories": [
         "table_guard"
       ],
@@ -15735,7 +15735,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2869,
+      "line": 2881,
       "categories": [
         "lifecycle"
       ],
@@ -15744,7 +15744,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3066,
+      "line": 3078,
       "categories": [
         "epoll"
       ],
@@ -15753,7 +15753,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3068,
+      "line": 3080,
       "categories": [
         "epoll"
       ],
@@ -15762,7 +15762,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3070,
+      "line": 3082,
       "categories": [
         "epoll"
       ],
@@ -15771,7 +15771,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3140,
+      "line": 3152,
       "categories": [
         "table_guard"
       ],
@@ -15780,7 +15780,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3160,
+      "line": 3172,
       "categories": [
         "lifecycle"
       ],
@@ -15789,7 +15789,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3187,
+      "line": 3199,
       "categories": [
         "lifecycle"
       ],
@@ -15798,7 +15798,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3188,
+      "line": 3200,
       "categories": [
         "lifecycle"
       ],
@@ -15807,7 +15807,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3245,
+      "line": 3257,
       "categories": [
         "epoll"
       ],
@@ -15816,7 +15816,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3246,
+      "line": 3258,
       "categories": [
         "epoll"
       ],
@@ -15825,7 +15825,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3248,
+      "line": 3260,
       "categories": [
         "epoll"
       ],
@@ -15834,7 +15834,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3249,
+      "line": 3261,
       "categories": [
         "epoll"
       ],
@@ -15843,7 +15843,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3256,
+      "line": 3268,
       "categories": [
         "epoll"
       ],
@@ -15852,7 +15852,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3257,
+      "line": 3269,
       "categories": [
         "epoll"
       ],
@@ -15861,7 +15861,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3260,
+      "line": 3272,
       "categories": [
         "epoll"
       ],
@@ -15870,7 +15870,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3263,
+      "line": 3275,
       "categories": [
         "epoll"
       ],
@@ -15879,7 +15879,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3266,
+      "line": 3278,
       "categories": [
         "epoll"
       ],
@@ -15888,7 +15888,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3268,
+      "line": 3280,
       "categories": [
         "epoll"
       ],
@@ -15897,7 +15897,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3280,
+      "line": 3292,
       "categories": [
         "table_guard",
         "epoll"
@@ -15907,7 +15907,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3290,
+      "line": 3302,
       "categories": [
         "epoll"
       ],
@@ -15916,7 +15916,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3297,
+      "line": 3309,
       "categories": [
         "epoll"
       ],
@@ -15925,7 +15925,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3315,
+      "line": 3327,
       "categories": [
         "lifecycle"
       ],
@@ -15934,7 +15934,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3399,
+      "line": 3411,
       "categories": [
         "table_guard"
       ],
@@ -15943,7 +15943,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3411,
+      "line": 3423,
       "categories": [
         "table_guard"
       ],
@@ -15952,7 +15952,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3543,
+      "line": 3555,
       "categories": [
         "table_guard"
       ],
@@ -15961,7 +15961,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3601,
+      "line": 3613,
       "categories": [
         "table_guard"
       ],
@@ -15970,7 +15970,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3664,
+      "line": 3676,
       "categories": [
         "table_guard"
       ],
@@ -15979,7 +15979,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3705,
+      "line": 3717,
       "categories": [
         "table_guard"
       ],
@@ -15988,7 +15988,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 4024,
+      "line": 4061,
       "categories": [
         "lifecycle"
       ],
@@ -15997,7 +15997,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 4025,
+      "line": 4062,
       "categories": [
         "lifecycle"
       ],
@@ -17905,7 +17905,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5550,
+      "line": 5552,
       "categories": [
         "mapping"
       ],
@@ -17914,7 +17914,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5558,
+      "line": 5560,
       "categories": [
         "mapping"
       ],
@@ -17923,7 +17923,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5574,
+      "line": 5576,
       "categories": [
         "mapping"
       ],
@@ -17968,7 +17968,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
-      "line": 651,
+      "line": 657,
       "categories": [
         "mapping"
       ],
@@ -17977,7 +17977,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
-      "line": 2071,
+      "line": 2089,
       "categories": [
         "mapping"
       ],
@@ -18418,7 +18418,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 2954,
+      "line": 2958,
       "categories": [
         "mapping"
       ],
@@ -18427,7 +18427,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 2956,
+      "line": 2960,
       "categories": [
         "mapping"
       ],
@@ -18436,20 +18436,11 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 2964,
+      "line": 2968,
       "categories": [
         "mapping"
       ],
       "text": "mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 2976,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".expect(\"test exec prepare mapping\");",
       "scope_kind": "test_or_definition"
     },
     {
@@ -18458,12 +18449,21 @@
       "categories": [
         "mapping"
       ],
+      "text": ".expect(\"test exec prepare mapping\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "line": 2984,
+      "categories": [
+        "mapping"
+      ],
       "text": "mapping,",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 2983,
+      "line": 2987,
       "categories": [
         "mapping"
       ],
