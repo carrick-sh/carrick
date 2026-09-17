@@ -1824,6 +1824,10 @@ impl Task {
         self.shared.load_full()
     }
 
+    pub fn autoreaps_children(&self) -> bool {
+        self.shared().sighand().autoreaps_children()
+    }
+
     pub(in crate::kernel) fn replace_shared(
         &self,
         replacement: Arc<TaskShared>,

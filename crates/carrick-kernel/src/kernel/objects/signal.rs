@@ -127,6 +127,14 @@ impl Sighand {
         }
     }
 
+    /// Whether terminating children with exit signal `SIGCHLD` should be auto-reaped
+    /// rather than transformed into zombies (POSIX.1-2001 `SIG_IGN` or `SA_NOCLDWAIT`).
+    pub fn autoreaps_children(&self) -> bool {
+        let action = self.action(LinuxSignal::SIGCHLD);
+        action.sa_handler == carrick_abi::LINUX_SIG_IGN
+            || (action.sa_flags & carrick_abi::LINUX_SA_NOCLDWAIT != 0)
+    }
+
     pub(in crate::kernel) fn snapshot_until(
         &self,
         deadline: std::time::Instant,
@@ -884,6 +892,10 @@ impl SignalAuthority {
 
     pub fn action(&self, signal: LinuxSignal) -> LinuxSigaction {
         self.sighand.action(signal)
+    }
+
+    pub fn autoreaps_children(&self) -> bool {
+        self.sighand.autoreaps_children()
     }
 
     /// Whether this thread authority observes a queued or delivered child-exit signal.

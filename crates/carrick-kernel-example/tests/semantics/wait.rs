@@ -97,7 +97,6 @@ fn an_orphan_is_reparented_to_init_which_can_reap_it() {
 ///
 /// Authority: `man 2 sigaction` (SIGCHLD set to SIG_IGN auto-reaps children; wait4 returns ECHILD).
 #[test]
-#[ignore = "defect: SIGCHLD set to SIG_IGN does not autoreap terminating children in carrick-kernel"]
 fn sigchld_set_to_sig_ign_autoreaps_and_wait4_reports_echild() {
     let run = run(vec![
         Step::Sys(sys::rt_sigaction_ign(LINUX_SIGCHLD).ret(0)),
