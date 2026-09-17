@@ -1129,6 +1129,7 @@ where
 
         match outcome {
             DispatchOutcome::WaitOnFds { .. }
+            | DispatchOutcome::BlockingOpen(_)
             | DispatchOutcome::BlockingWrite(_)
             | DispatchOutcome::BlockingTimerFdRead(_)
             | DispatchOutcome::BlockingSemop(_)

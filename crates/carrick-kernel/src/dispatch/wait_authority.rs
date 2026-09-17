@@ -298,6 +298,7 @@ impl WaitFds {
         }
     }
 
+    #[allow(dead_code)]
     pub(in crate::dispatch) fn anchored_parked_opener(
         fd: i32,
         events: i16,

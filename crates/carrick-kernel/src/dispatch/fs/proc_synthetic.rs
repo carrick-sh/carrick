@@ -444,6 +444,7 @@ impl<'a> FsView<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn reopen_proc_self_fd(
         &self,
         context: &crate::kernel::KernelContext,
@@ -452,8 +453,10 @@ impl<'a> FsView<'a> {
         flags: u64,
         _resolved: &str,
         reporter: &CompatReporter,
+        reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
     ) -> Result<DispatchOutcome, LinuxErrno> {
         let Some(open_file) = self.open_file(n) else {
+            *reservation = None;
             return Ok(self.duplicate_fd(
                 n,
                 0,
@@ -467,6 +470,7 @@ impl<'a> FsView<'a> {
 
         let action = {
             let Some(mut open) = open_file.description.write() else {
+                *reservation = None;
                 return Ok(self.duplicate_fd(
                     n,
                     0,
@@ -542,6 +546,7 @@ impl<'a> FsView<'a> {
                 target_path,
                 fallback_unlinked,
             } => {
+                *reservation = None;
                 let outcome = self.open_at_path_string(
                     context,
                     registry,
@@ -583,18 +588,29 @@ impl<'a> FsView<'a> {
                 }
             }
             ReopenAction::CopyDescription(new_desc, new_common, fd_flags) => {
-                Ok(self.install_fd_with_common(*new_desc, new_common, fd_flags))
+                let open_file = OpenFile::from_open_description_with_common(
+                    Arc::new(RwLock::new(*new_desc)),
+                    new_common,
+                    fd_flags,
+                );
+                match self.install_admitted_open_file(reservation, open_file) {
+                    Ok(fd) => Ok(DispatchOutcome::returned_i32(fd)),
+                    Err(e) => Ok(DispatchOutcome::errno(e)),
+                }
             }
             ReopenAction::Errno(errno) => Ok(DispatchOutcome::errno(errno)),
-            ReopenAction::Duplicate => Ok(self.duplicate_fd(
-                n,
-                0,
-                if flags & LINUX_O_CLOEXEC != 0 {
-                    LINUX_FD_CLOEXEC
-                } else {
-                    0
-                },
-            )),
+            ReopenAction::Duplicate => {
+                *reservation = None;
+                Ok(self.duplicate_fd(
+                    n,
+                    0,
+                    if flags & LINUX_O_CLOEXEC != 0 {
+                        LINUX_FD_CLOEXEC
+                    } else {
+                        0
+                    },
+                ))
+            }
         }
     }
 
@@ -675,6 +691,7 @@ impl<'a> FsView<'a> {
         path: &str,
         contents: Vec<u8>,
         flags: u64,
+        reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
     ) -> DispatchOutcome {
         let status = flags & !LINUX_O_CLOEXEC;
         let open_file = OpenFile::from_open_description_with_status_flags(
@@ -687,9 +704,9 @@ impl<'a> FsView<'a> {
             status,
             linux_fd_flags_from_open_flags(flags),
         );
-        match self.install_fd_at_or_above(0, open_file) {
+        match self.install_admitted_open_file(reservation, open_file) {
             Ok(fd) => DispatchOutcome::returned_i32(fd),
-            Err(_) => DispatchOutcome::errno(linux_errno::EMFILE),
+            Err(e) => DispatchOutcome::errno(e),
         }
     }
 
@@ -698,6 +715,7 @@ impl<'a> FsView<'a> {
         _path: &str,
         executable: crate::dispatch::executable_authority::CurrentExecutable,
         flags: u64,
+        reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
     ) -> DispatchOutcome {
         let status = flags & !LINUX_O_CLOEXEC;
         let open_file = OpenFile::from_open_description_with_status_flags(
@@ -709,9 +727,9 @@ impl<'a> FsView<'a> {
             status,
             linux_fd_flags_from_open_flags(flags),
         );
-        match self.install_fd_at_or_above(0, open_file) {
+        match self.install_admitted_open_file(reservation, open_file) {
             Ok(fd) => DispatchOutcome::returned_i32(fd),
-            Err(_) => DispatchOutcome::errno(linux_errno::EMFILE),
+            Err(e) => DispatchOutcome::errno(e),
         }
     }
 

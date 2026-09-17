@@ -1551,6 +1551,89 @@ impl FileSlot {
     }
 }
 
+#[derive(Debug)]
+pub struct FileSlotReservation {
+    table: Arc<FileTable>,
+    fd: i32,
+    reservation_id: u64,
+    committed: bool,
+}
+
+impl FileSlotReservation {
+    pub const fn fd(&self) -> i32 {
+        self.fd
+    }
+
+    pub const fn reservation_id(&self) -> u64 {
+        self.reservation_id
+    }
+
+    pub fn table(&self) -> &Arc<FileTable> {
+        &self.table
+    }
+
+    pub fn commit(mut self, slot: FileSlot) -> Result<(), crate::linux_abi::LinuxErrno> {
+        let res = self
+            .table
+            .commit_reserved_slot(self.fd, self.reservation_id, slot);
+        if res.is_ok() {
+            self.committed = true;
+        }
+        res
+    }
+}
+
+impl Drop for FileSlotReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.table.cancel_reservation(self.fd, self.reservation_id);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ExactSlotReservation {
+    table: Arc<FileTable>,
+    fd: i32,
+    reservation_id: u64,
+    committed: bool,
+}
+
+impl ExactSlotReservation {
+    pub const fn fd(&self) -> i32 {
+        self.fd
+    }
+
+    pub const fn reservation_id(&self) -> u64 {
+        self.reservation_id
+    }
+
+    pub fn table(&self) -> &Arc<FileTable> {
+        &self.table
+    }
+
+    pub fn commit(
+        mut self,
+        slot: FileSlot,
+    ) -> Result<Option<FileSlot>, crate::linux_abi::LinuxErrno> {
+        let res = self
+            .table
+            .commit_exact_replacement(self.fd, self.reservation_id, slot);
+        if res.is_ok() {
+            self.committed = true;
+        }
+        res
+    }
+}
+
+impl Drop for ExactSlotReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.table.cancel_reservation(self.fd, self.reservation_id);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileSlotAuthority {
     table: FileTableId,
@@ -1809,12 +1892,12 @@ impl Hasher for FileSlotHasher {
         // `Hash for i32` calls `write_i32`; retain a deterministic fallback so
         // the Hasher contract remains total if that implementation changes.
         self.0 = bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
         });
     }
 
-    fn write_i32(&mut self, value: i32) {
-        self.0 = u64::from(value as u32);
+    fn write_i32(&mut self, i: i32) {
+        self.0 = u64::from(i as u32);
     }
 }
 
@@ -1826,6 +1909,8 @@ pub struct FileTable {
     fd_ceiling: Arc<FdCeilingAuthority>,
     open_files: RwLock<FileSlotMap>,
     next_fd: Mutex<i32>,
+    reserved_slots: Mutex<HashMap<i32, u64>>,
+    next_reservation_id: AtomicU64,
     stdio_cloexec: Mutex<[bool; 3]>,
     closed_stdio: Mutex<[bool; 3]>,
     fd_open_paths: RwLock<HashMap<i32, String>>,
@@ -1842,12 +1927,14 @@ impl FileTable {
         Self::with_fd_ceiling(id, Arc::new(FdCeilingAuthority::new()))
     }
 
-    pub(super) fn with_fd_ceiling(id: FileTableId, fd_ceiling: Arc<FdCeilingAuthority>) -> Self {
+    pub fn with_fd_ceiling(id: FileTableId, fd_ceiling: Arc<FdCeilingAuthority>) -> Self {
         Self {
             id,
             fd_ceiling,
             open_files: RwLock::new(FileSlotMap::default()),
             next_fd: Mutex::new(3),
+            reserved_slots: Mutex::new(HashMap::new()),
+            next_reservation_id: AtomicU64::new(0),
             stdio_cloexec: Mutex::new([false; 3]),
             closed_stdio: Mutex::new([false; 3]),
             fd_open_paths: RwLock::new(HashMap::new()),
@@ -1869,11 +1956,21 @@ impl FileTable {
             slot.description.retain_fd_ref();
         }
         let epoll_wake_registry = Arc::clone(&parent.epoll_wake_registry);
+        let mut child_next_fd = 3;
+        while open_files.contains_key(&child_next_fd) {
+            let Some(next) = child_next_fd.checked_add(1) else {
+                break;
+            };
+            child_next_fd = next;
+        }
+        let _ = *parent.next_fd.lock();
         Self {
             id,
             fd_ceiling: Arc::clone(&parent.fd_ceiling),
             open_files: RwLock::new(open_files),
-            next_fd: Mutex::new(*parent.next_fd.lock()),
+            next_fd: Mutex::new(child_next_fd),
+            reserved_slots: Mutex::new(HashMap::new()),
+            next_reservation_id: AtomicU64::new(0),
             stdio_cloexec: Mutex::new(*parent.stdio_cloexec.lock()),
             closed_stdio: Mutex::new(*parent.closed_stdio.lock()),
             fd_open_paths: RwLock::new(parent.fd_open_paths.read().clone()),
@@ -1911,25 +2008,37 @@ impl FileTable {
         if let Some(maximum) = open_files.keys().max() {
             caller.fd_ceiling.publish(*maximum);
         }
-        let next_fd = *caller.next_fd.lock();
+        let mut next_fd = 3;
+        while open_files.contains_key(&next_fd) {
+            let Some(next) = next_fd.checked_add(1) else {
+                break;
+            };
+            next_fd = next;
+        }
+        let _ = *caller.next_fd.lock();
         let fd_open_paths = caller
             .fd_open_paths
             .read()
             .iter()
-            .filter_map(|(fd, path)| open_files.contains_key(fd).then_some((*fd, path.clone())))
+            .filter_map(|(number, path)| {
+                open_files
+                    .contains_key(number)
+                    .then_some((*number, path.clone()))
+            })
             .collect();
         let epoll_fds = caller
             .epoll_fds
             .read()
             .iter()
-            .filter(|fd| open_files.contains_key(fd))
-            .copied()
+            .filter_map(|number| open_files.contains_key(number).then_some(*number))
             .collect();
         Self {
             id,
             fd_ceiling: Arc::clone(&caller.fd_ceiling),
             open_files: RwLock::new(open_files),
             next_fd: Mutex::new(next_fd),
+            reserved_slots: Mutex::new(HashMap::new()),
+            next_reservation_id: AtomicU64::new(0),
             stdio_cloexec: Mutex::new([false; 3]),
             closed_stdio: Mutex::new(closed_stdio),
             fd_open_paths: RwLock::new(fd_open_paths),
@@ -1944,6 +2053,239 @@ impl FileTable {
 
     pub const fn id(&self) -> FileTableId {
         self.id
+    }
+
+    pub fn reserve_exact_target(
+        self: &Arc<Self>,
+        fd: i32,
+        limit: i32,
+    ) -> Result<ExactSlotReservation, crate::linux_abi::LinuxErrno> {
+        if !(0..limit).contains(&fd) {
+            return Err(crate::linux_abi::LINUX_EBADF);
+        }
+        let _mutation = self
+            .functional_gate
+            .acquire_mutation()
+            .ok_or(crate::linux_abi::LINUX_EBADF)?;
+        let mut reserved = self.lock_reserved_slots();
+        if reserved.contains_key(&fd) {
+            return Err(crate::linux_abi::LINUX_EBUSY);
+        }
+        let reservation_id = self.next_reservation_id.fetch_add(1, Ordering::Relaxed) + 1;
+        reserved.insert(fd, reservation_id);
+        drop(reserved);
+
+        Ok(ExactSlotReservation {
+            table: Arc::clone(self),
+            fd,
+            reservation_id,
+            committed: false,
+        })
+    }
+
+    pub fn reserve_slot_at_or_above(
+        self: &Arc<Self>,
+        min_fd: i32,
+        limit: i32,
+    ) -> Result<FileSlotReservation, crate::linux_abi::LinuxErrno> {
+        let open_files = self.read_open_files();
+        let mut next_fd = self.lock_next_fd();
+        let mut reserved = self.lock_reserved_slots();
+        let closed_stdio = self.lock_closed_stdio();
+
+        let mut fd = None;
+
+        // If min_fd < 3 and any stdio was closed, check closed stdio slots first
+        if min_fd < 3 && (closed_stdio[0] || closed_stdio[1] || closed_stdio[2]) {
+            for stdio in min_fd.max(0)..3 {
+                if closed_stdio[stdio as usize]
+                    && !open_files.contains_key(&stdio)
+                    && !reserved.contains_key(&stdio)
+                {
+                    fd = Some(stdio);
+                    break;
+                }
+            }
+        }
+
+        let fd = match fd {
+            Some(stdio) => stdio,
+            None => {
+                let mut candidate = if min_fd < 3 {
+                    *next_fd
+                } else {
+                    (*next_fd).max(min_fd)
+                };
+
+                loop {
+                    if candidate >= limit {
+                        return Err(crate::linux_abi::LINUX_EMFILE);
+                    }
+
+                    let reserved_stdio =
+                        (0..3).contains(&candidate) && !closed_stdio[candidate as usize];
+                    if !open_files.contains_key(&candidate)
+                        && !reserved.contains_key(&candidate)
+                        && !reserved_stdio
+                    {
+                        break candidate;
+                    }
+
+                    let Some(next) = candidate.checked_add(1) else {
+                        return Err(crate::linux_abi::LINUX_EMFILE);
+                    };
+                    candidate = next;
+                }
+            }
+        };
+
+        if fd >= limit {
+            return Err(crate::linux_abi::LINUX_EMFILE);
+        }
+
+        let reservation_id = self.next_reservation_id.fetch_add(1, Ordering::Relaxed) + 1;
+        reserved.insert(fd, reservation_id);
+
+        if fd >= 3 && fd == *next_fd {
+            let mut candidate = fd.saturating_add(1);
+            loop {
+                let reserved_stdio =
+                    (0..3).contains(&candidate) && !closed_stdio[candidate as usize];
+                if !open_files.contains_key(&candidate)
+                    && !reserved.contains_key(&candidate)
+                    && !reserved_stdio
+                {
+                    break;
+                }
+                let Some(next) = candidate.checked_add(1) else {
+                    break;
+                };
+                candidate = next;
+            }
+            *next_fd = candidate;
+        }
+
+        drop(closed_stdio);
+        drop(reserved);
+        drop(next_fd);
+        drop(open_files);
+
+        Ok(FileSlotReservation {
+            table: Arc::clone(self),
+            fd,
+            reservation_id,
+            committed: false,
+        })
+    }
+
+    pub fn is_slot_reserved(&self, fd: i32) -> bool {
+        self.lock_reserved_slots().contains_key(&fd)
+    }
+
+    pub(crate) fn cancel_reservation(&self, fd: i32, reservation_id: u64) -> bool {
+        let mut reserved = self.lock_reserved_slots();
+        if reserved.get(&fd).copied() == Some(reservation_id) {
+            reserved.remove(&fd);
+            if fd >= 3 && self.functional_refs_active() {
+                let mut next_fd = self.lock_next_fd();
+                if fd < *next_fd {
+                    *next_fd = fd;
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn commit_reserved_slot(
+        &self,
+        fd: i32,
+        reservation_id: u64,
+        slot: FileSlot,
+    ) -> Result<(), crate::linux_abi::LinuxErrno> {
+        let mut open_files = self.write_open_files();
+        let mut next_fd = self.lock_next_fd();
+        let mut reserved = self.lock_reserved_slots();
+
+        if reserved.get(&fd).copied() != Some(reservation_id) {
+            return Err(crate::linux_abi::LINUX_EBADF);
+        }
+
+        if open_files.contains_key(&fd) {
+            return Err(crate::linux_abi::LINUX_EBUSY);
+        }
+
+        reserved.remove(&fd);
+        open_files.insert(fd, slot);
+
+        if (0..3).contains(&fd) {
+            self.lock_closed_stdio()[fd as usize] = false;
+        }
+
+        if fd >= 3 && fd == *next_fd {
+            let mut candidate = fd.saturating_add(1);
+            let closed = self.lock_closed_stdio();
+            loop {
+                let reserved_stdio = (0..3).contains(&candidate) && !closed[candidate as usize];
+                if !open_files.contains_key(&candidate)
+                    && !reserved.contains_key(&candidate)
+                    && !reserved_stdio
+                {
+                    break;
+                }
+                let Some(next) = candidate.checked_add(1) else {
+                    break;
+                };
+                candidate = next;
+            }
+            *next_fd = candidate;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn commit_exact_replacement(
+        &self,
+        fd: i32,
+        reservation_id: u64,
+        slot: FileSlot,
+    ) -> Result<Option<FileSlot>, crate::linux_abi::LinuxErrno> {
+        let mut open_files = self.write_open_files();
+        let mut next_fd = self.lock_next_fd();
+        let mut reserved = self.lock_reserved_slots();
+
+        if reserved.get(&fd).copied() != Some(reservation_id) {
+            return Err(crate::linux_abi::LINUX_EBADF);
+        }
+
+        reserved.remove(&fd);
+        let replaced = open_files.insert(fd, slot);
+
+        if (0..3).contains(&fd) {
+            self.lock_closed_stdio()[fd as usize] = false;
+        }
+
+        if fd >= 3 && fd == *next_fd {
+            let mut candidate = fd.saturating_add(1);
+            let closed = self.lock_closed_stdio();
+            loop {
+                let reserved_stdio = (0..3).contains(&candidate) && !closed[candidate as usize];
+                if !open_files.contains_key(&candidate)
+                    && !reserved.contains_key(&candidate)
+                    && !reserved_stdio
+                {
+                    break;
+                }
+                let Some(next) = candidate.checked_add(1) else {
+                    break;
+                };
+                candidate = next;
+            }
+            *next_fd = candidate;
+        }
+
+        Ok(replaced)
     }
 
     pub fn install(
@@ -2179,12 +2521,20 @@ impl FileTable {
         self.mutex_write(&self.closed_stdio)
     }
 
+    pub(crate) fn lock_reserved_slots(&self) -> MutexGuard<'_, HashMap<i32, u64>> {
+        self.reserved_slots.lock()
+    }
+
     pub(crate) fn read_fd_open_paths(&self) -> RwLockReadGuard<'_, HashMap<i32, String>> {
         self.fd_open_paths.read()
     }
 
     pub(crate) fn write_fd_open_paths(&self) -> FileTableRwWriteGuard<'_, HashMap<i32, String>> {
         self.rw_write(&self.fd_open_paths)
+    }
+
+    pub(crate) fn record_fd_open_path(&self, fd: i32, path: String) {
+        self.write_fd_open_paths().insert(fd, path);
     }
 
     pub(crate) fn rename_fd_open_paths(&self, resolved_old: &str, resolved_new: &str) {
@@ -2237,10 +2587,10 @@ impl FileTable {
     }
 
     pub(crate) fn drain_functional_refs(&self) -> Vec<(i32, FileSlot)> {
+        self.functional_refs_active.store(false, Ordering::Release);
         if !self.functional_gate.retire() {
             return Vec::new();
         }
-        self.functional_refs_active.store(false, Ordering::Release);
         let slots = self
             .open_files
             .read()
@@ -3503,5 +3853,189 @@ mod tests {
         assert!(common.cork().has_pending());
         let taken = common.cork().take().expect("taken");
         assert_eq!(taken.0, b"data");
+    }
+
+    fn dummy_file_slot() -> FileSlot {
+        let ids = ObjectIdRegistry::new();
+        let desc = Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("desc"),
+        ));
+        FileSlot::new(desc, 0)
+    }
+
+    #[test]
+    fn sequential_reservations_allocate_contiguous_slots() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+
+        let n = 100;
+        let mut reservations = Vec::new();
+        for _ in 0..n {
+            let res = table.reserve_slot_at_or_above(0, 1024).expect("reserve");
+            reservations.push(res);
+        }
+
+        for (i, res) in reservations.into_iter().enumerate() {
+            assert_eq!(res.fd(), 3 + i as i32);
+            assert!(res.commit(dummy_file_slot()).is_ok());
+        }
+    }
+
+    #[test]
+    fn low_limit_early_bound_check() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+        let limit = 5; // Slots available: 3, 4 (stdio 0, 1, 2 not closed)
+
+        let r1 = table.reserve_slot_at_or_above(0, limit).expect("slot 3");
+        assert_eq!(r1.fd(), 3);
+        let r2 = table.reserve_slot_at_or_above(0, limit).expect("slot 4");
+        assert_eq!(r2.fd(), 4);
+
+        let err = table.reserve_slot_at_or_above(0, limit).unwrap_err();
+        assert_eq!(err, crate::linux_abi::LINUX_EMFILE);
+    }
+
+    #[test]
+    fn authenticated_commit_rejects_mismatched_reservation_id() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+        let res = table.reserve_slot_at_or_above(0, 1024).expect("slot 3");
+        let fd = res.fd();
+
+        // Attempting to commit directly with a wrong reservation_id must fail EBADF
+        let err = table
+            .commit_reserved_slot(fd, res.reservation_id() + 999, dummy_file_slot())
+            .unwrap_err();
+        assert_eq!(err, crate::linux_abi::LINUX_EBADF);
+
+        // Committing with valid reservation succeeds
+        assert!(res.commit(dummy_file_slot()).is_ok());
+    }
+
+    #[test]
+    fn reservation_rollback_and_cursor_rewind_on_drop() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+
+        {
+            let res = table.reserve_slot_at_or_above(0, 1024).expect("slot 3");
+            assert_eq!(res.fd(), 3);
+            assert!(table.is_slot_reserved(3));
+            // res is dropped without commit -> rollback
+        }
+
+        assert!(!table.is_slot_reserved(3));
+
+        // Next reservation must reuse slot 3 due to cursor rewind
+        let res2 = table
+            .reserve_slot_at_or_above(0, 1024)
+            .expect("slot 3 reuse");
+        assert_eq!(res2.fd(), 3);
+        assert!(res2.commit(dummy_file_slot()).is_ok());
+
+        // Slot 3 is now occupied
+        let res3 = table.reserve_slot_at_or_above(0, 1024).expect("slot 4");
+        assert_eq!(res3.fd(), 4);
+    }
+
+    #[test]
+    fn admitted_slot_stability_after_lowering_rlimit() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+
+        // Reserve slot 7 with limit 8
+        let r3 = table.reserve_slot_at_or_above(0, 8).expect("reserve 3");
+        let r4 = table.reserve_slot_at_or_above(0, 8).expect("reserve 4");
+        let r5 = table.reserve_slot_at_or_above(0, 8).expect("reserve 5");
+        let r6 = table.reserve_slot_at_or_above(0, 8).expect("reserve 6");
+        let r7 = table.reserve_slot_at_or_above(0, 8).expect("reserve 7");
+        assert_eq!(r7.fd(), 7);
+
+        // Commit r7 succeeds even if limit is conceptually lowered (commit doesn't re-check limit)
+        assert!(r7.commit(dummy_file_slot()).is_ok());
+
+        // Clean up remaining reservations
+        drop(r3);
+        drop(r4);
+        drop(r5);
+        drop(r6);
+    }
+
+    #[test]
+    fn exact_slot_reservation_linear_winner_and_isolation() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+
+        // 1. Open reserves slot 3
+        let open_res = table.reserve_slot_at_or_above(0, 1024).expect("reserve 3");
+        assert_eq!(open_res.fd(), 3);
+
+        // 2. Exact reservation on slot 3 must fail EBUSY while open reservation is live
+        let err = table.reserve_exact_target(3, 1024).unwrap_err();
+        assert_eq!(err, crate::linux_abi::LINUX_EBUSY);
+
+        // 3. Drop open reservation -> slot 3 freed
+        drop(open_res);
+        assert!(!table.is_slot_reserved(3));
+
+        // 4. Exact reservation on slot 3 now succeeds
+        let exact_res = table
+            .reserve_exact_target(3, 1024)
+            .expect("exact reserve 3");
+        assert_eq!(exact_res.fd(), 3);
+        assert!(table.is_slot_reserved(3));
+
+        // 5. Concurrent open allocation skips slot 3 and allocates slot 4
+        let open_res2 = table.reserve_slot_at_or_above(0, 1024).expect("reserve 4");
+        assert_eq!(open_res2.fd(), 4);
+
+        // 6. Exact reservation commits replacement
+        let slot1 = dummy_file_slot();
+        let desc1 = slot1.description();
+        let replaced = exact_res.commit(slot1).expect("commit exact");
+        assert!(replaced.is_none());
+
+        // 7. Subsequent exact reservation on occupied slot 3 replaces existing slot
+        let exact_res2 = table
+            .reserve_exact_target(3, 1024)
+            .expect("exact reserve 3 again");
+        let slot2 = dummy_file_slot();
+        let desc2 = slot2.description();
+        let replaced2 = exact_res2.commit(slot2).expect("commit replacement");
+        let old_slot = replaced2.expect("replaced slot");
+        assert!(Arc::ptr_eq(&old_slot.description(), &desc1));
+        assert!(Arc::ptr_eq(
+            &table.open_files.read().get(&3).unwrap().description(),
+            &desc2
+        ));
+
+        drop(open_res2);
+    }
+
+    #[test]
+    fn for_exec_closes_bare_stdio_with_cloexec() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+
+        // Mark stdin (0) as close-on-exec on bare stdio
+        table.stdio_cloexec.lock()[0] = true;
+
+        // Perform for_exec
+        let exec_table = Arc::new(FileTable::for_exec(
+            ids.file_table_id().expect("exec table id"),
+            &table,
+        ));
+
+        // Stdin (0) must now be recorded in closed_stdio
+        assert!(exec_table.closed_stdio.lock()[0]);
+        assert!(!exec_table.closed_stdio.lock()[1]);
+        assert!(!exec_table.closed_stdio.lock()[2]);
+
+        // A new open allocating from 0 must now allocate the closed stdin slot (0)
+        let res = exec_table
+            .reserve_slot_at_or_above(0, 1024)
+            .expect("reserve 0");
+        assert_eq!(res.fd(), 0);
     }
 }

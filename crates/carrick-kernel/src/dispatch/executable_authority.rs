@@ -1001,10 +1001,12 @@ mod tests {
             .current_executable
             .clone()
             .expect("current executable A");
-        let outcome =
-            dispatcher
-                .fs_view()
-                .install_proc_executable_source("/proc/self/exe", current_a, 0);
+        let outcome = dispatcher.fs_view().install_proc_executable_source(
+            "/proc/self/exe",
+            current_a,
+            0,
+            &mut None,
+        );
         let DispatchOutcome::Returned { value: fd } = outcome else {
             panic!("proc executable fd installation failed: {outcome:?}");
         };

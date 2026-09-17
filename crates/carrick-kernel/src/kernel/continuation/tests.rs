@@ -553,6 +553,26 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
             close_pair(fds);
             DispatchOutcome::BlockingWrite(write)
         }
+        ContinuationFamily::BlockingOpen => {
+            let (read_fd, token) =
+                crate::dispatch::fifo_beacon::ParkedOpenerToken::new_writer((1, 9999))
+                    .expect("writer token");
+            let ids = crate::kernel::ObjectIdRegistry::new();
+            let table = Arc::new(crate::kernel::objects::FileTable::new(
+                ids.file_table_id().expect("table id"),
+            ));
+            let reservation = table.reserve_slot_at_or_above(0, 1024).expect("reserve");
+            let open = crate::dispatch::retained_open::BlockingOpen::new_fifo_writer(
+                reservation,
+                (1, 9999),
+                "/tmp/fifo_test".to_owned(),
+                carrick_abi::LINUX_O_WRONLY,
+                1,
+                token,
+                read_fd,
+            );
+            DispatchOutcome::BlockingOpen(open)
+        }
         ContinuationFamily::TimerFdRead => DispatchOutcome::BlockingTimerFdRead(
             crate::dispatch::format_time::timerfd_read_for_continuation_test(),
         ),
@@ -620,7 +640,7 @@ fn continuation_family_event_codes_are_stable_unique_and_nonzero() {
     assert_eq!(
         codes,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21
         ]
     );
 }
@@ -661,6 +681,7 @@ fn exhaustive_real_dispatch_shapes_become_owned_send_static_continuations() {
                     | ContinuationFamily::WaitOnFdsSelect
                     | ContinuationFamily::WaitOnPollFds
                     | ContinuationFamily::BlockingWrite
+                    | ContinuationFamily::BlockingOpen
                     | ContinuationFamily::TimerFdRead
                     | ContinuationFamily::Semop
                     | ContinuationFamily::Mqueue
@@ -1650,6 +1671,7 @@ fn timeout_signal_exec_exit_and_drop_cleanup_are_literal_for_every_family() {
             (
                 ContinuationFamily::WaitOnSharedWord
                 | ContinuationFamily::BlockingRecordLock
+                | ContinuationFamily::BlockingOpen
                 | ContinuationFamily::WaitOnHvpatchChild,
                 ContinuationCompletion::Redispatch,
             ) => {}

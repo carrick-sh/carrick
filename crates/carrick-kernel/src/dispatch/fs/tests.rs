@@ -2253,8 +2253,14 @@ mod serial_host {
     #[test]
     fn absolute_readonly_open_can_install_an_upper_absent_lower_file_directly() {
         let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut reservation = dispatcher.reserve_slot_at_or_above(0).ok();
         let outcome = dispatcher
-            .try_immutable_lower_absolute_open(LINUX_AT_FDCWD, "/walk/file.txt", LINUX_O_RDONLY)
+            .try_immutable_lower_absolute_open(
+                LINUX_AT_FDCWD,
+                "/walk/file.txt",
+                LINUX_O_RDONLY,
+                &mut reservation,
+            )
             .expect("eligible absolute lower open should take the direct lane");
         let DispatchOutcome::Returned { value: fd } = outcome else {
             panic!("unexpected direct-open outcome: {outcome:?}");
@@ -2275,12 +2281,14 @@ mod serial_host {
     #[test]
     fn absolute_lower_fast_open_refuses_nofollow_symlink_semantics() {
         let (_lower, _upper, dispatcher) = trusted_lower_lane_fixture();
+        let mut reservation = dispatcher.reserve_slot_at_or_above(0).ok();
         assert!(
             dispatcher
                 .try_immutable_lower_absolute_open(
                     LINUX_AT_FDCWD,
                     "/walk/link",
                     LINUX_O_RDONLY | LinuxOpenFlags::NOFOLLOW.bits(),
+                    &mut reservation,
                 )
                 .is_none(),
             "O_NOFOLLOW must reach the layered lstat path and return ELOOP"
@@ -3778,6 +3786,7 @@ fn vfs_open_fallthrough_does_not_build_open_context() {
         LINUX_O_RDWR,
         0,
         0,
+        &mut None,
     );
 
     assert_eq!(outcome, VfsOpenAttempt::FallThrough);
@@ -6446,7 +6455,8 @@ fn trusted_dirfd_lane_serves_nofollow_directory_probe_enotdir() {
     assert!(lane_dir_is_trusted(&dispatcher, root));
     let nofollow_dir = LINUX_O_RDONLY | LINUX_O_DIRECTORY | LinuxOpenFlags::NOFOLLOW.bits();
     for name in ["file.txt", "link", "fifo"] {
-        let outcome = dispatcher.try_trusted_dirfd_openat(root as u64, name, nofollow_dir);
+        let outcome =
+            dispatcher.try_trusted_dirfd_openat(root as u64, name, nofollow_dir, &mut None);
         assert!(
             matches!(outcome, Some(DispatchOutcome::Errno { errno }) if errno == LINUX_ENOTDIR),
             "{name}: O_DIRECTORY|O_NOFOLLOW must be lane-served ENOTDIR, got {outcome:?}"
@@ -6465,7 +6475,12 @@ fn trusted_dirfd_lane_serves_nofollow_directory_probe_enotdir() {
     // slow path, never refused by the lane's probe.
     assert!(
         dispatcher
-            .try_trusted_dirfd_openat(root as u64, "link", LINUX_O_RDONLY | LINUX_O_DIRECTORY)
+            .try_trusted_dirfd_openat(
+                root as u64,
+                "link",
+                LINUX_O_RDONLY | LINUX_O_DIRECTORY,
+                &mut None
+            )
             .is_none()
     );
 }

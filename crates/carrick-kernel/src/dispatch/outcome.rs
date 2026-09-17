@@ -814,6 +814,11 @@ pub enum DispatchOutcome {
         wait: crate::dispatch::fd_wait::BlockingFdWait,
         sig_mask: WaitSigMask,
     },
+    /// A pending FIFO open waiting for peer arrival. It retains the reserved
+    /// descriptor slot, path, access mode, and presence registration token,
+    /// so the descriptor is not visible/reused while waiting and is committed
+    /// directly upon completion without re-dispatching from guest memory.
+    BlockingOpen(#[serde(skip)] crate::dispatch::retained_open::BlockingOpen),
     /// A pending record-lock or flock operation. The dispatcher retains its
     /// parsed request and exact ownership; the continuation reactor attempts
     /// acquisition without occupying a guest executor while a conflict remains.

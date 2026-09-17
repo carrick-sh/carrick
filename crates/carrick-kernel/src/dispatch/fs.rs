@@ -2671,9 +2671,10 @@ impl SyscallDispatcher {
         dirfd: u64,
         path: &str,
         flags: u64,
+        reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
     ) -> Option<DispatchOutcome> {
         self.fs_view()
-            .try_immutable_lower_absolute_open(dirfd, path, flags)
+            .try_immutable_lower_absolute_open(dirfd, path, flags, reservation)
     }
 
     #[inline]
@@ -2734,11 +2735,14 @@ impl SyscallDispatcher {
         dirfd: u64,
         path: &str,
         flags: u64,
+        reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
     ) -> Option<DispatchOutcome> {
-        self.fs_view().try_trusted_dirfd_openat(dirfd, path, flags)
+        self.fs_view()
+            .try_trusted_dirfd_openat(dirfd, path, flags, reservation)
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn try_vfs_open(
         &self,
         context: &crate::kernel::KernelContext,
@@ -2747,9 +2751,57 @@ impl SyscallDispatcher {
         access: u64,
         flags: u64,
         create_mode: u32,
+        reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
     ) -> VfsOpenAttempt {
+        self.fs_view().try_vfs_open(
+            context,
+            registry,
+            path,
+            access,
+            flags,
+            create_mode,
+            reservation,
+        )
+    }
+
+    #[inline]
+    pub(crate) fn reserve_slot_at_or_above(
+        &self,
+        min_fd: i32,
+    ) -> Result<crate::kernel::objects::FileSlotReservation, carrick_abi::LinuxErrno> {
+        self.fs_view().reserve_slot_at_or_above(min_fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn install_reserved_fd(
+        &self,
+        reservation: crate::kernel::objects::FileSlotReservation,
+        open_file: OpenFile,
+    ) -> Result<i32, LinuxErrno> {
+        self.fs_view().install_reserved_fd(reservation, open_file)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn install_admitted_open_file(
+        &self,
+        reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
+        open_file: OpenFile,
+    ) -> Result<i32, LinuxErrno> {
         self.fs_view()
-            .try_vfs_open(context, registry, path, access, flags, create_mode)
+            .install_admitted_open_file(reservation, open_file)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn open_fifo_nonblock(
+        &self,
+        path: &str,
+        access_idx: u32,
+    ) -> Option<i32> {
+        self.fs_view()
+            .fs
+            .rootfs_vfs
+            .overlay
+            .open_fifo_nonblock(path, access_idx)
     }
 
     #[inline]
