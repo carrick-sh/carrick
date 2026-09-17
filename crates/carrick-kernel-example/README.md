@@ -72,6 +72,16 @@ Signals that need no guest handler and kernel timer waits can be tested without
 an instruction stream. Process fork copies memory; threads share the process's
 dispatcher and address space and use their own kernel thread context.
 
+## Filesystem backend configuration
+
+By default, `ScriptedBackend::new()` mounts an in-memory root filesystem.
+For tests exercising real directory and host filesystem semantics,
+`ScriptedBackend::with_fs_backend(backend)` accepts a custom [`carrick_vfs::FsBackend`]
+(such as [`HostFsBackend`](carrick_vfs::fs_backend::HostFsBackend)).
+Dev-only instrumentation (such as per-instance directory entry visit counters enabled
+under `feature = "test-support"`) allows verifying algorithmic bounds without
+affecting shipped production behavior.
+
 ## Boundaries
 
 The harness does not emulate a CPU, execute an image with `execve`, or run guest
@@ -80,7 +90,7 @@ endpoint for `process_vm_readv`-style access. Unsupported outcomes fail by name;
 a passing script proves the kernel behavior it actually exercises.
 
 This experimental crate uses public items of `carrick-kernel`, `carrick-hal`,
-`carrick-guest-mem`, and `carrick-abi`. It is outside the product path.
+`carrick-guest-mem`, `carrick-vfs`, and `carrick-abi`. It is outside the product path.
 `just check-layering` excludes runtime/VMM dependencies from the harness and
 keeps its `test-support` dependencies out of the product selection. The root
 manifest's `default-members` selects only `carrick-cli`, preventing accidental

@@ -21,7 +21,7 @@
 //! failed run, not a hang.
 //!
 //! It is built from `pub` items of `carrick-kernel`, `carrick-hal`,
-//! `carrick-guest-mem` and `carrick-abi` alone. It takes `carrick-kernel` with
+//! `carrick-guest-mem`, `carrick-vfs` and `carrick-abi` alone. It takes `carrick-kernel` with
 //! NO features -- the backend above is its own, over the kernel's ordinary
 //! public surface, which is what a real backend author gets -- and needs
 //! `carrick-hal`'s `test-support` only for the two Null bridges.
@@ -34,6 +34,8 @@
 //! product path and `carrick` ships none of it: the root manifest's
 //! `default-members` keeps the product build to `carrick-cli`'s closure, and
 //! `just check-layering` fails if that selection enables `test-support`.
+//! Dev-only `test-support` instrumentation (such as test-isolated directory entry
+//! visit counters) does not ship in production builds.
 
 pub mod driver;
 pub mod memory;

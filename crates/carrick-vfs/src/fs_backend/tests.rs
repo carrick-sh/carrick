@@ -3148,4 +3148,85 @@ mod serial_host {
         assert!(b.name_matches_on_disk(Path::new("hl_dir/sub_é")));
         assert!(!b.name_matches_on_disk(Path::new("hl_dir/sub_e\u{0301}")));
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_decode_getattrlist_cmn_name_malformed_buffer_rejections() {
+        use crate::fs_backend::host::decode_getattrlist_cmn_name;
+
+        // 1. Truncated header (< 12 bytes)
+        assert_eq!(decode_getattrlist_cmn_name(&[]), Err(()));
+        assert_eq!(decode_getattrlist_cmn_name(&[0u8; 4]), Err(()));
+        assert_eq!(decode_getattrlist_cmn_name(&[0u8; 11]), Err(()));
+
+        // 2. Invalid total_len (< 12)
+        let mut buf = [0u8; 32];
+        buf[0..4].copy_from_slice(&8u32.to_ne_bytes());
+        assert_eq!(decode_getattrlist_cmn_name(&buf), Err(()));
+
+        // 3. total_len exceeds buffer slice
+        let mut buf = [0u8; 20];
+        buf[0..4].copy_from_slice(&50u32.to_ne_bytes());
+        assert_eq!(decode_getattrlist_cmn_name(&buf), Err(()));
+
+        // 4. Negative attr_offset
+        let mut buf = [0u8; 32];
+        buf[0..4].copy_from_slice(&24u32.to_ne_bytes());
+        buf[4..8].copy_from_slice(&(-1i32).to_ne_bytes());
+        buf[8..12].copy_from_slice(&4u32.to_ne_bytes());
+        assert_eq!(decode_getattrlist_cmn_name(&buf), Err(()));
+
+        // 5. attr_offset puts start before header (< 12)
+        let mut buf = [0u8; 32];
+        buf[0..4].copy_from_slice(&24u32.to_ne_bytes());
+        buf[4..8].copy_from_slice(&4i32.to_ne_bytes()); // start = 4 + 4 = 8 (< 12)
+        buf[8..12].copy_from_slice(&4u32.to_ne_bytes());
+        assert_eq!(decode_getattrlist_cmn_name(&buf), Err(()));
+
+        // 6. attr_offset puts start past total_len
+        let mut buf = [0u8; 32];
+        buf[0..4].copy_from_slice(&20u32.to_ne_bytes());
+        buf[4..8].copy_from_slice(&20i32.to_ne_bytes()); // start = 24 > 20
+        buf[8..12].copy_from_slice(&4u32.to_ne_bytes());
+        assert_eq!(decode_getattrlist_cmn_name(&buf), Err(()));
+
+        // 7. Zero attr_len
+        let mut buf = [0u8; 32];
+        buf[0..4].copy_from_slice(&20u32.to_ne_bytes());
+        buf[4..8].copy_from_slice(&8i32.to_ne_bytes());
+        buf[8..12].copy_from_slice(&0u32.to_ne_bytes());
+        assert_eq!(decode_getattrlist_cmn_name(&buf), Err(()));
+
+        // 8. attr_len overflows total_len
+        let mut buf = [0u8; 32];
+        buf[0..4].copy_from_slice(&20u32.to_ne_bytes());
+        buf[4..8].copy_from_slice(&8i32.to_ne_bytes()); // start = 12
+        buf[8..12].copy_from_slice(&10u32.to_ne_bytes()); // end = 22 > 20
+        assert_eq!(decode_getattrlist_cmn_name(&buf), Err(()));
+
+        // 9. Integer overflow in attr_len
+        let mut buf = [0u8; 32];
+        buf[0..4].copy_from_slice(&20u32.to_ne_bytes());
+        buf[4..8].copy_from_slice(&8i32.to_ne_bytes());
+        buf[8..12].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert_eq!(decode_getattrlist_cmn_name(&buf), Err(()));
+
+        // 10. Missing terminating NUL byte
+        let mut buf = [0u8; 32];
+        buf[0..4].copy_from_slice(&18u32.to_ne_bytes());
+        buf[4..8].copy_from_slice(&8i32.to_ne_bytes()); // start = 12
+        buf[8..12].copy_from_slice(&6u32.to_ne_bytes()); // len = 6, end = 18
+        buf[12..18].copy_from_slice(b"caf\xC3\xA9X"); // non-zero terminator
+        assert_eq!(decode_getattrlist_cmn_name(&buf), Err(()));
+
+        // 11. Valid buffer with exact UTF-8 name "café"
+        let mut buf = [0u8; 32];
+        buf[0..4].copy_from_slice(&18u32.to_ne_bytes());
+        buf[4..8].copy_from_slice(&8i32.to_ne_bytes()); // start = 12
+        buf[8..12].copy_from_slice(&6u32.to_ne_bytes()); // len = 6, end = 18
+        buf[12..18].copy_from_slice(b"caf\xC3\xA9\0");
+        let decoded = decode_getattrlist_cmn_name(&buf).expect("valid buffer must decode");
+        assert_eq!(decoded, "café".as_bytes());
+        assert_ne!(decoded, "cafe\u{0301}".as_bytes());
+    }
 }

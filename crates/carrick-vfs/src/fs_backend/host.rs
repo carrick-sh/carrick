@@ -3270,6 +3270,17 @@ impl HostFsBackend {
         if want.is_ascii() {
             return true;
         }
+
+        #[cfg(target_os = "macos")]
+        if let Some((parent_fd, leaf_c)) = self.namei_leaf(rel) {
+            use std::os::fd::AsRawFd;
+            if let Ok(matched) =
+                leaf_name_matches_stored_macos(parent_fd.as_raw_fd(), &leaf_c, want)
+            {
+                return matched;
+            }
+        }
+
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
         let Ok(entries) = self.read_dir_entries(parent, |d_name, _, _| {
             #[cfg(any(test, feature = "test-support"))]
@@ -3281,6 +3292,95 @@ impl HostFsBackend {
         };
         entries.into_iter().any(|matched| matched)
     }
+}
+
+#[cfg(target_os = "macos")]
+/// Decode the stored leaf name from a macOS `getattrlistat` buffer requested with `ATTR_CMN_NAME`.
+///
+/// Returns the slice of UTF-8/raw bytes for the leaf name excluding the terminating NUL.
+/// Returns `Err(())` if the buffer is truncated, offsets/lengths are out of bounds, or NUL is missing.
+pub(crate) fn decode_getattrlist_cmn_name(buf: &[u8]) -> Result<&[u8], ()> {
+    // Header requires at least 4 bytes for total length plus 8 bytes for attrreference (offset + length).
+    if buf.len() < 12 {
+        return Err(());
+    }
+
+    let total_len = u32::from_ne_bytes(buf[0..4].try_into().map_err(|_| ())?) as usize;
+    if total_len < 12 || total_len > buf.len() {
+        return Err(());
+    }
+
+    let attr_offset = i32::from_ne_bytes(buf[4..8].try_into().map_err(|_| ())?);
+    let attr_len = u32::from_ne_bytes(buf[8..12].try_into().map_err(|_| ())?) as usize;
+
+    if attr_offset < 0 {
+        return Err(());
+    }
+
+    // attr_offset is relative to the start of the attrreference structure (byte offset 4).
+    let attr_start = 4usize.checked_add(attr_offset as usize).ok_or(())?;
+    let attr_end = attr_start.checked_add(attr_len).ok_or(())?;
+
+    if attr_start < 12 || attr_end > total_len || attr_len == 0 {
+        return Err(());
+    }
+
+    // The name string returned by ATTR_CMN_NAME includes a terminating NUL byte.
+    if buf[attr_end - 1] != 0 {
+        return Err(());
+    }
+
+    Ok(&buf[attr_start..attr_end - 1])
+}
+
+#[cfg(target_os = "macos")]
+fn leaf_name_matches_stored_macos(
+    parent_fd: std::os::fd::RawFd,
+    leaf_c: &std::ffi::CStr,
+    want: &[u8],
+) -> Result<bool, ()> {
+    let mut attr_list = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_NAME,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+
+    let mut buf = [0u8; 1024];
+    // SAFETY:
+    // - `parent_fd` is an open, valid directory descriptor owned and pinned by the caller
+    //   for the duration of this call (`self.namei_leaf(rel)` guarantees containment).
+    // - `leaf_c` is a valid, NUL-terminated C string referencing the single leaf filename.
+    // - `attr_list` is a properly initialized `libc::attrlist` structure with `ATTR_BIT_MAP_COUNT`
+    //   and `ATTR_CMN_NAME`.
+    // - `buf` is a stack-allocated 1024-byte buffer, passing `buf.len()` as `attrBufSize`.
+    // - `FSOPT_NOFOLLOW` prevents symlink following so attributes of the leaf itself are returned.
+    let ret = unsafe {
+        libc::getattrlistat(
+            parent_fd,
+            leaf_c.as_ptr(),
+            &mut attr_list as *mut libc::attrlist as *mut libc::c_void,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+            libc::FSOPT_NOFOLLOW as libc::c_ulong,
+        )
+    };
+
+    if ret != 0 {
+        let err = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        if err == libc::ENOENT || err == libc::ENOTDIR {
+            return Ok(false);
+        }
+        return Err(());
+    }
+
+    let stored_name_bytes = decode_getattrlist_cmn_name(&buf)?;
+    Ok(stored_name_bytes == want)
 }
 
 pub(crate) fn native_reexec_transfers_cleanup(
