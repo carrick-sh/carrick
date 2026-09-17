@@ -438,6 +438,7 @@ ci:
     j deny
     j check-matrix
     j check-layering
+    j check-kernel-portable
     if [ "{{os()}}" = "macos" ]; then
         j check --workspace
     else
@@ -501,15 +502,9 @@ check-layering:
 # target that has no Hypervisor.framework at all
 # (docs/superpowers/plans/2026-09-13-extract-carrick-vfs-and-carrick-kernel.md, Task 2.10).
 #
-# NOT in `ci` yet, and that is the only thing still missing from Task 2.10:
-# this recipe is RED on six pre-existing off-macOS errors in `carrick-kernel`
-# that no task has been briefed to fix (`F_WRLCK`/`F_UNLCK` `i16`-vs-`i32` in
-# `dispatch/ioring.rs`; `reexec_kind_name`, `check_exec_source` and
-# `check_exec_target` gated `cfg(target_os = "macos")` beneath ungated callers;
-# one `isize`/`usize` `?` in the never-compiled `cfg(target_os = "linux")` `tee`
-# arm). Wiring `j check-kernel-portable` into `ci` after `j check-layering` is a
-# one-line change and must happen in the same commit that clears those six --
-# landing it while the recipe is red would create a permanently-failing gate.
+# In `ci`, right after `check-layering`: the layering gate proves the DEPENDENCY
+# graph carries no HVF, and this proves the SOURCE compiles without it. Both are
+# cheap and neither runs a guest, so they sit together ahead of the build gates.
 check-kernel-portable:
     cargo check -p carrick-kernel --features test-support --target aarch64-unknown-linux-gnu
 
