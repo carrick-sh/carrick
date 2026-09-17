@@ -293,6 +293,19 @@ If it fails in Docker too, it's not carrick's bug.
   gate (`cargo test -p carrick-cli --test conformance conformance_probes`) from
   the **repo root**: from any other cwd it finds no probe binaries, SKIPs every
   lane, and reports `ok` in 0.04s — a green that gated nothing.
+- **Oracle source hashes do not attest probe executable freshness.** Rebuild
+  both ARM64 libc probe sets when their sources change; inventory missing
+  executables and record binary hashes before interpreting differences. Stale
+  executables can omit checks even when the oracle's source hash is current.
+- **Re-signing can change artifact identity without relinking.** The current
+  post-link signer derives its identifier from a PID-bearing temporary filename.
+  Preserve the probe-tested signed artifact and use `just --no-deps conformance
+  smoke` followed by `just --no-deps conformance full` when no rebuild is needed;
+  verify SHA/CDHash after each rung. Equal LC_UUID alone is insufficient.
+- **Missing ledger metadata does not prove a guest never ran.** Audit every
+  declared row's run IDs and inspect both raw streams when a RunOutput is lost.
+  Preserve the original error/provenance gap; a supplementary diagnostic cannot
+  repair the original ledger or confer full-run acceptance.
 - **LTP parity is NOT workload coverage.** LTP cases are small enough to miss
   whole blocker classes: no LTP case pushes `brk` past 4 MiB, so the bhyve
   heap-backing bug that crashed **100% of cpython** hid behind a healthy ~70%
