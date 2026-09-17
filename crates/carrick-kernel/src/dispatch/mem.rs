@@ -52,6 +52,7 @@
 pub(crate) use super::dispatcher::MemView;
 use super::*;
 use carrick_fatal::carrick_fatal;
+use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 
 pub(crate) mod brk;
 #[cfg(test)]

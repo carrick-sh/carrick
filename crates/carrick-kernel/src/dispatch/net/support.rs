@@ -76,6 +76,7 @@
 //! handlers.
 
 use crate::linux_abi::LinuxErrno;
+use carrick_vfs::errno::HostSyscallResult as _;
 use std::collections::VecDeque;
 
 use zerocopy::{FromBytes, IntoBytes};

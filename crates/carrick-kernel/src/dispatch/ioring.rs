@@ -29,6 +29,7 @@ use crate::linux_abi::{
     LinuxIoCqringOffsets, LinuxIoSqringOffsets, LinuxIoUringCqe, LinuxIoUringParams,
     LinuxIoUringSqe, LinuxIovec, LinuxMsghdr,
 };
+use carrick_vfs::errno::HostSyscallResult as _;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

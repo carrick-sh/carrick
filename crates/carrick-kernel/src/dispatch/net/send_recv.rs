@@ -6,6 +6,7 @@
 //! IPv6 control messages, corking (MSG_MORE), synthetic Netlink/ICMP/DNS
 //! responses, error queues (MSG_ERRQUEUE), and Darwin/Linux flag translations.
 
+use carrick_vfs::errno::HostSyscallResult as _;
 use std::sync::Arc;
 
 use carrick_abi::{KernelAbi, LinuxErrno, LinuxMsgFlags};

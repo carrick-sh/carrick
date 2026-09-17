@@ -1,5 +1,7 @@
 //! Canonical semantic VMA representation, indexing, and projection.
 
+use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
+
 use super::*;
 
 /// Provenance of backing for a canonical semantic VMA.

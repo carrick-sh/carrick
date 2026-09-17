@@ -98,6 +98,7 @@ use crate::linux_abi::{
 use crate::network::{BindTarget, ConnectTarget, GuestSocketAddr, HostSocketAddr};
 use carrick_abi::LinuxPollEvents;
 use carrick_abi::syscall::nr;
+use carrick_vfs::errno::HostSyscallResult as _;
 
 syscall_table! {
     /// Per-module syscall routing for the `net` subsystem (Task A1).

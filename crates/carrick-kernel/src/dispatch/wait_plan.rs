@@ -21,11 +21,11 @@
 
 use carrick_abi::{LINUX_EBADF, LinuxErrno, LinuxPollEvents};
 
-use crate::dispatch::HostSyscallResult;
 use crate::dispatch::WaitFds;
 use crate::dispatch::abi_args::Fd;
 use crate::dispatch::dispatcher::NetView;
 use crate::dispatch::wait_source::{HostProxyCoverage, WaitRegistration, WaitSource, WatchedSlot};
+use carrick_vfs::errno::HostSyscallResult;
 
 /// One guest fd a wait names, with the events the guest asked for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

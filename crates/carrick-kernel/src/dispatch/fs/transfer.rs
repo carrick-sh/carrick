@@ -2,6 +2,7 @@
 //! host handles and pipes, including staging queues and host pipe routing.
 //! Split out of `dispatch/fs.rs` (WS-F3) as `impl SyscallDispatcher` methods.
 
+use carrick_vfs::errno::HostSyscallResult as _;
 use std::sync::Arc;
 
 use carrick_abi::*;

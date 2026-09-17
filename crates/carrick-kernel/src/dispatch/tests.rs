@@ -14,6 +14,7 @@ mod overlay_dispatch_tests {
     //! Keep these tests minimal — there's no need to exercise every
     //! flag combination here, just the four scenarios called out in the
     //! task spec.
+use carrick_vfs::ProcMapSharing;
 use super::*;
 
 #[test]
@@ -2902,7 +2903,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
     #[cfg(target_os = "macos")]
     #[test]
     fn host_syscall_result_translates_captured_host_errno() {
-        use crate::dispatch::HostSyscallResult;
+        use carrick_vfs::errno::HostSyscallResult;
         use carrick_host_bsd::errno::linux_errno;
 
         carrick_portable::set_errno(libc::EINPROGRESS);

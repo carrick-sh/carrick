@@ -3,16 +3,14 @@
 use std::sync::Arc;
 
 use carrick_fatal::carrick_fatal;
+use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 use parking_lot::Mutex;
 
 use super::host_alias::{HostAliasDispatchGuard, HostAliasTransactions};
 use super::outcome::DispatchError;
 #[cfg(any(test, feature = "test-support"))]
 #[allow(unused_imports)]
-use super::{
-    LinearMemory, LinuxErrno, ProcMapSharing, ProcMapsEntry, SyscallCtx, SyscallDispatcher,
-    SyscallRequest,
-};
+use super::{LinearMemory, LinuxErrno, SyscallCtx, SyscallDispatcher, SyscallRequest};
 use super::{mem, mm_mutation};
 
 pub use super::mm_mutation::MmTransactionGuard;

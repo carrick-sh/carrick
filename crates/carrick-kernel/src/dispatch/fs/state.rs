@@ -3,6 +3,7 @@
 use super::super::*;
 use crate::linux_abi::{LinuxDnotifyMask, LinuxErrno};
 use carrick_fatal::carrick_fatal;
+use carrick_vfs::errno::HostSyscallResult as _;
 
 #[derive(Debug, Clone)]
 pub(in crate::dispatch) struct DnotifyRegistration {
