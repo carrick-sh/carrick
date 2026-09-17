@@ -731,6 +731,11 @@ impl<'a> NetView<'a> {
                     OpenDescription::InMemorySocket { socket, .. } => {
                         let socket = Arc::clone(socket);
                         drop(open);
+                        if LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::ERRQUEUE) {
+                            if socket.family() != LINUX_AF_UNIX {
+                                return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                            }
+                        }
                         let mut target_buf = vec![0u8; len];
                         let peek = flags & LinuxMsgFlags::PEEK.bits() != 0;
                         if (flags & LinuxMsgFlags::OOB.bits()) != 0 {
@@ -746,18 +751,22 @@ impl<'a> NetView<'a> {
                                     {
                                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                                     }
-                                    if let Some(peer) = socket.peer_addr() {
-                                        if src_addr != 0 && src_len_addr != 0 {
-                                            if let Some(sockaddr_bytes) =
-                                                socket_addr_to_linux_sockaddr(peer)
-                                            {
-                                                let _ = write_linux_sockaddr(
-                                                    memory,
-                                                    src_addr,
-                                                    src_len_addr,
-                                                    &sockaddr_bytes,
-                                                );
-                                            }
+                                    if src_addr != 0 {
+                                        if src_len_addr == 0 {
+                                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                                        }
+                                        let len_bytes = match memory.read_bytes(src_len_addr, 4) {
+                                            Ok(b) => b,
+                                            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                                        };
+                                        if i32::from_ne_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) < 0 {
+                                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                                        }
+                                        if memory
+                                            .write_bytes(src_len_addr, &0u32.to_ne_bytes())
+                                            .is_err()
+                                        {
+                                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                                         }
                                     }
                                     this.notify_inmem_epoll();
@@ -773,16 +782,34 @@ impl<'a> NetView<'a> {
                                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                                     }
                                 }
-                                if let Some(peer) = socket.peer_addr() {
-                                    if src_addr != 0 && src_len_addr != 0 {
-                                        if let Some(sockaddr_bytes) = socket_addr_to_linux_sockaddr(peer) {
-                                            let _ = write_linux_sockaddr(
-                                                memory,
-                                                src_addr,
-                                                src_len_addr,
-                                                &sockaddr_bytes,
-                                            );
+                                if src_addr != 0 {
+                                    if src_len_addr == 0 {
+                                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                                    }
+                                    let len_bytes = match memory.read_bytes(src_len_addr, 4) {
+                                        Ok(b) => b,
+                                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                                    };
+                                    if i32::from_ne_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) < 0 {
+                                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                                    }
+                                    if let Some(peer) = socket.peer_addr()
+                                        && let Some(sockaddr_bytes) = socket_addr_to_linux_sockaddr(peer) {
+                                        if write_linux_sockaddr(
+                                            memory,
+                                            src_addr,
+                                            src_len_addr,
+                                            &sockaddr_bytes,
+                                        )
+                                        .is_err()
+                                        {
+                                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                                         }
+                                    } else if memory
+                                        .write_bytes(src_len_addr, &0u32.to_ne_bytes())
+                                        .is_err()
+                                    {
+                                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                                     }
                                 }
                                 return Ok(DispatchOutcome::returned_len(read_len)?);
@@ -804,10 +831,13 @@ impl<'a> NetView<'a> {
             }
             // MSG_ERRQUEUE reads the socket's error queue. carrick keeps no
             // error queue, so it's always empty → EAGAIN (recv01/recvfrom01),
-            // matching Linux when no error is queued. Checked after the socket
+            // matching Linux when no error is queued. Linux ignores MSG_ERRQUEUE on AF_UNIX sockets and
+            // delivers stream payload/EOF instead. Checked after the socket
             // lookup so a bad/non-socket fd still surfaces EBADF/ENOTSOCK.
             // (from_bits_retain: recv IGNORES other unknown flag bits.)
-            if LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::ERRQUEUE) {
+            if LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::ERRQUEUE)
+                && family != LINUX_AF_UNIX
+            {
                 return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
             }
             if let Some((payload, source)) = this.synthetic_datagram_drain(fd) {
@@ -832,21 +862,6 @@ impl<'a> NetView<'a> {
             recverr::poll_errors(host_fd.get());
             if let Some(errno) = this.take_socket_pending_error(fd) {
                 return Ok(DispatchOutcome::errno(errno));
-            }
-            // When the caller wants the source address back, Linux's
-            // move_addr_to_user reads the in/out length as a *signed* int and
-            // returns EINVAL for a negative value (recvfrom01 "invalid socket
-            // addr length", fromlen = -1). carrick's write_linux_sockaddr reads
-            // it as u32, so it would never reject it — validate here.
-            if src_addr != 0 && src_len_addr != 0 {
-                match memory.read_bytes(src_len_addr, 4) {
-                    Ok(b) => {
-                        if i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) < 0 {
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                        }
-                    }
-                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-                }
             }
             // Native fd mode preserved; force this CALL non-blocking with
             // MSG_DONTWAIT and route through blocking_io: on EAGAIN a blocking-mode
@@ -889,6 +904,8 @@ impl<'a> NetView<'a> {
             };
             let inbound_flow = this.open_file(fd).and_then(|f| f.description.common().inbound_flow());
             let is_stream = this.socket_guest_type(fd) == Some(libc::SOCK_STREAM);
+            let returns_source = !is_stream
+                || this.socket_guest_protocol(fd) == Some(LINUX_IPPROTO_SCTP);
             let is_peek = (flags & LinuxMsgFlags::PEEK.bits()) != 0;
             let recv_to = this
                 .open_file(fd)
@@ -1018,24 +1035,34 @@ impl<'a> NetView<'a> {
                 // This member took the group's turn; hand it to the next.
                 reuseport::advance_turn(host_fd.get());
             }
-            if matches!(outcome, DispatchOutcome::Returned { .. })
-                && src_addr != 0
-                && src_len_addr != 0
-                && let Some(host_source) = received_source.into_inner()
-            {
-                let linux_bytes = if let Some(protocol) = recv_protocol
-                    && let Some(host_addr) = host_sockaddr_to_socket_addr(&host_source)
-                    && let Ok(Some(guest_addr)) =
-                        this.network
-                            .provider
-                            .translate_recv_addr(HostSocketAddr(host_addr), protocol)
-                    && let Some(guest_sockaddr) = socket_addr_to_linux_sockaddr(guest_addr.0)
-                {
-                    guest_sockaddr
-                } else {
-                    host_to_linux_sockaddr(&host_source, family, true)
+            if matches!(outcome, DispatchOutcome::Returned { .. }) && src_addr != 0 {
+                if src_len_addr == 0 {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                }
+                let len_bytes = match memory.read_bytes(src_len_addr, 4) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                 };
-                if write_linux_sockaddr(memory, src_addr, src_len_addr, &linux_bytes).is_err() {
+                if i32::from_ne_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) < 0 {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if returns_source && let Some(host_source) = received_source.into_inner() {
+                    let linux_bytes = if let Some(protocol) = recv_protocol
+                        && let Some(host_addr) = host_sockaddr_to_socket_addr(&host_source)
+                        && let Ok(Some(guest_addr)) =
+                            this.network
+                                .provider
+                                .translate_recv_addr(HostSocketAddr(host_addr), protocol)
+                        && let Some(guest_sockaddr) = socket_addr_to_linux_sockaddr(guest_addr.0)
+                    {
+                        guest_sockaddr
+                    } else {
+                        host_to_linux_sockaddr(&host_source, family, true)
+                    };
+                    if write_linux_sockaddr(memory, src_addr, src_len_addr, &linux_bytes).is_err() {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                } else if memory.write_bytes(src_len_addr, &0u32.to_ne_bytes()).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
             }
@@ -1520,13 +1547,18 @@ impl<'a> NetView<'a> {
             let socket = Arc::clone(socket);
             drop(open);
             let msg = read_linux_msghdr(memory, msg_addr)?;
-            if (msg.namelen as i32) < 0 {
+            if msg.name != 0 && (msg.namelen as i32) < 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if msg.iovlen as usize > 1024 {
                 return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EMSGSIZE));
             }
             let iovecs = read_iovecs(memory, msg.iov, msg.iovlen as usize)?;
+            if LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::ERRQUEUE) {
+                if socket.family() != LINUX_AF_UNIX {
+                    return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                }
+            }
             let total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
             let mut target_buf = vec![0u8; total];
             let peek = flags & LinuxMsgFlags::PEEK.bits() != 0;
@@ -1560,22 +1592,54 @@ impl<'a> NetView<'a> {
                             remaining -= take;
                         }
                     }
-                    if let Some(peer) = socket.peer_addr() {
-                        if msg.name != 0 && msg.namelen != 0 {
-                            if let Some(sockaddr_bytes) = socket_addr_to_linux_sockaddr(peer) {
-                                let take = sockaddr_bytes.len().min(msg.namelen as usize);
-                                if memory
+                    if msg.name != 0 {
+                        let mut name_len = 0u32;
+                        if let Some(peer) = socket.peer_addr()
+                            && let Some(sockaddr_bytes) = socket_addr_to_linux_sockaddr(peer)
+                        {
+                            name_len = sockaddr_bytes.len() as u32;
+                            let take = (msg.namelen as usize).min(sockaddr_bytes.len());
+                            if take > 0
+                                && memory
                                     .write_bytes(msg.name, &sockaddr_bytes[..take])
                                     .is_err()
-                                {
-                                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                                }
-                                let _ = memory.write_bytes(
-                                    msg_addr + core::mem::offset_of!(LinuxMsghdr, namelen) as u64,
-                                    &(sockaddr_bytes.len() as u32).to_ne_bytes(),
-                                );
+                            {
+                                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                             }
                         }
+                        if memory
+                            .write_bytes(
+                                msg_addr + core::mem::offset_of!(LinuxMsghdr, namelen) as u64,
+                                &name_len.to_ne_bytes(),
+                            )
+                            .is_err()
+                        {
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        }
+                    }
+                    let mut linux_flags = 0i32;
+                    if LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::CMSG_CLOEXEC)
+                    {
+                        linux_flags |= LinuxMsgFlags::CMSG_CLOEXEC.bits();
+                    }
+                    let written_controllen = 0u64;
+                    if memory
+                        .write_bytes(
+                            msg_addr + core::mem::offset_of!(LinuxMsghdr, controllen) as u64,
+                            &written_controllen.to_ne_bytes(),
+                        )
+                        .is_err()
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                    if memory
+                        .write_bytes(
+                            msg_addr + core::mem::offset_of!(LinuxMsghdr, flags) as u64,
+                            &linux_flags.to_ne_bytes(),
+                        )
+                        .is_err()
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                     return Ok(DispatchOutcome::returned_len(read_len)?);
                 }
@@ -1595,19 +1659,11 @@ impl<'a> NetView<'a> {
         };
         let msg = read_linux_msghdr(memory, msg_addr)?;
         // Linux validates the msghdr during copy-in before touching the flags: a
-        // negative msg_namelen is EINVAL (recvmsg01 "invalid socket length",
+        // negative msg_namelen (with non-null msg_name) is EINVAL (recvmsg01 "invalid socket length",
         // which passes flags=-1 so its MSG_ERRQUEUE bit must NOT short-circuit
-        // ahead of this check).
-        if !is_netlink && (msg.namelen as i32) < 0 {
+        // ahead of this check). With msg_name == NULL, namelen is ignored.
+        if !is_netlink && msg.name != 0 && (msg.namelen as i32) < 0 {
             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-        }
-        // MSG_ERRQUEUE reads the socket's error queue. carrick keeps no error
-        // queue, so it's always empty -> EAGAIN (recvmsg01), matching Linux when
-        // no error is queued. Checked after msghdr validation so an invalid
-        // msg_namelen still surfaces EINVAL. (from_bits_retain: recvmsg IGNORES
-        // other unknown flag bits.) Mirrors the recvfrom MSG_ERRQUEUE path.
-        if !is_netlink && LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::ERRQUEUE) {
-            return self.recvmsg_errqueue(fd, msg_addr, &msg, memory);
         }
         // Linux caps the iovec array at UIO_MAXIOV (1024); a larger msg_iovlen is
         // EMSGSIZE, not the EINVAL that read_iovecs' length guard would raise
@@ -1616,6 +1672,18 @@ impl<'a> NetView<'a> {
             return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EMSGSIZE));
         }
         let iovecs = read_iovecs(memory, msg.iov, msg.iovlen as usize)?;
+        // MSG_ERRQUEUE reads the socket's error queue. carrick keeps no error
+        // queue, so it's always empty -> EAGAIN (recvmsg01), matching Linux when
+        // no error is queued. Linux ignores MSG_ERRQUEUE on AF_UNIX sockets and
+        // delivers stream payload/EOF instead. Checked after msghdr and iovec validation
+        // so invalid header fields still surface EINVAL/EFAULT. (from_bits_retain:
+        // recvmsg IGNORES other unknown flag bits.) Mirrors the recvfrom MSG_ERRQUEUE path.
+        if !is_netlink
+            && LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::ERRQUEUE)
+            && family != LINUX_AF_UNIX
+        {
+            return self.recvmsg_errqueue(fd, msg_addr, &msg, memory);
+        }
         // AF_NETLINK: drain the queued dump reply into the iovecs, fill in
         // the source sockaddr_nl (kernel; pid=0), and zero controllen/flags.
         if is_netlink {
