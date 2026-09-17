@@ -111,3 +111,47 @@ No regression attributable to the Phase 1 extraction on any gate. The environmen
 ### Verdict
 
 No regression attributable to the Phase 2 extraction on any gate. The kernel crate is product-clean (no test double linked into the shipped binary), the layering and probe gates are green, and every gating row that is not in the base set was attributed to load or to a race that reproduces on unmodified main at a rate the branch did not change. Two follow-ups landed after this receipt's binary and are covered by the final whole-branch review: the `check-kernel-portable` recipe and the six Linux-target fixes it required (Task 2.10b/2.10c), which touch no macOS behaviour except the RNG source (`arc4random` → `getrandom`).
+
+## Final-head receipt — main merged, review fix wave landed (2026-09-17)
+
+The Phase 2 receipt above was recorded on `bbd668760`. After it, the branch merged `main` (`984f96545`, 29 commits: typed wait sources, the POLLNVAL fix, conformance budget-kill and the wedge watchdog), took the final whole-branch review's fix wave (`4da1de3c5..ce6dc16f6`, twelve commits: docs drift, the layering rule for `carrick-vfs`, the two gates in hosted CI, the stale conformance-harness binary, Python unit tests under `lint-domains`, `begin_pt_pause` off the public surface, the interim errno aliases, kernel test fixtures out of feature-compiled modules, `HvfGuestTimers` as an instantiation of `TimerCoreBridge`, the retired host-process wait family deleted, the example crate's unused `test-support` edge), and re-ran every signed gate on `ce6dc16f6` (run `finalaccept-14108`).
+
+| | Head `ce6dc16f6` (conformance tier) | Head `ce6dc16f6` (relinked for probes/embed) |
+|---|---|---|
+| Binary SHA-256 | `6f1a442457f57a51c16b6696869d4aae03dac6774577cb5a56a3353ea1c15c19` | `83b6a0ff046f9acd…` (same source; `just test-embed` re-signs through the shipped post-link path) |
+| CDHash | `7a33074c755350f91f0ea02f1b15742ee57496a3` | recorded in the acceptance log |
+| Hypervisor entitlement / `__dof_carrick` | present / 1 | present / 1 |
+| Product proof | `strings` names `NullHostSignal`/`NullTimerFiring`/`TestCarrierProcess` 0 times, `carrick_kernel` 19 times | same source |
+| Host state | no sibling builds or guests before/after, Docker VM idle | same |
+
+### Gates
+
+| Gate | Result |
+|---|---|
+| `just check-layering` | exit 0 (three crate rules + three product-feature rules, now including `carrick-vfs`) |
+| `just check-kernel-portable` | exit 0 |
+| `just build` + `scripts/conformance/smoke-two-process.sh` | exit 0 / exit 0 |
+| `just conformance full` | 2,127 rows: MATCH 2078, excused DIFF 14, NEW 6, BUDGET_KILL 10 (non-gating; the harness feature main added), gating 19 (unmodified main on this host: 25) |
+| `just conformance-probes` | exit 0, every gating lane MATCH |
+| `just test-embed` | 3 failures, all in the base's set (`fault_latency_is_independent_of_sibling_fork`, `explicit_carrier_runs_two_isolated_containers`, `explicit_carrier_shutdown_cancels_a_live_guest_and_joins_it`) |
+| `just ci` (fix-wave head) | exit 0 (57 `test result: ok`) |
+
+### The 19 gating rows
+
+Sixteen are the base set recorded in the Phase 1 receipt: the thirteen REGRESSION rows (`ltp-accept02`, `ltp-epoll_wait05`, `ltp-recv01`, `ltp-recvmsg01`, `ltp-send02`, `ltp-setsockopt02`, `ltp-sendfile09`, `ltp-sendfile09_64`, `ltp-ioctl02`, `ltp-test_ioctl`, `ltp-execve03`, `ltp-lseek11`, `cpython-socket`) and three of the base's TIMEOUT rows (`ltp-inotify09`, `ltp-msgstress01`, `ltp-shmctl05`); the base's other nine TIMEOUT rows now MATCH or are BUDGET_KILL.
+
+| Row | Gate verdict | Attribution |
+|---|---|---|
+| `ltp-flock03` | REGRESSION, carrick `Empty`: guest abort "carrick-kernel arena creation failed: Too many open files in system (os error 23)" | Host `ENFILE` under the concurrent gate; MATCH 3/3 serially on the same binary. Load. |
+| `ltp-fork14` | REGRESSION 0/1: LTP's own 30 s timeout ("Test killed! (timeout?)") | The base's `[blocked]` hang, now cut by LTP's internal timeout before the harness deadline (main's harness change). FAIL 3/3 serially on the head binary and TIMEOUT `[blocked]` on the `bbd668760` binary. Pre-existing. |
+| `ltp-ptrace11` | REGRESSION 1/2 ("HVPatch child selector is stale") | The pre-existing race measured in the Phase 2 receipt; 1 of 3 serial samples here. |
+
+### Verdict
+
+No gating row is attributable to the merge of main or to the fix wave. The branch is green on every gate that main is green on in this environment, with the same pre-existing failures.
+
+### Head after the acceptance
+
+Two commits follow `ce6dc16f6`: `5703b27c2` (four cosmetic re-review follow-ups: a dangling `cfg_attr`, two comments, four test-only helpers narrowed to `pub(crate)`) and `9d5cc2b49` (the host-authority capture re-taken at a published `source_head`, rows and `rows_sha256` unchanged). No product behaviour changes, so the full tier was not re-run; the signed fast gates were re-bound to the head binary (run `headgate`): `just build` exit 0, SHA-256 `ca7c830ef5d0056c3c715fb4ed7a3fb5e95d6b06103ea2e0c4813befa229b83e`, CDHash `f657d8bf036468e9a682cedc546451b317a1f583`, `__dof_carrick` 1, entitlement present, 0 test-double strings; `scripts/conformance/smoke-two-process.sh` exit 0; `just conformance-probes` exit 0.
+
+Owner-facing items that predate this branch and are not fixed by it: unmodified main fails 25 conformance rows and 4 embed tests on this host (Phase 1 receipt); `ltp-ptrace11`'s "HVPatch child selector is stale" race; `ltp-fork14`'s hang; the `platform-linux` `carrick-runtime` crate does not compile (41 errors in untouched files); `just check-freebsd` needs the FreeBSD sysroot (CI's cross job has it); main's `wedge_capture.rs` followed `deadlock_watchdog` into `carrick-kernel` and shells out to `sudo -n lldb` from the kernel crate; main's `finish_and_run_image_owned` no longer arms the deadlock watchdog.
