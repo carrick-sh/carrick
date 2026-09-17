@@ -13,7 +13,7 @@
 //! table, the dentry cache, the host and in-memory backends, the root
 //! filesystem and the layer cache. Names no kernel, carrier or VMM type; the
 //! kernel-view filesystems (procfs, sysfs, devpts, /dev) live in
-//! carrick-runtime because they render kernel state.
+//! carrick-kernel (`carrick_kernel::vfs`) because they render kernel state.
 
 #[cfg(target_os = "macos")]
 pub mod apfs;

@@ -12,12 +12,13 @@ cache, the path codec, and the single-file/bind mounts (`BindVfs`,
 
 ## What it deliberately excludes
 
-The **kernel-view filesystems stay in `carrick-runtime`**: `/proc` (`ProcVfs`),
-`/sys` (`SysVfs`), `/dev` (`DevVfs`) and `/dev/pts` (`DevptsVfs`). They are not
-filesystems in the sense this crate models — they *render kernel state* (the
-task graph, credentials, the network namespace, the pty table), so they live
-with the kernel that owns that state and implement this crate's `Vfs` trait from
-above.
+The **kernel-view filesystems live in `carrick-kernel`**
+(`crates/carrick-kernel/src/vfs/`): `/proc` (`ProcVfs`, `proc.rs`), `/sys`
+(`SysVfs`, `sys.rs`), `/dev` (`DevVfs`, `dev.rs`) and `/dev/pts` (`DevptsVfs`,
+`devpts.rs`). They are not filesystems in the sense this crate models — they
+*render kernel state* (the task graph, credentials, the network namespace, the
+pty table), so they live with the kernel that owns that state and implement this
+crate's `Vfs` trait from above.
 
 ## The `FsCaller` / `FsNetworkView` seam
 
