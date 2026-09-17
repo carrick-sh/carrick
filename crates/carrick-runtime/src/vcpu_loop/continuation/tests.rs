@@ -146,12 +146,14 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
             "HVPatch continuation path retains prohibited host-blocking authority: {prohibited}"
         );
     }
-    // 17 dispatch-produced families + `VforkParent`. It was 20 until the
+    // 18 dispatch-produced families + `VforkParent`. The retained
+    // `BlockingOpen` family owns a descriptor reservation while a FIFO open
+    // is parked. It was 20 until the
     // host-pid `WaitOnProcExit`/`WaitOnProcState` families went with the
     // retired 1:1 native lane; their event codes (12, 13) stay retired rather
     // than being renumbered, so this census is the family COUNT, not the code
     // range.
-    assert_eq!(DISPATCH_FAMILIES.len() + 1, 18);
+    assert_eq!(DISPATCH_FAMILIES.len() + 1, 19);
     // The retired 1:1 native lane's host-pid wait is gone from the
     // continuation path: no outcome, no family, no selector, and no
     // "reject a host wait on HVPatch" guard, because the types can no longer
