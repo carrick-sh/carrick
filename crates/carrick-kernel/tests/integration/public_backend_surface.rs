@@ -24,8 +24,20 @@
 //!   3. The `CarrierProcess` double, reached through the trait, as the shape a
 //!      backend implements for its own process handle.
 //!
-//! These are the items `crates/carrick-kernel-example` declares it consumes;
-//! this file is the standing check that they remain public, one crate away.
+//! It is specifically the check on the kernel's PROMOTED `test-support`
+//! doubles -- `TestCarrierProcess`, `TestMmBackend`, `TestStage1MmProjection`,
+//! `test_mm_binding`, and the Null bridges they pair with -- from outside the
+//! crate. That matters because `cfg(test)` is not set for an integration
+//! target: the doubles reach this file only through the feature and the self
+//! dev-dependency, which is the same path `carrick-runtime`'s suites take, so a
+//! double that regresses to `pub(crate)` or loses its gate breaks here first.
+//!
+//! It is NOT a check on what `crates/carrick-kernel-example` consumes: the
+//! example takes `carrick-kernel` with no features and brings its OWN
+//! `CarrierProcess` / `MmBackend` / `Stage1MmProjection` impls, which is the
+//! bring-your-own-backend point. Its `tests/fork_pipe_wait.rs` is the standing
+//! check on the ungated public surface; this file is the standing check on the
+//! gated doubles.
 
 use std::sync::Arc;
 

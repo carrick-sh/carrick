@@ -11,14 +11,15 @@ exclude = ["fixtures/*", "crates/*/fixtures/*", "conformance-probes"]
 # and its dependency closure, not every member. This is load-bearing, not a
 # convenience: under resolver 2 a NORMAL dependency's features unify across
 # every package in one selection, and carrick-kernel-example enables
-# `test-support` on carrick-kernel and carrick-hal to boot its backend on the
-# Null bridges. With the whole workspace as the default selection, that
-# test-only surface (`SyscallDispatcher::new()`, the Null bridges, the
+# `test-support` on carrick-hal for the Null bridges its backend boots on.
+# With the whole workspace as the default selection, that test-only surface
+# (the Null bridges, and through them the gated dispatcher constructors and
 # CarrierProcess doubles) was compiled into the shipped binary (2026-09-16).
 # Every gate that means the whole workspace says so explicitly (`--workspace`
 # in `just clippy` / `doc` / `test` / `check --workspace`); the product-closure
 # rule in scripts/closure-assert-layering.sh (`just check-layering`) fails if
-# this selection ever enables `test-support` on either crate.
+# this selection ever enables `test-support` on carrick-hal, carrick-kernel or
+# carrick-vfs.
 default-members = ["crates/carrick-cli"]
 
 [workspace.package]

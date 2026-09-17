@@ -119,7 +119,9 @@ done
 # carrick-kernel / carrick-hal / carrick-vfs compiles that test-only surface
 # -- `SyscallDispatcher::new()`, the Null bridges, the CarrierProcess
 # doubles, and carrick-vfs's per-host-call `openat`/`stat` counters -- into
-# `carrick` the moment it shares the product's selection. That is
+# `carrick` the moment it shares the product's selection.
+# `carrick-kernel-example` is the live example: it enables `test-support` on
+# carrick-hal (for the Null bridges) and on nothing else. That is
 # exactly what a whole-workspace selection did while the root manifest had
 # no `default-members` (found in review of the example crate, 2026-09-16).
 # This rule resolves the SAME argument-less selection the product build

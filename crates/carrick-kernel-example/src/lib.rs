@@ -21,8 +21,11 @@
 //! exit posts no `SIGCHLD` -- a scripted task has no signal delivery.
 //!
 //! It is built from `pub` items of `carrick-kernel`, `carrick-hal`,
-//! `carrick-guest-mem` and `carrick-abi` alone, with `carrick-kernel`'s
-//! `test-support` feature on for the Null bridges. `tests/fork_pipe_wait.rs`
+//! `carrick-guest-mem` and `carrick-abi` alone. It takes `carrick-kernel` with
+//! NO features -- the backend above is its own, over the kernel's ordinary
+//! public surface, which is what a real backend author gets -- and needs
+//! `carrick-hal`'s `test-support` only for the two Null bridges.
+//! `tests/fork_pipe_wait.rs`
 //! is the proof: `pipe2 -> fork -> (child: write, exit 7) -> read -> wait4 ->
 //! exit` through `SyscallDispatcher`, and it fails to compile the moment one
 //! of those items regresses to `pub(crate)`.

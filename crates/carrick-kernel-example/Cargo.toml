@@ -13,17 +13,24 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
-# `test-support` is the bridge-less surface a non-carrier backend boots on:
-# carrick-hal's Null host-signal / guest-timer bridges and the dispatcher
-# constructors that accept them. Enabled through a NORMAL dependency, so
-# resolver 2 unifies it into carrick-kernel and carrick-hal for every package
-# built in the same selection as this crate. The product build is never that
+# carrick-kernel is taken with NO features: this crate is the
+# bring-your-own-backend template, so its backend is its OWN impls
+# (`ExampleProcess`, `ExampleStage1Projection`, `ExampleMmBackend` in
+# `src/process.rs`) over the kernel's ordinary public surface -- which is the
+# point. It uses none of the kernel's `test-support`-gated doubles, and taking
+# the feature would have made the template quietly depend on a test surface a
+# real backend author does not get.
+carrick-kernel = { path = "../carrick-kernel" }
+# carrick-hal's `test-support` IS required, and only for the two Null bridges
+# (`NullHostSignalBridge`, `NullGuestTimerBridge`), which are gated behind it so
+# they are not linkable from a product build. Enabled through a NORMAL
+# dependency, so resolver 2 unifies it into carrick-hal for every package built
+# in the same selection as this crate. The product build is never that
 # selection: the root manifest's `default-members` restricts an argument-less
 # `cargo build --release` (scripts/build-signed.sh) to carrick-cli's closure,
 # and `just check-layering` fails if that selection enables `test-support` on
-# either crate. A `--workspace` build (clippy, doc, test) does unify it, which
-# is what lints and renders the gated surface.
-carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
+# carrick-hal, carrick-kernel or carrick-vfs. A `--workspace` build (clippy,
+# doc, test) does unify it, which is what lints and renders the gated surface.
 carrick-hal = { path = "../carrick-hal", features = ["test-support"] }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-abi = { path = "../carrick-abi" }
