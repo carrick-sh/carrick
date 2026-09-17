@@ -141,6 +141,18 @@ lint-domains:
     python3 scripts/migrate/check-mm-authority.py --self-test
     python3 scripts/migrate/check-dispatch-lock-authority.py --self-test
     python3 scripts/migrate/check-k1-burndown.py --self-test
+    # The two inventory-maintenance tools carry their own unittest files
+    # rather than a `--self-test` flag, and until now no gate executed
+    # them -- a test no gate runs is not a test. They belong here for the
+    # same reason as the self-tests above: both tools REWRITE the
+    # line-pinned inventories (a rename map, a rehome of pinned positions),
+    # so a silent break in either corrupts the very files
+    # `check-host-authority-transitions.py --check` then validates below.
+    # NAMED, not `unittest discover`: `scripts/tests/` also holds
+    # `test_host_authority_transitions.py`, which is red at this branch's
+    # base, and a discover run would turn that pre-existing red into a
+    # blocked gate for every unrelated change.
+    python3 -m unittest scripts/migrate/tests/test_reconcile_rename.py scripts/tests/test_rehome_line_pinned_inventories.py
     python3 scripts/migrate/check-runtime-global-state.py --check
     python3 scripts/migrate/check-runtime-aborts.py --check
     python3 scripts/migrate/check-task-participant-witnesses.py --check
