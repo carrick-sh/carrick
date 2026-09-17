@@ -71,3 +71,8 @@ implements `GuestMemory + CurrentMmMemory` itself.
 
 Experimental, like the kernel it drives. It is not on the product path, the
 `carrick` binary ships none of it, and its API changes with the kernel's.
+That is by construction, not convention: this crate's `test-support`
+dependency on `carrick-kernel`/`carrick-hal` would unify into any build that
+selects it together with `carrick-cli`, so the root manifest's
+`default-members` restricts the product build to `carrick-cli`'s closure and
+`just check-layering` fails if that selection ever enables `test-support`.

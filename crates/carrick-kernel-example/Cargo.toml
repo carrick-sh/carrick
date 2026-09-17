@@ -15,7 +15,14 @@ workspace = true
 [dependencies]
 # `test-support` is the bridge-less surface a non-carrier backend boots on:
 # carrick-hal's Null host-signal / guest-timer bridges and the dispatcher
-# constructors that accept them. A product build of carrick never compiles it.
+# constructors that accept them. Enabled through a NORMAL dependency, so
+# resolver 2 unifies it into carrick-kernel and carrick-hal for every package
+# built in the same selection as this crate. The product build is never that
+# selection: the root manifest's `default-members` restricts an argument-less
+# `cargo build --release` (scripts/build-signed.sh) to carrick-cli's closure,
+# and `just check-layering` fails if that selection enables `test-support` on
+# either crate. A `--workspace` build (clippy, doc, test) does unify it, which
+# is what lints and renders the gated surface.
 carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
 carrick-hal = { path = "../carrick-hal", features = ["test-support"] }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
