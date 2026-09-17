@@ -184,6 +184,27 @@ pub(crate) fn drive(
                 CancellationCause::ProcessExit,
             ));
         }
+        // Capture the current resource generation at each syscall boundary.
+        // set*id and close_range may replace immutable thread resources while
+        // preserving the task/thread identity; a creation-time snapshot is stale.
+        let fresh = match task
+            .process
+            .context_for_linux_tid(task.context.thread().key().tid)
+        {
+            Ok(context) => context,
+            Err(_) if !task.context.exact_thread_is_live() => {
+                return Ok(InternalCompletion::Cancelled(
+                    CancellationCause::ProcessExit,
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if fresh.thread().key() != task.context.thread().key() {
+            return Ok(InternalCompletion::Cancelled(
+                CancellationCause::ProcessExit,
+            ));
+        }
+        task.context = fresh;
         let tid = task.context.thread().registry_id();
 
         let (mut outcome, request) = {

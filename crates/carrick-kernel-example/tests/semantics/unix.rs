@@ -3,8 +3,9 @@
 //! Authorities: man 7 unix, man 3 cmsg, man 7 socket, man 2 send, man 2 recvmsg, man 2 getsockopt.
 
 use carrick_abi::{
-    LINUX_CMSGHDR_LEN, LINUX_EPIPE, LINUX_MSG_CTRUNC, LINUX_MSG_NOSIGNAL, LINUX_SCM_CREDENTIALS,
-    LINUX_SCM_RIGHTS, LINUX_SIGPIPE, LINUX_SO_PASSCRED, LINUX_SOL_SOCKET,
+    LINUX_CMSGHDR_LEN, LINUX_EPERM, LINUX_EPIPE, LINUX_MSG_CTRUNC, LINUX_MSG_NOSIGNAL,
+    LINUX_MSG_PEEK, LINUX_SCM_CREDENTIALS, LINUX_SCM_RIGHTS, LINUX_SIGPIPE, LINUX_SO_PASSCRED,
+    LINUX_SOL_SOCKET,
 };
 use carrick_kernel_example::{
     Layout, Operand, RelocWidth, ScriptedBackend, Step, await_parked, last_child, slot, sys,
@@ -115,7 +116,6 @@ fn a_descriptor_passed_over_scm_rights_reads_the_same_pipe() {
 }
 
 #[test]
-#[ignore = "defect: SCM_CREDENTIALS on socketpair returns creator pid rather than sender pid"]
 fn scm_credentials_carry_the_senders_pid_uid_gid() {
     // man 7 unix / man 3 cmsg: SCM_CREDENTIALS ancillary message carries struct ucred { pid, uid, gid }.
     // When SO_PASSCRED is enabled on the receiver, recvmsg synthesizes the sender's credentials.
@@ -178,6 +178,200 @@ fn scm_credentials_carry_the_senders_pid_uid_gid() {
     );
     assert_eq!(uid, 0, "ucred.uid == 0");
     assert_eq!(gid, 0, "ucred.gid == 0");
+}
+
+#[test]
+fn scm_credentials_tracks_multiple_forked_senders_and_preserves_so_peercred() {
+    // man 7 unix / man 7 socket:
+    // SCM_CREDENTIALS tracks the exact sender process per message across forks,
+    // while SO_PEERCRED remains stable to the socketpair creator identity (parent PID 1).
+    let script = vec![
+        Step::Sys(
+            sys::socketpair_stream()
+                .ret(0)
+                .save_out_i32(3, 0, 0)
+                .save_out_i32(3, 1, 1),
+        ),
+        // Enable SO_PASSCRED on parent's receiving socket (slot 0)
+        Step::Sys(sys::setsockopt_int(slot(0), LINUX_SOL_SOCKET, LINUX_SO_PASSCRED, 1).ret(0)),
+        // Fork child 1 (PID 2)
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::close(slot(0)).ret(0)),
+            Step::Sys(sys::sendto(slot(1), b"1", 0).ret(1)),
+            Step::Sys(sys::close(slot(1)).ret(0)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        // Fork child 2 (PID 3)
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::close(slot(0)).ret(0)),
+            Step::Sys(sys::sendto(slot(1), b"2", 0).ret(1)),
+            Step::Sys(sys::close(slot(1)).ret(0)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        // Parent closes child end
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        // Verify SO_PEERCRED before any recvmsg returns creator PID 1
+        Step::Sys(sys::getsockopt_so_peercred(slot(0)).ret(0)),
+        // Parent receives first message (from child 1, PID 2)
+        Step::Sys(sys::recvmsg_stream(slot(0), 1, 32, 0).ret(1)),
+        // Verify SO_PEERCRED between recvmsgs still returns creator PID 1
+        Step::Sys(sys::getsockopt_so_peercred(slot(0)).ret(0)),
+        // Parent receives second message (from child 2, PID 3)
+        Step::Sys(sys::recvmsg_stream(slot(0), 1, 32, 0).ret(1)),
+        // Verify SO_PEERCRED after all recvmsgs still returns creator PID 1
+        Step::Sys(sys::getsockopt_so_peercred(slot(0)).ret(0)),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::wait4(-1, 0)),
+        Step::Sys(sys::wait4(-1, 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+
+    // Verify SO_PEERCRED results: all 3 queries must return creator PID 1
+    let optval_outputs = run.outputs_for("getsockopt");
+    let peercred_outputs: Vec<_> = optval_outputs
+        .into_iter()
+        .filter(|o| o.tag == Some("optval"))
+        .collect();
+    assert_eq!(peercred_outputs.len(), 3);
+    for out in peercred_outputs {
+        let pid = i32::from_le_bytes(out.bytes[0..4].try_into().unwrap());
+        let uid = u32::from_le_bytes(out.bytes[4..8].try_into().unwrap());
+        let gid = u32::from_le_bytes(out.bytes[8..12].try_into().unwrap());
+        assert_eq!(pid, 1, "SO_PEERCRED must remain creator PID 1");
+        assert_eq!(uid, 0);
+        assert_eq!(gid, 0);
+    }
+
+    // Verify SCM_CREDENTIALS results: first from PID 2, second from PID 3
+    let recvmsg_outputs = run.outputs_for("recvmsg");
+    let control_outputs: Vec<_> = recvmsg_outputs
+        .into_iter()
+        .filter(|o| o.tag == Some("control"))
+        .collect();
+    assert_eq!(control_outputs.len(), 2);
+
+    let pid1 = i32::from_le_bytes(control_outputs[0].bytes[16..20].try_into().unwrap());
+    let pid2 = i32::from_le_bytes(control_outputs[1].bytes[16..20].try_into().unwrap());
+    assert_eq!(
+        pid1, 2,
+        "First message credentials must reflect Child 1 (PID 2)"
+    );
+    assert_eq!(
+        pid2, 3,
+        "Second message credentials must reflect Child 2 (PID 3)"
+    );
+}
+
+#[test]
+fn scm_credentials_synthesized_for_plain_write() {
+    // man 7 unix / man 7 socket: When SO_PASSCRED is enabled on the receiver,
+    // SCM_CREDENTIALS is synthesized even if the sender used ordinary write(2).
+    let script = vec![
+        Step::Sys(
+            sys::socketpair_stream()
+                .ret(0)
+                .save_out_i32(3, 0, 0)
+                .save_out_i32(3, 1, 1),
+        ),
+        Step::Sys(sys::setsockopt_int(slot(0), LINUX_SOL_SOCKET, LINUX_SO_PASSCRED, 1).ret(0)),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::close(slot(0)).ret(0)),
+            Step::Sys(sys::write(slot(1), b"W").ret(1)),
+            Step::Sys(sys::close(slot(1)).ret(0)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        Step::Sys(sys::recvmsg_stream(slot(0), 1, 32, 0).ret(1)),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+
+    let control_bytes = run.output_tagged("control");
+    assert!(control_bytes.len() >= 28);
+    let pid = i32::from_le_bytes(control_bytes[16..20].try_into().unwrap());
+    let uid = u32::from_le_bytes(control_bytes[20..24].try_into().unwrap());
+    let gid = u32::from_le_bytes(control_bytes[24..28].try_into().unwrap());
+    assert_eq!(
+        pid, 2,
+        "SCM_CREDENTIALS on plain write reflects child sender PID 2"
+    );
+    assert_eq!(uid, 0);
+    assert_eq!(gid, 0);
+    assert_eq!(run.output_tagged("iov"), b"W");
+}
+
+#[test]
+fn scm_credentials_peek_does_not_consume() {
+    // man 2 recvmsg / man 7 unix: MSG_PEEK returns data and ancillary credentials without consuming them from the queue.
+    let script = vec![
+        Step::Sys(
+            sys::socketpair_stream()
+                .ret(0)
+                .save_out_i32(3, 0, 0)
+                .save_out_i32(3, 1, 1),
+        ),
+        Step::Sys(sys::setsockopt_int(slot(0), LINUX_SOL_SOCKET, LINUX_SO_PASSCRED, 1).ret(0)),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::close(slot(0)).ret(0)),
+            Step::Sys(sys::sendto(slot(1), b"P", 0).ret(1)),
+            Step::Sys(sys::close(slot(1)).ret(0)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        // First recvmsg with MSG_PEEK
+        Step::Sys(sys::recvmsg_stream(slot(0), 1, 32, LINUX_MSG_PEEK).ret(1)),
+        // Second recvmsg without MSG_PEEK
+        Step::Sys(sys::recvmsg_stream(slot(0), 1, 32, 0).ret(1)),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+
+    let recvmsg_outputs = run.outputs_for("recvmsg");
+    let control_outputs: Vec<_> = recvmsg_outputs
+        .iter()
+        .copied()
+        .filter(|o| o.tag == Some("control"))
+        .collect();
+    assert_eq!(
+        control_outputs.len(),
+        2,
+        "both peek and non-peek received control message"
+    );
+
+    let pid_peek = i32::from_le_bytes(control_outputs[0].bytes[16..20].try_into().unwrap());
+    let pid_nonpeek = i32::from_le_bytes(control_outputs[1].bytes[16..20].try_into().unwrap());
+    assert_eq!(pid_peek, 2, "peek received sender PID 2");
+    assert_eq!(pid_nonpeek, 2, "subsequent non-peek received sender PID 2");
+
+    let iov_outputs: Vec<_> = recvmsg_outputs
+        .iter()
+        .copied()
+        .filter(|o| o.tag == Some("iov"))
+        .collect();
+    assert_eq!(iov_outputs.len(), 2);
+    assert_eq!(iov_outputs[0].bytes, b"P");
+    assert_eq!(iov_outputs[1].bytes, b"P");
 }
 
 #[test]
@@ -390,4 +584,247 @@ fn recvmsg_control_truncation_sets_msg_ctrunc() {
         0,
         "man 2 recvmsg: MSG_CTRUNC must be set when control buffer is truncated"
     );
+}
+
+#[test]
+fn scm_credentials_deferred_read_after_sender_exit_and_reap() {
+    // Sender writes "ab", then exits and is reaped; parent queries SO_PEERCRED (still creator PID 1),
+    // peeks byte "a" (SCM_CREDENTIALS sender PID 2), calls plain read(1) to consume "a",
+    // and calls recvmsg(1) for "b" which still carries sender PID 2.
+    let script = vec![
+        Step::Sys(
+            sys::socketpair_stream()
+                .ret(0)
+                .save_out_i32(3, 0, 0)
+                .save_out_i32(3, 1, 1),
+        ),
+        Step::Sys(sys::setsockopt_int(slot(0), LINUX_SOL_SOCKET, LINUX_SO_PASSCRED, 1).ret(0)),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::close(slot(0)).ret(0)),
+            Step::Sys(sys::sendto(slot(1), b"ab", 0).ret(2)),
+            Step::Sys(sys::close(slot(1)).ret(0)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        // Wait and reap child
+        Step::Sys(sys::wait4(last_child(), 0)),
+        // SO_PEERCRED remains creator PID 1
+        Step::Sys(sys::getsockopt_so_peercred(slot(0)).ret(0)),
+        // Peek byte "a"
+        Step::Sys(sys::recvmsg_stream(slot(0), 1, 32, LINUX_MSG_PEEK).ret(1)),
+        // Consume byte "a" with plain read
+        Step::Sys(sys::read(slot(0), 1).ret(1)),
+        // Receive byte "b" with recvmsg; must still carry SCM_CREDENTIALS for sender PID 2
+        Step::Sys(sys::recvmsg_stream(slot(0), 1, 32, 0).ret(1)),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+
+    // SO_PEERCRED is PID 1
+    let optval_outputs = run.outputs_for("getsockopt");
+    let peercred_out = optval_outputs
+        .into_iter()
+        .find(|o| o.tag == Some("optval"))
+        .unwrap();
+    let peercred_pid = i32::from_le_bytes(peercred_out.bytes[0..4].try_into().unwrap());
+    assert_eq!(peercred_pid, 1, "SO_PEERCRED must remain creator PID 1");
+
+    // recvmsg outputs
+    let recvmsg_outputs = run.outputs_for("recvmsg");
+    let control_outputs: Vec<_> = recvmsg_outputs
+        .iter()
+        .copied()
+        .filter(|o| o.tag == Some("control"))
+        .collect();
+    assert_eq!(control_outputs.len(), 2);
+
+    let pid_peek = i32::from_le_bytes(control_outputs[0].bytes[16..20].try_into().unwrap());
+    let pid_b = i32::from_le_bytes(control_outputs[1].bytes[16..20].try_into().unwrap());
+    assert_eq!(pid_peek, 2, "peek of 'a' carries sender Child PID 2");
+    assert_eq!(
+        pid_b, 2,
+        "recvmsg of 'b' after plain read of 'a' carries sender Child PID 2"
+    );
+
+    let iov_outputs: Vec<_> = recvmsg_outputs
+        .iter()
+        .copied()
+        .filter(|o| o.tag == Some("iov"))
+        .collect();
+    assert_eq!(iov_outputs.len(), 2);
+    assert_eq!(iov_outputs[0].bytes, b"a");
+    assert_eq!(iov_outputs[1].bytes, b"b");
+
+    let read_outputs = run.outputs_for("read");
+    assert_eq!(read_outputs[0].bytes, b"a");
+}
+
+#[test]
+fn scm_credentials_stream_read_capping_across_multiple_senders() {
+    // When SO_PASSCRED is enabled on a stream socket, recvmsg caps the read length
+    // at the front sender's chunk boundary, preventing merging data across different senders.
+    let script = vec![
+        Step::Sys(
+            sys::socketpair_stream()
+                .ret(0)
+                .save_out_i32(3, 0, 0)
+                .save_out_i32(3, 1, 1),
+        ),
+        Step::Sys(sys::setsockopt_int(slot(0), LINUX_SOL_SOCKET, LINUX_SO_PASSCRED, 1).ret(0)),
+        // Child 1 (PID 2) writes "AA"
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::close(slot(0)).ret(0)),
+            Step::Sys(sys::sendto(slot(1), b"AA", 0).ret(2)),
+            Step::Sys(sys::close(slot(1)).ret(0)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        // Child 2 (PID 3) writes "BB"
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::close(slot(0)).ret(0)),
+            Step::Sys(sys::sendto(slot(1), b"BB", 0).ret(2)),
+            Step::Sys(sys::close(slot(1)).ret(0)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        // Parent requests 4 bytes in recvmsg, but it must be capped to 2 bytes (Child 1's chunk)
+        Step::Sys(sys::recvmsg_stream(slot(0), 4, 32, 0).ret(2)),
+        // Next recvmsg returns the remaining 2 bytes (Child 2's chunk)
+        Step::Sys(sys::recvmsg_stream(slot(0), 4, 32, 0).ret(2)),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+
+    let recvmsg_outputs = run.outputs_for("recvmsg");
+    let control_outputs: Vec<_> = recvmsg_outputs
+        .iter()
+        .copied()
+        .filter(|o| o.tag == Some("control"))
+        .collect();
+    assert_eq!(control_outputs.len(), 2);
+
+    let pid1 = i32::from_le_bytes(control_outputs[0].bytes[16..20].try_into().unwrap());
+    let pid2 = i32::from_le_bytes(control_outputs[1].bytes[16..20].try_into().unwrap());
+    assert_eq!(pid1, 2, "First recvmsg returned Child 1 (PID 2)");
+    assert_eq!(pid2, 3, "Second recvmsg returned Child 2 (PID 3)");
+
+    let iov_outputs: Vec<_> = recvmsg_outputs
+        .iter()
+        .copied()
+        .filter(|o| o.tag == Some("iov"))
+        .collect();
+    assert_eq!(iov_outputs.len(), 2);
+    assert_eq!(&iov_outputs[0].bytes[..2], b"AA");
+    assert_eq!(&iov_outputs[1].bytes[..2], b"BB");
+}
+
+#[test]
+fn scm_credentials_explicit_unprivileged_forgery_returns_eperm() {
+    // man 7 unix: An unprivileged process that passes SCM_CREDENTIALS specifying a PID/UID/GID
+    // it does not own without the required capability receives EPERM.
+    let script = vec![
+        Step::Sys(
+            sys::socketpair_stream()
+                .ret(0)
+                .save_out_i32(3, 0, 0)
+                .save_out_i32(3, 1, 1),
+        ),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::close(slot(0)).ret(0)),
+            // Child (unprivileged non-init task) tries to forge PID 9999
+            Step::Sys(sys::sendmsg_creds(slot(1), 9999, 0, 0, b"forged", 0).errno(LINUX_EPERM)),
+            Step::Sys(sys::close(slot(1)).ret(0)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+}
+
+#[test]
+fn scm_credentials_zero_length_datagram_and_subsequent_datagram() {
+    // Zero-length datagrams queue and consume credential records.
+    let script = vec![
+        Step::Sys(
+            sys::socketpair_dgram()
+                .ret(0)
+                .save_out_i32(3, 0, 0)
+                .save_out_i32(3, 1, 1),
+        ),
+        Step::Sys(sys::setsockopt_int(slot(0), LINUX_SOL_SOCKET, LINUX_SO_PASSCRED, 1).ret(0)),
+        // Child 1 sends 0-byte datagram
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::close(slot(0)).ret(0)),
+            Step::Sys(sys::sendto(slot(1), b"", 0).ret(0)),
+            Step::Sys(sys::close(slot(1)).ret(0)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        // Child 2 sends 5-byte datagram "hello"
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::close(slot(0)).ret(0)),
+            Step::Sys(sys::sendto(slot(1), b"hello", 0).ret(5)),
+            Step::Sys(sys::close(slot(1)).ret(0)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        // Parent receives 0-byte datagram from Child 1 (PID 2)
+        Step::Sys(sys::recvmsg_stream(slot(0), 0, 32, 0).ret(0)),
+        // Parent receives 5-byte datagram from Child 2 (PID 3)
+        Step::Sys(sys::recvmsg_stream(slot(0), 5, 32, 0).ret(5)),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
+
+    let recvmsg_outputs = run.outputs_for("recvmsg");
+    let control_outputs: Vec<_> = recvmsg_outputs
+        .iter()
+        .copied()
+        .filter(|o| o.tag == Some("control"))
+        .collect();
+    assert_eq!(control_outputs.len(), 2);
+
+    let pid1 = i32::from_le_bytes(control_outputs[0].bytes[16..20].try_into().unwrap());
+    let pid2 = i32::from_le_bytes(control_outputs[1].bytes[16..20].try_into().unwrap());
+    assert_eq!(pid1, 2, "0-byte datagram carried Child 1 (PID 2)");
+    assert_eq!(pid2, 3, "Second datagram carried Child 2 (PID 3)");
+
+    let iov_outputs: Vec<_> = recvmsg_outputs
+        .iter()
+        .copied()
+        .filter(|o| o.tag == Some("iov"))
+        .collect();
+    assert_eq!(iov_outputs.len(), 2);
+    assert_eq!(iov_outputs[0].bytes, b"");
+    assert_eq!(iov_outputs[1].bytes, b"hello");
 }

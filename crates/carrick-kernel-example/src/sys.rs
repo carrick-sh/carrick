@@ -3,8 +3,8 @@
 use carrick_abi::syscall::nr;
 use carrick_abi::{
     CanonicalNr, LINUX_AF_UNIX, LINUX_CMSGHDR_LEN, LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL,
-    LINUX_EPOLL_CTL_MOD, LINUX_SCM_RIGHTS, LINUX_SIGCHLD, LINUX_SO_PEERCRED, LINUX_SOCK_STREAM,
-    LINUX_SOL_SOCKET, LINUX_UCRED_SIZE,
+    LINUX_EPOLL_CTL_MOD, LINUX_SCM_CREDENTIALS, LINUX_SCM_RIGHTS, LINUX_SIGCHLD, LINUX_SO_PEERCRED,
+    LINUX_SOCK_DGRAM, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET, LINUX_UCRED_SIZE,
 };
 
 use crate::operand::{Expect, Layout, Operand, RelocWidth, Syscall};
@@ -469,6 +469,40 @@ pub fn socketpair(domain: i32, type_: i32, protocol: i32) -> Syscall {
 /// `socketpair(AF_UNIX, SOCK_STREAM, 0)` helper.
 pub fn socketpair_stream() -> Syscall {
     socketpair(LINUX_AF_UNIX, LINUX_SOCK_STREAM, 0)
+}
+
+/// `socketpair(AF_UNIX, SOCK_DGRAM, 0)` helper.
+pub fn socketpair_dgram() -> Syscall {
+    socketpair(LINUX_AF_UNIX, LINUX_SOCK_DGRAM, 0)
+}
+
+/// `sendmsg(2)` passing credentials via `SCM_CREDENTIALS`.
+pub fn sendmsg_creds(
+    fd: impl Into<Operand>,
+    pid: i32,
+    uid: u32,
+    gid: u32,
+    data: &[u8],
+    flags: i32,
+) -> Syscall {
+    let iov_data = Operand::Bytes(data.to_vec());
+    let iov_layout = Layout::new(16)
+        .with_reloc(0, RelocWidth::U64, iov_data)
+        .with_u64(8, data.len() as u64);
+    let cmsg_len = LINUX_CMSGHDR_LEN + 12;
+    let cmsg = Layout::new(cmsg_len)
+        .with_u64(0, cmsg_len as u64)
+        .with_i32(8, LINUX_SOL_SOCKET)
+        .with_i32(12, LINUX_SCM_CREDENTIALS)
+        .with_i32(16, pid)
+        .with_u32(20, uid)
+        .with_u32(24, gid);
+    let msghdr = Layout::new(56)
+        .with_reloc(16, RelocWidth::U64, iov_layout)
+        .with_u64(24, 1)
+        .with_reloc(32, RelocWidth::U64, cmsg)
+        .with_u64(40, cmsg_len as u64);
+    sendmsg(fd, msghdr, flags)
 }
 
 /// `sendmsg(2)`: send a message on a socket using a `msghdr` layout.

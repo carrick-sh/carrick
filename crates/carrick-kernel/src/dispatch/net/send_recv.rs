@@ -41,6 +41,19 @@ fn linux_msg_trunc_recv_capacity(host_fd: i32, guest_len: usize, flags: i32) -> 
         .min(crate::dispatch::MAX_RW_COUNT)
 }
 
+fn current_task_default_send_cred(
+    creds: &crate::kernel::Credentials,
+    context: &crate::kernel::KernelContext,
+) -> SocketPeerCred {
+    let task_id = u32::try_from(context.task().key().id.raw()).unwrap_or(0);
+    let pid = crate::namespace::pid::ns_self_pid_for(context, task_id);
+    SocketPeerCred {
+        pid: crate::dispatch::NsPid(pid as i32),
+        uid: creds.ruid,
+        gid: creds.rgid,
+    }
+}
+
 #[cfg(test)]
 mod host_dgram_msg_trunc_tests {
     use super::{LINUX_MSG_TRUNC, linux_msg_trunc_recv_capacity};
@@ -552,6 +565,9 @@ impl<'a> NetView<'a> {
                     .and_then(|local| recverr::shadow_for_send(host_fd.get(), &local, dest)),
                 _ => None,
             };
+            let outbound_flow = this.open_file(fd).and_then(|f| f.description.common().outbound_flow());
+            let creds = this.cross.cred_snapshot();
+            let my_cred = current_task_default_send_cred(&creds, cx.kernel);
             let send_to = this
                 .open_file(fd)
                 .and_then(|f| f.description.read()?.send_timeout());
@@ -561,77 +577,125 @@ impl<'a> NetView<'a> {
                 // the error-queue shadow are O_NONBLOCK, and MSG_DONTWAIT keeps
                 // that true per call.
                 let host_flags = host_flags | libc::MSG_DONTWAIT;
-                // Publish the SCTP boundary BEFORE the host send: the peer can
-                // read the bytes the instant it returns.
-                let pending_sctp = if is_sctp_stream {
-                    sctp::begin_send(host_fd.get(), len)
-                } else {
-                    None
-                };
-                let n = match &host_addr {
-                    None => unsafe {
-                        libc::sendto(
-                            host_fd.get(),
-                            data_ptr as *const _,
-                            len,
-                            host_flags,
-                            std::ptr::null(),
-                            0,
-                        )
-                    },
-                    // An error-queue socket sends through its shadow (same
-                    // local addr:port, connected to this destination), so Darwin
-                    // reports the returning ICMP error — it reports nothing on
-                    // an unconnected socket. The shadow is already connected, so
-                    // the destination is implicit: Darwin answers EISCONN for a
-                    // `sendto` that names an address on a connected socket.
-                    // No shadow means send normally; losing the datagram would
-                    // be far worse than losing the error report.
-                    Some(a) => {
-                        let host_flags = host_flags | libc::MSG_DONTWAIT;
-                        match recverr_send_fd {
-                            Some(shadow) => unsafe {
-                                libc::sendto(
-                                    shadow,
-                                    data_ptr as *const _,
-                                    len,
-                                    host_flags,
-                                    std::ptr::null(),
-                                    0,
-                                )
-                            },
-                            None => unsafe {
-                                libc::sendto(
-                                    host_fd.get(),
-                                    data_ptr as *const _,
-                                    len,
-                                    host_flags,
-                                    a.as_ptr() as *const _,
-                                    a.len() as u32,
-                                )
-                            },
+                let (n_res, pending_sctp) = if let Some(flow) = &outbound_flow {
+                    let mut ledger = flow.lock_ledger();
+                    let pending_sctp = if is_sctp_stream {
+                        sctp::begin_send(host_fd.get(), len)
+                    } else {
+                        None
+                    };
+                    let n = match &host_addr {
+                        None => unsafe {
+                            libc::sendto(
+                                host_fd.get(),
+                                data_ptr as *const _,
+                                len,
+                                host_flags,
+                                std::ptr::null(),
+                                0,
+                            )
+                        },
+                        Some(a) => {
+                            match recverr_send_fd {
+                                Some(shadow) => unsafe {
+                                    libc::sendto(
+                                        shadow,
+                                        data_ptr as *const _,
+                                        len,
+                                        host_flags,
+                                        std::ptr::null(),
+                                        0,
+                                    )
+                                },
+                                None => unsafe {
+                                    libc::sendto(
+                                        host_fd.get(),
+                                        data_ptr as *const _,
+                                        len,
+                                        host_flags,
+                                        a.as_ptr() as *const _,
+                                        a.len() as u32,
+                                    )
+                                },
+                            }
+                        }
+                    };
+                    let n_res = match n.host_syscall_errno().map(|value| value as i64) {
+                        Err(LINUX_ENOTCONN) if is_stream => Err(LINUX_EPIPE),
+                        other => other,
+                    };
+                    if let Ok(sent) = n_res && (sent > 0 || !is_stream) {
+                        if is_stream {
+                            ledger.push_stream_bytes(sent as usize, my_cred);
+                        } else {
+                            ledger.push_dgram(sent as usize, my_cred);
                         }
                     }
-                };
-                let result = match n.host_syscall_errno().map(|value| value as i64) {
-                    Err(LINUX_ENOTCONN) if is_stream => Err(LINUX_EPIPE),
-                    other => other,
+                    (n_res, pending_sctp)
+                } else {
+                    let pending_sctp = if is_sctp_stream {
+                        sctp::begin_send(host_fd.get(), len)
+                    } else {
+                        None
+                    };
+                    let n = match &host_addr {
+                        None => unsafe {
+                            libc::sendto(
+                                host_fd.get(),
+                                data_ptr as *const _,
+                                len,
+                                host_flags,
+                                std::ptr::null(),
+                                0,
+                            )
+                        },
+                        Some(a) => {
+                            match recverr_send_fd {
+                                Some(shadow) => unsafe {
+                                    libc::sendto(
+                                        shadow,
+                                        data_ptr as *const _,
+                                        len,
+                                        host_flags,
+                                        std::ptr::null(),
+                                        0,
+                                    )
+                                },
+                                None => unsafe {
+                                    libc::sendto(
+                                        host_fd.get(),
+                                        data_ptr as *const _,
+                                        len,
+                                        host_flags,
+                                        a.as_ptr() as *const _,
+                                        a.len() as u32,
+                                    )
+                                },
+                            }
+                        }
+                    };
+                    let n_res = match n.host_syscall_errno().map(|value| value as i64) {
+                        Err(LINUX_ENOTCONN) if is_stream => Err(LINUX_EPIPE),
+                        other => other,
+                    };
+                    (n_res, pending_sctp)
                 };
                 if let Some(pending) = pending_sctp {
-                    pending.settle(result.ok().map(|sent| sent.max(0) as usize));
+                    pending.settle(n_res.as_ref().ok().map(|sent| *sent.max(&0) as usize));
                 }
-                result
+                n_res
             });
             if connected_send && matches!(outcome, DispatchOutcome::Returned { value } if value >= 0) {
                 this.queue_socket_error_after_send(fd);
             }
-            Ok(this.settle_cork_send(
+            let final_outcome = this.settle_cork_send(
                 fd,
                 outcome,
                 combined_buf.as_deref(),
                 len - current_payload_len,
                 nonblocking,
-            ))
+            );
+            Ok(final_outcome)
         }
 
         fn recvfrom(this, cx, fd: Fd, buf: GuestPtr, len: u64, flags: u64, src_addr: GuestPtr, addrlen: GuestPtr) {
@@ -823,6 +887,9 @@ impl<'a> NetView<'a> {
                 (None, Some(b)) => b.as_mut_ptr(),
                 (None, None) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
             };
+            let inbound_flow = this.open_file(fd).and_then(|f| f.description.common().inbound_flow());
+            let is_stream = this.socket_guest_type(fd) == Some(libc::SOCK_STREAM);
+            let is_peek = (flags & LinuxMsgFlags::PEEK.bits()) != 0;
             let recv_to = this
                 .open_file(fd)
                 .and_then(|f| f.description.read()?.recv_timeout());
@@ -854,7 +921,36 @@ impl<'a> NetView<'a> {
                 let host_flags = host_flags | libc::MSG_DONTWAIT;
                 for target in &recv_targets {
                     sa_len = sa.len() as libc::socklen_t;
-                    let attempt = if used_addr {
+                    let attempt = if let Some(flow) = &inbound_flow {
+                        let mut ledger = flow.lock_ledger();
+                        let res = if used_addr {
+                            unsafe {
+                                libc::recvfrom(
+                                    *target,
+                                    dst_ptr as *mut _,
+                                    host_recv_len,
+                                    host_flags,
+                                    sa.as_mut_ptr() as *mut _,
+                                    &mut sa_len as *mut _,
+                                )
+                            }
+                        } else {
+                            unsafe {
+                                libc::recvfrom(
+                                    *target,
+                                    dst_ptr as *mut _,
+                                    host_recv_len,
+                                    host_flags,
+                                    std::ptr::null_mut(),
+                                    std::ptr::null_mut(),
+                                )
+                            }
+                        };
+                        if let Ok(got) = res.host_syscall_errno() && (got > 0 || !is_stream) && !is_peek {
+                            ledger.consume_bytes(got as usize, is_stream);
+                        }
+                        res
+                    } else if used_addr {
                         unsafe {
                             libc::recvfrom(
                                 *target,
@@ -1123,8 +1219,17 @@ impl<'a> NetView<'a> {
         // Lives until the host sendmsg has settled: it owns the placeholder
         // fds named by `host_control` and un-parks them if the send fails.
         let mut rights = scm_rights::InFlightRights::new();
+        let mut explicit_creds = None;
         if msg.control != 0 && msg.controllen > 0 {
             let raw = memory.read_bytes(msg.control, msg.controllen as usize)?;
+            let creds = self.cross.cred_snapshot();
+            match support::validate_and_extract_scm_credentials(&raw, context, &creds) {
+                Ok(creds) => explicit_creds = creds,
+                Err(errno) => {
+                    rights.abort();
+                    return Ok(DispatchOutcome::errno(errno));
+                }
+            }
             let guest_fds = parse_linux_scm_rights_fds(&raw);
             if !guest_fds.is_empty() {
                 for gfd in &guest_fds {
@@ -1160,13 +1265,9 @@ impl<'a> NetView<'a> {
         if is_unix_stream && host_addr.is_some() && host_socket_is_connected(host_fd.get()) {
             return Ok(DispatchOutcome::errno(LINUX_EISCONN));
         }
-        let payload_len = data.len();
         let send_to = self
             .open_file(fd)
             .and_then(|f| f.description.read()?.send_timeout());
-        // An error-queue socket sends through its shadow so Darwin will report
-        // the returning ICMP error (it reports nothing on an unconnected
-        // socket). Same bytes and same source address on the wire. libuv's
         // `uv_udp_send` lowers to sendmsg, not sendto, so this path needs the
         // routing just as much as `sendto` does.
         let recverr_send_fd = match (&host_addr, recverr::is_enabled(host_fd.get())) {
@@ -1174,6 +1275,12 @@ impl<'a> NetView<'a> {
                 .and_then(|local| recverr::shadow_for_send(host_fd.get(), &local, dest)),
             _ => None,
         };
+        let outbound_flow = self
+            .open_file(fd)
+            .and_then(|f| f.description.common().outbound_flow());
+        let creds = self.cross.cred_snapshot();
+        let my_cred =
+            explicit_creds.unwrap_or_else(|| current_task_default_send_cred(&creds, context));
         let outcome = self.blocking_io(
             fd,
             host_fd.get(),
@@ -1212,17 +1319,39 @@ impl<'a> NetView<'a> {
                 // error-queue shadow are O_NONBLOCK, and MSG_DONTWAIT keeps this
                 // call non-blocking regardless.
                 let host_flags = host_flags | libc::MSG_DONTWAIT;
-                let pending_sctp = if is_sctp_stream {
-                    sctp::begin_send(send_fd, payload_len)
+                let (n_res, pending_sctp) = if let Some(flow) = &outbound_flow {
+                    let mut ledger = flow.lock_ledger();
+                    let pending_sctp = if is_sctp_stream {
+                        sctp::begin_send(send_fd, data.len())
+                    } else {
+                        None
+                    };
+                    let n = unsafe { libc::sendmsg(send_fd, &hmsg as *const _, host_flags) };
+                    let n_res = n.host_syscall_errno().map(|value| value as i64);
+                    if let Ok(sent) = n_res
+                        && (sent > 0 || !is_stream)
+                    {
+                        if is_stream {
+                            ledger.push_stream_bytes(sent as usize, my_cred);
+                        } else {
+                            ledger.push_dgram(sent as usize, my_cred);
+                        }
+                    }
+                    (n_res, pending_sctp)
                 } else {
-                    None
+                    let pending_sctp = if is_sctp_stream {
+                        sctp::begin_send(send_fd, data.len())
+                    } else {
+                        None
+                    };
+                    let n = unsafe { libc::sendmsg(send_fd, &hmsg as *const _, host_flags) };
+                    let n_res = n.host_syscall_errno().map(|value| value as i64);
+                    (n_res, pending_sctp)
                 };
-                let n = unsafe { libc::sendmsg(send_fd, &hmsg as *const _, host_flags) };
-                let result = n.host_syscall_errno().map(|value| value as i64);
                 if let Some(pending) = pending_sctp {
-                    pending.settle(result.ok().map(|sent| sent.max(0) as usize));
+                    pending.settle(n_res.as_ref().ok().map(|sent| *sent.max(&0) as usize));
                 }
-                result
+                n_res
             },
         );
         // A delivered message holds its own dups of the placeholders; anything
@@ -1233,13 +1362,14 @@ impl<'a> NetView<'a> {
         } else {
             rights.abort();
         }
-        Ok(self.settle_cork_send(
+        let final_outcome = self.settle_cork_send(
             fd,
             outcome,
             Some(&data),
             data.len() - current_payload_len,
             nonblocking,
-        ))
+        );
+        Ok(final_outcome)
     }
 
     /// Translate the host's accepted byte count into the guest's `send`
@@ -1638,6 +1768,13 @@ impl<'a> NetView<'a> {
         let recvmsg_targets: Vec<i32> = std::iter::once(host_fd.get())
             .chain(reuseport::steal_targets(host_fd.get()))
             .collect();
+        let inbound_flow = self
+            .open_file(fd)
+            .and_then(|f| f.description.common().inbound_flow());
+        let is_stream = guest_type == Some(libc::SOCK_STREAM);
+        let is_peek = (flags & LinuxMsgFlags::PEEK.bits()) != 0;
+        let passcred = !is_netlink && self.socket_so_passcred(fd);
+        let observed_cred = std::cell::RefCell::new(None);
         let outcome =
             self.blocking_io(fd, host_fd.get(), IoDir::Read, nonblocking, recv_to, || {
                 // A retry must not leak fds from a prior partial attempt.
@@ -1709,12 +1846,40 @@ impl<'a> NetView<'a> {
                     if want_control {
                         hmsg.msg_controllen = hcontrol.len() as _;
                     }
-                    let attempt =
-                        unsafe { libc::recvmsg(*target, &mut hmsg as *mut _, host_flags) };
+                    let (attempt, target_cred) = if let Some(flow) = &inbound_flow {
+                        let mut ledger = flow.lock_ledger();
+                        let front = ledger.peek_front_cred(is_stream);
+                        let orig_len = hiov.iov_len;
+                        if is_stream && passcred {
+                            if let Some(front_run) = &front {
+                                hiov.iov_len = hiov.iov_len.min(front_run.bytes);
+                            }
+                        }
+                        let attempt =
+                            unsafe { libc::recvmsg(*target, &mut hmsg as *mut _, host_flags) };
+                        hiov.iov_len = orig_len;
+                        let cred = match attempt.host_syscall_errno() {
+                            Ok(got) if got >= 0 => {
+                                if !is_peek && (got > 0 || !is_stream) {
+                                    ledger.consume_bytes(got as usize, is_stream);
+                                }
+                                front.map(|f| f.cred)
+                            }
+                            _ => None,
+                        };
+                        (attempt, cred)
+                    } else {
+                        let attempt =
+                            unsafe { libc::recvmsg(*target, &mut hmsg as *mut _, host_flags) };
+                        (attempt, None)
+                    };
                     match attempt.host_syscall_errno() {
                         Ok(_) => {
                             n = attempt;
                             last_errno = None;
+                            if let Some(c) = target_cred {
+                                observed_cred.borrow_mut().replace(c);
+                            }
                             break;
                         }
                         Err(e) if e == LINUX_EAGAIN => last_errno = Some(e),
@@ -1859,8 +2024,12 @@ impl<'a> NetView<'a> {
                 // ucred after any SCM_RIGHTS, bounded by the remaining control
                 // budget. (audit M2)
                 let mut cred_trunc = false;
-                if !is_netlink && self.socket_so_passcred(fd) {
-                    let (pid, uid, gid) = self.peer_ucred(fd);
+                if passcred {
+                    let (pid, uid, gid) = if let Some(c) = observed_cred.into_inner() {
+                        (c.pid.0 as u32, c.uid.raw(), c.gid.raw())
+                    } else {
+                        self.peer_ucred(fd)
+                    };
                     let remaining = (msg.controllen as usize).saturating_sub(scm.len());
                     let (creds, t) = build_linux_scm_creds(pid, uid, gid, remaining);
                     scm.extend_from_slice(&creds);

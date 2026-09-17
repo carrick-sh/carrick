@@ -162,6 +162,9 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                 tid: crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0101),
                 sigpipe_on_epipe: true,
                 authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+                socket_flow: None,
+                socket_cred: None,
+                is_stream: false,
             },
         );
 
@@ -220,6 +223,9 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                 tid: crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0103),
                 sigpipe_on_epipe: false,
                 authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+                socket_flow: None,
+                socket_cred: None,
+                is_stream: false,
             },
         );
 
@@ -279,6 +285,9 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                 tid: crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0104),
                 sigpipe_on_epipe: false,
                 authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+                socket_flow: None,
+                socket_cred: None,
+                is_stream: false,
             },
         );
 

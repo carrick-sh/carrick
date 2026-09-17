@@ -776,8 +776,8 @@ pub mod io_pipe;
 pub mod routing;
 pub mod seccomp_observer;
 pub(crate) use io_pipe::{
-    HostPipeWriteTarget, MAX_RW_COUNT, host_pipe_write_room, read_host_pipe, would_block_outcome,
-    write_host_pipe, write_host_pipe_owned,
+    HostPipeReadTarget, HostPipeWriteTarget, MAX_RW_COUNT, host_pipe_write_room, read_host_pipe,
+    would_block_outcome, write_host_pipe, write_host_pipe_owned,
 };
 pub use routing::MM_MUTATION_SYSCALLS;
 #[allow(unused_imports)]

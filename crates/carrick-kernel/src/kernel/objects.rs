@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
@@ -593,6 +593,150 @@ pub struct SocketPeerCred {
     pub gid: NsGid,
 }
 
+/// A chunk of stream bytes associated with a sender's credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnixStreamCred {
+    pub bytes: usize,
+    pub cred: SocketPeerCred,
+}
+
+/// A datagram message associated with a sender's credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnixDgramCred {
+    pub len: usize,
+    pub cred: SocketPeerCred,
+}
+
+/// FIFO metadata ledger for a unidirectional flow.
+#[derive(Debug, Default)]
+pub struct UnixLedger {
+    pub stream: VecDeque<UnixStreamCred>,
+    pub dgram: VecDeque<UnixDgramCred>,
+}
+
+impl UnixLedger {
+    pub fn push_stream(&mut self, bytes: usize, cred: SocketPeerCred) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(last) = self.stream.back_mut() {
+            if last.cred == cred {
+                last.bytes = last.bytes.saturating_add(bytes);
+                return;
+            }
+        }
+        self.stream.push_back(UnixStreamCred { bytes, cred });
+    }
+
+    pub fn push_dgram(&mut self, len: usize, cred: SocketPeerCred) {
+        self.dgram.push_back(UnixDgramCred { len, cred });
+    }
+
+    pub fn peek_stream(&self) -> Option<UnixStreamCred> {
+        self.stream.front().copied()
+    }
+
+    pub fn peek_dgram(&self) -> Option<UnixDgramCred> {
+        self.dgram.front().copied()
+    }
+
+    pub fn consume_stream(&mut self, mut bytes: usize) {
+        while bytes > 0 && !self.stream.is_empty() {
+            if let Some(front) = self.stream.front_mut() {
+                if front.bytes <= bytes {
+                    bytes -= front.bytes;
+                    self.stream.pop_front();
+                } else {
+                    front.bytes -= bytes;
+                    bytes = 0;
+                }
+            }
+        }
+    }
+
+    pub fn push_stream_bytes(&mut self, bytes: usize, cred: SocketPeerCred) {
+        self.push_stream(bytes, cred);
+    }
+
+    pub fn peek_front_cred(&self, is_stream: bool) -> Option<UnixStreamCred> {
+        if is_stream {
+            self.peek_stream()
+        } else {
+            self.peek_dgram().map(|d| UnixStreamCred {
+                bytes: d.len,
+                cred: d.cred,
+            })
+        }
+    }
+
+    pub fn consume_bytes(&mut self, bytes: usize, is_stream: bool) {
+        if is_stream {
+            self.consume_stream(bytes);
+        } else {
+            self.consume_dgram();
+        }
+    }
+
+    pub fn consume_dgram(&mut self) -> Option<UnixDgramCred> {
+        self.dgram.pop_front()
+    }
+}
+
+/// A unidirectional FIFO flow between a sender and a receiver over a UNIX socket.
+#[derive(Debug, Default)]
+pub struct UnixFlow {
+    ledger: Mutex<UnixLedger>,
+}
+
+impl UnixFlow {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn lock_ledger(&self) -> MutexGuard<'_, UnixLedger> {
+        self.ledger.lock()
+    }
+}
+
+impl PartialEq for UnixFlow {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for UnixFlow {}
+
+/// Paired bidirectional flows for a connected socket endpoint.
+#[derive(Debug, Clone)]
+pub struct SocketFlows {
+    pub outbound: Arc<UnixFlow>,
+    pub inbound: Arc<UnixFlow>,
+}
+
+impl SocketFlows {
+    pub fn pair() -> (Self, Self) {
+        let a_to_b = UnixFlow::new();
+        let b_to_a = UnixFlow::new();
+        (
+            Self {
+                outbound: Arc::clone(&a_to_b),
+                inbound: Arc::clone(&b_to_a),
+            },
+            Self {
+                outbound: b_to_a,
+                inbound: a_to_b,
+            },
+        )
+    }
+
+    pub fn standalone() -> Self {
+        Self {
+            outbound: UnixFlow::new(),
+            inbound: UnixFlow::new(),
+        }
+    }
+}
+
 /// Cork buffer and destination state for datagram coalescing (MSG_MORE / UDP_CORK / TCP_CORK).
 #[derive(Debug, Default)]
 pub struct SocketCork {
@@ -676,6 +820,7 @@ pub struct DescriptionCommon {
     seals: Arc<Mutex<Option<u32>>>,
     splice_pushback: Mutex<crate::dispatch::SplicePushback>,
     peer_cred: Mutex<Option<SocketPeerCred>>,
+    socket_flows: Mutex<Option<SocketFlows>>,
     cork: Mutex<SocketCork>,
 }
 
@@ -691,6 +836,7 @@ impl DescriptionCommon {
             seals: Arc::new(Mutex::new(None)),
             splice_pushback: Mutex::new(crate::dispatch::SplicePushback::default()),
             peer_cred: Mutex::new(None),
+            socket_flows: Mutex::new(None),
             cork: Mutex::new(SocketCork::default()),
         }
     }
@@ -706,6 +852,7 @@ impl DescriptionCommon {
             seals,
             splice_pushback: Mutex::new(crate::dispatch::SplicePushback::default()),
             peer_cred: Mutex::new(None),
+            socket_flows: Mutex::new(None),
             cork: Mutex::new(SocketCork::default()),
         }
     }
@@ -813,6 +960,33 @@ impl DescriptionCommon {
         *self.peer_cred.lock() = cred;
     }
 
+    pub(crate) fn socket_flows(&self) -> Option<SocketFlows> {
+        self.socket_flows.lock().clone()
+    }
+
+    pub(crate) fn outbound_flow(&self) -> Option<Arc<UnixFlow>> {
+        self.socket_flows().map(|f| f.outbound)
+    }
+
+    pub(crate) fn inbound_flow(&self) -> Option<Arc<UnixFlow>> {
+        self.socket_flows().map(|f| f.inbound)
+    }
+
+    pub(crate) fn init_socket_flows(&self, flows: SocketFlows) {
+        *self.socket_flows.lock() = Some(flows);
+    }
+
+    pub(crate) fn ensure_socket_flows(&self) -> SocketFlows {
+        let mut guard = self.socket_flows.lock();
+        if let Some(flows) = &*guard {
+            flows.clone()
+        } else {
+            let flows = SocketFlows::standalone();
+            *guard = Some(flows.clone());
+            flows
+        }
+    }
+
     pub(crate) fn cork(&self) -> MutexGuard<'_, SocketCork> {
         self.cork.lock()
     }
@@ -868,6 +1042,11 @@ pub struct FileDescription {
 impl FileDescription {
     pub(crate) fn common(&self) -> &DescriptionCommon {
         &self.common
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn common_arc(&self) -> Arc<DescriptionCommon> {
+        Arc::clone(&self.common)
     }
 
     pub(crate) fn concrete_with_common<T>(

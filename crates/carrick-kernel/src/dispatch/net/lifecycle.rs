@@ -1571,10 +1571,14 @@ impl<'a> NetView<'a> {
         }
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
-        let peer_cred = if family == LINUX_AF_UNIX {
+        let peer_info = if family == LINUX_AF_UNIX {
             support::pop_pending_unix_client(host_fd)
         } else {
             None
+        };
+        let (peer_cred, peer_flows) = match peer_info {
+            Some((cred, flows)) => (Some(cred), flows),
+            None => (None, None),
         };
         let mut base = OpenDescriptionBase::new(status_flags);
         base.set_connected(true);
@@ -1593,6 +1597,16 @@ impl<'a> NetView<'a> {
         );
         if peer_cred.is_some() {
             open_file.description.common().set_peer_cred(peer_cred);
+        }
+        if let Some(c_flows) = peer_flows {
+            let server_flows = crate::kernel::SocketFlows {
+                outbound: Arc::clone(&c_flows.inbound),
+                inbound: Arc::clone(&c_flows.outbound),
+            };
+            open_file
+                .description
+                .common()
+                .init_socket_flows(server_flows);
         }
         let linux_fd = match self.install_fd_at_or_above(3, open_file) {
             Ok(fd) => fd,
@@ -1985,6 +1999,9 @@ impl<'a> NetView<'a> {
                 fd_flags,
             );
             second.description.common().set_peer_cred(Some(my_cred));
+            let (flows_first, flows_second) = crate::kernel::SocketFlows::pair();
+            first.description.common().init_socket_flows(flows_first);
+            second.description.common().init_socket_flows(flows_second);
             let (read_fd, write_fd) = match this.install_fd_pair_at_or_above(3, first, second) {
                 Ok(pair) => pair,
                 Err(_) => {
@@ -2596,7 +2613,11 @@ impl<'a> NetView<'a> {
                     uid: creds.euid,
                     gid: creds.egid,
                 };
-                support::register_unix_listener(&host_addr[2..end], host_fd_raw, my_cred);
+                support::register_unix_listener(
+                    &host_addr[2..end],
+                    host_fd_raw,
+                    my_cred,
+                );
                 // Stamp the guest sun_path onto the just-created host node so a
                 // DIFFERENT carrick process (whose per-process registry lacks
                 // this bind) can reverse-translate it in getsockname/getpeername
@@ -3581,9 +3602,14 @@ impl<'a> NetView<'a> {
                     uid: creds.euid,
                     gid: creds.egid,
                 };
-                if let Some(server_cred) =
-                    support::lookup_and_queue_unix_connect(&host_addr[2..end], client_cred)
-                {
+                let client_flows = this
+                    .open_file(fd)
+                    .map(|of| of.description.common().ensure_socket_flows());
+                if let Some(server_cred) = support::lookup_and_queue_unix_connect(
+                    &host_addr[2..end],
+                    client_cred,
+                    client_flows,
+                ) {
                     this.record_unix_peer_cred(fd, server_cred);
                 }
             }
