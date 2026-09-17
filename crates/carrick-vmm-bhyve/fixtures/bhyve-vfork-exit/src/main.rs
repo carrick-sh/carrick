@@ -11,7 +11,7 @@
 //! `exec`/`_exit`), and matches the KVM x86 lane. The generic loop's vfork-pipe
 //! suspends the parent until the child `_exit`s (write end closed → pipe EOF);
 //! the parent then resumes on its own LIVE VM and reaps the child via the shared
-//! `wait_proc_exit`. The child runs to `_exit(9)` on its OWN fresh VM exactly
+//! the child wait. The child runs to `_exit(9)` on its OWN fresh VM exactly
 //! like the passing `fork` test.
 //!
 //! vfork contract: a `vfork` child that RETURNS from the calling function is UB

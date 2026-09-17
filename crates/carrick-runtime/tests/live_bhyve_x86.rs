@@ -115,7 +115,7 @@ fn fork_wait4_runs_to_zero() {
     // here proves `BhyveVmm::freeze_ram()` eagerly copies the parent guest RAM
     // into a fresh child VM, long-mode-programs child vCPU 0 at the post-fork
     // resume, and the child VM is destroyed on `_exit` (process_exit_cleanup,
-    // no /dev/vmm leak). wait4 reuses the shared wait_proc_exit.
+    // no /dev/vmm leak).
     let Some(path) = fixture("CARRICK_BHYVE_FORK") else {
         eprintln!("skip: set CARRICK_BHYVE_FORK to the fork ELF");
         return;

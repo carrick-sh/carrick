@@ -1,6 +1,6 @@
 //! SP1 fixture: fork(), child writes a marker + _exit(7); parent wait4s and
 //! asserts WEXITSTATUS==7. Static-musl x86_64. Exercises the bhyve eager-RAM-
-//! copy fork + the shared wait_proc_exit + the normalize_syscall fork desugar.
+//! copy fork + the shared child wait + the normalize_syscall fork desugar.
 use std::process;
 
 fn main() {

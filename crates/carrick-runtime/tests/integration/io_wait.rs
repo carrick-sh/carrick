@@ -92,8 +92,10 @@ fn kqueue_wait_wakes_when_peer_writes_after_registration() {
     assert!(matches!(result, WaitResult::Ready));
 }
 
-// NOTE: the EBADF-recovery regression test lives in its own top-level test
-// binary (tests/wait_proc_exit_recovery.rs) so it runs in an isolated process.
-// `wait_proc_exit` consults process-global signal/quiesce state, which the HVF
-// and fork tests in *this* binary mutate concurrently — running it here makes it
-// flaky for reasons unrelated to the fix.
+// NOTE: the EBADF-recovery regression test that used to live in its own
+// top-level binary (tests/wait_proc_exit_recovery.rs) is gone with the
+// host-process wait family it covered: under HVPatch a guest `fork` creates no
+// host process, so there is no `EVFILT_PROC`/`NOTE_EXIT` wait on a Darwin pid to
+// recover. Its isolation rationale (the family read process-global
+// signal/quiesce state that the HVF and fork tests in *this* binary mutate)
+// stands as the reason any future process-global wait test needs its own binary.
