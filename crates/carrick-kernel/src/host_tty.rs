@@ -31,7 +31,7 @@ use std::collections::HashMap;
 
 use parking_lot::Mutex;
 
-use crate::linux_abi::{LinuxTermios, LinuxWinsize};
+use crate::linux_abi::{LINUX_CS8, LINUX_CSIZE, LinuxTermios, LinuxWinsize};
 
 // The Linux↔Darwin termios bit/index translation tables and helpers below are
 // macOS-only (Darwin's bit positions and `c_cc` order differ from Linux's). Every
@@ -77,14 +77,15 @@ const DARWIN_OCRNL: carrick_portable::TcFlag = 0x0010;
 /// CSIZE/CSTOPB/parity group, so each is translated per-field (not masked 1:1).
 /// The CBAUD baud nibble is NOT copied (baud rides in c_ispeed/c_ospeed).
 /// (audit M4; probe termiosbits)
-#[cfg(target_os = "macos")]
-const LINUX_CSIZE: u32 = 0x0030;
+///
+/// `LINUX_CSIZE`/`LINUX_CS8` are NOT in this list: `coerce_pty_termios` needs
+/// them on every host, so they live in `carrick-abi` and are imported above.
+/// The rest stay here because they exist only to pair with the `DARWIN_*`
+/// position they translate to.
 #[cfg(target_os = "macos")]
 const LINUX_CS6: u32 = 0x0010;
 #[cfg(target_os = "macos")]
 const LINUX_CS7: u32 = 0x0020;
-#[cfg(target_os = "macos")]
-const LINUX_CS8: u32 = 0x0030;
 #[cfg(target_os = "macos")]
 const LINUX_CSTOPB: u32 = 0x0040;
 #[cfg(target_os = "macos")]
