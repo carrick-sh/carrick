@@ -340,7 +340,10 @@ fn generic_probe_shard_1() {
 
             eprintln!("RUN generic probe shard 1 {target}:{probe_name}");
             executed_count += 1;
-            let outcome = common::with_empty_stdin_pipe(|| container.run(["/tmp/carrick-init"]));
+            let outcome = common::timed_probe_run(
+                &format!("generic probe shard 1 {target}:{probe_name}"),
+                || common::with_empty_stdin_pipe(|| container.run(["/tmp/carrick-init"])),
+            );
             let result = match outcome {
                 Ok(result) => result,
                 Err(error) if expected_gaps.contains(&probe_name) => {

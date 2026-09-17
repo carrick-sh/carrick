@@ -205,6 +205,8 @@ mod tests {
             },
             perf: None,
             timeout_kind: None,
+            deadline: None,
+            confirmation: None,
             new_diffs: vec![],
             known_diffs: vec![],
             carrick_run_id: String::new(),

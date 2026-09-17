@@ -321,8 +321,20 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
 
     let net_source = include_str!("../../../../carrick-kernel/src/dispatch/net.rs");
     assert!(
-        net_source.matches("with_guest_slots(&files").count() >= 2,
-        "pselect/ppoll must capture every exact guest fd slot at dispatch"
+        net_source.matches("this.assemble_wait(").count() >= 2,
+        "pselect/ppoll must go through the ONE wait assembly, which classifies \
+         every guest fd into a registration carrying both its host half and its \
+         exact slot"
+    );
+    let wait_plan_source = include_str!("../../../../carrick-kernel/src/dispatch/wait_plan.rs");
+    assert!(
+        wait_plan_source.contains("self.wait_source_for(files, entry.fd, entry.requested)"),
+        "the assembly classifies every requested fd at dispatch"
+    );
+    assert!(
+        !net_source.contains("fn host_poll_target")
+            && !net_source.contains("fn wait_target_for_poll"),
+        "the two independently built wait lists and their -1 sentinel are retired"
     );
     let io_uring_source = include_str!("../../../../carrick-kernel/src/dispatch/ioring.rs");
     assert!(io_uring_source.contains("with_guest_slots(&files, [ring_fd, sqe.fd])"));

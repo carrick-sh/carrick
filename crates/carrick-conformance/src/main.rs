@@ -24,7 +24,8 @@ mod verdict;
 use crate::closure::{ClosurePolicy, validate_closure_reports, validate_closure_selection};
 use crate::manifest::{Ecosystem, Manifest, Suite, Tier, Weight};
 use crate::verdict::{
-    Baseline, PerfSummary, SideSummary, SuiteReport, Verdict, classify, classify_closure,
+    Baseline, CarrickRunFacts, ConfirmReason, PerfSummary, SerialConfirmation, SideSummary,
+    SuiteReport, Verdict, classify, classify_closure,
 };
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -245,9 +246,29 @@ struct Args {
     /// deliberate `--refresh-oracle` run, never a side effect of this flag.
     #[arg(long)]
     oracle_fill: bool,
+    /// Total wall-clock seconds the Phase 1b serial confirmation pass may
+    /// spend, across ALL rows. Exact `0` disables the pass (the bisection
+    /// hatch); every candidate is then named as unconfirmed and keeps blocking
+    /// bless.
+    ///
+    /// Phase 1b re-runs, on the main thread with no fan-out, each row whose
+    /// phase-1 run was cut off at the operator's diagnostic budget or was
+    /// starved by the box. It is single-shot and adopts the serial verdict
+    /// unconditionally, including a worse one — it is NOT `--flake-retries`.
+    #[arg(
+        long,
+        default_value_t = 900,
+        env = "CARRICK_CONFORMANCE_SERIAL_CONFIRM_BUDGET_S"
+    )]
+    carrick_serial_confirm_budget_s: u64,
     /// Parser profile for `--oracle-fill`: `closure` (the assertion-exact
-    /// profile the closure gate keys on) or `regression`. These are DIFFERENT
-    /// cache keys; filling the wrong one leaves the gate's row still missing.
+    /// profile the closure gate keys on) or `regression`.
+    ///
+    /// A fill now writes BOTH profile rows from the one container it runs, each
+    /// admitted by its own cacheability rule, so this flag no longer decides
+    /// which row exists — it selects which parse the REPORT uses, and which row
+    /// is invalidated up front and required to come back (the other is a bonus
+    /// its own rule may legitimately refuse).
     #[arg(long, default_value = "closure")]
     oracle_fill_profile: String,
 }
@@ -482,6 +503,11 @@ fn run() -> anyhow::Result<ExitCode> {
 
     let pid = std::process::id();
     let carrick_bin = args.carrick_bin.to_string_lossy().into_owned();
+    // A gate result belongs to exactly ONE binary. Record its identity now and
+    // re-verify before Phase 1b: `just build` replaces
+    // `target/release/carrick` underneath a running gate. Absent for the lima
+    // KVM lane, whose binary lives in the guest.
+    let carrick_binary_sha256 = binary_identity(&args.carrick_bin).ok();
 
     // Image-freshness guard: re-pull carrick's copy of any selected image whose
     // registry digest moved, SERIALLY before the parallel carrick phase, so
@@ -636,7 +662,7 @@ fn run() -> anyhow::Result<ExitCode> {
 
     // ---- Phase 1: ALL carrick (weight-aware; never overlapping docker). ----
     eprintln!(
-        "phase 1/3: {n} carrick runs (workers={workers}, cpython-workers={cpython_workers}, fast-timeout={}s; cached slow rows get 2x oracle + 2s; hard-cap={:?})",
+        "phase 1/4: {n} carrick runs (workers={workers}, cpython-workers={cpython_workers}, fast-timeout={}s; cached slow rows get 2x oracle + 2s; hard-cap={:?})",
         args.carrick_fast_timeout_s, args.carrick_timeout_cap_s
     );
     let all_indices: Vec<usize> = (0..n).collect();
@@ -719,6 +745,136 @@ fn run() -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
 
+    // ---- Phase 1b: bounded serial confirmation. Strictly between the carrick
+    // phase and the docker phase, on the main thread with no fan-out, so it is
+    // carrick-only and never overlaps docker. Single-shot: the serial verdict
+    // is adopted unconditionally, including a worse one. ----
+    let mut carrick_outs = carrick_outs;
+    let mut confirmations: std::collections::BTreeMap<usize, SerialConfirmation> =
+        std::collections::BTreeMap::new();
+    {
+        let mut load_facts: std::collections::BTreeMap<
+            usize,
+            (ConfirmReason, u64, u64, Option<engine::TimeoutKind>),
+        > = std::collections::BTreeMap::new();
+        for (i, slot) in carrick_outs.iter().enumerate() {
+            let Some(Ok(out)) = slot.as_ref().map(|r| r.as_ref()) else {
+                continue;
+            };
+            let kind = out.timeout_evidence.map(|e| {
+                engine::classify_timeout_with_progress(
+                    &e,
+                    out.elapsed_ms,
+                    engine::PROGRESS_WINDOW_MS,
+                )
+            });
+            if let Some(reason) = needs_serial_confirmation(out, kind) {
+                load_facts.insert(
+                    i,
+                    (
+                        reason,
+                        out.elapsed_ms,
+                        out.deadline.effective_s.saturating_mul(1_000),
+                        kind,
+                    ),
+                );
+            }
+        }
+        if !load_facts.is_empty() {
+            let pool_s = args.carrick_serial_confirm_budget_s;
+            let plan: Vec<(usize, u64)> = load_facts
+                .keys()
+                .map(|i| (*i, selected[*i].timeout_s))
+                .collect();
+            let (confirm, unconfirmed) = plan_serial_confirmation(&plan, pool_s);
+            eprintln!(
+                "phase 1b/4: serial confirmation — {} row(s), pool {pool_s}s \
+                 (workers=1, declared budgets)",
+                load_facts.len()
+            );
+            if !confirm.is_empty()
+                && let Some(recorded) = carrick_binary_sha256.as_deref()
+            {
+                let now = binary_identity(&args.carrick_bin)?;
+                if now != recorded {
+                    anyhow::bail!(
+                        "{} changed under the running gate (preflight sha256 {recorded}, \
+                         now {now}); a gate result belongs to exactly one binary",
+                        args.carrick_bin.display()
+                    );
+                }
+            }
+            for i in confirm {
+                let (reason, load_ms, load_budget_ms, load_timeout_kind) = load_facts[&i];
+                let s = &selected[i];
+                let run_id = format!("conf-{pid}-s{i:02}");
+                // `timeout_cap_s = Some(0)` restores the suite's DECLARED budget:
+                // the operator's diagnostic deadline is exactly what is being
+                // re-measured.
+                let out = engine::run_carrick(
+                    s,
+                    &carrick_bin,
+                    &run_id,
+                    &lane,
+                    args.carrick_fast_timeout_s,
+                    Some(0),
+                    None,
+                );
+                let (serial_ms, serial_timed_out) = match out.as_ref() {
+                    Ok(o) => (Some(o.elapsed_ms), o.timed_out),
+                    Err(_) => (None, false),
+                };
+                eprintln!(
+                    "  [confirm] {} ({:?}: {load_ms}ms on a {load_budget_ms}ms budget) -> {}",
+                    s.name,
+                    reason,
+                    match (serial_ms, serial_timed_out) {
+                        (Some(ms), false) => format!("completed in {ms}ms"),
+                        (Some(ms), true) =>
+                            format!("TIMED OUT after {ms}ms at its declared budget"),
+                        (None, _) => "carrick failed to spawn".to_string(),
+                    }
+                );
+                confirmations.insert(
+                    i,
+                    SerialConfirmation {
+                        reason,
+                        load_ms,
+                        load_budget_ms,
+                        load_timeout_kind,
+                        serial_ms,
+                        serial_timed_out,
+                        skipped: None,
+                    },
+                );
+                carrick_outs[i] = Some(out);
+            }
+            // Silent truncation is forbidden: every row the pool could not
+            // afford is named, keeps its phase-1 verdict, and still blocks bless.
+            let why = if pool_s == 0 {
+                "disabled"
+            } else {
+                "budget pool exhausted"
+            };
+            for i in unconfirmed {
+                let (reason, load_ms, load_budget_ms, load_timeout_kind) = load_facts[&i];
+                eprintln!("  [unconfirmed] {} ({why})", selected[i].name);
+                confirmations.insert(
+                    i,
+                    SerialConfirmation {
+                        reason,
+                        load_ms,
+                        load_budget_ms,
+                        load_timeout_kind,
+                        serial_ms: None,
+                        serial_timed_out: false,
+                        skipped: Some(why.to_string()),
+                    },
+                );
+            }
+        }
+    }
+
     // ---- Phase 2: docker — but ONLY for suites whose oracle is not already
     // cached. The docker oracle for a deterministic suite is stable, so it needs
     // to run once, ever; a cached suite contributes its committed result and
@@ -726,7 +882,7 @@ fn run() -> anyhow::Result<ExitCode> {
     // (`cache`/`cached` were loaded before Phase 1 for the live-stream above.)
     let need_docker: Vec<usize> = (0..n).filter(|&i| cached[i].is_none()).collect();
     eprintln!(
-        "phase 2/3: {} docker run(s), {} cached oracle(s){} (workers={workers}, cpython-workers={cpython_workers})",
+        "phase 2/4: {} docker run(s), {} cached oracle(s){} (workers={workers}, cpython-workers={cpython_workers})",
         need_docker.len(),
         n - need_docker.len(),
         if args.refresh_oracle {
@@ -753,28 +909,32 @@ fn run() -> anyhow::Result<ExitCode> {
         let side = match out.and_then(|r| r.ok()) {
             Some(o) => {
                 let timed_out = o.timed_out;
-                let res = parsers::parse_for_mode(verdict_kind(s), &o.raw(), parser_mode);
-                match oracle_profile {
-                    oracle::ParserProfile::Regression => {
-                        cache.insert_fresh(
-                            s,
-                            docker_platform,
-                            res.clone(),
-                            Some(o.elapsed_ms),
-                            timed_out,
-                        );
-                    }
-                    oracle::ParserProfile::ClosureV3 => {
-                        cache.insert_fresh_for_profile(
-                            s,
-                            docker_platform,
-                            oracle_profile,
-                            res.clone(),
-                            Some(o.elapsed_ms),
-                            timed_out,
-                        );
-                    }
-                }
+                // One container's bytes answer BOTH parsers, so fill both rows
+                // from this run. `--closure` and a regression gate key on
+                // different determinants, and a closure-only cache left a
+                // filtered regression run refusing with 438 uncached rows.
+                let raw = o.raw();
+                let res = parsers::parse_for_mode(verdict_kind(s), &raw, parser_mode);
+                let other = parsers::parse_for_mode(
+                    verdict_kind(s),
+                    &raw,
+                    match parser_mode {
+                        parsers::ParseMode::Regression => parsers::ParseMode::Closure,
+                        parsers::ParseMode::Closure => parsers::ParseMode::Regression,
+                    },
+                );
+                let (regression, closure) = match oracle_profile {
+                    oracle::ParserProfile::Regression => (res.clone(), other),
+                    oracle::ParserProfile::ClosureV3 => (other, res.clone()),
+                };
+                cache.insert_fresh_both_profiles(
+                    s,
+                    docker_platform,
+                    regression,
+                    closure,
+                    Some(o.elapsed_ms),
+                    timed_out,
+                );
                 DockerSide {
                     result: res,
                     run_id: o.run_id,
@@ -805,7 +965,7 @@ fn run() -> anyhow::Result<ExitCode> {
     // ---- Phase 3: classify (runs neither engine). ----
     // Assemble each suite's docker side (cached or fresh) into an index-keyed vec
     // first, so the retry pass can re-classify against it without re-running docker.
-    eprintln!("phase 3/3: classify");
+    eprintln!("phase 3/4: classify");
     let mut docker_sides: Vec<DockerSide> = Vec::with_capacity(n);
     for (i, s) in selected.iter().enumerate() {
         let docker = match &cached[i] {
@@ -828,11 +988,15 @@ fn run() -> anyhow::Result<ExitCode> {
         .enumerate()
         .map(|(i, (s, cout))| {
             let cout = cout.as_ref().and_then(|r| r.as_ref().ok());
-            build_report(s, cout, &docker_sides[i], classification)
+            let report = build_report(s, cout, &docker_sides[i], classification);
+            match confirmations.get(&i) {
+                Some(confirmation) => adopt_serial_confirmation(report, confirmation.clone()),
+                None => report,
+            }
         })
         .collect();
 
-    // ---- Phase 3b: retry-on-flake. Re-run carrick (only) for any gating suite;
+    // ---- Phase 4: retry-on-flake. Re-run carrick (only) for any gating suite;
     // adopt the first non-gating attempt. The oracle side is reused from phase 3
     // (no docker re-run), so this never overlaps docker. ----
     let retries = args.flake_retries;
@@ -849,7 +1013,7 @@ fn run() -> anyhow::Result<ExitCode> {
     }
     if retries > 0 && gating_before > 0 {
         eprintln!(
-            "phase 3b: retry-on-flake — {gating_before} gating suite(s), up to {retries} retr{} each",
+            "phase 4/4: retry-on-flake — {gating_before} gating suite(s), up to {retries} retr{} each",
             if retries == 1 { "y" } else { "ies" }
         );
         let recovered = apply_flake_retries(
@@ -914,6 +1078,82 @@ fn run() -> anyhow::Result<ExitCode> {
     }
 }
 
+/// Whether a phase-1 carrick run's verdict is an artefact of HOW it was
+/// measured rather than of what carrick did.
+///
+/// Two shapes qualify. A kill at the operator's diagnostic budget measured the
+/// deadline, not the suite. A `Starved` timeout measured the box. Everything
+/// else — a completed run, or a hang at the suite's own declared budget — is
+/// already authoritative and is never re-run: Phase 1b is a confirmation pass,
+/// not a retry loop.
+fn needs_serial_confirmation(
+    out: &engine::RunOutput,
+    kind: Option<engine::TimeoutKind>,
+) -> Option<ConfirmReason> {
+    if !out.timed_out {
+        return None;
+    }
+    if out.deadline.is_diagnostic() {
+        return Some(ConfirmReason::BudgetKill);
+    }
+    kind.filter(|k| k.is_measurement_failure())
+        .map(|_| ConfirmReason::Starved)
+}
+
+/// Split the confirmation candidates into the rows the wall-clock pool can
+/// afford and the remainder, in suite-index order.
+///
+/// Each row reserves its DECLARED budget — the worst case it is allowed to
+/// take — so the pass can never overrun the pool, and the split is a pure
+/// function of the selection rather than of how the day went. The pass STOPS at
+/// the first row that does not fit; it never reorders to squeeze small rows in,
+/// because a reproducible prefix is worth more than a fuller one.
+fn plan_serial_confirmation(candidates: &[(usize, u64)], pool_s: u64) -> (Vec<usize>, Vec<usize>) {
+    let mut ran = Vec::new();
+    let mut skipped = Vec::new();
+    let mut spent_s = 0u64;
+    for (index, declared_s) in candidates {
+        if !skipped.is_empty() || spent_s.saturating_add(*declared_s) > pool_s {
+            skipped.push(*index);
+            continue;
+        }
+        spent_s += *declared_s;
+        ran.push(*index);
+    }
+    (ran, skipped)
+}
+
+/// Adopt a confirmation run's report over the phase-1 one, retaining the load
+/// run's kill observation as evidence.
+///
+/// Unconditional by design: the serial verdict wins even when it is worse. The
+/// flake-retry path adopts the first NON-GATING attempt, which is
+/// retry-until-green; this is the opposite.
+fn adopt_serial_confirmation(
+    mut serial: SuiteReport,
+    confirmation: SerialConfirmation,
+) -> SuiteReport {
+    serial.confirmation = Some(confirmation);
+    serial
+}
+
+/// SHA-256 of the binary under test, recorded at preflight and re-verified
+/// before Phase 1b. `just build` replaces `target/release/carrick` underneath a
+/// running gate, and a gate result belongs to exactly one binary.
+fn binary_identity(path: &Path) -> anyhow::Result<String> {
+    use sha2::Digest as _;
+    // Operator-controlled CLI path in a local dev tool; same trust model as the
+    // other IO helpers here.
+    let bytes =
+        std::fs::read(path) // nosemgrep
+            .map_err(|error| {
+                anyhow::anyhow!("cannot read {} for identity: {error}", path.display())
+            })?;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 /// The docker (oracle) side of one suite, already parsed — sourced either from a
 /// fresh `docker run` or the committed oracle cache (so phase 3 is agnostic to
 /// which).
@@ -960,6 +1200,16 @@ fn build_report(
             None,
         ),
     };
+    let deadline = cout.map(|o| o.deadline);
+    // Only meaningful on a TIMEOUT, and only when the host answered. A
+    // transcript still growing at the kill outranks the duty/load ladder:
+    // `[blocked]` must never be printed for a run that was demonstrably making
+    // progress.
+    let timeout_kind = cout.and_then(|o| {
+        o.timeout_evidence.map(|e| {
+            engine::classify_timeout_with_progress(&e, o.elapsed_ms, engine::PROGRESS_WINDOW_MS)
+        })
+    });
 
     let c_res = match policy {
         ClassificationPolicy::Closure => {
@@ -968,11 +1218,14 @@ fn build_report(
         ClassificationPolicy::Baseline(_) => parsers::parse(verdict_kind(s), &c_raw),
     };
     let d_res = &docker.result;
+    let facts = || CarrickRunFacts {
+        timed_out: c_timed,
+        deadline,
+        result: &c_res,
+    };
     let cl = match policy {
-        ClassificationPolicy::Closure => {
-            classify_closure(s, &c_res, c_timed, d_res, docker.timed_out)
-        }
-        ClassificationPolicy::Baseline(baseline) => classify(s, &c_res, c_timed, d_res, baseline),
+        ClassificationPolicy::Closure => classify_closure(s, facts(), d_res, docker.timed_out),
+        ClassificationPolicy::Baseline(baseline) => classify(s, facts(), d_res, baseline),
     };
 
     SuiteReport {
@@ -990,11 +1243,9 @@ fn build_report(
             totals: d_res.totals.clone(),
         },
         perf: c_elapsed_ms.map(|elapsed_ms| perf_summary(elapsed_ms, docker.elapsed_ms)),
-        // Only meaningful on a TIMEOUT, and only when the host answered.
-        timeout_kind: cout.and_then(|o| {
-            o.timeout_evidence
-                .map(|e| engine::classify_timeout(e.cpu_ms, o.elapsed_ms, e.loadavg_1m, e.ncpu))
-        }),
+        timeout_kind,
+        deadline,
+        confirmation: None,
         new_diffs: cl.new_diffs,
         known_diffs: cl.known_diffs,
         carrick_run_id: c_runid,
@@ -1104,7 +1355,16 @@ fn oracle_fill(
             ));
             continue;
         }
-        let res = parsers::parse_for_mode(verdict_kind(suite), &out.raw(), parser_mode);
+        let raw = out.raw();
+        let res = parsers::parse_for_mode(verdict_kind(suite), &raw, parser_mode);
+        let other = parsers::parse_for_mode(
+            verdict_kind(suite),
+            &raw,
+            match parser_mode {
+                parsers::ParseMode::Regression => parsers::ParseMode::Closure,
+                parsers::ParseMode::Closure => parsers::ParseMode::Regression,
+            },
+        );
         eprintln!(
             "  [docker] {} -> {:?} n={} pass={} fail={} broken={} skip={} ({} ms)\n\
                         raw: {} / {}",
@@ -1119,14 +1379,25 @@ fn oracle_fill(
             out.stdout_path.display(),
             out.stderr_path.display(),
         );
-        if !cache.insert_fresh_for_profile(
+        let (regression, closure) = match profile {
+            oracle::ParserProfile::Regression => (res, other),
+            oracle::ParserProfile::ClosureV3 => (other, res),
+        };
+        let (stored_regression, stored_closure) = cache.insert_fresh_both_profiles(
             suite,
             docker_platform,
-            profile,
-            res,
+            regression,
+            closure,
             Some(out.elapsed_ms),
             out.timed_out,
-        ) {
+        );
+        // Only the NAMED profile is the repair being asked for; the other row
+        // is a bonus that its own cacheability rule may legitimately refuse.
+        let stored_named = match profile {
+            oracle::ParserProfile::Regression => stored_regression,
+            oracle::ParserProfile::ClosureV3 => stored_closure,
+        };
+        if !stored_named {
             failures.push(format!(
                 "{}: cache refused the fresh oracle — row left missing",
                 suite.name
@@ -1281,7 +1552,12 @@ fn timeout_blocks_bless(kind: Option<crate::engine::TimeoutKind>) -> bool {
 
 fn bless_blocks(target: BlessTarget, verdict: Verdict) -> bool {
     match verdict {
-        Verdict::Incomplete | Verdict::Timeout | Verdict::CarrickCrash => true,
+        // A BUDGET_KILL has no measured result at all, so there is nothing to
+        // bless — and unlike a starved timeout it is not a measurement waiver:
+        // the operator's deadline cut it off, not a busy box.
+        Verdict::Incomplete | Verdict::Timeout | Verdict::BudgetKill | Verdict::CarrickCrash => {
+            true
+        }
         Verdict::OracleFail => matches!(target, BlessTarget::SharedBaseline),
         Verdict::Match | Verdict::Diff | Verdict::Regression | Verdict::New => false,
     }
@@ -2373,6 +2649,11 @@ mod tests {
             elapsed_ms: 1,
             run_id: "closure-parser-test".into(),
             argv: Vec::new(),
+            deadline: engine::CarrickDeadline {
+                declared_s: 30,
+                effective_s: 30,
+                origin: engine::DeadlineOrigin::Declared,
+            },
             timeout_evidence: None,
         };
         let raw = parsers::Raw {
@@ -2727,6 +3008,8 @@ mod tests {
             },
             perf: None,
             timeout_kind,
+            deadline: None,
+            confirmation: None,
             new_diffs: Vec::new(),
             known_diffs: Vec::new(),
             carrick_run_id: "conf-test-c00".to_string(),
@@ -2773,6 +3056,174 @@ mod tests {
         assert!(gate.carried.is_empty());
     }
 
+    fn run_output(timed_out: bool, deadline: engine::CarrickDeadline) -> engine::RunOutput {
+        engine::RunOutput {
+            stdout_path: PathBuf::from("/dev/null"),
+            stderr_path: PathBuf::from("/dev/null"),
+            exit_code: if timed_out { -1 } else { 0 },
+            timed_out,
+            elapsed_ms: 14_181,
+            run_id: "conf-test-c00".to_string(),
+            argv: Vec::new(),
+            deadline,
+            timeout_evidence: None,
+        }
+    }
+
+    fn diagnostic() -> engine::CarrickDeadline {
+        engine::CarrickDeadline {
+            declared_s: 300,
+            effective_s: 14,
+            origin: engine::DeadlineOrigin::AdaptiveOracle,
+        }
+    }
+
+    fn declared() -> engine::CarrickDeadline {
+        engine::CarrickDeadline {
+            declared_s: 300,
+            effective_s: 300,
+            origin: engine::DeadlineOrigin::Declared,
+        }
+    }
+
+    /// Phase 1b costs real wall-clock time, so it re-runs EXACTLY the rows whose
+    /// phase-1 verdict is an artefact of how the row was measured: cut off at the
+    /// operator's diagnostic budget, or starved by a busy box. A timeout at the
+    /// suite's own declared budget is a real hang and is not re-measured, and a
+    /// completed run — MATCH or CRASH — is already authoritative.
+    #[test]
+    fn needs_serial_confirmation_selects_only_budget_kills_and_starvation() {
+        use crate::engine::TimeoutKind;
+        assert_eq!(
+            needs_serial_confirmation(&run_output(true, diagnostic()), Some(TimeoutKind::Blocked)),
+            Some(ConfirmReason::BudgetKill)
+        );
+        assert_eq!(
+            needs_serial_confirmation(
+                &run_output(true, diagnostic()),
+                Some(TimeoutKind::Progressing)
+            ),
+            Some(ConfirmReason::BudgetKill)
+        );
+        assert_eq!(
+            needs_serial_confirmation(&run_output(true, declared()), Some(TimeoutKind::Starved)),
+            Some(ConfirmReason::Starved),
+            "a starved measurement measured the box, so re-measure it quiet"
+        );
+        assert_eq!(
+            needs_serial_confirmation(&run_output(true, declared()), Some(TimeoutKind::Blocked)),
+            None,
+            "a hang at the DECLARED budget is a real hang, not a measurement artefact"
+        );
+        // A completed run (MATCH, or a CRASH that produced output) is already
+        // authoritative whichever budget it ran under.
+        assert_eq!(
+            needs_serial_confirmation(&run_output(false, diagnostic()), None),
+            None
+        );
+        assert_eq!(
+            needs_serial_confirmation(&run_output(false, declared()), None),
+            None
+        );
+    }
+
+    /// The confirmation pass is bounded by a wall-clock pool and MUST NOT
+    /// truncate silently: the rows it could not afford are named individually and
+    /// keep their `BudgetKill`, which blocks bless. Planning reserves each row's
+    /// DECLARED budget (the worst case it is allowed to take), in suite-index
+    /// order, so the split is reproducible.
+    #[test]
+    fn serial_confirmation_pool_stops_and_names_the_remainder() {
+        let candidates = [(0usize, 300u64), (3, 300), (7, 300), (9, 30)];
+        let (ran, skipped) = plan_serial_confirmation(&candidates, 900);
+        assert_eq!(ran, vec![0, 3, 7]);
+        assert_eq!(skipped, vec![9], "the remainder is named, never dropped");
+
+        // An exact `0` disables the pass entirely (the bisection hatch).
+        let (ran, skipped) = plan_serial_confirmation(&candidates, 0);
+        assert!(ran.is_empty());
+        assert_eq!(skipped, vec![0, 3, 7, 9]);
+
+        // A single row larger than the whole pool is skipped, not run
+        // unbounded.
+        let (ran, skipped) = plan_serial_confirmation(&[(4usize, 1_800u64)], 900);
+        assert!(ran.is_empty());
+        assert_eq!(skipped, vec![4]);
+    }
+
+    /// Confirmation is single-shot and adopts the serial verdict UNCONDITIONALLY,
+    /// including a worse one. It is not `--flake-retries`, which adopts the first
+    /// non-gating attempt; retry-until-green is forbidden.
+    #[test]
+    fn serial_confirmation_adopts_the_serial_verdict_even_when_worse() {
+        let mut load = gate_report("go-net", Verdict::BudgetKill, None);
+        load.perf = Some(perf_summary(8_229, Some(2_500)));
+        let mut serial = gate_report("go-net", Verdict::Regression, None);
+        serial.gating = true;
+        serial.perf = Some(perf_summary(21_400, Some(2_500)));
+
+        let adopted = adopt_serial_confirmation(
+            serial,
+            SerialConfirmation {
+                reason: ConfirmReason::BudgetKill,
+                load_ms: 8_229,
+                load_budget_ms: 7_000,
+                load_timeout_kind: Some(crate::engine::TimeoutKind::Progressing),
+                serial_ms: Some(21_400),
+                serial_timed_out: false,
+                skipped: None,
+            },
+        );
+
+        assert_eq!(adopted.verdict, Verdict::Regression);
+        assert!(
+            adopted.gating,
+            "a worse serial verdict is adopted, not retried"
+        );
+        let confirmation = adopted.confirmation.expect("confirmation is retained");
+        assert_eq!(confirmation.load_ms, 8_229);
+        assert_eq!(confirmation.load_budget_ms, 7_000);
+        assert_eq!(confirmation.serial_ms, Some(21_400));
+        assert!(confirmation.skipped.is_none());
+        // The citable measurement is the SERIAL one; the load run's timing
+        // survives only inside `confirmation`, labelled as a kill observation.
+        assert_eq!(adopted.perf.expect("perf").carrick_ms, 21_400);
+        let _ = load;
+    }
+
+    /// A BUDGET_KILL has no measured result, so it can never enter the blessed
+    /// baseline — and it is NOT a measurement waiver like `Starved`: the box was
+    /// not at fault, the operator's diagnostic deadline was. It blocks until
+    /// Phase 1b confirms it serially, or until `--allow-hang` names it.
+    #[test]
+    fn budget_kill_blocks_bless_and_is_not_a_measurement_waiver() {
+        use crate::engine::TimeoutKind;
+        let target = BlessTarget::SharedBaseline;
+        let reports = [
+            gate_report(
+                "go-go_types",
+                Verdict::BudgetKill,
+                Some(TimeoutKind::Progressing),
+            ),
+            gate_report("ltp-fine", Verdict::Match, None),
+        ];
+
+        let gate = bless_gate(target, &reports, &[]);
+        assert_eq!(gate.blocking, vec!["go-go_types"]);
+        assert!(
+            gate.starved.is_empty(),
+            "a budget kill measured the operator's deadline, not a busy box"
+        );
+        assert!(gate.carried.is_empty());
+        assert!(bless_blocks(target, Verdict::BudgetKill));
+
+        // `--allow-hang` still carries it by name, withheld from the artifact.
+        let allow = vec!["go-go_types".to_string()];
+        let gate = bless_gate(target, &reports, &allow);
+        assert!(gate.blocking.is_empty());
+        assert_eq!(gate.carried, vec!["go-go_types"]);
+    }
+
     /// An allowlist entry that no longer hangs is reported as stale, so a fixed
     /// suite's waiver gets pruned instead of silently exempting it forever.
     #[test]
@@ -2813,6 +3264,8 @@ mod tests {
             },
             perf: Some(perf_summary(10_000, Some(1_000))),
             timeout_kind: None,
+            deadline: None,
+            confirmation: None,
             new_diffs: Vec::new(),
             known_diffs: Vec::new(),
             carrick_run_id: "conf-test-c00".to_string(),

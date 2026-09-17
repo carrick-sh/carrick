@@ -722,6 +722,10 @@ pub(crate) use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 use fd_table::*;
 
 pub mod wait_authority;
+pub(crate) mod wait_plan;
+#[cfg(test)]
+pub(crate) mod wait_queue_fixture;
+pub(crate) mod wait_source;
 pub use wait_authority::WaitFds;
 pub(crate) use wait_authority::{InternalWaitKind, WaitFdAuthority};
 

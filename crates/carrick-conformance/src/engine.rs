@@ -27,11 +27,66 @@ pub struct RunOutput {
     pub elapsed_ms: u64,
     pub run_id: String,
     pub argv: Vec<String>,
+    /// The deadline this run was actually held to, and WHICH budget produced
+    /// it. Recorded by construction so the classifier never has to infer the
+    /// provenance from elapsed-vs-budget arithmetic.
+    pub deadline: CarrickDeadline,
     /// Evidence captured at the moment of a TIMEOUT, so the verdict can say
     /// WHY the deadline was missed instead of just that it was. `None` when the
     /// run did not time out (or the host could not answer).
     pub timeout_evidence: Option<TimeoutEvidence>,
 }
+
+/// Which budget produced the deadline a run was actually held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeadlineOrigin {
+    /// The suite's own declared `timeout_s` — the only budget the suite itself
+    /// promises to finish inside.
+    Declared,
+    /// The operator's routine fast budget (`--carrick-fast-timeout-s`).
+    Fast,
+    /// Twice the cached Docker duration plus two seconds of scheduling grace:
+    /// the project's 2x-Docker bar expressed as a deadline.
+    AdaptiveOracle,
+    /// The operator's explicit hard cap (`--carrick-timeout-cap-s`).
+    Cap,
+}
+
+/// The deadline a run was held to, alongside the declaration it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CarrickDeadline {
+    pub declared_s: u64,
+    pub effective_s: u64,
+    pub origin: DeadlineOrigin,
+}
+
+impl CarrickDeadline {
+    /// Whether the deadline that fired was the operator's diagnostic budget
+    /// rather than the suite's own declaration. A kill here is a perf
+    /// observation by construction and can never, on its own, be evidence of a
+    /// hang — AGENTS.md: a row sitting exactly on its budget has a meaningless
+    /// ratio.
+    pub fn is_diagnostic(self) -> bool {
+        self.effective_s < self.declared_s
+    }
+
+    /// Re-express both budgets in a lane's stretched seconds, so a nested-KVM
+    /// run keeps the same declared-vs-diagnostic relation it has on HVF.
+    fn scaled_by(self, scale: impl Fn(u64) -> u64) -> Self {
+        CarrickDeadline {
+            declared_s: scale(self.declared_s),
+            effective_s: scale(self.effective_s),
+            origin: self.origin,
+        }
+    }
+}
+
+/// How recently the transcript grew for growth to count as progress. Two
+/// seconds is short enough to stay well inside even the five-second routine
+/// fast budget, so a run that produced its last byte at spawn never reads as
+/// progressing at the kill.
+pub const PROGRESS_WINDOW_MS: u64 = 2_000;
 
 /// What the box looked like when a suite hit its deadline.
 #[derive(Debug, Clone, Copy)]
@@ -43,6 +98,14 @@ pub struct TimeoutEvidence {
     pub loadavg_1m: Option<f64>,
     /// Cores, so load can be read as an oversubscription ratio.
     pub ncpu: usize,
+    /// Bytes the run had written to each transcript at the kill.
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    /// Time between the last observed transcript growth and the kill. `None`
+    /// when the poll loop never saw the transcripts grow at all — which is NOT
+    /// evidence of a hang (an old-API LTP test block-buffers stdout and flushes
+    /// only in `tst_exit()`), so it falls through to the duty/load ladder.
+    pub ms_since_last_growth: Option<u64>,
 }
 
 /// Why a suite missed its deadline. A bare TIMEOUT conflates three very
@@ -61,6 +124,10 @@ pub enum TimeoutKind {
     /// Got little CPU while the box was idle: nobody was competing, so the
     /// guest was waiting on something that never came. A real hang.
     Blocked,
+    /// The transcript was still growing when the deadline fired: whatever the
+    /// duty cycle looked like, the run was making observable progress and was
+    /// cut off, not stuck.
+    Progressing,
     /// The host would not tell us (no CPU sample / no load average).
     Unknown,
 }
@@ -71,6 +138,7 @@ impl TimeoutKind {
             TimeoutKind::Spinning => "spinning",
             TimeoutKind::Starved => "starved",
             TimeoutKind::Blocked => "blocked",
+            TimeoutKind::Progressing => "progressing",
             TimeoutKind::Unknown => "unknown",
         }
     }
@@ -115,6 +183,27 @@ pub fn classify_timeout(
     } else {
         TimeoutKind::Blocked
     }
+}
+
+/// Classify a missed deadline with transcript-growth evidence in hand.
+///
+/// Growth is POSITIVE evidence only: a transcript that grew within
+/// `progress_window_ms` of the kill proves the run was progressing, and wins
+/// over the duty/load ladder — `classify_timeout` cannot separate an I/O-bound
+/// or `sleep`-heavy suite that is passing tests from one waiting forever,
+/// because both consume no CPU. The absence of growth proves nothing and
+/// delegates to [`classify_timeout`] unchanged.
+pub fn classify_timeout_with_progress(
+    evidence: &TimeoutEvidence,
+    wall_ms: u64,
+    progress_window_ms: u64,
+) -> TimeoutKind {
+    if let Some(since_growth_ms) = evidence.ms_since_last_growth
+        && since_growth_ms <= progress_window_ms
+    {
+        return TimeoutKind::Progressing;
+    }
+    classify_timeout(evidence.cpu_ms, wall_ms, evidence.loadavg_1m, evidence.ncpu)
 }
 
 /// CPU (user+sys) consumed by `pid`, sampled while it is still alive.
@@ -312,7 +401,8 @@ pub fn carrick_dry_run(
 ) -> Vec<String> {
     let mut effective_suite = suite.clone();
     effective_suite.timeout_s =
-        effective_carrick_timeout_s(suite.timeout_s, fast_timeout_s, timeout_cap_s, None);
+        effective_carrick_timeout_s(suite.timeout_s, fast_timeout_s, timeout_cap_s, None)
+            .effective_s;
     crate::lane::carrick_invocation_argv(&effective_suite, carrick_bin, run_id, lane)
 }
 pub fn docker_dry_run(
@@ -332,14 +422,14 @@ pub fn run_carrick(
     timeout_cap_s: Option<u64>,
     oracle_elapsed_ms: Option<u64>,
 ) -> anyhow::Result<RunOutput> {
-    let effective_timeout_s = effective_carrick_timeout_s(
+    let deadline = effective_carrick_timeout_s(
         suite.timeout_s,
         fast_timeout_s,
         timeout_cap_s,
         oracle_elapsed_ms,
     );
     let mut effective_suite = suite.clone();
-    effective_suite.timeout_s = effective_timeout_s;
+    effective_suite.timeout_s = deadline.effective_s;
     let argv = crate::lane::carrick_invocation_argv(&effective_suite, carrick_bin, run_id, lane);
     // SAFE: argv comes from the version-controlled manifest (suites.toml), not external
     // input; `Command::args` passes each token literally (no shell), so there is no
@@ -365,7 +455,7 @@ pub fn run_carrick(
     run_one(
         cmd,
         argv,
-        lane.scaled_timeout(effective_timeout_s),
+        deadline.scaled_by(|s| lane.scaled_timeout(s)),
         run_id,
         Engine::Carrick,
         Some(cleanup),
@@ -382,19 +472,40 @@ fn effective_carrick_timeout_s(
     fast_timeout_s: u64,
     timeout_cap_s: Option<u64>,
     oracle_elapsed_ms: Option<u64>,
-) -> u64 {
+) -> CarrickDeadline {
+    let declared = |origin| CarrickDeadline {
+        declared_s,
+        effective_s: declared_s,
+        origin,
+    };
     if timeout_cap_s == Some(0) {
-        declared_s
+        return declared(DeadlineOrigin::Declared);
+    }
+    let oracle_budget_s = oracle_elapsed_ms.map_or(0, |elapsed_ms| {
+        elapsed_ms
+            .saturating_mul(2)
+            .saturating_add(999)
+            .saturating_div(1_000)
+            .saturating_add(2)
+    });
+    let adaptive_s = fast_timeout_s.max(oracle_budget_s);
+    let adaptive_origin = if oracle_budget_s > fast_timeout_s {
+        DeadlineOrigin::AdaptiveOracle
     } else {
-        let oracle_budget_s = oracle_elapsed_ms.map_or(0, |elapsed_ms| {
-            elapsed_ms
-                .saturating_mul(2)
-                .saturating_add(999)
-                .saturating_div(1_000)
-                .saturating_add(2)
-        });
-        let adaptive_s = fast_timeout_s.max(oracle_budget_s);
-        declared_s.min(timeout_cap_s.map_or(adaptive_s, |cap_s| adaptive_s.min(cap_s)))
+        DeadlineOrigin::Fast
+    };
+    let (diagnostic_s, diagnostic_origin) = match timeout_cap_s {
+        Some(cap_s) if cap_s < adaptive_s => (cap_s, DeadlineOrigin::Cap),
+        _ => (adaptive_s, adaptive_origin),
+    };
+    if declared_s <= diagnostic_s {
+        declared(DeadlineOrigin::Declared)
+    } else {
+        CarrickDeadline {
+            declared_s,
+            effective_s: diagnostic_s,
+            origin: diagnostic_origin,
+        }
     }
 }
 
@@ -419,7 +530,15 @@ pub fn run_docker(
     // SAFE: see run_carrick — argv is from the trusted manifest; `Command::args` is shell-free.
     let mut cmd = Command::new(&argv[0]); // nosemgrep
     cmd.args(&argv[1..]);
-    let out = run_one(cmd, argv, suite.timeout_s, run_id, Engine::Docker, None);
+    // The oracle is always held to the suite's own declaration: the operator's
+    // diagnostic budget is Carrick-only, so a Docker deadline is never a
+    // budget kill.
+    let deadline = CarrickDeadline {
+        declared_s: suite.timeout_s,
+        effective_s: suite.timeout_s,
+        origin: DeadlineOrigin::Declared,
+    };
+    let out = run_one(cmd, argv, deadline, run_id, Engine::Docker, None);
     // Always remove the container we named (no `--rm`, so the exit code came
     // straight from the `docker run` process).
     let _ = Command::new("docker")
@@ -460,7 +579,7 @@ impl CarrickCleanup {
 fn run_one(
     mut cmd: Command,
     argv: Vec<String>,
-    timeout_s: u64,
+    deadline_budget: CarrickDeadline,
     run_id: &str,
     engine: Engine,
     cleanup: Option<CarrickCleanup>,
@@ -477,12 +596,17 @@ fn run_one(
 
     throttle_under_extreme_load();
     let start = Instant::now();
-    let deadline = Duration::from_secs(timeout_s);
+    let deadline = Duration::from_secs(deadline_budget.effective_s);
     let mut child = cmd.spawn()?;
     let pid = child.id() as i32;
 
     let mut timed_out = false;
     let mut timeout_evidence = None;
+    // Transcript growth, sampled on the SAME 200 ms cadence the wait loop
+    // already runs on (two `stat`s per step, no new syscalls outside it). A
+    // growing transcript at the kill is the only positive proof that the run
+    // was progressing rather than stuck.
+    let mut transcript = TranscriptGrowth::new(&stdout_path, &stderr_path);
     let exit_code = loop {
         match child.try_wait()? {
             Some(status) => break status.code().unwrap_or(-1),
@@ -493,18 +617,26 @@ fn run_one(
                     // can no longer tell us whether it was spinning or idle,
                     // and that is the whole difference between "carrick hung"
                     // and "this box was too busy to measure anything".
+                    transcript.sample();
                     timeout_evidence = Some(TimeoutEvidence {
                         cpu_ms: pid_cpu_ms(pid),
                         loadavg_1m: loadavg_1m(),
                         ncpu: std::thread::available_parallelism()
                             .map(|n| n.get())
                             .unwrap_or(0),
+                        stdout_bytes: transcript.stdout_bytes,
+                        stderr_bytes: transcript.stderr_bytes,
+                        ms_since_last_growth: transcript.ms_since_last_growth(),
                     });
+                    if let Some(evidence) = timeout_evidence.as_ref() {
+                        report_deadline_receipt(run_id, deadline_budget, evidence);
+                    }
                     let _ = kill_scoped(pid, run_id, engine, cleanup.as_ref());
                     // Reap whatever is left.
                     let _ = child.wait();
                     break -1;
                 }
+                transcript.sample();
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
@@ -534,8 +666,74 @@ fn run_one(
         elapsed_ms: elapsed_ms(start.elapsed()),
         run_id: run_id.to_string(),
         argv,
+        deadline: deadline_budget,
         timeout_evidence,
     })
+}
+
+/// Name the deadline that fired at the moment it fires, with the transcript
+/// evidence that was sampled just before the kill. Which budget cut the run off
+/// is the difference between a perf observation and a hang, and it is decided
+/// by construction here — never re-derived downstream from elapsed-vs-budget
+/// arithmetic.
+fn report_deadline_receipt(run_id: &str, deadline: CarrickDeadline, evidence: &TimeoutEvidence) {
+    let budget = if deadline.is_diagnostic() {
+        "diagnostic"
+    } else {
+        "declared"
+    };
+    let growth = match evidence.ms_since_last_growth {
+        Some(ms) => format!("{ms}ms"),
+        None => "never".to_string(),
+    };
+    eprintln!(
+        "  [deadline] {run_id} cut off at {}s ({budget}, origin={:?}, declared={}s);          stdout={}B stderr={}B last-growth={growth}",
+        deadline.effective_s,
+        deadline.origin,
+        deadline.declared_s,
+        evidence.stdout_bytes,
+        evidence.stderr_bytes,
+    );
+}
+
+/// Byte-length watch over a run's two capture files.
+///
+/// Only GROWTH is recorded, never its absence: an old-API LTP test block-buffers
+/// stdout and flushes in `tst_exit()`, so a silent transcript says nothing about
+/// whether the guest is alive.
+struct TranscriptGrowth {
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+    last_growth: Option<Instant>,
+}
+
+impl TranscriptGrowth {
+    fn new(stdout_path: &Path, stderr_path: &Path) -> Self {
+        TranscriptGrowth {
+            stdout_path: stdout_path.to_path_buf(),
+            stderr_path: stderr_path.to_path_buf(),
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            last_growth: None,
+        }
+    }
+
+    fn sample(&mut self) {
+        let len = |path: &Path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let stdout_bytes = len(&self.stdout_path);
+        let stderr_bytes = len(&self.stderr_path);
+        if stdout_bytes > self.stdout_bytes || stderr_bytes > self.stderr_bytes {
+            self.last_growth = Some(Instant::now());
+        }
+        self.stdout_bytes = self.stdout_bytes.max(stdout_bytes);
+        self.stderr_bytes = self.stderr_bytes.max(stderr_bytes);
+    }
+
+    fn ms_since_last_growth(&self) -> Option<u64> {
+        self.last_growth.map(|at| elapsed_ms(at.elapsed()))
+    }
 }
 
 fn maybe_append_crash_core_summary(stderr_path: &Path, pid: i32, argv: &[String]) {
@@ -935,18 +1133,148 @@ mod tests {
         assert_eq!(privileged_attempts, vec![false, true]);
     }
 
+    /// The gate's own diagnostic budget must be distinguishable from the
+    /// suite's declared one, BY CONSTRUCTION rather than by comparing elapsed
+    /// time against a budget after the fact.
+    ///
+    /// sep14 receipt (`target/conformance/sep14-ecosystem/`): `go-go_types`
+    /// was killed at 14181 ms against an adaptive budget of
+    /// `2 x 5883 ms oracle + 2000 ms` = 13766 ms -> 14 s, while its DECLARED
+    /// budget was 300 s. Re-run serially at the declared budget it was a plain
+    /// MATCH in 14672 ms. A kill at 14 s therefore proves a 2.49x ratio, never
+    /// a hang.
+    #[test]
+    fn budget_kill_is_named_by_the_deadline_that_fired() {
+        let adaptive = effective_carrick_timeout_s(300, 5, None, Some(5_883));
+        assert_eq!(adaptive.declared_s, 300);
+        assert_eq!(adaptive.effective_s, 14);
+        assert_eq!(adaptive.origin, DeadlineOrigin::AdaptiveOracle);
+        assert!(
+            adaptive.is_diagnostic(),
+            "a deadline below the declaration is the operator's, not the suite's"
+        );
+
+        // `--carrick-timeout-cap-s 0` restores the declared budget: a kill
+        // there IS the suite failing its own declaration.
+        let declared = effective_carrick_timeout_s(300, 5, Some(0), Some(5_883));
+        assert_eq!(declared.effective_s, 300);
+        assert_eq!(declared.origin, DeadlineOrigin::Declared);
+        assert!(!declared.is_diagnostic(), "equal values are not diagnostic");
+
+        // A short declaration wins over a long adaptive budget: still the
+        // suite's own deadline.
+        let short = effective_carrick_timeout_s(15, 5, None, Some(20_766));
+        assert_eq!(short.effective_s, 15);
+        assert_eq!(short.origin, DeadlineOrigin::Declared);
+        assert!(!short.is_diagnostic());
+
+        // The operator's explicit hard cap is its own origin.
+        let capped = effective_carrick_timeout_s(300, 5, Some(10), Some(20_766));
+        assert_eq!(capped.effective_s, 10);
+        assert_eq!(capped.origin, DeadlineOrigin::Cap);
+        assert!(capped.is_diagnostic());
+
+        // No oracle evidence: the fast routine budget names itself.
+        let fast = effective_carrick_timeout_s(300, 5, None, None);
+        assert_eq!(fast.effective_s, 5);
+        assert_eq!(fast.origin, DeadlineOrigin::Fast);
+        assert!(fast.is_diagnostic());
+    }
+
+    /// `[blocked]` means "idle on an idle box, waiting for something that never
+    /// came". A transcript that was still growing 500 ms before the kill
+    /// disproves that outright, whatever the duty cycle says: an I/O-bound or
+    /// `sleep`-heavy suite is indistinguishable from a hang on CPU duty alone.
+    /// 21 of the 22 sep14 TIMEOUT rows were annotated `[blocked]`, and five of
+    /// the first ten were plain MATCHes when re-run serially.
+    #[test]
+    fn a_growing_transcript_is_never_blocked() {
+        let evidence = TimeoutEvidence {
+            cpu_ms: Some(4_000),
+            loadavg_1m: Some(1.0),
+            ncpu: 10,
+            stdout_bytes: 65_536,
+            stderr_bytes: 0,
+            ms_since_last_growth: Some(500),
+        };
+        // Duty 0.02 on an idle 10-core box: the ladder alone says "hang".
+        assert_eq!(
+            classify_timeout(evidence.cpu_ms, 200_000, evidence.loadavg_1m, evidence.ncpu),
+            TimeoutKind::Blocked
+        );
+        assert_eq!(
+            classify_timeout_with_progress(&evidence, 200_000, PROGRESS_WINDOW_MS),
+            TimeoutKind::Progressing
+        );
+        assert_eq!(TimeoutKind::Progressing.as_str(), "progressing");
+        assert!(
+            !TimeoutKind::Progressing.is_measurement_failure(),
+            "a progressing budget kill is resolved by confirmation, never waived"
+        );
+
+        // Growth OUTSIDE the window is not evidence of progress, and the
+        // absence of any growth is not evidence of a hang either — both fall
+        // through to the existing duty/load ladder.
+        let stale = TimeoutEvidence {
+            ms_since_last_growth: Some(120_000),
+            ..evidence
+        };
+        assert_eq!(
+            classify_timeout_with_progress(&stale, 200_000, PROGRESS_WINDOW_MS),
+            TimeoutKind::Blocked
+        );
+        let silent = TimeoutEvidence {
+            ms_since_last_growth: None,
+            ..evidence
+        };
+        assert_eq!(
+            classify_timeout_with_progress(&silent, 200_000, PROGRESS_WINDOW_MS),
+            TimeoutKind::Blocked
+        );
+        // A spin that also emits output stays a spin: progress does not excuse
+        // burning a core.
+        let spinning = TimeoutEvidence {
+            cpu_ms: Some(190_000),
+            ms_since_last_growth: Some(500),
+            ..evidence
+        };
+        assert_eq!(
+            classify_timeout_with_progress(&spinning, 200_000, PROGRESS_WINDOW_MS),
+            TimeoutKind::Progressing,
+            "progress wins over the duty/load ladder"
+        );
+    }
+
     #[test]
     fn carrick_timeout_is_fast_unless_the_oracle_proves_the_case_is_slow() {
-        assert_eq!(effective_carrick_timeout_s(300, 5, None, None), 5);
-        assert_eq!(effective_carrick_timeout_s(300, 5, None, Some(400)), 5);
-        assert_eq!(effective_carrick_timeout_s(300, 5, None, Some(1_600)), 6);
-        assert_eq!(effective_carrick_timeout_s(300, 5, None, Some(20_766)), 44);
-        assert_eq!(effective_carrick_timeout_s(15, 5, None, Some(20_766)), 15);
         assert_eq!(
-            effective_carrick_timeout_s(300, 5, Some(10), Some(20_766)),
+            effective_carrick_timeout_s(300, 5, None, None).effective_s,
+            5
+        );
+        assert_eq!(
+            effective_carrick_timeout_s(300, 5, None, Some(400)).effective_s,
+            5
+        );
+        assert_eq!(
+            effective_carrick_timeout_s(300, 5, None, Some(1_600)).effective_s,
+            6
+        );
+        assert_eq!(
+            effective_carrick_timeout_s(300, 5, None, Some(20_766)).effective_s,
+            44
+        );
+        assert_eq!(
+            effective_carrick_timeout_s(15, 5, None, Some(20_766)).effective_s,
+            15
+        );
+        assert_eq!(
+            effective_carrick_timeout_s(300, 5, Some(10), Some(20_766)).effective_s,
             10
         );
-        assert_eq!(effective_carrick_timeout_s(300, 5, Some(0), Some(400)), 300);
+        assert_eq!(
+            effective_carrick_timeout_s(300, 5, Some(0), Some(400)).effective_s,
+            300
+        );
     }
 
     #[test]

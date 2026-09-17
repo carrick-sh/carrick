@@ -1683,6 +1683,44 @@ pub(super) fn is_anon_overlay_path(path: &str) -> bool {
     path == "/__carrick_o_tmpfile" || path.starts_with("/memfd:")
 }
 
+/// Every distinguishable producer/consumer pair behind [`OpenDescription::wait_queue`].
+///
+/// The list is the acceptance surface of the enrollment-gap property: a wake
+/// that fires between a syscall's own readiness check and the wait service's
+/// enrollment must not be lost for ANY of these.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WaitQueueKind {
+    PipeReader,
+    PipeWriter,
+    EventFd,
+    TimerFd,
+    InMemorySocket,
+    InZoneListenerSocket,
+    Epoll,
+    Netlink,
+    Packet,
+    InZoneListenerHostSocket,
+}
+
+#[cfg(test)]
+impl WaitQueueKind {
+    /// Every kind, checked against the classifier by
+    /// `wait_queue_kind_enumeration_is_exhaustive`.
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::PipeReader,
+        Self::PipeWriter,
+        Self::EventFd,
+        Self::TimerFd,
+        Self::InMemorySocket,
+        Self::InZoneListenerSocket,
+        Self::Epoll,
+        Self::Netlink,
+        Self::Packet,
+        Self::InZoneListenerHostSocket,
+    ];
+}
+
 impl OpenDescription {
     /// The host fd whose inode a guest file mapping may alias live: a host
     /// regular file, or a memfd whose bytes live in an unlinked host file.
@@ -1713,6 +1751,54 @@ impl OpenDescription {
             Self::Packet { socket, .. } => Some(Arc::clone(&socket.wait_queue)),
             Self::HostSocket { base, .. } => base.inzone_listener().map(|l| l.wait_queue()),
             _ => None,
+        }
+    }
+
+    /// The wait-queue-bearing classification of this description, exhaustively.
+    ///
+    /// [`Self::wait_queue`] answers "is there a queue" with a wildcard arm; this
+    /// answers "WHICH producer/consumer pair" with none, so a new description
+    /// that publishes readiness through a wait queue cannot be added without
+    /// being classified here — and therefore cannot silently escape the
+    /// enrollment-gap property in
+    /// `kernel::continuation::tests::wait_enrollment_gap`.
+    #[cfg(test)]
+    pub(crate) fn wait_queue_kind(&self) -> Option<WaitQueueKind> {
+        match self {
+            Self::PipeReader { .. } => Some(WaitQueueKind::PipeReader),
+            Self::PipeWriter { .. } => Some(WaitQueueKind::PipeWriter),
+            Self::EventFd { .. } => Some(WaitQueueKind::EventFd),
+            Self::TimerFd { .. } => Some(WaitQueueKind::TimerFd),
+            Self::InMemorySocket { base, .. } => Some(if base.inzone_listener().is_some() {
+                WaitQueueKind::InZoneListenerSocket
+            } else {
+                WaitQueueKind::InMemorySocket
+            }),
+            Self::Epoll { .. } => Some(WaitQueueKind::Epoll),
+            Self::Netlink { .. } => Some(WaitQueueKind::Netlink),
+            Self::Packet { .. } => Some(WaitQueueKind::Packet),
+            Self::HostSocket { base, .. } => base
+                .inzone_listener()
+                .map(|_| WaitQueueKind::InZoneListenerHostSocket),
+            Self::Closed { .. }
+            | Self::File { .. }
+            | Self::InMemoryFile { .. }
+            | Self::Directory { .. }
+            | Self::SyntheticFile { .. }
+            | Self::ProcExecutable { .. }
+            | Self::SyntheticDevice { .. }
+            | Self::Pidfd { .. }
+            | Self::Inotify { .. }
+            | Self::Fanotify { .. }
+            | Self::SignalFd { .. }
+            | Self::PerfEvent { .. }
+            | Self::FsContext { .. }
+            | Self::HostPipe { .. }
+            | Self::HostFile { .. }
+            | Self::Mqueue { .. }
+            | Self::BpfMap { .. }
+            | Self::BpfProg { .. }
+            | Self::VirtualConsole { .. } => None,
         }
     }
 
