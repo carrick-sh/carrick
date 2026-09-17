@@ -111,6 +111,25 @@ pub enum Step {
     Sys(Syscall),
     /// The script the child of the preceding fork runs.
     ChildMarker(Vec<Step>),
+    /// Wait for another task to park/enroll in a specific syscall before continuing.
+    AwaitParked {
+        /// PID of the task to await.
+        pid: i32,
+        /// Syscall label that must be parked/enrolled.
+        label: &'static str,
+    },
+    /// Sleep for a fixed number of milliseconds on the host thread.
+    HostSleepMs(u64),
+}
+
+/// Await enrollment/parking of syscall `label` on task `pid`.
+pub const fn await_parked(pid: i32, label: &'static str) -> Step {
+    Step::AwaitParked { pid, label }
+}
+
+/// Sleep for `ms` milliseconds on the host thread between script steps.
+pub const fn host_sleep_ms(ms: u64) -> Step {
+    Step::HostSleepMs(ms)
 }
 
 /// Reference slot `i` of the task's slot table.

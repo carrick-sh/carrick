@@ -9,7 +9,8 @@ use std::time::Instant;
 
 use carrick_abi::{LINUX_EBADF, LINUX_EINVAL};
 use carrick_kernel_example::{
-    ExampleError, ScriptedBackend, Step, WAIT_BOUND, last_child, slot, sys,
+    ExampleError, ScriptedBackend, Step, WAIT_BOUND, await_parked, host_sleep_ms, last_child, slot,
+    sys,
 };
 
 #[test]
@@ -251,4 +252,44 @@ fn save_out_i32_out_of_bounds_rejects() {
         .run_root(script)
         .expect_err("out of bounds save_out_i32 must fail");
     assert!(matches!(err, ExampleError::Script(msg) if msg.contains("exceeds out buffer len 8")));
+}
+
+#[test]
+fn a_blocked_read_is_dispatched_exactly_twice_when_the_writer_arrives() {
+    // Parking, not polling: the read parks once, the kernel wakes it on the write, it restarts once.
+    let script = vec![
+        Step::Sys(
+            sys::pipe2(0)
+                .ret(0)
+                .save_out_i32(0, 0, 0)
+                .save_out_i32(0, 1, 1),
+        ),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            await_parked(1, "read"),
+            Step::Sys(sys::write(slot(1), b"late").ret(4)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        Step::Sys(sys::read(slot(0), 4).ret(4)),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.output("read"), b"late");
+    assert_eq!(
+        run.dispatches_for(1, "read"),
+        2,
+        "a parked read is dispatched exactly twice"
+    );
+}
+
+#[test]
+fn host_sleep_step_executes() {
+    let script = vec![host_sleep_ms(1), Step::Sys(sys::exit_group(0))];
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("backend ran");
+    assert_eq!(run.exit_code(), 0);
 }
