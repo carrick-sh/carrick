@@ -305,6 +305,10 @@ pub struct HostFsBackend {
     marker_absent_gen: std::sync::atomic::AtomicU64,
     /// In-memory set of directory relative paths that contain marker nodes.
     marker_dirs: parking_lot::RwLock<std::collections::HashSet<std::path::PathBuf>>,
+    /// Per-directory negative marker proofs, stamped with the fork-shared root
+    /// marker generation. A new marker node bumps that generation after its
+    /// durable xattrs land, invalidating every process's copied negative map.
+    marker_absent_dirs: parking_lot::RwLock<std::collections::HashMap<std::path::PathBuf, u64>>,
     /// Sticky fast answer for "does any entry carry guest metadata xattrs"
     /// (mode/uid/gid): mirrors `marker_seen`/`marker_absent_gen` over
     /// [`CARRICK_HAS_META_XATTRS_XATTR`], stamped by `set_mode`/`set_owner`
@@ -1029,6 +1033,7 @@ impl HostFsBackend {
             marker_seen: std::sync::atomic::AtomicBool::new(false),
             marker_absent_gen: std::sync::atomic::AtomicU64::new(0),
             marker_dirs: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            marker_absent_dirs: parking_lot::RwLock::new(std::collections::HashMap::new()),
             meta_xattr_seen: std::sync::atomic::AtomicBool::new(false),
             meta_xattr_absent_gen: std::sync::atomic::AtomicU64::new(0),
             whiteout_seen: std::sync::atomic::AtomicBool::new(false),
@@ -1093,6 +1098,7 @@ impl HostFsBackend {
             marker_seen: std::sync::atomic::AtomicBool::new(false),
             marker_absent_gen: std::sync::atomic::AtomicU64::new(0),
             marker_dirs: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            marker_absent_dirs: parking_lot::RwLock::new(std::collections::HashMap::new()),
             meta_xattr_seen: std::sync::atomic::AtomicBool::new(false),
             meta_xattr_absent_gen: std::sync::atomic::AtomicU64::new(0),
             whiteout_seen: std::sync::atomic::AtomicBool::new(false),
@@ -3466,7 +3472,7 @@ const CARRICK_HAS_FIFO_XATTR: &[u8] = b"user.carrick.has_fifo\0";
 /// every `user.carrick.*` name.
 const CARRICK_HAS_MARKER_NODES_XATTR: &[u8] = b"user.carrick.has_marker_nodes\0";
 /// Marker xattr on a DIRECTORY recording that a marker node (socket/device) has
-/// been created directly under it. While absent, `read_host_dir_entries` knows
+/// been created directly under it. While absent, the trusted stream knows
 /// that DT_REG entries in this directory are genuine regular files without
 /// checking xattrs.
 const CARRICK_DIR_HAS_MARKERS_XATTR: &[u8] = b"user.carrick.dir_has_markers\0";
@@ -4574,11 +4580,23 @@ impl FsBackend for HostFsBackend {
         if self.marker_dirs.read().contains(rel) {
             return true;
         }
+        let marker_generation = crate::fs_resolve_cache::current_marker_generation();
+        if self
+            .marker_absent_dirs
+            .read()
+            .get(rel)
+            .is_some_and(|generation| *generation == marker_generation)
+        {
+            return false;
+        }
         if let Ok(dir_fd) = self.dir_fd_for(rel) {
             if fget_u32_xattr(dir_fd.as_raw_fd(), CARRICK_DIR_HAS_MARKERS_XATTR).is_some() {
                 self.marker_dirs.write().insert(rel.to_path_buf());
                 return true;
             }
+            self.marker_absent_dirs
+                .write()
+                .insert(rel.to_path_buf(), marker_generation);
         }
         false
     }
@@ -5122,20 +5140,11 @@ impl FsBackend for HostFsBackend {
         let normalized = normalize(dir)?;
         let rel = Self::rel_path(&normalized).unwrap_or_else(|| Path::new(""));
         let parent = self.dir_fd_for(rel).ok()?;
-        // The cached capability fd's seek offset must not be touched by a
-        // concurrent enumeration. Give the stream its own open description.
-        let raw = unsafe {
-            host_openat!(
-                parent.as_raw_fd(),
-                c".".as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        if raw < 0 {
-            return None;
-        }
-        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        read_host_dir_entries(owned.as_raw_fd(), dir)
+        // `read_plain_host_dir_entries` opens its own description before it
+        // creates a DIR*, so the cached capability fd's offset remains
+        // untouched. Re-opening here as well paid two `openat(".")` calls per
+        // directory without adding isolation.
+        read_plain_host_dir_entries(parent.as_raw_fd(), dir)
     }
 
     fn child_names_bounded(
@@ -7039,17 +7048,22 @@ pub fn layered_directory_entries(
     Ok(out)
 }
 
-/// One streamed readdir batch of a TRUSTED host dirfd, translated to the
+/// One streamed readdir batch of a TRUSTED, marker-free host dirfd, translated to the
 /// `RootFsDirEntry` shape `getdents64`'s `dirent64_record` encoder consumes —
 /// `d_name`/`d_type`/`d_ino` straight off the kernel, zero per-child stats.
-/// `dup` + `fdopendir` gives `DIR*` ownership of a separate descriptor, but
-/// shares its open-description offset. Callers must supply a private stream
-/// description or serialize its offset. Skips "."/".." (the getdents
+/// The caller must first prove `dir_has_overlay_interference(dir_path) == false`;
+/// repeating the per-directory marker xattr read here would make every directory
+/// walk pay twice for the same proof.
+/// `openat(fd, ".")` gives `DIR*` ownership of a separate open-file description,
+/// so enumeration never moves the caller's offset. Skips "."/".." (the getdents
 /// handler synthesizes deterministic dot entries) and carrick's internal
 /// sidecar names. `None` on any surprise (`DT_UNKNOWN`, an unmappable type,
 /// `fdopendir` failure) ⇒ the caller takes the exact layered path.
 #[cfg(target_os = "macos")]
-pub fn read_host_dir_entries(host_dir_fd: i32, dir_path: &str) -> Option<Vec<RootFsDirEntry>> {
+pub fn read_plain_host_dir_entries(
+    host_dir_fd: i32,
+    dir_path: &str,
+) -> Option<Vec<RootFsDirEntry>> {
     struct Dirp(*mut libc::DIR);
     impl Drop for Dirp {
         fn drop(&mut self) {
@@ -7087,29 +7101,6 @@ pub fn read_host_dir_entries(host_dir_fd: i32, dir_path: &str) -> Option<Vec<Roo
     }
     let dirp = Dirp(raw_dirp);
 
-    let dir_has_markers = fget_u32_xattr(host_dir_fd, CARRICK_DIR_HAS_MARKERS_XATTR).is_some();
-    let mut dir_path_buf = [0u8; libc::PATH_MAX as usize];
-    let dir_host_path = if dir_has_markers {
-        let rc = unsafe {
-            libc::fcntl(
-                host_dir_fd,
-                libc::F_GETPATH,
-                dir_path_buf.as_mut_ptr() as *mut libc::c_char,
-            )
-        };
-        if rc >= 0 {
-            let len = dir_path_buf
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(dir_path_buf.len());
-            std::str::from_utf8(&dir_path_buf[..len]).ok()
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     let mut out = Vec::new();
     loop {
         // SAFETY: dirp.0 is a live DIR*; readdir returns null at end.
@@ -7140,32 +7131,7 @@ pub fn read_host_dir_entries(host_dir_fd: i32, dir_path: &str) -> Option<Vec<Roo
         }
         let kind = match d_type {
             libc::DT_DIR => RootFsEntryKind::Directory,
-            libc::DT_REG => {
-                if dir_has_markers {
-                    if let Some(host_dir) = dir_host_path {
-                        let full = format!("{host_dir}/{name}\0");
-                        let (mode, _uid, _gid, is_sock) =
-                            path_carrick_meta(full.as_ptr() as *const libc::c_char);
-                        if is_sock {
-                            RootFsEntryKind::Socket
-                        } else if let Some(m) = mode {
-                            match m & carrick_abi::LINUX_S_IFMT {
-                                s if s == carrick_abi::LINUX_S_IFCHR => RootFsEntryKind::CharDevice,
-                                s if s == carrick_abi::LINUX_S_IFBLK => return None,
-                                s if s == carrick_abi::LINUX_S_IFIFO => RootFsEntryKind::Fifo,
-                                s if s == carrick_abi::LINUX_S_IFSOCK => RootFsEntryKind::Socket,
-                                _ => RootFsEntryKind::File,
-                            }
-                        } else {
-                            RootFsEntryKind::File
-                        }
-                    } else {
-                        return None;
-                    }
-                } else {
-                    RootFsEntryKind::File
-                }
-            }
+            libc::DT_REG => RootFsEntryKind::File,
             libc::DT_LNK => RootFsEntryKind::Symlink,
             libc::DT_FIFO => RootFsEntryKind::Fifo,
             libc::DT_SOCK => RootFsEntryKind::Socket,
@@ -7229,7 +7195,10 @@ pub fn read_host_dir_entries(host_dir_fd: i32, dir_path: &str) -> Option<Vec<Roo
 /// Trusted host dirfds are only ever minted by the macOS `--fs host` fast
 /// path; the streaming reader is unreachable elsewhere.
 #[cfg(not(target_os = "macos"))]
-pub fn read_host_dir_entries(_host_dir_fd: i32, _dir_path: &str) -> Option<Vec<RootFsDirEntry>> {
+pub fn read_plain_host_dir_entries(
+    _host_dir_fd: i32,
+    _dir_path: &str,
+) -> Option<Vec<RootFsDirEntry>> {
     None
 }
 
