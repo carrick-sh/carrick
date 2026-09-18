@@ -738,10 +738,18 @@
       "rationale": "Test-only synchronization hook allows deterministic testing of SETALL prepare-to-finalize interleaving and permission revalidation."
     },
     {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
+      "symbol": "ensure_dir::READY",
+      "fingerprint": "83a564a2e83e966d12380395660d3d546f40e6ebfccbc8ecf57c6d6787fb92bb",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide one-time initialization guard for the fixed host SysV shared-memory directory; it holds no guest identity or semantic state."
+    },
+    {
       "kind": "thread_local",
       "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
       "symbol": "MSG_QUEUE_FD_CACHE",
-      "fingerprint": "86bd1f420337ed19f6377584f908fd98a6075fd364dbae7140405a5c29abac75",
+      "fingerprint": "153f27546f83a1324a910dc36a2f68850bd0795b3865d93a2654acb87fa675e4",
       "classification": "carrier_infra",
       "rationale": "Host thread-local cell MSG_QUEUE_FD_CACHE in crates/carrick-runtime/src/dispatch/sysv.rs maintaining per-host-thread execution state for the carrier."
     },

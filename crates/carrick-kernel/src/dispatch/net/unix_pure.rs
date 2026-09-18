@@ -2337,7 +2337,9 @@ mod tests {
 
         let mut buf = [0u8; 32 * 1024];
         while sent < payload.len() {
-            while sender.poll_mask() & LINUX_EPOLLOUT == 0 {
+            while !carrick_abi::LinuxEpollEvents::from_bits_retain(sender.poll_mask())
+                .contains(carrick_abi::LinuxEpollEvents::OUT)
+            {
                 let (read, _) = receiver.recv_stream(&mut buf, 0).unwrap();
                 assert_eq!(read, buf.len());
             }
