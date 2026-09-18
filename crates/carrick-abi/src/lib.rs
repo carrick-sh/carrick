@@ -4395,6 +4395,9 @@ pub const LINUX_TCSETS: u64 = 0x5402;
 pub const LINUX_TCSETSW: u64 = 0x5403;
 pub const LINUX_TCSETSF: u64 = 0x5404;
 pub const LINUX_TCGETA: u64 = 0x5405;
+pub const LINUX_TCSETA: u64 = 0x5406;
+pub const LINUX_TCSETAW: u64 = 0x5407;
+pub const LINUX_TCSETAF: u64 = 0x5408;
 // termios2 variants. glibc-aarch64 implements tcgetattr/tcsetattr (and thus
 // isatty(3), which goes through tcgetattr) via these — NOT the legacy
 // TCGETS/TCSETS above — so it can carry an arbitrary baud rate (BOTHER) in the

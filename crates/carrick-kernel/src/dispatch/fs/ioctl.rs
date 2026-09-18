@@ -61,6 +61,23 @@ fn write_linux_termio(
     write_packed(memory, address, &linux_termio_bytes(termios))
 }
 
+fn merge_linux_termio(current: &LinuxTermios, bytes: &[u8]) -> Result<LinuxTermios, LinuxErrno> {
+    let legacy = carrick_abi::LinuxTermio::read_from_bytes(
+        bytes
+            .get(..core::mem::size_of::<carrick_abi::LinuxTermio>())
+            .ok_or(LINUX_EINVAL)?,
+    )
+    .map_err(|_| LINUX_EINVAL)?;
+    let mut next = *current;
+    next.c_iflag = (next.c_iflag & 0xffff_0000) | u32::from(legacy.c_iflag);
+    next.c_oflag = (next.c_oflag & 0xffff_0000) | u32::from(legacy.c_oflag);
+    next.c_cflag = (next.c_cflag & 0xffff_0000) | u32::from(legacy.c_cflag);
+    next.c_lflag = (next.c_lflag & 0xffff_0000) | u32::from(legacy.c_lflag);
+    next.c_line = legacy.c_line;
+    next.c_cc[..legacy.c_cc.len()].copy_from_slice(&legacy.c_cc);
+    Ok(next)
+}
+
 fn host_fd_matches_device(host_fd: i32, path: &str) -> bool {
     let mut fd_stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(host_fd, &mut fd_stat) } != 0 {
@@ -534,6 +551,18 @@ impl<'a> FsView<'a> {
                                     Err(_) => DispatchOutcome::errno(LINUX_EINVAL),
                                 }
                             }
+                            Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
+                        }
+                    }
+                    LINUX_TCSETA | LINUX_TCSETAW | LINUX_TCSETAF => {
+                        match cx.memory.read_bytes(arg, LINUX_TERMIO_SIZE) {
+                            Ok(bytes) => match merge_linux_termio(&console.get_termios(), &bytes) {
+                                Ok(termios) => {
+                                    console.set_termios(termios);
+                                    DispatchOutcome::Returned { value: 0 }
+                                }
+                                Err(errno) => DispatchOutcome::errno(errno),
+                            },
                             Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
                         }
                     }

@@ -2502,6 +2502,67 @@ mod serial_host {
             );
         }
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tty0_legacy_termio_set_variants_round_trip() {
+        use zerocopy::IntoBytes as _;
+
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        let fd = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/dev/tty0",
+            LINUX_O_RDWR,
+        );
+        assert!(fd >= 0, "open of /dev/tty0 should succeed: {fd}");
+
+        for (index, request) in [
+            carrick_abi::LINUX_TCSETA,
+            carrick_abi::LINUX_TCSETAW,
+            carrick_abi::LINUX_TCSETAF,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let expected = carrick_abi::LinuxTermio {
+                c_iflag: 0x1200 | index as u16,
+                c_oflag: 0x2300 | index as u16,
+                c_cflag: 0x3400 | index as u16,
+                c_lflag: 0x4500 | index as u16,
+                c_line: index as u8,
+                c_cc: [0x11 + index as u8; 8],
+            };
+            memory
+                .write_bytes(0x6000, expected.as_bytes())
+                .expect("write legacy termio input");
+            assert_eq!(
+                lane_syscall(
+                    &mut dispatcher,
+                    &mut memory,
+                    29,
+                    [fd as u64, request, 0x6000, 0, 0, 0],
+                ),
+                0,
+                "legacy termio set request {request:#x} should succeed"
+            );
+            assert_eq!(
+                lane_syscall(
+                    &mut dispatcher,
+                    &mut memory,
+                    29,
+                    [fd as u64, carrick_abi::LINUX_TCGETA, 0x7000, 0, 0, 0],
+                ),
+                0
+            );
+            let actual = memory
+                .read_bytes(0x7000, carrick_abi::LINUX_TERMIO_SIZE)
+                .expect("read legacy termio output");
+            assert_eq!(&actual[..expected.as_bytes().len()], expected.as_bytes());
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
