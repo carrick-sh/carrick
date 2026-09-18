@@ -18,4 +18,8 @@ impl SignalArrival for HvfSignalArrival {
     fn wake_all_waiters(&self) {
         crate::host_signal::wake_all_waiters();
     }
+
+    fn wake_waiter(&self, tid: carrick_hal::ThreadId) {
+        crate::host_signal::wake_waiter(tid.raw());
+    }
 }

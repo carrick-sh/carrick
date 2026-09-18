@@ -665,6 +665,7 @@ impl KernelState {
         // The kernel wakes a task through this; cross-process signal delivery
         // reaches a PARKED guest only because of it.
         signal_context.task().set_waker(Arc::new(HvpatchTaskWaker {
+            task: Arc::downgrade(signal_context.task()),
             futex,
             kicker,
             platform_futex,

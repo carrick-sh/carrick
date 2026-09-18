@@ -72,6 +72,9 @@ impl HvpatchRuntimeEndpoint {
 /// both through one waker is what keeps a single answer to "how is a task on
 /// this lane woken".
 pub(crate) struct HvpatchTaskWaker {
+    /// Weak exact task authority. The task owns this waker, so retaining an
+    /// `Arc<Task>` here would form a cycle and keep exited processes alive.
+    pub(crate) task: Weak<carrick_kernel::kernel::Task>,
     /// Unparks a `FUTEX_WAIT`, and the futex-backed waits layered on it.
     pub(crate) futex: Arc<FutexTable>,
     /// Forces the vCPU out of `hv_vcpu_run` so a RUNNING guest reaches a
@@ -94,16 +97,34 @@ impl carrick_kernel::kernel::TaskWaker for HvpatchTaskWaker {
     fn wake_task(&self) {
         self.signal_pump
             .publish_kernel_wake(&self.kicker, &self.platform_futex);
-        self.futex.notify_signal_pending();
-        // Shared (`MAP_SHARED`) futex waiters park in the CARRIER-wide table,
-        // not this process's — a wake that only pokes `self.futex` leaves a
-        // shared waiter asleep until its timeout. Concretely: `tgkill` posts
-        // the signal and comes through here; before this line, a target parked
-        // in `tst_checkpoint_wait` never noticed the pending signal and the
-        // sender's delivery handshake stalled its full 10 s (`tgkill01`).
-        carrick_thread::platform_futex::carrier_shared_futex_table().notify_signal_pending();
-        self.signal_arrival.wake_all_waiters();
-        self.kicker.kick_all();
+        let tids = self
+            .task
+            .upgrade()
+            .map(|task| {
+                task.threads()
+                    .into_iter()
+                    .map(|thread| thread.registry_id())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if tids.is_empty() {
+            // A task racing physical retirement no longer has an exact thread
+            // to target. Preserve the safe compatibility nudge for that brief
+            // interval; ordinary live-task wakes never take this path.
+            self.futex.notify_signal_pending();
+            carrick_thread::platform_futex::carrier_shared_futex_table().notify_signal_pending();
+            self.signal_arrival.wake_all_waiters();
+            self.kicker.kick_all();
+            return;
+        }
+        for tid in tids {
+            // The platform futex owns both this process's private table and the
+            // carrier-wide shared table. Targeting the park token prevents one
+            // child notification from unparking every unrelated waiter.
+            self.platform_futex.notify_signal_pending_for(tid);
+            self.signal_arrival.wake_waiter(tid);
+            self.kicker.kick(tid);
+        }
     }
 }
 
@@ -1084,6 +1105,51 @@ mod tests {
 
     impl carrick_hal::SignalArrival for EndpointTestSignalArrival {
         fn wake_all_waiters(&self) {}
+    }
+
+    #[derive(Default)]
+    struct RecordingSignalArrival {
+        broadcasts: std::sync::atomic::AtomicUsize,
+        targeted: Mutex<Vec<ThreadId>>,
+    }
+
+    impl carrick_hal::SignalArrival for RecordingSignalArrival {
+        fn wake_all_waiters(&self) {
+            self.broadcasts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn wake_waiter(&self, tid: ThreadId) {
+            self.targeted.lock().push(tid);
+        }
+    }
+
+    #[test]
+    fn task_waker_targets_only_the_tasks_live_threads() {
+        let context = alias_context(610);
+        let task = Arc::clone(context.task());
+        let expected: Vec<_> = task
+            .threads()
+            .into_iter()
+            .map(|thread| thread.registry_id())
+            .collect();
+        let arrival = Arc::new(RecordingSignalArrival::default());
+        let waker = HvpatchTaskWaker {
+            task: Arc::downgrade(&task),
+            futex: Arc::new(FutexTable::new()),
+            kicker: Arc::new(carrick_hal::GenericVcpuRegistry::default()),
+            platform_futex: Arc::new(crate::vcpu_loop::tests::NoopPlatformFutex),
+            signal_pump: Arc::new(EndpointTestSignalPump),
+            signal_arrival: Arc::clone(&arrival) as Arc<dyn carrick_hal::SignalArrival>,
+        };
+
+        carrick_kernel::kernel::TaskWaker::wake_task(&waker);
+
+        assert_eq!(*arrival.targeted.lock(), expected);
+        assert_eq!(
+            arrival.broadcasts.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[test]
