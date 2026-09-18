@@ -443,17 +443,43 @@ impl<'a> FsView<'a> {
                 }
             }
 
-            let bytes = this.sendfile_bytes(in_fd.0, offset, count)?;
-            let outcome = this.complete_wait_fd_authority(
-                this.write_output_fd(out_fd.0, &bytes, tid),
-                &this.captured_file_table(),
-                [in_fd.0, out_fd.0],
-            );
-            let DispatchOutcome::Returned { value } = outcome else {
-                return Ok(outcome);
-            };
-            let written = usize::try_from(value).unwrap_or(0);
-            offset = offset.saturating_add(written);
+            // Keep the staging allocation bounded, but do not turn that
+            // internal 16 MiB bound into the syscall's visible short count.
+            // A regular-file destination cannot wait for a guest reader, so it
+            // is safe to drain successive chunks in this dispatch. Pipe/socket
+            // destinations retain the historical one-chunk return: a later
+            // chunk may need to park, and the blocking-write continuation owns
+            // only that chunk rather than an earlier committed prefix.
+            let drain_regular_file = this.regular_host_file_write_fd(out_fd.0).is_some();
+            let mut written_total = 0usize;
+            while written_total < count {
+                let bytes = this.sendfile_bytes(
+                    in_fd.0,
+                    offset,
+                    count.saturating_sub(written_total),
+                )?;
+                if bytes.is_empty() {
+                    break;
+                }
+                let offered = bytes.len();
+                let outcome = this.complete_wait_fd_authority(
+                    this.write_output_fd(out_fd.0, &bytes, tid),
+                    &this.captured_file_table(),
+                    [in_fd.0, out_fd.0],
+                );
+                let DispatchOutcome::Returned { value } = outcome else {
+                    if written_total == 0 {
+                        return Ok(outcome);
+                    }
+                    break;
+                };
+                let written = usize::try_from(value).unwrap_or(0).min(offered);
+                written_total = written_total.saturating_add(written);
+                offset = offset.saturating_add(written);
+                if written < offered || !drain_regular_file {
+                    break;
+                }
+            }
             if offset_address == 0 {
                 if let Some(open_file) = this.open_file(in_fd.0)
                     && let Some(mut open) = open_file.description.write()
@@ -491,7 +517,7 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
 
-            Ok(DispatchOutcome::Returned { value })
+            Ok(DispatchOutcome::returned_len_or_errno(written_total))
 
         }
 

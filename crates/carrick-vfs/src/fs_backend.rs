@@ -525,6 +525,13 @@ pub trait FsBackend: Send + Sync {
         Err(BackendError::Unsupported)
     }
 
+    /// Report the filesystem geometry of the storage authority behind this
+    /// backend. Purely in-memory backends have no host storage authority and
+    /// leave the answer to the VFS identity fallback.
+    fn statfs(&self) -> Option<carrick_abi::LinuxStatfs> {
+        None
+    }
+
     /// Look up `path`. Returns `Some(OverlayEntry::Deleted)` for a
     /// tombstoned path, `Some(File)` / `Some(Dir)` for entries the
     /// backend owns, and `None` when the backend has nothing to say

@@ -317,12 +317,12 @@ impl<'a> FsView<'a> {
         if let Err(errno) = self.layered_metadata(&path) {
             return Ok(DispatchOutcome::errno(errno));
         }
-        let identity = if let Some(m) = self.fs.vfs_mounts.resolve(&path) {
-            m.vfs.fs_identity()
+        let statfs = if let Some(m) = self.fs.vfs_mounts.resolve(&path) {
+            m.vfs.fs_identity().statfs()
         } else {
-            carrick_vfs::FsIdentity::Overlay
+            self.fs.rootfs_vfs.statfs()
         };
-        Ok(write_statfs(memory, buffer.0, &identity.statfs()))
+        Ok(write_statfs(memory, buffer.0, &statfs))
     }
 
     fn fstatfs(&self, fd: Fd, buf: GuestPtr, memory: &mut impl CurrentMmMemory) -> DispatchOutcome {
@@ -330,7 +330,12 @@ impl<'a> FsView<'a> {
             Ok(record) => record,
             Err(errno) => return DispatchOutcome::errno(errno),
         };
-        write_statfs(memory, buf.0, &record.fs_identity.statfs())
+        let statfs = if record.fs_identity == carrick_vfs::FsIdentity::Overlay {
+            self.fs.rootfs_vfs.statfs()
+        } else {
+            record.fs_identity.statfs()
+        };
+        write_statfs(memory, buf.0, &statfs)
     }
 
     /// Single-component `newfstatat`/`statx` through a TRUSTED host dirfd:

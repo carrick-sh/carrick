@@ -472,6 +472,75 @@ fn sendfile_null_offset_advances_host_backed_file_across_calls() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn sendfile_host_files_completes_a_request_larger_than_the_staging_buffer() {
+    const TRANSFER_LEN: u64 = 32 * 1024 * 1024;
+
+    let scratch = tempfile::TempDir::new().unwrap();
+    let source = std::fs::File::create(scratch.path().join("source")).unwrap();
+    source.set_len(TRANSFER_LEN).unwrap();
+    std::fs::File::create(scratch.path().join("destination")).unwrap();
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory.write_bytes(0x4000, b"/source\0").unwrap();
+    memory.write_bytes(0x4020, b"/destination\0").unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([LINUX_AT_FDCWD as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([LINUX_AT_FDCWD as u64, 0x4020, LINUX_O_WRONLY, 0, 0, 0,]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(71, SyscallArgs::from([4, 3, 0, TRANSFER_LEN, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: TRANSFER_LEN as i64
+        }
+    );
+    assert_eq!(
+        std::fs::metadata(scratch.path().join("destination"))
+            .unwrap()
+            .len(),
+        TRANSFER_LEN
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
 #[test]
 fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(

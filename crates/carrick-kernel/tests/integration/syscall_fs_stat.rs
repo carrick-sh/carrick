@@ -431,6 +431,79 @@ fn fstatfs_writes_packed_linux_statfs_for_open_fd() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn host_overlay_statfs_and_fstatfs_report_the_backing_volume() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
+    backend.create_file("/payload").unwrap();
+
+    let path = std::ffi::CString::new(scratch.path().as_os_str().as_encoded_bytes()).unwrap();
+    let mut native = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` names the live scratch directory and `native` points to
+    // writable storage for one statvfs result.
+    let rc = unsafe { libc::statvfs(path.as_ptr(), native.as_mut_ptr()) };
+    assert_eq!(rc, 0, "statvfs failed: {}", std::io::Error::last_os_error());
+    // SAFETY: a zero return from statvfs initializes the complete structure.
+    let native = unsafe { native.assume_init() };
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4000, b"/\0").unwrap();
+    memory.write_bytes(0x4020, b"/payload\0").unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(43, SyscallArgs::from([0x4000, 0x4100, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let path_statfs = read_statfs(&memory, 0x4100);
+    let path_blocks = path_statfs.f_blocks;
+    let path_fragment_size = path_statfs.f_frsize;
+    assert_eq!(path_blocks, native.f_blocks as u64);
+    assert_eq!(path_fragment_size, native.f_frsize as i64);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4020, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(44, SyscallArgs::from([3, 0x4180, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let fd_statfs = read_statfs(&memory, 0x4180);
+    let fd_blocks = fd_statfs.f_blocks;
+    let fd_fragment_size = fd_statfs.f_frsize;
+    assert_eq!(fd_blocks, native.f_blocks as u64);
+    assert_eq!(fd_fragment_size, native.f_frsize as i64);
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
 #[test]
 fn newfstatat_and_fstat_write_typed_linux_stat() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
