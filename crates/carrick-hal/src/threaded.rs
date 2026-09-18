@@ -2464,6 +2464,13 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     /// Capture the freshly materialized exec image without parking or
     /// destroying the destination executor's live vCPU.
     fn snapshot_guest_state_for_publication(&mut self) -> Result<GuestCpuState, TrapError>;
+
+    /// Consume task-owned syscall continuation state when the task becomes
+    /// terminal before the trapped syscall can publish a return. Persistent
+    /// executors must reach their idle boundary without carrying the dead
+    /// task's completion vehicle into the next logical task.
+    fn discard_terminal_syscall_continuation(&mut self) -> Result<(), TrapError>;
+
     fn bind_frame_cow(
         &mut self,
         _authority: std::sync::Arc<dyn FrameCowAuthority>,
