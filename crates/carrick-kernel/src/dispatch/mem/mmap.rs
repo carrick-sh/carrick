@@ -4063,9 +4063,7 @@ impl<'a> MemView<'a> {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        mm_mutation fn remap_file_pages(this, cx, addr: u64, size: u64, prot: u64, pgoff: u64, _flags: u64) {
-            let permit = cx.mm_mutation.host_alias_permit();
-            let _host_alias_dispatch = this.begin_host_alias_dispatch(&permit);
+        fn remap_file_pages(this, cx, addr: u64, size: u64, prot: u64, pgoff: u64, _flags: u64) {
             if addr == 0 || size == 0 || prot != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }

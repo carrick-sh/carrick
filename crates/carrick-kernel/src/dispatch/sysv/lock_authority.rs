@@ -13,9 +13,8 @@
 //! - A `SysvNamespacePermit` is consumed linearly by `permit.lock_paired()` and cannot reacquire.
 //! - Paired operations operate strictly through the captured namespace and accept no external receiver.
 //!
-//! Host-backed `nattch` accounting remains synchronous under this exact paired
-//! authority. Extracting that I/O requires a separate generation-authenticated
-//! transaction and is not claimed by this structural-order milestone.
+//! `nattch` accounting lives in the shared HVPatch namespace under this exact
+//! paired authority, so it remains generation-specific without host-file I/O.
 
 use super::{
     HostAliasShmatCommit, LinuxErrno, PendingShmat, SysvIpcNamespace, SysvProcessAttachments,
@@ -79,6 +78,9 @@ impl<'a> SysvProcessGuard<'a> {
                 continue;
             };
             if addr >= attached && end <= attached_end {
+                if segment.removed {
+                    return Err(crate::linux_abi::LINUX_EIDRM);
+                }
                 found = Some(attached);
                 break;
             }

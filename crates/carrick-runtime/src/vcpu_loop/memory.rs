@@ -704,6 +704,32 @@ mod tests {
         assert!(!syscall_takes_pre_dispatch_pt_pause(63, 0, true));
     }
 
+    #[test]
+    fn remap_file_pages_does_not_pause_stage1() {
+        assert!(
+            !syscall_edits_stage1(carrick_abi::syscall::nr::REMAP_FILE_PAGES.raw(), 0),
+            "remap_file_pages only updates attachment metadata or copies bytes"
+        );
+        assert!(!syscall_takes_pre_dispatch_pt_pause(
+            carrick_abi::syscall::nr::REMAP_FILE_PAGES.raw(),
+            0,
+            true,
+        ));
+    }
+
+    #[test]
+    fn shmdt_validates_before_pausing_stage1() {
+        assert!(
+            !syscall_edits_stage1(carrick_abi::syscall::nr::SHMDT.raw(), 0),
+            "shmdt must reject invalid or remapped attachments before acquiring mutation authority"
+        );
+        assert!(!syscall_takes_pre_dispatch_pt_pause(
+            carrick_abi::syscall::nr::SHMDT.raw(),
+            0,
+            true,
+        ));
+    }
+
     // ------------------------------------------------------------------
     // Carrier foreign-COW projection tests. These exercise the production
     // HVF carrier harness, the stage-1 composition and `KernelFrameCowAuthority`

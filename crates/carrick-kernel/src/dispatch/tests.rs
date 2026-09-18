@@ -26,7 +26,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             "mutation classifier drift for syscall {number}"
         );
     }
-    assert_eq!(MM_MUTATION_SYSCALLS.len(), 17);
+    assert_eq!(MM_MUTATION_SYSCALLS.len(), 15);
 }
     use crate::compat::CompatReporter;
     use carrick_vfs::rootfs::LayerSource;

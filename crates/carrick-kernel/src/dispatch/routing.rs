@@ -60,7 +60,7 @@ pub(crate) fn resolve_mutation_handler<M: CurrentMmMemory>(
 }
 
 pub const MM_MUTATION_SYSCALLS: &[u64] = &[
-    25, 196, 197, 214, 215, 216, 222, 226, 227, 228, 229, 230, 231, 232, 233, 234, 284,
+    25, 196, 214, 215, 216, 222, 226, 227, 228, 229, 230, 231, 232, 233, 284,
 ];
 
 pub fn syscall_requires_mm_mutation(number: u64, _args: SyscallArgs) -> bool {

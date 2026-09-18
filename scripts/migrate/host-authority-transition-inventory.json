@@ -2429,33 +2429,6 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
-      "resource": "run-scoped SysV IPC backing object used by `with_shm_nattch_file`"
-    },
-    "expansion": null,
-    "operation": "std::fs::OpenOptions::new",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/sysv.rs:2084 in `with_shm_nattch_file`, `std::fs::OpenOptions::new` accesses only the run-scoped SysV IPC backing object used by `with_shm_nattch_file`.",
-    "review_id": "HA-000108",
-    "source": {
-      "byte_end": 69268,
-      "byte_start": 69243,
-      "column": 20,
-      "column_end": 45,
-      "column_start": 20,
-      "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
-      "line": 2084,
-      "line_end": 2084,
-      "line_start": 2084
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-NEW",
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
       "resource": "configured exec-timing evidence artifact used by `stamp_record`"
     },
     "expansion": null,
@@ -2984,33 +2957,6 @@
       "line": 77,
       "line_end": 77,
       "line_start": 77
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-OPEN",
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
-      "resource": "run-scoped SysV IPC backing object used by `with_shm_nattch_file`"
-    },
-    "expansion": null,
-    "operation": "std::fs::OpenOptions::open",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/sysv.rs:2089 in `with_shm_nattch_file`, `std::fs::OpenOptions::open` accesses only the run-scoped SysV IPC backing object used by `with_shm_nattch_file`.",
-    "review_id": "HA-000131",
-    "source": {
-      "byte_end": 69372,
-      "byte_start": 69368,
-      "column": 10,
-      "column_end": 14,
-      "column_start": 10,
-      "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
-      "line": 2089,
-      "line_end": 2089,
-      "line_start": 2089
     }
   },
   {
