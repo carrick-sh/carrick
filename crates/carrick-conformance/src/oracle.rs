@@ -782,7 +782,7 @@ mod tests {
         s.verdict = VerdictKind::Regrtest;
         let key = oracle_key(&s, crate::lane::DockerPlatform::LinuxArm64);
         assert!(
-            key.contains(r#""verdict":"regrtest","parser":"regrtest-v3-doctest-wrapper""#),
+            key.contains(r#""verdict":"regrtest","parser":"regrtest-v4-deferred-status""#),
             "a regrtest oracle row is only valid for the parser that produced it: {key}"
         );
         let mut shell = base_suite();

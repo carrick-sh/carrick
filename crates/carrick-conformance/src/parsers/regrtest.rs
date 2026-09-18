@@ -22,7 +22,7 @@ pub struct RegrtestParser;
 /// regressions whose oracle ids were merely `absent` under the old parse. Bump
 /// this whenever the recognised id set or outcome mapping changes; the key
 /// change forces a deliberate `--refresh-oracle` instead of a false verdict.
-pub const PARSER_FINGERPRINT: &str = "regrtest-v3-doctest-wrapper";
+pub const PARSER_FINGERPRINT: &str = "regrtest-v4-deferred-status";
 
 const LINE: &str = r"^(?:\d+(?:\.\d+)?s )?(\S+) \(([\w.]+)\)(?: \[\d+\])? \.\.\.(?: (.*))?$";
 const HEADER_LINE: &str = r"^(?:\d+(?:\.\d+)?s )?(\S+) \(([\w.]+)\)(?: \[\d+\])?$";
@@ -182,10 +182,32 @@ impl RegrtestParser {
                 };
                 push_assertion(&mut collector, &id, &ordinal, outcome);
             }
-            if let Some(caps) = line_re.captures(trimmed) {
-                if let Some((pid, pord)) = pending_header.take() {
-                    push_assertion(&mut collector, &pid, &pord, Outcome::Other);
+            if let Some((pid, pord)) = pending_header.take() {
+                let direct = classify(trimmed);
+                if direct != Outcome::Other {
+                    push_assertion(&mut collector, &pid, &pord, direct);
+                    continue;
                 }
+                let boundary = result_re.is_match(trimmed)
+                    || line_re.is_match(trimmed)
+                    || header_re.is_match(trimmed);
+                if boundary {
+                    push_assertion(&mut collector, &pid, &pord, Outcome::Other);
+                } else if let Some(caps) = cont_re.captures(trimmed) {
+                    let rest = caps.get(1).map_or("", |m| m.as_str());
+                    let outcome = classify(rest);
+                    if outcome != Outcome::Other {
+                        push_assertion(&mut collector, &pid, &pord, outcome);
+                        continue;
+                    }
+                    pending_header = Some((pid, pord));
+                    continue;
+                } else {
+                    pending_header = Some((pid, pord));
+                    continue;
+                }
+            }
+            if let Some(caps) = line_re.captures(trimmed) {
                 let Some(id) = caps.get(2) else {
                     continue;
                 };
@@ -199,11 +221,12 @@ impl RegrtestParser {
                     continue;
                 }
                 let outcome = classify(rest);
-                push_assertion(&mut collector, id.as_str(), &ordinal, outcome);
-            } else if let Some(caps) = header_re.captures(trimmed) {
-                if let Some((pid, pord)) = pending_header.take() {
-                    push_assertion(&mut collector, &pid, &pord, Outcome::Other);
+                if outcome == Outcome::Other {
+                    pending_header = Some((id.as_str().to_string(), ordinal));
+                } else {
+                    push_assertion(&mut collector, id.as_str(), &ordinal, outcome);
                 }
+            } else if let Some(caps) = header_re.captures(trimmed) {
                 let Some(id) = caps.get(2) else {
                     continue;
                 };
@@ -211,14 +234,6 @@ impl RegrtestParser {
                     .get(3)
                     .map_or(String::new(), |value| format!("[{}]", value.as_str()));
                 pending_header = Some((id.as_str().to_string(), ordinal));
-            } else if let Some((pid, pord)) = pending_header.take() {
-                if let Some(caps) = cont_re.captures(trimmed) {
-                    let rest = caps.get(1).map_or("", |m| m.as_str());
-                    let outcome = classify(rest);
-                    push_assertion(&mut collector, &pid, &pord, outcome);
-                } else {
-                    push_assertion(&mut collector, &pid, &pord, Outcome::Other);
-                }
             }
         }
         if let Some((pid, pord)) = pending_header.take() {
@@ -304,10 +319,32 @@ impl VerdictParser for RegrtestParser {
                 };
                 ids.entry(id).or_insert(outcome);
             }
-            if let Some(caps) = line_re.captures(trimmed) {
-                if let Some(pid) = pending_header.take() {
-                    ids.entry(pid).or_insert(Outcome::Other);
+            if let Some(pid) = pending_header.take() {
+                let direct = classify(trimmed);
+                if direct != Outcome::Other {
+                    ids.entry(pid).or_insert(direct);
+                    continue;
                 }
+                let boundary = result_re.is_match(trimmed)
+                    || line_re.is_match(trimmed)
+                    || header_re.is_match(trimmed);
+                if boundary {
+                    ids.entry(pid).or_insert(Outcome::Other);
+                } else if let Some(caps) = cont_re.captures(trimmed) {
+                    let rest = caps.get(1).map_or("", |m| m.as_str());
+                    let outcome = classify(rest);
+                    if outcome != Outcome::Other {
+                        ids.entry(pid).or_insert(outcome);
+                        continue;
+                    }
+                    pending_header = Some(pid);
+                    continue;
+                } else {
+                    pending_header = Some(pid);
+                    continue;
+                }
+            }
+            if let Some(caps) = line_re.captures(trimmed) {
                 let Some(id) = caps.get(2) else {
                     continue;
                 };
@@ -317,23 +354,17 @@ impl VerdictParser for RegrtestParser {
                     continue;
                 }
                 // first-occurrence wins (cpython-parity's setdefault)
-                ids.entry(id.as_str().to_string())
-                    .or_insert_with(|| classify(rest));
-            } else if let Some(caps) = header_re.captures(trimmed) {
-                if let Some(pid) = pending_header.take() {
-                    ids.entry(pid).or_insert(Outcome::Other);
+                let outcome = classify(rest);
+                if outcome == Outcome::Other {
+                    pending_header = Some(id.as_str().to_string());
+                } else {
+                    ids.entry(id.as_str().to_string()).or_insert(outcome);
                 }
+            } else if let Some(caps) = header_re.captures(trimmed) {
                 let Some(id) = caps.get(2) else {
                     continue;
                 };
                 pending_header = Some(id.as_str().to_string());
-            } else if let Some(pid) = pending_header.take() {
-                if let Some(caps) = cont_re.captures(trimmed) {
-                    let rest = caps.get(1).map_or("", |m| m.as_str());
-                    ids.entry(pid).or_insert_with(|| classify(rest));
-                } else {
-                    ids.entry(pid).or_insert(Outcome::Other);
-                }
             }
         }
         if let Some(pid) = pending_header.take() {
@@ -886,6 +917,48 @@ Result: SUCCESS";
         assert_eq!(r.totals.passed, 2);
         assert_eq!(r.totals.failed, 0);
         assert_eq!(r.totals.n, 2);
+    }
+
+    #[test]
+    fn noisy_inline_output_defers_to_standalone_status() {
+        let out = "\
+test_session_handling (test.test_ssl.ThreadedTests.test_session_handling) ...  connection timeout TimeoutError('timed out')
+ok
+test_sni_callback_raising (test.test_ssl.ThreadedTests.test_sni_callback_raising) ...  connection timeout TimeoutError('timed out')
+server cleanup detail
+ok
+
+Result: SUCCESS";
+
+        let regression = RegrtestParser.parse(&raw(out));
+        assert_eq!(
+            regression
+                .ids
+                .get("test.test_ssl.ThreadedTests.test_session_handling"),
+            Some(&Outcome::Ok)
+        );
+        assert_eq!(
+            regression
+                .ids
+                .get("test.test_ssl.ThreadedTests.test_sni_callback_raising"),
+            Some(&Outcome::Ok)
+        );
+        assert_eq!(regression.totals.passed, 2);
+
+        let closure = RegrtestParser.parse_closure(&raw(out));
+        assert_eq!(
+            closure
+                .ids
+                .get("py:test.test_ssl.ThreadedTests.test_session_handling#1"),
+            Some(&Outcome::Ok)
+        );
+        assert_eq!(
+            closure
+                .ids
+                .get("py:test.test_ssl.ThreadedTests.test_sni_callback_raising#1"),
+            Some(&Outcome::Ok)
+        );
+        assert_eq!(closure.totals.passed, 2);
     }
 
     #[test]
