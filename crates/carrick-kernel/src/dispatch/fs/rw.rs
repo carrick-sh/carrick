@@ -275,6 +275,32 @@ impl<'a> FsView<'a> {
             // HostFile: the kernel owns the offset — delegate straight to
             // libc::lseek on the real fd.
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
+                if (whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE) && offset >= 0 {
+                    if let Some(next) = this.fs.seek_host_sparse_extents(
+                        host_fd.raw(),
+                        offset as u64,
+                        whence == LINUX_SEEK_DATA,
+                    ) {
+                        return Ok(match next {
+                            Some(next) => {
+                                let positioned = unsafe {
+                                    libc::lseek(
+                                        host_fd.raw(),
+                                        next as libc::off_t,
+                                        libc::SEEK_SET,
+                                    )
+                                };
+                                match positioned.host_syscall_errno() {
+                                    Ok(positioned) => {
+                                        DispatchOutcome::returned_offset_or_errno(positioned)
+                                    }
+                                    Err(errno) => DispatchOutcome::errno(errno),
+                                }
+                            }
+                            None => DispatchOutcome::errno(LINUX_ENXIO),
+                        });
+                    }
+                }
                 let host_whence = match whence {
                     LINUX_SEEK_SET => libc::SEEK_SET,
                     LINUX_SEEK_CUR => libc::SEEK_CUR,
@@ -1831,6 +1857,18 @@ impl<'a> FsView<'a> {
                         punch_unwritten_host_blocks(raw_fd, old_len, offset as u64)?;
                     }
                     this.invalidate_dentry_host_fd(raw_fd);
+                    let write_offset = if is_append {
+                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                        if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
+                            (st.st_size as u64).saturating_sub(n as u64)
+                        } else {
+                            offset as u64
+                        }
+                    } else {
+                        offset as u64
+                    };
+                    this.fs
+                        .record_host_sparse_write(raw_fd, write_offset, n as usize);
                 }
                 return Ok(DispatchOutcome::returned_isize_or_errno(n));
             }
@@ -2644,12 +2682,9 @@ impl<'a> FsView<'a> {
                             if is_append {
                                 unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
                             }
-                            let cur_pos = if !is_append {
-                                let pos = unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) };
-                                (pos >= 0).then_some(pos as u64)
-                            } else {
-                                None
-                            };
+                            let pos = unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) };
+                            let write_offset = (pos >= 0).then_some(pos as u64);
+                            let cur_pos = (!is_append).then_some(write_offset).flatten();
                             let old_len = if let Some(pos) = cur_pos {
                                 let mut st: libc::stat = unsafe { core::mem::zeroed() };
                                 if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0 && pos > st.st_size as u64 {
@@ -2704,6 +2739,13 @@ impl<'a> FsView<'a> {
                                     punch_unwritten_host_blocks(raw_fd, old_len, pos)?;
                                 }
                                 this.invalidate_dentry_host_fd(raw_fd);
+                                if let Some(write_offset) = write_offset {
+                                    this.fs.record_host_sparse_write(
+                                        raw_fd,
+                                        write_offset,
+                                        value as usize,
+                                    );
+                                }
                             }
                             return Ok(out);
                         }

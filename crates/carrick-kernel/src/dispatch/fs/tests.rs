@@ -8218,6 +8218,153 @@ fn test_seekholemap_truncate_write_cycle() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn host_sparse_extents_preserve_linux_holes_inside_apfs_allocations() {
+    let scratch = tempfile::tempdir().unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    memory.write_bytes(0x4000, b"/lseek11.bin\0").unwrap();
+    memory.write_bytes(0x5000, b"data").unwrap();
+    let fd = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [
+            LINUX_AT_FDCWD,
+            0x4000,
+            LINUX_O_CREAT | LINUX_O_RDWR | LINUX_O_TRUNC,
+            0o644,
+            0,
+            0,
+        ],
+    );
+    assert!(fd >= 0, "openat failed: {fd}");
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            46,
+            [fd as u64, 30 * 4096, 0, 0, 0, 0],
+        ),
+        0
+    );
+    for offset in [0, 10 * 4096, 20 * 4096, 30 * 4096 - 128] {
+        assert_eq!(
+            lane_syscall(
+                &mut dispatcher,
+                &mut memory,
+                62,
+                [fd as u64, offset, LINUX_SEEK_SET as u64, 0, 0, 0],
+            ),
+            offset as i64
+        );
+        assert_eq!(
+            lane_syscall(
+                &mut dispatcher,
+                &mut memory,
+                64,
+                [fd as u64, 0x5000, 4, 0, 0, 0],
+            ),
+            4,
+        );
+    }
+
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            62,
+            [fd as u64, 0, LINUX_SEEK_HOLE as u64, 0, 0, 0],
+        ),
+        4096
+    );
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            63,
+            [fd as u64, 0x6000, 1023, 0, 0, 0],
+        ),
+        1023
+    );
+    assert_eq!(memory.read_bytes(0x6000, 1023).unwrap(), vec![0; 1023]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sendfile_rejects_invalid_and_read_only_destinations_before_copying() {
+    let scratch = tempfile::tempdir().unwrap();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+    memory.write_bytes(0x4000, b"/source\0").unwrap();
+    memory.write_bytes(0x4100, b"/destination\0").unwrap();
+    memory.write_bytes(0x5000, b"x").unwrap();
+
+    let source = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [
+            LINUX_AT_FDCWD,
+            0x4000,
+            LINUX_O_CREAT | LINUX_O_RDWR | LINUX_O_TRUNC,
+            0o644,
+            0,
+            0,
+        ],
+    );
+    assert!(source >= 0);
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            68,
+            [source as u64, 0x5000, 1, 0, 0, 0],
+        ),
+        1
+    );
+    let destination = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [
+            LINUX_AT_FDCWD,
+            0x4100,
+            LINUX_O_CREAT | LINUX_O_RDONLY,
+            0o644,
+            0,
+            0,
+        ],
+    );
+    assert!(destination >= 0);
+
+    let ebadf = -i64::from(LINUX_EBADF.get());
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            71,
+            [destination as u64, source as u64, 0, 1, 0, 0],
+        ),
+        ebadf
+    );
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            71,
+            [u64::MAX, source as u64, 0, 1, 0, 0],
+        ),
+        ebadf
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn test_creat_through_guest_created_symlink_to_dir() {
     let scratch = tempfile::tempdir().unwrap();
     let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
