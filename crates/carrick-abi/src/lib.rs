@@ -3463,6 +3463,13 @@ pub fn errno_name(e: LinuxErrno) -> Option<&'static str> {
 pub const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
 pub const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 pub const LINUX_AT_SYMLINK_FOLLOW: u64 = 0x400;
+/// Request an identity-only file handle that need not be decodable by
+/// `open_by_handle_at(2)`.
+pub const LINUX_AT_HANDLE_FID: u64 = 0x200;
+/// Return the mount's 64-bit unique id rather than its legacy 32-bit id.
+pub const LINUX_AT_HANDLE_MNT_ID_UNIQUE: u64 = 0x001;
+/// Request a handle that can later reconnect a non-directory to its parent.
+pub const LINUX_AT_HANDLE_CONNECTABLE: u64 = 0x002;
 pub const LINUX_AT_EACCESS: u64 = 0x200;
 pub const LINUX_AT_EMPTY_PATH: u64 = 0x1000;
 pub const LINUX_AT_REMOVEDIR: u64 = 0x200;

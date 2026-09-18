@@ -577,7 +577,7 @@ define_aarch64_syscall_table! {
     (PRLIMIT64, 261, "prlimit64", "process", SupportLevel::BringUp);
     (FANOTIFY_INIT, 262, "fanotify_init", "fs", SupportLevel::BringUp);
     (FANOTIFY_MARK, 263, "fanotify_mark", "fs", SupportLevel::BringUp);
-    (NAME_TO_HANDLE_AT, 264, "name_to_handle_at", "fs", SupportLevel::Deferred);
+    (NAME_TO_HANDLE_AT, 264, "name_to_handle_at", "fs", SupportLevel::BringUp);
     (OPEN_BY_HANDLE_AT, 265, "open_by_handle_at", "fs", SupportLevel::Deferred);
     (CLOCK_ADJTIME, 266, "clock_adjtime", "time", SupportLevel::BringUp);
     (SYNCFS, 267, "syncfs", "fs", SupportLevel::BringUp);
