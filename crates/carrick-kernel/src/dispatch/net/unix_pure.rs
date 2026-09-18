@@ -401,6 +401,15 @@ impl PureSocketInner {
         self.state.lock().peer_sockaddr
     }
 
+    pub(crate) fn getpeername_addr(&self) -> Option<SocketAddr> {
+        let state = self.state.lock();
+        if state.tcp_pair && state.tcp_peer_terminal == TcpPeerTerminal::Reset {
+            None
+        } else {
+            state.peer_sockaddr
+        }
+    }
+
     pub(crate) fn disconnect_tcp_reset(&self) -> Result<(), LinuxErrno> {
         if self.socket_type != LINUX_SOCK_STREAM
             || !matches!(self.protocol, LINUX_IPPROTO_TCP | LINUX_IPPROTO_SCTP)
@@ -1864,8 +1873,12 @@ mod tests {
     #[test]
     fn tcp_final_close_preserves_data_fin_and_write_error_transition() {
         let (client, server) = tcp_pair();
+        let peer = "127.0.0.1:1234".parse().unwrap();
+        client.state.lock().peer_sockaddr = Some(peer);
         assert_eq!(server.send_stream(b"data", Vec::new()), Ok(4));
         drop(server);
+
+        assert_eq!(client.getpeername_addr(), Some(peer));
 
         let mut buf = [0; 8];
         assert_eq!(
@@ -1905,9 +1918,16 @@ mod tests {
     #[test]
     fn tcp_abortive_final_close_preserves_delivered_data_then_reports_reset() {
         let (client, server) = tcp_pair();
+        client.state.lock().peer_sockaddr = Some("127.0.0.1:1234".parse().unwrap());
         assert_eq!(server.send_stream(b"discard", Vec::new()), Ok(7));
         server.set_so_linger((1, 0));
         drop(server);
+
+        assert_eq!(
+            client.getpeername_addr(),
+            None,
+            "Linux getpeername reports ENOTCONN after an abortive reset even while data remains"
+        );
 
         let mut buf = [0; 8];
         assert_eq!(client.recv_stream(&mut buf, 0).unwrap().0, 7);

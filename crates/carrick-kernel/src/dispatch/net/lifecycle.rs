@@ -3833,7 +3833,7 @@ impl<'a> NetView<'a> {
                         {
                             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         }
-                        let peer = socket.peer_addr();
+                        let peer = socket.getpeername_addr();
                         let Some(peer) = peer else {
                             return Ok(DispatchOutcome::errno(LINUX_ENOTCONN));
                         };
