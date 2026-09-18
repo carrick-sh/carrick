@@ -59,6 +59,34 @@ fn copy_deque_prefix(bytes: &VecDeque<u8>, dest: &mut [u8], len: usize) {
     }
 }
 
+enum SendStreamPayload<'a> {
+    Slice(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl<'a> SendStreamPayload<'a> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Slice(s) => s.len(),
+            Self::Owned(v) => v.len(),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Slice(s) => s,
+            Self::Owned(v) => v.as_slice(),
+        }
+    }
+
+    fn into_owned(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Slice(_) => None,
+            Self::Owned(v) => Some(v),
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinuxUcred {
@@ -795,44 +823,44 @@ impl PureSocketInner {
         }
     }
 
-    pub(crate) fn send_stream(
+    fn send_stream_inner<'a>(
         &self,
-        data: &[u8],
+        payload: SendStreamPayload<'a>,
         rights: Vec<Arc<OpenFile>>,
-    ) -> Result<usize, LinuxErrno> {
+    ) -> Result<(usize, Option<Vec<u8>>), (LinuxErrno, Option<Vec<u8>>)> {
         let mut state = self.state.lock();
-        // A pending socket error is reported once, by whichever of `send`,
-        // `recv` or `SO_ERROR` asks first; after that a send on the dead
-        // connection is EPIPE.
         if let Some(err) = state.so_error.take() {
-            return Err(LinuxErrno::new(err));
+            return Err((LinuxErrno::new(err), payload.into_owned()));
         }
         if state.shutdown_write {
-            return Err(LINUX_EPIPE);
+            return Err((LINUX_EPIPE, payload.into_owned()));
         }
         if state.tcp_pair && state.tcp_send_terminal {
-            return Err(LINUX_EPIPE);
+            return Err((LINUX_EPIPE, payload.into_owned()));
         }
+
+        let data_len = payload.len();
+        let data_slice = payload.as_slice();
 
         // Mock Service Interception Path
         if let Some(mock) = state.mock_service.clone() {
             if state.mock_peer_closed {
-                return Err(LINUX_EPIPE);
+                return Err((LINUX_EPIPE, payload.into_owned()));
             }
             let send_cap = self.effective_send_capacity(&state, None);
             let available = send_cap.saturating_sub(state.request_buf.len());
-            if available == 0 && !data.is_empty() {
-                return Err(LINUX_EAGAIN);
+            if available == 0 && data_len > 0 {
+                return Err((LINUX_EAGAIN, payload.into_owned()));
             }
-            let to_write = data.len().min(available);
-            state.request_buf.extend_from_slice(&data[..to_write]);
+            let to_write = data_len.min(available);
+            state.request_buf.extend_from_slice(&data_slice[..to_write]);
 
             if let Some(rec_ref) = &state.connection_record {
                 let mut rec = rec_ref.lock();
                 rec.bytes_sent += to_write;
                 if rec.capture_payload {
-                    if let Some(payload) = &mut rec.sent_payload {
-                        payload.extend_from_slice(&data[..to_write]);
+                    if let Some(p) = &mut rec.sent_payload {
+                        p.extend_from_slice(&data_slice[..to_write]);
                     }
                 }
             }
@@ -847,8 +875,8 @@ impl PureSocketInner {
                     let mut rec = rec_ref.lock();
                     rec.bytes_received += response_bytes.len();
                     if rec.capture_payload {
-                        if let Some(payload) = &mut rec.received_payload {
-                            payload.extend_from_slice(&response_bytes);
+                        if let Some(p) = &mut rec.received_payload {
+                            p.extend_from_slice(&response_bytes);
                         }
                     }
                 }
@@ -860,35 +888,45 @@ impl PureSocketInner {
 
             drop(state);
             self.notify_waiters();
-            return Ok(to_write);
+            let unaccepted = match payload {
+                SendStreamPayload::Owned(mut vec) if to_write < data_len => {
+                    Some(vec.split_off(to_write))
+                }
+                _ => None,
+            };
+            return Ok((to_write, unaccepted));
         }
 
         // Interconnected Peer Path
         let peer_arc = {
             let Some(peer_weak) = &state.peer else {
-                return Err(LINUX_ENOTCONN);
+                return Err((LINUX_ENOTCONN, payload.into_owned()));
             };
             let Some(peer) = peer_weak.upgrade() else {
                 if state.tcp_pair
                     && state.tcp_peer_terminal == TcpPeerTerminal::Fin
-                    && data.is_empty()
+                    && data_len == 0
                 {
-                    return Ok(0);
+                    return Ok((0, None));
                 }
-                if state.tcp_pair
-                    && state.tcp_peer_terminal == TcpPeerTerminal::Fin
-                    && !data.is_empty()
+                if state.tcp_pair && state.tcp_peer_terminal == TcpPeerTerminal::Fin && data_len > 0
                 {
                     let send_cap = self.effective_send_capacity(&state, None);
-                    let admitted = data.len().min(send_cap);
+                    let admitted = data_len.min(send_cap);
                     if admitted == 0 {
-                        return Err(LINUX_EAGAIN);
+                        return Err((LINUX_EAGAIN, payload.into_owned()));
                     }
                     state.tcp_send_terminal = true;
                     state.so_error = Some(LINUX_EPIPE.get());
-                    return Ok(admitted);
+                    let unaccepted = match payload {
+                        SendStreamPayload::Owned(mut vec) if admitted < data_len => {
+                            Some(vec.split_off(admitted))
+                        }
+                        _ => None,
+                    };
+                    return Ok((admitted, unaccepted));
                 }
-                return Err(LINUX_EPIPE);
+                return Err((LINUX_EPIPE, payload.into_owned()));
             };
             peer
         };
@@ -896,20 +934,20 @@ impl PureSocketInner {
 
         let (mut state, mut peer_state) = self.lock_with_peer(&peer_arc);
         if let Some(err) = state.so_error.take() {
-            return Err(LinuxErrno::new(err));
+            return Err((LinuxErrno::new(err), payload.into_owned()));
         }
         if state.shutdown_write || state.tcp_send_terminal {
-            return Err(LINUX_EPIPE);
+            return Err((LINUX_EPIPE, payload.into_owned()));
         }
         let send_cap = self.effective_send_capacity(&state, Some(&peer_state));
         if peer_state.shutdown_read {
-            if state.tcp_pair && data.is_empty() {
-                return Ok(0);
+            if state.tcp_pair && data_len == 0 {
+                return Ok((0, None));
             }
-            if state.tcp_pair && !data.is_empty() {
-                let admitted = data.len().min(send_cap);
+            if state.tcp_pair && data_len > 0 {
+                let admitted = data_len.min(send_cap);
                 if admitted == 0 {
-                    return Err(LINUX_EAGAIN);
+                    return Err((LINUX_EAGAIN, payload.into_owned()));
                 }
                 state.tcp_send_terminal = true;
                 state.so_error = Some(LINUX_EPIPE.get());
@@ -923,26 +961,113 @@ impl PureSocketInner {
                 drop(state);
                 peer_arc.notify_waiters();
                 self.notify_waiters();
-                return Ok(admitted);
+                let unaccepted = match payload {
+                    SendStreamPayload::Owned(mut vec) if admitted < data_len => {
+                        Some(vec.split_off(admitted))
+                    }
+                    _ => None,
+                };
+                return Ok((admitted, unaccepted));
             }
-            return Err(LINUX_EPIPE);
+            return Err((LINUX_EPIPE, payload.into_owned()));
         }
 
         let available = send_cap.saturating_sub(peer_state.stream_buf.len());
-        if available == 0 && !data.is_empty() {
-            return Err(LINUX_EAGAIN);
+        if available == 0 && data_len > 0 {
+            return Err((LINUX_EAGAIN, payload.into_owned()));
         }
 
-        let to_write = data.len().min(available);
-        peer_state.stream_buf.extend(&data[..to_write]);
+        let to_write = data_len.min(available);
+        let unaccepted = match payload {
+            SendStreamPayload::Owned(mut vec) => {
+                let tail = if to_write < data_len {
+                    Some(vec.split_off(to_write))
+                } else {
+                    None
+                };
+                if peer_state.stream_buf.is_empty() && self.protocol != LINUX_IPPROTO_SCTP {
+                    peer_state.stream_buf = VecDeque::from(vec);
+                } else {
+                    peer_state.stream_buf.extend(&vec);
+                    if self.protocol == LINUX_IPPROTO_SCTP && to_write > 0 {
+                        peer_state.sctp_messages.push_back(to_write);
+                    }
+                }
+                tail
+            }
+            SendStreamPayload::Slice(slice) => {
+                peer_state.stream_buf.extend(&slice[..to_write]);
+                if self.protocol == LINUX_IPPROTO_SCTP && to_write > 0 {
+                    peer_state.sctp_messages.push_back(to_write);
+                }
+                None
+            }
+        };
+
         if !rights.is_empty() {
             peer_state.stream_rights.extend(rights);
         }
-        if self.protocol == LINUX_IPPROTO_SCTP && to_write > 0 {
-            peer_state.sctp_messages.push_back(to_write);
-        }
+
+        drop(peer_state);
+        drop(state);
         peer_arc.notify_waiters();
-        Ok(to_write)
+        Ok((to_write, unaccepted))
+    }
+
+    pub(crate) fn send_stream(
+        &self,
+        data: &[u8],
+        rights: Vec<Arc<OpenFile>>,
+    ) -> Result<usize, LinuxErrno> {
+        self.send_stream_inner(SendStreamPayload::Slice(data), rights)
+            .map(|(n, _)| n)
+            .map_err(|(err, _)| err)
+    }
+
+    pub(crate) fn send_stream_splice_owned(
+        &self,
+        data: Vec<u8>,
+    ) -> Result<(usize, Option<Vec<u8>>), (LinuxErrno, Vec<u8>)> {
+        self.send_stream_inner(SendStreamPayload::Owned(data), Vec::new())
+            .map_err(|(err, opt)| (err, opt.unwrap_or_default()))
+    }
+
+    pub(crate) fn recv_stream_splice(&self, max_len: usize) -> Result<Vec<u8>, LinuxErrno> {
+        if max_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Fast path: attempt zero-copy buffer handoff when safe
+        {
+            let mut state = self.state.lock();
+            let can_move = state.mock_service.is_none()
+                && !state.so_oobinline
+                && state.oob_mark.is_none()
+                && state.oob_data.is_none()
+                && self.protocol != LINUX_IPPROTO_SCTP
+                && state.sctp_messages.is_empty()
+                && state.stream_rights.is_empty()
+                && !state.stream_buf.is_empty()
+                && max_len >= state.stream_buf.len()
+                && !state.shutdown_read
+                && state.so_error.is_none();
+
+            if can_move {
+                let deque = std::mem::take(&mut state.stream_buf);
+                if let Some(peer) = state.peer.as_ref().and_then(|p| p.upgrade()) {
+                    peer.notify_waiters();
+                }
+                drop(state);
+                return Ok(Vec::from(deque));
+            }
+        }
+
+        // Single semantic authority: fall back to ordinary recv_stream
+        let want = max_len.min(1 << 20);
+        let mut buf = vec![0u8; want];
+        let (n, _) = self.recv_stream(&mut buf, 0)?;
+        buf.truncate(n);
+        Ok(buf)
     }
 
     pub(crate) fn recv_stream(
@@ -2355,5 +2480,140 @@ mod tests {
         assert_eq!(sent, DEFAULT_STREAM_BUFFER_CAPACITY);
         assert_eq!(s1.poll_mask() & LINUX_EPOLLOUT, 0);
         assert_eq!(s1.send_stream(b"overflow", Vec::new()), Err(LINUX_EAGAIN));
+    }
+
+    #[test]
+    fn stream_splice_owned_preserves_allocation_and_byte_order() {
+        let (s1, s2) = tcp_pair();
+        let payload_len = 1024 * 1024;
+        let data: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
+        let orig_ptr = data.as_ptr();
+
+        let (sent, unaccepted) = s1.send_stream_splice_owned(data).unwrap();
+        assert_eq!(sent, payload_len);
+        assert!(unaccepted.is_none());
+
+        let received = s2.recv_stream_splice(payload_len).unwrap();
+        assert_eq!(received.len(), payload_len);
+        assert_eq!(
+            received.as_ptr(),
+            orig_ptr,
+            "buffer allocation should be preserved across send/recv splice"
+        );
+        for (i, &b) in received.iter().enumerate() {
+            assert_eq!(b, (i % 251) as u8);
+        }
+    }
+
+    #[test]
+    fn stream_splice_owned_explicit_capacity_and_partial_restoration() {
+        let (s1, s2) = tcp_pair();
+        s2.set_so_rcvbuf(4096);
+
+        let payload_len = 8192;
+        let data: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
+
+        let (sent, unaccepted) = s1.send_stream_splice_owned(data).unwrap();
+        assert_eq!(sent, 4096);
+        let tail = unaccepted.expect("unaccepted tail must be returned");
+        assert_eq!(tail.len(), 4096);
+        for (i, &b) in tail.iter().enumerate() {
+            assert_eq!(b, ((i + 4096) % 251) as u8);
+        }
+
+        // Next send returns EAGAIN because receiver buffer is full
+        let more_data = vec![0x99u8; 1024];
+        let err = s1.send_stream_splice_owned(more_data).unwrap_err();
+        assert_eq!(err.0, LINUX_EAGAIN);
+        assert_eq!(err.1.len(), 1024);
+
+        // Drain receiver
+        let drained = s2.recv_stream_splice(4096).unwrap();
+        assert_eq!(drained.len(), 4096);
+        for (i, &b) in drained.iter().enumerate() {
+            assert_eq!(b, (i % 251) as u8);
+        }
+
+        // Now send the unaccepted tail
+        let (sent_tail, unaccepted_tail) = s1.send_stream_splice_owned(tail).unwrap();
+        assert_eq!(sent_tail, 4096);
+        assert!(unaccepted_tail.is_none());
+
+        let drained_tail = s2.recv_stream_splice(4096).unwrap();
+        assert_eq!(drained_tail.len(), 4096);
+        for (i, &b) in drained_tail.iter().enumerate() {
+            assert_eq!(b, ((i + 4096) % 251) as u8);
+        }
+    }
+
+    #[test]
+    fn stream_splice_recv_semantic_fallback_oob() {
+        let (sender, receiver) = tcp_pair();
+        sender.send_stream(b"hello", Vec::new()).unwrap();
+        sender.send_oob(b"!").unwrap();
+        sender.send_stream(b"world", Vec::new()).unwrap();
+
+        // recv_stream_splice must fall back and deliver data without skipping OOB mark
+        let received = receiver.recv_stream_splice(16).unwrap();
+        assert_eq!(&received, b"hello");
+        assert_eq!(receiver.poll_mask() & LINUX_EPOLLPRI, LINUX_EPOLLPRI);
+
+        // Reading the urgent byte preserves the stream cursor, then the splice
+        // fallback resumes after the mark without losing ordinary data.
+        let mut oob = [0u8; 1];
+        let n = receiver.recv_oob(&mut oob, false).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(&oob, b"!");
+
+        let rest = receiver.recv_stream_splice(16).unwrap();
+        assert_eq!(&rest, b"world");
+    }
+
+    #[test]
+    fn stream_splice_semantic_fallback_sctp() {
+        let (sender, receiver) = sctp_pair();
+        let (sent1, tail1) = sender.send_stream_splice_owned(b"msg1".to_vec()).unwrap();
+        assert_eq!(sent1, 4);
+        assert!(tail1.is_none());
+
+        let (sent2, tail2) = sender
+            .send_stream_splice_owned(b"message2".to_vec())
+            .unwrap();
+        assert_eq!(sent2, 8);
+        assert!(tail2.is_none());
+
+        // recv_stream_splice should respect SCTP message boundaries through fallback
+        let rec1 = receiver.recv_stream_splice(16).unwrap();
+        assert_eq!(&rec1, b"msg1");
+
+        let rec2 = receiver.recv_stream_splice(16).unwrap();
+        assert_eq!(&rec2, b"message2");
+    }
+
+    #[test]
+    fn stream_splice_negative_control_af_unix_and_sctp_semantics_unchanged() {
+        // AF_UNIX sockets do not autotune beyond DEFAULT_STREAM_BUFFER_CAPACITY
+        let (u1, u2) = PureSocketInner::pair(
+            LINUX_SOCK_STREAM,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+        let big = vec![0xaa; DEFAULT_STREAM_BUFFER_CAPACITY + 512];
+        let (sent, tail) = u1.send_stream_splice_owned(big).unwrap();
+        assert_eq!(sent, DEFAULT_STREAM_BUFFER_CAPACITY);
+        let tail = tail.expect("tail beyond capacity must not be admitted");
+        assert_eq!(tail.len(), 512);
+
+        let rec = u2
+            .recv_stream_splice(DEFAULT_STREAM_BUFFER_CAPACITY)
+            .unwrap();
+        assert_eq!(rec.len(), DEFAULT_STREAM_BUFFER_CAPACITY);
+        assert_eq!(rec[0], 0xaa);
+
+        // Sockets with shutdown_write still fail with EPIPE
+        u1.state.lock().shutdown_write = true;
+        let err = u1.send_stream_splice_owned(b"fail".to_vec()).unwrap_err();
+        assert_eq!(err.0, LINUX_EPIPE);
+        assert_eq!(err.1, b"fail".to_vec());
     }
 }

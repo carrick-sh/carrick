@@ -4033,6 +4033,22 @@ fn splice_pushback_moves_owned_full_chunks_without_copy() {
 }
 
 #[test]
+fn splice_pushback_push_front_owned_preserves_allocation() {
+    let mut pushback = fs::SplicePushback::default();
+    let bytes = vec![0x77; 1024 * 1024];
+    let ptr = bytes.as_ptr();
+
+    pushback.push_front_owned(bytes);
+    assert_eq!(pushback.len(), 1024 * 1024);
+    assert_eq!(pushback.chunk_count_for_tests(), 1);
+
+    let drained = pushback.take_vec(1024 * 1024);
+    assert_eq!(drained.as_ptr(), ptr);
+    assert_eq!(drained.len(), 1024 * 1024);
+    assert!(pushback.is_empty());
+}
+
+#[test]
 fn vfs_open_fallthrough_does_not_build_open_context() {
     fd_helpers::reset_open_fd_numbers_calls();
 

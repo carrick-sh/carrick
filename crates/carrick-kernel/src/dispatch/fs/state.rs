@@ -59,6 +59,10 @@ impl SplicePushback {
         self.push_owned(bytes.to_vec(), PushbackEnd::Front);
     }
 
+    pub(in crate::dispatch) fn push_front_owned(&mut self, bytes: Vec<u8>) {
+        self.push_owned(bytes, PushbackEnd::Front);
+    }
+
     pub(in crate::dispatch) fn take_vec(&mut self, count: usize) -> Vec<u8> {
         let Some(chunk) = self.chunks.front() else {
             return Vec::new();
