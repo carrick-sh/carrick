@@ -2591,6 +2591,58 @@ impl SyscallDispatcher {
     /// Takes the process binding captured in `synthetic_proc_context` so every
     /// process-owned render field comes from one short mutex snapshot. The
     /// caller releases that mutex before entering MM snapshot authority.
+    fn synthetic_proc_process(
+        context: &crate::kernel::KernelContext,
+        registry: &crate::kernel::Registry,
+        process: crate::kernel::core::LiveProcess,
+        init: crate::kernel::TaskKey,
+    ) -> Option<carrick_vfs::SyntheticProcProcess> {
+        let to_ns = |raw: i32| {
+            u32::try_from(raw)
+                .ok()
+                .and_then(|raw| crate::namespace::pid::kernel_to_ns_for(context, raw))
+        };
+        let pid = to_ns(process.key.id.raw())?;
+        let task_ref = registry.task(process.key.id);
+        let (user_cpu_us, system_cpu_us, is_stopped) =
+            task_ref.as_ref().map_or((0, 0, false), |task| {
+                (
+                    task.self_cpu_us(),
+                    task.self_system_cpu_us(),
+                    task.is_job_control_stopped(),
+                )
+            });
+        Some(carrick_vfs::SyntheticProcProcess {
+            pid,
+            // A parentless task is an orphan reparented to init — except
+            // for init ITSELF, which Linux reports with ppid 0.
+            ppid: process
+                .parent
+                .and_then(|parent| to_ns(parent.id.raw()))
+                .unwrap_or(if process.key == init { 0 } else { 1 }),
+            pgrp: crate::namespace::pid::process_group_to_ns_for(context, process.process_group)?,
+            session: crate::namespace::pid::session_to_ns_for(context, process.session)?,
+            state: if is_stopped {
+                'T'
+            } else {
+                u32::try_from(process.key.id.raw())
+                    .ok()
+                    .and_then(crate::run_state::published_stat_char)
+                    .unwrap_or('R')
+            },
+            tids: process
+                .tids
+                .iter()
+                .filter_map(|tid| to_ns(tid.raw()))
+                .collect(),
+            // HONEST GAP: this is the registry's fork-time label, not the
+            // Linux `comm`; see the full-census caller below.
+            comm: process.diagnostic_name,
+            user_cpu_us,
+            system_cpu_us,
+        })
+    }
+
     fn synthetic_proc_processes(
         context: &crate::kernel::KernelContext,
         hvpatch_process: Option<&dyn crate::kernel::CarrierProcess>,
@@ -2598,75 +2650,10 @@ impl SyscallDispatcher {
         let registry = hvpatch_process?.kernel_graph().registry();
         let container = context.container().id();
         let init = context.kernel().container_init(container)?;
-        let to_ns = |raw: i32| {
-            u32::try_from(raw)
-                .ok()
-                .and_then(|raw| crate::namespace::pid::kernel_to_ns_for(context, raw))
-        };
         let mut processes: Vec<_> = registry
             .live_processes_for_container(container)
             .into_iter()
-            .filter_map(|process| {
-                let pid = to_ns(process.key.id.raw())?;
-                let task_ref = registry.task(process.key.id);
-                let (user_cpu_us, system_cpu_us, is_stopped) =
-                    task_ref.as_ref().map_or((0, 0, false), |task| {
-                        (
-                            task.self_cpu_us(),
-                            task.self_system_cpu_us(),
-                            task.is_job_control_stopped(),
-                        )
-                    });
-                Some(carrick_vfs::SyntheticProcProcess {
-                    pid,
-                    // A parentless task is an orphan reparented to init — except
-                    // for init ITSELF, which Linux reports with ppid 0. Without
-                    // that case `/proc/1/stat` claims pid 1 is its own parent.
-                    ppid: process
-                        .parent
-                        .and_then(|parent| to_ns(parent.id.raw()))
-                        .unwrap_or(if process.key == init { 0 } else { 1 }),
-                    pgrp: crate::namespace::pid::process_group_to_ns_for(
-                        context,
-                        process.process_group,
-                    )?,
-                    session: crate::namespace::pid::session_to_ns_for(context, process.session)?,
-                    // The run-state table is keyed by the LOGICAL task pid on
-                    // this lane (`publish_task_thread`), so it is the one live
-                    // per-Linux-process state carrick has. A task that has not
-                    // published yet reads as runnable, and one already inside
-                    // its exit path reads `R` rather than `Z` — it becomes a
-                    // zombie only when the registry moves it, which is when the
-                    // zombie arm takes over. Stopped tasks query the kernel graph
-                    // directly to report 'T'.
-                    state: if is_stopped {
-                        'T'
-                    } else {
-                        u32::try_from(process.key.id.raw())
-                            .ok()
-                            .and_then(crate::run_state::published_stat_char)
-                            .unwrap_or('R')
-                    },
-                    tids: process
-                        .tids
-                        .iter()
-                        .filter_map(|tid| to_ns(tid.raw()))
-                        .collect(),
-                    // HONEST GAP: this is the registry's fork-time label, not
-                    // the Linux `comm`. Linux's is the exec basename as later
-                    // amended by `prctl(PR_SET_NAME)`, and carrick keeps that
-                    // in the per-process `ProcState.task_name` — which is
-                    // reachable only from the process that owns it, so a peer
-                    // cannot be asked. The same substitution already ships on
-                    // the zombie arm. Closing it means promoting `comm` to a
-                    // `Task` field (as `oom_score_adj` was) and retiring
-                    // `ProcState.task_name`; identity is fixed first because
-                    // it is what LTP and `getpgid`/`getsid` actually read.
-                    comm: process.diagnostic_name,
-                    user_cpu_us,
-                    system_cpu_us,
-                })
-            })
+            .filter_map(|process| Self::synthetic_proc_process(context, registry, process, init))
             .collect();
         processes.sort_by_key(|process| process.pid);
         Some(processes)

@@ -843,6 +843,15 @@ impl<'a> FsView<'a> {
         SyscallDispatcher::synthetic_proc_processes(context, hvpatch_process)
     }
 
+    pub(super) fn synthetic_proc_process(
+        context: &crate::kernel::KernelContext,
+        registry: &crate::kernel::Registry,
+        process: crate::kernel::core::LiveProcess,
+        init: crate::kernel::TaskKey,
+    ) -> Option<carrick_vfs::SyntheticProcProcess> {
+        SyscallDispatcher::synthetic_proc_process(context, registry, process, init)
+    }
+
     pub(super) fn synthetic_proc_threads(
         &self,
         context: &crate::kernel::KernelContext,

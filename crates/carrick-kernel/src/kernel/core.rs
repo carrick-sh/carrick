@@ -2302,6 +2302,21 @@ pub struct LiveProcess {
 }
 
 impl Registry {
+    pub(crate) fn live_process(&self, id: TaskId) -> Option<LiveProcess> {
+        let state = self.state.read();
+        let record = state.tasks.get(&id)?;
+        Some(LiveProcess {
+            key: record.task.key(),
+            container: record.task.container().id(),
+            parent: record.task.parent(),
+            process_group: record.task.process_group(),
+            session: record.task.session(),
+            lifecycle: record.task.lifecycle(),
+            tids: record.thread_claims.keys().copied().collect(),
+            diagnostic_name: record.diagnostic_name.clone(),
+        })
+    }
+
     pub fn task(&self, id: TaskId) -> Option<TaskRef> {
         self.state
             .read()

@@ -852,6 +852,15 @@ pub struct SyntheticProcZombie {
     pub system_cpu_us: u64,
 }
 
+/// One exact process selected by the numeric component of a `/proc/<pid>`
+/// path. Per-pid opens use this narrow record so they do not have to build the
+/// complete process census that directory enumeration requires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyntheticProcRecord {
+    Live(SyntheticProcProcess),
+    Zombie(SyntheticProcZombie),
+}
+
 /// Live dispatcher state that some VFS mounts need at `open` time
 /// (e.g. `/proc/self/maps` reflecting the loaded address space).
 /// Threading this through `Vfs::open` keeps the trait independent of
@@ -870,6 +879,10 @@ pub struct OpenContext<'a> {
     pub sgid: NsGid,
     pub runtime_endpoint_container: Option<carrick_hal::ContainerId>,
     pub identity: Option<SyntheticProcIdentity>,
+    /// Whether the in-process kernel graph is authoritative for guest PIDs.
+    /// This is separate from `processes`: checking authority must not force the
+    /// expensive full census on a per-pid open.
+    pub process_graph: bool,
 
     pub executable_path: LazyField<'a, Option<Cow<'a, str>>>,
     pub argv: LazyField<'a, Option<Cow<'a, [String]>>>,
@@ -884,6 +897,8 @@ pub struct OpenContext<'a> {
     pub oom_score_adj: LazyField<'a, Option<Cow<'a, std::collections::BTreeMap<u32, i32>>>>,
     pub creds_ns: LazyField<'a, Option<Arc<dyn FsCaller>>>,
     pub processes: LazyField<'a, Option<Cow<'a, [SyntheticProcProcess]>>>,
+    /// Exact record named by this open's `/proc/<pid>` component, if any.
+    pub target_process: LazyField<'a, Option<SyntheticProcRecord>>,
     pub threads: LazyField<'a, Option<Cow<'a, [SyntheticProcThread]>>>,
     pub zombies: LazyField<'a, Option<Cow<'a, [SyntheticProcZombie]>>>,
     pub sysvipc_shm: LazyField<'a, Option<Cow<'a, str>>>,
@@ -951,6 +966,16 @@ impl<'a> OpenContext<'a> {
 
     pub fn processes(&self) -> Option<&[SyntheticProcProcess]> {
         self.processes.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub fn target_process(&self) -> Option<&SyntheticProcRecord> {
+        self.target_process.get().and_then(Option::as_ref)
+    }
+
+    /// `None` means this context has no exact-lookup capability; `Some(None)`
+    /// means an exact lookup ran and proved the requested PID absent.
+    pub fn target_process_lookup(&self) -> Option<Option<&SyntheticProcRecord>> {
+        self.target_process.get().map(Option::as_ref)
     }
 
     pub fn threads(&self) -> Option<&[SyntheticProcThread]> {

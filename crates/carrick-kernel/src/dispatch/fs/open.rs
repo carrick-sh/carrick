@@ -1388,6 +1388,12 @@ impl<'a> FsView<'a> {
         let native_guest_va = self.page_geometry().native_geometry().is_some();
         let runtime_endpoint_container = Some(context.container().id());
         let identity = self.synthetic_proc_identity(context);
+        let hvpatch_process = self.hvpatch_process();
+        let process_graph = hvpatch_process.is_some();
+        let target_pid = path
+            .strip_prefix("/proc/")
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|component| component.parse::<u32>().ok());
 
         let exec_path_provider = || Some(std::borrow::Cow::Borrowed(exec_path.as_str()));
         let argv_provider = || Some(std::borrow::Cow::Borrowed(argv.as_slice()));
@@ -1406,7 +1412,7 @@ impl<'a> FsView<'a> {
             (sig_ignored.raw(), sig_caught.raw(), sig_shdpnd.raw())
         };
         let oom_score_adj_provider = || {
-            self.hvpatch_process().map(|process| {
+            hvpatch_process.as_ref().map(|process| {
                 std::borrow::Cow::Owned(
                     process
                         .kernel_graph()
@@ -1424,15 +1430,58 @@ impl<'a> FsView<'a> {
         let creds_ns_provider =
             || Some(Arc::new(context.task().creds_ns()) as Arc<dyn carrick_vfs::FsCaller>);
         let processes_provider = || {
-            Self::synthetic_proc_processes(context, self.hvpatch_process().as_deref())
+            Self::synthetic_proc_processes(context, hvpatch_process.as_deref())
                 .map(std::borrow::Cow::Owned)
+        };
+        let target_process_provider = || {
+            let visible_pid = target_pid?;
+            let internal_pid = crate::namespace::pid::ns_to_kernel_for(context, visible_pid)?;
+            let task_id = i32::try_from(internal_pid)
+                .ok()
+                .and_then(|pid| crate::kernel::TaskId::from_abi_positive(pid).ok())?;
+            let process = hvpatch_process.as_ref()?;
+            let registry = process.kernel_graph().registry();
+            if let Some(live) = registry
+                .live_process(task_id)
+                .filter(|live| live.container == context.container().id())
+            {
+                let init = context.kernel().container_init(context.container().id())?;
+                return Self::synthetic_proc_process(context, registry, live, init)
+                    .map(carrick_vfs::SyntheticProcRecord::Live);
+            }
+            registry
+                .zombie(task_id)
+                .filter(|zombie| zombie.container == context.container().id())
+                .and_then(|zombie| {
+                    let to_ns = |raw: i32| {
+                        u32::try_from(raw)
+                            .ok()
+                            .and_then(|raw| crate::namespace::pid::kernel_to_ns_for(context, raw))
+                    };
+                    Some(carrick_vfs::SyntheticProcRecord::Zombie(
+                        carrick_vfs::SyntheticProcZombie {
+                            pid: to_ns(zombie.key.id.raw())?,
+                            ppid: zombie
+                                .parent
+                                .and_then(|parent| to_ns(parent.id.raw()))
+                                .unwrap_or(1),
+                            pgrp: zombie.namespace_process_group,
+                            session: zombie.namespace_session,
+                            comm: zombie.diagnostic_name,
+                            user_cpu_us: u64::try_from(zombie.rusage.user_time.as_micros())
+                                .unwrap_or(u64::MAX),
+                            system_cpu_us: u64::try_from(zombie.rusage.system_time.as_micros())
+                                .unwrap_or(u64::MAX),
+                        },
+                    ))
+                })
         };
         let threads_provider = || {
             self.synthetic_proc_threads(context, registry)
                 .map(std::borrow::Cow::Owned)
         };
         let zombies_provider = || {
-            self.hvpatch_process().map(|process| {
+            hvpatch_process.as_ref().map(|process| {
                 std::borrow::Cow::Owned(
                     process
                         .kernel_graph()
@@ -1500,6 +1549,7 @@ impl<'a> FsView<'a> {
             sgid: creds.sgid,
             runtime_endpoint_container,
             identity,
+            process_graph,
             executable_path: carrick_vfs::LazyField::new(&exec_path_provider),
             argv: carrick_vfs::LazyField::new(&argv_provider),
             task_comm: carrick_vfs::LazyField::new(&task_comm_provider),
@@ -1513,6 +1563,7 @@ impl<'a> FsView<'a> {
             oom_score_adj: carrick_vfs::LazyField::new(&oom_score_adj_provider),
             creds_ns: carrick_vfs::LazyField::new(&creds_ns_provider),
             processes: carrick_vfs::LazyField::new(&processes_provider),
+            target_process: carrick_vfs::LazyField::new(&target_process_provider),
             threads: carrick_vfs::LazyField::new(&threads_provider),
             zombies: carrick_vfs::LazyField::new(&zombies_provider),
             sysvipc_shm: carrick_vfs::LazyField::new(&sysvipc_shm_provider),

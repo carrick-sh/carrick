@@ -77,8 +77,8 @@ use crate::memory::{
 use carrick_vfs::{
     DirEnt, EntryKind, FsCaller, FsNetworkInterface, FsNetworkView, GuestMemoryRange,
     GuestReportedArch, LazyField, Metadata, OpenContext, OpenContextMemorySnapshot, OpenFlags,
-    ProcMapsEntry, SyntheticProcIdentity, SyntheticProcProcess, SyntheticProcThread,
-    SyntheticProcZombie, Vfs, VfsError, VfsHandle,
+    ProcMapsEntry, SyntheticProcIdentity, SyntheticProcProcess, SyntheticProcRecord,
+    SyntheticProcThread, SyntheticProcZombie, Vfs, VfsError, VfsHandle,
 };
 
 /// Minimal live state needed by synthetic `/proc` renderers.
@@ -190,6 +190,7 @@ impl<'a> From<&'a SyntheticProcContext> for OpenContext<'a> {
             sgid: ctx.sgid,
             runtime_endpoint_container: ctx.runtime_endpoint_container,
             identity: ctx.identity,
+            process_graph: ctx.processes.is_some(),
             executable_path: LazyField::from_value(Some(Cow::Borrowed(&ctx.executable_path))),
             argv: LazyField::from_value(Some(Cow::Borrowed(&ctx.argv))),
             task_comm: LazyField::from_value(Some(Cow::Borrowed(&ctx.task_comm))),
@@ -209,6 +210,7 @@ impl<'a> From<&'a SyntheticProcContext> for OpenContext<'a> {
                 Arc::new(ctx.creds_ns.clone()) as Arc<dyn FsCaller>
             )),
             processes: LazyField::from_value(ctx.processes.as_deref().map(Cow::Borrowed)),
+            target_process: LazyField::default(),
             threads: LazyField::from_value(ctx.threads.as_deref().map(Cow::Borrowed)),
             zombies: LazyField::from_value(ctx.zombies.as_deref().map(Cow::Borrowed)),
             sysvipc_shm: LazyField::from_value(Some(Cow::Borrowed(&ctx.sysvipc_shm))),
@@ -1014,7 +1016,9 @@ pub(crate) fn proc_foreign_live_memory_open_errno(
     }
     // Without a kernel graph this lane cannot enumerate peers at all; leave its
     // behaviour to the mature host-process path rather than inventing a refusal.
-    ctx.processes()?;
+    if !ctx.process_graph {
+        return None;
+    }
     Some(match graph_process(mid, ctx) {
         Some(_) => crate::linux_abi::LINUX_EACCES,
         None => LINUX_ENOENT,
@@ -1150,7 +1154,7 @@ fn proc_net_basename<'a>(path: &'a str, ctx: &OpenContext<'_>) -> Option<&'a str
         return None;
     }
     if pid.bytes().all(|byte| byte.is_ascii_digit())
-        && ctx.processes().is_some()
+        && ctx.process_graph
         && !proc_pid_component_is_live(pid, ctx)
     {
         return None;
@@ -1240,7 +1244,7 @@ fn proc_net_dir_entries_with_context(path: &str, ctx: &OpenContext<'_>) -> Optio
     if component.is_empty() || component.contains('/') {
         return None;
     }
-    if ctx.processes().is_some() {
+    if ctx.process_graph {
         proc_pid_component_is_live(component, ctx).then(proc_net_entries)
     } else {
         proc_net_dir_entries(path)
@@ -1919,6 +1923,16 @@ fn graph_process<'a>(component: &str, ctx: &'a OpenContext<'_>) -> Option<GraphP
     if pid == identity.pid {
         return Some(GraphProcess::Reader);
     }
+    match ctx.target_process_lookup() {
+        Some(Some(SyntheticProcRecord::Live(peer))) if peer.pid == pid => {
+            return Some(GraphProcess::Peer(peer));
+        }
+        Some(Some(SyntheticProcRecord::Zombie(zombie))) if zombie.pid == pid => {
+            return Some(GraphProcess::Zombie);
+        }
+        Some(_) => return None,
+        _ => {}
+    }
     if let Some(peer) = ctx
         .processes()
         .and_then(|processes| processes.iter().find(|process| process.pid == pid))
@@ -2116,7 +2130,7 @@ fn proc_pid_dir_entries_with_context(path: &str, ctx: &OpenContext<'_>) -> Optio
         Some(GraphProcess::Peer(_) | GraphProcess::Zombie) => {
             proc_pid_dir_entries_for_known_process(path, false)
         }
-        None if ctx.processes().is_some() => None,
+        None if ctx.process_graph => None,
         // No kernel graph on this lane: the host process table is still the
         // authority, one Linux process being one host process there.
         None => proc_pid_dir_entries(path),
@@ -2131,7 +2145,7 @@ fn proc_pid_dir_entries_with_context(path: &str, ctx: &OpenContext<'_>) -> Optio
 /// predicate for the subtrees that only need "does this process exist" and not
 /// the process record itself.
 pub(crate) fn proc_pid_component_is_live(component: &str, ctx: &OpenContext<'_>) -> bool {
-    if ctx.processes().is_some() {
+    if ctx.process_graph {
         graph_process(component, ctx).is_some()
     } else {
         graph_process(component, ctx).is_some() || proc_live_pid(component).is_some()
@@ -3483,6 +3497,60 @@ fn synthetic_self_thread_and_peer_stat_use_published_logical_cpu() {
 
 #[cfg(test)]
 #[test]
+fn targeted_peer_status_does_not_materialize_full_process_census() {
+    use std::borrow::Cow;
+    use std::cell::Cell;
+
+    let census_reads = Cell::new(0usize);
+    let processes_provider = || {
+        census_reads.set(census_reads.get() + 1);
+        Some(Cow::Owned(vec![SyntheticProcProcess {
+            pid: 7,
+            ppid: 3,
+            pgrp: 7,
+            session: 7,
+            state: 'S',
+            tids: vec![7],
+            comm: "peer".to_owned(),
+            user_cpu_us: 0,
+            system_cpu_us: 0,
+        }]))
+    };
+    let ctx = OpenContext {
+        identity: Some(SyntheticProcIdentity {
+            pid: 3,
+            tid: 3,
+            ppid: 1,
+            pgrp: 3,
+            session: 3,
+            user_cpu_us: 0,
+            system_cpu_us: 0,
+        }),
+        process_graph: true,
+        target_process: carrick_vfs::LazyField::from_value(Some(SyntheticProcRecord::Live(
+            SyntheticProcProcess {
+                pid: 7,
+                ppid: 3,
+                pgrp: 7,
+                session: 7,
+                state: 'S',
+                tids: vec![7],
+                comm: "peer".to_owned(),
+                user_cpu_us: 0,
+                system_cpu_us: 0,
+            },
+        ))),
+        processes: carrick_vfs::LazyField::new(&processes_provider),
+        ..OpenContext::default()
+    };
+
+    let status = synthetic_file_for_open("/proc/7/status", &ctx).unwrap();
+    assert!(String::from_utf8(status).unwrap().contains("Pid:\t7\n"));
+    assert_eq!(census_reads.get(), 0);
+}
+
+#[cfg(test)]
+#[test]
 fn synthetic_zombie_stat_uses_exact_published_rusage() {
     let ctx = SyntheticProcContext {
         identity: Some(SyntheticProcIdentity {
@@ -3523,6 +3591,38 @@ fn cpu_us_to_ticks(cpu_us: u64) -> u64 {
     cpu_us.saturating_mul(carrick_abi::LINUX_CLK_TCK as u64) / 1_000_000
 }
 
+fn selected_graph_zombie<'a>(
+    ctx: &'a OpenContext<'_>,
+    pid: u32,
+) -> Option<&'a SyntheticProcZombie> {
+    match ctx.target_process_lookup() {
+        Some(Some(SyntheticProcRecord::Zombie(zombie))) if zombie.pid == pid => Some(zombie),
+        Some(_) => None,
+        None => ctx
+            .zombies()
+            .and_then(|zombies| zombies.iter().find(|zombie| zombie.pid == pid)),
+    }
+}
+
+fn selected_graph_process<'a>(
+    ctx: &'a OpenContext<'_>,
+    pid: u32,
+) -> Option<&'a SyntheticProcProcess> {
+    match ctx.target_process_lookup() {
+        Some(Some(SyntheticProcRecord::Live(process)))
+            if process.pid == pid || process.tids.contains(&pid) =>
+        {
+            Some(process)
+        }
+        Some(_) => None,
+        None => ctx.processes().and_then(|processes| {
+            processes
+                .iter()
+                .find(|process| process.pid == pid || process.tids.contains(&pid))
+        }),
+    }
+}
+
 fn synthetic_proc_pid_file(
     pid: u32,
     rest: &str,
@@ -3545,11 +3645,8 @@ fn synthetic_proc_pid_file(
     // makes LTP's `access(2)` probe of a dead pid fail the way Linux fails it
     // rather than reporting a fabricated 0.
     if matches!(rest, "oom_score" | "oom_adj" | "oom_score_adj") {
-        let known = pid_oom_score_adj(ctx, pid).or_else(|| {
-            ctx.zombies()
-                .is_some_and(|zombies| zombies.iter().any(|zombie| zombie.pid == pid))
-                .then_some(0)
-        })?;
+        let known = pid_oom_score_adj(ctx, pid)
+            .or_else(|| selected_graph_zombie(ctx, pid).is_some().then_some(0))?;
         return Some(match rest {
             // oom_score is the volatile computed score and oom_adj the legacy
             // knob; carrick models neither, and 0 is a valid answer for both.
@@ -3605,9 +3702,7 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{count}\n",
         }
     }
 
-    if let Some(zombies) = ctx.zombies()
-        && let Some(zombie) = zombies.iter().find(|zombie| zombie.pid == pid)
-    {
+    if let Some(zombie) = selected_graph_zombie(ctx, pid) {
         let name = if zombie.comm.is_empty() {
             self_comm
         } else {
@@ -3651,11 +3746,7 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
     // Ordered after the thread arm so a tid of the READER's own task — which
     // can numerically equal a peer's pid only if the graph is inconsistent —
     // still resolves through the richer per-thread snapshot.
-    if let Some(processes) = ctx.processes()
-        && let Some(process) = processes
-            .iter()
-            .find(|process| process.pid == pid || process.tids.contains(&pid))
-    {
+    if let Some(process) = selected_graph_process(ctx, pid) {
         let name = if process.comm.is_empty() {
             self_comm
         } else {
@@ -3720,7 +3811,7 @@ Threads:\t{threads}\n",
     // point means the id was neither the reader, one of its threads, a live
     // peer, nor a zombie; never reinterpret the same raw number through the
     // carrier's host process/thread/run-state tables.
-    if ctx.processes().is_some() {
+    if ctx.process_graph {
         return None;
     }
 
