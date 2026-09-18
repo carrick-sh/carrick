@@ -86,9 +86,10 @@ const LTP_SMOKE: &[&str] = &[
 /// additionally creates a real file per fd, and its `sysconf(_SC_OPEN_MAX)`
 /// loop must end in `EMFILE` at the guest's own limit — below the host
 /// descriptor budget carrick advertises as `/proc/sys/fs/file-max`, where
-/// the answer is `ENFILE`. pipe07 opens pipe PAIRS until `EMFILE` at
-/// `getdtablesize()` and expects that exact errno for the same reason.
-const LTP_NOFILE_4096: &[&str] = &["dup03", "dup06", "dup205", "fork09", "pipe07"];
+/// the answer is `ENFILE`. open04 opens regular files and pipe07 opens pipe
+/// PAIRS until `EMFILE` at the process limit; both expect that exact errno for
+/// the same reason.
+const LTP_NOFILE_4096: &[&str] = &["dup03", "dup06", "dup205", "fork09", "open04", "pipe07"];
 
 /// Exact LTP command overrides that must survive manifest regeneration. Keep
 /// these narrow: each one documents a known harness/resource mismatch where the
@@ -894,6 +895,10 @@ mod tests {
         assert_eq!(
             ltp_cmd("fcntl14_64"),
             vec!["/opt/ltp/testcases/bin/fcntl14_64", "-n", "200"]
+        );
+        assert_eq!(
+            ltp_cmd("open04"),
+            vec!["ulimit -n 4096; /opt/ltp/testcases/bin/open04"]
         );
     }
 
