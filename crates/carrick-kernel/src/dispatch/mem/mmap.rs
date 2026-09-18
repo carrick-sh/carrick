@@ -739,10 +739,7 @@ impl<'a> MemView<'a> {
                     !prot_none && !prot_flags.contains(LinuxProtFlags::WRITE),
                     carrick_guest_mem::MappingSharing::Private,
                 );
-                if memory
-                    .protect_range(requested.0, length_usize, prot)
-                    .is_err()
-                {
+                if let Err(error) = memory.protect_range(requested.0, length_usize, prot) {
                     // Repoint succeeded, so the prior mapping cannot be restored.
                     // Match the runtime alias transaction: do not return to the
                     // guest with split backing/metadata ownership after a
@@ -750,7 +747,7 @@ impl<'a> MemView<'a> {
                     mark_range_unmapped(memory, requested.0, length_usize);
                     carrick_fatal!(
                         "dispatch::mmap_overlay",
-                        "protect_range failed on repointed memory range during private overlay"
+                        "protect_range failed on repointed memory range during private overlay: {error}"
                     );
                 }
                 if let Some((bus_start, bus_len)) = bus_fault {

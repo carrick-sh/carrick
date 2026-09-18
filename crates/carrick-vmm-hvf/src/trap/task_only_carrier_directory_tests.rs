@@ -410,6 +410,33 @@ fn an_unmap_supersedes_the_cow_receipts_naming_its_range_first() {
     }
 }
 
+/// A private repoint replaces the stage-1 output for its semantic VA, so any
+/// deferred-COW receipt describing the previous output must be retired before
+/// the replacement alias becomes observable. Otherwise the immediately
+/// following protection commit authenticates the new leaf against the old IPA
+/// and fail-stops (`ltp-mmap04`, after the two PROT_NONE cases).
+#[test]
+fn a_private_repoint_supersedes_the_previous_cow_receipt_before_publication() {
+    let source = include_str!("cow_engine.rs");
+    let body = source
+        .split_once("pub(crate) fn publish_private_repoint(")
+        .expect("private repoint publication entry point")
+        .1
+        .split_once("\n    pub(crate) fn ")
+        .expect("end of private repoint publication")
+        .0;
+    let supersede = body
+        .find("self.supersede_cow_receipts(")
+        .expect("private repoint must retire receipts for the replaced VA range");
+    let publish = body
+        .find("register_shared_alias(")
+        .expect("private repoint alias publication");
+    assert!(
+        supersede < publish,
+        "the stale receipt must be retired before the replacement alias is published"
+    );
+}
+
 #[test]
 fn pending_fork_frame_authentication_false_and_error_paths_fail_closed() {
     let source = include_str!("../trap.rs");

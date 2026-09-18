@@ -193,6 +193,10 @@ impl HvfVmState {
             } else {
                 mapping_owner_generation
             };
+        // The stage-1 repoint has replaced every promise about the previous
+        // VA -> IPA output. Retire those promises before publishing the alias,
+        // so the protection commit authenticates only the replacement state.
+        self.supersede_cow_receipts("private-repoint", va, len as u64);
         let sharing = GuestMappingSharing::Private;
         register_shared_alias(AliasBacking {
             start: va,
