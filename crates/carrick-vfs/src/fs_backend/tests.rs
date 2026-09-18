@@ -90,10 +90,14 @@ fn host_statfs_reports_the_open_backing_volume() {
     assert_eq!(block_size, native.f_bsize as i64);
     assert_eq!(fragment_size, native.f_frsize as i64);
     assert_eq!(blocks, native.f_blocks as u64);
-    assert_eq!(free_blocks, native.f_bfree as u64);
-    assert_eq!(available_blocks, native.f_bavail as u64);
-    assert_eq!(files, native.f_files as u64);
-    assert_eq!(free_files, native.f_ffree as u64);
+    // Capacity counters are live volume state. Other tests and host processes
+    // may allocate or release blocks and inodes between the two fstatvfs calls,
+    // so exact equality here would test global filesystem quiescence rather
+    // than this backend's translation. Preserve the Linux statfs invariants
+    // that the translated snapshot itself must satisfy.
+    assert!(free_blocks <= blocks);
+    assert!(available_blocks <= free_blocks);
+    assert!(free_files <= files);
     assert_eq!(name_length, native.f_namemax as i64);
 }
 
