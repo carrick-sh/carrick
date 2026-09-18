@@ -14,14 +14,16 @@
  * Phase ordinals are append-only: 0=parent table load, 1=vCPU snapshot,
  * 2=parent table clone, 3=rebase, 4=alias union, 5=private snapshot,
  * 6=validation, 7=table publish, 8=backend protections,
- * 9=backend finalization, 10=wrapper protections, 11=cumulative total.
- * Total encloses phases 0..10 and must not be summed with them.
+ * 9=backend finalization, 10=wrapper protections, 11=cumulative total,
+ * 12=COW-range projection, 13=parent COW publication/authentication.
+ * Total encloses phases 0..10 and 12..13 and must not be summed with them.
  *
  * `units` is a boolean load flag for parent table load; bytes for table clone,
  * rebase, table publish, and backend finalization; packed bank span for private
- * snapshot; mapping count for alias union and validation; and zero elsewhere.
+ * snapshot; mapping count for alias union, validation, COW projection, and
+ * parent COW publication; and zero elsewhere.
  *
- * Perturbation: twelve low-frequency USDT probes per Linux guest fork plus
+ * Perturbation: fourteen low-frequency USDT probes per Linux guest fork plus
  * timestamp reads around the measured stages. No syscall, VM-exit, page, or
  * instruction hot path is instrumented. A missing stage, a zero-event capture,
  * or a DTrace error exits nonzero instead of producing a plausible empty result.
@@ -36,7 +38,7 @@ dtrace:::BEGIN
     errors = 0;
     bounded = 0;
     p0 = p1 = p2 = p3 = p4 = p5 = 0;
-    p6 = p7 = p8 = p9 = p10 = p11 = 0;
+    p6 = p7 = p8 = p9 = p10 = p11 = p12 = p13 = 0;
 }
 
 carrick*:::hvpatch-fork-process-spec-stage
@@ -55,6 +57,8 @@ carrick*:::hvpatch-fork-process-spec-stage
     p9 += arg0 == 9;
     p10 += arg0 == 10;
     p11 += arg0 == 11;
+    p12 += arg0 == 12;
+    p13 += arg0 == 13;
     printf("HVPATCH4PSPEC|event|ns=%llu|host_pid=%d|phase=%u|child_pid=%d|forking_tid=%d|elapsed_ns=%llu|units=%llu\n",
         timestamp, pid, (uint32_t)arg0, (int32_t)arg1, (int32_t)arg2,
         (uint64_t)arg3, (uint64_t)arg4);
@@ -74,7 +78,8 @@ proc:::exit
     this->bad = errors != 0 || p11 == 0 ||
         p0 != p11 || p1 != p11 || p2 != p11 || p3 != p11 ||
         p4 != p11 || p5 != p11 || p6 != p11 || p7 != p11 ||
-        p8 != p11 || p9 != p11 || p10 != p11;
+        p8 != p11 || p9 != p11 || p10 != p11 ||
+        p12 != p11 || p13 != p11;
     exit(this->bad);
 }
 
@@ -90,10 +95,11 @@ dtrace:::END
     this->bad = errors != 0 || bounded != 0 || p11 == 0 ||
         p0 != p11 || p1 != p11 || p2 != p11 || p3 != p11 ||
         p4 != p11 || p5 != p11 || p6 != p11 || p7 != p11 ||
-        p8 != p11 || p9 != p11 || p10 != p11;
-    printf("HVPATCH4PSPEC|summary|status=%s|events=%d|total=%d|bounded=%d|errors=%d|counts=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+        p8 != p11 || p9 != p11 || p10 != p11 ||
+        p12 != p11 || p13 != p11;
+    printf("HVPATCH4PSPEC|summary|status=%s|events=%d|total=%d|bounded=%d|errors=%d|counts=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
         this->bad ? "error" : "ok", events, p11, bounded, errors,
-        p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11);
+        p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13);
     printa("HVPATCH4PSPEC|count|phase=%u|value=%@d\n", @count);
     printa("HVPATCH4PSPEC|elapsed-ns|phase=%u|value=%@d\n", @elapsed_ns);
     printa("HVPATCH4PSPEC|units|phase=%u|value=%@d\n", @units);

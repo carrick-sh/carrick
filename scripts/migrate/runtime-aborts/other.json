@@ -40,10 +40,10 @@
       "file": "crates/carrick-aarch64/src/engine.rs",
       "function": "<Aarch64EngineCore<V> as ThreadedEngine>::build_process_spec",
       "ordinal_in_function": 1,
-      "fingerprint": "e3ac827b81e412c9a967abc2592a1b90bdeb27ad5c87435225674ce2e067e8a0",
+      "fingerprint": "bffd03ec8c927e0dab50e3580df8a7f5c9dfb2290576f270430303b4b3b05ae7",
       "verdict": "carrier_fault",
       "failure_domain": "aarch64::fork_cow",
-      "rationale": "Failed page table rollback and TLB invalidation during parent fork copy-on-write setup leaves parent memory protections inconsistent.",
+      "rationale": "Failed page table rollback and TLB invalidation during parent fork copy-on-write setup leaves parent memory protections inconsistent. Re-reviewed 2026-09-18: the abort is unchanged; build_process_spec now authenticates and caches the mapping projection and rearms only COW ranges not already protected in the parent.",
       "sink": "fatal",
       "domain": "aarch64::fork_cow"
     },

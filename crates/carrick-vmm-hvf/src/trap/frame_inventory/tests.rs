@@ -6411,8 +6411,7 @@ fn fork_translation_accepts_winning_overlay_independent_of_descriptor_order() {
         mapping(stale_ipa, 0x3000_0000),
     ];
 
-    let overlay_index =
-        ForkTranslationOverlayIndex::build(&mappings, None, ContainerRootToken::ROOT);
+    let overlay_index = ForkTranslationOverlayIndex::build(&mappings);
     assert!(fork_translation_has_overlay_owner(
         &overlay_index,
         &mappings,
@@ -6420,4 +6419,59 @@ fn fork_translation_accepts_winning_overlay_independent_of_descriptor_order() {
         0x4000_0000,
         winning_ipa,
     ));
+}
+
+#[test]
+fn fork_translation_rejects_registry_only_overlay_without_a_child_mapping_owner() {
+    clear_alias_registry();
+    let va = 0x4000_0000;
+    let stale_ipa = 0x9b00_008000;
+    let winning_ipa = 0x9b00_028000;
+    let mappings = vec![ProcessMappingDesc {
+        start: va,
+        ipa: stale_ipa,
+        end: va + 0x4000,
+        host: ProcessMappingHost::Borrowed {
+            pointer: 0x3000_0000 as *mut u8,
+            structural_owner: None,
+        },
+        size: 0x4000,
+        physical_ipa: stale_ipa,
+        physical_host_addr: 0x3000_0000 as *mut u8,
+        physical_size: 0x4000,
+        inventory_backing: InventoryBackingIdentity::Private(stale_ipa),
+        perms: applevisor::memory::MemPerms::ReadWrite,
+        is_dynamic_alias: true,
+        sharing: GuestMappingSharing::Private,
+        guest_writable: true,
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        inherited_frame: None,
+        stage2_lease: None,
+        owner_generation: 0,
+    }];
+    alias_registry().lock().push(AliasBacking {
+        start: va,
+        ipa: winning_ipa,
+        host_addr: 0x2000_0000,
+        size: 0x4000,
+        physical_ipa: winning_ipa,
+        physical_host_addr: 0x2000_0000,
+        physical_size: 0x4000,
+        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        guest_writable: true,
+        sharing: GuestMappingSharing::Private,
+        ownership_scope: AliasOwnershipScope::Global,
+        inventory_backing: InventoryBackingIdentity::Private(winning_ipa),
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    });
+
+    let overlay_index = ForkTranslationOverlayIndex::build(&mappings);
+    assert!(
+        !fork_translation_has_overlay_owner(&overlay_index, &mappings, 0, va, winning_ipa,),
+        "a carrier-registry row absent from the authenticated child mapping plan cannot own its translation"
+    );
+    clear_alias_registry();
 }

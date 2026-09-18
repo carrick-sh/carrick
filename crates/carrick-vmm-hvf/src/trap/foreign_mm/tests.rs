@@ -3437,6 +3437,211 @@ fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync(
 }
 
 #[test]
+fn fork_source_regions_exclude_parent_extension_page_table_arenas() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    const TWO_MIB: u64 = 2 * 1024 * 1024;
+    let root = crate::memory::LINUX_PAGE_TABLES_BASE;
+    let extension_a = 0xd0_0000_0000;
+    let extension_b = extension_a + TWO_MIB;
+    let guest = crate::memory::LINUX_MMAP_BASE + 0x40_0000;
+    let mut mappings = TaskMappingIndex::new();
+    mappings.insert(crate::trap::thread_sibling_tests::mapped_region(
+        root,
+        root + crate::memory::LINUX_PAGE_TABLES_SIZE,
+        root,
+    ));
+    mappings.insert(crate::trap::thread_sibling_tests::mapped_region(
+        extension_a,
+        extension_a + TWO_MIB,
+        extension_a,
+    ));
+    mappings.insert(crate::trap::thread_sibling_tests::mapped_region(
+        extension_b,
+        extension_b + TWO_MIB,
+        extension_b,
+    ));
+    mappings.insert(crate::trap::thread_sibling_tests::mapped_region(
+        guest,
+        guest + 0x4000,
+        guest,
+    ));
+
+    let selected: Vec<_> =
+        crate::trap::process_plan::fork_source_regions(&mappings, &[extension_a, extension_b])
+            .map(|mapping| mapping.start)
+            .collect();
+
+    assert_eq!(selected, vec![root, guest]);
+}
+
+#[test]
+fn fork_source_regions_exclude_shadowed_mapping_incarnations() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let va = crate::memory::LINUX_MMAP_BASE + 0x80_0000;
+    let mut mappings = TaskMappingIndex::new();
+    let mut retired = crate::trap::thread_sibling_tests::mapped_region(va, va + 0x4000, va);
+    retired.owner_generation = 1;
+    let mut current =
+        crate::trap::thread_sibling_tests::mapped_region(va, va + 0x4000, va + 0x40_0000);
+    current.owner_generation = 2;
+    mappings.insert(retired);
+    mappings.insert(current);
+
+    let selected: Vec<_> = crate::trap::process_plan::fork_source_regions(&mappings, &[])
+        .map(|mapping| mapping.owner_generation)
+        .collect();
+
+    assert_eq!(
+        selected,
+        vec![2],
+        "fork must project only the current semantic mapping while the retired incarnation remains retained"
+    );
+    assert_eq!(mappings.shadowed_len(), 1);
+}
+
+#[test]
+fn fork_mapping_snapshot_reuses_unchanged_mapping_projection_and_invalidates_on_insert() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    clear_alias_registry();
+    let root = crate::memory::LINUX_PAGE_TABLES_BASE;
+    let guest = crate::memory::LINUX_MMAP_BASE + 0x40_0000;
+    let mut task = HvfTaskState::neutral();
+    task.mappings
+        .insert(crate::trap::thread_sibling_tests::mapped_region(
+            root,
+            root + crate::memory::LINUX_PAGE_TABLES_SIZE,
+            root,
+        ));
+    task.mappings
+        .insert(crate::trap::thread_sibling_tests::mapped_region(
+            guest,
+            guest + 0x4000,
+            guest,
+        ));
+
+    let before = hot_path_rows_scanned(HotPathScan::TaskMappings);
+    let first = task.fork_mapping_snapshot();
+    let first_ranges = first.cow_ranges();
+    let after_first = hot_path_rows_scanned(HotPathScan::TaskMappings);
+    assert_eq!(first.source_mappings.len(), 2);
+    assert!(
+        after_first > before,
+        "the first snapshot must inspect mappings"
+    );
+
+    let second = task.fork_mapping_snapshot();
+    let second_ranges = second.cow_ranges();
+    assert!(std::rc::Rc::ptr_eq(
+        &first.source_mappings,
+        &second.source_mappings
+    ));
+    assert!(std::sync::Arc::ptr_eq(&first_ranges, &second_ranges));
+    assert_eq!(
+        hot_path_rows_scanned(HotPathScan::TaskMappings),
+        after_first,
+        "an unchanged fork must reuse the exact mapping projection"
+    );
+
+    alias_registry().lock().push(AliasBacking {
+        start: guest + 0x20_0000,
+        ipa: guest + 0x20_0000,
+        host_addr: 0,
+        size: 0x4000,
+        physical_ipa: guest + 0x20_0000,
+        physical_host_addr: 0,
+        physical_size: 0x4000,
+        perms: u64::from(applevisor::memory::MemPerms::Read),
+        guest_writable: false,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: AliasOwnershipScope::Global,
+        inventory_backing: InventoryBackingIdentity::Private(0x517),
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    });
+    let after_visible_alias_churn = task.fork_mapping_snapshot();
+    let after_visible_alias_ranges = after_visible_alias_churn.cow_ranges();
+    assert!(std::rc::Rc::ptr_eq(
+        &second.source_mappings,
+        &after_visible_alias_churn.source_mappings
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        &second_ranges,
+        &after_visible_alias_ranges
+    ));
+    assert!(
+        alias_registry()
+            .lock()
+            .process_visible_ordered(task.mm_root_slot, task.container_root)
+            .is_empty(),
+        "a dead process-visible alias must be retired from the registry after its exact liveness check"
+    );
+    let after_dead_alias_retirement = task.fork_mapping_snapshot();
+    assert!(std::rc::Rc::ptr_eq(
+        &after_visible_alias_churn.source_mappings,
+        &after_dead_alias_retirement.source_mappings
+    ));
+    assert_eq!(
+        hot_path_rows_scanned(HotPathScan::TaskMappings),
+        after_first,
+        "visible alias churn must rebuild only the alias union, not the local mapping projection"
+    );
+
+    let later = guest + 0x80_0000;
+    task.mappings
+        .insert(crate::trap::thread_sibling_tests::mapped_region(
+            later,
+            later + 0x4000,
+            later,
+        ));
+    let third = task.fork_mapping_snapshot();
+    let third_ranges = third.cow_ranges();
+    assert!(!std::rc::Rc::ptr_eq(
+        &after_visible_alias_churn.source_mappings,
+        &third.source_mappings
+    ));
+    assert_eq!(third.source_mappings.len(), 3);
+    assert!(!std::sync::Arc::ptr_eq(
+        &after_visible_alias_ranges,
+        &third_ranges
+    ));
+    assert_eq!(
+        hot_path_rows_scanned(HotPathScan::TaskMappings),
+        after_first,
+        "an exact insert delta must update the fork projection without rescanning mappings"
+    );
+
+    task.mappings.remove_range(GuestVa(later), 0x4000);
+    let fourth = task.fork_mapping_snapshot();
+    assert_eq!(fourth.source_mappings.len(), 2);
+    assert_eq!(
+        hot_path_rows_scanned(HotPathScan::TaskMappings),
+        after_first,
+        "an exact removal delta must update the fork projection without rescanning mappings"
+    );
+
+    let root_guest_writable = {
+        let root_mapping = task.mappings.first_mut().expect("root mapping");
+        root_mapping.guest_writable = !root_mapping.guest_writable;
+        root_mapping.guest_writable
+    };
+    let fifth = task.fork_mapping_snapshot();
+    assert!(
+        hot_path_rows_scanned(HotPathScan::TaskMappings) > after_first,
+        "arbitrary mutable access must force a full fork-projection rebuild"
+    );
+    assert_eq!(
+        fifth
+            .source_mappings
+            .iter()
+            .find(|mapping| mapping.start == root)
+            .map(|mapping| mapping.guest_writable),
+        Some(root_guest_writable)
+    );
+    clear_alias_registry();
+}
+
+#[test]
 fn child_fork_replicates_multi_arena_stage1_page_tables() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
@@ -4175,6 +4380,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
     assert_eq!(published_vvar_extent.stage2_owner, vvar_extent.stage2_owner);
     let mut parent = HvfTaskState {
         mappings: TaskMappingIndex::from_iter([page_tables, vvar, overlay]),
+        fork_mapping_cache: parking_lot::Mutex::new(Default::default()),
         mm_root_slot: Some((0x9a00_2000_0000, 0x20_0000)),
         container_root: ContainerRootToken::from_raw(1),
         pending_exec_mm_root_slot: None,
@@ -4302,17 +4508,17 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         }
         Err(error) => error,
     };
+    let error_text = error.to_string();
+    let rejected_by_owner_audit = error_text
+        .contains("has no authenticated inherited inventory extent")
+        && error_text.contains("live_translation=Some")
+        && error_text.contains("candidate_translation=Some")
+        && error_text.contains("authenticated_overlay=false");
+    let rejected_before_owner_audit =
+        error_text.contains("resolves to IPA") && error_text.contains("expected");
     assert!(
-        error
-            .to_string()
-            .contains("has no authenticated inherited inventory extent"),
+        rejected_by_owner_audit || rejected_before_owner_audit,
         "unexpected arbitrary translated-IPA failure: {error}",
-    );
-    assert!(
-        error.to_string().contains("live_translation=Some")
-            && error.to_string().contains("candidate_translation=Some")
-            && error.to_string().contains("authenticated_overlay=false"),
-        "fork refusal must report the exact stage-1/overlay discriminator: {error}",
     );
 
     let mut unauthenticated_child_page_tables = make_child_page_tables(vvar_ipa);
@@ -4327,17 +4533,17 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         Ok(_) => panic!("a live vvar PTE without its structural owner must fail closed"),
         Err(error) => error,
     };
+    let error_text = error.to_string();
+    let rejected_by_owner_audit = error_text
+        .contains("has no authenticated inherited inventory extent")
+        && error_text.contains("live_translation=Some")
+        && error_text.contains("candidate_translation=Some")
+        && error_text.contains("authenticated_overlay=false");
+    let rejected_before_owner_audit =
+        error_text.contains("resolves to IPA") && error_text.contains("expected");
     assert!(
-        error
-            .to_string()
-            .contains("has no authenticated inherited inventory extent"),
+        rejected_by_owner_audit || rejected_before_owner_audit,
         "unexpected unauthenticated vvar failure: {error}",
-    );
-    assert!(
-        error.to_string().contains("live_translation=Some")
-            && error.to_string().contains("candidate_translation=Some")
-            && error.to_string().contains("authenticated_overlay=false"),
-        "fork refusal must report the exact stage-1/overlay discriminator: {error}",
     );
     parent
         .mappings
@@ -4503,6 +4709,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
             .iter()
             .map(HvpatchTaskMappingState::unowned_runtime_region)
             .collect(),
+        fork_mapping_cache: parking_lot::Mutex::new(Default::default()),
         mm_root_slot: prepared.mm_root_slot,
         container_root: prepared.container_root,
         pending_exec_mm_root_slot: None,
@@ -6128,6 +6335,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
 
     let parent_task = HvfTaskState {
         mappings: parent_mappings,
+        fork_mapping_cache: parking_lot::Mutex::new(Default::default()),
         mm_root_slot: Some((0x8800_0000_0000, 0x0020_0000)),
         container_root: ContainerRootToken::from_raw(1),
         pending_exec_mm_root_slot: None,

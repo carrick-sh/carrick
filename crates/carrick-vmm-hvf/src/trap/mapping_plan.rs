@@ -513,6 +513,7 @@ impl HvfVmState {
                 #[cfg(not(test))]
                 custody,
                 mappings: TaskMappingIndex::new(),
+                fork_mapping_cache: parking_lot::Mutex::new(Default::default()),
                 mm_root_slot: None,
                 container_root: ContainerRootToken::next(),
                 pending_exec_mm_root_slot: None,

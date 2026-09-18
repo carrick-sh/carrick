@@ -524,6 +524,62 @@ struct ParentForkCowRollback {
     armed_ranges: Vec<crate::vmm::ForkCowRange>,
 }
 
+/// Portions of the desired fork-COW graph whose parent leaves are not already
+/// read-only under the exact same arm semantics. The child clones the parent's
+/// live stage-1 image, so existing arms need neither a second descriptor edit
+/// nor another parent rollback pre-image.
+fn uncovered_fork_cow_ranges(
+    desired: &[crate::vmm::ForkCowRange],
+    armed: &[crate::vmm::ForkCowRange],
+) -> Vec<crate::vmm::ForkCowRange> {
+    let mut uncovered = Vec::new();
+    for desired in desired {
+        let Some(desired_end) = desired.va.checked_add(desired.len as u64) else {
+            uncovered.push(*desired);
+            continue;
+        };
+        let mut matching: Vec<_> = armed
+            .iter()
+            .filter(|armed| {
+                armed.executable == desired.executable
+                    && armed.kernel_only == desired.kernel_only
+                    && armed.granule == desired.granule
+                    && armed.va < desired_end
+                    && armed
+                        .va
+                        .checked_add(armed.len as u64)
+                        .is_some_and(|end| end > desired.va)
+            })
+            .copied()
+            .collect();
+        matching.sort_by_key(|range| range.va);
+        let mut cursor = desired.va;
+        for armed in matching {
+            let armed_start = armed.va.max(desired.va);
+            let armed_end = armed.va.saturating_add(armed.len as u64).min(desired_end);
+            if armed_start > cursor {
+                uncovered.push(crate::vmm::ForkCowRange {
+                    va: cursor,
+                    len: usize::try_from(armed_start - cursor).unwrap_or_default(),
+                    ..*desired
+                });
+            }
+            cursor = cursor.max(armed_end);
+            if cursor >= desired_end {
+                break;
+            }
+        }
+        if cursor < desired_end {
+            uncovered.push(crate::vmm::ForkCowRange {
+                va: cursor,
+                len: usize::try_from(desired_end - cursor).unwrap_or_default(),
+                ..*desired
+            });
+        }
+    }
+    uncovered
+}
+
 fn aarch64_task_state_from_snapshot(
     snapshot: &Aarch64VcpuSnapshot,
     pending_resume_pc: Option<u64>,
@@ -3307,11 +3363,19 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // gives the child a private stage-1 root and per-process EL1 state, but
         // its user mappings must retain the same writable frames rather than
         // entering the ordinary fork-COW protocol.
+        let stage_started = std::time::Instant::now();
         let cow_ranges = if request.shares_mm() {
-            Vec::new()
+            Arc::new(Vec::new())
         } else {
             self.vm.fork_cow_ranges()
         };
+        emit_stage(
+            HvpatchForkProcessSpecStagePhase::CowRangeProjection,
+            stage_started,
+            cow_ranges.len() as u64,
+        );
+        let parent_armed_snapshot = self.vm.frame_cow_arm_snapshot();
+        let cow_ranges_to_arm = uncovered_fork_cow_ranges(&cow_ranges, &parent_armed_snapshot);
 
         let stage_started = std::time::Instant::now();
         let parent = self.vcpu.snapshot()?;
@@ -3346,7 +3410,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // edited, and the snapshot below was pure copying. `CLONE_VM` and vfork
         // take that path, and cpython's forkserver and `subprocess` lean on it.
         let parent_page_tables_snapshot =
-            (!cow_ranges.is_empty()).then(|| match self.pt_snapshot_scratch.take() {
+            (!cow_ranges_to_arm.is_empty()).then(|| match self.pt_snapshot_scratch.take() {
                 Some(mut reused) => {
                     reused.clone_from(&page_tables);
                     reused
@@ -3364,7 +3428,6 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // reclaim sweep and fails `OutOfTables` with reclaimable tables still
         // in the graph.
         page_tables.declare_offline_private_image();
-        let parent_armed_snapshot = self.vm.frame_cow_arm_snapshot();
         // The child's own editable graph, plus the parent's rollback pre-image
         // when this fork copies the mm.
         emit_stage(
@@ -3378,7 +3441,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // still offline. A failure here cannot affect the parent. This closes
         // the interval in which the old implementation had already armed the
         // surviving parent before snapshot/clone/rebase/builder could fail.
-        for range in &cow_ranges {
+        for range in &cow_ranges_to_arm {
             if range.kernel_only {
                 page_tables
                     .set_kernel_readonly(
@@ -3458,7 +3521,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             process_asid: child_asid,
         };
 
-        if !cow_ranges.is_empty() {
+        let stage_started = std::time::Instant::now();
+        if !cow_ranges_to_arm.is_empty() {
             // Final publication transaction. All child allocation, mapping-plan,
             // ASID, snapshot, and wrapper work is complete. Save the exact live
             // graph and restore it (including a scoped TLBI) if either the edit
@@ -3478,7 +3542,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             let publish_parent = (|| -> Result<(), TrapError> {
                 self.pt_edit_and_flush(|manager| {
                     let mut outcome = PageTableApplyOutcome::default();
-                    for range in &cow_ranges {
+                    for range in &cow_ranges_to_arm {
                         outcome |= if range.kernel_only {
                             manager.set_kernel_readonly(range.va, range.len, range.executable)?
                         } else {
@@ -3496,7 +3560,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 // Durable pre-write structural receipt: one live-backing walk
                 // per armed semantic range. bit4 distinguishes fork-COW arming
                 // from alias publication and post-COW authentication.
-                for range in &cow_ranges {
+                for range in &cow_ranges_to_arm {
                     let walk = self.live_pt_debug_walk(range.va).map_err(|error| {
                         TrapError::Hypervisor(format!(
                             "authenticate hvpatch parent fork-COW arm at VA 0x{:x}: {error}",
@@ -3572,12 +3636,17 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     .restore_frame_cow_arm_snapshot(parent_armed_snapshot);
                 return Err(error);
             }
-            self.vm.arm_frame_cow_ranges(&cow_ranges);
+            self.vm.arm_frame_cow_ranges(&cow_ranges_to_arm);
             self.pending_process_fork = Some(ParentForkCowRollback {
                 page_tables: parent_page_tables_snapshot,
                 armed_ranges: parent_armed_snapshot,
             });
         }
+        emit_stage(
+            HvpatchForkProcessSpecStagePhase::ParentCowPublication,
+            stage_started,
+            cow_ranges_to_arm.len() as u64,
+        );
         emit_stage(HvpatchForkProcessSpecStagePhase::Total, total_started, 0);
         Ok(spec)
     }
@@ -3975,6 +4044,54 @@ unsafe impl<V: Aarch64Vmm> Send for Aarch64EngineCore<V> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fork_cow_rearm_projects_only_uncovered_spans() {
+        use crate::vmm::{CowGranule, ForkCowRange};
+
+        let desired = ForkCowRange {
+            va: 0x10_000,
+            len: 0x8000,
+            executable: false,
+            kernel_only: false,
+            granule: CowGranule::Compound,
+        };
+        let armed = [
+            ForkCowRange {
+                va: 0x10_000,
+                len: 0x2000,
+                ..desired
+            },
+            ForkCowRange {
+                va: 0x14_000,
+                len: 0x3000,
+                ..desired
+            },
+            ForkCowRange {
+                va: 0x17_000,
+                len: 0x1000,
+                granule: CowGranule::Page,
+                ..desired
+            },
+        ];
+
+        assert_eq!(
+            uncovered_fork_cow_ranges(&[desired], &armed),
+            vec![
+                ForkCowRange {
+                    va: 0x12_000,
+                    len: 0x2000,
+                    ..desired
+                },
+                ForkCowRange {
+                    va: 0x17_000,
+                    len: 0x1000,
+                    ..desired
+                },
+            ]
+        );
+        assert!(uncovered_fork_cow_ranges(&[desired], &[desired]).is_empty());
+    }
 
     fn continuation() -> carrick_hal::threaded::Aarch64SyscallContinuationV1 {
         carrick_hal::threaded::Aarch64SyscallContinuationV1 {
