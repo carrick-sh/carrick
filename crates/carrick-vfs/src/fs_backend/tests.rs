@@ -710,44 +710,6 @@ fn open_trusted_dir_fd_trusts_only_byte_exact_paths() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn marker_nodes_flip_dir_overlay_interference() {
-    let (b, scratch) = host_backend();
-    b.make_dir("/walk").unwrap();
-    b.make_dir("/elsewhere").unwrap();
-    b.make_dir("/later").unwrap();
-    // Fresh scratch: nothing can make a raw stream lie (a real FIFO has
-    // a faithful DT_FIFO, so it is NOT interference).
-    assert!(!b.dir_has_overlay_interference("/walk"));
-    b.create_fifo("/walk/pipe", 0o644).unwrap();
-    assert!(!b.dir_has_overlay_interference("/walk"));
-    // A socket MARKER node (regular file whose guest type lives in an
-    // xattr) must disable streaming for that directory, durably.
-    b.create_socket("/walk/sock", 0o755).unwrap();
-    assert!(b.dir_has_overlay_interference("/walk"));
-    assert!(!b.dir_has_overlay_interference("/elsewhere"));
-    reset_host_xattr_read_count();
-    assert!(!b.dir_has_overlay_interference("/elsewhere"));
-    assert_eq!(
-        host_xattr_read_count(),
-        0,
-        "a marker-free directory must retain its generation-bound negative proof"
-    );
-    assert!(!b.dir_has_overlay_interference("/later"));
-    b.create_socket("/later/sock", 0o755).unwrap();
-    assert!(
-        b.dir_has_overlay_interference("/later"),
-        "a marker write must invalidate the cached negative proof"
-    );
-    // ... including for a SIBLING backend on the same scratch (the
-    // fork-coherence property: the truth is the directory xattr, not the
-    // in-process bool).
-    let reattached = HostFsBackend::attach(scratch.path()).unwrap();
-    assert!(reattached.dir_has_overlay_interference("/walk"));
-    assert!(!reattached.dir_has_overlay_interference("/elsewhere"));
-}
-
-#[cfg(target_os = "macos")]
-#[test]
 fn device_marker_flips_dir_overlay_interference() {
     let (b, _scratch) = host_backend();
     assert!(!b.dir_has_overlay_interference("/"));
@@ -2205,35 +2167,74 @@ fn trusted_dirent_stream_owns_its_seek_offset() {
     }
 }
 
-/// Once the caller has proved that a directory contains no marker nodes, the
-/// trusted stream must not repeat that xattr proof while enumerating it.  This
-/// is a per-directory hot path: pathlib-style walks open and drain tens of
-/// thousands of directories, so one redundant `fgetxattr` per stream is a
-/// correctness-level amplification rather than bookkeeping noise.
-#[cfg(target_os = "macos")]
-#[test]
-fn trusted_plain_dirent_stream_does_not_repeat_marker_xattr_probe() {
-    let (backend, _scratch) = host_backend();
-    backend.make_dir("/plain").unwrap();
-    backend.create_file("/plain/entry").unwrap();
-
-    // Warm the fork-coherent root marker proof used by stream_dirents itself;
-    // the measured interval begins after the caller has established that this
-    // directory is safe for raw streaming.
-    assert!(!backend.dir_has_overlay_interference("/plain"));
-    reset_host_xattr_read_count();
-
-    let rows = backend.stream_dirents("/plain").expect("trusted stream");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(
-        host_xattr_read_count(),
-        0,
-        "trusted plain stream repeated the already-proved marker xattr read"
-    );
-}
-
 mod serial_host {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn marker_nodes_flip_dir_overlay_interference() {
+        let (b, scratch) = host_backend();
+        b.make_dir("/walk").unwrap();
+        b.make_dir("/elsewhere").unwrap();
+        b.make_dir("/later").unwrap();
+        // Fresh scratch: nothing can make a raw stream lie (a real FIFO has
+        // a faithful DT_FIFO, so it is NOT interference).
+        assert!(!b.dir_has_overlay_interference("/walk"));
+        b.create_fifo("/walk/pipe", 0o644).unwrap();
+        assert!(!b.dir_has_overlay_interference("/walk"));
+        // A socket MARKER node (regular file whose guest type lives in an
+        // xattr) must disable streaming for that directory, durably.
+        b.create_socket("/walk/sock", 0o755).unwrap();
+        assert!(b.dir_has_overlay_interference("/walk"));
+        assert!(!b.dir_has_overlay_interference("/elsewhere"));
+        reset_host_xattr_read_count();
+        assert!(!b.dir_has_overlay_interference("/elsewhere"));
+        assert_eq!(
+            host_xattr_read_count(),
+            0,
+            "a marker-free directory must retain its generation-bound negative proof"
+        );
+        assert!(!b.dir_has_overlay_interference("/later"));
+        b.create_socket("/later/sock", 0o755).unwrap();
+        assert!(
+            b.dir_has_overlay_interference("/later"),
+            "a marker write must invalidate the cached negative proof"
+        );
+        // ... including for a SIBLING backend on the same scratch (the
+        // fork-coherence property: the truth is the directory xattr, not the
+        // in-process bool).
+        let reattached = HostFsBackend::attach(scratch.path()).unwrap();
+        assert!(reattached.dir_has_overlay_interference("/walk"));
+        assert!(!reattached.dir_has_overlay_interference("/elsewhere"));
+    }
+
+    /// Once the caller has proved that a directory contains no marker nodes, the
+    /// trusted stream must not repeat that xattr proof while enumerating it. This
+    /// is a per-directory hot path: pathlib-style walks open and drain tens of
+    /// thousands of directories, so one redundant `fgetxattr` per stream is a
+    /// correctness-level amplification rather than bookkeeping noise.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trusted_plain_dirent_stream_does_not_repeat_marker_xattr_probe() {
+        let (backend, _scratch) = host_backend();
+        backend.make_dir("/plain").unwrap();
+        backend.create_file("/plain/entry").unwrap();
+
+        // Warm the fork-coherent root marker proof used by stream_dirents itself;
+        // the measured interval begins after the caller has established that this
+        // directory is safe for raw streaming.
+        assert!(!backend.dir_has_overlay_interference("/plain"));
+        reset_host_xattr_read_count();
+
+        let rows = backend.stream_dirents("/plain").expect("trusted stream");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            host_xattr_read_count(),
+            0,
+            "trusted plain stream repeated the already-proved marker xattr read"
+        );
+    }
+
     /// Answering "does the upper shadow this lower entry?" from the upper's
     /// own child-name set (one directory read) instead of one full path
     /// lookup per lower entry must be EXACT: every way the sparse upper can
