@@ -17761,7 +17761,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3104,
+      "line": 3183,
       "categories": [
         "mapping"
       ],
@@ -17770,7 +17770,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3112,
+      "line": 3191,
       "categories": [
         "mapping"
       ],
@@ -17779,7 +17779,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3128,
+      "line": 3207,
       "categories": [
         "mapping"
       ],
@@ -17788,7 +17788,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3141,
+      "line": 3220,
       "categories": [
         "mapping"
       ],
@@ -17968,7 +17968,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
-      "line": 657,
+      "line": 662,
       "categories": [
         "mapping"
       ],
@@ -17977,7 +17977,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
-      "line": 2089,
+      "line": 2127,
       "categories": [
         "mapping"
       ],
