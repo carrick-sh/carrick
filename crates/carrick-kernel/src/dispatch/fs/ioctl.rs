@@ -136,14 +136,10 @@ fn pidfd_get_info(
     let Some(open_file) = this.open_file(fd) else {
         return DispatchOutcome::errno(LINUX_EBADF);
     };
-    let watch = {
-        let Some(description) = open_file.description.read() else {
-            return DispatchOutcome::errno(LINUX_EBADF);
-        };
-        match &*description {
-            OpenDescription::Pidfd { kqueue, .. } => Arc::clone(kqueue),
-            _ => return DispatchOutcome::errno(LINUX_ENOTTY),
-        }
+    let watch = match open_file.description().pidfd_watch() {
+        PidfdWatchAccess::Closed => return DispatchOutcome::errno(LINUX_EBADF),
+        PidfdWatchAccess::WrongKind => return DispatchOutcome::errno(LINUX_ENOTTY),
+        PidfdWatchAccess::Watch(watch) => watch,
     };
     if arg == 0 {
         return DispatchOutcome::errno(LINUX_EINVAL);

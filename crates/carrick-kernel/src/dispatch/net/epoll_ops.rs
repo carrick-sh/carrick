@@ -305,15 +305,15 @@ impl<'a> NetView<'a> {
         // particular, EPOLLIN on a pipe write end made epoll_pwait repeatedly
         // drain and reject the beacon while restarting its relative timeout.
         // Keep only the direction the beacon actually represents. Endpoint
-        // state changes still pulse the epoll user wake through the target's
+        // state changes still pulse the instance user wake through the target's
         // wait-queue callback, so HUP/ERR and later readiness are re-sampled.
-        if let Some(open_file) = self.open_file(fd)
-            && let Some(open) = open_file.description.read()
+        if let Some(endpoint) = self
+            .open_file(fd)
+            .and_then(|open_file| open_file.description().in_memory_pipe_endpoint())
         {
-            match &*open {
-                OpenDescription::PipeReader { .. } => interest.write = false,
-                OpenDescription::PipeWriter { .. } => interest.read = false,
-                _ => {}
+            match endpoint {
+                InMemoryPipeEndpoint::Reader => interest.write = false,
+                InMemoryPipeEndpoint::Writer => interest.read = false,
             }
         }
         if interest.oob && !self.fd_supports_epoll_oob(fd) {
