@@ -660,12 +660,186 @@ impl<'a> FsView<'a> {
 
         }
 
+        fn name_to_handle_at(this, cx, dirfd: u64, pathname: GuestPtr, handle: GuestPtr, mount_id: GuestPtr, flags: u64) {
+            const HANDLE_BYTES: u32 = 16;
+            const MAX_HANDLE_BYTES: u32 = 128;
+            const HANDLE_TYPE_CARRICK_FID: i32 = 1;
+            const LEGACY_MOUNT_ID: i32 = 24;
+
+            let allowed = LINUX_AT_SYMLINK_FOLLOW
+                | LINUX_AT_EMPTY_PATH
+                | carrick_abi::LINUX_AT_HANDLE_FID
+                | carrick_abi::LINUX_AT_HANDLE_MNT_ID_UNIQUE
+                | carrick_abi::LINUX_AT_HANDLE_CONNECTABLE;
+            if flags & !allowed != 0
+                || flags & carrick_abi::LINUX_AT_HANDLE_CONNECTABLE != 0
+                    && flags
+                        & (carrick_abi::LINUX_AT_HANDLE_FID | LINUX_AT_EMPTY_PATH)
+                        != 0
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+
+            let path = read_guest_c_string(&*cx.memory, pathname.0)?;
+            let record = if path.is_empty() {
+                if flags & LINUX_AT_EMPTY_PATH == 0 {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+                }
+                match this.fd_stat_record(dirfd as i32) {
+                    Ok(record) => record,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                }
+            } else {
+                let stat_flags = if flags & LINUX_AT_SYMLINK_FOLLOW != 0 {
+                    0
+                } else {
+                    LINUX_AT_SYMLINK_NOFOLLOW
+                };
+                match this.path_stat_record(cx.kernel, dirfd, &path, stat_flags) {
+                    Ok(record) => record,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                }
+            };
+
+            // Identity-only handles can cover synthetic filesystems and never
+            // promise that open_by_handle_at can decode them. Keep decodable
+            // handles unsupported until that syscall has an authority model.
+            if flags & carrick_abi::LINUX_AT_HANDLE_FID == 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+            }
+
+            let header = match cx.memory.read_bytes(handle.0, 8) {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+            };
+            let available = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+            if available > MAX_HANDLE_BYTES {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let mount_width = if flags & carrick_abi::LINUX_AT_HANDLE_MNT_ID_UNIQUE != 0 {
+                8
+            } else {
+                4
+            };
+            if cx.memory.read_bytes(mount_id.0, mount_width).is_err() {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+
+            let mut encoded = [0u8; 24];
+            encoded[..4].copy_from_slice(&HANDLE_BYTES.to_le_bytes());
+            encoded[4..8].copy_from_slice(&HANDLE_TYPE_CARRICK_FID.to_le_bytes());
+            let filesystem = match record.fs_identity {
+                carrick_vfs::FsIdentity::Overlay => 1u64,
+                carrick_vfs::FsIdentity::Pipe => 2,
+                carrick_vfs::FsIdentity::Socket => 3,
+                carrick_vfs::FsIdentity::Proc => 4,
+                carrick_vfs::FsIdentity::Tmpfs => 5,
+                carrick_vfs::FsIdentity::SecretMem => 6,
+                carrick_vfs::FsIdentity::AnonInode => 7,
+                carrick_vfs::FsIdentity::DevPts => 8,
+                carrick_vfs::FsIdentity::Sysfs => 9,
+            };
+            encoded[8..16].copy_from_slice(&filesystem.to_le_bytes());
+            encoded[16..24].copy_from_slice(&record.ino.to_le_bytes());
+
+            let mount_write = if mount_width == 8 {
+                cx.memory
+                    .write_bytes(mount_id.0, &(LEGACY_MOUNT_ID as u64).to_le_bytes())
+            } else {
+                cx.memory
+                    .write_bytes(mount_id.0, &LEGACY_MOUNT_ID.to_le_bytes())
+            };
+            if mount_write.is_err() {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            let write_len = if available < HANDLE_BYTES { 8 } else { 24 };
+            if cx.memory.write_bytes(handle.0, &encoded[..write_len]).is_err() {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            if available < HANDLE_BYTES {
+                return Ok(DispatchOutcome::errno(LINUX_EOVERFLOW));
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_to_handle_at_returns_identity_only_fid() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let base = 0x3000u64;
+        let path_address = base;
+        let handle_address = base + 0x100;
+        let mount_address = base + 0x200;
+        let mut memory = LinearMemory::new(base, vec![0u8; 0x1000]);
+        memory
+            .write_bytes(path_address, b"/proc/filesystems\0")
+            .unwrap();
+        memory
+            .write_bytes(handle_address, &16u32.to_le_bytes())
+            .unwrap();
+
+        let out = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    264,
+                    SyscallArgs::from([
+                        LINUX_AT_FDCWD,
+                        path_address,
+                        handle_address,
+                        mount_address,
+                        carrick_abi::LINUX_AT_HANDLE_FID,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out, DispatchOutcome::Returned { value: 0 });
+        let header = memory.read_bytes(handle_address, 8).unwrap();
+        assert_eq!(u32::from_le_bytes(header[..4].try_into().unwrap()), 16);
+        assert_eq!(i32::from_le_bytes(header[4..8].try_into().unwrap()), 1);
+        assert_ne!(
+            memory.read_bytes(handle_address + 8, 16).unwrap(),
+            &[0u8; 16]
+        );
+    }
+
+    #[test]
+    fn name_to_handle_at_rejects_conflicting_handle_intent() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x3000, vec![0u8; 0x1000]);
+        let out = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    264,
+                    SyscallArgs::from([
+                        LINUX_AT_FDCWD,
+                        0,
+                        0,
+                        0,
+                        carrick_abi::LINUX_AT_HANDLE_FID | carrick_abi::LINUX_AT_HANDLE_CONNECTABLE,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out, DispatchOutcome::errno(LINUX_EINVAL));
+    }
 
     fn host_stream_file(
         host_fd: i32,
