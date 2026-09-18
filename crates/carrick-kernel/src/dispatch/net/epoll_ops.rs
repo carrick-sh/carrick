@@ -298,6 +298,24 @@ impl<'a> NetView<'a> {
             interest.write = false;
             interest.read = true;
         }
+        // An in-memory pipe endpoint's host fd is a Carrick readiness beacon,
+        // not the pipe itself: a reader's beacon means readable and a writer's
+        // beacon means writable. Registering the opposite guest direction on
+        // that same readable beacon manufactures a permanent host edge. In
+        // particular, EPOLLIN on a pipe write end made epoll_pwait repeatedly
+        // drain and reject the beacon while restarting its relative timeout.
+        // Keep only the direction the beacon actually represents. Endpoint
+        // state changes still pulse the epoll user wake through the target's
+        // wait-queue callback, so HUP/ERR and later readiness are re-sampled.
+        if let Some(open_file) = self.open_file(fd)
+            && let Some(open) = open_file.description.read()
+        {
+            match &*open {
+                OpenDescription::PipeReader { .. } => interest.write = false,
+                OpenDescription::PipeWriter { .. } => interest.read = false,
+                _ => {}
+            }
+        }
         if interest.oob && !self.fd_supports_epoll_oob(fd) {
             interest.oob = false;
         }
@@ -2055,6 +2073,42 @@ mod dns_gateway_wake_tests {
 #[cfg(test)]
 mod epoll_interest_tests {
     use super::*;
+
+    #[test]
+    fn in_memory_pipe_host_filters_follow_the_linux_endpoint_direction() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = crate::dispatch::LinearMemory::new(0x1000, vec![0; 0x100]);
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(59, SyscallArgs::from([0x1000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .expect("pipe2 dispatch");
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        let fds = memory.read_bytes(0x1000, 8).expect("pipe fds");
+        let reader = i32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let writer = i32::from_le_bytes(fds[4..8].try_into().unwrap());
+
+        let writer_read = dispatcher.epoll_effective_interest(writer, LINUX_EPOLLIN, 0, false);
+        assert!(
+            !writer_read.read && !writer_read.write,
+            "a write endpoint's writable readiness pipe must not stand in for EPOLLIN"
+        );
+        let writer_write = dispatcher.epoll_effective_interest(writer, LINUX_EPOLLOUT, 0, false);
+        assert!(writer_write.write);
+
+        let reader_write = dispatcher.epoll_effective_interest(reader, LINUX_EPOLLOUT, 0, false);
+        assert!(
+            !reader_write.read && !reader_write.write,
+            "a read endpoint's readable readiness pipe must not stand in for EPOLLOUT"
+        );
+        let reader_read = dispatcher.epoll_effective_interest(reader, LINUX_EPOLLIN, 0, false);
+        assert!(reader_read.read);
+    }
 
     #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
     #[test]
