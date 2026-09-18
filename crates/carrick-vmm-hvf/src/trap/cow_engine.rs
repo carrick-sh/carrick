@@ -11,63 +11,10 @@ impl HvfVmState {
     /// mapping: a later mprotect-to-write must still take frame COW rather than
     /// silently sharing the parent's frame. The alias registry supplies mappings
     /// installed by sibling vCPUs and filters retired lifetime-owner rows.
-    pub(crate) fn fork_cow_ranges(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
-        let aliases = alias_registry()
-            .lock()
-            .process_visible_ordered(self.mm_root_slot, self.container_root);
-        let alias_index = process_alias_index(&aliases, self.mm_root_slot, self.container_root);
-        let mut ranges: Vec<_> = self
-            .mappings
-            .iter()
-            .filter(|mapping| {
-                mapping.sharing == GuestMappingSharing::Private
-                    && mapping.start != crate::memory::LINUX_PAGE_TABLES_BASE
-                    && !is_kernel_only_stage1_range(
-                        mapping.start,
-                        semantic_extent_size(mapping.start, mapping.end),
-                    )
-                    && mapping_is_current_for_process_fork_indexed(mapping, &alias_index)
-            })
-            .map(|mapping| carrick_aarch64::vmm::ForkCowRange {
-                va: mapping.start,
-                len: semantic_extent_size(mapping.start, mapping.end),
-                executable: u64::from(mapping.perms) & 4 != 0,
-                kernel_only: is_kernel_only_stage1_range(
-                    mapping.start,
-                    semantic_extent_size(mapping.start, mapping.end),
-                ),
-                granule: carrick_aarch64::vmm::CowGranule::Compound,
-            })
-            .collect();
-        let local_aliases = current_process_alias_keys(
-            &self.mappings,
-            &aliases,
-            self.mm_root_slot,
-            self.container_root,
-        );
-        ranges.extend(
-            missing_process_aliases(
-                &local_aliases,
-                &aliases,
-                self.mm_root_slot,
-                self.container_root,
-            )
-            .into_iter()
-            .filter(|mapping| {
-                mapping.sharing == GuestMappingSharing::Private
-                    && !is_kernel_only_stage1_range(mapping.start, mapping.size)
-            })
-            .map(|mapping| carrick_aarch64::vmm::ForkCowRange {
-                va: mapping.start,
-                len: mapping.size,
-                executable: mapping.perms & 4 != 0,
-                kernel_only: is_kernel_only_stage1_range(mapping.start, mapping.size),
-                granule: carrick_aarch64::vmm::CowGranule::Compound,
-            }),
-        );
-        ranges.sort_by_key(|range| (range.va, range.len));
-        ranges.dedup_by_key(|range| (range.va, range.len));
-        ranges
+    pub(crate) fn fork_cow_ranges(
+        &self,
+    ) -> std::sync::Arc<Vec<carrick_aarch64::vmm::ForkCowRange>> {
+        self.fork_mapping_snapshot().cow_ranges()
     }
 
     pub(crate) fn arm_frame_cow_ranges(&mut self, ranges: &[carrick_aarch64::vmm::ForkCowRange]) {

@@ -680,8 +680,8 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// Exact private writable ranges owned by this mm. HVPatch consumes this
     /// before cloning the stage-1 graph; reference backends retain the empty
     /// default because their host VM mechanism supplies fork COW.
-    fn fork_cow_ranges(&self) -> Vec<ForkCowRange> {
-        Vec::new()
+    fn fork_cow_ranges(&self) -> std::sync::Arc<Vec<ForkCowRange>> {
+        std::sync::Arc::new(Vec::new())
     }
 
     fn arm_frame_cow_ranges(&mut self, _ranges: &[ForkCowRange]) {}

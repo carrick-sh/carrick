@@ -74,6 +74,13 @@ dtrace:::BEGIN
     bounded = 0;
 }
 
+carrick*:::host-image-base
+/pid == $target || progenyof($target)/
+{
+    printf("HVPUSERCPU|image|host_pid=%d|text_base=0x%llx|slide=0x%llx\n",
+        (int)arg0, (uint64_t)arg1, (uint64_t)arg2);
+}
+
 profile-1997
 /pid == $target || progenyof($target)/
 {

@@ -1912,6 +1912,10 @@ pub enum HvpatchForkProcessSpecStagePhase {
     BackendSpecFinalize = 9,
     WrapperProtections = 10,
     Total = 11,
+    /// Select the exact semantic ranges that enter fork COW.
+    CowRangeProjection = 12,
+    /// Arm and authenticate the surviving parent's stage-1 COW leaves.
+    ParentCowPublication = 13,
 }
 
 impl HvpatchForkProcessSpecStagePhase {
@@ -1924,8 +1928,9 @@ impl HvpatchForkProcessSpecStagePhase {
 ///
 /// `units` is stage-specific supporting shape: a boolean load flag for parent
 /// table load; bytes for page-table clone, rebase, publication, frame planning,
-/// and backend finalization; mapping count for alias union and validation; zero
-/// where no useful cardinality exists.
+/// and backend finalization; mapping count for alias union, validation, COW
+/// projection, and parent COW publication; zero where no useful cardinality
+/// exists.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HvpatchForkProcessSpecStage {
     phase: HvpatchForkProcessSpecStagePhase,
@@ -2992,6 +2997,14 @@ mod hvpatch_guest_probe_abi {
             10
         );
         assert_eq!(HvpatchForkProcessSpecStagePhase::Total.raw(), 11);
+        assert_eq!(
+            HvpatchForkProcessSpecStagePhase::CowRangeProjection.raw(),
+            12
+        );
+        assert_eq!(
+            HvpatchForkProcessSpecStagePhase::ParentCowPublication.raw(),
+            13
+        );
         assert_eq!(
             event.phase(),
             HvpatchForkProcessSpecStagePhase::TablePublish

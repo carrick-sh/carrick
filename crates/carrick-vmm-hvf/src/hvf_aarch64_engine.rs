@@ -1518,7 +1518,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         Some(self.state.protections_ref())
     }
 
-    fn fork_cow_ranges(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
+    fn fork_cow_ranges(&self) -> std::sync::Arc<Vec<carrick_aarch64::vmm::ForkCowRange>> {
         self.state.fork_cow_ranges()
     }
 

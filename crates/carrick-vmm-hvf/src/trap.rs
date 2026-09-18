@@ -1020,6 +1020,7 @@ pub(crate) struct HvfTaskState {
     #[cfg(not(test))]
     custody: std::sync::Arc<CarrierVmCustody>,
     pub(crate) mappings: TaskMappingIndex,
+    pub(crate) fork_mapping_cache: parking_lot::Mutex<process_plan::ForkMappingCache>,
     /// Per-mm stage-1 root-table slot. It contains page-table/control backing
     /// only; guest data frames live at stable global IPAs outside the slot.
     /// Ordinary VMM engines leave this unset.
@@ -1379,6 +1380,7 @@ impl HvfTaskState {
             #[cfg(not(test))]
             custody: std::sync::Arc::new(CarrierVmCustody::new()),
             mappings: TaskMappingIndex::new(),
+            fork_mapping_cache: parking_lot::Mutex::new(Default::default()),
             mm_root_slot: None,
             container_root: ContainerRootToken(0),
             pending_exec_mm_root_slot: None,
@@ -1622,6 +1624,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
             shared_key_offset: 0,
             owner_generation: mm_slot,
         }),
+        fork_mapping_cache: parking_lot::Mutex::new(Default::default()),
         mm_root_slot: Some((mm_slot << 20, 0x20_0000)),
         container_root: ContainerRootToken::from_raw(1),
         pending_exec_mm_root_slot: None,
@@ -5096,6 +5099,7 @@ impl HvpatchTaskRegistration {
                 .iter()
                 .map(HvpatchTaskMappingState::unowned_runtime_region)
                 .collect(),
+            fork_mapping_cache: parking_lot::Mutex::new(Default::default()),
             mm_root_slot: task_mm.mm_root_slot,
             container_root: task_mm.container_root,
             pending_exec_mm_root_slot: None,
@@ -6819,6 +6823,7 @@ impl HvfVmState {
                 #[cfg(not(test))]
                 custody,
                 mappings: mapped,
+                fork_mapping_cache: parking_lot::Mutex::new(Default::default()),
                 mm_root_slot: Some(plan.mm_root_slot),
                 container_root: plan.container_root,
                 pending_exec_mm_root_slot: None,
