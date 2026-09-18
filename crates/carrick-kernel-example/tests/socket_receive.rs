@@ -290,6 +290,138 @@ fn sctp_recvmsg_preserves_source_address() {
 }
 
 #[test]
+fn sctp_recvmsg_message_boundaries_and_eor() {
+    let mut script = setup_stream_pair(0, 1, LINUX_IPPROTO_SCTP);
+
+    // 1. Full message receive sets MSG_EOR
+    let msg1 = b"full message 1";
+    script.push(Step::Sys(
+        sys::sendto(slot(1), msg1, 0).ret(msg1.len() as i64),
+    ));
+    let iov1 = Layout::new(16)
+        .with_reloc(0, RelocWidth::U64, Operand::TaggedOut("payload1", 64))
+        .with_u64(8, 64);
+    let header1 = Layout::new(56)
+        .with_reloc(16, RelocWidth::U64, iov1)
+        .with_u64(24, 1)
+        .with_capture(true)
+        .with_tag("header1");
+    script.push(Step::Sys(
+        sys::recvmsg(slot(0), header1, 0).ret(msg1.len() as i64),
+    ));
+
+    // 2. Partial reads: short read omits EOR, completing read sets EOR
+    let msg2 = b"0123456789"; // 10 bytes
+    script.push(Step::Sys(
+        sys::sendto(slot(1), msg2, 0).ret(msg2.len() as i64),
+    ));
+    let iov2_part1 = Layout::new(16)
+        .with_reloc(0, RelocWidth::U64, Operand::TaggedOut("payload2_1", 4))
+        .with_u64(8, 4);
+    let header2_part1 = Layout::new(56)
+        .with_reloc(16, RelocWidth::U64, iov2_part1)
+        .with_u64(24, 1)
+        .with_capture(true)
+        .with_tag("header2_1");
+    script.push(Step::Sys(sys::recvmsg(slot(0), header2_part1, 0).ret(4)));
+
+    let iov2_part2 = Layout::new(16)
+        .with_reloc(0, RelocWidth::U64, Operand::TaggedOut("payload2_2", 64))
+        .with_u64(8, 64);
+    let header2_part2 = Layout::new(56)
+        .with_reloc(16, RelocWidth::U64, iov2_part2)
+        .with_u64(24, 1)
+        .with_capture(true)
+        .with_tag("header2_2");
+    script.push(Step::Sys(sys::recvmsg(slot(0), header2_part2, 0).ret(6)));
+
+    // 3. Two queued messages retain two separate boundaries
+    let msg3_a = b"first"; // 5 bytes
+    let msg3_b = b"second"; // 6 bytes
+    script.push(Step::Sys(
+        sys::sendto(slot(1), msg3_a, 0).ret(msg3_a.len() as i64),
+    ));
+    script.push(Step::Sys(
+        sys::sendto(slot(1), msg3_b, 0).ret(msg3_b.len() as i64),
+    ));
+
+    let iov3_a = Layout::new(16)
+        .with_reloc(0, RelocWidth::U64, Operand::TaggedOut("payload3_a", 64))
+        .with_u64(8, 64);
+    let header3_a = Layout::new(56)
+        .with_reloc(16, RelocWidth::U64, iov3_a)
+        .with_u64(24, 1)
+        .with_capture(true)
+        .with_tag("header3_a");
+    script.push(Step::Sys(sys::recvmsg(slot(0), header3_a, 0).ret(5)));
+
+    let iov3_b = Layout::new(16)
+        .with_reloc(0, RelocWidth::U64, Operand::TaggedOut("payload3_b", 64))
+        .with_u64(8, 64);
+    let header3_b = Layout::new(56)
+        .with_reloc(16, RelocWidth::U64, iov3_b)
+        .with_u64(24, 1)
+        .with_capture(true)
+        .with_tag("header3_b");
+    script.push(Step::Sys(sys::recvmsg(slot(0), header3_b, 0).ret(6)));
+
+    script.extend([
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ]);
+
+    let run = ScriptedBackend::new()
+        .run_root(script)
+        .expect("SCTP EOR run");
+
+    assert_eq!(run.exit_code(), 0);
+
+    // 1. Verify full message EOR
+    let flags1 = u32::from_ne_bytes(run.output_tagged("header1")[48..52].try_into().unwrap());
+    assert_ne!(
+        flags1 & carrick_abi::LINUX_MSG_EOR as u32,
+        0,
+        "full message recvmsg must set MSG_EOR"
+    );
+    assert_eq!(&run.output_tagged("payload1")[..msg1.len()], msg1);
+
+    // 2. Verify partial read EOR
+    let flags2_1 = u32::from_ne_bytes(run.output_tagged("header2_1")[48..52].try_into().unwrap());
+    assert_eq!(
+        flags2_1 & carrick_abi::LINUX_MSG_EOR as u32,
+        0,
+        "partial recvmsg before record end must NOT set MSG_EOR"
+    );
+    assert_eq!(&run.output_tagged("payload2_1")[..4], b"0123");
+
+    let flags2_2 = u32::from_ne_bytes(run.output_tagged("header2_2")[48..52].try_into().unwrap());
+    assert_ne!(
+        flags2_2 & carrick_abi::LINUX_MSG_EOR as u32,
+        0,
+        "completing recvmsg at record end must set MSG_EOR"
+    );
+    assert_eq!(&run.output_tagged("payload2_2")[..6], b"456789");
+
+    // 3. Verify two queued messages retain separate boundaries
+    let flags3_a = u32::from_ne_bytes(run.output_tagged("header3_a")[48..52].try_into().unwrap());
+    assert_ne!(
+        flags3_a & carrick_abi::LINUX_MSG_EOR as u32,
+        0,
+        "first queued message must set MSG_EOR"
+    );
+    assert_eq!(&run.output_tagged("payload3_a")[..5], msg3_a);
+
+    let flags3_b = u32::from_ne_bytes(run.output_tagged("header3_b")[48..52].try_into().unwrap());
+    assert_ne!(
+        flags3_b & carrick_abi::LINUX_MSG_EOR as u32,
+        0,
+        "second queued message must set MSG_EOR"
+    );
+    assert_eq!(&run.output_tagged("payload3_b")[..6], msg3_b);
+}
+
+#[test]
 fn tcp_recvfrom_ignores_source_pointer_for_payload_and_eof() {
     let mut script = setup_tcp_pair(0, 1);
     script.extend([
