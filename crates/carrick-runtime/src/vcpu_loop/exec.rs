@@ -326,6 +326,11 @@ enum RuntimePreparedExec {
     Other(Box<carrick_kernel::kernel::PreparedExec>),
 }
 
+enum RuntimeArmedExec {
+    Hvpatch(crate::hvpatch::ArmedProcessExec),
+    Other(carrick_kernel::kernel::PreparedExec),
+}
+
 enum RuntimePublishedExec {
     Hvpatch(crate::hvpatch::PublishedProcessExec),
     Other(carrick_kernel::kernel::PreparedExec),
@@ -1198,26 +1203,29 @@ mod exec_image_verification_tests {
     }
 
     #[test]
-    fn mm_publication_is_the_no_return_cut_and_precedes_destructive_work() {
+    fn no_return_arming_precedes_destructive_work_and_mm_publication_follows_it() {
         let source = include_str!("exec.rs");
+        let arm = source
+            .rfind("process.arm_exec_no_return(*prepared")
+            .expect("exec no-return arm");
         let publish = source
-            .rfind("process.publish_exec_mm(*prepared")
-            .expect("MM publication cut");
+            .rfind("process.publish_exec_mm(armed")
+            .expect("MM publication");
         let retire = source
             .rfind("retire_execution_authority_for_exec(&retiring_thread")
             .expect("predecessor retirement");
         let replace = source
             .rfind("engine.execve_into(&img)")
             .expect("destructive engine replacement");
-        assert!(publish < retire && retire < replace);
+        assert!(arm < retire && retire < replace && replace < publish);
         assert!(
-            !source[publish..].contains("get_sys_reg(carrick_hal::SysReg::Ttbr0)"),
-            "post-publication engine TTBR reads must not select MM authority",
+            !source[arm..].contains("get_sys_reg(carrick_hal::SysReg::Ttbr0)"),
+            "post-no-return engine TTBR reads must not select MM authority",
         );
-        let retirement_failure = &source[retire..replace];
+        let retirement_failure = &source[arm..replace];
         assert!(
             retirement_failure.contains("Self::exec_failed_past_no_return("),
-            "every failure after MM publication must be terminal",
+            "every failure after the no-return arm must be terminal",
         );
     }
 }
@@ -1873,22 +1881,22 @@ where
                 }
             };
         let old_files = prepared_kernel_exec.old_file_table();
-        let published_kernel_exec = match (kernel.hvpatch_process.as_ref(), prepared_kernel_exec) {
+        let armed_kernel_exec = match (kernel.hvpatch_process.as_ref(), prepared_kernel_exec) {
             (Some(process), RuntimePreparedExec::Hvpatch(prepared)) => {
                 let replacement_vma_source = prepared_dispatch_mm_exec.as_ref().map_or_else(
                     || kernel.dispatcher.vma_snapshot_source(),
                     carrick_kernel::dispatch::PreparedDispatchMmExec::vma_snapshot_source,
                 );
-                match process.publish_exec_mm(*prepared, replacement_vma_source) {
-                    Ok(published) => RuntimePublishedExec::Hvpatch(published),
+                match process.arm_exec_no_return(*prepared, replacement_vma_source) {
+                    Ok(armed) => RuntimeArmedExec::Hvpatch(armed),
                     Err(error) => {
                         return Err(RuntimeError::Configuration(format!(
-                            "reject exec before MM publication: {error}"
+                            "reject exec before no-return arm: {error}"
                         )));
                     }
                 }
             }
-            (None, RuntimePreparedExec::Other(prepared)) => RuntimePublishedExec::Other(*prepared),
+            (None, RuntimePreparedExec::Other(prepared)) => RuntimeArmedExec::Other(*prepared),
             _ => {
                 carrick_fatal!(
                     "hvpatch::exec_backend",
@@ -1899,16 +1907,20 @@ where
         if let Err(error) =
             retire_execution_authority_for_exec(&retiring_thread, &self.execution_lease)
         {
+            drop(replacement_asid_load);
+            drop(armed_kernel_exec);
             return Self::exec_failed_past_no_return(
                 kernel,
                 engine,
-                &format!("retire predecessor after MM publication: {error}"),
+                &format!("retire predecessor after exec no-return arm: {error}"),
             )
             .map(Some);
         }
         if let Some(identity) = exec_predecessor_identity
             && let Err(error) = engine.bind_exec_predecessor_identity(identity)
         {
+            drop(replacement_asid_load);
+            drop(armed_kernel_exec);
             return Self::exec_failed_past_no_return(
                 kernel,
                 engine,
@@ -1917,6 +1929,8 @@ where
             .map(Some);
         }
         if inventory_failure_injection == Some(HvpatchExecInventoryFailureInjection::ImageReplace) {
+            drop(replacement_asid_load);
+            drop(armed_kernel_exec);
             return Self::exec_failed_past_no_return(
                 kernel,
                 engine,
@@ -1925,6 +1939,8 @@ where
             .map(Some);
         }
         if let Err(error) = engine.execve_into(&img) {
+            drop(replacement_asid_load);
+            drop(armed_kernel_exec);
             return Self::exec_failed_past_no_return(
                 kernel,
                 engine,
@@ -1932,6 +1948,29 @@ where
             )
             .map(Some);
         }
+        backend_publication_gate.record_engine_replaced();
+        let published_kernel_exec = match (kernel.hvpatch_process.as_ref(), armed_kernel_exec) {
+            (Some(process), RuntimeArmedExec::Hvpatch(armed)) => {
+                match process.publish_exec_mm(armed) {
+                    Ok(published) => RuntimePublishedExec::Hvpatch(published),
+                    Err(error) => {
+                        return Self::exec_failed_past_no_return(
+                            kernel,
+                            engine,
+                            &format!("publish replacement MM after image replacement: {error}"),
+                        )
+                        .map(Some);
+                    }
+                }
+            }
+            (None, RuntimeArmedExec::Other(prepared)) => RuntimePublishedExec::Other(prepared),
+            _ => {
+                carrick_fatal!(
+                    "hvpatch::exec_backend",
+                    "armed Kernel exec variant disagrees with configured HVPatch backend after destructive image replacement"
+                );
+            }
+        };
         if let (Some(process), RuntimePublishedExec::Hvpatch(published)) =
             (kernel.hvpatch_process.as_ref(), &published_kernel_exec)
         {
@@ -1946,7 +1985,6 @@ where
                 .map(Some);
             }
         }
-        backend_publication_gate.record_engine_replaced();
         // `execve_into` has released every stage-2/frame lock. Topology
         // serialization must also be released before runtime takes its
         // frame-inventory authority lock.
