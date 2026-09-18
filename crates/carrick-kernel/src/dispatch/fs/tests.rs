@@ -2448,6 +2448,60 @@ mod serial_host {
         assert_eq!(ws_row, 50, "fd2 should observe winsize set by fd1");
         assert_eq!(ws_col, 132, "fd2 should observe winsize set by fd1");
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tty0_tcflsh_accepts_linux_selectors_and_rejects_invalid() {
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+        let fd = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/dev/tty0",
+            LINUX_O_RDWR,
+        );
+        assert!(fd >= 0, "open of /dev/tty0 should succeed: {fd}");
+
+        for selector in [
+            carrick_abi::LINUX_TCIFLUSH,
+            carrick_abi::LINUX_TCOFLUSH,
+            carrick_abi::LINUX_TCIOFLUSH,
+        ] {
+            let rc = lane_syscall(
+                &mut dispatcher,
+                &mut memory,
+                29, // ioctl
+                [fd as u64, carrick_abi::LINUX_TCFLSH, selector, 0, 0, 0],
+            );
+            assert_eq!(
+                rc, 0,
+                "TCFLSH on /dev/tty0 with selector {selector} should return 0"
+            );
+        }
+
+        for invalid_selector in [3, u64::MAX] {
+            let rc = lane_syscall(
+                &mut dispatcher,
+                &mut memory,
+                29, // ioctl
+                [
+                    fd as u64,
+                    carrick_abi::LINUX_TCFLSH,
+                    invalid_selector,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            assert_eq!(
+                rc,
+                -i64::from(carrick_abi::LINUX_EINVAL.get()),
+                "TCFLSH on /dev/tty0 with invalid selector {invalid_selector} should return -EINVAL"
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]

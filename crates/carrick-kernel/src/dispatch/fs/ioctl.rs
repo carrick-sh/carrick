@@ -551,6 +551,14 @@ impl<'a> FsView<'a> {
                         },
                         Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
                     },
+                    LINUX_TCFLSH => match arg {
+                        crate::linux_abi::LINUX_TCIFLUSH
+                        | crate::linux_abi::LINUX_TCOFLUSH
+                        | crate::linux_abi::LINUX_TCIOFLUSH => {
+                            DispatchOutcome::Returned { value: 0 }
+                        }
+                        _ => DispatchOutcome::errno(LINUX_EINVAL),
+                    },
                     _ => {
                         cx.reporter
                             .record(CompatEvent::unhandled_ioctl(fd.0, ioctl_request, arg));
