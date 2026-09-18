@@ -91,6 +91,30 @@ fn setsockopt_in_memory(
     optval_addr: u64,
     optlen: u32,
 ) -> DispatchOutcome {
+    if is_mcast_sockopt(level, optname) {
+        if socket.family() != crate::linux_abi::LINUX_AF_INET
+            && socket.family() != crate::linux_abi::LINUX_AF_INET6
+        {
+            return DispatchOutcome::errno(LINUX_ENOPROTOOPT);
+        }
+        if optlen != 0 && optval_addr == 0 {
+            return DispatchOutcome::errno(LINUX_EFAULT);
+        }
+        let bytes = if optval_addr == 0 || optlen == 0 {
+            Vec::new()
+        } else {
+            let Ok(bytes) = memory.read_bytes(optval_addr, optlen as usize) else {
+                return DispatchOutcome::errno(LINUX_EFAULT);
+            };
+            bytes
+        };
+        return mcast_setsockopt_outcome(
+            &mut socket.state.lock().mcast_memberships,
+            level,
+            optname,
+            bytes,
+        );
+    }
     if level == LINUX_SOL_SOCKET {
         match optname {
             LINUX_SO_KEEPALIVE => {
@@ -1230,6 +1254,8 @@ impl<'a> NetView<'a> {
 #[cfg(test)]
 mod mcast_membership_tests {
     use super::*;
+    use crate::dispatch::LinearMemory;
+    use crate::dispatch::net::unix_pure::{LinuxUcred, PureSocketInner};
 
     fn errno(outcome: DispatchOutcome) -> Option<LinuxErrno> {
         match outcome {
@@ -1286,6 +1312,28 @@ mod mcast_membership_tests {
             DispatchOutcome::Returned { value: 0 }
         ));
         assert!(listener_memberships.is_empty());
+    }
+
+    #[test]
+    fn fresh_in_memory_accepted_socket_does_not_inherit_multicast_membership() {
+        let socket = PureSocketInner::new_with_family(
+            crate::linux_abi::LINUX_AF_INET,
+            crate::linux_abi::LINUX_SOCK_STREAM,
+            crate::linux_abi::LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+        );
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+        memory.write_bytes(0x4000, &[0xa5; 136]).unwrap();
+
+        let outcome = setsockopt_in_memory(
+            &socket,
+            &memory,
+            crate::linux_abi::LINUX_SOL_IP,
+            MCAST_LEAVE_GROUP,
+            0x4000,
+            136,
+        );
+        assert_eq!(errno(outcome), Some(crate::linux_abi::LINUX_EADDRNOTAVAIL));
     }
 }
 

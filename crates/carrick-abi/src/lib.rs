@@ -2495,6 +2495,40 @@ pub struct LinuxIfconf {
     pub ifc_buf: u64,
 }
 
+/// Linux `struct procmap_query` used by `ioctl(PROCMAP_QUERY)` on a
+/// `/proc/<pid>/maps` descriptor.
+#[repr(C, packed)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+    Unaligned,
+)]
+pub struct LinuxProcmapQuery {
+    pub size: u64,
+    pub query_flags: u64,
+    pub query_addr: u64,
+    pub vma_start: u64,
+    pub vma_end: u64,
+    pub vma_flags: u64,
+    pub vma_page_size: u64,
+    pub vma_offset: u64,
+    pub inode: u64,
+    pub dev_major: u32,
+    pub dev_minor: u32,
+    pub vma_name_size: u32,
+    pub build_id_size: u32,
+    pub vma_name_addr: u64,
+    pub build_id_addr: u64,
+}
+
 /// Linux sigset argument pack passed to `pselect6`, `ppoll`, and `epoll_pwait`.
 #[repr(C, packed)]
 #[derive(
@@ -2849,6 +2883,12 @@ assert_layout!(LinuxIfreq, size = 40, ifr_name @ 0, ifr_ifru @ 16);
 
 kernel_abi!(LinuxIfconf, 16, "struct ifconf on 64-bit Linux is 16 bytes");
 assert_layout!(LinuxIfconf, size = 16, ifc_len @ 0, ifc_buf @ 8);
+kernel_abi!(
+    LinuxProcmapQuery,
+    104,
+    "struct procmap_query on 64-bit Linux is 104 bytes"
+);
+assert_layout!(LinuxProcmapQuery, size = 104, size @ 0, query_flags @ 8, query_addr @ 16, vma_start @ 24, vma_end @ 32, vma_flags @ 40, vma_page_size @ 48, vma_offset @ 56, inode @ 64, dev_major @ 72, dev_minor @ 76, vma_name_size @ 80, build_id_size @ 84, vma_name_addr @ 88, build_id_addr @ 96);
 
 kernel_abi!(
     LinuxSigsetArgpack,
@@ -4425,6 +4465,14 @@ pub const LINUX_TCXONC: u64 = 0x540A;
 pub const LINUX_TCFLSH: u64 = 0x540B;
 pub const LINUX_TCSBRKP: u64 = 0x5425;
 pub const LINUX_FICLONE: u64 = 0x4004_9409;
+pub const LINUX_PROCMAP_QUERY: u64 = 0xc068_6611;
+pub const LINUX_PROCMAP_QUERY_VMA_READABLE: u64 = 0x01;
+pub const LINUX_PROCMAP_QUERY_VMA_WRITABLE: u64 = 0x02;
+pub const LINUX_PROCMAP_QUERY_VMA_EXECUTABLE: u64 = 0x04;
+pub const LINUX_PROCMAP_QUERY_VMA_SHARED: u64 = 0x08;
+pub const LINUX_PROCMAP_QUERY_COVERING_OR_NEXT_VMA: u64 = 0x10;
+pub const LINUX_PROCMAP_QUERY_FILE_BACKED_VMA: u64 = 0x20;
+pub const LINUX_KCMP_FILE: u64 = 0;
 pub const LINUX_RNDGETENTCNT: u64 = 0x8004_5200;
 // TCXONC actions (tcflow): suspend/resume output/input.
 pub const LINUX_TCOOFF: u64 = 0;

@@ -2007,6 +2007,14 @@ impl Task {
             .collect()
     }
 
+    /// File table of the process leader named by a pidfd. Linux pidfds name a
+    /// thread-group leader; retain the exact leader resource generation rather
+    /// than recapturing the caller's ambient table.
+    pub(crate) fn leader_file_table(&self) -> Option<Arc<FileTable>> {
+        let leader = LinuxTid::for_task_leader(self.key.id);
+        self.thread(leader).map(|thread| thread.resources().files())
+    }
+
     pub fn fork_barrier_participants(
         &self,
         owner: ThreadKey,

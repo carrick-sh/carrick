@@ -269,6 +269,10 @@ pub(crate) fn is_root_slot_pool_enabled() -> bool {
 }
 
 pub(crate) const ROOT_SLOT_SIZE: usize = 2 * 1024 * 1024;
+pub(crate) const ROOT_SLOT_MAPPED_SIZE: usize =
+    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
+
+const _: () = assert!(ROOT_SLOT_MAPPED_SIZE < ROOT_SLOT_SIZE);
 
 /// Query the configured size of the root slot pool in bytes.
 ///
@@ -295,6 +299,7 @@ struct PooledRootSlotEntry {
     host_ptr: *mut u8,
     in_use: bool,
     populated_prefix: usize,
+    stage2_lease: Option<crate::trap::GlobalFrameStage2Lease>,
 }
 
 /// A pre-mapped, carrier-scoped pool of stage-2 backed 2 MiB root-slot memory regions.
@@ -302,9 +307,9 @@ struct PooledRootSlotEntry {
 pub(crate) struct PreMappedRootSlotPool {
     base_ipa: u64,
     pool_size: usize,
-    _host_mapping: crate::host_mapping::OwnedHostMapping,
-    lease: Mutex<Option<crate::trap::GlobalFrameStage2Lease>>,
     slots: Mutex<Vec<PooledRootSlotEntry>>,
+    _host_mapping: crate::host_mapping::OwnedHostMapping,
+    backend_mapping_required: bool,
     allocated_count: AtomicUsize,
 }
 
@@ -332,7 +337,6 @@ impl PreMappedRootSlotPool {
     pub(crate) fn try_new() -> Result<Self, crate::trap::TrapError> {
         let pool_size = root_slot_pool_size();
         let base_ipa = carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE;
-        let mut lease = crate::trap::GlobalFrameStage2Lease::fixed(base_ipa, pool_size as u64);
         let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             pool_size,
             crate::host_mapping::HostMappingKind::PerMmKernelState,
@@ -341,27 +345,10 @@ impl PreMappedRootSlotPool {
             crate::trap::TrapError::Hypervisor(format!("allocate root slot pool backing: {error}"))
         })?;
 
-        let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
-        let map_rc = unsafe {
-            crate::trap::inventory_hv_vm_map(
-                host_mapping.as_ptr().cast(),
-                base_ipa,
-                pool_size,
-                u64::from(stage2_perms),
-            )
-        };
-        if map_rc != 0 {
-            return Err(crate::trap::TrapError::Hypervisor(format!(
-                "map root slot pool IPA 0x{base_ipa:x} size 0x{pool_size:x}: 0x{map_rc:x}"
-            )));
-        }
-        lease.mark_mapped();
-
-        const TWO_MIB: usize = 2 * 1024 * 1024;
-        let num_slots = pool_size / TWO_MIB;
+        let num_slots = pool_size / ROOT_SLOT_SIZE;
         let mut slots = Vec::with_capacity(num_slots);
         for i in 0..num_slots as u32 {
-            let offset = i as usize * TWO_MIB;
+            let offset = i as usize * ROOT_SLOT_SIZE;
             let slot_ipa = base_ipa + offset as u64;
             let host_ptr = unsafe { host_mapping.as_ptr().add(offset) };
             slots.push(PooledRootSlotEntry {
@@ -370,23 +357,23 @@ impl PreMappedRootSlotPool {
                 host_ptr,
                 in_use: false,
                 populated_prefix: 0,
+                stage2_lease: None,
             });
         }
 
         Ok(Self {
             base_ipa,
             pool_size,
-            _host_mapping: host_mapping,
-            lease: Mutex::new(Some(lease)),
             slots: Mutex::new(slots),
+            _host_mapping: host_mapping,
+            backend_mapping_required: true,
             allocated_count: AtomicUsize::new(0),
         })
     }
 
     #[cfg(test)]
     pub(crate) fn new_test_fixture(num_slots: usize) -> Self {
-        const TWO_MIB: usize = 2 * 1024 * 1024;
-        let pool_size = num_slots * TWO_MIB;
+        let pool_size = num_slots * ROOT_SLOT_SIZE;
         let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             pool_size,
             crate::host_mapping::HostMappingKind::PerMmKernelState,
@@ -395,7 +382,7 @@ impl PreMappedRootSlotPool {
         let base_ipa = carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE;
         let mut slots = Vec::with_capacity(num_slots);
         for i in 0..num_slots as u32 {
-            let offset = i as usize * TWO_MIB;
+            let offset = i as usize * ROOT_SLOT_SIZE;
             let slot_ipa = base_ipa + offset as u64;
             let host_ptr = unsafe { host_mapping.as_ptr().add(offset) };
             slots.push(PooledRootSlotEntry {
@@ -404,35 +391,67 @@ impl PreMappedRootSlotPool {
                 host_ptr,
                 in_use: false,
                 populated_prefix: 0,
+                stage2_lease: None,
             });
         }
         Self {
             base_ipa,
             pool_size,
-            _host_mapping: host_mapping,
-            lease: Mutex::new(None),
             slots: Mutex::new(slots),
+            _host_mapping: host_mapping,
+            backend_mapping_required: false,
             allocated_count: AtomicUsize::new(0),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn allocate_slot_at(
         self: &Arc<Self>,
         requested_ipa: u64,
     ) -> Option<PooledRootSlotHandle> {
-        const TWO_MIB: usize = 2 * 1024 * 1024;
+        self.allocate_slot_at_for_extent(requested_ipa, ROOT_SLOT_MAPPED_SIZE)
+    }
+
+    pub(crate) fn allocate_slot_at_for_extent(
+        self: &Arc<Self>,
+        requested_ipa: u64,
+        required_len: usize,
+    ) -> Option<PooledRootSlotHandle> {
+        if required_len == 0 || required_len > ROOT_SLOT_MAPPED_SIZE {
+            return None;
+        }
         if requested_ipa < self.base_ipa || requested_ipa >= self.base_ipa + self.pool_size as u64 {
             return None;
         }
         let offset = (requested_ipa - self.base_ipa) as usize;
-        if !offset.is_multiple_of(TWO_MIB) {
+        if !offset.is_multiple_of(ROOT_SLOT_SIZE) {
             return None;
         }
-        let slot_index = (offset / TWO_MIB) as u32;
+        let slot_index = (offset / ROOT_SLOT_SIZE) as u32;
         let mut slots = self.slots.lock();
         let slot = slots.get_mut(slot_index as usize)?;
         if slot.in_use {
             return None;
+        }
+        if self.backend_mapping_required && slot.stage2_lease.is_none() {
+            let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+            let map_rc = unsafe {
+                crate::trap::inventory_hv_vm_map(
+                    slot.host_ptr.cast(),
+                    slot.base_ipa,
+                    ROOT_SLOT_MAPPED_SIZE,
+                    u64::from(stage2_perms),
+                )
+            };
+            if map_rc != 0 {
+                return None;
+            }
+            let mut lease = crate::trap::GlobalFrameStage2Lease::fixed(
+                slot.base_ipa,
+                ROOT_SLOT_MAPPED_SIZE as u64,
+            );
+            lease.mark_mapped();
+            slot.stage2_lease = Some(lease);
         }
         // Invariant: Zero only as far as the populated prefix on reuse.
         // A stale table beyond the prefix is unreachable from the root because the
@@ -448,17 +467,16 @@ impl PreMappedRootSlotPool {
         self.allocated_count.fetch_add(1, Ordering::Relaxed);
         Some(PooledRootSlotHandle {
             pool: Arc::clone(self),
-            slot_index,
+            slot_index: slot.slot_index,
             _ipa: requested_ipa,
             host_ptr: slot.host_ptr,
-            len: TWO_MIB,
+            len: ROOT_SLOT_MAPPED_SIZE,
             populated_prefix: AtomicUsize::new(0),
         })
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn allocate_slot(self: &Arc<Self>) -> Option<PooledRootSlotHandle> {
-        const TWO_MIB: usize = 2 * 1024 * 1024;
         let mut slots = self.slots.lock();
         for slot in slots.iter_mut() {
             if !slot.in_use {
@@ -475,7 +493,7 @@ impl PreMappedRootSlotPool {
                     slot_index: slot.slot_index,
                     _ipa: slot.base_ipa,
                     host_ptr: slot.host_ptr,
-                    len: TWO_MIB,
+                    len: ROOT_SLOT_MAPPED_SIZE,
                     populated_prefix: AtomicUsize::new(0),
                 });
             }
@@ -484,17 +502,26 @@ impl PreMappedRootSlotPool {
     }
 
     fn recycle(&self, slot_index: u32, prefix: usize) {
-        const TWO_MIB: usize = 2 * 1024 * 1024;
         let mut slots = self.slots.lock();
         if let Some(slot) = slots.get_mut(slot_index as usize) {
             slot.in_use = false;
-            slot.populated_prefix = prefix.max(slot.populated_prefix).min(TWO_MIB);
+            slot.populated_prefix = prefix.max(slot.populated_prefix).min(ROOT_SLOT_MAPPED_SIZE);
             self.allocated_count.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     pub(crate) fn contains_ipa(&self, ipa: u64) -> bool {
-        ipa >= self.base_ipa && ipa < self.base_ipa + (self.pool_size as u64)
+        if ipa < self.base_ipa || ipa >= self.base_ipa + (self.pool_size as u64) {
+            return false;
+        }
+        let offset = (ipa - self.base_ipa) as usize;
+        if offset % ROOT_SLOT_SIZE >= ROOT_SLOT_MAPPED_SIZE {
+            return false;
+        }
+        !self.backend_mapping_required
+            || self.slots.lock()[offset / ROOT_SLOT_SIZE]
+                .stage2_lease
+                .is_some()
     }
 
     #[allow(dead_code)]
@@ -513,8 +540,10 @@ impl PreMappedRootSlotPool {
     }
 
     pub(crate) fn forget_backend_mapping(&self) {
-        if let Some(mut lease) = self.lease.lock().take() {
-            lease.forget_backend_mapping();
+        for slot in self.slots.lock().iter_mut() {
+            if let Some(lease) = slot.stage2_lease.as_mut() {
+                lease.forget_backend_mapping();
+            }
         }
     }
 }
@@ -554,6 +583,33 @@ impl PooledRootSlotHandle {
 
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    /// A root slot owns the aligned 2 MiB carrier allocation, while the
+    /// primary stage-1 arena currently publishes only its 1.75 MiB logical
+    /// extent. The unused tail stays outside the child's inventory and stage-1
+    /// graph, but it does not require a separate host mapping.
+    pub(crate) fn can_back_extent(&self, extent_len: usize) -> bool {
+        extent_len != 0 && extent_len <= self.len
+    }
+
+    pub(crate) fn backend_mapping_is_live(&self) -> bool {
+        let slots = self.pool.slots.lock();
+        let Some(slot) = slots.get(self.slot_index as usize) else {
+            return false;
+        };
+        if !slot.in_use || slot.base_ipa != self._ipa || slot.host_ptr != self.host_ptr {
+            return false;
+        }
+        if !self.pool.backend_mapping_required {
+            return true;
+        }
+        slot.stage2_lease.as_ref().is_some_and(|lease| {
+            lease.active
+                && lease.mapped
+                && lease.backend_map_installed
+                && lease.key() == (self._ipa, self.len as u64)
+        })
     }
 
     pub(crate) fn record_populated_prefix(&self, prefix: usize) {
@@ -747,9 +803,25 @@ mod tests {
 
         assert!(!pool.contains_ipa(base - 1));
         assert!(pool.contains_ipa(base));
+        assert!(pool.contains_ipa(base + ROOT_SLOT_MAPPED_SIZE as u64 - 1));
+        assert!(!pool.contains_ipa(base + ROOT_SLOT_MAPPED_SIZE as u64));
         assert!(pool.contains_ipa(base + ROOT_SLOT_SIZE as u64));
-        assert!(pool.contains_ipa(base + size - 1));
+        assert!(!pool.contains_ipa(base + size - 1));
         assert!(!pool.contains_ipa(base + size));
+    }
+
+    #[test]
+    fn root_slot_accepts_the_populated_primary_page_table_extent() {
+        let pool = Arc::new(PreMappedRootSlotPool::new_test_fixture(1));
+        let slot = pool.allocate_slot().expect("checkout root slot");
+
+        assert!(slot.backend_mapping_is_live());
+        assert!(slot.can_back_extent(carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize));
+        assert!(!slot.can_back_extent(ROOT_SLOT_SIZE));
+        assert_eq!(
+            slot.len(),
+            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize
+        );
     }
 
     #[test]

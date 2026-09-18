@@ -477,6 +477,28 @@
       "domain": "hvpatch::cow_token"
     },
     {
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "function": "HvfTaskState::promote_exclusive_cow_source_in_place",
+      "ordinal_in_function": 1,
+      "fingerprint": "e85086e648c53f18429a2d30e212562c2864a9d1620056890213776ab2135ada",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Stage-1 TLB invalidation failed while rolling back an unsuccessful in-place exclusive COW promotion, leaving hardware translations inconsistent with the restored page-table journal.",
+      "sink": "fatal",
+      "domain": "hvpatch::mm_authority"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "function": "HvfTaskState::promote_exclusive_cow_source_in_place",
+      "ordinal_in_function": 2,
+      "fingerprint": "a6bb67a08d79607561fa04d7287b98a0b896e0d958941eed5e26d4e1443b603b",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Stage-1 TLB invalidation failed after committing an in-place exclusive COW promotion, leaving stale read-only translations after the page-table authority made the source writable.",
+      "sink": "fatal",
+      "domain": "hvpatch::mm_authority"
+    },
+    {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfTaskState::publish_pending_fork_frame_receipts_with",
       "ordinal_in_function": 1,

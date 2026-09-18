@@ -17,7 +17,8 @@
  * of pt-alias-walk is not reliable on this macOS build) and carries the live
  * leaf, independently expected IPA/AP, and phase (0 parent armed, 1 child
  * inherited, 2 writer COW published, 3 COW preserved denied protection,
- * 4/5/6 later writable/read-only/inaccessible publication).
+ * 4/5/6 later writable/read-only/inaccessible publication, and 7 an
+ * authenticated in-place write grant after VM-wide last-owner proof).
  * hvpatch-global-frame-stage2 carries every successful map/unmap of an HVPatch
  * physical extent, including host backing/perms on map.  Boot frames retain
  * stable identity-numbered global IPAs while replacement/COW frames live in

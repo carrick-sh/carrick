@@ -22,6 +22,7 @@ pub struct PacketRing {
     version: i32,
     block_size: usize,
     block_nr: usize,
+    packet_offset: usize,
     #[allow(dead_code)]
     frame_size: usize,
     #[allow(dead_code)]
@@ -37,6 +38,7 @@ pub struct PacketRing {
 
 impl PacketRing {
     pub(crate) fn new_v3(req: &LinuxTpacketReq3) -> Result<Self, LinuxErrno> {
+        const TPACKET_ALIGNMENT: usize = 16;
         let block_size = req.tp_block_size as usize;
         let block_nr = req.tp_block_nr as usize;
         let frame_size = req.tp_frame_size as usize;
@@ -50,18 +52,33 @@ impl PacketRing {
         if frame_size < core::mem::size_of::<LinuxTpacket3Hdr>() || frame_size > block_size {
             return Err(LINUX_EINVAL);
         }
+        // Linux's BLK_PLUS_PRIV() check is a security boundary: the aligned
+        // private area and the block descriptor must both fit in one block.
+        // Performing the addition in the host-size domain also prevents the
+        // high-bit tp_sizeof_priv value used by LTP's CVE-2017-7308 regression
+        // from wrapping through a 32-bit intermediate.
+        let private_size = (req.tp_sizeof_priv as usize)
+            .checked_add(TPACKET_ALIGNMENT - 1)
+            .map(|size| size & !(TPACKET_ALIGNMENT - 1))
+            .ok_or(LINUX_EINVAL)?;
+        let packet_offset = core::mem::size_of::<LinuxTpacketBlockDesc>()
+            .checked_add(private_size)
+            .ok_or(LINUX_EINVAL)?;
+        if packet_offset > block_size {
+            return Err(LINUX_EINVAL);
+        }
         let total_size = block_size.checked_mul(block_nr).ok_or(LINUX_EINVAL)?;
         let mut buf = vec![0u8; total_size];
         for i in 0..block_nr {
             let offset = i * block_size;
             let desc = LinuxTpacketBlockDesc {
                 version: LINUX_TPACKET_V3 as u32,
-                offset_to_priv: 0,
+                offset_to_priv: core::mem::size_of::<LinuxTpacketBlockDesc>() as u32,
                 hdr: LinuxTpacketHdrV1 {
                     block_status: LINUX_TP_STATUS_KERNEL,
                     num_pkts: 0,
-                    offset_to_first_pkt: core::mem::size_of::<LinuxTpacketBlockDesc>() as u32,
-                    blk_len: core::mem::size_of::<LinuxTpacketBlockDesc>() as u32,
+                    offset_to_first_pkt: packet_offset as u32,
+                    blk_len: packet_offset as u32,
                     seq_num: 0,
                     ts_first_pkt: LinuxTpacketBdTs {
                         ts_sec: 0,
@@ -80,6 +97,7 @@ impl PacketRing {
             version: LINUX_TPACKET_V3,
             block_size,
             block_nr,
+            packet_offset,
             frame_size,
             frame_nr,
             retire_blk_tov: req.tp_retire_blk_tov,
@@ -107,6 +125,7 @@ impl PacketRing {
             version,
             block_size,
             block_nr,
+            packet_offset: 0,
             frame_size,
             frame_nr,
             retire_blk_tov: 0,
@@ -138,7 +157,7 @@ impl PacketRing {
             let mac_offset = hdr_len as u16;
             let net_offset = mac_offset + 14;
             let total_pkt_len = hdr_len + frame.len();
-            let blk_len = (desc_len + total_pkt_len) as u32;
+            let blk_len = (self.packet_offset + total_pkt_len) as u32;
 
             let pkt_hdr = LinuxTpacket3Hdr {
                 tp_next_offset: 0,
@@ -160,11 +179,11 @@ impl PacketRing {
 
             let desc = LinuxTpacketBlockDesc {
                 version: LINUX_TPACKET_V3 as u32,
-                offset_to_priv: 0,
+                offset_to_priv: desc_len as u32,
                 hdr: LinuxTpacketHdrV1 {
                     block_status: LINUX_TP_STATUS_USER,
                     num_pkts: 1,
-                    offset_to_first_pkt: desc_len as u32,
+                    offset_to_first_pkt: self.packet_offset as u32,
                     blk_len,
                     seq_num: *seq,
                     ts_first_pkt: LinuxTpacketBdTs {
@@ -179,12 +198,12 @@ impl PacketRing {
             };
             *seq += 1;
 
-            let payload_offset = block_offset + desc_len + hdr_len;
+            let payload_offset = block_offset + self.packet_offset + hdr_len;
             if payload_offset + frame.len() <= buf.len() {
                 buf[payload_offset..payload_offset + frame.len()].copy_from_slice(frame);
             }
 
-            let pkt_hdr_offset = block_offset + desc_len;
+            let pkt_hdr_offset = block_offset + self.packet_offset;
             if pkt_hdr_offset + hdr_len <= buf.len() {
                 buf[pkt_hdr_offset..pkt_hdr_offset + hdr_len].copy_from_slice(pkt_hdr.as_bytes());
             }
@@ -560,5 +579,31 @@ impl<'a> NetView<'a> {
             status_flags,
             fd_flags,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tpacket_v3_request(private_size: u32) -> LinuxTpacketReq3 {
+        LinuxTpacketReq3 {
+            tp_block_size: 4096,
+            tp_block_nr: 2,
+            tp_frame_size: 4096,
+            tp_frame_nr: 2,
+            tp_retire_blk_tov: 100,
+            tp_sizeof_priv: private_size,
+            tp_feature_req_word: 0,
+        }
+    }
+
+    #[test]
+    fn tpacket_v3_rejects_private_area_larger_than_block() {
+        assert_eq!(
+            PacketRing::new_v3(&tpacket_v3_request(3_u32 << 30)).unwrap_err(),
+            LINUX_EINVAL,
+        );
+        assert!(PacketRing::new_v3(&tpacket_v3_request(512)).is_ok());
     }
 }

@@ -1855,8 +1855,16 @@ fn mremap_dontunmap_moves_contents_and_leaves_the_source_zeroed() {
     assert_eq!(memory.read_bytes(source, 4).unwrap(), &[0; 4]);
     let mem_authority_112 = dispatcher.mem();
     let mem = mem_authority_112.lock();
-    assert!(mem.dynamic_maps.iter().any(|map| map.start == source));
-    assert!(mem.dynamic_maps.iter().any(|map| map.start == destination));
+    assert!(
+        mem.dynamic_maps
+            .iter()
+            .any(|map| map.start <= source && map.end >= source + LINUX_PAGE_SIZE)
+    );
+    assert!(
+        mem.dynamic_maps
+            .iter()
+            .any(|map| { map.start <= destination && map.end >= destination + LINUX_PAGE_SIZE })
+    );
 }
 
 #[test]
@@ -3654,6 +3662,68 @@ fn committed_vma_coverage_rejects_holes_and_accepts_adjacent_mappings() {
         base,
         3 * LINUX_PAGE_SIZE,
     ));
+}
+
+#[test]
+fn adjacent_compatible_anonymous_dynamic_mappings_coalesce() {
+    let dispatcher = SyscallDispatcher::new();
+    let base = LINUX_MMAP_BASE;
+    let first_len = 3 * LINUX_PAGE_SIZE;
+    let second_len = 5 * LINUX_PAGE_SIZE;
+
+    dispatcher.record_dynamic_mapping(
+        base,
+        first_len,
+        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+        ProcMapSharing::Private,
+        String::new(),
+    );
+    dispatcher.record_dynamic_mapping(
+        base + first_len,
+        second_len,
+        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+        ProcMapSharing::Private,
+        String::new(),
+    );
+    dispatcher.record_dynamic_mapping_with_file_offset(
+        base + first_len + second_len,
+        LINUX_PAGE_SIZE,
+        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+        ProcMapSharing::Private,
+        String::new(),
+        DynamicMappingSemantics {
+            file_page_offset: None,
+            droppable: true,
+            semantic_vmas: None,
+        },
+    );
+
+    let mem = dispatcher.mem();
+    let mem = mem.lock();
+    assert_eq!(
+        mem.dynamic_maps,
+        vec![
+            ProcMapsEntry {
+                start: base,
+                end: base + first_len + second_len,
+                read: true,
+                write: true,
+                execute: false,
+                sharing: ProcMapSharing::Private,
+                path: String::new(),
+            },
+            ProcMapsEntry {
+                start: base + first_len + second_len,
+                end: base + first_len + second_len + LINUX_PAGE_SIZE,
+                read: true,
+                write: true,
+                execute: false,
+                sharing: ProcMapSharing::Private,
+                path: String::new(),
+            },
+        ]
+    );
+    assert_eq!(mem.semantic_vmas.len(), 2);
 }
 
 #[test]

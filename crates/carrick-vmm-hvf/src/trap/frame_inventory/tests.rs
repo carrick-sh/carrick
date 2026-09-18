@@ -5579,6 +5579,21 @@ fn fork_inherits_private_and_shared_frames_before_any_write() {
         "EL1-only per-mm control state must not enter fault-driven guest COW",
     );
 
+    let mut vvar = mapping(GuestMappingSharing::Private);
+    vvar.start = crate::vdso::LINUX_VVAR_BASE;
+    vvar.end = vvar.start + size;
+    vvar.guest_writable = false;
+    assert_eq!(
+        fork_mapping_disposition(&vvar, false),
+        ForkMappingDisposition::IndependentProcessState,
+        "fork must allocate the child vvar before refreshing its process-local generation",
+    );
+    assert_eq!(
+        fork_mapping_disposition(&vvar, true),
+        ForkMappingDisposition::IndependentProcessState,
+        "CLONE_VM must still isolate Carrick's process-local vvar generation",
+    );
+
     // The fork projection is what carries `MADV_DONTFORK`/`MADV_WIPEONFORK`
     // into the child. Before this was consumed the VMM derived every
     // disposition from the mapping alone, so both advices changed only
@@ -6043,12 +6058,12 @@ fn fork_receipts_cover_read_only_user_cow_but_not_independent_kernel_frames() {
 
     assert_eq!(
         fork_frame_receipt_kind(
-            ForkMappingDisposition::SharedFrameReadOnly,
+            ForkMappingDisposition::IndependentProcessState,
             crate::vdso::LINUX_VVAR_BASE,
             HVF_PAGE_SIZE as usize,
         ),
-        Some(HvpatchForkFrameKind::PrivateCow),
-        "the inherited read-only vvar frame is internally COWed for the child RNG stamp",
+        None,
+        "the independent child vvar shares no frame that needs a fork receipt",
     );
     assert_eq!(
         fork_frame_receipt_kind(
@@ -6095,6 +6110,18 @@ fn cow_fault_classifier_accepts_only_el0_write_permission_aborts() {
 }
 
 #[test]
+fn frame_cow_relocates_only_a_mailbox_binding_in_the_repointed_compound() {
+    let mailbox = crate::memory::LINUX_SYSCALL_MAILBOX_BASE + 0x120;
+    assert!(frame_cow_repoints_mailbox(mailbox + 0x20, mailbox));
+    assert!(frame_cow_repoints_mailbox(mailbox + 0x3000, mailbox));
+    assert!(!frame_cow_repoints_mailbox(0xffff_fef000, mailbox));
+    assert!(!frame_cow_repoints_mailbox(
+        mailbox + CowArmedRanges::COMPOUND_SIZE,
+        mailbox,
+    ));
+}
+
+#[test]
 fn cow_intents_preserve_guest_write_authority_while_internal_writes_bypass_it() {
     use carrick_aarch64::vmm::FrameCowWriteIntent;
 
@@ -6130,6 +6157,91 @@ fn cow_intents_preserve_guest_write_authority_while_internal_writes_bypass_it() 
     assert!(frame_cow_preserves_guest_protection(
         FrameCowWriteIntent::PrivilegedInternal,
     ));
+}
+
+#[test]
+fn exclusive_private_guest_cow_can_restore_write_without_splitting() {
+    use carrick_aarch64::vmm::FrameCowWriteIntent;
+
+    let exclusive = CowInventoryRetirementDecision {
+        retire_old_frame: true,
+        backend_frame_references_complete: true,
+    };
+    assert!(exclusive_cow_promotion_is_safe(
+        FrameCowWriteIntent::GuestVisible,
+        false,
+        CowArmedRanges::COMPOUND_SIZE as usize,
+        InventoryBackingIdentity::Private(7),
+        exclusive,
+        false,
+    ));
+
+    for unsafe_shape in [
+        exclusive_cow_promotion_is_safe(
+            FrameCowWriteIntent::BackingMaintenance,
+            false,
+            CowArmedRanges::COMPOUND_SIZE as usize,
+            InventoryBackingIdentity::Private(7),
+            exclusive,
+            false,
+        ),
+        exclusive_cow_promotion_is_safe(
+            FrameCowWriteIntent::GuestVisible,
+            true,
+            CowArmedRanges::COMPOUND_SIZE as usize,
+            InventoryBackingIdentity::Private(7),
+            exclusive,
+            false,
+        ),
+        exclusive_cow_promotion_is_safe(
+            FrameCowWriteIntent::GuestVisible,
+            false,
+            0x1000,
+            InventoryBackingIdentity::Private(7),
+            exclusive,
+            false,
+        ),
+        exclusive_cow_promotion_is_safe(
+            FrameCowWriteIntent::GuestVisible,
+            false,
+            CowArmedRanges::COMPOUND_SIZE as usize,
+            InventoryBackingIdentity::PrivateFileView(7),
+            exclusive,
+            false,
+        ),
+        exclusive_cow_promotion_is_safe(
+            FrameCowWriteIntent::GuestVisible,
+            false,
+            CowArmedRanges::COMPOUND_SIZE as usize,
+            InventoryBackingIdentity::Private(7),
+            CowInventoryRetirementDecision {
+                retire_old_frame: false,
+                backend_frame_references_complete: true,
+            },
+            false,
+        ),
+        exclusive_cow_promotion_is_safe(
+            FrameCowWriteIntent::GuestVisible,
+            false,
+            CowArmedRanges::COMPOUND_SIZE as usize,
+            InventoryBackingIdentity::Private(7),
+            CowInventoryRetirementDecision {
+                retire_old_frame: true,
+                backend_frame_references_complete: false,
+            },
+            false,
+        ),
+        exclusive_cow_promotion_is_safe(
+            FrameCowWriteIntent::GuestVisible,
+            false,
+            CowArmedRanges::COMPOUND_SIZE as usize,
+            InventoryBackingIdentity::Private(7),
+            exclusive,
+            true,
+        ),
+    ] {
+        assert!(!unsafe_shape);
+    }
 }
 
 #[test]

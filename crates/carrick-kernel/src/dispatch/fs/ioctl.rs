@@ -111,6 +111,175 @@ fn fd_is_random_device(this: &FsView<'_>, fd: i32) -> bool {
         })
 }
 
+fn fd_is_proc_maps(this: &FsView<'_>, fd: i32) -> bool {
+    this.open_file(fd)
+        .and_then(|open_file| {
+            let description = open_file.description.read()?;
+            description.open_path().map(str::to_owned)
+        })
+        .is_some_and(|path| {
+            path == "/proc/self/maps"
+                || path == "/proc/thread-self/maps"
+                || path
+                    .strip_prefix("/proc/")
+                    .and_then(|tail| tail.strip_suffix("/maps"))
+                    .is_some_and(|pid| {
+                        !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+        })
+}
+
+fn procmap_query(
+    this: &FsView<'_>,
+    memory: &mut impl CurrentMmMemory,
+    arg: u64,
+) -> DispatchOutcome {
+    let mut query: carrick_abi::LinuxProcmapQuery = match read_kernel_struct(memory, arg) {
+        Ok(query) => query,
+        Err(errno) => return DispatchOutcome::errno(errno),
+    };
+    let size = query.size;
+    if size < <carrick_abi::LinuxProcmapQuery as KernelAbi>::ABI_SIZE as u64 {
+        return DispatchOutcome::errno(LINUX_EINVAL);
+    }
+
+    const FILTER_FLAGS: u64 = carrick_abi::LINUX_PROCMAP_QUERY_VMA_READABLE
+        | carrick_abi::LINUX_PROCMAP_QUERY_VMA_WRITABLE
+        | carrick_abi::LINUX_PROCMAP_QUERY_VMA_EXECUTABLE
+        | carrick_abi::LINUX_PROCMAP_QUERY_VMA_SHARED
+        | carrick_abi::LINUX_PROCMAP_QUERY_FILE_BACKED_VMA;
+    const ALL_FLAGS: u64 = FILTER_FLAGS | carrick_abi::LINUX_PROCMAP_QUERY_COVERING_OR_NEXT_VMA;
+    let flags = query.query_flags;
+    if flags & !ALL_FLAGS != 0 {
+        return DispatchOutcome::errno(LINUX_EINVAL);
+    }
+
+    let executable_path = this.proc.lock().executable_path.clone();
+    let (mut maps, brk_current, mmap_next) = {
+        let mem_authority = this.mem();
+        let mem = mem_authority.lock();
+        let mut maps = mem.address_space_regions.clone().unwrap_or_default();
+        maps.extend(mem.dynamic_maps.iter().cloned());
+        (maps, mem.brk_current, mem.mmap_next)
+    };
+    maps.sort_by_key(|map| map.start);
+    let query_addr = query.query_addr;
+    let covering_or_next = flags & carrick_abi::LINUX_PROCMAP_QUERY_COVERING_OR_NEXT_VMA != 0;
+    let page = carrick_abi::LINUX_PAGE_SIZE;
+    let matches_filter = |map: &carrick_vfs::ProcMapsEntry| {
+        let mut map_flags = 0;
+        if map.read {
+            map_flags |= carrick_abi::LINUX_PROCMAP_QUERY_VMA_READABLE;
+        }
+        if map.write {
+            map_flags |= carrick_abi::LINUX_PROCMAP_QUERY_VMA_WRITABLE;
+        }
+        if map.execute {
+            map_flags |= carrick_abi::LINUX_PROCMAP_QUERY_VMA_EXECUTABLE;
+        }
+        if map.sharing == carrick_vfs::ProcMapSharing::Shared {
+            map_flags |= carrick_abi::LINUX_PROCMAP_QUERY_VMA_SHARED;
+        }
+        let name = if map.path.is_empty() && map.execute {
+            executable_path.as_str()
+        } else {
+            map.path.as_str()
+        };
+        if !name.is_empty() && !name.starts_with('[') {
+            map_flags |= carrick_abi::LINUX_PROCMAP_QUERY_FILE_BACKED_VMA;
+        }
+        map_flags & (flags & FILTER_FLAGS) == flags & FILTER_FLAGS
+    };
+    let selected = maps.into_iter().find(|map| {
+        let start = map.start & !(page - 1);
+        let mut semantic_end = map.end;
+        if map.start == crate::memory::LINUX_HEAP_BASE
+            && brk_current > map.start
+            && brk_current <= map.end
+        {
+            semantic_end = brk_current;
+        } else if map.start == crate::memory::LINUX_MMAP_BASE
+            && mmap_next > map.start
+            && mmap_next <= map.end
+        {
+            semantic_end = mmap_next;
+        }
+        let end = semantic_end.div_ceil(page) * page;
+        let address_matches = if covering_or_next {
+            end > query_addr
+        } else {
+            start <= query_addr && query_addr < end
+        };
+        address_matches && matches_filter(map)
+    });
+    let Some(map) = selected else {
+        return DispatchOutcome::errno(LINUX_ENOENT);
+    };
+
+    let start = map.start & !(page - 1);
+    let mut semantic_end = map.end;
+    if map.start == crate::memory::LINUX_HEAP_BASE
+        && brk_current > map.start
+        && brk_current <= map.end
+    {
+        semantic_end = brk_current;
+    } else if map.start == crate::memory::LINUX_MMAP_BASE
+        && mmap_next > map.start
+        && mmap_next <= map.end
+    {
+        semantic_end = mmap_next;
+    }
+    let end = semantic_end.div_ceil(page) * page;
+    let mut map_flags = 0;
+    if map.read {
+        map_flags |= carrick_abi::LINUX_PROCMAP_QUERY_VMA_READABLE;
+    }
+    if map.write {
+        map_flags |= carrick_abi::LINUX_PROCMAP_QUERY_VMA_WRITABLE;
+    }
+    if map.execute {
+        map_flags |= carrick_abi::LINUX_PROCMAP_QUERY_VMA_EXECUTABLE;
+    }
+    if map.sharing == carrick_vfs::ProcMapSharing::Shared {
+        map_flags |= carrick_abi::LINUX_PROCMAP_QUERY_VMA_SHARED;
+    }
+    let name = if map.path.is_empty() && map.execute {
+        executable_path
+    } else {
+        map.path
+    };
+    let name_capacity = query.vma_name_size as usize;
+    let name_address = query.vma_name_addr;
+    let name_bytes = (!name.is_empty()).then(|| {
+        let mut bytes = name.into_bytes();
+        bytes.push(0);
+        bytes
+    });
+    if let Some(name_bytes) = &name_bytes {
+        if name_bytes.len() > name_capacity {
+            return DispatchOutcome::errno(LINUX_E2BIG);
+        }
+        if name_address == 0 || memory.write_bytes(name_address, name_bytes).is_err() {
+            return DispatchOutcome::errno(LINUX_EFAULT);
+        }
+    }
+
+    query.vma_start = start;
+    query.vma_end = end;
+    query.vma_flags = map_flags;
+    query.vma_page_size = page;
+    query.vma_offset = 0;
+    query.inode = 0;
+    query.dev_major = 0;
+    query.dev_minor = 0;
+    query.vma_name_size = name_bytes.as_ref().map_or(0, |bytes| bytes.len() as u32);
+    query.build_id_size = 0;
+    match write_kernel_struct_raw(memory, arg, &query) {
+        Ok(()) => DispatchOutcome::Returned { value: 0 },
+        Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
+    }
+}
+
 /// One Linux-visible interface with an IPv4 address. Flags and MTU stay in
 /// their Linux model domain; translating them through host constants would
 /// discard namespace state and can contradict rtnetlink and sysfs.
@@ -465,6 +634,9 @@ impl<'a> FsView<'a> {
             // (open13 issues FIGETBSZ on an O_PATH fd).
             if this.fd_is_o_path(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            if ioctl_request == carrick_abi::LINUX_PROCMAP_QUERY && fd_is_proc_maps(this, fd.0) {
+                return Ok(procmap_query(this, &mut *cx.memory, arg));
             }
             let changes_tty_state = matches!(
                 ioctl_request,

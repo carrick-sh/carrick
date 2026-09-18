@@ -612,9 +612,10 @@ impl PoolControl {
         // that idle peer's ack: execfromthread's container wedge, sampled
         // live as one executor parked in `invalidate_after_exec`'s
         // recv_timeout and another in `Scheduler::take`'s condvar. Poke the
-        // queue control so every idle executor bounces out with ControlPoked,
-        // services its command channel at loop-top, and acks.
-        self.scheduler.poke_executor_control();
+        // queue control once when a peer command actually exists so every idle
+        // target bounces out with ControlPoked, services its command channel at
+        // loop-top, and acks. A current-executor-only retirement has no peer
+        // command and must not wake the whole carrier pool.
         if !pending.is_empty() {
             self.scheduler.poke_executor_control();
         }
@@ -1466,6 +1467,33 @@ fn append_failures(message: &mut String, failures: Vec<String>) {
     for failure in failures {
         message.push_str("; ");
         message.push_str(&failure);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_asid_invalidation_fanout_does_not_poke_idle_executors() {
+        let input = carrick_kernel::kernel::RootBootstrap::for_reference_model(
+            13_990,
+            carrick_hal::ThreadId::synthetic_for_tests(13_990),
+            "empty invalidation fanout".to_owned(),
+        )
+        .expect("bootstrap input");
+        let (kernel, _) = carrick_kernel::kernel::Kernel::bootstrap_root(input).expect("kernel");
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let control = PoolControl::new(0, Arc::clone(&scheduler));
+        let before = scheduler.scheduler_summary().control_epoch;
+        let generation = crate::hvpatch::AsidGeneration::for_tests(1, 1);
+
+        let pending = control
+            .dispatch_invalidation_commands(generation, std::iter::empty())
+            .expect("empty invalidation fanout");
+
+        assert!(pending.is_empty());
+        assert_eq!(scheduler.scheduler_summary().control_epoch, before);
     }
 }
 

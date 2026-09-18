@@ -445,6 +445,17 @@ impl<'a> MemView<'a> {
             if length == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
+            let Some(end) = address.0.checked_add(length) else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            };
+            if flags & LINUX_MS_INVALIDATE != 0 {
+                let locked = this.mem().lock().locked_ranges.iter().any(|range| {
+                    range.start().raw() < end && range.end().raw() > address.0
+                });
+                if locked {
+                    return Ok(DispatchOutcome::errno(LINUX_EBUSY));
+                }
+            }
             let alloc = {
                 let mem_authority_20 = this.mem();
                 let mem = mem_authority_20.lock();

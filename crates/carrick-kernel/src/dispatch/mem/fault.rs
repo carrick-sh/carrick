@@ -46,13 +46,22 @@ impl FirstTouchArming {
     /// armed the pages it covers.
     pub(crate) fn arm(&mut self, range: carrick_vfs::GuestMemoryRange, prot: LinuxProtFlags) {
         self.disarm(range);
-        self.extents.insert(
-            range.start().raw(),
-            FirstTouchArm {
-                end: range.end().raw(),
-                prot,
-            },
-        );
+        let mut start = range.start().raw();
+        let mut end = range.end().raw();
+        if let Some((&previous_start, &previous)) = self.extents.range(..start).next_back()
+            && previous.end == start
+            && previous.prot == prot
+        {
+            self.extents.remove(&previous_start);
+            start = previous_start;
+        }
+        if let Some(&next) = self.extents.get(&end)
+            && next.prot == prot
+        {
+            self.extents.remove(&end);
+            end = next.end;
+        }
+        self.extents.insert(start, FirstTouchArm { end, prot });
     }
 
     /// The protection to publish for a first touch of `page`, or `None` when

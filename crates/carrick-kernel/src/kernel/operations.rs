@@ -2335,7 +2335,10 @@ pub(super) mod tests {
         let aio = crate::dispatch::LegacyAioContextId::allocated_from(
             root.shared().mm().allocate_legacy_aio_context(),
         );
-        root.shared().mm().write_legacy_aio_contexts().insert(aio);
+        root.shared()
+            .mm()
+            .write_legacy_aio_contexts()
+            .insert(aio, std::collections::VecDeque::new());
 
         let copied = kernel
             .fork_task(
@@ -2371,7 +2374,7 @@ pub(super) mod tests {
                 .shared()
                 .mm()
                 .read_legacy_aio_contexts()
-                .contains(&aio)
+                .contains_key(&aio)
         );
     }
 

@@ -442,10 +442,11 @@ impl<'a> NetView<'a> {
             let is_stream = guest_type == Some(libc::SOCK_STREAM);
             let is_sctp_stream = is_stream && guest_protocol == Some(LINUX_IPPROTO_SCTP);
             let is_unix_stream = is_stream && guest_domain == Some(libc::AF_UNIX);
+            let host_stream_connected = is_stream && host_socket_is_connected(host_fd.get());
             let is_connected_stream = is_stream
                 && !is_unix_stream
                 && !is_sctp_stream
-                && host_socket_is_connected(host_fd.get());
+                && host_stream_connected;
 
             // Linux move_addr_to_kernel bound: sizeof(struct sockaddr_storage) = 128
             const LINUX_SOCKADDR_STORAGE_MAX: usize = 128;
@@ -489,6 +490,13 @@ impl<'a> NetView<'a> {
                     }
                 }
             };
+            if is_stream && !is_unix_stream && !is_sctp_stream && !host_stream_connected {
+                let outcome = DispatchOutcome::errno(LINUX_EPIPE);
+                if flags & LINUX_MSG_NOSIGNAL == 0 {
+                    return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
+                }
+                return Ok(outcome);
+            }
             if !is_connected_stream
                 && family == LINUX_AF_INET
                 && let Some(protocol) = this.socket_port_protocol(fd)
@@ -2422,6 +2430,58 @@ mod inet_in_memory_socket_tests {
                 .pending()
                 .contains(LINUX_SIGPIPE),
             "sendmsg without MSG_NOSIGNAL on closed peer must raise SIGPIPE"
+        );
+    }
+
+    #[test]
+    fn unconnected_inet_stream_sendto_returns_epipe_and_sigpipe() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x4000, vec![b'a'; 0x1000]);
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let fd = match dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    198,
+                    SyscallArgs::from([LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("socket failed: {other:?}"),
+        };
+        let mut destination = [0u8; 16];
+        destination[..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+        destination[2..4].copy_from_slice(&9u16.to_be_bytes());
+        destination[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        memory.write_bytes(0x4100, &destination).unwrap();
+        context
+            .thread()
+            .update_signal_state(|state| state.replace_pending_entries(&[]));
+
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    206,
+                    SyscallArgs::from([fd as u64, 0x4000, 16, 0, 0x4100, 16]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EPIPE));
+        assert!(
+            context
+                .thread()
+                .signal_state()
+                .pending()
+                .contains(LINUX_SIGPIPE),
+            "unconnected TCP sendto must raise SIGPIPE"
         );
     }
 
