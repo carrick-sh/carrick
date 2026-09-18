@@ -90,6 +90,7 @@ syscall_table! {
     nr::IO_URING_REGISTER => io_uring_register,
     nr::MEMBARRIER => sys_membarrier,
     nr::USERFAULTFD => userfaultfd,
+    nr::REMAP_FILE_PAGES => remap_file_pages,
 }
 
 mutation_syscall_table! {
@@ -106,7 +107,6 @@ mutation_syscall_table! {
     nr::MUNLOCKALL => munlockall,
     nr::MINCORE => mincore,
     nr::MADVISE => madvise,
-    nr::REMAP_FILE_PAGES => remap_file_pages,
     nr::MLOCK2 => mlock2,
 }
 
@@ -1891,6 +1891,7 @@ forward_mem_handlers! {
     io_uring_register,
     sys_membarrier,
     userfaultfd,
+    remap_file_pages,
 }
 
 macro_rules! forward_mem_mutation_handlers {
@@ -1922,7 +1923,6 @@ forward_mem_mutation_handlers! {
     munlockall,
     mincore,
     madvise,
-    remap_file_pages,
     mlock2,
 }
 

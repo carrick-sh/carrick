@@ -5826,7 +5826,7 @@ mod kernel_process_dispatch_tests {
         );
         assert!(!crate::dispatch::syscall_requires_mm_mutation(271, args));
         assert!(crate::dispatch::syscall_requires_execution_lease(271, args));
-        assert_eq!(crate::dispatch::MM_MUTATION_SYSCALLS.len(), 17);
+        assert_eq!(crate::dispatch::MM_MUTATION_SYSCALLS.len(), 15);
     }
 
     #[test]

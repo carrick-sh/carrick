@@ -2766,7 +2766,7 @@ class ProductionInventoryTest(unittest.TestCase):
                 self.assertEqual(row["evidence"]["authority"], "authenticated_carrier")
                 self.assertIn(resource, row["evidence"]["resource"])
 
-        for function in ("private_name", "with_shm_nattch_file", "ensure_dir"):
+        for function in ("private_name", "ensure_dir"):
             with self.subTest(backing=function):
                 row = next(
                     row
