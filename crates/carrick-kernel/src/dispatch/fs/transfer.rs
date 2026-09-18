@@ -643,20 +643,6 @@ impl<'a> FsView<'a> {
             .push_front(bytes);
     }
 
-    pub(super) fn restore_splice_pipe_bytes_owned(&self, guest_fd: i32, bytes: Vec<u8>) {
-        if bytes.is_empty() {
-            return;
-        }
-        let Some(file) = self.open_file(guest_fd) else {
-            return;
-        };
-        file.description
-            .common()
-            .splice_pushback()
-            .lock()
-            .push_front_owned(bytes);
-    }
-
     pub(in crate::dispatch::fs) fn write_output_fd(
         &self,
         fd: i32,
@@ -1174,32 +1160,6 @@ impl<'a> FsView<'a> {
                         )));
                     }
                 };
-                if off_out_address == 0
-                    && let Some(open_file) = this.open_file(out_fd.0)
-                    && let Some(open) = open_file.description.read()
-                    && let OpenDescription::InMemorySocket { socket, .. } = &*open
-                {
-                    let socket = Arc::clone(socket);
-                    drop(open);
-                    match socket.send_stream_splice_owned(bytes) {
-                        Ok((written, unaccepted)) => {
-                            this.notify_inmem_epoll();
-                            if let Some(tail) = unaccepted {
-                                Self::restore_pipe_bytes(&pipe, &tail);
-                            }
-                            return Ok(DispatchOutcome::returned_len_or_errno(written));
-                        }
-                        Err((errno, returned_bytes)) => {
-                            Self::restore_pipe_bytes(&pipe, &returned_bytes);
-                            let outcome = if errno == LINUX_EAGAIN && !out_nonblocking {
-                                this.splice_output_would_block(out_fd.0, false)
-                            } else {
-                                DispatchOutcome::errno(errno)
-                            };
-                            return Ok(complete_wait(outcome));
-                        }
-                    }
-                }
                 let outcome = this.splice_write_out(out_fd.0, off_out_address, &bytes, cx.memory, tid, out_nonblocking);
                 let DispatchOutcome::Returned { value } = outcome else {
                     Self::restore_pipe_bytes(&pipe, &bytes);
@@ -1249,32 +1209,6 @@ impl<'a> FsView<'a> {
                 };
                 if buf.is_empty() {
                     return Ok(DispatchOutcome::Returned { value: 0 });
-                }
-                if off_out_address == 0
-                    && let Some(open_file) = this.open_file(out_fd.0)
-                    && let Some(open) = open_file.description.read()
-                    && let OpenDescription::InMemorySocket { socket, .. } = &*open
-                {
-                    let socket = Arc::clone(socket);
-                    drop(open);
-                    match socket.send_stream_splice_owned(buf) {
-                        Ok((written, unaccepted)) => {
-                            this.notify_inmem_epoll();
-                            if let Some(tail) = unaccepted {
-                                this.restore_splice_pipe_bytes_owned(in_fd.0, tail);
-                            }
-                            return Ok(DispatchOutcome::returned_len_or_errno(written));
-                        }
-                        Err((errno, returned_buf)) => {
-                            this.restore_splice_pipe_bytes_owned(in_fd.0, returned_buf);
-                            let outcome = if errno == LINUX_EAGAIN && !out_nonblocking {
-                                this.splice_output_would_block(out_fd.0, false)
-                            } else {
-                                DispatchOutcome::errno(errno)
-                            };
-                            return Ok(complete_wait(outcome));
-                        }
-                    }
                 }
                 let outcome = this.splice_write_out(out_fd.0, off_out_address, &buf, cx.memory, tid, out_nonblocking);
                 let DispatchOutcome::Returned { value } = outcome else {
@@ -1511,11 +1445,11 @@ impl<'a> FsView<'a> {
                             return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                         }
                         let want = count.min(room).min(1 << 20);
-                        match socket.recv_stream_splice(want) {
-                            Ok(buf) if buf.is_empty() => {
-                                return Ok(DispatchOutcome::Returned { value: 0 });
-                            }
-                            Ok(buf) => {
+                        let mut buf = vec![0u8; want];
+                        match socket.recv_stream(&mut buf, 0) {
+                            Ok((0, _)) => return Ok(DispatchOutcome::Returned { value: 0 }),
+                            Ok((n, _)) => {
+                                buf.truncate(n);
                                 let consumed = buf.len();
                                 this.stage_splice_pipe_bytes_owned(pipe_read_fd, buf);
                                 this.notify_inmem_epoll();
