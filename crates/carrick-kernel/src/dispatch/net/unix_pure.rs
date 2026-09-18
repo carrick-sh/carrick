@@ -590,6 +590,28 @@ impl PureSocketInner {
         }
     }
 
+    fn effective_write_ready_lowat(
+        &self,
+        sender_state: &PureSocketState,
+        receiver_state: Option<&PureSocketState>,
+    ) -> usize {
+        let default_autotuned_tcp = self.is_tcp()
+            && sender_state.tcp_pair
+            && sender_state.so_sndbuf_explicit.is_none()
+            && receiver_state.is_none_or(|state| state.so_rcvbuf_explicit.is_none());
+        if default_autotuned_tcp {
+            // Linux TCP does not publish POLLOUT again for every byte freed
+            // from a full autotuned send queue. Its write-space hysteresis
+            // leaves enough room for forward progress before waking an
+            // edge-triggered writer. Keep the threshold off an exact power-of-
+            // two boundary so a request ending on a libuv-sized read batch
+            // still leaves room for the next queued write.
+            self.effective_send_capacity(sender_state, receiver_state) / 4 + 1
+        } else {
+            1
+        }
+    }
+
     pub(crate) fn is_listening(&self) -> bool {
         self.state.lock().listening
     }
@@ -1387,14 +1409,19 @@ impl PureSocketInner {
             }
             if !state.shutdown_write && !state.tcp_send_terminal {
                 let send_cap = self.effective_send_capacity(&state, peer_state.as_deref());
+                let write_ready_lowat =
+                    self.effective_write_ready_lowat(&state, peer_state.as_deref());
                 if let Some(p) = peer_state.as_ref() {
-                    if (!peer_shut_rd && p.stream_buf.len() < send_cap)
+                    if (!peer_shut_rd
+                        && send_cap.saturating_sub(p.stream_buf.len()) >= write_ready_lowat)
                         || (state.tcp_pair && peer_shut_rd)
                     {
                         mask |= LINUX_EPOLLOUT;
                     }
                 } else if has_mock {
-                    if !peer_shut_rd && state.request_buf.len() < send_cap {
+                    if !peer_shut_rd
+                        && send_cap.saturating_sub(state.request_buf.len()) >= write_ready_lowat
+                    {
                         mask |= LINUX_EPOLLOUT;
                     }
                 } else if state.tcp_pair
@@ -2298,6 +2325,30 @@ mod tests {
         assert_eq!(sent, one_mib);
         assert_eq!(s1.so_sndbuf(), DEFAULT_STREAM_BUFFER_CAPACITY);
         assert_eq!(s2.so_rcvbuf(), DEFAULT_STREAM_BUFFER_CAPACITY);
+    }
+
+    #[test]
+    fn autotuned_tcp_write_wake_leaves_room_for_the_next_queued_write() {
+        let (sender, receiver) = tcp_pair();
+        let payload = vec![0x5a; 10 * 1024 * 1024];
+        let mut sent = sender.send_stream(&payload, Vec::new()).unwrap();
+        assert_eq!(sent, TCP_AUTOTUNE_MAX_WMEM);
+        assert_eq!(sender.poll_mask() & LINUX_EPOLLOUT, 0);
+
+        let mut buf = [0u8; 32 * 1024];
+        while sent < payload.len() {
+            while sender.poll_mask() & LINUX_EPOLLOUT == 0 {
+                let (read, _) = receiver.recv_stream(&mut buf, 0).unwrap();
+                assert_eq!(read, buf.len());
+            }
+            sent += sender.send_stream(&payload[sent..], Vec::new()).unwrap();
+        }
+
+        assert_eq!(
+            sender.send_stream(b"x", Vec::new()),
+            Ok(1),
+            "a completion callback must not run while the next queued byte is still backpressured"
+        );
     }
 
     #[test]
