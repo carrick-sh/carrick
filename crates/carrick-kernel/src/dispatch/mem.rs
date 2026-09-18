@@ -2332,13 +2332,13 @@ mod routing_characterization_tests {
     /// memory dispatch tables to `carrick_abi::syscall::nr::*` constants.
     ///
     /// The literal tables on base routed exactly these canonical numbers:
-    /// - `dispatch_mem`: 213, 223, 282, 283, 425, 426, 427.
+    /// - `dispatch_mem`: 213, 223, 234, 282, 283, 425, 426, 427.
     /// - `dispatch_mem_mutation`: 214, 215, 216, 222, 226, 227, 228, 229,
-    ///   230, 231, 232, 233, 234, 284.
-    const BASE_MEM_HANDLED_NUMBERS: &[u64] = &[213, 223, 282, 283, 425, 426, 427];
+    ///   230, 231, 232, 233, 284.
+    const BASE_MEM_HANDLED_NUMBERS: &[u64] = &[213, 223, 234, 282, 283, 425, 426, 427];
 
     const BASE_MEM_MUTATION_HANDLED_NUMBERS: &[u64] = &[
-        214, 215, 216, 222, 226, 227, 228, 229, 230, 231, 232, 233, 234, 284,
+        214, 215, 216, 222, 226, 227, 228, 229, 230, 231, 232, 233, 284,
     ];
 
     #[test]
