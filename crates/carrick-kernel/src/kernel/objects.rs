@@ -2187,15 +2187,22 @@ impl FileTable {
     }
 
     pub(crate) fn cancel_reservation(&self, fd: i32, reservation_id: u64) -> bool {
+        if fd >= 3 {
+            if let Some(mut next_fd) = self.try_lock_next_fd() {
+                let mut reserved = self.lock_reserved_slots();
+                if reserved.get(&fd).copied() == Some(reservation_id) {
+                    reserved.remove(&fd);
+                    if fd < *next_fd {
+                        *next_fd = fd;
+                    }
+                    return true;
+                }
+                return false;
+            }
+        }
         let mut reserved = self.lock_reserved_slots();
         if reserved.get(&fd).copied() == Some(reservation_id) {
             reserved.remove(&fd);
-            if fd >= 3 && self.functional_refs_active() {
-                let mut next_fd = self.lock_next_fd();
-                if fd < *next_fd {
-                    *next_fd = fd;
-                }
-            }
             true
         } else {
             false
@@ -2521,6 +2528,10 @@ impl FileTable {
         }
     }
 
+    fn try_lock_next_fd(&self) -> Option<FileTableMutexGuard<'_, i32>> {
+        self.try_mutex_write(&self.next_fd)
+    }
+
     pub(crate) fn lock_next_fd(&self) -> FileTableMutexGuard<'_, i32> {
         self.mutex_write(&self.next_fd)
     }
@@ -2619,6 +2630,15 @@ impl FileTable {
                 "kernel::file_table_gate",
                 "mutation reached a draining FileTable generation"
             );
+        })
+    }
+
+    fn try_mutex_write<'a, T>(&'a self, lock: &'a Mutex<T>) -> Option<FileTableMutexGuard<'a, T>> {
+        let mutation = self.functional_gate.acquire_mutation()?;
+        Some(FileTableMutexGuard {
+            guard: lock.lock(),
+            _mutation: mutation,
+            revision: &self.revision,
         })
     }
 
@@ -4074,5 +4094,68 @@ mod tests {
             .reserve_slot_at_or_above(0, 1024)
             .expect("reserve 0");
         assert_eq!(res.fd(), 0);
+    }
+
+    #[test]
+    fn cancellation_does_not_hold_reserved_slots_while_awaiting_next_fd() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+
+        let res = table.reserve_slot_at_or_above(0, 1024).expect("slot 3");
+        assert_eq!(res.fd(), 3);
+        assert!(table.is_slot_reserved(3));
+
+        // Thread 1 holds next_fd lock
+        let next_fd_guard = table.next_fd.lock();
+
+        // Spawn Thread 2 to cancel the reservation (drop uncommitted reservation)
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn({
+            let _table = Arc::clone(&table);
+            move || {
+                tx.send(()).unwrap();
+                drop(res); // triggers cancel_reservation
+            }
+        });
+
+        rx.recv().unwrap();
+        // Wait until cancellation reaches mutation admission and is blocked attempting next_fd
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut reached_admission = false;
+        while std::time::Instant::now() < deadline {
+            if table.functional_gate.state.lock().active_mutations == 1 {
+                reached_admission = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        // Under correct lock ordering (next_fd -> reserved_slots), Thread 2 awaits next_fd
+        // WITHOUT holding reserved_slots, so reserved_slots is free to acquire here.
+        // Under inverted lock ordering (reserved_slots -> next_fd), Thread 2 holds reserved_slots
+        // while blocked on next_fd, deadlocking any attempt to acquire reserved_slots.
+        let acquired = if reached_admission {
+            table
+                .reserved_slots
+                .try_lock_for(std::time::Duration::from_millis(100))
+        } else {
+            None
+        };
+
+        let is_unlocked = acquired.is_some();
+        drop(acquired);
+        drop(next_fd_guard);
+        let join_res = t.join();
+
+        assert!(
+            reached_admission,
+            "cancellation should have reached mutation admission within timeout"
+        );
+        assert!(
+            is_unlocked,
+            "cancel_reservation must acquire next_fd before reserved_slots to prevent lock inversion deadlock"
+        );
+        assert!(join_res.is_ok());
+        assert!(!table.is_slot_reserved(3));
     }
 }
