@@ -189,6 +189,7 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         // `dispatch/fs.rs`, backed by `crate::fanotify`.
         | 262
         | 263
+        | 264
         | 267
         | 276
         | 285
