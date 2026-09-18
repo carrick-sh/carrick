@@ -27,19 +27,6 @@ pub(crate) enum MappingExtent {
     Ipa(u64, u64),
 }
 
-#[derive(Clone, Debug)]
-pub(crate) enum ForkProjectionChange {
-    Remove(u64),
-    Upsert(ThreadMappingDesc),
-}
-
-#[derive(Debug, Default)]
-struct ForkProjectionJournal {
-    base_revision: u64,
-    changes: Vec<ForkProjectionChange>,
-    reset: bool,
-}
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MappingExtent {
     pub(crate) fn overlaps_region(&self, region: &HvfMappedRegion) -> bool {
@@ -228,40 +215,18 @@ impl TaskMappingClassIndex {
 /// The per-task mapping table: sorted by construction, non-overlapping, and
 /// coalescing.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct TaskMappingIndex {
     live: std::collections::BTreeMap<GuestVa, HvfMappedRegion>,
     /// Rows an overlapping insert displaced. Retained only so that displacing
     /// a row never changes when its handles drop.
     shadowed: Vec<HvfMappedRegion>,
-    /// Positions of displaced rows that still carry backing ownership.
-    ///
-    /// Fork inherits current live mappings, but it may need an older
-    /// incarnation to authenticate or retain the physical owner selected by
-    /// the live stage-1 translation. Keeping this sparse position list lets
-    /// fork avoid scanning every handle-free historical incarnation.
-    fork_shadowed_structural: parking_lot::Mutex<Option<Vec<usize>>>,
-    /// Exact live-row changes since the fork cache last consumed this index.
-    /// Arbitrary mutable access sets `reset`, forcing one full rebuild rather
-    /// than trying to infer which descriptor fields changed.
-    fork_projection_journal: parking_lot::Mutex<ForkProjectionJournal>,
     /// Live rows partitioned by width class and ordered by stage-2 IPA base,
     /// `(class, row.ipa)` naming `row.start` in `live`.
     by_ipa: TaskMappingClassIndex,
     /// Live rows partitioned by width class and ordered by physical stage-2 IPA base,
     /// `(class, row.physical_ipa)` naming `row.start` in `live`.
     by_physical: TaskMappingClassIndex,
-    /// Monotonic semantic mutation generation. Fork snapshots key their
-    /// reusable projection on this value so an unchanged mapping graph is not
-    /// rebuilt for every fork, while any mutable access invalidates it.
-    revision: u64,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Default for TaskMappingIndex {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -270,119 +235,14 @@ impl TaskMappingIndex {
         Self {
             live: std::collections::BTreeMap::new(),
             shadowed: Vec::new(),
-            fork_shadowed_structural: parking_lot::Mutex::new(Some(Vec::new())),
-            fork_projection_journal: parking_lot::Mutex::new(ForkProjectionJournal::default()),
             by_ipa: TaskMappingClassIndex::new(),
             by_physical: TaskMappingClassIndex::new(),
-            revision: 0,
         }
-    }
-
-    fn bump_revision(&mut self) {
-        self.revision = self.revision.checked_add(1).unwrap_or_else(|| {
-            carrick_fatal!(
-                "hvpatch::task_mapping_index",
-                "task mapping revision counter overflow"
-            );
-        });
-    }
-
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision
-    }
-
-    fn record_fork_projection_change(&mut self, change: ForkProjectionChange) {
-        let journal = self.fork_projection_journal.get_mut();
-        if !journal.reset {
-            journal.changes.push(change);
-        }
-    }
-
-    fn reset_fork_projection_changes(&mut self) {
-        let journal = self.fork_projection_journal.get_mut();
-        journal.changes.clear();
-        journal.reset = true;
-    }
-
-    pub(crate) fn take_fork_projection_changes_since(
-        &self,
-        revision: u64,
-    ) -> Option<Vec<ForkProjectionChange>> {
-        let mut journal = self.fork_projection_journal.lock();
-        let usable = journal.base_revision == revision && !journal.reset;
-        let changes = usable.then(|| std::mem::take(&mut journal.changes));
-        journal.base_revision = self.revision;
-        journal.changes.clear();
-        journal.reset = false;
-        changes
-    }
-
-    pub(crate) fn acknowledge_fork_projection_rebuild(&self) {
-        let mut journal = self.fork_projection_journal.lock();
-        journal.base_revision = self.revision;
-        journal.changes.clear();
-        journal.reset = false;
-    }
-
-    fn push_shadowed(&mut self, row: HvfMappedRegion) {
-        let position = self.shadowed.len();
-        let carries_backing_owner = row.holds_backing_handle();
-        self.shadowed.push(row);
-        if carries_backing_owner
-            && let Some(positions) = self.fork_shadowed_structural.get_mut().as_mut()
-        {
-            positions.push(position);
-        }
-    }
-
-    fn invalidate_fork_shadowed_structural(&mut self) {
-        *self.fork_shadowed_structural.get_mut() = None;
-    }
-
-    /// Current semantic rows, ordered by guest VA. Displaced owner rows remain
-    /// available through [`Self::shadowed_backing_for_translation`] when the
-    /// live stage-1 graph selects an older physical incarnation.
-    pub(crate) fn fork_projection_rows(&self) -> Vec<&HvfMappedRegion> {
-        self.live
-            .values()
-            .inspect(|_| note_task_mapping_row_visited())
-            .collect()
-    }
-
-    /// Displaced rows that still own backing, newest first. Fork consults this
-    /// sparse set only to add an owner actually selected by the live stage-1
-    /// graph; these rows are never admitted wholesale as child VMAs.
-    pub(crate) fn fork_shadowed_backing_rows(&self) -> Vec<&HvfMappedRegion> {
-        let positions = {
-            let mut cached = self.fork_shadowed_structural.lock();
-            cached
-                .get_or_insert_with(|| {
-                    self.shadowed
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(position, row)| {
-                            row.holds_backing_handle().then_some(position)
-                        })
-                        .collect()
-                })
-                .clone()
-        };
-        positions
-            .into_iter()
-            .rev()
-            .filter_map(|position| {
-                let row = self.shadowed.get(position)?;
-                note_task_mapping_row_visited();
-                Some(row)
-            })
-            .collect()
     }
 
     /// Publish one row into the live map and both ordered views. Every live
     /// insertion goes through here so the IPA view cannot drift.
     fn live_insert(&mut self, region: HvfMappedRegion) {
-        let projected = ThreadMappingDesc::from_region(&region);
-        self.bump_revision();
         if let Some(previous) = self.live.remove(&GuestVa(region.start)) {
             // A same-start replacement: retire the row that left.
             self.forget_ipa_entry(&previous);
@@ -395,15 +255,12 @@ impl TaskMappingIndex {
             region.start,
         );
         self.live.insert(GuestVa(region.start), region);
-        self.record_fork_projection_change(ForkProjectionChange::Upsert(projected));
     }
 
     /// Take one row out of the live map and both ordered views.
     fn live_remove(&mut self, key: &GuestVa) -> Option<HvfMappedRegion> {
         let row = self.live.remove(key)?;
-        self.bump_revision();
         self.forget_ipa_entry(&row);
-        self.record_fork_projection_change(ForkProjectionChange::Remove(row.start));
         Some(row)
     }
 
@@ -596,7 +453,7 @@ impl TaskMappingIndex {
         );
         for key in displaced {
             if let Some(row) = self.live_remove(&key) {
-                self.push_shadowed(row);
+                self.shadowed.push(row);
             }
         }
     }
@@ -619,13 +476,8 @@ impl TaskMappingIndex {
         for key in doomed {
             self.live_remove(&key);
         }
-        let shadowed_before = self.shadowed.len();
         self.shadowed
             .retain(|row| row.end <= va.0 || row.start >= end);
-        if self.shadowed.len() != shadowed_before {
-            self.invalidate_fork_shadowed_structural();
-            self.bump_revision();
-        }
         self.assert_invariants();
     }
 
@@ -642,12 +494,7 @@ impl TaskMappingIndex {
         for key in dropped {
             self.live_remove(&key);
         }
-        let shadowed_before = self.shadowed.len();
         self.shadowed.retain(|row| predicate(row));
-        if self.shadowed.len() != shadowed_before {
-            self.invalidate_fork_shadowed_structural();
-            self.bump_revision();
-        }
         self.assert_invariants();
     }
 
@@ -746,8 +593,6 @@ impl TaskMappingIndex {
                 note_task_mapping_row_visited();
                 if predicate(&self.shadowed[idx]) {
                     self.shadowed.remove(idx);
-                    self.invalidate_fork_shadowed_structural();
-                    self.bump_revision();
                     removed_count += 1;
                     continue;
                 }
@@ -759,13 +604,8 @@ impl TaskMappingIndex {
     }
 
     pub(crate) fn clear(&mut self) {
-        if !self.is_empty() {
-            self.bump_revision();
-        }
         self.live.clear();
         self.shadowed.clear();
-        *self.fork_shadowed_structural.get_mut() = Some(Vec::new());
-        self.reset_fork_projection_changes();
         self.by_ipa.clear();
         self.by_physical.clear();
     }
@@ -802,8 +642,6 @@ impl TaskMappingIndex {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn first_mut(&mut self) -> Option<&mut HvfMappedRegion> {
-        self.bump_revision();
-        self.reset_fork_projection_changes();
         self.live.values_mut().next()
     }
 
@@ -822,9 +660,6 @@ impl TaskMappingIndex {
     }
 
     pub(crate) fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut HvfMappedRegion> {
-        self.invalidate_fork_shadowed_structural();
-        self.bump_revision();
-        self.reset_fork_projection_changes();
         self.shadowed.iter_mut().chain(self.live.values_mut())
     }
 
@@ -997,8 +832,6 @@ impl TaskMappingIndex {
             let row = &self.shadowed[index];
             if row.start < end && va < row.end {
                 affected.push(self.shadowed.remove(index));
-                self.invalidate_fork_shadowed_structural();
-                self.bump_revision();
             } else {
                 index += 1;
             }
@@ -1017,7 +850,6 @@ impl TaskMappingIndex {
         ipa: u64,
         length: u64,
     ) -> Option<(MappingRowRef, std::sync::Arc<StructuralBackingOwner>)> {
-        self.invalidate_fork_shadowed_structural();
         let claims = |mapping: &HvfMappedRegion| {
             mapping.structural_owner.as_ref().is_some_and(|owner| {
                 (mapping.physical_ipa, mapping.physical_size as u64) == (ipa, length)
@@ -1033,16 +865,12 @@ impl TaskMappingIndex {
         for (position, mapping) in self.shadowed.iter_mut().enumerate() {
             if claims(mapping) {
                 let owner = mapping.structural_owner.take()?;
-                self.bump_revision();
-                self.reset_fork_projection_changes();
                 return Some((MappingRowRef::Shadowed(position), owner));
             }
         }
         for (&va, mapping) in self.live.iter_mut() {
             if claims(mapping) {
                 let owner = mapping.structural_owner.take()?;
-                self.bump_revision();
-                self.reset_fork_projection_changes();
                 return Some((MappingRowRef::Live(va), owner));
             }
         }
@@ -1061,15 +889,12 @@ impl TaskMappingIndex {
         row: MappingRowRef,
         owner: std::sync::Arc<StructuralBackingOwner>,
     ) {
-        self.invalidate_fork_shadowed_structural();
         let slot = match row {
             MappingRowRef::Live(va) => self.live.get_mut(&va),
             MappingRowRef::Shadowed(position) => self.shadowed.get_mut(position),
         };
         if let Some(mapping) = slot {
             mapping.structural_owner = Some(owner);
-            self.bump_revision();
-            self.reset_fork_projection_changes();
         }
     }
 
@@ -1172,9 +997,6 @@ impl<'a> IntoIterator for &'a mut TaskMappingIndex {
     >;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.invalidate_fork_shadowed_structural();
-        self.bump_revision();
-        self.reset_fork_projection_changes();
         self.shadowed.iter_mut().chain(self.live.values_mut())
     }
 }

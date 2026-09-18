@@ -538,22 +538,6 @@ pub(crate) struct AliasScopeBucket {
     pub(crate) rows: Vec<(u64, AliasBacking)>,
     pub(crate) replay: std::collections::BTreeSet<ReplayMappingKey>,
     pub(crate) versions: AliasVersionRegistry,
-    /// Monotonic generation of this scope's visible alias rows. Fork snapshot
-    /// caching keys on the scopes one process can see, so churn in an unrelated
-    /// child mm does not invalidate the parent's projection.
-    pub(crate) revision: u64,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl AliasScopeBucket {
-    fn bump_revision(&mut self) {
-        self.revision = self.revision.checked_add(1).unwrap_or_else(|| {
-            carrick_fatal!(
-                "hvpatch::host_alias",
-                "alias scope revision counter overflow"
-            );
-        });
-    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -928,7 +912,6 @@ impl AliasRegistry {
         let at = bucket.rows.partition_point(|&(row_seq, _)| row_seq <= seq);
         bucket.rows.insert(at, (seq, alias));
         bucket.replay.insert(replay_mapping_key(alias));
-        bucket.bump_revision();
     }
 
     pub(crate) fn push(&mut self, alias: AliasBacking) {
@@ -1135,7 +1118,6 @@ impl AliasRegistry {
             if changed {
                 bucket.replay.remove(&replay_mapping_key(previous));
                 bucket.replay.insert(replay_mapping_key(updated));
-                bucket.bump_revision();
             }
             (seq, previous, updated, changed)
         };
@@ -1200,7 +1182,6 @@ impl AliasRegistry {
             let Some(bucket) = self.by_scope.get_mut(&scope) else {
                 continue;
             };
-            let rows_before = bucket.rows.len();
             bucket.rows.retain(|row| {
                 let survives = keep(&row.1);
                 if !survives {
@@ -1210,9 +1191,6 @@ impl AliasRegistry {
             });
             for &(_, alias) in &dropped {
                 bucket.replay.remove(&replay_mapping_key(alias));
-            }
-            if bucket.rows.len() != rows_before {
-                bucket.bump_revision();
             }
             self.rebuild_exact_scope(scope);
         }
@@ -1254,7 +1232,6 @@ impl AliasRegistry {
     ) -> Vec<AliasBacking> {
         let mut dropped = Vec::new();
         if let Some(bucket) = self.by_scope.get_mut(&scope) {
-            let rows_before = bucket.rows.len();
             bucket.rows.retain(|row| {
                 let survives = keep(&row.1);
                 if !survives {
@@ -1268,8 +1245,6 @@ impl AliasRegistry {
             self.rows = self.rows.saturating_sub(dropped.len());
             if bucket.rows.is_empty() {
                 self.by_scope.remove(&scope);
-            } else if bucket.rows.len() != rows_before {
-                bucket.bump_revision();
             }
         }
         for &(seq, alias) in &dropped {
@@ -1315,7 +1290,6 @@ impl AliasRegistry {
             );
         });
         bucket.rows = replacement.clone();
-        bucket.bump_revision();
         for &(_, alias) in &previous {
             bucket.replay.remove(&replay_mapping_key(alias));
         }
@@ -1409,7 +1383,6 @@ impl AliasRegistry {
                 if changed {
                     bucket.replay.remove(&replay_mapping_key(previous));
                     bucket.replay.insert(replay_mapping_key(alias));
-                    bucket.bump_revision();
                 }
                 changed
             };
@@ -1605,7 +1578,6 @@ impl AliasRegistry {
                     }
                 }
                 rows.truncate(write);
-                bucket.bump_revision();
             }
 
             for (start, ipa) in promoted_keys {
@@ -1882,28 +1854,6 @@ impl AliasRegistry {
             Self::owned_scope(mm_root_slot, container_root),
             AliasOwnershipScope::Global,
         ]
-    }
-
-    /// Constant-size freshness receipt for the alias scopes visible to one
-    /// process. A fork snapshot can compare this without walking the scopes'
-    /// rows; unrelated process scopes deliberately do not participate.
-    pub(crate) fn process_visible_signature(
-        &self,
-        mm_root_slot: Option<(u64, u64)>,
-        container_root: ContainerRootToken,
-    ) -> Vec<(AliasOwnershipScope, u64, usize, Option<u64>)> {
-        Self::process_visible_scopes(mm_root_slot, container_root)
-            .into_iter()
-            .map(|scope| {
-                let bucket = self.by_scope.get(&scope);
-                (
-                    scope,
-                    bucket.map_or(0, |bucket| bucket.revision),
-                    bucket.map_or(0, |bucket| bucket.rows.len()),
-                    bucket.and_then(|bucket| bucket.rows.last().map(|(seq, _)| *seq)),
-                )
-            })
-            .collect()
     }
 
     /// The scope a process owns, per `alias_is_owned_by_process`.
@@ -2443,12 +2393,6 @@ pub(crate) fn alias_backing_is_live(host_addr: usize) -> bool {
     if host_addr == 0 {
         return false;
     }
-    mapped_host_region_at_or_after(host_addr)
-        .is_some_and(|(start, end)| start <= host_addr && host_addr < end)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn mapped_host_region_at_or_after(host_addr: usize) -> Option<(usize, usize)> {
     // macOS `mincore` is NO USE here: it returns 0/success even for an unmapped
     // page or an outright gap address. Use `mach_vm_region`, which returns the
     // region AT OR AFTER the queried address — `host_addr` is mapped iff that
@@ -2486,104 +2430,9 @@ fn mapped_host_region_at_or_after(host_addr: usize) -> Option<(usize, usize)> {
             &mut obj,
         )
     };
-    (kr == 0).then(|| {
-        let start = addr as usize;
-        (start, start.saturating_add(size as usize))
-    })
-}
-
-/// Filter alias publications by host-VM liveness with one ordered region walk.
-///
-/// `mach_vm_region` returns the mapped region at or after its query address, so
-/// one answer classifies every alias address in that region and every gap before
-/// it. Fork snapshots may carry thousands of retired global publications; a
-/// syscall per publication made repeated fork quadratic even though almost all
-/// candidates shared a small number of host VM regions.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn partition_live_alias_backings_with<F>(
-    aliases: &[AliasBacking],
-    mut region_at_or_after: F,
-) -> (Vec<AliasBacking>, Vec<AliasBacking>)
-where
-    F: FnMut(usize) -> Option<(usize, usize)>,
-{
-    let mut ordered: Vec<(usize, usize)> = aliases
-        .iter()
-        .enumerate()
-        .filter_map(|(index, alias)| (alias.host_addr != 0).then_some((alias.host_addr, index)))
-        .collect();
-    ordered.sort_unstable_by_key(|&(host_addr, _)| host_addr);
-
-    let mut live = vec![false; aliases.len()];
-    let mut cursor = 0;
-    while cursor < ordered.len() {
-        let query = ordered[cursor].0;
-        let Some((region_start, region_end)) = region_at_or_after(query) else {
-            break;
-        };
-        if region_end <= region_start || region_end <= query {
-            cursor += 1;
-            continue;
-        }
-        while cursor < ordered.len() && ordered[cursor].0 < region_start {
-            cursor += 1;
-        }
-        while cursor < ordered.len() && ordered[cursor].0 < region_end {
-            live[ordered[cursor].1] = true;
-            cursor += 1;
-        }
-    }
-
-    aliases.iter().copied().zip(live).fold(
-        (Vec::new(), Vec::new()),
-        |mut partition, (alias, live)| {
-            if live {
-                partition.0.push(alias);
-            } else {
-                partition.1.push(alias);
-            }
-            partition
-        },
-    )
-}
-
-/// Restrict a process-visible registry view to aliases selected by this
-/// process's live stage-1 graph before authenticating host-VM liveness.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn partition_current_live_alias_backings_with<T, F>(
-    aliases: &[AliasBacking],
-    mut translate: T,
-    region_at_or_after: F,
-) -> (Vec<AliasBacking>, Vec<AliasBacking>)
-where
-    T: FnMut(u64) -> Option<u64>,
-    F: FnMut(usize) -> Option<(usize, usize)>,
-{
-    let current: Vec<_> = aliases
-        .iter()
-        .copied()
-        .filter(|alias| translate(alias.start) == Some(alias.ipa))
-        .collect();
-    partition_live_alias_backings_with(&current, region_at_or_after)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn partition_current_live_alias_backings(
-    aliases: &[AliasBacking],
-    page_tables: &crate::page_table::PageTableManager,
-) -> (Vec<AliasBacking>, Vec<AliasBacking>) {
-    partition_current_live_alias_backings_with(
-        aliases,
-        |va| page_tables.translate(va),
-        mapped_host_region_at_or_after,
-    )
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn partition_live_alias_backings(
-    aliases: &[AliasBacking],
-) -> (Vec<AliasBacking>, Vec<AliasBacking>) {
-    partition_live_alias_backings_with(aliases, mapped_host_region_at_or_after)
+    kr == 0
+        && (addr as usize) <= host_addr
+        && host_addr < (addr as usize).saturating_add(size as usize)
 }
 
 /// Find the registered alias whose `hv_vm_map`'d IPA window contains `ipa`.
@@ -2695,7 +2544,7 @@ pub(crate) fn process_alias_key(alias: AliasBacking) -> ProcessAliasKey {
     )
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", test))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn mapped_region_process_alias_key(mapping: &HvfMappedRegion) -> ProcessAliasKey {
     (
         mapping.start,
@@ -2759,7 +2608,7 @@ pub(crate) fn mapping_is_current_for_process_fork_indexed(
         ))
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", test))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn current_process_alias_keys<'a>(
     mappings: impl IntoIterator<Item = &'a HvfMappedRegion>,
     aliases: &[AliasBacking],
@@ -2972,7 +2821,6 @@ pub(crate) fn unregister_alias_entries(
             }
             note_alias_rows_moved(new_rows.len());
             *rows = new_rows;
-            bucket.bump_revision();
         }
         for (seq, entry, fragments) in mutations {
             // Every exact key this mutation can disturb: the row's own key, and

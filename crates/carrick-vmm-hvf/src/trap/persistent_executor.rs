@@ -181,7 +181,6 @@ impl ThreadMappingDesc {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_alias_with_structural_owner(
         alias: AliasBacking,
         sources: &[Self],
@@ -1593,7 +1592,6 @@ impl HvfVmState {
                 #[cfg(not(test))]
                 custody,
                 mappings: TaskMappingIndex::new(),
-                fork_mapping_cache: parking_lot::Mutex::new(Default::default()),
                 mm_root_slot,
                 container_root,
                 pending_exec_mm_root_slot: None,
