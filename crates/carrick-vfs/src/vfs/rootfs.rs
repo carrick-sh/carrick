@@ -46,8 +46,8 @@ use crate::rootfs::{RootFs, RootFsEntryKind, RootFsError, RootFsMetadata};
 use carrick_abi::LinuxErrno;
 use carrick_abi::{
     LINUX_E2BIG, LINUX_EACCES, LINUX_EEXIST, LINUX_EFBIG, LINUX_EINVAL, LINUX_EISDIR, LINUX_ELOOP,
-    LINUX_ENOENT, LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS, LINUX_EXDEV,
-    LINUX_S_IFBLK, LINUX_S_IFCHR, LINUX_S_IFMT,
+    LINUX_ENAMETOOLONG, LINUX_ENOENT, LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS,
+    LINUX_EXDEV, LINUX_S_IFBLK, LINUX_S_IFCHR, LINUX_S_IFMT,
 };
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -788,6 +788,9 @@ impl RootFsVfs {
     /// `AT_SYMLINK_NOFOLLOW` and the writable backend can't answer a
     /// `real_stat` (e.g. the in-memory backend).
     pub fn lookup_nofollow(&self, path: &str) -> Result<Metadata, VfsError> {
+        if path.len() >= 4096 || path.split('/').any(|c| c.len() > 255) {
+            return Err(LINUX_ENAMETOOLONG);
+        }
         if self.overlay.serves_dentry_cache() {
             match self.dentry_stat(path, false) {
                 Ok(real) => {
@@ -812,6 +815,7 @@ impl RootFsVfs {
                 Err(LINUX_ENOENT) => return Err(LINUX_ENOENT),
                 Err(LINUX_ENOTDIR) => return Err(LINUX_ENOTDIR),
                 Err(LINUX_ELOOP) => return Err(LINUX_ELOOP),
+                Err(LINUX_ENAMETOOLONG) => return Err(LINUX_ENAMETOOLONG),
                 _ => {}
             }
         }
@@ -1732,6 +1736,9 @@ impl Vfs for RootFsVfs {
     /// rootfs for tombstoned paths and overlay-owned entries; if
     /// neither layer has the path, return ENOENT.
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError> {
+        if path.len() >= 4096 || path.split('/').any(|c| c.len() > 255) {
+            return Err(LINUX_ENAMETOOLONG);
+        }
         // The filesystem root always exists as a directory. Resolve it
         // here so root-relative metadata (statfs("/"), open("/"),
         // mkdir parent checks) works regardless of whether the rootfs
@@ -1773,6 +1780,7 @@ impl Vfs for RootFsVfs {
                 Err(LINUX_ENOENT) => return Err(LINUX_ENOENT),
                 Err(LINUX_ENOTDIR) => return Err(LINUX_ENOTDIR),
                 Err(LINUX_ELOOP) => return Err(LINUX_ELOOP),
+                Err(LINUX_ENAMETOOLONG) => return Err(LINUX_ENAMETOOLONG),
                 _ => {}
             }
         }
@@ -2840,6 +2848,22 @@ mod tests {
     fn lookup_missing_is_enoent() {
         let v = RootFsVfs::with_rootfs(rootfs_with_files());
         assert_eq!(v.lookup("/no-such"), Err(LINUX_ENOENT));
+    }
+
+    #[test]
+    fn lookup_overlong_pathname_returns_enametoolong_before_enoent() {
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let overlong_component = format!("/tmp/{}", "a".repeat(256));
+        assert_eq!(v.lookup(&overlong_component), Err(LINUX_ENAMETOOLONG));
+        assert_eq!(
+            v.lookup_nofollow(&overlong_component),
+            Err(LINUX_ENAMETOOLONG)
+        );
+
+        let overlong_path = format!("/{}", "a/".repeat(2048));
+        assert!(overlong_path.len() >= 4096);
+        assert_eq!(v.lookup(&overlong_path), Err(LINUX_ENAMETOOLONG));
+        assert_eq!(v.lookup_nofollow(&overlong_path), Err(LINUX_ENAMETOOLONG));
     }
 
     #[test]

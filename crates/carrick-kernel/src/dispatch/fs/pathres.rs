@@ -199,8 +199,10 @@ impl<'a> FsView<'a> {
     }
 
     pub(crate) fn canonicalize_following(&self, path: &str) -> Result<String, LinuxErrno> {
+        check_path_length(path)?;
         let mut cur = path.to_string();
         for _ in 0..40 {
+            check_path_length(&cur)?;
             let md = self.layered_lstat(&cur)?;
             if md.kind != RootFsEntryKind::Symlink {
                 return Ok(cur);
@@ -246,8 +248,10 @@ impl<'a> FsView<'a> {
         &self,
         path: &str,
     ) -> Result<String, LinuxErrno> {
+        check_path_length(path)?;
         let mut cur = path.to_string();
         for _ in 0..40 {
+            check_path_length(&cur)?;
             let md = match self.layered_lstat(&cur) {
                 Ok(md) => md,
                 // Resolved to a not-yet-existent path (the link's missing target,
