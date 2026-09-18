@@ -43,7 +43,7 @@ pub const DEFAULT_DGRAM_QUEUE_LIMIT: usize = 256;
 ///
 /// Stream receive used to index or `pop_front` one byte at a time. Large
 /// in-zone TCP transfers therefore spent their time in per-byte deque
-/// bookkeeping even when `splice(2)` moved MiB-sized chunks. The deque's two
+/// bookkeeping even when bulk I/O moved MiB-sized chunks. The deque's two
 /// physical slices are already contiguous, so preserve the logical stream
 /// order without that amplification.
 fn copy_deque_prefix(bytes: &VecDeque<u8>, dest: &mut [u8], len: usize) {
