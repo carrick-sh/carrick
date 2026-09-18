@@ -2529,6 +2529,45 @@ pub struct LinuxProcmapQuery {
     pub build_id_addr: u64,
 }
 
+/// Current Linux `struct pidfd_info`. `PIDFD_GET_INFO` is size-versioned: the
+/// 64-byte prefix ends at `exit_code`, older LTP headers use a 72-byte form,
+/// and current headers use all 88 bytes.
+#[repr(C, packed)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+    Unaligned,
+)]
+pub struct LinuxPidfdInfo {
+    pub mask: u64,
+    pub cgroupid: u64,
+    pub pid: u32,
+    pub tgid: u32,
+    pub ppid: u32,
+    pub ruid: u32,
+    pub rgid: u32,
+    pub euid: u32,
+    pub egid: u32,
+    pub suid: u32,
+    pub sgid: u32,
+    pub fsuid: u32,
+    pub fsgid: u32,
+    pub exit_code: i32,
+    pub coredump_mask: u32,
+    pub coredump_signal: u32,
+    pub coredump_code: u32,
+    pub coredump_pad: u32,
+    pub supported_mask: u64,
+}
+
 /// Linux sigset argument pack passed to `pselect6`, `ppoll`, and `epoll_pwait`.
 #[repr(C, packed)]
 #[derive(
@@ -2889,6 +2928,9 @@ kernel_abi!(
     "struct procmap_query on 64-bit Linux is 104 bytes"
 );
 assert_layout!(LinuxProcmapQuery, size = 104, size @ 0, query_flags @ 8, query_addr @ 16, vma_start @ 24, vma_end @ 32, vma_flags @ 40, vma_page_size @ 48, vma_offset @ 56, inode @ 64, dev_major @ 72, dev_minor @ 76, vma_name_size @ 80, build_id_size @ 84, vma_name_addr @ 88, build_id_addr @ 96);
+
+kernel_abi!(LinuxPidfdInfo, 88, "current pidfd_info is 88 bytes");
+assert_layout!(LinuxPidfdInfo, size = 88, mask @ 0, cgroupid @ 8, pid @ 16, exit_code @ 60, coredump_mask @ 64, supported_mask @ 80);
 
 kernel_abi!(
     LinuxSigsetArgpack,
@@ -4466,6 +4508,9 @@ pub const LINUX_TCFLSH: u64 = 0x540B;
 pub const LINUX_TCSBRKP: u64 = 0x5425;
 pub const LINUX_FICLONE: u64 = 0x4004_9409;
 pub const LINUX_PROCMAP_QUERY: u64 = 0xc068_6611;
+/// `_IOWR(PIDFS_IOCTL_MAGIC=0xff, 11, struct pidfd_info)` for current headers.
+pub const LINUX_PIDFD_GET_INFO: u64 = 0xc058_ff0b;
+pub const LINUX_PIDFD_INFO_EXIT: u64 = 1 << 3;
 pub const LINUX_PROCMAP_QUERY_VMA_READABLE: u64 = 0x01;
 pub const LINUX_PROCMAP_QUERY_VMA_WRITABLE: u64 = 0x02;
 pub const LINUX_PROCMAP_QUERY_VMA_EXECUTABLE: u64 = 0x04;

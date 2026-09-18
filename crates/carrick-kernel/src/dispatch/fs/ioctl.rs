@@ -126,6 +126,51 @@ fn fd_is_proc_maps(this: &FsView<'_>, fd: i32) -> bool {
         })
 }
 
+fn pidfd_get_info(
+    this: &FsView<'_>,
+    memory: &mut impl CurrentMmMemory,
+    fd: i32,
+    request: u64,
+    arg: u64,
+) -> DispatchOutcome {
+    let Some(open_file) = this.open_file(fd) else {
+        return DispatchOutcome::errno(LINUX_EBADF);
+    };
+    let watch = {
+        let Some(description) = open_file.description.read() else {
+            return DispatchOutcome::errno(LINUX_EBADF);
+        };
+        match &*description {
+            OpenDescription::Pidfd { kqueue, .. } => Arc::clone(kqueue),
+            _ => return DispatchOutcome::errno(LINUX_ENOTTY),
+        }
+    };
+    if arg == 0 {
+        return DispatchOutcome::errno(LINUX_EINVAL);
+    }
+    let size = usize::try_from((request >> 16) & 0x3fff).unwrap_or(0);
+    if !(64..=core::mem::size_of::<carrick_abi::LinuxPidfdInfo>()).contains(&size) {
+        return DispatchOutcome::errno(LINUX_EINVAL);
+    }
+    let mut info: carrick_abi::LinuxPidfdInfo = match read_kernel_prefix(memory, arg, size) {
+        Ok(info) => info,
+        Err(errno) => return DispatchOutcome::errno(errno),
+    };
+    let requested = info.mask;
+    info = carrick_abi::LinuxPidfdInfo::default();
+    if requested & carrick_abi::LINUX_PIDFD_INFO_EXIT != 0 {
+        if let Some(status) = watch.exit_status() {
+            info.mask |= carrick_abi::LINUX_PIDFD_INFO_EXIT;
+            info.exit_code = status.raw();
+        }
+    }
+    write_packed(memory, arg, &info.as_bytes()[..size])
+}
+
+fn is_pidfd_get_info(request: u64) -> bool {
+    request & 0xc000_ffff == 0xc000_ff0b
+}
+
 fn procmap_query(
     this: &FsView<'_>,
     context: &crate::kernel::KernelContext,
@@ -632,6 +677,9 @@ impl<'a> FsView<'a> {
             }
             if ioctl_request == carrick_abi::LINUX_PROCMAP_QUERY && fd_is_proc_maps(this, fd.0) {
                 return Ok(procmap_query(this, cx.kernel, &mut *cx.memory, arg));
+            }
+            if is_pidfd_get_info(ioctl_request) {
+                return Ok(pidfd_get_info(this, &mut *cx.memory, fd.0, ioctl_request, arg));
             }
             let changes_tty_state = matches!(
                 ioctl_request,
@@ -1838,6 +1886,65 @@ mod tests {
     use crate::linux_abi::{LINUX_AF_INET, LINUX_IPPROTO_TCP, LINUX_O_RDWR, LINUX_SOCK_STREAM};
     use parking_lot::RwLock;
     use std::sync::Arc;
+
+    #[test]
+    fn pidfd_get_info_reports_exit_after_pidfd_receipt_survives() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let mut mux = crate::event_mux::make_event_multiplexer().expect("pidfd multiplexer");
+        mux.register_user(0).expect("register pidfd user wake");
+        let watch = Arc::new(PidfdWatch::new(mux));
+        let status = crate::kernel::LinuxWaitStatus::from_wait_encoding(100 << 8);
+        watch.publish_exit(status);
+
+        let fd = dispatcher
+            .install_fd_at_or_above(
+                3,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::Pidfd {
+                        base: OpenDescriptionBase::new(0),
+                        target: PidfdTarget::Hvpatch(context.task().key()),
+                        kqueue: Arc::clone(&watch),
+                    })),
+                    LINUX_O_RDWR,
+                    0,
+                ),
+            )
+            .unwrap();
+
+        let base = 0x3000u64;
+        let mut info = carrick_abi::LinuxPidfdInfo::default();
+        info.mask = carrick_abi::LINUX_PIDFD_INFO_EXIT;
+        let mut memory = LinearMemory::new(base, vec![0u8; 0x1000]);
+        memory.write_bytes(base, info.as_bytes()).unwrap();
+
+        // The current LTP fallback header encodes its 72-byte pidfd_info,
+        // while newer headers encode 88. The kernel accepts compatible sizes.
+        let request = 0xc048_ff0b;
+        let out = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(29, SyscallArgs::from([fd as u64, request, base, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(out, DispatchOutcome::Returned { value: 0 });
+        let result: carrick_abi::LinuxPidfdInfo = read_kernel_struct(&memory, base).unwrap();
+        let result_mask = result.mask;
+        let result_exit_code = result.exit_code;
+        assert_eq!(result_mask, carrick_abi::LINUX_PIDFD_INFO_EXIT);
+        assert_eq!(result_exit_code, 100 << 8);
+    }
+
+    #[test]
+    fn pidfd_get_info_recognizes_compatible_struct_sizes() {
+        assert!(is_pidfd_get_info(0xc040_ff0b));
+        assert!(is_pidfd_get_info(0xc048_ff0b));
+        assert!(is_pidfd_get_info(carrick_abi::LINUX_PIDFD_GET_INFO));
+        assert!(!is_pidfd_get_info(0xc058_ff0a));
+    }
 
     #[test]
     fn inet_in_memory_socket_fionread_and_siocoutq() {

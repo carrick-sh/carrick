@@ -17,9 +17,9 @@ use super::ids::{
     SessionId, TaskId,
 };
 use super::objects::{
-    Credentials, FileSlot, FileTable, FsContext, Mm, ObjectGraphError, ProcessGroup, Session,
-    Sighand, Task, TaskIdentity, TaskKey, TaskLifecycle, TaskRef, TaskShared, Thread, ThreadKey,
-    ThreadRef, ThreadResources, Zombie,
+    Credentials, FileSlot, FileTable, FsContext, LinuxWaitStatus, Mm, ObjectGraphError,
+    ProcessGroup, Session, Sighand, Task, TaskIdentity, TaskKey, TaskLifecycle, TaskRef,
+    TaskShared, Thread, ThreadKey, ThreadRef, ThreadResources, Zombie,
 };
 use super::operations::KernelOperationError;
 use super::registry::{IdError, IdRegistry, TaskClaim, TaskReservation, ThreadClaim};
@@ -1063,7 +1063,7 @@ impl ReservationGate {
 pub(super) struct KernelDomain;
 
 pub trait TaskExitSubscriber: Send + Sync {
-    fn publish_exit(&self);
+    fn publish_exit(&self, status: LinuxWaitStatus);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

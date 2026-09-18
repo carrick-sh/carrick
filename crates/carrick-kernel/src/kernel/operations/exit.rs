@@ -242,12 +242,15 @@ impl Kernel {
             self.exit_subscribers.register(task, subscriber);
             return Some(task);
         }
-        let exited = state.zombies.get(&task_id).map(|record| record.zombie.key);
+        let exited = state
+            .zombies
+            .get(&task_id)
+            .map(|record| record.zombie.clone());
         drop(state);
-        if exited.is_some() {
-            subscriber.publish_exit();
+        if let Some(zombie) = &exited {
+            subscriber.publish_exit(zombie.status);
         }
-        exited
+        exited.map(|zombie| zombie.key)
     }
 
     /// Retire one non-final thread from the authoritative task graph. The TID
@@ -897,7 +900,7 @@ impl Kernel {
             .into_iter()
             .filter_map(|subscriber| subscriber.upgrade())
         {
-            subscriber.publish_exit();
+            subscriber.publish_exit(prepared.result_zombie.status);
         }
         Ok(prepared.result_zombie)
     }

@@ -1384,7 +1384,7 @@ pub(super) mod tests {
     pub struct CountingExitSubscriber(pub(crate) AtomicUsize);
 
     impl super::super::core::TaskExitSubscriber for CountingExitSubscriber {
-        fn publish_exit(&self) {
+        fn publish_exit(&self, _status: super::super::LinuxWaitStatus) {
             self.0.fetch_add(1, Ordering::Release);
         }
     }
