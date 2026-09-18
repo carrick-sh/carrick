@@ -1479,7 +1479,7 @@ mod netlink_readiness_tests {
             "a live pidfd target is not readable"
         );
 
-        watch.publish_exit();
+        watch.publish_exit(crate::kernel::LinuxWaitStatus::from_wait_encoding(0));
 
         assert_eq!(
             pidfd

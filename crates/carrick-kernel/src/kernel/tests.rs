@@ -19,7 +19,7 @@ use super::{Kernel, RootBootstrap};
 struct CountingExitSubscriber(AtomicUsize);
 
 impl super::core::TaskExitSubscriber for CountingExitSubscriber {
-    fn publish_exit(&self) {
+    fn publish_exit(&self, _status: super::LinuxWaitStatus) {
         self.0.fetch_add(1, Ordering::Release);
     }
 }

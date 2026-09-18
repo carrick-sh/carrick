@@ -1045,6 +1045,10 @@ pub struct PidfdWatch {
     #[allow(dead_code)]
     mux: Mutex<Box<dyn carrick_hal::event::EventMultiplexer>>,
     poll_fd: i32,
+    /// Durable exit receipt. Linux keeps `PIDFD_INFO_EXIT` available after the
+    /// parent reaps the zombie, so the pidfd must own this independently of the
+    /// process table's wait-consumable zombie record.
+    exit_status: Mutex<Option<crate::kernel::LinuxWaitStatus>>,
 }
 
 impl PidfdWatch {
@@ -1053,6 +1057,7 @@ impl PidfdWatch {
         Self {
             mux: Mutex::new(mux),
             poll_fd,
+            exit_status: Mutex::new(None),
         }
     }
 
@@ -1065,14 +1070,19 @@ impl PidfdWatch {
     /// The process table calls this exactly when it publishes the target's
     /// zombie record. A saturated user wake is already the required persistent
     /// readiness, so firing is deliberately best-effort.
-    pub(crate) fn publish_exit(&self) {
+    pub(crate) fn publish_exit(&self, status: crate::kernel::LinuxWaitStatus) {
+        *self.exit_status.lock() = Some(status);
         let _ = self.mux.lock().trigger_user(0);
+    }
+
+    pub(crate) fn exit_status(&self) -> Option<crate::kernel::LinuxWaitStatus> {
+        *self.exit_status.lock()
     }
 }
 
 impl crate::kernel::TaskExitSubscriber for PidfdWatch {
-    fn publish_exit(&self) {
-        PidfdWatch::publish_exit(self);
+    fn publish_exit(&self, status: crate::kernel::LinuxWaitStatus) {
+        PidfdWatch::publish_exit(self, status);
     }
 }
 
@@ -1080,6 +1090,7 @@ impl std::fmt::Debug for PidfdWatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PidfdWatch")
             .field("poll_fd", &self.poll_fd)
+            .field("exit_status", &self.exit_status.lock())
             // The mux keeps the kqueue fd alive; nothing else to surface.
             .field("mux", &"<dyn EventMultiplexer>")
             .finish()
