@@ -781,7 +781,7 @@ impl<'a> NetView<'a> {
     }
 
     /// Observe an existing poll target without materializing an in-memory
-    /// pipe's lazy readiness fds. Close/epoll-retirement paths use this because
+    /// pipe's lazy readiness fds. Close/readiness-retirement paths use this because
     /// an unmaterialized target cannot have a host registration to remove.
     pub(super) fn initialized_host_fd_for_poll(&self, fd: i32) -> Option<HostFd> {
         if fd < 0 {

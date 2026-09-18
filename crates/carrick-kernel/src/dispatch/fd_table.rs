@@ -1637,6 +1637,17 @@ pub(in crate::dispatch) enum InMemoryTcpAtMark {
     AtMark(bool),
 }
 
+pub(in crate::dispatch) enum PidfdWatchAccess {
+    Closed,
+    WrongKind,
+    Watch(Arc<PidfdWatch>),
+}
+
+pub(in crate::dispatch) enum InMemoryPipeEndpoint {
+    Reader,
+    Writer,
+}
+
 pub type OpenFile = crate::kernel::FileSlot;
 
 pub(super) fn kernel_file_description(
@@ -2698,6 +2709,24 @@ impl crate::kernel::FileDescription {
     /// its backing lock to callers that only need stable metadata.
     pub(in crate::dispatch) fn open_path_snapshot(&self) -> Option<String> {
         self.read()?.open_path().map(str::to_owned)
+    }
+
+    pub(in crate::dispatch) fn pidfd_watch(&self) -> PidfdWatchAccess {
+        let Some(open) = self.read() else {
+            return PidfdWatchAccess::Closed;
+        };
+        match &*open {
+            OpenDescription::Pidfd { kqueue, .. } => PidfdWatchAccess::Watch(Arc::clone(kqueue)),
+            _ => PidfdWatchAccess::WrongKind,
+        }
+    }
+
+    pub(in crate::dispatch) fn in_memory_pipe_endpoint(&self) -> Option<InMemoryPipeEndpoint> {
+        match &*self.read()? {
+            OpenDescription::PipeReader { .. } => Some(InMemoryPipeEndpoint::Reader),
+            OpenDescription::PipeWriter { .. } => Some(InMemoryPipeEndpoint::Writer),
+            _ => None,
+        }
     }
 
     /// Report the one legacy-AIO case that must complete immediately with
