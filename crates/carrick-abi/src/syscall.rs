@@ -228,6 +228,7 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 217..=219
         | 270
         | 271
+        | 272
         | 277
         | 278
         | 280
@@ -239,6 +240,7 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 293
         | 424
         | 434
+        | 438
         | 180..=197 => SyscallHandler::Process,
         93 | 94 | 220 | 221 | 260 | 435 => SyscallHandler::Lifecycle,
         74 | 129..=139 => SyscallHandler::Signal,

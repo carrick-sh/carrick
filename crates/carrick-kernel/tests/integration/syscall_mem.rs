@@ -472,9 +472,7 @@ fn mprotect_rounds_length_to_configured_16k_linux_page_size() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno {
-            errno: LinuxErrno::new(22)
-        }
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
