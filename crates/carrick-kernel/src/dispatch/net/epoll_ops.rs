@@ -867,7 +867,7 @@ impl<'a> NetView<'a> {
     }
 
     pub(in crate::dispatch) fn detach_fd_from_epolls(&self, fd: i32) {
-        let detached_host_fd = self.host_fd_for_poll(fd);
+        let detached_host_fd = self.initialized_host_fd_for_poll(fd);
         let (detached_description, owners, should_auto_detach) = {
             let files = self.captured_file_table();
             let table = files.read_open_files();

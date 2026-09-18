@@ -178,6 +178,14 @@ impl PipeInner {
     }
 
     #[cfg(test)]
+    pub(crate) fn readiness_pipes_initialized(&self) -> (bool, bool) {
+        (
+            self.read_pipe_ready.get().is_some(),
+            self.write_pipe_ready.get().is_some(),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_connected(pipe_id: u64, capacity: usize) -> Self {
         let pipe = Self::new(pipe_id, capacity);
         {
@@ -228,6 +236,16 @@ impl PipeInner {
         self.read_poll_fd_locked(&state)
     }
 
+    /// Observe the read readiness fd without materializing it. Lifecycle
+    /// cleanup uses this because an untouched pipe has no host registration
+    /// to remove.
+    pub(crate) fn initialized_read_poll_fd(&self) -> Option<HostFdRef> {
+        self.read_pipe_ready
+            .get()
+            .and_then(Option::as_ref)
+            .map(|(r, _)| r.clone())
+    }
+
     /// [`Self::read_poll_fd`] for a caller that already holds `state`.
     pub(crate) fn read_poll_fd_locked(&self, state: &PipeState) -> Option<HostFdRef> {
         if self.read_pipe_ready.get().is_none() {
@@ -252,6 +270,14 @@ impl PipeInner {
         }
         let state = self.state.lock();
         self.write_poll_fd_locked(&state)
+    }
+
+    /// Observe the write readiness fd without materializing it.
+    pub(crate) fn initialized_write_poll_fd(&self) -> Option<HostFdRef> {
+        self.write_pipe_ready
+            .get()
+            .and_then(Option::as_ref)
+            .map(|(r, _)| r.clone())
     }
 
     /// [`Self::write_poll_fd`] for a caller that already holds `state`.

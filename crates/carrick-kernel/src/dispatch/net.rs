@@ -696,9 +696,9 @@ impl<'a> NetView<'a> {
         })
     }
 
-    /// Return the host fd backing an open file description (`&Arc<FileDescription>`) for ppoll's fast path.
-    pub(super) fn description_host_fd_for_poll(
+    fn description_host_fd_for_poll_mode(
         desc: &Arc<crate::kernel::FileDescription>,
+        materialize_pipe_readiness: bool,
     ) -> Option<HostFd> {
         let open = desc.read()?;
         match &*open {
@@ -711,8 +711,18 @@ impl<'a> NetView<'a> {
                     Some(host_fd.view())
                 }
             }
-            OpenDescription::PipeReader { pipe, .. } => pipe.read_poll_fd().map(|fd| fd.view()),
-            OpenDescription::PipeWriter { pipe, .. } => pipe.write_poll_fd().map(|fd| fd.view()),
+            OpenDescription::PipeReader { pipe, .. } => if materialize_pipe_readiness {
+                pipe.read_poll_fd()
+            } else {
+                pipe.initialized_read_poll_fd()
+            }
+            .map(|fd| fd.view()),
+            OpenDescription::PipeWriter { pipe, .. } => if materialize_pipe_readiness {
+                pipe.write_poll_fd()
+            } else {
+                pipe.initialized_write_poll_fd()
+            }
+            .map(|fd| fd.view()),
             OpenDescription::EventFd { state, .. } => state.read_fd.as_ref().map(|fd| fd.view()),
             // A pidfd is read-ready when its process exits; the backing
             // multiplexer's poll fd (the kqueue fd on macOS, the
@@ -735,6 +745,19 @@ impl<'a> NetView<'a> {
         }
     }
 
+    /// Return the host fd backing an open file description (`&Arc<FileDescription>`) for ppoll's fast path.
+    pub(super) fn description_host_fd_for_poll(
+        desc: &Arc<crate::kernel::FileDescription>,
+    ) -> Option<HostFd> {
+        Self::description_host_fd_for_poll_mode(desc, true)
+    }
+
+    fn description_initialized_host_fd_for_poll(
+        desc: &Arc<crate::kernel::FileDescription>,
+    ) -> Option<HostFd> {
+        Self::description_host_fd_for_poll_mode(desc, false)
+    }
+
     /// `Some(host_fd)` means we can hand this off to libc::poll.
     /// `None` means it's synthetic (epoll/eventfd/timerfd/in-memory pipe)
     /// and ppoll has to fall back to the per-fd readiness loop.
@@ -754,6 +777,22 @@ impl<'a> NetView<'a> {
         // (host fds 3,4,5… belong to carrick itself — the cap-std rootfs dir,
         // the HVF device, etc., so polling them blocks on the wrong object).
         // Route to the synthetic readiness path instead.
+        None
+    }
+
+    /// Observe an existing poll target without materializing an in-memory
+    /// pipe's lazy readiness fds. Close/epoll-retirement paths use this because
+    /// an unmaterialized target cannot have a host registration to remove.
+    pub(super) fn initialized_host_fd_for_poll(&self, fd: i32) -> Option<HostFd> {
+        if fd < 0 {
+            return Some(HostFd(fd));
+        }
+        if let Some(open_file) = self.open_file(fd) {
+            return Self::description_initialized_host_fd_for_poll(&open_file.description);
+        }
+        if is_stdio_fd(fd) {
+            return Some(HostFd(fd));
+        }
         None
     }
 
