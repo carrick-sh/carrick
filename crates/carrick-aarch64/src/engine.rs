@@ -2873,6 +2873,17 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         ))
     }
 
+    fn discard_terminal_syscall_continuation(&mut self) -> Result<(), TrapError> {
+        let _ = self
+            .vm
+            .take_task_continuation_for_executor_switch(&mut self.vcpu)?;
+        self.pending_resume_pc = None;
+        self.last_syscall_nr = None;
+        self.last_syscall_orig_x0 = 0;
+        self.last_fault_esr = 0;
+        Ok(())
+    }
+
     fn bind_frame_cow(
         &mut self,
         authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,

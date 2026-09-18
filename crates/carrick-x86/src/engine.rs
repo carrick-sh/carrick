@@ -1542,6 +1542,13 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
         GuestCpuState::from_x86_64_v1(x86_task_state_from_snapshot(self, &snapshot)?)
     }
 
+    fn discard_terminal_syscall_continuation(&mut self) -> Result<(), TrapError> {
+        self.pending_resume_pc = None;
+        self.last_syscall_canonical = None;
+        self.sysret_resume = None;
+        Ok(())
+    }
+
     fn diagnostic_wait_registers(&self) -> Option<carrick_hal::GuestWaitRegisters> {
         Some(carrick_hal::GuestWaitRegisters {
             pc: self.current_pc().ok()?,

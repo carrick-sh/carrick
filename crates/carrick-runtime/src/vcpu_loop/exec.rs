@@ -1257,6 +1257,9 @@ where
             cause,
             "execve failed after the point of no return; killing the guest process by SIGSEGV"
         );
+        engine
+            .discard_terminal_syscall_continuation()
+            .map_err(RuntimeError::Trap)?;
         let sigsegv = crate::linux_abi::LINUX_SIGSEGV;
         if super::requires_no_unwind_host_exit(kernel, engine.is_forked_child()) {
             if let Err(error) = engine.process_exit_cleanup() {
@@ -5267,6 +5270,10 @@ pub(crate) mod tests {
             }
             assert!(matches!(case.job.phase, HvpatchProductionPhase::Complete));
             assert!(submission.exec_replacement.is_none());
+            assert_eq!(
+                case.engine.terminal_continuation_discards, 1,
+                "post-no-return exec failure must discard the dead syscall continuation"
+            );
 
             assert_eq!(
                 case.preparations.load(std::sync::atomic::Ordering::SeqCst),

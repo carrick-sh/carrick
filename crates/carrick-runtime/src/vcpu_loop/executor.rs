@@ -1032,6 +1032,11 @@ where
                 ) {
                     Ok(stop_seen) => deferred_stop |= stop_seen,
                     Err(error) => {
+                        tracing::error!(
+                            executor = ?executor_id,
+                            %error,
+                            "terminal ASID invalidation failed before detached address-space cleanup"
+                        );
                         let settlement = match settlement_authority {
                             SettlementAuthority::Live => {
                                 fail_running_and_retire::<F::TaskBinding, _>(

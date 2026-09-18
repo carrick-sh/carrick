@@ -2825,6 +2825,7 @@ pub(crate) mod tests {
         pub(crate) read_tracker: Option<CrashReadTracker>,
         pub(crate) fail_read_at: Option<u64>,
         pub(crate) fail_execve_into: Option<String>,
+        pub(crate) terminal_continuation_discards: usize,
     }
 
     impl carrick_guest_mem::GuestMemory for CrashCaptureTestEngine {
@@ -3020,6 +3021,11 @@ pub(crate) mod tests {
 
         fn take_guest_run_receipt_ns(&mut self) -> u64 {
             0
+        }
+
+        fn discard_terminal_syscall_continuation(&mut self) -> Result<(), TrapError> {
+            self.terminal_continuation_discards += 1;
+            Ok(())
         }
 
         fn frame_cow_owner_inventory(
