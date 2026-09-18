@@ -418,6 +418,10 @@ impl DentryCache {
     ) -> Result<ResolvedDentry, LinuxErrno> {
         self.check_fork();
 
+        if path.len() >= 4096 || path.split('/').any(|c| c.len() > 255) {
+            return Err(LINUX_ENAMETOOLONG);
+        }
+
         let requires_dir = path.ends_with('/') || path.ends_with("/.");
         let effective_follow = follow_trailing || requires_dir;
 

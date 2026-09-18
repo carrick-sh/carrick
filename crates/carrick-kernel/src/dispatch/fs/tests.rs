@@ -6,6 +6,43 @@ use crate::dispatch::dispatcher::FsCrossSubsystem;
 use std::sync::Arc;
 
 #[test]
+fn acquire_exec_source_overlong_path_returns_enametoolong_before_enoent() {
+    let backend = carrick_vfs::fs_backend::MemoryBackend::new();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let context = dispatcher.capture_one_task_context().unwrap();
+
+    let overlong_component = format!("/tmp/{}", "a".repeat(256));
+    let err = dispatcher
+        .acquire_exec_source(&context, &overlong_component)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::dispatch::executable_authority::ExecSourceError::Linux(
+                crate::linux_abi::LINUX_ENAMETOOLONG
+            )
+        ),
+        "expected ENAMETOOLONG, got {err:?}"
+    );
+
+    let overlong_path = format!("/{}", "a/".repeat(2048));
+    assert!(overlong_path.len() >= 4096);
+    let err = dispatcher
+        .acquire_exec_source(&context, &overlong_path)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::dispatch::executable_authority::ExecSourceError::Linux(
+                crate::linux_abi::LINUX_ENAMETOOLONG
+            )
+        ),
+        "expected ENAMETOOLONG, got {err:?}"
+    );
+}
+
+#[test]
 fn proc_exe_open_fd_tracks_dentry_and_reads_retained_live_object() {
     let backend = carrick_vfs::fs_backend::MemoryBackend::new();
     backend
