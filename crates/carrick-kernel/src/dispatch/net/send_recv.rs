@@ -13,6 +13,7 @@ use carrick_abi::{KernelAbi, LinuxErrno, LinuxMsgFlags};
 
 use super::support::*;
 use super::*;
+use crate::dispatch::net::unix_pure::PureSocketInner;
 use crate::dispatch::net::{recverr, reuseport, scm_rights, sctp};
 use crate::dispatch::{
     CurrentMmMemory, DispatchError, DispatchOutcome, Fd, GuestPtr, HostFd, SyscallCtx,
@@ -104,6 +105,62 @@ impl<'a> NetView<'a> {
             cork_enabled,
             has_pending_cork,
         })
+    }
+
+    fn send_in_memory_stream(
+        &self,
+        fd: i32,
+        socket: &PureSocketInner,
+        data: &[u8],
+        rights: Vec<Arc<OpenFile>>,
+        flags: i32,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let is_ip = matches!(socket.family(), LINUX_AF_INET | LINUX_AF_INET6);
+        let is_msg_more =
+            is_ip && LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::MORE);
+        let (is_cork_enabled, has_pending_cork) =
+            self.open_file(fd).map_or((false, false), |open_file| {
+                let cork = open_file.description.common().cork();
+                (cork.is_enabled(), cork.has_pending())
+            });
+
+        if is_cork_enabled || is_msg_more {
+            if let Some(open_file) = self.open_file(fd) {
+                open_file.description.common().cork().stage(data, None);
+            }
+            return DispatchOutcome::returned_len(data.len()).map_err(DispatchError::from);
+        }
+
+        let pending_cork = has_pending_cork
+            .then(|| {
+                self.open_file(fd)
+                    .and_then(|open_file| open_file.description.common().cork().take())
+            })
+            .flatten();
+        let current_payload_len = data.len();
+        let combined = pending_cork.map(|(mut pending, _)| {
+            pending.extend_from_slice(data);
+            pending
+        });
+        let cork_len = combined
+            .as_ref()
+            .map_or(0, |bytes| bytes.len() - current_payload_len);
+        let send_data = combined.as_deref().unwrap_or(data);
+        let nonblocking = self.io_is_nonblocking(fd, flags);
+        let outcome = match socket.send_stream(send_data, rights) {
+            Ok(written) => {
+                self.notify_inmem_epoll();
+                DispatchOutcome::returned_len(written)?
+            }
+            Err(LINUX_EAGAIN) if !nonblocking => {
+                if cork_len > 0 {
+                    self.restore_cork_prefix(fd, &send_data[..cork_len]);
+                }
+                return Ok(self.wait_in_memory_slot(fd, libc::POLLOUT, socket.get_sndtimeo()));
+            }
+            Err(errno) => DispatchOutcome::errno(errno),
+        };
+        Ok(self.settle_cork_send(fd, outcome, combined.as_deref(), cork_len, nonblocking))
     }
 
     /// `sendmmsg(sockfd, msgvec, vlen, flags)` — Linux's batched
@@ -345,24 +402,13 @@ impl<'a> NetView<'a> {
                                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                             }
                         }
-                        match socket.send_stream(&bytes, Vec::new()) {
-                            Ok(written) => {
-                                this.notify_inmem_epoll();
-                                return Ok(DispatchOutcome::returned_len(written)?);
-                            }
-                            Err(LINUX_EAGAIN) if !this.io_is_nonblocking(fd, flags) => {
-                                return Ok(this.wait_in_memory_slot(fd, libc::POLLOUT, socket.get_sndtimeo()));
-                            }
-                            Err(LINUX_EPIPE) => {
-                                let outcome = DispatchOutcome::errno(LINUX_EPIPE);
-                                if (flags & LINUX_MSG_NOSIGNAL) == 0 {
-                                    return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
-                                } else {
-                                    return Ok(outcome);
-                                }
-                            }
-                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        let outcome = this.send_in_memory_stream(fd, &socket, &bytes, Vec::new(), flags)?;
+                        if outcome == DispatchOutcome::errno(LINUX_EPIPE)
+                            && (flags & LINUX_MSG_NOSIGNAL) == 0
+                        {
+                            return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
                         }
+                        return Ok(outcome);
                     }
                     _ => {}
                 }
@@ -1135,19 +1181,7 @@ impl<'a> NetView<'a> {
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
             }
-            match socket.send_stream(&data, Vec::new()) {
-                Ok(written) => {
-                    self.notify_inmem_epoll();
-                    return Ok(DispatchOutcome::returned_len(written)?);
-                }
-                Err(LINUX_EAGAIN) if !self.io_is_nonblocking(fd, flags) => {
-                    return Ok(self.wait_in_memory_slot(fd, libc::POLLOUT, socket.get_sndtimeo()));
-                }
-                Err(LINUX_EPIPE) => {
-                    return Ok(DispatchOutcome::errno(LINUX_EPIPE));
-                }
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            }
+            return self.send_in_memory_stream(fd, &socket, &data, Vec::new(), flags);
         }
         let send_view = if is_netlink {
             None
@@ -2203,10 +2237,77 @@ mod inet_in_memory_socket_tests {
         SyscallRequest,
     };
     use crate::linux_abi::{
-        LINUX_AF_INET, LINUX_EPIPE, LINUX_IPPROTO_TCP, LINUX_MSG_NOSIGNAL, LINUX_MSG_PEEK,
-        LINUX_O_RDWR, LINUX_SIGPIPE, LINUX_SOCK_STREAM,
+        LINUX_AF_INET, LINUX_EAGAIN, LINUX_EPIPE, LINUX_IPPROTO_TCP, LINUX_MSG_MORE,
+        LINUX_MSG_NOSIGNAL, LINUX_MSG_PEEK, LINUX_O_RDWR, LINUX_SIGPIPE, LINUX_SOCK_STREAM,
     };
     use parking_lot::RwLock;
+
+    #[test]
+    fn inet_in_memory_msg_more_hides_bytes_until_uncorking_send() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let (sender, receiver) = PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+        let fd = dispatcher
+            .install_fd_at_or_above(
+                3,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::InMemorySocket {
+                        base: OpenDescriptionBase::new(0),
+                        socket: sender,
+                    })),
+                    LINUX_O_RDWR,
+                    0,
+                ),
+            )
+            .unwrap();
+
+        let base = 0x2000u64;
+        let mut memory = LinearMemory::new(base, vec![0u8; 0x1000]);
+        memory.write_bytes(base, b"staged-").unwrap();
+        memory.write_bytes(base + 0x100, b"visible").unwrap();
+
+        let staged = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    206,
+                    SyscallArgs::from([fd as u64, base, 7, LINUX_MSG_MORE as u64, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(staged, DispatchOutcome::returned_len(7).unwrap());
+        let mut received = [0u8; 32];
+        assert_eq!(
+            receiver.recv_stream(&mut received, 0).unwrap_err(),
+            LINUX_EAGAIN,
+            "MSG_MORE bytes must remain hidden from the peer"
+        );
+
+        let uncorked = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    206,
+                    SyscallArgs::from([fd as u64, base + 0x100, 7, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(uncorked, DispatchOutcome::returned_len(7).unwrap());
+        let (count, _) = receiver.recv_stream(&mut received, 0).unwrap();
+        assert_eq!(count, 14);
+        assert_eq!(&received[..count], b"staged-visible");
+    }
 
     #[test]
     fn inet_in_memory_socket_closed_peer_send_epipe_and_sigpipe() {
