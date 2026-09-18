@@ -216,9 +216,23 @@ impl PreparedProcessExec {
     }
 }
 
-/// MM publication is the HVPatch exec no-return cut. This non-cloneable token
-/// carries the still-prepared Kernel transition and exact pinned MM receipt
-/// forward to post-engine publication.
+/// The HVPatch exec no-return cut, armed before destructive engine replacement.
+///
+/// The MM reservation remains abortable until the engine reports a successful
+/// replacement. Dropping this token terminates predecessor siblings through the
+/// Kernel guard while restoring the exact predecessor MM edge, so terminal
+/// cleanup never receives a replacement stage-1 ticket for a predecessor
+/// backend.
+pub(crate) struct ArmedProcessExec {
+    kernel: carrick_kernel::kernel::PreparedExec,
+    backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
+    reservation: mm_resources::ExecMmReservation,
+    vma_source: carrick_kernel::kernel::SharedVmaSnapshotSource,
+}
+
+/// MM publication after the engine has installed the replacement image. This
+/// non-cloneable token carries the prepared Kernel transition and exact pinned
+/// MM receipt forward to Kernel exec publication.
 pub(crate) struct PublishedProcessExec {
     kernel: carrick_kernel::kernel::PreparedExec,
     receipt: mm_resources::ExecMmCommitReceipt,
@@ -753,13 +767,14 @@ impl ProcessContext {
         ))
     }
 
-    /// Publish the exact pinned MM disposition. Success is the bounded exec
-    /// no-return cut: callers must fail-stop rather than restore the old image.
-    pub(crate) fn publish_exec_mm(
+    /// Arm the bounded exec no-return cut without publishing the replacement
+    /// MM edge. A failure before the engine replaces its image may still drop
+    /// the reservation and retire the process through its exact predecessor.
+    pub(crate) fn arm_exec_no_return(
         &self,
         prepared: PreparedProcessExec,
         vma_source: carrick_kernel::kernel::SharedVmaSnapshotSource,
-    ) -> Result<PublishedProcessExec, String> {
+    ) -> Result<ArmedProcessExec, String> {
         let PreparedProcessExec {
             mut kernel,
             backend,
@@ -808,6 +823,29 @@ impl ProcessContext {
                 return Err(error);
             }
         }
+        kernel.enter_no_return();
+        Ok(ArmedProcessExec {
+            kernel,
+            backend,
+            reservation,
+            vma_source,
+        })
+    }
+
+    /// Publish the exact pinned MM disposition after destructive engine
+    /// replacement succeeds. From this point onward the replacement backend
+    /// and replacement MM edge advance together and ordinary failures must
+    /// retire the replacement generation.
+    pub(crate) fn publish_exec_mm(
+        &self,
+        armed: ArmedProcessExec,
+    ) -> Result<PublishedProcessExec, String> {
+        let ArmedProcessExec {
+            kernel,
+            backend,
+            reservation,
+            vma_source,
+        } = armed;
         let stage1_root = reservation
             .replacement_root_slot()
             .unwrap_or_else(|| {
@@ -836,7 +874,6 @@ impl ProcessContext {
         backend.bind_inventory(self.kernel_graph(), replacement_mm);
         backend.bind_vma_source(vma_source);
         *self.mm_backend.write() = backend;
-        kernel.enter_no_return();
         Ok(PublishedProcessExec { kernel, receipt })
     }
 
@@ -883,7 +920,8 @@ impl ProcessContext {
         vma_source: carrick_kernel::kernel::SharedVmaSnapshotSource,
         dispatch_mm: Option<carrick_kernel::dispatch::PreparedDispatchMmExec>,
     ) -> Result<CommittedProcessExec, String> {
-        let published = self.publish_exec_mm(prepared, vma_source)?;
+        let armed = self.arm_exec_no_return(prepared, vma_source)?;
+        let published = self.publish_exec_mm(armed)?;
         self.complete_exec(published, dispatch_mm)
             .map_err(|error| error.to_string())
     }
@@ -2163,7 +2201,7 @@ mod tests {
 
         let (unrelated, _) = authoritative_root();
         *process.mm_backend.write() = std::sync::Arc::clone(&unrelated.mm_backend.read());
-        let error = match process.publish_exec_mm(prepared, test_vma_source()) {
+        let error = match process.arm_exec_no_return(prepared, test_vma_source()) {
             Ok(_) => panic!("backend drift must reject before MM publication"),
             Err(error) => error,
         };
@@ -2182,8 +2220,13 @@ mod tests {
     }
 
     #[test]
-    fn dropping_mm_published_exec_terminates_parked_predecessor_siblings() {
+    fn dropping_armed_exec_terminates_siblings_without_publishing_replacement_mm() {
         let (process, root) = authoritative_root();
+        let predecessor_lease = process
+            .mm_resources()
+            .lease(process.task_key())
+            .expect("predecessor lease");
+        let predecessor_backend = std::sync::Arc::clone(&process.mm_backend.read());
         let plan = carrick_kernel::kernel::ClonePlan::from_flags(
             carrick_abi::LinuxCloneFlags::THREAD
                 | carrick_abi::LinuxCloneFlags::SIGHAND
@@ -2212,10 +2255,46 @@ mod tests {
         });
 
         let prepared = process.prepare_exec(&root).expect("prepare drained exec");
-        let published = process
-            .publish_exec_mm(prepared, test_vma_source())
-            .expect("publish MM no-return cut");
-        drop(published);
+        let replacement_root = prepared
+            .replacement_root_slot()
+            .expect("replacement root slot");
+        let executor = carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(
+            crate::thread::ThreadId::synthetic_for_tests(10_002),
+        )
+        .expect("test executor");
+        let replacement_load = prepared
+            .begin_replacement_load(executor)
+            .expect("replacement load admission");
+        let armed = process
+            .arm_exec_no_return(prepared, test_vma_source())
+            .expect("arm exec no-return cut");
+        assert!(std::sync::Arc::ptr_eq(
+            &process.mm_resources().lease(process.task_key()).unwrap(),
+            &predecessor_lease,
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &process.mm_backend.read(),
+            &predecessor_backend,
+        ));
+        drop(replacement_load);
+        drop(armed);
+
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &process.mm_resources().lease(process.task_key()).unwrap(),
+                &predecessor_lease,
+            ),
+            "an engine failure before replacement must leave terminal cleanup on the predecessor MM",
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&process.mm_backend.read(), &predecessor_backend),
+            "an engine failure before replacement must preserve the predecessor backend",
+        );
+        let reusable = process
+            .mm_resources()
+            .prepare_child()
+            .expect("aborted replacement root must remain reusable");
+        assert_eq!(reusable.root_slot(), Some(replacement_root));
 
         assert_eq!(
             runner_thread.join().expect("join predecessor sibling"),

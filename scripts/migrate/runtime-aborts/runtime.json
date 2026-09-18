@@ -1053,7 +1053,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "function": "ProcessContext::publish_exec_mm",
+      "function": "ProcessContext::arm_exec_no_return",
       "ordinal_in_function": 1,
       "fingerprint": "5f9f0355900fb9701faaf8be22a2ce9902cb3925477fcc06e08670ac726e64f2",
       "verdict": "carrier_fault",
@@ -1064,7 +1064,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "function": "ProcessContext::publish_exec_mm",
+      "function": "ProcessContext::arm_exec_no_return",
       "ordinal_in_function": 2,
       "fingerprint": "2e48a91dea79c4d8e556ff2377d14712f566c726c8fcc94b92408828f7b91c6e",
       "verdict": "carrier_fault",
@@ -1075,7 +1075,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "function": "ProcessContext::publish_exec_mm",
+      "function": "ProcessContext::arm_exec_no_return",
       "ordinal_in_function": 3,
       "fingerprint": "2e48a91dea79c4d8e556ff2377d14712f566c726c8fcc94b92408828f7b91c6e",
       "verdict": "carrier_fault",
@@ -1087,8 +1087,8 @@
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
       "function": "ProcessContext::publish_exec_mm",
-      "ordinal_in_function": 4,
-      "fingerprint": "65631fa12afc4329c6b3058c187aa0846f7a56fe7619870d23ced4af5f396c9c",
+      "ordinal_in_function": 1,
+      "fingerprint": "495f90a13331f572a6196c144c7f2a0676575e92a89afba7de7b3d0abbc8d558",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::stage1_mm",
       "rationale": "Active ExecMmReservation missing replacement Stage-1 root table slot; cannot publish replacement address space.",
@@ -1098,7 +1098,7 @@
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
       "function": "ProcessContext::publish_exec_mm",
-      "ordinal_in_function": 5,
+      "ordinal_in_function": 2,
       "fingerprint": "c8e4fe7f271d033f84dce8e91860f96a1079fb2039ab185d7e0352d0305d2158",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_commit",
