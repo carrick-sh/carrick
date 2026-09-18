@@ -39,6 +39,26 @@ pub const TCP_AUTOTUNE_MAX_RMEM: usize = 6_291_456;
 /// Max queued datagrams before backpressure/drop.
 pub const DEFAULT_DGRAM_QUEUE_LIMIT: usize = 256;
 
+/// Copy a byte prefix out of a `VecDeque` with at most two bulk copies.
+///
+/// Stream receive used to index or `pop_front` one byte at a time. Large
+/// in-zone TCP transfers therefore spent their time in per-byte deque
+/// bookkeeping even when `splice(2)` moved MiB-sized chunks. The deque's two
+/// physical slices are already contiguous, so preserve the logical stream
+/// order without that amplification.
+fn copy_deque_prefix(bytes: &VecDeque<u8>, dest: &mut [u8], len: usize) {
+    debug_assert!(len <= bytes.len());
+    debug_assert!(len <= dest.len());
+
+    let (front, back) = bytes.as_slices();
+    let front_len = len.min(front.len());
+    dest[..front_len].copy_from_slice(&front[..front_len]);
+    let back_len = len - front_len;
+    if back_len > 0 {
+        dest[front_len..len].copy_from_slice(&back[..back_len]);
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinuxUcred {
@@ -981,16 +1001,12 @@ impl PureSocketInner {
             {
                 buf[0] = byte;
                 let suffix_len = state.stream_buf.len().min(buf.len().saturating_sub(1));
-                for (index, slot) in buf.iter_mut().skip(1).take(suffix_len).enumerate() {
-                    *slot = state.stream_buf[index];
-                }
+                copy_deque_prefix(&state.stream_buf, &mut buf[1..], suffix_len);
                 return Ok((suffix_len + 1, Vec::new(), false));
             }
 
             let suffix_len = state.stream_buf.len().min(buf.len());
-            for (index, slot) in buf.iter_mut().take(suffix_len).enumerate() {
-                *slot = state.stream_buf[index];
-            }
+            copy_deque_prefix(&state.stream_buf, buf, suffix_len);
             return Ok((suffix_len, Vec::new(), false));
         }
 
@@ -1060,9 +1076,7 @@ impl PureSocketInner {
             .min(mark_limit)
             .min(sctp_limit);
         if peek {
-            for (i, slot) in buf.iter_mut().take(to_read).enumerate() {
-                *slot = state.stream_buf[i];
-            }
+            copy_deque_prefix(&state.stream_buf, buf, to_read);
             let ends_message = if self.protocol == LINUX_IPPROTO_SCTP
                 && to_read > 0
                 && let Some(&len) = state.sctp_messages.front()
@@ -1081,10 +1095,9 @@ impl PureSocketInner {
                 written = 1;
             }
         }
-        for slot in buf.iter_mut().skip(written).take(to_read) {
-            *slot = state.stream_buf.pop_front().unwrap_or(0);
-            written += 1;
-        }
+        copy_deque_prefix(&state.stream_buf, &mut buf[written..], to_read);
+        drop(state.stream_buf.drain(..to_read));
+        written += to_read;
         if let Some(mark) = &mut state.oob_mark {
             *mark = mark.saturating_sub(to_read);
         }
