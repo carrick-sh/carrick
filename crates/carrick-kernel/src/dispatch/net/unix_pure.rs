@@ -32,6 +32,10 @@ pub const LINUX_SHUT_RDWR: i32 = 2;
 
 /// Default capacity for stream socket ring buffers (matches Linux default ~208 KiB).
 pub const DEFAULT_STREAM_BUFFER_CAPACITY: usize = 212_992;
+/// TCP autotuning maximum send buffer size (matches advertised /proc/sys/net/ipv4/tcp_wmem max 4 MiB).
+pub const TCP_AUTOTUNE_MAX_WMEM: usize = 4_194_304;
+/// TCP autotuning maximum receive buffer size (matches advertised /proc/sys/net/ipv4/tcp_rmem max 6 MiB).
+pub const TCP_AUTOTUNE_MAX_RMEM: usize = 6_291_456;
 /// Max queued datagrams before backpressure/drop.
 pub const DEFAULT_DGRAM_QUEUE_LIMIT: usize = 256;
 
@@ -529,6 +533,30 @@ impl PureSocketInner {
         self.state.lock().so_rcvbuf_explicit
     }
 
+    pub(crate) fn is_tcp(&self) -> bool {
+        self.socket_type == LINUX_SOCK_STREAM
+            && self.protocol == LINUX_IPPROTO_TCP
+            && matches!(self.family(), LINUX_AF_INET | LINUX_AF_INET6)
+    }
+
+    pub(crate) fn effective_send_capacity(
+        &self,
+        sender_state: &PureSocketState,
+        receiver_state: Option<&PureSocketState>,
+    ) -> usize {
+        if self.is_tcp() && sender_state.tcp_pair {
+            let sender_cap = sender_state
+                .so_sndbuf_explicit
+                .unwrap_or(TCP_AUTOTUNE_MAX_WMEM);
+            let receiver_cap = receiver_state
+                .and_then(|r| r.so_rcvbuf_explicit)
+                .unwrap_or(TCP_AUTOTUNE_MAX_RMEM);
+            sender_cap.min(receiver_cap)
+        } else {
+            sender_state.so_sndbuf
+        }
+    }
+
     pub(crate) fn is_listening(&self) -> bool {
         self.state.lock().listening
     }
@@ -766,13 +794,12 @@ impl PureSocketInner {
             return Err(LINUX_EPIPE);
         }
 
-        let send_cap = state.so_sndbuf;
-
         // Mock Service Interception Path
         if let Some(mock) = state.mock_service.clone() {
             if state.mock_peer_closed {
                 return Err(LINUX_EPIPE);
             }
+            let send_cap = self.effective_send_capacity(&state, None);
             let available = send_cap.saturating_sub(state.request_buf.len());
             if available == 0 && !data.is_empty() {
                 return Err(LINUX_EAGAIN);
@@ -832,6 +859,7 @@ impl PureSocketInner {
                     && state.tcp_peer_terminal == TcpPeerTerminal::Fin
                     && !data.is_empty()
                 {
+                    let send_cap = self.effective_send_capacity(&state, None);
                     let admitted = data.len().min(send_cap);
                     if admitted == 0 {
                         return Err(LINUX_EAGAIN);
@@ -853,6 +881,7 @@ impl PureSocketInner {
         if state.shutdown_write || state.tcp_send_terminal {
             return Err(LINUX_EPIPE);
         }
+        let send_cap = self.effective_send_capacity(&state, Some(&peer_state));
         if peer_state.shutdown_read {
             if state.tcp_pair && data.is_empty() {
                 return Ok(0);
@@ -1206,15 +1235,8 @@ impl PureSocketInner {
         if data.is_empty() {
             return Err(LINUX_EINVAL);
         }
-        let mut state = self.state.lock();
-        if let Some(err) = state.so_error.take() {
-            return Err(LinuxErrno::new(err));
-        }
-        if state.shutdown_write {
-            return Err(LINUX_EPIPE);
-        }
-        let send_cap = state.so_sndbuf;
         let peer_arc = {
+            let state = self.state.lock();
             let Some(peer_weak) = &state.peer else {
                 return Err(LINUX_ENOTCONN);
             };
@@ -1223,13 +1245,19 @@ impl PureSocketInner {
             };
             peer
         };
-        drop(state);
 
-        let mut peer_state = peer_arc.state.lock();
+        let (mut state, mut peer_state) = self.lock_with_peer(&peer_arc);
+        if let Some(err) = state.so_error.take() {
+            return Err(LinuxErrno::new(err));
+        }
+        if state.shutdown_write {
+            return Err(LINUX_EPIPE);
+        }
         if peer_state.shutdown_read {
             return Err(LINUX_EPIPE);
         }
 
+        let send_cap = self.effective_send_capacity(&state, Some(&peer_state));
         let urgent_byte = data[data.len() - 1];
         let stream_part = &data[..data.len() - 1];
         // Linux has one active urgent indication.  A later MSG_OOB makes the
@@ -1251,6 +1279,7 @@ impl PureSocketInner {
         peer_state.oob_mark = Some(peer_state.stream_buf.len());
         peer_state.oob_data = Some(urgent_byte);
         drop(peer_state);
+        drop(state);
         peer_arc.notify_waiters();
         Ok(data.len())
     }
@@ -1331,14 +1360,15 @@ impl PureSocketInner {
                 mask |= LINUX_EPOLLIN;
             }
             if !state.shutdown_write && !state.tcp_send_terminal {
+                let send_cap = self.effective_send_capacity(&state, peer_state.as_deref());
                 if let Some(p) = peer_state.as_ref() {
-                    if (!peer_shut_rd && p.stream_buf.len() < state.so_sndbuf)
+                    if (!peer_shut_rd && p.stream_buf.len() < send_cap)
                         || (state.tcp_pair && peer_shut_rd)
                     {
                         mask |= LINUX_EPOLLOUT;
                     }
                 } else if has_mock {
-                    if !peer_shut_rd && state.request_buf.len() < state.so_sndbuf {
+                    if !peer_shut_rd && state.request_buf.len() < send_cap {
                         mask |= LINUX_EPOLLOUT;
                     }
                 } else if state.tcp_pair
@@ -2211,5 +2241,106 @@ mod tests {
         assert_eq!(n, 4);
         assert_eq!(&buf[..4], b"rld!");
         assert!(eor);
+    }
+
+    #[test]
+    fn inet_tcp_stream_default_autotunes_send_capacity_above_visible_so_buf() {
+        let (s1, s2) = tcp_pair();
+        assert_eq!(s1.so_sndbuf(), DEFAULT_STREAM_BUFFER_CAPACITY);
+        assert_eq!(s2.so_rcvbuf(), DEFAULT_STREAM_BUFFER_CAPACITY);
+        assert_eq!(s1.so_sndbuf_explicit(), None);
+        assert_eq!(s2.so_rcvbuf_explicit(), None);
+
+        // A default TCP stream pair must admit at least 1 MiB in one send while visible getters
+        // remain 212,992.
+        let one_mib = 1024 * 1024;
+        let data = vec![0x5a; one_mib];
+        let sent = s1
+            .send_stream(&data, Vec::new())
+            .expect("send 1 MiB on default TCP pair");
+        assert_eq!(sent, one_mib);
+        assert_eq!(s1.so_sndbuf(), DEFAULT_STREAM_BUFFER_CAPACITY);
+        assert_eq!(s2.so_rcvbuf(), DEFAULT_STREAM_BUFFER_CAPACITY);
+    }
+
+    #[test]
+    fn inet_tcp_stream_explicit_so_rcvbuf_caps_send_and_clears_epollout() {
+        let (s1, s2) = tcp_pair();
+        assert_eq!(s2.so_rcvbuf(), DEFAULT_STREAM_BUFFER_CAPACITY);
+
+        // Cap receiver buffer to 4096 bytes on s2
+        s2.set_so_rcvbuf(4096);
+        assert_eq!(s2.so_rcvbuf(), 4096);
+        assert_eq!(s1.poll_mask() & LINUX_EPOLLOUT, LINUX_EPOLLOUT);
+
+        // Sender s1 fills receiver buffer to capacity
+        let data = vec![0x42u8; 4096];
+        let sent = s1.send_stream(&data, Vec::new()).unwrap();
+        assert_eq!(sent, 4096);
+
+        // Buffer full: EPOLLOUT cleared on sender, send returns EAGAIN
+        assert_eq!(
+            s1.poll_mask() & LINUX_EPOLLOUT,
+            0,
+            "full receiver buffer must clear sender EPOLLOUT"
+        );
+        assert_eq!(s1.send_stream(b"overflow", Vec::new()), Err(LINUX_EAGAIN));
+
+        // Drain 1024 bytes from receiver s2
+        let mut buf = [0u8; 1024];
+        let (read, _) = s2.recv_stream(&mut buf, 0).unwrap();
+        assert_eq!(read, 1024);
+
+        // Space freed: sender EPOLLOUT restored, send succeeds
+        assert_eq!(
+            s1.poll_mask() & LINUX_EPOLLOUT,
+            LINUX_EPOLLOUT,
+            "draining receiver buffer must restore sender EPOLLOUT"
+        );
+        assert_eq!(s1.send_stream(b"more", Vec::new()).unwrap(), 4);
+    }
+
+    #[test]
+    fn inet_tcp_stream_explicit_sender_and_receiver_caps_constrained_by_both() {
+        // Sender explicit 8192, receiver explicit 4096 -> effective cap 4096
+        let (s1, s2) = tcp_pair();
+        s1.set_so_sndbuf(8192);
+        s2.set_so_rcvbuf(4096);
+        let data = vec![0x42u8; 8192];
+        let sent = s1.send_stream(&data, Vec::new()).unwrap();
+        assert_eq!(sent, 4096);
+        assert_eq!(s1.poll_mask() & LINUX_EPOLLOUT, 0);
+
+        // Sender explicit 4096, receiver explicit 8192 -> effective cap 4096
+        let (s3, s4) = tcp_pair();
+        s3.set_so_sndbuf(4096);
+        s4.set_so_rcvbuf(8192);
+        let sent = s3.send_stream(&data, Vec::new()).unwrap();
+        assert_eq!(sent, 4096);
+        assert_eq!(s3.poll_mask() & LINUX_EPOLLOUT, 0);
+    }
+
+    #[test]
+    fn unix_stream_does_not_autotune_beyond_default_buffer() {
+        let (s1, _s2) = PureSocketInner::pair(
+            LINUX_SOCK_STREAM,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+        let data = vec![0x42u8; DEFAULT_STREAM_BUFFER_CAPACITY + 1024];
+        let sent = s1.send_stream(&data, Vec::new()).unwrap();
+        assert_eq!(sent, DEFAULT_STREAM_BUFFER_CAPACITY);
+        assert_eq!(s1.poll_mask() & LINUX_EPOLLOUT, 0);
+        assert_eq!(s1.send_stream(b"overflow", Vec::new()), Err(LINUX_EAGAIN));
+    }
+
+    #[test]
+    fn sctp_stream_does_not_autotune_beyond_default_buffer() {
+        let (s1, _s2) = sctp_pair();
+        let data = vec![0x42u8; DEFAULT_STREAM_BUFFER_CAPACITY + 1024];
+        let sent = s1.send_stream(&data, Vec::new()).unwrap();
+        assert_eq!(sent, DEFAULT_STREAM_BUFFER_CAPACITY);
+        assert_eq!(s1.poll_mask() & LINUX_EPOLLOUT, 0);
+        assert_eq!(s1.send_stream(b"overflow", Vec::new()), Err(LINUX_EAGAIN));
     }
 }
