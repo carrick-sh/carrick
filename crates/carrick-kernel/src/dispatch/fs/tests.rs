@@ -43,6 +43,112 @@ fn acquire_exec_source_overlong_path_returns_enametoolong_before_enoent() {
 }
 
 #[test]
+fn deep_cwd_allows_legal_relative_resolution_and_chdir_beyond_path_max() {
+    let backend = carrick_vfs::fs_backend::MemoryBackend::new();
+
+    // Create a deep directory hierarchy whose total path exceeds 4000 bytes.
+    // 20 components of 200 bytes each -> 4020 bytes.
+    let comp = "a".repeat(200);
+    let mut deep_cwd = String::new();
+    for _ in 0..20 {
+        deep_cwd.push('/');
+        deep_cwd.push_str(&comp);
+        backend.make_dir(&deep_cwd).unwrap();
+    }
+    assert_eq!(deep_cwd.len(), 4020);
+
+    // Create a child directory under deep_cwd:
+    let next_dir_name = "b".repeat(100);
+    let child_dir = format!("{deep_cwd}/{next_dir_name}");
+    backend.make_dir(&child_dir).unwrap();
+    assert_eq!(child_dir.len(), 4121);
+    assert!(child_dir.len() >= 4096);
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let context = dispatcher.capture_one_task_context().unwrap();
+    // Set cwd to deep_cwd.
+    context.resources().fs_context().set_cwd(deep_cwd.clone());
+    dispatcher.try_set_cwd(&deep_cwd).unwrap();
+    assert_eq!(dispatcher.cwd(), deep_cwd);
+
+    // 1. Caller in already-deep cwd can resolve a legal relative component when
+    // semantic absolute result exceeds 4096 bytes.
+    let resolved = dispatcher
+        .resolve_at_path(LINUX_AT_FDCWD, &next_dir_name)
+        .unwrap();
+    assert_eq!(resolved, child_dir);
+
+    let canon = dispatcher.canonicalize_following(&resolved).unwrap();
+    assert_eq!(canon, child_dir);
+
+    let md = dispatcher.layered_metadata(&canon).unwrap();
+    assert_eq!(md.kind, RootFsEntryKind::Directory);
+
+    // 2. Caller in already-deep cwd can chdir to a legal relative component when
+    // semantic absolute result exceeds 4096 bytes.
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    memory
+        .write_bytes(0x4000, format!("{next_dir_name}\0").as_bytes())
+        .unwrap();
+    let outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                carrick_abi::syscall::nr::CHDIR.raw(),
+                SyscallArgs::from([0x4000, 0, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    assert_eq!(dispatcher.cwd(), child_dir);
+
+    // 3. Individual components over 255 still return ENAMETOOLONG:
+    let overlong_comp = "c".repeat(256);
+    let err = dispatcher
+        .resolve_at_path(LINUX_AT_FDCWD, &overlong_comp)
+        .unwrap_err();
+    assert_eq!(err, crate::linux_abi::LINUX_ENAMETOOLONG);
+
+    memory
+        .write_bytes(0x4000, format!("{overlong_comp}\0").as_bytes())
+        .unwrap();
+    let outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                carrick_abi::syscall::nr::CHDIR.raw(),
+                SyscallArgs::from([0x4000, 0, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        DispatchOutcome::errno(crate::linux_abi::LINUX_ENAMETOOLONG)
+    );
+
+    // 4. A guest-supplied pathname of 4096 bytes or more still returns ENAMETOOLONG:
+    let overlong_rel = "a/".repeat(2048);
+    assert!(overlong_rel.len() >= 4096);
+    let err = dispatcher
+        .resolve_at_path(LINUX_AT_FDCWD, &overlong_rel)
+        .unwrap_err();
+    assert_eq!(err, crate::linux_abi::LINUX_ENAMETOOLONG);
+
+    let overlong_abs = format!("/{}", "a/".repeat(2048));
+    assert!(overlong_abs.len() >= 4096);
+    let err = dispatcher
+        .resolve_at_path(LINUX_AT_FDCWD, &overlong_abs)
+        .unwrap_err();
+    assert_eq!(err, crate::linux_abi::LINUX_ENAMETOOLONG);
+}
+
+#[test]
 fn proc_exe_open_fd_tracks_dentry_and_reads_retained_live_object() {
     let backend = carrick_vfs::fs_backend::MemoryBackend::new();
     backend

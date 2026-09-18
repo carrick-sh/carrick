@@ -788,7 +788,7 @@ impl RootFsVfs {
     /// `AT_SYMLINK_NOFOLLOW` and the writable backend can't answer a
     /// `real_stat` (e.g. the in-memory backend).
     pub fn lookup_nofollow(&self, path: &str) -> Result<Metadata, VfsError> {
-        if path.len() >= 4096 || path.split('/').any(|c| c.len() > 255) {
+        if path.split('/').any(|c| c.len() > 255) {
             return Err(LINUX_ENAMETOOLONG);
         }
         if self.overlay.serves_dentry_cache() {
@@ -1736,7 +1736,7 @@ impl Vfs for RootFsVfs {
     /// rootfs for tombstoned paths and overlay-owned entries; if
     /// neither layer has the path, return ENOENT.
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError> {
-        if path.len() >= 4096 || path.split('/').any(|c| c.len() > 255) {
+        if path.split('/').any(|c| c.len() > 255) {
             return Err(LINUX_ENAMETOOLONG);
         }
         // The filesystem root always exists as a directory. Resolve it
@@ -2862,8 +2862,10 @@ mod tests {
 
         let overlong_path = format!("/{}", "a/".repeat(2048));
         assert!(overlong_path.len() >= 4096);
-        assert_eq!(v.lookup(&overlong_path), Err(LINUX_ENAMETOOLONG));
-        assert_eq!(v.lookup_nofollow(&overlong_path), Err(LINUX_ENAMETOOLONG));
+        // Internal canonical paths may exceed PATH_MAX as long as individual
+        // components do not exceed NAME_MAX.
+        assert_eq!(v.lookup(&overlong_path), Err(LINUX_ENOENT));
+        assert_eq!(v.lookup_nofollow(&overlong_path), Err(LINUX_ENOENT));
     }
 
     #[test]

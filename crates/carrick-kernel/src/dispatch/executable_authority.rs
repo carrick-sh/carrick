@@ -596,6 +596,7 @@ impl SyscallDispatcher {
                 return Ok(source);
             }
         }
+        crate::dispatch::fs::check_path_length(path).map_err(ExecSourceError::Linux)?;
         let resolved = self
             .canonicalize_following(path)
             .map_err(ExecSourceError::Linux)?;
