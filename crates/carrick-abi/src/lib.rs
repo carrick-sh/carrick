@@ -3536,6 +3536,8 @@ pub const LINUX_F_SETLEASE: u64 = 1024;
 pub const LINUX_F_GETLEASE: u64 = 1025;
 /// Directory-change notification (dnotify).
 pub const LINUX_F_NOTIFY: u64 = 1026;
+/// Query whether the open file description created the file (Linux 6.12+).
+pub const LINUX_F_CREATED_QUERY: u64 = 1028;
 /// `F_NOTIFY` masks from fcntl(2).
 pub const LINUX_DN_ACCESS: u64 = 0x0000_0001;
 pub const LINUX_DN_MODIFY: u64 = 0x0000_0002;

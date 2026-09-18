@@ -9229,3 +9229,122 @@ fn fs_view_direct_construction_and_operations() {
     );
     assert!(!view.fd_table_contains(new_fd3));
 }
+
+#[test]
+fn fcntl_f_created_query_semantics() {
+    let mut rig = SpliceTestRig::new(0x10000);
+
+    let open =
+        |rig: &mut SpliceTestRig, path_addr: u64, path: &[u8], flags: u64, mode: u64| -> u64 {
+            rig.memory.write_bytes(path_addr, path).unwrap();
+            match rig.run(
+                SpliceTestRig::SYS_OPENAT,
+                [LINUX_AT_FDCWD, path_addr, flags, mode, 0, 0],
+            ) {
+                DispatchOutcome::Returned { value } => value as u64,
+                other => panic!("open {path:?} failed: {other:?}"),
+            }
+        };
+
+    let fcntl_created_query = |rig: &mut SpliceTestRig, fd: u64| -> DispatchOutcome {
+        rig.run(
+            SpliceTestRig::SYS_FCNTL,
+            [fd, LINUX_F_CREATED_QUERY, 0, 0, 0, 0],
+        )
+    };
+
+    // Case 1: open existing /dev/null without O_CREAT -> F_CREATED_QUERY must return 0.
+    let dev_null_fd = open(
+        &mut rig,
+        0x4200,
+        b"/dev/null\0",
+        LINUX_O_RDONLY | LINUX_O_CLOEXEC,
+        0,
+    );
+    assert_eq!(
+        fcntl_created_query(&mut rig, dev_null_fd),
+        DispatchOutcome::Returned { value: 0 },
+        "/dev/null open must report not created",
+    );
+    rig.close(dev_null_fd);
+
+    // Case 2: open new file with O_CREAT that actually creates it -> F_CREATED_QUERY must return 1.
+    let new_path = b"/created_query_test.txt\0";
+    let creator_fd = open(
+        &mut rig,
+        0x4200,
+        new_path,
+        LINUX_O_CREAT | LINUX_O_RDONLY | LINUX_O_CLOEXEC,
+        0o600,
+    );
+    assert_eq!(
+        fcntl_created_query(&mut rig, creator_fd),
+        DispatchOutcome::Returned { value: 1 },
+        "new file creation open must report created",
+    );
+
+    // Case 3: dup alias of creator fd shares the open file description -> returns 1.
+    let dup_fd = match rig.run(
+        SpliceTestRig::SYS_FCNTL,
+        [creator_fd, LINUX_F_DUPFD, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("dup failed: {other:?}"),
+    };
+    assert_eq!(
+        fcntl_created_query(&mut rig, dup_fd),
+        DispatchOutcome::Returned { value: 1 },
+        "dup alias must inherit created provenance from shared description",
+    );
+    rig.close(dup_fd);
+
+    // Case 4: reopen now-existing file WITHOUT O_CREAT -> F_CREATED_QUERY must return 0.
+    let reopen_fd = open(
+        &mut rig,
+        0x4200,
+        new_path,
+        LINUX_O_RDONLY | LINUX_O_CLOEXEC,
+        0,
+    );
+    assert_eq!(
+        fcntl_created_query(&mut rig, reopen_fd),
+        DispatchOutcome::Returned { value: 0 },
+        "reopening existing file without O_CREAT must report not created",
+    );
+    rig.close(reopen_fd);
+
+    // Case 5: reopen now-existing file WITH O_CREAT -> F_CREATED_QUERY must return 0 (not created).
+    let reopen_creat_fd = open(
+        &mut rig,
+        0x4200,
+        new_path,
+        LINUX_O_CREAT | LINUX_O_RDONLY | LINUX_O_CLOEXEC,
+        0o600,
+    );
+    assert_eq!(
+        fcntl_created_query(&mut rig, reopen_creat_fd),
+        DispatchOutcome::Returned { value: 0 },
+        "reopening existing file with O_CREAT must report not created",
+    );
+    rig.close(reopen_creat_fd);
+
+    // Case 6: closed fd must return EBADF.
+    rig.close(creator_fd);
+    assert_eq!(
+        fcntl_created_query(&mut rig, creator_fd),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "closed fd must return EBADF",
+    );
+
+    // Case 7: invalid fd must return EBADF.
+    assert_eq!(
+        fcntl_created_query(&mut rig, (-1i64) as u64),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "negative fd must return EBADF",
+    );
+    assert_eq!(
+        fcntl_created_query(&mut rig, 999),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "unallocated high fd must return EBADF",
+    );
+}
