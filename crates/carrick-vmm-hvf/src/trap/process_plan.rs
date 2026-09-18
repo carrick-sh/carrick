@@ -6,186 +6,6 @@
 
 use super::*;
 
-/// Parent extension page-table arenas are implementation backing, not semantic
-/// mappings inherited by a process child. The child rebuild below allocates
-/// and publishes its own extension arenas from the cloned page-table manager.
-/// Keep the parent's arenas out of every semantic mapping pass leading up to
-/// that rebuild: retaining them here makes repeated sparse mmap + fork scan an
-/// ever-growing list of internal table storage.
-pub(crate) fn fork_source_regions<'a>(
-    mappings: &'a TaskMappingIndex,
-    parent_extension_bases: &'a [u64],
-) -> impl Iterator<Item = &'a HvfMappedRegion> {
-    mappings
-        .fork_projection_rows()
-        .into_iter()
-        .filter(move |mapping| !parent_extension_bases.contains(&mapping.start))
-}
-
-type ForkStructuralOwnerKey = (usize, u64, usize, u64);
-
-fn fork_structural_owner_key(alias: AliasBacking) -> Option<ForkStructuralOwnerKey> {
-    let offset = usize::try_from(alias.ipa.checked_sub(alias.physical_ipa)?).ok()?;
-    if offset.checked_add(alias.size)? > alias.physical_size
-        || alias.physical_host_addr.checked_add(offset)? != alias.host_addr
-    {
-        return None;
-    }
-    Some((
-        alias.physical_host_addr,
-        alias.physical_ipa,
-        alias.physical_size,
-        alias.owner_generation,
-    ))
-}
-
-fn fork_structural_owner_index(
-    mappings: &TaskMappingIndex,
-) -> std::collections::HashMap<ForkStructuralOwnerKey, std::sync::Arc<StructuralBackingOwner>> {
-    mappings
-        .iter()
-        .filter_map(|mapping| {
-            mapping.structural_owner.as_ref().map(|owner| {
-                (
-                    (
-                        owner.ptr() as usize,
-                        owner.physical_ipa,
-                        owner.physical_size,
-                        owner.epoch().raw(),
-                    ),
-                    std::sync::Arc::clone(owner),
-                )
-            })
-        })
-        .collect()
-}
-
-fn restore_fork_structural_owner(
-    mapping: &mut ThreadMappingDesc,
-    alias: AliasBacking,
-    mappings: &TaskMappingIndex,
-    owners: &std::cell::OnceCell<
-        std::collections::HashMap<ForkStructuralOwnerKey, std::sync::Arc<StructuralBackingOwner>>,
-    >,
-) {
-    if mapping.structural_owner.is_some() {
-        return;
-    }
-    let Some(key) = fork_structural_owner_key(alias) else {
-        return;
-    };
-    if let Some(owner) = owners
-        .get_or_init(|| fork_structural_owner_index(mappings))
-        .get(&key)
-    {
-        mapping.structural_owner = Some(std::sync::Arc::clone(owner));
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ForkLocalMappingProjectionKey {
-    mapping_revision: u64,
-    parent_extension_bases: Vec<u64>,
-}
-
-#[derive(Clone, Debug)]
-struct ForkLocalMappingProjection {
-    static_mappings: std::rc::Rc<Vec<ThreadMappingDesc>>,
-    dynamic_mappings: std::rc::Rc<Vec<ThreadMappingDesc>>,
-    static_cow_ranges: std::sync::Arc<Vec<carrick_aarch64::vmm::ForkCowRange>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ForkMappingSnapshotKey {
-    local: ForkLocalMappingProjectionKey,
-    alias_signature: Vec<(AliasOwnershipScope, u64, usize, Option<u64>)>,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct ForkMappingCache {
-    local: Option<(ForkLocalMappingProjectionKey, ForkLocalMappingProjection)>,
-    complete: Option<(ForkMappingSnapshotKey, ForkMappingSnapshot)>,
-}
-
-fn apply_fork_projection_changes(
-    projection: ForkLocalMappingProjection,
-    changes: Vec<ForkProjectionChange>,
-) -> ForkLocalMappingProjection {
-    let mut static_mappings = std::rc::Rc::try_unwrap(projection.static_mappings)
-        .unwrap_or_else(|shared| (*shared).clone());
-    let mut dynamic_mappings = std::rc::Rc::try_unwrap(projection.dynamic_mappings)
-        .unwrap_or_else(|shared| (*shared).clone());
-    let mut static_cow_ranges = std::sync::Arc::try_unwrap(projection.static_cow_ranges)
-        .unwrap_or_else(|shared| (*shared).clone());
-    for change in changes {
-        let (start, replacement) = match change {
-            ForkProjectionChange::Remove(start) => (start, None),
-            ForkProjectionChange::Upsert(mapping) => (mapping.start, Some(mapping)),
-        };
-        static_mappings.retain(|mapping| mapping.start != start);
-        dynamic_mappings.retain(|mapping| mapping.start != start);
-        static_cow_ranges.retain(|range| range.va != start);
-        if let Some(mapping) = replacement {
-            let target = if mapping.is_dynamic_alias {
-                &mut dynamic_mappings
-            } else {
-                if let Some(range) = mapping_fork_cow_range(&mapping) {
-                    let position =
-                        static_cow_ranges.partition_point(|existing| existing.va < range.va);
-                    static_cow_ranges.insert(position, range);
-                }
-                &mut static_mappings
-            };
-            let position = target.partition_point(|existing| existing.start < mapping.start);
-            target.insert(position, mapping);
-        }
-    }
-    ForkLocalMappingProjection {
-        static_mappings: std::rc::Rc::new(static_mappings),
-        dynamic_mappings: std::rc::Rc::new(dynamic_mappings),
-        static_cow_ranges: std::sync::Arc::new(static_cow_ranges),
-    }
-}
-
-fn mapping_fork_cow_range(
-    mapping: &ThreadMappingDesc,
-) -> Option<carrick_aarch64::vmm::ForkCowRange> {
-    (mapping.sharing == GuestMappingSharing::Private
-        && mapping.start != crate::memory::LINUX_PAGE_TABLES_BASE
-        && !is_independent_process_state_mapping(mapping)
-        && !is_kernel_only_stage1_range(
-            mapping.start,
-            semantic_extent_size(mapping.start, mapping.end),
-        ))
-    .then(|| carrick_aarch64::vmm::ForkCowRange {
-        va: mapping.start,
-        len: semantic_extent_size(mapping.start, mapping.end),
-        executable: u64::from(mapping.perms) & 4 != 0,
-        kernel_only: false,
-        granule: carrick_aarch64::vmm::CowGranule::Compound,
-    })
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ForkMappingSnapshot {
-    alias_revision_begin: u64,
-    pub(crate) source_mappings: std::rc::Rc<Vec<ThreadMappingDesc>>,
-    cow_ranges: std::sync::Arc<Vec<carrick_aarch64::vmm::ForkCowRange>>,
-    local_regions: u64,
-    candidate_regions: u64,
-    added_regions: u64,
-    added_bytes: u64,
-    private_added_regions: u64,
-    shared_added_regions: u64,
-    largest_added_bytes: u64,
-}
-
-impl ForkMappingSnapshot {
-    pub(crate) fn cow_ranges(&self) -> std::sync::Arc<Vec<carrick_aarch64::vmm::ForkCowRange>> {
-        std::sync::Arc::clone(&self.cow_ranges)
-    }
-}
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn invalidate_projected_fork_omissions(
     page_tables: &mut crate::page_table::PageTableManager,
@@ -412,19 +232,27 @@ pub(super) fn fork_translation_has_overlay_owner(
 /// mapping AND the whole carrier-global alias registry, once per mapping, so a
 /// process with M mappings in a carrier holding R alias rows paid O(M * (M + R))
 /// per fork. Measured 20.1% of carrier CPU under a fork/exit storm even after
-/// the call was made lazy. The authenticated child mapping plan is the complete
-/// owner set: a carrier-registry row absent from it cannot authorize a child
-/// translation.
+/// the call was made lazy.
+///
+/// The alias half admits exactly the scopes the original predicate did: the
+/// scopes `alias_matches_process_scope` accepts, plus this container's root
+/// regardless of `mm_root_slot`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Default)]
 pub(crate) struct ForkTranslationOverlayIndex {
     mappings_by_delta_and_start: std::collections::BTreeMap<(u64, u64), Vec<usize>>,
     mappings_widest_by_delta: std::collections::BTreeMap<u64, u64>,
+    aliases_by_delta_and_start: std::collections::BTreeMap<(u64, u64), Vec<AliasBacking>>,
+    aliases_widest_by_delta: std::collections::BTreeMap<u64, u64>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl ForkTranslationOverlayIndex {
-    pub(super) fn build(mappings: &[ProcessMappingDesc]) -> Self {
+    pub(super) fn build(
+        mappings: &[ProcessMappingDesc],
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    ) -> Self {
         let mut index = Self::default();
         for (position, overlay) in mappings.iter().enumerate() {
             let delta = overlay.ipa.wrapping_sub(overlay.start);
@@ -435,6 +263,27 @@ impl ForkTranslationOverlayIndex {
                 .push(position);
             let widest = index.mappings_widest_by_delta.entry(delta).or_insert(0);
             *widest = (*widest).max(overlay.end.saturating_sub(overlay.start));
+        }
+        let registry = alias_registry().lock();
+        let mut scopes: Vec<AliasOwnershipScope> =
+            AliasRegistry::process_visible_scopes(mm_root_slot, container_root).to_vec();
+        let container_scope = AliasOwnershipScope::ContainerRoot(container_root);
+        if !scopes.contains(&container_scope) {
+            scopes.push(container_scope);
+        }
+        for scope in scopes {
+            let rows = registry.scope_rows(scope);
+            note_alias_state_rows_scanned(rows.len());
+            for (_, alias) in rows {
+                let delta = alias.ipa.wrapping_sub(alias.start);
+                index
+                    .aliases_by_delta_and_start
+                    .entry((delta, alias.start))
+                    .or_default()
+                    .push(*alias);
+                let widest = index.aliases_widest_by_delta.entry(delta).or_insert(0);
+                *widest = (*widest).max(alias.size as u64);
+            }
         }
         index
     }
@@ -468,7 +317,18 @@ impl ForkTranslationOverlayIndex {
                 }
             }
         }
-        false
+        let Some(&widest) = self.aliases_widest_by_delta.get(&delta) else {
+            return false;
+        };
+        let lower = va.saturating_sub(widest);
+        self.aliases_by_delta_and_start
+            .range((delta, lower)..=(delta, va))
+            .flat_map(|(_, aliases)| aliases)
+            .any(|alias| {
+                va >= alias.start
+                    && va < alias.start.saturating_add(alias.size as u64)
+                    && alias.ipa.checked_add(va.saturating_sub(alias.start)) == Some(translated)
+            })
     }
 }
 
@@ -490,229 +350,6 @@ pub(crate) fn fork_mapping_requires_base_translation(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfTaskState {
-    /// Build or reuse the exact process-visible mapping projection consumed by
-    /// both fork-COW arming and child process-plan construction. The cache key
-    /// names this task's mapping generation, only the two alias scopes it can
-    /// see, and the parent page-table extension layout. A child in another mm
-    /// may churn the carrier-global registry without invalidating this parent.
-    pub(crate) fn fork_mapping_snapshot(&self) -> ForkMappingSnapshot {
-        let parent_extension_bases = self
-            .page_tables_authority()
-            .with_manager(|pt| pt.extension_arena_bases())
-            .unwrap_or_default();
-        let registry = alias_registry().lock();
-        let local_key = ForkLocalMappingProjectionKey {
-            mapping_revision: self.mappings.revision(),
-            parent_extension_bases,
-        };
-        let mut key = ForkMappingSnapshotKey {
-            local: local_key.clone(),
-            alias_signature: registry
-                .process_visible_signature(self.mm_root_slot, self.container_root),
-        };
-        if let Some((cached_key, cached)) = self.fork_mapping_cache.lock().complete.as_ref()
-            && cached_key == &key
-        {
-            let mut cached = cached.clone();
-            cached.alias_revision_begin = registry.revision();
-            return cached;
-        }
-        let mut alias_revision_begin = registry.revision();
-        let aliases = registry.process_visible_ordered(self.mm_root_slot, self.container_root);
-        drop(registry);
-        // The registry is carrier-wide and intentionally retains publications
-        // that may still be authoritative for another address space. Scope is
-        // necessary but not sufficient for process fork: authenticate every
-        // candidate through this process's current stage-1 graph before a
-        // host mapping can become a child VMA. Without this check, repeated
-        // fork imported live host aliases that no longer named the parent's VA
-        // and made the child plan grow with carrier history.
-        let (aliases, dead_aliases) = self
-            .page_tables_authority()
-            .with_manager(|page_tables| {
-                partition_current_live_alias_backings(&aliases, page_tables)
-            })
-            .unwrap_or_else(|| partition_live_alias_backings(&aliases));
-        if !dead_aliases.is_empty() {
-            let mut registry = alias_registry().lock();
-            if registry.revision() == alias_revision_begin {
-                registry.remove_exact_values_in_batch(&dead_aliases);
-                alias_revision_begin = registry.revision();
-                key.alias_signature =
-                    registry.process_visible_signature(self.mm_root_slot, self.container_root);
-            }
-        }
-
-        let previous_local = {
-            let mut cache = self.fork_mapping_cache.lock();
-            cache.complete = None;
-            cache.local.take()
-        };
-        let local = match previous_local {
-            Some((cached_key, projection)) if cached_key == local_key => projection,
-            Some((cached_key, projection))
-                if cached_key.parent_extension_bases == local_key.parent_extension_bases =>
-            {
-                match self
-                    .mappings
-                    .take_fork_projection_changes_since(cached_key.mapping_revision)
-                {
-                    Some(changes) => apply_fork_projection_changes(projection, changes),
-                    None => {
-                        let mut static_mappings = Vec::new();
-                        let mut dynamic_mappings = Vec::new();
-                        let mut static_cow_ranges = Vec::new();
-                        for mapping in
-                            fork_source_regions(&self.mappings, &local_key.parent_extension_bases)
-                        {
-                            let projected = ThreadMappingDesc::from_region(mapping);
-                            if mapping.is_dynamic_alias {
-                                dynamic_mappings.push(projected);
-                            } else {
-                                if let Some(range) = mapping_fork_cow_range(&projected) {
-                                    static_cow_ranges.push(range);
-                                }
-                                static_mappings.push(projected);
-                            }
-                        }
-                        self.mappings.acknowledge_fork_projection_rebuild();
-                        ForkLocalMappingProjection {
-                            static_mappings: std::rc::Rc::new(static_mappings),
-                            dynamic_mappings: std::rc::Rc::new(dynamic_mappings),
-                            static_cow_ranges: std::sync::Arc::new(static_cow_ranges),
-                        }
-                    }
-                }
-            }
-            _ => {
-                let mut static_mappings = Vec::new();
-                let mut dynamic_mappings = Vec::new();
-                let mut static_cow_ranges = Vec::new();
-                for mapping in
-                    fork_source_regions(&self.mappings, &local_key.parent_extension_bases)
-                {
-                    let projected = ThreadMappingDesc::from_region(mapping);
-                    if mapping.is_dynamic_alias {
-                        dynamic_mappings.push(projected);
-                    } else {
-                        if let Some(range) = mapping_fork_cow_range(&projected) {
-                            static_cow_ranges.push(range);
-                        }
-                        static_mappings.push(projected);
-                    }
-                }
-                self.mappings.acknowledge_fork_projection_rebuild();
-                ForkLocalMappingProjection {
-                    static_mappings: std::rc::Rc::new(static_mappings),
-                    dynamic_mappings: std::rc::Rc::new(dynamic_mappings),
-                    static_cow_ranges: std::sync::Arc::new(static_cow_ranges),
-                }
-            }
-        };
-        self.fork_mapping_cache.lock().local = Some((local_key.clone(), local.clone()));
-
-        let alias_index = process_alias_index(&aliases, self.mm_root_slot, self.container_root);
-        let mut seen_dynamic_aliases = std::collections::HashSet::new();
-        let structural_owners = std::cell::OnceCell::new();
-        let mut cow_ranges = std::sync::Arc::clone(&local.static_cow_ranges);
-        let mut cow_ranges_changed = false;
-        let mut source_mappings = if local.dynamic_mappings.is_empty() {
-            std::rc::Rc::clone(&local.static_mappings)
-        } else {
-            let mut source_mappings = local.static_mappings.to_vec();
-            for source in local.dynamic_mappings.iter() {
-                let alias_key = thread_mapping_process_alias_key(source);
-                if !seen_dynamic_aliases.insert(alias_key) {
-                    continue;
-                }
-                let Some(alias) = alias_index.get(&alias_key).copied() else {
-                    continue;
-                };
-                let Some(mut projected) = ThreadMappingDesc::from_alias(alias) else {
-                    continue;
-                };
-                restore_fork_structural_owner(
-                    &mut projected,
-                    alias,
-                    &self.mappings,
-                    &structural_owners,
-                );
-                if let Some(range) = mapping_fork_cow_range(&projected) {
-                    std::sync::Arc::make_mut(&mut cow_ranges).push(range);
-                    cow_ranges_changed = true;
-                }
-                source_mappings.push(projected);
-            }
-            std::rc::Rc::new(source_mappings)
-        };
-        let local_regions = source_mappings.len() as u64;
-        let local_aliases: std::collections::HashSet<ProcessAliasKey> = source_mappings
-            .iter()
-            .map(thread_mapping_process_alias_key)
-            .collect();
-        let missing = missing_process_aliases(
-            &local_aliases,
-            &aliases,
-            self.mm_root_slot,
-            self.container_root,
-        );
-        let candidate_regions = missing.len() as u64;
-        let mut added_regions = 0_u64;
-        let mut added_bytes = 0_u64;
-        let mut private_added_regions = 0_u64;
-        let mut shared_added_regions = 0_u64;
-        let mut largest_added_bytes = 0_u64;
-        let mut extended_source_mappings = None;
-        for alias in missing {
-            if let Some(mapping) = ThreadMappingDesc::from_alias(alias) {
-                let mut mapping = mapping;
-                restore_fork_structural_owner(
-                    &mut mapping,
-                    alias,
-                    &self.mappings,
-                    &structural_owners,
-                );
-                added_regions = added_regions.saturating_add(1);
-                added_bytes = added_bytes.saturating_add(mapping.size as u64);
-                largest_added_bytes = largest_added_bytes.max(mapping.size as u64);
-                if mapping.sharing.shares_across_fork() {
-                    shared_added_regions = shared_added_regions.saturating_add(1);
-                } else {
-                    private_added_regions = private_added_regions.saturating_add(1);
-                }
-                if let Some(range) = mapping_fork_cow_range(&mapping) {
-                    std::sync::Arc::make_mut(&mut cow_ranges).push(range);
-                    cow_ranges_changed = true;
-                }
-                extended_source_mappings
-                    .get_or_insert_with(|| source_mappings.to_vec())
-                    .push(mapping);
-            }
-        }
-        if let Some(extended) = extended_source_mappings {
-            source_mappings = std::rc::Rc::new(extended);
-        }
-        if cow_ranges_changed {
-            let ranges = std::sync::Arc::make_mut(&mut cow_ranges);
-            ranges.sort_by_key(|range| (range.va, range.len));
-            ranges.dedup_by_key(|range| (range.va, range.len));
-        }
-        let snapshot = ForkMappingSnapshot {
-            alias_revision_begin,
-            source_mappings,
-            cow_ranges,
-            local_regions,
-            candidate_regions,
-            added_regions,
-            added_bytes,
-            private_added_regions,
-            shared_added_regions,
-            largest_added_bytes,
-        };
-        self.fork_mapping_cache.lock().complete = Some((key, snapshot.clone()));
-        snapshot
-    }
-
     pub(crate) fn build_process_plan(
         &self,
         request: carrick_hal::ProcessForkRequest,
@@ -751,55 +388,12 @@ impl HvfTaskState {
                 TrapError::Hypervisor("hvpatch child stage-1 root slot overflow".to_owned())
             })?;
         let mut cursor = request.root_slot_base;
-        let snapshot = self.fork_mapping_snapshot();
-        // The complete snapshot is a one-fork handoff from COW-range planning
-        // into process-plan construction. Drop that extra Arc now so the local
-        // projection is uniquely owned again before the next mmap mutation and
-        // can absorb its exact journal delta without cloning the full table.
-        self.fork_mapping_cache.lock().complete = None;
-        let ForkMappingSnapshot {
-            alias_revision_begin,
-            source_mappings,
-            cow_ranges: _,
-            local_regions,
-            candidate_regions,
-            added_regions,
-            added_bytes,
-            private_added_regions,
-            shared_added_regions,
-            largest_added_bytes,
-        } = snapshot;
-        let selected_shadowed: Vec<_> = self
-            .mappings
-            .fork_shadowed_backing_rows()
-            .into_iter()
-            .filter(|mapping| {
-                page_tables
-                    .translate(mapping.start)
-                    .or_else(|| page_tables.translate_retained_output(mapping.start))
-                    == Some(mapping.ipa)
-            })
-            .map(ThreadMappingDesc::from_region)
-            .collect();
-        let expanded_source_mappings;
-        let source_mappings = if selected_shadowed.is_empty() {
-            source_mappings.as_ref()
-        } else {
-            let mut expanded = source_mappings.to_vec();
-            for retained in selected_shadowed {
-                let duplicate = expanded.iter().any(|mapping| {
-                    mapping.start == retained.start
-                        && mapping.ipa == retained.ipa
-                        && mapping.host_addr == retained.host_addr
-                        && mapping.size == retained.size
-                        && mapping.owner_generation == retained.owner_generation
-                });
-                if !duplicate {
-                    expanded.push(retained);
-                }
-            }
-            expanded_source_mappings = expanded;
-            &expanded_source_mappings
+        let (alias_revision_begin, aliases) = {
+            let registry = alias_registry().lock();
+            (
+                registry.revision(),
+                registry.process_visible_ordered(self.mm_root_slot, self.container_root),
+            )
         };
         record_alias_revision(
             CowDiagnosticAliasRevisionSite::ForkSnapshotBegin,
@@ -808,6 +402,33 @@ impl HvfTaskState {
             0,
             alias_revision_begin,
         );
+        let alias_index = process_alias_index(&aliases, self.mm_root_slot, self.container_root);
+        let mut seen_dynamic_aliases = std::collections::HashSet::new();
+        let mut source_mappings: Vec<ThreadMappingDesc> = self
+            .mappings
+            .iter()
+            .filter_map(|mapping| {
+                if !mapping.is_dynamic_alias {
+                    return Some(ThreadMappingDesc::from_region(mapping));
+                }
+                let key = (
+                    mapping.start,
+                    mapping.ipa,
+                    mapping.host_addr as usize,
+                    semantic_extent_size(mapping.start, mapping.end),
+                    mapping.owner_generation,
+                );
+                if !seen_dynamic_aliases.insert(key) {
+                    return None;
+                }
+                let alias = alias_index.get(&key).copied()?;
+                let source = ThreadMappingDesc::from_region(mapping);
+                ThreadMappingDesc::from_alias_with_structural_owner(
+                    alias,
+                    std::slice::from_ref(&source),
+                )
+            })
+            .collect();
         // Fork-union audit: `CARRICK_FORK_DEBUG_VA=<hex guest VA>` reports every
         // LOCAL mapping row covering that VA and whether the alias index kept
         // it. The `[FORKDBG] mapping` block further down only prints rows that
@@ -815,10 +436,6 @@ impl HvfTaskState {
         // inherits a writable stage-1 leaf onto the parent's frame with nothing
         // arming COW — was previously invisible.
         if let Some(debug_va) = fork_debug_va() {
-            let aliases = alias_registry()
-                .lock()
-                .process_visible_ordered(self.mm_root_slot, self.container_root);
-            let alias_index = process_alias_index(&aliases, self.mm_root_slot, self.container_root);
             let window_lo = debug_va.saturating_sub(0x20_0000);
             let window_hi = debug_va.saturating_add(0x20_0000);
             for alias in aliases.iter().filter(|alias| {
@@ -886,6 +503,48 @@ impl HvfTaskState {
                 armed.len(),
             );
         }
+        let local_regions = source_mappings.len() as u64;
+        // A structural boot mapping can physically contain a narrower semantic
+        // alias at the same IPA (the private-overlay aperture is the canonical
+        // case). Only an exact current local descriptor suppresses a registry
+        // row; keying every local descriptor by IPA hid MAP_FIXED private
+        // ownership from fork even though stage-1 already selected it.
+        let local_aliases: std::collections::HashSet<ProcessAliasKey> = source_mappings
+            .iter()
+            .map(thread_mapping_process_alias_key)
+            .collect();
+        let missing = missing_process_aliases(
+            &local_aliases,
+            &aliases,
+            self.mm_root_slot,
+            self.container_root,
+        );
+        let candidate_regions = missing.len() as u64;
+        let mut added_regions = 0_u64;
+        let mut added_bytes = 0_u64;
+        let mut private_added_regions = 0_u64;
+        let mut shared_added_regions = 0_u64;
+        let mut largest_added_bytes = 0_u64;
+        for alias in missing {
+            // The registry is the authoritative live-alias inventory. Scope by
+            // mm root-slot scope above and require its retained host owner to be live, but
+            // do not require a valid stage-1 leaf: a live PROT_NONE alias is
+            // intentionally invalid in stage-1 and still must survive fork.
+            if alias_backing_is_live(alias.host_addr)
+                && let Some(mapping) =
+                    ThreadMappingDesc::from_alias_with_structural_owner(alias, &source_mappings)
+            {
+                added_regions = added_regions.saturating_add(1);
+                added_bytes = added_bytes.saturating_add(mapping.size as u64);
+                largest_added_bytes = largest_added_bytes.max(mapping.size as u64);
+                if mapping.sharing.shares_across_fork() {
+                    shared_added_regions = shared_added_regions.saturating_add(1);
+                } else {
+                    private_added_regions = private_added_regions.saturating_add(1);
+                }
+                source_mappings.push(mapping);
+            }
+        }
         emit_stage(
             HvpatchForkProcessSpecStagePhase::AliasUnion,
             stage_started,
@@ -911,23 +570,31 @@ impl HvfTaskState {
         let parent_inventory_by_stage2 = index_fork_inventory_by_stage2(&parent_inventory);
         let overlay_owner_index = ForkOverlayOwnerIndex::build(
             &carrier_foreign_mm_transport.custody,
-            source_mappings,
+            &source_mappings,
             &parent_inventory_by_stage2,
         );
         let projection_ranges = std::sync::Arc::clone(request.projection_plan());
         invalidate_projected_fork_omissions(page_tables, request.shares_mm(), &projection_ranges)?;
+        let parent_extension_bases = self
+            .page_tables_authority()
+            .with_manager(|pt| pt.extension_arena_bases())
+            .unwrap_or_default();
         let mut projected_source_mappings = Vec::with_capacity(source_mappings.len());
         for index in order {
             let source = &source_mappings[index];
+            if parent_extension_bases.contains(&source.start) {
+                // Parent extension page-table arenas are Carrick stage-1 backing, not guest VMAs;
+                // child extension arenas are allocated and installed into stage-2 below.
+                continue;
+            }
             for projected in
                 projected_fork_mappings(source, request.shares_mm(), &projection_ranges)?
             {
                 projected_source_mappings.push((index, projected));
             }
         }
-        let mut independent_process_state_planned = false;
         for (source_index, projected) in projected_source_mappings {
-            let mut mapping = &projected.mapping;
+            let mapping = &projected.mapping;
             let (disposition, wiped_subranges) = match projected.plan {
                 // `MADV_DONTFORK`: the child gets no mapping, no stage-1 leaf
                 // and no inventory row here, which is what makes its `mincore`
@@ -942,34 +609,6 @@ impl HvfTaskState {
                     )));
                 }
             };
-            if disposition == ForkMappingDisposition::IndependentProcessState {
-                if independent_process_state_planned {
-                    continue;
-                }
-                let live_translation = page_tables
-                    .translate(mapping.start)
-                    .or_else(|| page_tables.translate_retained_output(mapping.start));
-                let Some((_, authenticated_source)) =
-                    source_mappings.iter().enumerate().find(|(_, candidate)| {
-                        is_independent_process_state_mapping(candidate)
-                            && thread_mapping_semantic_ipa_at(candidate, candidate.start)
-                                == live_translation
-                            && !inherited_fork_inventory_extents_indexed(
-                                &carrier_foreign_mm_transport.custody,
-                                candidate,
-                                &parent_inventory_by_stage2,
-                            )
-                            .is_empty()
-                    })
-                else {
-                    return Err(TrapError::Hypervisor(format!(
-                        "hvpatch independent process-state mapping VA 0x{:x} has no authenticated source for live IPA {live_translation:#x?}",
-                        mapping.start,
-                    )));
-                };
-                mapping = authenticated_source;
-                independent_process_state_planned = true;
-            }
             if matches!(
                 disposition,
                 ForkMappingDisposition::SharedFrameWritable
@@ -1097,7 +736,7 @@ impl HvfTaskState {
                         thread_mapping_semantic_ipa_at(mapping, mapping.start);
                     let authenticated_overlay = live_translation.is_some_and(|translated| {
                         overlay_owner_index.has_overlay_owner(
-                            source_mappings,
+                            &source_mappings,
                             source_index,
                             mapping.start,
                             translated,
@@ -1203,7 +842,7 @@ impl HvfTaskState {
             }
 
             const TWO_MIB: u64 = 2 * 1024 * 1024;
-            let (mut physical_ipa, mut stage2_lease) = match disposition {
+            let (physical_ipa, stage2_lease) = match disposition {
                 ForkMappingDisposition::IndependentPageTables => {
                     let packing_alignment = if mapping.start.is_multiple_of(TWO_MIB)
                         && (mapping.physical_size as u64) >= TWO_MIB
@@ -1236,7 +875,6 @@ impl HvfTaskState {
                     )
                 }
                 ForkMappingDisposition::IndependentKernelState
-                | ForkMappingDisposition::IndependentProcessState
                 | ForkMappingDisposition::IndependentGuestZeroed => {
                     let lease = GlobalFrameStage2Lease::reserve(
                         mapping.physical_size as u64,
@@ -1252,24 +890,6 @@ impl HvfTaskState {
                     ));
                 }
             };
-            let pooled_frame = if matches!(
-                disposition,
-                ForkMappingDisposition::IndependentKernelState
-                    | ForkMappingDisposition::IndependentProcessState
-            ) && mapping.physical_size
-                == CowArmedRanges::COMPOUND_SIZE as usize
-            {
-                carrier_foreign_mm_transport
-                    .custody
-                    .frame_pool()
-                    .and_then(|pool| pool.allocate_compound())
-            } else {
-                None
-            };
-            if let Some(handle) = pooled_frame.as_ref() {
-                physical_ipa = handle.ipa();
-                stage2_lease = None;
-            }
             // Per-mm page tables and EL1 control state are the only fresh fork
             // frames.  Both are Carrick kernel state, not the guest-private
             // mappings governed by permission-fault COW.
@@ -1279,9 +899,6 @@ impl HvfTaskState {
                 }
                 ForkMappingDisposition::IndependentKernelState => {
                     crate::host_mapping::HostMappingKind::PerMmKernelState
-                }
-                ForkMappingDisposition::IndependentProcessState => {
-                    crate::host_mapping::HostMappingKind::PrivateAnon
                 }
                 ForkMappingDisposition::IndependentGuestZeroed => {
                     crate::host_mapping::HostMappingKind::PrivateAnon
@@ -1293,15 +910,11 @@ impl HvfTaskState {
                     ));
                 }
             };
-            let host = if let Some(handle) = pooled_frame {
-                ProcessMappingHost::PooledFrame { handle }
-            } else if disposition == ForkMappingDisposition::IndependentPageTables
-                && mapping.physical_size <= crate::frame_pool::ROOT_SLOT_SIZE
+            let host = if disposition == ForkMappingDisposition::IndependentPageTables
+                && mapping.physical_size == crate::frame_pool::ROOT_SLOT_SIZE
             {
                 if let Some(pool) = carrier_foreign_mm_transport.custody.root_slot_pool() {
-                    if let Some(handle) =
-                        pool.allocate_slot_at_for_extent(physical_ipa, mapping.physical_size)
-                    {
+                    if let Some(handle) = pool.allocate_slot_at(physical_ipa) {
                         ProcessMappingHost::PooledRootSlot { handle }
                     } else {
                         let owned = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -1385,15 +998,11 @@ impl HvfTaskState {
                     }
                 }
             }
-            if matches!(
-                disposition,
-                ForkMappingDisposition::IndependentKernelState
-                    | ForkMappingDisposition::IndependentProcessState
-            ) {
-                // Preserve the fork boundary's coherent Carrick-owned state;
-                // child identity/mailbox/vvar rebinding mutates this
-                // independent frame before entry. This is one bounded
-                // compound copy, never a guest-private whole-mapping snapshot.
+            if disposition == ForkMappingDisposition::IndependentKernelState {
+                // Preserve the fork boundary's coherent control-state image;
+                // child identity/mailbox rebinding mutates this independent
+                // frame before entry.  This is a bounded Carrick-kernel copy,
+                // never a guest private whole-mapping snapshot.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         mapping.physical_host_addr,
@@ -1503,8 +1112,11 @@ impl HvfTaskState {
         let stage_started = std::time::Instant::now();
         let mut child_pte_receipts = Vec::new();
         // Copied out so the memoizing closures below borrow neither `self`.
+        let fork_mm_root_slot = self.mm_root_slot;
+        let fork_container_root = self.container_root;
         // Built once for the whole fork; see `ForkTranslationOverlayIndex`.
-        let overlay_index = ForkTranslationOverlayIndex::build(&mappings);
+        let overlay_index =
+            ForkTranslationOverlayIndex::build(&mappings, fork_mm_root_slot, fork_container_root);
         for (index, mapping) in mappings.iter().enumerate() {
             let Some(translated) = page_tables
                 .translate(mapping.start)
@@ -1634,7 +1246,7 @@ impl HvfTaskState {
         for base in &child_extension_bases {
             let (host, physical_host_addr) =
                 if let Some(pool) = carrier_foreign_mm_transport.custody.root_slot_pool() {
-                    if let Some(handle) = pool.allocate_slot_at_for_extent(*base, TWO_MIB) {
+                    if let Some(handle) = pool.allocate_slot_at(*base) {
                         let ptr = handle.as_mut_ptr();
                         (ProcessMappingHost::PooledRootSlot { handle }, ptr)
                     } else {

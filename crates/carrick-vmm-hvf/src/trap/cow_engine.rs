@@ -11,10 +11,63 @@ impl HvfVmState {
     /// mapping: a later mprotect-to-write must still take frame COW rather than
     /// silently sharing the parent's frame. The alias registry supplies mappings
     /// installed by sibling vCPUs and filters retired lifetime-owner rows.
-    pub(crate) fn fork_cow_ranges(
-        &self,
-    ) -> std::sync::Arc<Vec<carrick_aarch64::vmm::ForkCowRange>> {
-        self.fork_mapping_snapshot().cow_ranges()
+    pub(crate) fn fork_cow_ranges(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
+        let aliases = alias_registry()
+            .lock()
+            .process_visible_ordered(self.mm_root_slot, self.container_root);
+        let alias_index = process_alias_index(&aliases, self.mm_root_slot, self.container_root);
+        let mut ranges: Vec<_> = self
+            .mappings
+            .iter()
+            .filter(|mapping| {
+                mapping.sharing == GuestMappingSharing::Private
+                    && mapping.start != crate::memory::LINUX_PAGE_TABLES_BASE
+                    && !is_kernel_only_stage1_range(
+                        mapping.start,
+                        semantic_extent_size(mapping.start, mapping.end),
+                    )
+                    && mapping_is_current_for_process_fork_indexed(mapping, &alias_index)
+            })
+            .map(|mapping| carrick_aarch64::vmm::ForkCowRange {
+                va: mapping.start,
+                len: semantic_extent_size(mapping.start, mapping.end),
+                executable: u64::from(mapping.perms) & 4 != 0,
+                kernel_only: is_kernel_only_stage1_range(
+                    mapping.start,
+                    semantic_extent_size(mapping.start, mapping.end),
+                ),
+                granule: carrick_aarch64::vmm::CowGranule::Compound,
+            })
+            .collect();
+        let local_aliases = current_process_alias_keys(
+            &self.mappings,
+            &aliases,
+            self.mm_root_slot,
+            self.container_root,
+        );
+        ranges.extend(
+            missing_process_aliases(
+                &local_aliases,
+                &aliases,
+                self.mm_root_slot,
+                self.container_root,
+            )
+            .into_iter()
+            .filter(|mapping| {
+                mapping.sharing == GuestMappingSharing::Private
+                    && !is_kernel_only_stage1_range(mapping.start, mapping.size)
+            })
+            .map(|mapping| carrick_aarch64::vmm::ForkCowRange {
+                va: mapping.start,
+                len: mapping.size,
+                executable: mapping.perms & 4 != 0,
+                kernel_only: is_kernel_only_stage1_range(mapping.start, mapping.size),
+                granule: carrick_aarch64::vmm::CowGranule::Compound,
+            }),
+        );
+        ranges.sort_by_key(|range| (range.va, range.len));
+        ranges.dedup_by_key(|range| (range.va, range.len));
+        ranges
     }
 
     pub(crate) fn arm_frame_cow_ranges(&mut self, ranges: &[carrick_aarch64::vmm::ForkCowRange]) {
@@ -1826,175 +1879,6 @@ impl HvfTaskState {
         None
     }
 
-    fn promote_exclusive_cow_source_in_place(
-        &mut self,
-        span: CowArmedSpan,
-        old_ipa: u64,
-        page_table_host: *mut u8,
-        source_guest_writable: bool,
-        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
-    ) -> Result<(), TrapError> {
-        const PAGE_SIZE: u64 = 4 * 1024;
-        const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
-        const AP_MASK: u64 = 0b11 << 6;
-        const AP_USER_RW: u64 = 0b01 << 6;
-        const VALID: u64 = 1;
-        const TYPE_TABLE_OR_PAGE: u64 = 0b11;
-        const NON_GLOBAL: u64 = 1 << 11;
-
-        let page_table_result = {
-            let page_tables_authority = self.page_tables_authority();
-            page_tables_authority.edit(
-                || {
-                    page_tables_authority.emit_absent_probe(2);
-                    Err(TrapError::Hypervisor(
-                        "HVPatch exclusive COW promotion has no page-table manager".to_owned(),
-                    ))
-                },
-                |manager| -> Result<(), TrapError> {
-                    manager.begin_undo();
-                    let mut pre_edit_ap = std::collections::BTreeMap::new();
-                    let span_end = span.va.saturating_add(span.len as u64);
-                    let mut page_va = span.va & !(PAGE_SIZE - 1);
-                    while page_va < span_end {
-                        pre_edit_ap.insert(page_va, manager.debug_walk(page_va)[3] & AP_MASK);
-                        page_va = page_va.saturating_add(PAGE_SIZE);
-                    }
-
-                    HvfVmState::refresh_stage1_exclusivity(manager.manager);
-                    let mut page_va = span.va & !(PAGE_SIZE - 1);
-                    while page_va < span_end {
-                        if source_guest_writable
-                            && !self.protections.range_write_denied(page_va, 1)
-                        {
-                            manager
-                                .set_writable_preserving_attributes(
-                                    page_va,
-                                    PAGE_SIZE as usize,
-                                )
-                                .map_err(|error| {
-                                    TrapError::Hypervisor(format!(
-                                        "grant exclusive HVPatch COW page write: {error:?}"
-                                    ))
-                                })?;
-                        }
-                        page_va = page_va.saturating_add(PAGE_SIZE);
-                    }
-                    self.publish_stage1_extension_arenas(manager.manager)?;
-                    let page_table_resolver =
-                        self.page_table_resolver(manager.base(), Some(page_table_host));
-                    unsafe { manager.sync_to_host(page_table_resolver) }.map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "exclusive HVPatch COW sync_to_host failed: {error:?}"
-                        ))
-                    })?;
-
-                    let mut page_va = span.va & !(PAGE_SIZE - 1);
-                    while page_va < span_end {
-                        let expected_ipa = old_ipa
-                            .checked_add(page_va.saturating_sub(span.va))
-                            .ok_or_else(|| {
-                                TrapError::Hypervisor(
-                                    "exclusive HVPatch COW leaf IPA overflow".to_owned(),
-                                )
-                            })?;
-                        let shadow = manager.debug_walk(page_va);
-                        let live = unsafe {
-                            manager.debug_walk_host(page_table_resolver, page_va)
-                        }
-                        .map_err(|error| {
-                            TrapError::Hypervisor(format!(
-                                "exclusive HVPatch COW debug_walk_host failed: {error:?}"
-                            ))
-                        })?;
-                        if shadow != live {
-                            return Err(TrapError::Hypervisor(format!(
-                                "exclusive HVPatch COW shadow/live mismatch at VA 0x{page_va:x}"
-                            )));
-                        }
-                        let leaf = live[3];
-                        let page_is_valid = leaf & VALID != 0;
-                        let expected_ap = if source_guest_writable
-                            && !self.protections.range_write_denied(page_va, 1)
-                        {
-                            AP_USER_RW
-                        } else {
-                            pre_edit_ap.get(&page_va).copied().ok_or_else(|| {
-                                TrapError::Hypervisor(format!(
-                                    "exclusive HVPatch COW pre-edit AP bits are absent for VA 0x{page_va:x}"
-                                ))
-                            })?
-                        };
-                        if leaf & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
-                            || (page_is_valid
-                                && (leaf & 0b11 != TYPE_TABLE_OR_PAGE
-                                    || leaf & AP_MASK != expected_ap
-                                    || leaf & NON_GLOBAL == 0))
-                        {
-                            return Err(TrapError::Hypervisor(format!(
-                                "exclusive HVPatch COW leaf authentication failed at VA 0x{page_va:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x}"
-                            )));
-                        }
-                        if page_va == span.va {
-                            crate::probes::pt_alias_receipt(
-                                page_va,
-                                leaf,
-                                expected_ipa,
-                                expected_ap,
-                                7,
-                            );
-                        }
-                        crate::probes::pt_alias_walk(page_va, live, 1 << 3);
-                        page_va = page_va.saturating_add(PAGE_SIZE);
-                    }
-                    Ok(())
-                },
-            )
-        };
-        if let Err(error) = page_table_result {
-            let _ = self.page_tables_authority().edit(
-                || Err(()),
-                |manager| {
-                    let manager_base = manager.base();
-                    let page_table_resolver = |base: u64| {
-                        (base == manager_base)
-                            .then_some(page_table_host)
-                            .or_else(|| {
-                                self.host_ptr_for_ipa(
-                                    base,
-                                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-                                )
-                            })
-                    };
-                    unsafe { manager.rollback_undo(page_table_resolver) };
-                    Ok::<(), ()>(())
-                },
-            );
-            if let Err(flush_error) = flush_stage1() {
-                carrick_fatal!(
-                    "hvpatch::mm_authority",
-                    "exclusive HVPatch COW rollback stage-1 TLBI failed: {flush_error}"
-                );
-            }
-            return Err(error);
-        }
-        let _ = self.page_tables_authority().edit(
-            || Err(()),
-            |manager| {
-                manager.commit_undo();
-                Ok::<(), ()>(())
-            },
-        );
-        if let Err(error) = flush_stage1() {
-            carrick_fatal!(
-                "hvpatch::mm_authority",
-                "exclusive HVPatch COW stage-1 TLBI failed: {error}"
-            );
-        }
-        self.cow_armed.lock().disarm(span);
-        Ok(())
-    }
-
     pub(crate) fn perform_frame_cow(
         &mut self,
         custody: &std::sync::Arc<CarrierVmCustody>,
@@ -2223,24 +2107,6 @@ impl HvfTaskState {
             .ok_or_else(|| {
                 TrapError::Hypervisor("HVPatch COW page-table backing is absent".to_owned())
             })?;
-
-        if exclusive_cow_promotion_is_safe(
-            intent,
-            span.kernel_only,
-            span.len,
-            old_inventory_extent.backing,
-            retirement,
-            retain_old_compound,
-        ) {
-            self.promote_exclusive_cow_source_in_place(
-                span,
-                old_ipa,
-                page_table_host,
-                source_guest_writable,
-                flush_stage1,
-            )?;
-            return Ok(true);
-        }
 
         let receipt_va = align_down(fault_va, 4 * 1024);
         let trigger_event = carrick_observability::probes::HvpatchFrameCowTrigger::new(
@@ -2947,32 +2813,40 @@ impl HvfTaskState {
     pub(crate) fn refresh_fork_process_state_in(
         &mut self,
         custody: &std::sync::Arc<CarrierVmCustody>,
-        _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
     ) -> Result<(), TrapError> {
         let generation_address =
             crate::vdso::LINUX_VVAR_BASE + crate::vdso::VVAR_OFF_RNG_GENERATION as u64;
-        if self.cow_armed.lock().span_for(generation_address).is_some() {
+        if self.cow_armed.lock().span_for(generation_address).is_none() {
             return Err(TrapError::Hypervisor(
-                "HVPatch child vvar generation unexpectedly retained a COW arm".to_owned(),
+                "HVPatch child vvar generation has no COW arm".to_owned(),
+            ));
+        }
+        if !self.perform_frame_cow(
+            custody,
+            generation_address,
+            carrick_aarch64::vmm::FrameCowWriteIntent::PrivilegedInternal,
+            FrameCowTrigger {
+                class:
+                    carrick_observability::probes::HvpatchFrameCowTriggerClass::PrivilegedInternal,
+                syndrome: 0,
+                far: generation_address,
+                ttbr0: 0,
+            },
+            flush_stage1,
+        )? {
+            return Err(TrapError::Hypervisor(
+                "HVPatch child vvar generation COW was not resolved".to_owned(),
             ));
         }
         let mapping = self
             .mapping_for_range_in(custody, generation_address, core::mem::size_of::<u64>())
             .ok_or_else(|| {
                 TrapError::Hypervisor(
-                    "HVPatch child vvar generation has no semantic mapping authority".to_owned(),
+                    "HVPatch child vvar generation has no semantic mapping authority after COW"
+                        .to_owned(),
                 )
             })?;
-        if mapping.start != crate::vdso::LINUX_VVAR_BASE
-            || mapping.end != crate::vdso::LINUX_VVAR_BASE + CowArmedRanges::COMPOUND_SIZE
-            || mapping.guest_writable
-            || mapping.sharing != GuestMappingSharing::Private
-        {
-            return Err(TrapError::Hypervisor(
-                "HVPatch child vvar generation is not backed by exact independent process state"
-                    .to_owned(),
-            ));
-        }
         let offset = usize::try_from(generation_address - mapping.start).map_err(|_| {
             TrapError::Hypervisor("HVPatch child vvar generation offset overflow".to_owned())
         })?;
@@ -5522,11 +5396,6 @@ pub(crate) enum ForkMappingDisposition {
     /// fresh per-mm frame before entry rather than depending on recovery from a
     /// current-EL write-permission fault.
     IndependentKernelState,
-    /// Carrick-owned guest-visible process state changes at every fork.  Give
-    /// the child an independent frame before entry so the privileged refresh
-    /// does not have to drive an ordinary guest COW transaction for a mapping
-    /// that is intentionally read-only to EL0.
-    IndependentProcessState,
     /// `MADV_WIPEONFORK`: the child must see this guest mapping as fresh zero
     /// pages while the parent keeps its contents, so it cannot share the
     /// parent's frame even read-only. The child gets its own frame, seeded with
@@ -5608,8 +5477,6 @@ pub(crate) fn fork_mapping_disposition(
         ForkMappingDisposition::SharedFrameWritable
     } else if mapping.start == crate::memory::LINUX_PAGE_TABLES_BASE {
         ForkMappingDisposition::IndependentPageTables
-    } else if is_independent_process_state_mapping(mapping) {
-        ForkMappingDisposition::IndependentProcessState
     } else if mapping.guest_writable && is_kernel_only_stage1_range(mapping.start, mapping.size) {
         ForkMappingDisposition::IndependentKernelState
     } else if shares_mm && !is_kernel_only_stage1_range(mapping.start, mapping.size) {
@@ -5617,17 +5484,6 @@ pub(crate) fn fork_mapping_disposition(
     } else {
         ForkMappingDisposition::SharedFrameReadOnly
     }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn is_independent_process_state_mapping(mapping: &ThreadMappingDesc) -> bool {
-    mapping.sharing == GuestMappingSharing::Private
-        && !mapping.guest_writable
-        && mapping.start == crate::vdso::LINUX_VVAR_BASE
-        && semantic_extent_size(mapping.start, mapping.end)
-            == CowArmedRanges::COMPOUND_SIZE as usize
-        && mapping.size == CowArmedRanges::COMPOUND_SIZE as usize
-        && mapping.physical_size == CowArmedRanges::COMPOUND_SIZE as usize
 }
 
 /// Apply the dispatcher's fork projection on top of the mapping's own
@@ -5814,7 +5670,6 @@ pub(crate) fn fork_frame_receipt_kind(
         ForkMappingDisposition::SharedFrameReadOnly
         | ForkMappingDisposition::IndependentPageTables
         | ForkMappingDisposition::IndependentKernelState
-        | ForkMappingDisposition::IndependentProcessState
         // A wiped mapping shares no frame with the parent, so there is no
         // fork-frame receipt to publish for it.
         | ForkMappingDisposition::IndependentGuestZeroed => None,
@@ -5834,11 +5689,6 @@ pub(crate) fn is_stage1_cow_write_fault(syndrome: u64) -> bool {
         && matches!(fault_status, 0x0d..=0x0f)
 }
 
-pub(crate) fn frame_cow_repoints_mailbox(cow_va: u64, mailbox_va: u64) -> bool {
-    align_down(cow_va, CowArmedRanges::COMPOUND_SIZE)
-        == align_down(mailbox_va, CowArmedRanges::COMPOUND_SIZE)
-}
-
 pub(crate) fn frame_cow_write_is_denied(
     protection_denied: bool,
     guest_writable: bool,
@@ -5852,23 +5702,6 @@ pub(crate) fn frame_cow_preserves_guest_protection(
     intent: carrick_aarch64::vmm::FrameCowWriteIntent,
 ) -> bool {
     intent != carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible
-}
-
-pub(crate) fn exclusive_cow_promotion_is_safe(
-    intent: carrick_aarch64::vmm::FrameCowWriteIntent,
-    kernel_only: bool,
-    span_len: usize,
-    backing: InventoryBackingIdentity,
-    retirement: CowInventoryRetirementDecision,
-    retain_old_compound: bool,
-) -> bool {
-    intent == carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible
-        && !kernel_only
-        && span_len as u64 == CowArmedRanges::COMPOUND_SIZE
-        && matches!(backing, InventoryBackingIdentity::Private(_))
-        && retirement.retire_old_frame
-        && retirement.backend_frame_references_complete
-        && !retain_old_compound
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

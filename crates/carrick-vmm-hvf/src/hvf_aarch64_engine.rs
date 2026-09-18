@@ -1518,7 +1518,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         Some(self.state.protections_ref())
     }
 
-    fn fork_cow_ranges(&self) -> std::sync::Arc<Vec<carrick_aarch64::vmm::ForkCowRange>> {
+    fn fork_cow_ranges(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
         self.state.fork_cow_ranges()
     }
 
@@ -1571,16 +1571,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             .resolve_frame_cow_fault(syndrome, far, ttbr0, flush_stage1)
     }
 
-    fn refresh_vcpu_after_frame_cow(
-        &self,
-        vcpu: &mut Self::Vcpu,
-        cow_va: Option<u64>,
-    ) -> Result<(), TrapError> {
-        if cow_va.is_some_and(|address| {
-            !crate::trap::frame_cow_repoints_mailbox(address, vcpu.mailbox.slot().guest_address())
-        }) {
-            return Ok(());
-        }
+    fn refresh_vcpu_after_frame_cow(&self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
         self.state.relocate_mailbox_after_cow(&mut vcpu.mailbox)
     }
 

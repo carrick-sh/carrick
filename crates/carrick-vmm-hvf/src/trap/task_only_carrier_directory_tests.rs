@@ -597,43 +597,6 @@ fn alias(host: usize, perms: u64) -> AliasBacking {
     }
 }
 
-#[test]
-fn process_visible_signature_changes_only_for_visible_alias_scopes() {
-    let root_slot = (0x4fff_1000_0000, 0x4000);
-    let mut registry = AliasRegistry::default();
-    let initial = registry.process_visible_signature(Some(root_slot), ContainerRootToken::ROOT);
-
-    let mut foreign = alias(0x2000, 3);
-    foreign.ownership_scope = AliasOwnershipScope::MmRootSlot {
-        base: root_slot.0 + 0x10_0000,
-        size: root_slot.1,
-    };
-    registry.push(foreign);
-    assert_eq!(
-        registry.process_visible_signature(Some(root_slot), ContainerRootToken::ROOT),
-        initial,
-        "a foreign process must not invalidate this process's fork snapshot"
-    );
-
-    let mut owned = alias(0x3000, 3);
-    owned.ownership_scope = AliasOwnershipScope::MmRootSlot {
-        base: root_slot.0,
-        size: root_slot.1,
-    };
-    registry.push(owned);
-    let after_owned = registry.process_visible_signature(Some(root_slot), ContainerRootToken::ROOT);
-    assert_ne!(after_owned, initial);
-
-    let mut global = alias(0x4000, 1);
-    global.ownership_scope = AliasOwnershipScope::Global;
-    global.sharing = GuestMappingSharing::GlobalShared;
-    registry.push(global);
-    assert_ne!(
-        registry.process_visible_signature(Some(root_slot), ContainerRootToken::ROOT),
-        after_owned
-    );
-}
-
 /// A first-touch fault must not pay for every extent the process already
 /// materialized.
 ///

@@ -5579,21 +5579,6 @@ fn fork_inherits_private_and_shared_frames_before_any_write() {
         "EL1-only per-mm control state must not enter fault-driven guest COW",
     );
 
-    let mut vvar = mapping(GuestMappingSharing::Private);
-    vvar.start = crate::vdso::LINUX_VVAR_BASE;
-    vvar.end = vvar.start + size;
-    vvar.guest_writable = false;
-    assert_eq!(
-        fork_mapping_disposition(&vvar, false),
-        ForkMappingDisposition::IndependentProcessState,
-        "fork must allocate the child vvar before refreshing its process-local generation",
-    );
-    assert_eq!(
-        fork_mapping_disposition(&vvar, true),
-        ForkMappingDisposition::IndependentProcessState,
-        "CLONE_VM must still isolate Carrick's process-local vvar generation",
-    );
-
     // The fork projection is what carries `MADV_DONTFORK`/`MADV_WIPEONFORK`
     // into the child. Before this was consumed the VMM derived every
     // disposition from the mapping alone, so both advices changed only
@@ -6058,12 +6043,12 @@ fn fork_receipts_cover_read_only_user_cow_but_not_independent_kernel_frames() {
 
     assert_eq!(
         fork_frame_receipt_kind(
-            ForkMappingDisposition::IndependentProcessState,
+            ForkMappingDisposition::SharedFrameReadOnly,
             crate::vdso::LINUX_VVAR_BASE,
             HVF_PAGE_SIZE as usize,
         ),
-        None,
-        "the independent child vvar shares no frame that needs a fork receipt",
+        Some(HvpatchForkFrameKind::PrivateCow),
+        "the inherited read-only vvar frame is internally COWed for the child RNG stamp",
     );
     assert_eq!(
         fork_frame_receipt_kind(
@@ -6110,18 +6095,6 @@ fn cow_fault_classifier_accepts_only_el0_write_permission_aborts() {
 }
 
 #[test]
-fn frame_cow_relocates_only_a_mailbox_binding_in_the_repointed_compound() {
-    let mailbox = crate::memory::LINUX_SYSCALL_MAILBOX_BASE + 0x120;
-    assert!(frame_cow_repoints_mailbox(mailbox + 0x20, mailbox));
-    assert!(frame_cow_repoints_mailbox(mailbox + 0x3000, mailbox));
-    assert!(!frame_cow_repoints_mailbox(0xffff_fef000, mailbox));
-    assert!(!frame_cow_repoints_mailbox(
-        mailbox + CowArmedRanges::COMPOUND_SIZE,
-        mailbox,
-    ));
-}
-
-#[test]
 fn cow_intents_preserve_guest_write_authority_while_internal_writes_bypass_it() {
     use carrick_aarch64::vmm::FrameCowWriteIntent;
 
@@ -6157,91 +6130,6 @@ fn cow_intents_preserve_guest_write_authority_while_internal_writes_bypass_it() 
     assert!(frame_cow_preserves_guest_protection(
         FrameCowWriteIntent::PrivilegedInternal,
     ));
-}
-
-#[test]
-fn exclusive_private_guest_cow_can_restore_write_without_splitting() {
-    use carrick_aarch64::vmm::FrameCowWriteIntent;
-
-    let exclusive = CowInventoryRetirementDecision {
-        retire_old_frame: true,
-        backend_frame_references_complete: true,
-    };
-    assert!(exclusive_cow_promotion_is_safe(
-        FrameCowWriteIntent::GuestVisible,
-        false,
-        CowArmedRanges::COMPOUND_SIZE as usize,
-        InventoryBackingIdentity::Private(7),
-        exclusive,
-        false,
-    ));
-
-    for unsafe_shape in [
-        exclusive_cow_promotion_is_safe(
-            FrameCowWriteIntent::BackingMaintenance,
-            false,
-            CowArmedRanges::COMPOUND_SIZE as usize,
-            InventoryBackingIdentity::Private(7),
-            exclusive,
-            false,
-        ),
-        exclusive_cow_promotion_is_safe(
-            FrameCowWriteIntent::GuestVisible,
-            true,
-            CowArmedRanges::COMPOUND_SIZE as usize,
-            InventoryBackingIdentity::Private(7),
-            exclusive,
-            false,
-        ),
-        exclusive_cow_promotion_is_safe(
-            FrameCowWriteIntent::GuestVisible,
-            false,
-            0x1000,
-            InventoryBackingIdentity::Private(7),
-            exclusive,
-            false,
-        ),
-        exclusive_cow_promotion_is_safe(
-            FrameCowWriteIntent::GuestVisible,
-            false,
-            CowArmedRanges::COMPOUND_SIZE as usize,
-            InventoryBackingIdentity::PrivateFileView(7),
-            exclusive,
-            false,
-        ),
-        exclusive_cow_promotion_is_safe(
-            FrameCowWriteIntent::GuestVisible,
-            false,
-            CowArmedRanges::COMPOUND_SIZE as usize,
-            InventoryBackingIdentity::Private(7),
-            CowInventoryRetirementDecision {
-                retire_old_frame: false,
-                backend_frame_references_complete: true,
-            },
-            false,
-        ),
-        exclusive_cow_promotion_is_safe(
-            FrameCowWriteIntent::GuestVisible,
-            false,
-            CowArmedRanges::COMPOUND_SIZE as usize,
-            InventoryBackingIdentity::Private(7),
-            CowInventoryRetirementDecision {
-                retire_old_frame: true,
-                backend_frame_references_complete: false,
-            },
-            false,
-        ),
-        exclusive_cow_promotion_is_safe(
-            FrameCowWriteIntent::GuestVisible,
-            false,
-            CowArmedRanges::COMPOUND_SIZE as usize,
-            InventoryBackingIdentity::Private(7),
-            exclusive,
-            true,
-        ),
-    ] {
-        assert!(!unsafe_shape);
-    }
 }
 
 #[test]
@@ -6523,7 +6411,8 @@ fn fork_translation_accepts_winning_overlay_independent_of_descriptor_order() {
         mapping(stale_ipa, 0x3000_0000),
     ];
 
-    let overlay_index = ForkTranslationOverlayIndex::build(&mappings);
+    let overlay_index =
+        ForkTranslationOverlayIndex::build(&mappings, None, ContainerRootToken::ROOT);
     assert!(fork_translation_has_overlay_owner(
         &overlay_index,
         &mappings,
@@ -6531,59 +6420,4 @@ fn fork_translation_accepts_winning_overlay_independent_of_descriptor_order() {
         0x4000_0000,
         winning_ipa,
     ));
-}
-
-#[test]
-fn fork_translation_rejects_registry_only_overlay_without_a_child_mapping_owner() {
-    clear_alias_registry();
-    let va = 0x4000_0000;
-    let stale_ipa = 0x9b00_008000;
-    let winning_ipa = 0x9b00_028000;
-    let mappings = vec![ProcessMappingDesc {
-        start: va,
-        ipa: stale_ipa,
-        end: va + 0x4000,
-        host: ProcessMappingHost::Borrowed {
-            pointer: 0x3000_0000 as *mut u8,
-            structural_owner: None,
-        },
-        size: 0x4000,
-        physical_ipa: stale_ipa,
-        physical_host_addr: 0x3000_0000 as *mut u8,
-        physical_size: 0x4000,
-        inventory_backing: InventoryBackingIdentity::Private(stale_ipa),
-        perms: applevisor::memory::MemPerms::ReadWrite,
-        is_dynamic_alias: true,
-        sharing: GuestMappingSharing::Private,
-        guest_writable: true,
-        shared_key_base: 0,
-        shared_key_offset: 0,
-        inherited_frame: None,
-        stage2_lease: None,
-        owner_generation: 0,
-    }];
-    alias_registry().lock().push(AliasBacking {
-        start: va,
-        ipa: winning_ipa,
-        host_addr: 0x2000_0000,
-        size: 0x4000,
-        physical_ipa: winning_ipa,
-        physical_host_addr: 0x2000_0000,
-        physical_size: 0x4000,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
-        guest_writable: true,
-        sharing: GuestMappingSharing::Private,
-        ownership_scope: AliasOwnershipScope::Global,
-        inventory_backing: InventoryBackingIdentity::Private(winning_ipa),
-        shared_key_base: 0,
-        shared_key_offset: 0,
-        owner_generation: 0,
-    });
-
-    let overlay_index = ForkTranslationOverlayIndex::build(&mappings);
-    assert!(
-        !fork_translation_has_overlay_owner(&overlay_index, &mappings, 0, va, winning_ipa,),
-        "a carrier-registry row absent from the authenticated child mapping plan cannot own its translation"
-    );
-    clear_alias_registry();
 }
