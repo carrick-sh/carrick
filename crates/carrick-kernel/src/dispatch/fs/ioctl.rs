@@ -113,10 +113,7 @@ fn fd_is_random_device(this: &FsView<'_>, fd: i32) -> bool {
 
 fn fd_is_proc_maps(this: &FsView<'_>, fd: i32) -> bool {
     this.open_file(fd)
-        .and_then(|open_file| {
-            let description = open_file.description.read()?;
-            description.open_path().map(str::to_owned)
-        })
+        .and_then(|open_file| open_file.description().open_path_snapshot())
         .is_some_and(|path| {
             path == "/proc/self/maps"
                 || path == "/proc/thread-self/maps"

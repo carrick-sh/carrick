@@ -2683,6 +2683,27 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
 }
 
 impl crate::kernel::FileDescription {
+    /// Snapshot the pathname recorded by an open description without exposing
+    /// its backing lock to callers that only need stable metadata.
+    pub(in crate::dispatch) fn open_path_snapshot(&self) -> Option<String> {
+        self.read()?.open_path().map(str::to_owned)
+    }
+
+    /// Report the one legacy-AIO case that must complete immediately with
+    /// `EAGAIN`: a nonblocking read from an empty in-memory pipe that still
+    /// has a writer. Keeping both description and pipe-state locking here
+    /// makes the readiness observation one owned operation.
+    pub(in crate::dispatch) fn is_empty_pipe_reader_with_writer(&self) -> bool {
+        let Some(open) = self.read() else {
+            return false;
+        };
+        let OpenDescription::PipeReader { pipe, .. } = &*open else {
+            return false;
+        };
+        let state = pipe.state.lock();
+        state.buffer.is_empty() && state.writers != 0
+    }
+
     pub(in crate::dispatch) fn host_socket_authority(
         self: &Arc<Self>,
     ) -> Option<HostSocketAuthority> {
