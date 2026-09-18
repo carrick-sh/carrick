@@ -949,6 +949,15 @@ fn wake_thread_waiter(tid: i32) -> bool {
     wake_thread_waiter_fds(&fds)
 }
 
+/// Wake one exact guest thread's blocking-I/O waiter. A thread between waiter
+/// registrations falls back to the process pipe so it still observes the wake
+/// at its next enrollment boundary.
+pub fn wake_waiter(tid: i32) {
+    if !wake_thread_waiter(tid) {
+        notify_waiters_fallback();
+    }
+}
+
 /// Drain the self-pipe (non-blocking). Called by a waiter after it observes the
 /// pipe readable so queued wake bytes do not keep the source readable. Racing
 /// drains across threads are harmless — `has_pending` is the source of truth.

@@ -13,6 +13,12 @@
 pub trait SignalArrival: Send + Sync {
     /// Wake ALL parked waiters (fork/exec quiesce, process-directed arrival).
     fn wake_all_waiters(&self);
+
+    /// Wake one exact guest thread's backend-specific blocking-I/O waiter.
+    /// Backends without a targeted vehicle retain the safe broadcast default.
+    fn wake_waiter(&self, _tid: crate::ThreadId) {
+        self.wake_all_waiters();
+    }
 }
 
 /// The one `SignalArrival` impl shared by every backend whose "wake all" is
