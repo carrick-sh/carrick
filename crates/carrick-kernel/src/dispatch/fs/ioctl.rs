@@ -1914,8 +1914,10 @@ mod tests {
             .unwrap();
 
         let base = 0x3000u64;
-        let mut info = carrick_abi::LinuxPidfdInfo::default();
-        info.mask = carrick_abi::LINUX_PIDFD_INFO_EXIT;
+        let info = carrick_abi::LinuxPidfdInfo {
+            mask: carrick_abi::LINUX_PIDFD_INFO_EXIT,
+            ..Default::default()
+        };
         let mut memory = LinearMemory::new(base, vec![0u8; 0x1000]);
         memory.write_bytes(base, info.as_bytes()).unwrap();
 

@@ -1335,7 +1335,7 @@ impl SyscallDispatcher {
             MSG_QUEUE_FD_CACHE.with(|cache| {
                 cache.borrow_mut().entries.clear();
             });
-            return MSG_QUEUE_FD_CACHE.with(|cache| cache.borrow().entries.is_empty());
+            MSG_QUEUE_FD_CACHE.with(|cache| cache.borrow().entries.is_empty())
         }
         #[cfg(not(any(test, feature = "test-support")))]
         {
