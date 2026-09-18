@@ -15,6 +15,7 @@
 //! namespaces (Phase 4) extend the same slot model.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -78,10 +79,20 @@ pub struct NsSharedRegion {
     /// monotonic; dropping a preparation burns its number but publishes no
     /// membership, which is both Linux-compatible and rollback-safe.
     next_identity: AtomicU32,
+    /// Process-local accelerator for the authoritative shared records. A host
+    /// fork inherits a private copy, so every hit is validated against the
+    /// arena and every miss falls back to the shared table before caching.
+    indexes: Mutex<PidIndexes>,
     /// Serializes exact-claim validation with retirement. Once a stale holder
     /// acquires this lock, it must still prove `claim` names the live arena
     /// owner before reading or mutating either the slot or member records.
     lifecycle: Mutex<()>,
+}
+
+#[derive(Default)]
+struct PidIndexes {
+    host_to_slot: HashMap<u32, usize>,
+    ns_to_slot: HashMap<u32, usize>,
 }
 
 #[derive(Debug)]
@@ -178,6 +189,7 @@ impl NsSharedRegion {
             claim,
             released: AtomicBool::new(false),
             next_identity: AtomicU32::new(NS_INIT_PID + 1),
+            indexes: Mutex::new(PidIndexes::default()),
             lifecycle: Mutex::new(()),
         }))
     }
@@ -384,6 +396,12 @@ impl NsSharedRegion {
                 );
             }
         }
+        let mut indexes = self
+            .indexes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        indexes.host_to_slot.clear();
+        indexes.ns_to_slot.clear();
     }
 }
 
@@ -1034,6 +1052,7 @@ impl NsSharedRegion {
             }
             if let Some((i, record)) = self.reusable_record_for(host_pid) {
                 fill_member(record, self.ns_id(), ns_pid, parent_host_pid);
+                self.cache_member_slot_locked(i);
                 return Some(i);
             }
             // A matching record whose transition is owned by registration or
@@ -1056,6 +1075,7 @@ impl NsSharedRegion {
                 fill_member(record, ns_id, ns_pid, parent_host_pid);
             })
             .ok()?;
+        self.cache_member_slot_locked(claimed.index);
         Some(claimed.index)
     }
 
@@ -1073,12 +1093,8 @@ impl NsSharedRegion {
         if host_pid == 0 {
             return None;
         }
-        for record in self.member_records() {
-            if record.host_pid.load(Ordering::Acquire) == host_pid {
-                return Some(record.ns_pid.load(Ordering::Acquire));
-            }
-        }
-        None
+        let index = self.slot_of_locked(host_pid)?;
+        Some(self.section.records[index].ns_pid.load(Ordering::Acquire))
     }
 
     /// Translate an ns-pid to its host pid, or `None` if the ns-pid names no
@@ -1091,12 +1107,35 @@ impl NsSharedRegion {
         if !self.claim_is_live() {
             return None;
         }
-        for record in self.member_records() {
-            if record.ns_pid.load(Ordering::Acquire) == ns_pid {
-                return Some(record.host_pid.load(Ordering::Acquire));
-            }
+        if ns_pid == 0 {
+            return None;
         }
-        None
+        let mut indexes = self
+            .indexes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(&index) = indexes.ns_to_slot.get(&ns_pid)
+            && self
+                .member_at_locked(index)
+                .is_some_and(|(_, seen)| seen == ns_pid)
+        {
+            return Some(self.section.records[index].host_pid.load(Ordering::Acquire));
+        }
+        indexes.ns_to_slot.remove(&ns_pid);
+        let found = self
+            .section
+            .records
+            .iter()
+            .enumerate()
+            .find_map(|(index, _)| {
+                self.member_at_locked(index)
+                    .filter(|(_, seen)| *seen == ns_pid)
+                    .map(|(host, _)| (index, host))
+            });
+        let (index, host_pid) = found?;
+        indexes.host_to_slot.insert(host_pid, index);
+        indexes.ns_to_slot.insert(ns_pid, index);
+        Some(host_pid)
     }
 
     /// Find the slot index for a host pid, if registered.
@@ -1115,14 +1154,66 @@ impl NsSharedRegion {
         if host_pid == 0 {
             return None;
         }
-        let ns_id = self.ns_id();
-        self.section.records.iter().position(|s| {
-            let ns_pid = s.ns_pid.load(Ordering::Acquire);
-            s.host_pid.load(Ordering::Acquire) == host_pid
-                && ns_pid != 0
-                && ns_pid != NS_PID_REGISTERING
-                && s.pid_ns.load(Ordering::Acquire) == ns_id
-        })
+        let mut indexes = self
+            .indexes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(&index) = indexes.host_to_slot.get(&host_pid)
+            && self
+                .member_at_locked(index)
+                .is_some_and(|(seen, _)| seen == host_pid)
+        {
+            return Some(index);
+        }
+        indexes.host_to_slot.remove(&host_pid);
+        let found = self
+            .section
+            .records
+            .iter()
+            .enumerate()
+            .find_map(|(index, _)| {
+                self.member_at_locked(index)
+                    .filter(|(seen, _)| *seen == host_pid)
+                    .map(|(_, ns_pid)| (index, ns_pid))
+            });
+        let (index, ns_pid) = found?;
+        indexes.host_to_slot.insert(host_pid, index);
+        indexes.ns_to_slot.insert(ns_pid, index);
+        Some(index)
+    }
+
+    fn member_at_locked(&self, index: usize) -> Option<(u32, u32)> {
+        let record = self.section.records.get(index)?;
+        let host_pid = record.host_pid.load(Ordering::Acquire);
+        let ns_pid = record.ns_pid.load(Ordering::Acquire);
+        (host_pid != 0
+            && ns_pid != 0
+            && ns_pid != NS_PID_REGISTERING
+            && record.pid_ns.load(Ordering::Acquire) == self.ns_id())
+        .then_some((host_pid, ns_pid))
+    }
+
+    fn cache_member_slot_locked(&self, index: usize) {
+        let Some((host_pid, ns_pid)) = self.member_at_locked(index) else {
+            return;
+        };
+        let mut indexes = self
+            .indexes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        indexes.host_to_slot.retain(|_, slot| *slot != index);
+        indexes.ns_to_slot.retain(|_, slot| *slot != index);
+        indexes.host_to_slot.insert(host_pid, index);
+        indexes.ns_to_slot.insert(ns_pid, index);
+    }
+
+    fn forget_member_slot_locked(&self, index: usize) {
+        let mut indexes = self
+            .indexes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        indexes.host_to_slot.retain(|_, slot| *slot != index);
+        indexes.ns_to_slot.retain(|_, slot| *slot != index);
     }
 
     /// Whether `host_pid` is a published member of a DIFFERENT namespace.
@@ -1322,6 +1413,9 @@ impl NsSharedRegion {
                 record.exit_status.store(0, Ordering::Relaxed);
             }
             record.release_transition();
+            if still_member {
+                self.forget_member_slot_locked(i);
+            }
             return still_member;
         }
         false
@@ -1335,7 +1429,11 @@ impl NsSharedRegion {
                 .with_record_transition(record_ref, HostPid::new(host_pid), |_| {
                     ((), ProcessRecordTransitionAction::Retire)
                 }) {
-                Ok(_) | Err(ProcessRecordTransitionError::Stale) => return true,
+                Ok(_) => {
+                    self.forget_member_slot_locked(record_ref.index);
+                    return true;
+                }
+                Err(ProcessRecordTransitionError::Stale) => return true,
                 Err(ProcessRecordTransitionError::Busy) if std::time::Instant::now() < deadline => {
                     std::thread::yield_now();
                 }
@@ -1443,6 +1541,9 @@ impl NsSharedRegion {
             } else {
                 self.section.release(record_ref)
             };
+            if did_release {
+                self.forget_member_slot_locked(index);
+            }
             released += usize::from(did_release);
         }
         released
@@ -1850,7 +1951,15 @@ mod tests {
         assert_eq!(region.register(100, NS_INIT_PID, 0), Some(0));
 
         // a forked child host pid 200, ns-parent 100
-        assert!(region.register(200, 2, 100).is_some());
+        let child_slot = region.register(200, 2, 100).expect("register child");
+
+        let indexes = region
+            .indexes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(indexes.host_to_slot.get(&200), Some(&child_slot));
+        assert_eq!(indexes.ns_to_slot.get(&2), Some(&child_slot));
+        drop(indexes);
 
         assert_eq!(region.host_to_ns(100), Some(1));
         assert_eq!(region.host_to_ns(200), Some(2));
