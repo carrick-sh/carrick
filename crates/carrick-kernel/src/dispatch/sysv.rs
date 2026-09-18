@@ -281,10 +281,6 @@ impl ShmPermMode {
         self.bits & Self::PERMS_MASK
     }
 
-    fn is_empty_perms(self) -> bool {
-        self.perms() == 0
-    }
-
     fn set_locked(&mut self, locked: bool) {
         if locked {
             self.bits |= ShmModeFlags::LOCKED.bits();
@@ -348,6 +344,10 @@ pub struct ShmSegment {
 }
 
 impl ShmSegment {
+    fn can_admin(&self, creds: &crate::kernel::Credentials) -> bool {
+        creds.euid.is_root() || creds.euid == self.uid || creds.euid == self.cuid
+    }
+
     fn can_read(&self, creds: &crate::kernel::Credentials) -> bool {
         creds.euid.is_root()
             || if creds.euid == self.uid {
@@ -2341,11 +2341,7 @@ impl<'a> IpcView<'a> {
                     else {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     };
-                    if !segment.can_write(&creds)
-                    {
-                        if segment.mode.is_empty_perms() {
-                            let _ = shmctl_rmid(state, shmid);
-                        }
+                    if !segment.can_admin(&creds) {
                         return Ok(DispatchOutcome::errno(LINUX_EPERM));
                     }
                     match shmctl_rmid(state, shmid) {
@@ -2402,7 +2398,7 @@ impl<'a> IpcView<'a> {
                     this.sysv.with_state_mut(|state| {
                         match state.segments.get_mut(&shmid).filter(|segment| !segment.removed) {
                             Some(seg) => {
-                                if !seg.can_write(&creds) {
+                                if !seg.can_admin(&creds) {
                                     return Ok(DispatchOutcome::errno(LINUX_EPERM));
                                 }
                                 seg.mode = ShmPermMode::from_ipc_set(new_mode, seg.mode);
@@ -2416,7 +2412,7 @@ impl<'a> IpcView<'a> {
                 LINUX_SHM_LOCK | LINUX_SHM_UNLOCK => {
                     this.sysv.with_state_mut(|state| {
                         match state.segments.get_mut(&shmid).filter(|segment| !segment.removed) {
-                            Some(segment) if !segment.can_write(&creds) => {
+                            Some(segment) if !segment.can_admin(&creds) => {
                                 Ok(DispatchOutcome::errno(LINUX_EPERM))
                             }
                             Some(segment) => {
@@ -4454,6 +4450,84 @@ mod ipc_set_tests {
             },
         );
         file
+    }
+
+    #[test]
+    fn shmctl_rmid_authorizes_the_owner_even_without_write_mode_bits() {
+        let dispatcher = SyscallDispatcher::new();
+        let shmid = 4_898;
+        let _backing = insert_test_shm_segment(&dispatcher, shmid, LINUX_PAGE_SIZE as usize);
+        let owner = NsUid::new(65_534);
+        {
+            let mut state = dispatcher.sysv.state.lock();
+            let segment = state.segments.get_mut(&shmid).expect("test segment");
+            segment.uid = owner;
+            segment.cuid = owner;
+            segment.mode = ShmPermMode::requested(0);
+        }
+
+        let root = dispatcher.capture_one_task_context().unwrap();
+        let owner_context = root
+            .kernel()
+            .update_credentials(&root, |credentials| {
+                credentials.set_uid_triple(owner, owner, owner);
+            })
+            .expect("install owner credentials");
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x10000, vec![0; 0x100]);
+        let outcome = dispatcher
+            .dispatch_normalized(
+                &owner_context,
+                SyscallRequest::new(
+                    195,
+                    SyscallArgs::from([shmid as u64, LINUX_IPC_RMID, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .expect("shmctl is a claimed syscall")
+            .expect("shmctl IPC_RMID must not be a fatal DispatchError");
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        assert!(
+            !dispatcher.sysv.state.lock().segments.contains_key(&shmid),
+            "successful IPC_RMID must retire an unattached segment"
+        );
+
+        let nonowner_shmid = shmid + 1;
+        let _nonowner_backing =
+            insert_test_shm_segment(&dispatcher, nonowner_shmid, LINUX_PAGE_SIZE as usize);
+        dispatcher
+            .sysv
+            .state
+            .lock()
+            .segments
+            .get_mut(&nonowner_shmid)
+            .expect("nonowner segment")
+            .mode = ShmPermMode::requested(0o666);
+        let outcome = dispatcher
+            .dispatch_normalized(
+                &owner_context,
+                SyscallRequest::new(
+                    195,
+                    SyscallArgs::from([nonowner_shmid as u64, LINUX_IPC_RMID, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .expect("shmctl is a claimed syscall")
+            .expect("shmctl IPC_RMID must not be a fatal DispatchError");
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EPERM));
+        assert!(
+            dispatcher
+                .sysv
+                .state
+                .lock()
+                .segments
+                .contains_key(&nonowner_shmid),
+            "mode write bits must not grant IPC administration to a nonowner"
+        );
     }
 
     #[test]
