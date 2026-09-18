@@ -343,15 +343,27 @@ pub(super) fn gather_bounded_iovec_bytes(
     Ok(Some(GatheredIovecBytes { bytes, faulted }))
 }
 
-/// Linux path-length limits enforced at resolution time: NAME_MAX (255) per
-/// component, PATH_MAX (4096) for the whole path. Either overflow →
-/// ENAMETOOLONG. (`PATH_MAX` includes the NUL, so the usable length is 4095.)
-pub(super) fn check_path_length(path: &str) -> Result<(), LinuxErrno> {
+/// Linux path-length limits enforced at the guest syscall/API input boundary:
+/// NAME_MAX (255) per component, PATH_MAX (4096) for the whole path. Either
+/// overflow → ENAMETOOLONG. (`PATH_MAX` includes the NUL, so the usable length is 4095.)
+pub(in crate::dispatch) fn check_path_length(path: &str) -> Result<(), LinuxErrno> {
     const NAME_MAX: usize = 255;
     const PATH_MAX: usize = 4096;
     if path.len() >= PATH_MAX {
         return Err(LINUX_ENAMETOOLONG);
     }
+    for component in path.split('/') {
+        if component.len() > NAME_MAX {
+            return Err(LINUX_ENAMETOOLONG);
+        }
+    }
+    Ok(())
+}
+
+/// Enforce NAME_MAX (255) per component on internal canonical paths without
+/// restricting total path length, allowing deep directory hierarchies beyond PATH_MAX.
+pub(in crate::dispatch) fn check_component_length(path: &str) -> Result<(), LinuxErrno> {
+    const NAME_MAX: usize = 255;
     for component in path.split('/') {
         if component.len() > NAME_MAX {
             return Err(LINUX_ENAMETOOLONG);
