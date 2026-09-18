@@ -3445,7 +3445,10 @@ impl<'a> ProcView<'a> {
             let Some(target_files) = target.leader_file_table() else {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             };
-            let Some(source) = target_files.read_open_files().get(&targetfd).cloned() else {
+            let Ok(targetfd) = crate::kernel::FileSlotNumber::for_open_fd(targetfd) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let Some(source) = target_files.slot(targetfd) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             let duplicate = OpenFile::new(source.description(), LINUX_FD_CLOEXEC);
@@ -3484,8 +3487,14 @@ impl<'a> ProcView<'a> {
             else {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             };
-            let first = first_files.read_open_files().get(&idx1).cloned();
-            let second = second_files.read_open_files().get(&idx2).cloned();
+            let (Ok(idx1), Ok(idx2)) = (
+                crate::kernel::FileSlotNumber::for_open_fd(idx1),
+                crate::kernel::FileSlotNumber::for_open_fd(idx2),
+            ) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let first = first_files.slot(idx1);
+            let second = second_files.slot(idx2);
             let (Some(first), Some(second)) = (first, second) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };

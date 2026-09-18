@@ -128,12 +128,7 @@ fn legacy_aio_immediate_completion(
         return None;
     }
     let open_file = this.open_file(iocb.fd.0)?;
-    let open = open_file.description.read()?;
-    let OpenDescription::PipeReader { pipe, .. } = &*open else {
-        return None;
-    };
-    let state = pipe.state.lock();
-    if !state.buffer.is_empty() || state.writers == 0 {
+    if !open_file.description().is_empty_pipe_reader_with_writer() {
         return None;
     }
     Some(crate::linux_abi::LinuxIoEvent {
