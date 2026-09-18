@@ -1995,6 +1995,8 @@ impl<'a> FsView<'a> {
                         {
                             return Ok(DispatchOutcome::errno(errno));
                         }
+                        this.fs
+                            .truncate_host_sparse_extents(host_fd.raw(), length as u64);
                         this.invalidate_dentry_host_fd(host_fd.raw());
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }

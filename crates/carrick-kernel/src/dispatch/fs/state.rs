@@ -193,6 +193,105 @@ pub(in crate::dispatch) struct FsState {
     /// processes inside one host process. HVPatch task generations are the
     /// owners; host-process-backed lanes continue using the host fcntl table.
     pub(in crate::dispatch) classic_record_locks: std::sync::Arc<super::LogicalRecordLocks>,
+
+    /// Linux-visible sparse extents for host files whose layout Carrick has
+    /// created from an empty file. Darwin/APFS may allocate a much larger
+    /// physical extent for a small write, so its SEEK_DATA/SEEK_HOLE answers
+    /// cannot describe the sparse layout Linux callers created. Key by host
+    /// object identity so dup/open/fork aliases observe one layout.
+    host_sparse_extents:
+        std::sync::Arc<parking_lot::Mutex<HashMap<HostFileIdentity, HostSparseExtents>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct HostFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Debug)]
+struct HostSparseExtents {
+    len: u64,
+    data: Vec<std::ops::Range<u64>>,
+}
+
+impl HostSparseExtents {
+    const BLOCK: u64 = 4096;
+
+    fn empty(len: u64) -> Self {
+        Self {
+            len,
+            data: Vec::new(),
+        }
+    }
+
+    fn truncate(&mut self, len: u64) {
+        self.len = len;
+        self.data.retain_mut(|range| {
+            range.end = range.end.min(len);
+            range.start < range.end
+        });
+    }
+
+    fn record_write(&mut self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let start = offset / Self::BLOCK * Self::BLOCK;
+        let end =
+            offset.saturating_add(len).saturating_add(Self::BLOCK - 1) / Self::BLOCK * Self::BLOCK;
+        self.len = self.len.max(offset.saturating_add(len));
+        let mut merged = start..end.min(self.len);
+        let mut out = Vec::with_capacity(self.data.len() + 1);
+        for range in self.data.drain(..) {
+            if range.end < merged.start {
+                out.push(range);
+            } else if merged.end < range.start {
+                out.push(merged);
+                merged = range;
+            } else {
+                merged.start = merged.start.min(range.start);
+                merged.end = merged.end.max(range.end);
+            }
+        }
+        out.push(merged);
+        self.data = out;
+    }
+
+    fn seek(&self, offset: u64, data: bool) -> Option<u64> {
+        if offset >= self.len {
+            return None;
+        }
+        for range in &self.data {
+            if offset < range.start {
+                return if data {
+                    Some(range.start)
+                } else {
+                    Some(offset)
+                };
+            }
+            if offset < range.end {
+                return if data {
+                    Some(offset)
+                } else {
+                    Some(range.end.min(self.len))
+                };
+            }
+        }
+        if data { None } else { Some(offset) }
+    }
+}
+
+fn host_file_identity(fd: i32) -> Option<HostFileIdentity> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let stat = unsafe { stat.assume_init() };
+    Some(HostFileIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino,
+    })
 }
 
 /// Exclusive terminal ownership of one container's immutable mount-routing
@@ -564,6 +663,7 @@ impl FsState {
             resolve_cache: carrick_vfs::fs_resolve_cache::ResolveCache::new(),
             hvpatch_exec_cache: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             classic_record_locks: std::sync::Arc::new(super::LogicalRecordLocks::default()),
+            host_sparse_extents: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -580,7 +680,53 @@ impl FsState {
             resolve_cache: carrick_vfs::fs_resolve_cache::ResolveCache::new(),
             hvpatch_exec_cache: std::sync::Arc::clone(&self.hvpatch_exec_cache),
             classic_record_locks: std::sync::Arc::clone(&self.classic_record_locks),
+            host_sparse_extents: std::sync::Arc::clone(&self.host_sparse_extents),
         }
+    }
+
+    pub(in crate::dispatch) fn reset_host_sparse_extents(&self, fd: i32, len: u64) {
+        if let Some(identity) = host_file_identity(fd) {
+            self.host_sparse_extents
+                .lock()
+                .insert(identity, HostSparseExtents::empty(len));
+        }
+    }
+
+    pub(in crate::dispatch) fn truncate_host_sparse_extents(&self, fd: i32, len: u64) {
+        let Some(identity) = host_file_identity(fd) else {
+            return;
+        };
+        let mut files = self.host_sparse_extents.lock();
+        if len == 0 {
+            files.insert(identity, HostSparseExtents::empty(0));
+        } else if let Some(extents) = files.get_mut(&identity) {
+            extents.truncate(len);
+        }
+    }
+
+    pub(in crate::dispatch) fn record_host_sparse_write(&self, fd: i32, offset: u64, len: usize) {
+        let Some(identity) = host_file_identity(fd) else {
+            return;
+        };
+        if let Some(extents) = self.host_sparse_extents.lock().get_mut(&identity) {
+            extents.record_write(offset, len as u64);
+        }
+    }
+
+    /// `None` means the file predates Carrick's sparse metadata and must use
+    /// the host answer. `Some(None)` is Linux ENXIO; `Some(Some(offset))` is a
+    /// tracked Linux-visible extent boundary.
+    pub(in crate::dispatch) fn seek_host_sparse_extents(
+        &self,
+        fd: i32,
+        offset: u64,
+        data: bool,
+    ) -> Option<Option<u64>> {
+        let identity = host_file_identity(fd)?;
+        self.host_sparse_extents
+            .lock()
+            .get(&identity)
+            .map(|extents| extents.seek(offset, data))
     }
 }
 

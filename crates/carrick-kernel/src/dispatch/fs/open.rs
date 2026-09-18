@@ -107,6 +107,7 @@ impl<'a> FsView<'a> {
             let create_mode = (mode as u32 & 0o7777) & !(creds.umask & 0o777);
             if let Some(host_fd) = self.fs.rootfs_vfs.overlay.open_anon_fd(create_mode) {
                 crate::dispatch::net::set_host_nonblocking(host_fd);
+                self.fs.reset_host_sparse_extents(host_fd, 0);
                 let description = OpenDescription::HostFile {
                     host_fd: HostFdRef::new(host_fd),
                     metadata: RootFsMetadata {
@@ -586,6 +587,7 @@ impl<'a> FsView<'a> {
             }) => {
                 debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(host_fd));
                 if want_trunc {
+                    self.fs.reset_host_sparse_extents(host_fd, 0);
                     self.invalidate_dentry_host_fd(host_fd);
                 }
                 OpenDescription::HostFile {
@@ -676,9 +678,8 @@ impl<'a> FsView<'a> {
                     carrick_vfs::fs_backend::HostFdOpen::Unavailable => None,
                 };
                 if let Some((host_fd, mode_applied)) = created {
-                    if want_trunc {
-                        self.invalidate_dentry_host_fd(host_fd);
-                    }
+                    self.fs.reset_host_sparse_extents(host_fd, 0);
+                    self.invalidate_dentry_host_fd(host_fd);
                     debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(host_fd));
                     // A backend that created with the host umask (or could not
                     // represent the mode natively) still needs the guest mode

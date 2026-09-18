@@ -343,10 +343,17 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
 
+            // Linux validates that the destination is open for writing before
+            // it reads or advances the source. Reuse the transfer endpoint
+            // validator so invalid and read-only outputs fail with EBADF
+            // instead of reaching write_output_fd after data has been staged.
+            if let Some(errno) = this.splice_output_errno(out_fd.0) {
+                return Ok(DispatchOutcome::errno(errno));
+            }
+
             // in_fd must be READABLE — sendfile reads the source from it. An
             // O_WRONLY in_fd → EBADF (LTP sendfile03 case 4). A bad in_fd is
-            // caught as EBADF by sendfile_offset below; out_fd writability is
-            // enforced on the write path (sendfile03 case 2 already passes).
+            // caught as EBADF by sendfile_offset below.
             if let Some(in_file) = this.open_file(in_fd.0)
                 && in_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
             {
