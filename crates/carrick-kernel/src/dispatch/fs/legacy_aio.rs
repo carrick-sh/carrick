@@ -90,6 +90,9 @@ impl LegacyAioOpcode {
 struct LegacyAioIocb {
     opcode: LegacyAioOpcode,
     fd: Fd,
+    address: u64,
+    data: u64,
+    rw_flags: u32,
 }
 
 impl LegacyAioIocb {
@@ -101,12 +104,44 @@ impl LegacyAioIocb {
         Ok(Self {
             opcode: LegacyAioOpcode::from_wire(iocb.aio_lio_opcode)?,
             fd: Fd(iocb.aio_fildes as i32),
+            address: address.0,
+            data: iocb.aio_data,
+            rw_flags: iocb.aio_reserved1,
         })
     }
 }
 
 fn legacy_aio_context_exists(this: &FsView<'_>, ctx: LegacyAioContextId) -> bool {
-    this.captured_mm().read_legacy_aio_contexts().contains(&ctx)
+    this.captured_mm()
+        .read_legacy_aio_contexts()
+        .contains_key(&ctx)
+}
+
+fn legacy_aio_immediate_completion(
+    this: &FsView<'_>,
+    iocb: LegacyAioIocb,
+) -> Option<crate::linux_abi::LinuxIoEvent> {
+    if iocb.opcode != LegacyAioOpcode::Pread
+        || !crate::linux_abi::LinuxRwfFlags::from_bits_retain(u64::from(iocb.rw_flags))
+            .contains(crate::linux_abi::LinuxRwfFlags::NOWAIT)
+    {
+        return None;
+    }
+    let open_file = this.open_file(iocb.fd.0)?;
+    let open = open_file.description.read()?;
+    let OpenDescription::PipeReader { pipe, .. } = &*open else {
+        return None;
+    };
+    let state = pipe.state.lock();
+    if !state.buffer.is_empty() || state.writers == 0 {
+        return None;
+    }
+    Some(crate::linux_abi::LinuxIoEvent {
+        data: iocb.data,
+        obj: iocb.address,
+        result: -i64::from(LINUX_EAGAIN.get()),
+        result2: 0,
+    })
 }
 
 fn legacy_aio_iocb_errno(this: &FsView<'_>, iocb: LegacyAioIocb) -> Option<LinuxErrno> {
@@ -157,7 +192,7 @@ pub(super) fn io_setup<M: CurrentMmMemory>(
     let ctx_id = LegacyAioContextId::allocated_from(raw);
     this.captured_mm()
         .write_legacy_aio_contexts()
-        .insert(ctx_id);
+        .insert(ctx_id, std::collections::VecDeque::new());
     if cx
         .memory
         .write_bytes(ctxp.0, &ctx_id.get().to_le_bytes())
@@ -178,7 +213,12 @@ pub(super) fn io_destroy(
     let Some(ctx) = LegacyAioContextId::from_guest(raw_ctx) else {
         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
     };
-    if this.captured_mm().write_legacy_aio_contexts().remove(&ctx) {
+    if this
+        .captured_mm()
+        .write_legacy_aio_contexts()
+        .remove(&ctx)
+        .is_some()
+    {
         Ok(DispatchOutcome::Returned { value: 0 })
     } else {
         Ok(DispatchOutcome::errno(LINUX_EINVAL))
@@ -208,6 +248,7 @@ pub(super) fn io_submit<M: CurrentMmMemory>(
     if iocbpp.0 == 0 {
         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
     }
+    let mut immediate = Vec::new();
     for idx in 0..count.get() {
         let Some(slot_addr) = iocbpp.0.checked_add(idx.saturating_mul(8)) else {
             return Ok(DispatchOutcome::errno(LINUX_EFAULT));
@@ -226,6 +267,17 @@ pub(super) fn io_submit<M: CurrentMmMemory>(
         if let Some(errno) = legacy_aio_iocb_errno(this, iocb) {
             return Ok(DispatchOutcome::errno(errno));
         }
+        if let Some(event) = legacy_aio_immediate_completion(this, iocb) {
+            immediate.push(event);
+        }
+    }
+    if !immediate.is_empty() {
+        let mm = this.captured_mm();
+        let mut contexts = mm.write_legacy_aio_contexts();
+        let Some(completions) = contexts.get_mut(&ctx) else {
+            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+        };
+        completions.extend(immediate);
     }
     Ok(DispatchOutcome::returned_u64_or_errno(count.get()))
 }
@@ -273,7 +325,22 @@ pub(super) fn io_getevents<M: CurrentMmMemory>(
     if range.max > 0 && (events.0 == 0 || cx.memory.read_bytes(events.0, 32).is_err()) {
         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
     }
-    Ok(DispatchOutcome::Returned { value: 0 })
+    let mm = this.captured_mm();
+    let mut contexts = mm.write_legacy_aio_contexts();
+    let Some(completions) = contexts.get_mut(&ctx) else {
+        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+    };
+    let available = completions.len().min(range.max as usize);
+    for (index, event) in completions.iter().take(available).enumerate() {
+        let Some(address) = events.0.checked_add((index as u64).saturating_mul(32)) else {
+            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+        };
+        if write_kernel_struct_raw(cx.memory, address, event).is_err() {
+            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+        }
+    }
+    completions.drain(..available);
+    Ok(DispatchOutcome::returned_len_or_errno(available))
 }
 
 impl<'a> FsView<'a> {

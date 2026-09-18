@@ -472,7 +472,9 @@ fn mprotect_rounds_length_to_configured_16k_linux_page_size() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -622,6 +624,7 @@ fn mmap_non_fixed_hint_does_not_overlap_existing_bump_allocation() {
 fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
     const MS_SYNC: u64 = 0x04;
     const MS_ASYNC: u64 = 0x01;
+    const MS_INVALIDATE: u64 = 0x02;
     const MCL_CURRENT: u64 = 0x01;
     let mut memory =
         AddressSpace::from_segments(0, [(LINUX_MMAP_BASE, rwx_perms(), b"".to_vec(), 0x4000)])
@@ -671,6 +674,20 @@ fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
                 &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     227,
+                    SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, MS_INVALIDATE, 0, 0, 0,]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    227,
                     SyscallArgs::from([0xdead_0000, 0x1000, MS_SYNC, 0, 0, 0]),
                 ),
                 &mut memory,
@@ -695,6 +712,22 @@ fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    227,
+                    SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, MS_INVALIDATE, 0, 0, 0,]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(16)
+        }
     );
     assert_eq!(
         dispatcher

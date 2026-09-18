@@ -4344,7 +4344,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         inventory.initialized = true;
         extent
     };
-    let overlay_extent = {
+    let _overlay_extent = {
         let mut inventory = parent_inventory.lock();
         HvfVmState::stage_mapping_in(
             &transport.custody,
@@ -4488,11 +4488,12 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
     assert!(
         overlay_plan.mappings.iter().any(|mapping| {
             mapping.start == vvar_ipa
-                && mapping.ipa == overlay_ipa
-                && mapping.inherited_frame == Some(overlay_extent.frame)
+                && mapping.physical_ipa != overlay_ipa
+                && mapping.inherited_frame.is_none()
         }),
-        "fork planning must retain the exact authenticated overlay owner",
+        "fork planning must copy the exact authenticated overlay into independent child state",
     );
+    drop(overlay_plan);
 
     let mut arbitrary_child_page_tables = make_child_page_tables(overlay_ipa + vvar_len);
     let error = match parent.build_process_plan(
@@ -4516,8 +4517,13 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         && error_text.contains("authenticated_overlay=false");
     let rejected_before_owner_audit =
         error_text.contains("resolves to IPA") && error_text.contains("expected");
+    let rejected_by_independent_source_audit = error_text
+        .contains("independent process-state mapping")
+        && error_text.contains("has no authenticated source");
     assert!(
-        rejected_by_owner_audit || rejected_before_owner_audit,
+        rejected_by_owner_audit
+            || rejected_before_owner_audit
+            || rejected_by_independent_source_audit,
         "unexpected arbitrary translated-IPA failure: {error}",
     );
 
@@ -4541,8 +4547,13 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         && error_text.contains("authenticated_overlay=false");
     let rejected_before_owner_audit =
         error_text.contains("resolves to IPA") && error_text.contains("expected");
+    let rejected_by_independent_source_audit = error_text
+        .contains("independent process-state mapping")
+        && error_text.contains("has no authenticated source");
     assert!(
-        rejected_by_owner_audit || rejected_before_owner_audit,
+        rejected_by_owner_audit
+            || rejected_before_owner_audit
+            || rejected_by_independent_source_audit,
         "unexpected unauthenticated vvar failure: {error}",
     );
     parent
@@ -4564,10 +4575,13 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         )
         .expect("build child plan with structural vvar");
     assert!(
-        plan.mappings
-            .iter()
-            .any(|mapping| mapping.start == vvar_ipa),
-        "production fork planning must retain the vvar semantic descriptor",
+        plan.mappings.iter().any(|mapping| {
+            mapping.start == vvar_ipa
+                && mapping.physical_ipa != vvar_ipa
+                && mapping.inherited_frame.is_none()
+                && !mapping.guest_writable
+        }),
+        "production fork planning must allocate an independent read-only child vvar",
     );
     let ids = std::sync::atomic::AtomicU64::new(880);
     plan.stage_with_reservation_factory(|frames, mappings, capacity| {
@@ -4603,12 +4617,10 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
     assert!(
         projected.mappings.iter().any(|mapping| {
             mapping.contains_range(generation_address, core::mem::size_of::<u64>())
-                && mapping
-                    .structural_owner
-                    .as_ref()
-                    .is_some_and(|owner| Arc::ptr_eq(owner, &vvar_owner))
+                && mapping.structural_owner.is_none()
+                && mapping.physical_ipa != vvar_ipa
         }),
-        "task-only projection must resolve the child RNG-generation stamp",
+        "task-only projection must resolve the RNG-generation stamp through independent child state",
     );
     let child_page_table_host = prepared
         .mappings
@@ -4749,6 +4761,14 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
             .is_some_and(|mapping| !mapping.guest_writable),
         "production mapping resolution must find the read-only prepared child vvar",
     );
+    assert!(
+        child_task
+            .cow_armed
+            .lock()
+            .span_for(generation_address)
+            .is_none(),
+        "independent child vvar state must never enter the COW arm set",
+    );
     let mut flushes = 0;
     child_task
         .refresh_fork_process_state_in(&transport.custody, &mut || {
@@ -4756,7 +4776,10 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
             Ok(())
         })
         .expect("production privileged child vvar refresh");
-    assert_eq!(flushes, 1, "child vvar refresh must publish stage-1 once");
+    assert_eq!(
+        flushes, 0,
+        "an already-independent child vvar refresh must not rewrite stage-1",
+    );
     let parent_generation = unsafe { parent_generation_ptr.cast::<u64>().read_unaligned() };
     assert_eq!(
         parent_generation, parent_generation_seed,
@@ -4778,7 +4801,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
             .with_manager(|pt| pt.debug_walk(generation_address)[3] & AP_MASK)
             .expect("refreshed child page tables"),
         AP_USER_RO,
-        "privileged internal COW must preserve the guest read-only AP",
+        "independent process-state refresh must preserve the guest read-only AP",
     );
     assert!(
         child_task
@@ -4786,7 +4809,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
             .lock()
             .span_for(generation_address)
             .is_none(),
-        "successful privileged refresh must disarm the child vvar span",
+        "independent child vvar state must remain outside the COW arm set",
     );
     let child_private_key = (
         align_down(refreshed.ipa, CowArmedRanges::COMPOUND_SIZE),
@@ -4845,27 +4868,26 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
             Arc::clone(&transport),
         )
         .expect("fork refreshed child-private vvar into grandchild");
-    assert!(
-        grandchild_plan.mappings.iter().any(|mapping| {
-            mapping.start == vvar_ipa
-                && mapping.physical_ipa == child_private_key.0
-                && mapping.owner_generation == child_private_owner.generation()
-                && mapping.inherited_frame.is_some()
-        }),
-        "the second fork must inherit the exact COW overlay owner",
+    let grandchild_vvar = grandchild_plan
+        .mappings
+        .iter()
+        .find(|mapping| mapping.start == vvar_ipa)
+        .expect("grandchild independent vvar mapping");
+    assert!(grandchild_vvar.inherited_frame.is_none());
+    assert_ne!(grandchild_vvar.physical_ipa, child_private_key.0);
+    let grandchild_generation = unsafe {
+        grandchild_vvar
+            .host
+            .ptr()
+            .add(crate::vdso::VVAR_OFF_RNG_GENERATION)
+            .cast::<u64>()
+            .read_unaligned()
+    };
+    assert_eq!(
+        grandchild_generation, child_generation,
+        "the second fork must copy the refreshed vvar before assigning its next generation",
     );
-    assert!(
-        grandchild_plan.inventory_mappings.iter().any(|mapping| {
-            mapping.gpa == child_private_key.0
-                && mapping.length == child_private_key.1
-                && mapping.stage2_owner
-                    == InventoryStage2OwnerIdentity {
-                        host_addr: child_private_owner.as_ptr() as usize,
-                        generation: child_private_owner.generation(),
-                    }
-        }),
-        "the second fork must carry the COW overlay's exact inventory authority",
-    );
+    drop(grandchild_plan);
     drop(child_task);
     prepared.inventory = HvpatchTaskInventoryAuthority::Absent;
     drop(child_state);

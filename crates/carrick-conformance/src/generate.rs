@@ -119,6 +119,20 @@ const LTP_CMD_OVERRIDES: &[(&str, &[&str])] = &[
 /// the generated suites.toml do NOT survive regen — this table is their home.
 /// Matched by EXACT suite name.
 const DOCKER_FLAG_OVERRIDES: &[(&str, &[&str])] = &[
+    // os/signal TestTerminalSignal creates a session leader with a controlling
+    // PTY. The confined oracle rejects its TIOCSCTTY child fork/exec with EPERM
+    // before the test reaches the signal/read contract. Unconfine and grant
+    // SYS_ADMIN (verified independently on the exact image) so the oracle
+    // measures Linux terminal semantics instead of container policy.
+    (
+        "go-os_signal",
+        &[
+            "--security-opt",
+            "seccomp=unconfined",
+            "--cap-add",
+            "SYS_ADMIN",
+        ],
+    ),
     // `go-os` and `go-net` each contain a test that requires a controlling
     // TERMINAL — `TestSpliceFile/{TCP,Unix}-To-TTY` and `TestCopyFromTTY`. In a
     // container without one they do not fail or skip, they HANG, and the suite
@@ -282,12 +296,9 @@ const OVERRIDE_EXCLUSIONS: &[&str] = &["ltp-setrlimit06"];
 
 /// Suites whose single LTP `"summary"` divergence is a TRACKED-unimplemented-
 /// capability marker (maintainer-approved report-only), NOT an edge-case excuse.
-/// `pidfd_getfd` has no carrick backend: with the oracle unconfined the docker
-/// side runs the real syscall and SUCCEEDS while carrick returns ENOSYS, so it
-/// legitimately DIFFs. Stamping the `"summary"` id known keeps the gate green
-/// while the gap stays visible. Matched by PREFIX. `"summary"` is the ONLY id
-/// the LTP parser emits (see parsers/ltp.rs), so it is the exact diverging id —
-/// verified empirically from a focused oracle run, not invented.
+/// `"summary"` is the ONLY id the LTP parser emits (see parsers/ltp.rs), so a
+/// family listed here would make every behavioral regression in that family
+/// report-only. Keep the list empty while no whole family needs that boundary.
 ///
 /// TWO families used to be listed here and no longer are, both because carrick
 /// now implements the capability. A report-only marker on an IMPLEMENTED
@@ -302,7 +313,7 @@ const OVERRIDE_EXCLUSIONS: &[&str] = &["ltp-setrlimit06"];
 ///    still diverges, and it is an EXACT-NAME entry below with a documented
 ///    permanent reason — a whole-family prefix here would re-mask 24 genuinely
 ///    gated rows.
-const KNOWN_GAP_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[("ltp-pidfd_getfd", &["summary"])];
+const KNOWN_GAP_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[];
 
 /// Exact-name known_gaps for suites that a whole-family prefix would over-mark.
 /// The setrlimit family mostly MATCHes with the unconfined+cap oracle (the
@@ -1088,10 +1099,26 @@ mod tests {
                 "{name} lost seccomp=unconfined"
             );
         }
+        let signal = m
+            .suite
+            .iter()
+            .find(|suite| suite.name == "go-os_signal")
+            .unwrap();
+        assert!(
+            signal
+                .docker_flags
+                .iter()
+                .any(|flag| flag == "seccomp=unconfined"),
+            "go-os_signal lost the seccomp exception required by TestTerminalSignal"
+        );
+        assert!(
+            signal.docker_flags.iter().any(|flag| flag == "SYS_ADMIN"),
+            "go-os_signal lost CAP_SYS_ADMIN required by TIOCSCTTY"
+        );
     }
 
-    /// The keyring/pidfd_getfd/setrlimit/fanotify oracle-fidelity flags (and
-    /// the keyring/pidfd/fanotify known_gaps) must be present in the COMMITTED
+    /// The keyring/pidfd_getfd/setrlimit/fanotify oracle-fidelity flags and
+    /// intentional exact-name gaps must be present in the COMMITTED
     /// manifest so a future regen without them is caught. Reads suites.toml off
     /// disk (not `build()`, which shells to docker).
     #[test]
@@ -1120,7 +1147,8 @@ mod tests {
                 "{name} is no longer a carrick gap; the keyring subsystem is implemented"
             );
         }
-        // pidfd_getfd: unconfined + CAP_SYS_PTRACE + known_gap "summary".
+        // pidfd_getfd: unconfined + CAP_SYS_PTRACE, with no waiver now that
+        // Carrick duplicates the target's kernel-graph file description.
         for name in ["ltp-pidfd_getfd01", "ltp-pidfd_getfd02"] {
             let s = find(name);
             assert!(
@@ -1131,10 +1159,7 @@ mod tests {
                 s.docker_flags.iter().any(|f| f == "SYS_PTRACE"),
                 "{name} lost cap SYS_PTRACE"
             );
-            assert!(
-                s.known_gaps.iter().any(|g| g == "summary"),
-                "{name} lost known_gap summary"
-            );
+            assert!(s.known_gaps.is_empty(), "{name} regained a known gap");
         }
         // fanotify: the oracle still needs unconfined + CAP_SYS_ADMIN to run
         // the real syscall, but the rows are no longer report-only — carrick
@@ -1305,13 +1330,10 @@ mod tests {
             assert!(!f.iter().any(|x| x == "SYS_PTRACE"), "{name}");
             assert_eq!(known_gap_overrides(name), None, "{name}");
         }
-        // pidfd_getfd: unconfined + SYS_PTRACE + known_gap summary.
+        // pidfd_getfd: unconfined + SYS_PTRACE, and genuinely gated.
         let f = docker_flag_overrides("ltp-pidfd_getfd01").unwrap();
         assert!(f.iter().any(|x| x == "SYS_PTRACE"));
-        assert_eq!(
-            known_gap_overrides("ltp-pidfd_getfd02"),
-            Some(vec!["summary".into()])
-        );
+        assert_eq!(known_gap_overrides("ltp-pidfd_getfd02"), None);
         // pidfd_open/pidfd_send_signal are genuinely implemented — no override.
         assert_eq!(docker_flag_overrides("ltp-pidfd_open01"), None);
         assert_eq!(known_gap_overrides("ltp-pidfd_send_signal01"), None);

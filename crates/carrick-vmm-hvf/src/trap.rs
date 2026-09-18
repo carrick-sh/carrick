@@ -2113,6 +2113,9 @@ enum ProcessMappingHost {
         structural_owner: Option<std::sync::Arc<StructuralBackingOwner>>,
     },
     Owned(crate::host_mapping::OwnedHostMapping),
+    PooledFrame {
+        handle: crate::frame_pool::PooledFrameHandle,
+    },
     PooledRootSlot {
         handle: crate::frame_pool::PooledRootSlotHandle,
     },
@@ -2125,6 +2128,7 @@ impl ProcessMappingHost {
         match self {
             Self::Borrowed { pointer, .. } => *pointer,
             Self::Owned(mapping) => mapping.as_ptr(),
+            Self::PooledFrame { handle } => handle.as_mut_ptr(),
             Self::PooledRootSlot { handle } => handle.as_mut_ptr(),
         }
     }
@@ -2132,7 +2136,7 @@ impl ProcessMappingHost {
     #[allow(dead_code)]
     fn into_owned(self) -> Option<crate::host_mapping::OwnedHostMapping> {
         match self {
-            Self::Borrowed { .. } | Self::PooledRootSlot { .. } => None,
+            Self::Borrowed { .. } | Self::PooledFrame { .. } | Self::PooledRootSlot { .. } => None,
             Self::Owned(mapping) => Some(mapping),
         }
     }
@@ -2194,6 +2198,8 @@ fn authenticated_structural_owner_record_in(
         return None;
     }
     let snapshot = custody.stage2_record_snapshot(identity.record_id)?;
+    let backend_mapping_live =
+        snapshot.backend_map_installed || owner.retained.mapping.backend_mapping_is_live();
     let logical_owner = CarrierLogicalOwner {
         id: owner_generation,
         generation: owner_generation,
@@ -2207,7 +2213,7 @@ fn authenticated_structural_owner_record_in(
         && snapshot.perms == u64::from(perms)
         && snapshot.logical_owner == Some(logical_owner)
         && snapshot.mapped
-        && snapshot.backend_map_installed
+        && backend_mapping_live
         && !snapshot.retirement_requested
         && !snapshot.terminalized_by_vm_destroy)
         .then_some(identity)
@@ -6090,7 +6096,10 @@ impl HvfVmState {
                 .physical_host_addr
                 .wrapping_add(semantic_physical_offset);
             let needs_child_alias_authority = process_mapping_needs_child_alias_authority(&mapping);
-            if matches!(mapping.host, ProcessMappingHost::PooledRootSlot { .. }) {
+            if matches!(
+                mapping.host,
+                ProcessMappingHost::PooledFrame { .. } | ProcessMappingHost::PooledRootSlot { .. }
+            ) {
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
                     lease.mark_pre_mapped();
                 }
@@ -6167,6 +6176,25 @@ impl HvfVmState {
                                 GlobalFrameOwnerRole::Registered,
                             )
                         }
+                        (None, ProcessMappingHost::PooledFrame { handle }) => {
+                            let owner_generation = register_pooled_global_frame_host_owner_in(
+                                &plan.carrier_foreign_mm_transport.custody,
+                                handle,
+                                u64::from(mapping.perms),
+                            )?;
+                            registered_global_owners.push((
+                                mapping.physical_ipa,
+                                mapping.physical_size as u64,
+                                owner_generation,
+                            ));
+                            (
+                                None,
+                                None,
+                                None,
+                                owner_generation,
+                                GlobalFrameOwnerRole::Registered,
+                            )
+                        }
                         (None, ProcessMappingHost::Borrowed { .. }) => {
                             // A COW/shared reference to a frame whose owner row
                             // another process registered (a forked child's view
@@ -6190,6 +6218,12 @@ impl HvfVmState {
                         (None, ProcessMappingHost::Owned(_)) => {
                             return Err(TrapError::Hypervisor(format!(
                                 "HVPatch reusable global-frame mapping at IPA ({:#x}, {:#x}) has owned host backing without stage-2 lease",
+                                mapping.physical_ipa, mapping.physical_size
+                            )));
+                        }
+                        (Some(_), ProcessMappingHost::PooledFrame { .. }) => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "HVPatch pooled global-frame mapping at IPA ({:#x}, {:#x}) has a redundant stage-2 lease",
                                 mapping.physical_ipa, mapping.physical_size
                             )));
                         }
@@ -6263,6 +6297,12 @@ impl HvfVmState {
                                 owner_generation,
                                 GlobalFrameOwnerRole::Borrowed,
                             )
+                        }
+                        ProcessMappingHost::PooledFrame { .. } => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "non-reusable structural mapping at IPA ({:#x}, {:#x}) cannot have pooled global-frame backing",
+                                mapping.physical_ipa, mapping.physical_size
+                            )));
                         }
                         ProcessMappingHost::Borrowed {
                             pointer,
@@ -6556,7 +6596,10 @@ impl HvfVmState {
                 .physical_host_addr
                 .wrapping_add(semantic_physical_offset);
             let needs_child_alias_authority = process_mapping_needs_child_alias_authority(&mapping);
-            if matches!(mapping.host, ProcessMappingHost::PooledRootSlot { .. }) {
+            if matches!(
+                mapping.host,
+                ProcessMappingHost::PooledFrame { .. } | ProcessMappingHost::PooledRootSlot { .. }
+            ) {
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
                     lease.mark_pre_mapped();
                 }
@@ -6630,6 +6673,19 @@ impl HvfVmState {
                             ));
                             (None, None, None, owner_generation)
                         }
+                        (None, ProcessMappingHost::PooledFrame { handle }) => {
+                            let owner_generation = register_pooled_global_frame_host_owner_in(
+                                &plan.carrier_foreign_mm_transport.custody,
+                                handle,
+                                u64::from(mapping.perms),
+                            )?;
+                            registered_global_owners.push((
+                                mapping.physical_ipa,
+                                mapping.physical_size as u64,
+                                owner_generation,
+                            ));
+                            (None, None, None, owner_generation)
+                        }
                         (None, ProcessMappingHost::Borrowed { .. }) => {
                             // An unowned reference to an already-registered global frame owner.
                             // The owner_generation stamped on the mapping is preserved.
@@ -6644,6 +6700,12 @@ impl HvfVmState {
                         (None, ProcessMappingHost::Owned(_)) => {
                             return Err(TrapError::Hypervisor(format!(
                                 "HVPatch reusable global-frame mapping at IPA ({:#x}, {:#x}) has owned host backing without stage-2 lease",
+                                mapping.physical_ipa, mapping.physical_size
+                            )));
+                        }
+                        (Some(_), ProcessMappingHost::PooledFrame { .. }) => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "HVPatch pooled global-frame mapping at IPA ({:#x}, {:#x}) has a redundant stage-2 lease",
                                 mapping.physical_ipa, mapping.physical_size
                             )));
                         }
@@ -6705,6 +6767,12 @@ impl HvfVmState {
                                 std::sync::Arc::clone(&owner),
                             );
                             (None, Some(owner), None, owner_generation)
+                        }
+                        ProcessMappingHost::PooledFrame { .. } => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "non-reusable structural mapping at IPA ({:#x}, {:#x}) cannot have pooled global-frame backing",
+                                mapping.physical_ipa, mapping.physical_size
+                            )));
                         }
                         ProcessMappingHost::Borrowed {
                             pointer,

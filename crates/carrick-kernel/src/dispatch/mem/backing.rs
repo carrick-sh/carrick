@@ -9,6 +9,63 @@ use carrick_guest_mem::GuestVa;
 use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 use std::sync::Arc;
 
+fn proc_map_sharing_for_vma(vma: &SemanticVma) -> ProcMapSharing {
+    match vma.provenance {
+        VmaBackingProvenance::SharedAnonymous | VmaBackingProvenance::SharedFile => {
+            ProcMapSharing::Shared
+        }
+        VmaBackingProvenance::PrivateAnonymous
+        | VmaBackingProvenance::PrivateFile
+        | VmaBackingProvenance::SpecialKernelSynthetic => ProcMapSharing::Private,
+    }
+}
+
+fn dynamic_maps_share_canonical_vma(
+    left: &ProcMapsEntry,
+    right: &ProcMapsEntry,
+    semantic_vmas: &VmaMap,
+) -> bool {
+    if left.end != right.start
+        || left.read != right.read
+        || left.write != right.write
+        || left.execute != right.execute
+        || left.sharing != right.sharing
+        || left.path != right.path
+    {
+        return false;
+    }
+
+    semantic_vmas.iter().any(|vma| {
+        vma.start <= left.start
+            && vma.end >= right.end
+            && vma.read == left.read
+            && vma.write == left.write
+            && vma.execute == left.execute
+            && proc_map_sharing_for_vma(vma) == left.sharing
+            && vma.path == left.path
+    })
+}
+
+fn insert_dynamic_map_coalescing(mem: &mut MemState, entry: ProcMapsEntry) {
+    let maps = &mut mem.dynamic_maps;
+    let mut idx = maps.partition_point(|map| map.start < entry.start);
+    maps.insert(idx, entry);
+
+    while idx > 0
+        && dynamic_maps_share_canonical_vma(&maps[idx - 1], &maps[idx], &mem.semantic_vmas)
+    {
+        let end = maps.remove(idx).end;
+        idx -= 1;
+        maps[idx].end = end;
+    }
+    while idx + 1 < maps.len()
+        && dynamic_maps_share_canonical_vma(&maps[idx], &maps[idx + 1], &mem.semantic_vmas)
+    {
+        let end = maps.remove(idx + 1).end;
+        maps[idx].end = end;
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivateRepointRecovery {
     RecoveredCleanly,
@@ -805,10 +862,7 @@ impl<'a> MemView<'a> {
             semantic.into_vec()
         };
         mem.semantic_vmas.insert_many_replacing(semantic);
-        let idx = mem
-            .dynamic_maps
-            .partition_point(|map| map.start < commit.start);
-        mem.dynamic_maps.insert(idx, entry);
+        insert_dynamic_map_coalescing(&mut mem, entry);
     }
 
     /// Snapshot one MAP_PRIVATE file payload into anonymous materialization
@@ -1265,14 +1319,12 @@ impl<'a> MemView<'a> {
         mem.semantic_vmas.insert_many_replacing(semantic);
 
         if !dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len) {
-            let idx = mem.dynamic_maps.partition_point(|map| map.start < start);
-            mem.dynamic_maps.insert(idx, entry);
+            insert_dynamic_map_coalescing(&mut mem, entry);
             return;
         }
 
         trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
-        let idx = mem.dynamic_maps.partition_point(|map| map.start < start);
-        mem.dynamic_maps.insert(idx, entry);
+        insert_dynamic_map_coalescing(&mut mem, entry);
     }
 
     pub(crate) fn record_remapped_dynamic_mapping(

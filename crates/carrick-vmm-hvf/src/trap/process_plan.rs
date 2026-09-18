@@ -152,6 +152,7 @@ fn mapping_fork_cow_range(
 ) -> Option<carrick_aarch64::vmm::ForkCowRange> {
     (mapping.sharing == GuestMappingSharing::Private
         && mapping.start != crate::memory::LINUX_PAGE_TABLES_BASE
+        && !is_independent_process_state_mapping(mapping)
         && !is_kernel_only_stage1_range(
             mapping.start,
             semantic_extent_size(mapping.start, mapping.end),
@@ -924,8 +925,9 @@ impl HvfTaskState {
                 projected_source_mappings.push((index, projected));
             }
         }
+        let mut independent_process_state_planned = false;
         for (source_index, projected) in projected_source_mappings {
-            let mapping = &projected.mapping;
+            let mut mapping = &projected.mapping;
             let (disposition, wiped_subranges) = match projected.plan {
                 // `MADV_DONTFORK`: the child gets no mapping, no stage-1 leaf
                 // and no inventory row here, which is what makes its `mincore`
@@ -940,6 +942,34 @@ impl HvfTaskState {
                     )));
                 }
             };
+            if disposition == ForkMappingDisposition::IndependentProcessState {
+                if independent_process_state_planned {
+                    continue;
+                }
+                let live_translation = page_tables
+                    .translate(mapping.start)
+                    .or_else(|| page_tables.translate_retained_output(mapping.start));
+                let Some((_, authenticated_source)) =
+                    source_mappings.iter().enumerate().find(|(_, candidate)| {
+                        is_independent_process_state_mapping(candidate)
+                            && thread_mapping_semantic_ipa_at(candidate, candidate.start)
+                                == live_translation
+                            && !inherited_fork_inventory_extents_indexed(
+                                &carrier_foreign_mm_transport.custody,
+                                candidate,
+                                &parent_inventory_by_stage2,
+                            )
+                            .is_empty()
+                    })
+                else {
+                    return Err(TrapError::Hypervisor(format!(
+                        "hvpatch independent process-state mapping VA 0x{:x} has no authenticated source for live IPA {live_translation:#x?}",
+                        mapping.start,
+                    )));
+                };
+                mapping = authenticated_source;
+                independent_process_state_planned = true;
+            }
             if matches!(
                 disposition,
                 ForkMappingDisposition::SharedFrameWritable
@@ -1173,7 +1203,7 @@ impl HvfTaskState {
             }
 
             const TWO_MIB: u64 = 2 * 1024 * 1024;
-            let (physical_ipa, stage2_lease) = match disposition {
+            let (mut physical_ipa, mut stage2_lease) = match disposition {
                 ForkMappingDisposition::IndependentPageTables => {
                     let packing_alignment = if mapping.start.is_multiple_of(TWO_MIB)
                         && (mapping.physical_size as u64) >= TWO_MIB
@@ -1206,6 +1236,7 @@ impl HvfTaskState {
                     )
                 }
                 ForkMappingDisposition::IndependentKernelState
+                | ForkMappingDisposition::IndependentProcessState
                 | ForkMappingDisposition::IndependentGuestZeroed => {
                     let lease = GlobalFrameStage2Lease::reserve(
                         mapping.physical_size as u64,
@@ -1221,6 +1252,24 @@ impl HvfTaskState {
                     ));
                 }
             };
+            let pooled_frame = if matches!(
+                disposition,
+                ForkMappingDisposition::IndependentKernelState
+                    | ForkMappingDisposition::IndependentProcessState
+            ) && mapping.physical_size
+                == CowArmedRanges::COMPOUND_SIZE as usize
+            {
+                carrier_foreign_mm_transport
+                    .custody
+                    .frame_pool()
+                    .and_then(|pool| pool.allocate_compound())
+            } else {
+                None
+            };
+            if let Some(handle) = pooled_frame.as_ref() {
+                physical_ipa = handle.ipa();
+                stage2_lease = None;
+            }
             // Per-mm page tables and EL1 control state are the only fresh fork
             // frames.  Both are Carrick kernel state, not the guest-private
             // mappings governed by permission-fault COW.
@@ -1230,6 +1279,9 @@ impl HvfTaskState {
                 }
                 ForkMappingDisposition::IndependentKernelState => {
                     crate::host_mapping::HostMappingKind::PerMmKernelState
+                }
+                ForkMappingDisposition::IndependentProcessState => {
+                    crate::host_mapping::HostMappingKind::PrivateAnon
                 }
                 ForkMappingDisposition::IndependentGuestZeroed => {
                     crate::host_mapping::HostMappingKind::PrivateAnon
@@ -1241,11 +1293,15 @@ impl HvfTaskState {
                     ));
                 }
             };
-            let host = if disposition == ForkMappingDisposition::IndependentPageTables
-                && mapping.physical_size == crate::frame_pool::ROOT_SLOT_SIZE
+            let host = if let Some(handle) = pooled_frame {
+                ProcessMappingHost::PooledFrame { handle }
+            } else if disposition == ForkMappingDisposition::IndependentPageTables
+                && mapping.physical_size <= crate::frame_pool::ROOT_SLOT_SIZE
             {
                 if let Some(pool) = carrier_foreign_mm_transport.custody.root_slot_pool() {
-                    if let Some(handle) = pool.allocate_slot_at(physical_ipa) {
+                    if let Some(handle) =
+                        pool.allocate_slot_at_for_extent(physical_ipa, mapping.physical_size)
+                    {
                         ProcessMappingHost::PooledRootSlot { handle }
                     } else {
                         let owned = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -1329,11 +1385,15 @@ impl HvfTaskState {
                     }
                 }
             }
-            if disposition == ForkMappingDisposition::IndependentKernelState {
-                // Preserve the fork boundary's coherent control-state image;
-                // child identity/mailbox rebinding mutates this independent
-                // frame before entry.  This is a bounded Carrick-kernel copy,
-                // never a guest private whole-mapping snapshot.
+            if matches!(
+                disposition,
+                ForkMappingDisposition::IndependentKernelState
+                    | ForkMappingDisposition::IndependentProcessState
+            ) {
+                // Preserve the fork boundary's coherent Carrick-owned state;
+                // child identity/mailbox/vvar rebinding mutates this
+                // independent frame before entry. This is one bounded
+                // compound copy, never a guest-private whole-mapping snapshot.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         mapping.physical_host_addr,
@@ -1574,7 +1634,7 @@ impl HvfTaskState {
         for base in &child_extension_bases {
             let (host, physical_host_addr) =
                 if let Some(pool) = carrier_foreign_mm_transport.custody.root_slot_pool() {
-                    if let Some(handle) = pool.allocate_slot_at(*base) {
+                    if let Some(handle) = pool.allocate_slot_at_for_extent(*base, TWO_MIB) {
                         let ptr = handle.as_mut_ptr();
                         (ProcessMappingHost::PooledRootSlot { handle }, ptr)
                     } else {

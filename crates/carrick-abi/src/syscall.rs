@@ -583,7 +583,7 @@ define_aarch64_syscall_table! {
     (SENDMMSG, 269, "sendmmsg", "net", SupportLevel::BringUp);
     (PROCESS_VM_READV, 270, "process_vm_readv", "process", SupportLevel::BringUp);
     (PROCESS_VM_WRITEV, 271, "process_vm_writev", "process", SupportLevel::BringUp);
-    (KCMP, 272, "kcmp", "process", SupportLevel::Deferred);
+    (KCMP, 272, "kcmp", "process", SupportLevel::BringUp);
     (FINIT_MODULE, 273, "finit_module", "process", SupportLevel::Deferred);
     (SCHED_SETATTR, 274, "sched_setattr", "sched", SupportLevel::Deferred);
     (SCHED_GETATTR, 275, "sched_getattr", "sched", SupportLevel::Deferred);
@@ -640,7 +640,7 @@ define_aarch64_syscall_table! {
     (CLONE3, 435, "clone3", "process", SupportLevel::Planned);
     (CLOSE_RANGE, 436, "close_range", "fs", SupportLevel::BringUp);
     (OPENAT2, 437, "openat2", "fs", SupportLevel::BringUp);
-    (PIDFD_GETFD, 438, "pidfd_getfd", "process", SupportLevel::Deferred);
+    (PIDFD_GETFD, 438, "pidfd_getfd", "process", SupportLevel::BringUp);
     (FACCESSAT2, 439, "faccessat2", "fs", SupportLevel::BringUp);
     (PROCESS_MADVISE, 440, "process_madvise", "mm", SupportLevel::Deferred);
     (EPOLL_PWAIT2, 441, "epoll_pwait2", "net", SupportLevel::Deferred);

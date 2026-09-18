@@ -6,6 +6,138 @@ use crate::dispatch::dispatcher::FsCrossSubsystem;
 use std::sync::Arc;
 
 #[test]
+fn procmap_query_reports_exact_next_filter_and_name_contracts() {
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_executable_path("/opt/ltp/testcases/bin/ioctl10");
+    dispatcher.set_address_space_regions(vec![
+        carrick_vfs::ProcMapsEntry {
+            start: 0x10_000,
+            end: 0x11_000,
+            read: true,
+            write: true,
+            execute: false,
+            sharing: carrick_vfs::ProcMapSharing::Private,
+            path: String::new(),
+        },
+        carrick_vfs::ProcMapsEntry {
+            start: 0x20_000,
+            end: 0x22_000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: carrick_vfs::ProcMapSharing::Private,
+            path: "/opt/ltp/testcases/bin/ioctl10".to_owned(),
+        },
+    ]);
+    let fd = dispatcher
+        .install_fd_at_or_above(
+            3,
+            OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+                    base: OpenDescriptionBase::new(LINUX_O_RDONLY),
+                    path: "/proc/self/maps".to_owned(),
+                    contents: Vec::new(),
+                    offset: 0,
+                })),
+                LINUX_O_RDONLY,
+                0,
+            ),
+        )
+        .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    let reporter = CompatReporter::default();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let mut query = carrick_abi::LinuxProcmapQuery {
+        size: core::mem::size_of::<carrick_abi::LinuxProcmapQuery>() as u64,
+        query_addr: 0x10_000,
+        ..Default::default()
+    };
+    write_kernel_struct_raw(&mut memory, 0x4000, &query).unwrap();
+    let run = |dispatcher: &mut SyscallDispatcher,
+               memory: &mut LinearMemory,
+               context: &crate::kernel::KernelContext| {
+        dispatcher
+            .dispatch(
+                context,
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([
+                        fd as u64,
+                        carrick_abi::LINUX_PROCMAP_QUERY,
+                        0x4000,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                memory,
+                &reporter,
+            )
+            .unwrap()
+    };
+
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, &context),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    query = memory.read_struct(0x4000).unwrap();
+    let vma_start = query.vma_start;
+    let vma_end = query.vma_end;
+    let vma_flags = query.vma_flags;
+    let vma_page_size = query.vma_page_size;
+    assert_eq!((vma_start, vma_end), (0x10_000, 0x11_000));
+    assert_eq!(
+        vma_flags,
+        carrick_abi::LINUX_PROCMAP_QUERY_VMA_READABLE
+            | carrick_abi::LINUX_PROCMAP_QUERY_VMA_WRITABLE
+    );
+    assert_eq!(vma_page_size, carrick_abi::LINUX_PAGE_SIZE);
+
+    query = carrick_abi::LinuxProcmapQuery {
+        size: core::mem::size_of::<carrick_abi::LinuxProcmapQuery>() as u64,
+        query_addr: 0x0f_fff,
+        ..Default::default()
+    };
+    write_kernel_struct_raw(&mut memory, 0x4000, &query).unwrap();
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, &context),
+        DispatchOutcome::errno(LINUX_ENOENT)
+    );
+    query.query_flags = carrick_abi::LINUX_PROCMAP_QUERY_COVERING_OR_NEXT_VMA;
+    write_kernel_struct_raw(&mut memory, 0x4000, &query).unwrap();
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, &context),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    query = carrick_abi::LinuxProcmapQuery {
+        size: core::mem::size_of::<carrick_abi::LinuxProcmapQuery>() as u64,
+        query_addr: 0x20_000,
+        query_flags: carrick_abi::LINUX_PROCMAP_QUERY_VMA_WRITABLE,
+        ..Default::default()
+    };
+    write_kernel_struct_raw(&mut memory, 0x4000, &query).unwrap();
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, &context),
+        DispatchOutcome::errno(LINUX_ENOENT)
+    );
+
+    query.query_flags = 0;
+    query.vma_name_addr = 0x4100;
+    query.vma_name_size = 256;
+    write_kernel_struct_raw(&mut memory, 0x4000, &query).unwrap();
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, &context),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    query = memory.read_struct(0x4000).unwrap();
+    let vma_name_size = query.vma_name_size;
+    let expected = b"/opt/ltp/testcases/bin/ioctl10\0";
+    assert_eq!(vma_name_size as usize, expected.len());
+    assert_eq!(memory.read_bytes(0x4100, expected.len()).unwrap(), expected);
+}
+
+#[test]
 fn acquire_exec_source_overlong_path_returns_enametoolong_before_enoent() {
     let backend = carrick_vfs::fs_backend::MemoryBackend::new();
     let mut dispatcher = SyscallDispatcher::new();
@@ -3689,6 +3821,60 @@ impl SpliceTestRig {
             DispatchOutcome::Returned { value: 0 },
         );
     }
+}
+
+#[test]
+fn legacy_aio_nowait_empty_pipe_publishes_eagain_completion() {
+    const SYS_IO_SETUP: u64 = 0;
+    const SYS_IO_SUBMIT: u64 = 2;
+    const SYS_IO_GETEVENTS: u64 = 4;
+    const CTX_ADDR: u64 = 0x4300;
+    const IOCB_ADDR: u64 = 0x4400;
+    const BUF_ADDR: u64 = 0x4500;
+    const IOCB_PTR_ADDR: u64 = 0x4600;
+    const EVENT_ADDR: u64 = 0x4700;
+
+    let mut rig = SpliceTestRig::new(0x10000);
+    let (read_fd, _write_fd) = rig.pipe2(0x4200);
+    assert_eq!(
+        rig.run(SYS_IO_SETUP, [1, CTX_ADDR, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    let ctx = read_u64(&rig.memory, CTX_ADDR).expect("aio context");
+    let iocb = LinuxIocb {
+        aio_data: 0xfeed_cafe,
+        aio_reserved1: crate::linux_abi::LINUX_RWF_NOWAIT as u32,
+        aio_lio_opcode: 0,
+        aio_fildes: read_fd as u32,
+        aio_buf: BUF_ADDR,
+        aio_nbytes: 100,
+        ..LinuxIocb::default()
+    };
+    write_kernel_struct_raw(&mut rig.memory, IOCB_ADDR, &iocb).expect("write iocb");
+    rig.memory
+        .write_bytes(IOCB_PTR_ADDR, &IOCB_ADDR.to_ne_bytes())
+        .expect("write iocb pointer");
+
+    assert_eq!(
+        rig.run(SYS_IO_SUBMIT, [ctx, 1, IOCB_PTR_ADDR, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 1 },
+    );
+    assert_eq!(
+        rig.run(SYS_IO_GETEVENTS, [ctx, 1, 1, EVENT_ADDR, 0, 0],),
+        DispatchOutcome::Returned { value: 1 },
+    );
+    let event: crate::linux_abi::LinuxIoEvent = rig
+        .memory
+        .read_struct(EVENT_ADDR)
+        .expect("read aio completion");
+    let data = event.data;
+    let obj = event.obj;
+    let result = event.result;
+    let result2 = event.result2;
+    assert_eq!(data, 0xfeed_cafe);
+    assert_eq!(obj, IOCB_ADDR);
+    assert_eq!(result, -i64::from(LINUX_EAGAIN.get()));
+    assert_eq!(result2, 0);
 }
 
 #[test]

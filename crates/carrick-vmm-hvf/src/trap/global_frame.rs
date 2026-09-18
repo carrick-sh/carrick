@@ -384,6 +384,13 @@ impl GlobalFrameBacking {
             Self::PooledRoot(handle) => handle.len(),
         }
     }
+
+    pub(crate) fn backend_mapping_is_live(&self) -> bool {
+        match self {
+            Self::PooledRoot(handle) => handle.backend_mapping_is_live(),
+            Self::Owned(_) | Self::Pooled(_) => false,
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -414,6 +421,10 @@ impl GlobalFrameSharedMapping {
             backing: GlobalFrameBacking::PooledRoot(handle),
             logical_pin_count: parking_lot::Mutex::new(0),
         }
+    }
+
+    pub(crate) fn backend_mapping_is_live(&self) -> bool {
+        self.backing.backend_mapping_is_live()
     }
 
     pub(crate) fn pin(&self) -> Result<(), CarrierStage2PinError> {
@@ -1474,7 +1485,7 @@ impl StructuralBackingOwner {
         physical_ipa: u64,
         physical_size: usize,
     ) -> Result<std::sync::Arc<Self>, TrapError> {
-        if handle.len() != physical_size
+        if !handle.can_back_extent(physical_size)
             || handle.as_mut_ptr().is_null()
             || physical_size == 0
             || physical_ipa.checked_add(physical_size as u64).is_none()
@@ -1541,7 +1552,7 @@ impl StructuralBackingOwner {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.retained.mapping.backing.len()
+        self.physical_size
     }
 
     pub(crate) fn epoch(&self) -> StructuralEpoch {

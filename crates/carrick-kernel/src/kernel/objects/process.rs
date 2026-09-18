@@ -5,7 +5,7 @@
 //! accounting ([`Zombie`], [`TaskRusage`], and [`LinuxWaitStatus`]), and weak
 //! process file-descriptor edge handles ([`PidfdTarget`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use carrick_abi::NsUid;
+use carrick_abi::{LinuxIoEvent, NsUid};
 use carrick_fatal::carrick_fatal;
 
 use crate::kernel::address::MmBackend;
@@ -54,7 +54,8 @@ pub struct Mm {
     foreign_mm_endpoint: RwLock<Option<carrick_hal::ForeignMmEndpoint>>,
     foreign_mm_mutation: RwLock<Option<crate::dispatch::mm_mutation::ForeignMmMutationAuthority>>,
     io_uring_mappings: RwLock<Vec<crate::dispatch::ioring::IoUringMapping>>,
-    legacy_aio_contexts: RwLock<BTreeSet<crate::dispatch::LegacyAioContextId>>,
+    legacy_aio_contexts:
+        RwLock<BTreeMap<crate::dispatch::LegacyAioContextId, VecDeque<LinuxIoEvent>>>,
     next_legacy_aio_context: AtomicU64,
     pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
     fork_quiesce: Arc<carrick_thread::fork_quiesce::ForkQuiesce>,
@@ -72,7 +73,7 @@ impl Mm {
             foreign_mm_endpoint: RwLock::new(None),
             foreign_mm_mutation: RwLock::new(None),
             io_uring_mappings: RwLock::new(Vec::new()),
-            legacy_aio_contexts: RwLock::new(BTreeSet::new()),
+            legacy_aio_contexts: RwLock::new(BTreeMap::new()),
             next_legacy_aio_context: AtomicU64::new(1),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
@@ -87,7 +88,7 @@ impl Mm {
             foreign_mm_endpoint: RwLock::new(None),
             foreign_mm_mutation: RwLock::new(None),
             io_uring_mappings: RwLock::new(Vec::new()),
-            legacy_aio_contexts: RwLock::new(BTreeSet::new()),
+            legacy_aio_contexts: RwLock::new(BTreeMap::new()),
             next_legacy_aio_context: AtomicU64::new(1),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
@@ -103,7 +104,7 @@ impl Mm {
             foreign_mm_endpoint: RwLock::new(None),
             foreign_mm_mutation: RwLock::new(None),
             io_uring_mappings: RwLock::new(parent.io_uring_mappings.read().clone()),
-            legacy_aio_contexts: RwLock::new(BTreeSet::new()),
+            legacy_aio_contexts: RwLock::new(BTreeMap::new()),
             next_legacy_aio_context: AtomicU64::new(1),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
@@ -118,7 +119,7 @@ impl Mm {
             foreign_mm_endpoint: RwLock::new(None),
             foreign_mm_mutation: RwLock::new(None),
             io_uring_mappings: RwLock::new(parent.io_uring_mappings.read().clone()),
-            legacy_aio_contexts: RwLock::new(BTreeSet::new()),
+            legacy_aio_contexts: RwLock::new(BTreeMap::new()),
             next_legacy_aio_context: AtomicU64::new(1),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
@@ -215,7 +216,8 @@ impl Mm {
 
     pub(crate) fn read_legacy_aio_contexts(
         &self,
-    ) -> RwLockReadGuard<'_, BTreeSet<crate::dispatch::LegacyAioContextId>> {
+    ) -> RwLockReadGuard<'_, BTreeMap<crate::dispatch::LegacyAioContextId, VecDeque<LinuxIoEvent>>>
+    {
         self.legacy_aio_contexts.read()
     }
 
@@ -336,12 +338,13 @@ impl std::fmt::Debug for Mm {
 }
 
 pub struct MmLegacyAioWriteGuard<'a> {
-    guard: RwLockWriteGuard<'a, BTreeSet<crate::dispatch::LegacyAioContextId>>,
+    guard:
+        RwLockWriteGuard<'a, BTreeMap<crate::dispatch::LegacyAioContextId, VecDeque<LinuxIoEvent>>>,
     revision: &'a ObjectRevision,
 }
 
 impl Deref for MmLegacyAioWriteGuard<'_> {
-    type Target = BTreeSet<crate::dispatch::LegacyAioContextId>;
+    type Target = BTreeMap<crate::dispatch::LegacyAioContextId, VecDeque<LinuxIoEvent>>;
 
     fn deref(&self) -> &Self::Target {
         &self.guard

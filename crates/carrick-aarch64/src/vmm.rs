@@ -726,9 +726,15 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     }
 
     /// Refresh per-vCPU host pointers whose guest VA may have moved to a new
-    /// physical backing during the just-completed stage-1 COW. Backends without
-    /// host pointers into guest-owned mappings keep the no-op default.
-    fn refresh_vcpu_after_frame_cow(&self, _vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
+    /// physical backing. `cow_va` names a just-completed fault-driven COW;
+    /// `None` requests the unconditional refresh needed after fork rebinding.
+    /// Backends without host pointers into guest-owned mappings keep the no-op
+    /// default.
+    fn refresh_vcpu_after_frame_cow(
+        &self,
+        _vcpu: &mut Self::Vcpu,
+        _cow_va: Option<u64>,
+    ) -> Result<(), TrapError> {
         Ok(())
     }
 

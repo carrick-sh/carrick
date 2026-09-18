@@ -46,6 +46,16 @@ impl AsidGeneration {
     }
 
     #[cfg(test)]
+    pub(crate) fn for_tests(raw: u16, generation: u64) -> Self {
+        Self {
+            asid: Asid::from_registry_allocation(
+                NonZeroU16::new(raw).expect("test ASID must be nonzero"),
+            ),
+            generation: NonZeroU64::new(generation).expect("test ASID generation must be nonzero"),
+        }
+    }
+
+    #[cfg(test)]
     fn successor_for_tests(self) -> Self {
         Self {
             asid: self.asid,

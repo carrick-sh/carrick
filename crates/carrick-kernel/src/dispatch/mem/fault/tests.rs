@@ -503,3 +503,45 @@ fn first_touch_arming_answers_and_splits_exactly_like_a_scan() {
     assert!(arming.overlaps(base, base + page));
     assert!(!arming.overlaps(base + 2 * page, base + 9 * page));
 }
+
+#[test]
+fn first_touch_arming_coalesces_adjacent_equal_protections() {
+    let page = LINUX_PAGE_SIZE;
+    let base = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+    let range = |start: u64, end: u64| {
+        carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)).expect("range")
+    };
+    let mut arming = FirstTouchArming::default();
+
+    arming.arm(
+        range(base, base + 3 * page),
+        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+    );
+    arming.arm(
+        range(base + 3 * page, base + 8 * page),
+        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+    );
+    arming.arm(
+        range(base + 8 * page, base + 9 * page),
+        LinuxProtFlags::READ,
+    );
+
+    assert_eq!(
+        arming
+            .iter()
+            .map(|fault| (
+                fault.range.start().raw(),
+                fault.range.end().raw(),
+                fault.prot
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                base,
+                base + 8 * page,
+                LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ),
+            (base + 8 * page, base + 9 * page, LinuxProtFlags::READ),
+        ]
+    );
+}

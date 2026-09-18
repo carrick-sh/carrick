@@ -1387,6 +1387,11 @@ pub(in crate::dispatch) trait ProcCrossSubsystem: Send + Sync {
         status_flags: u64,
         fd_flags: u64,
     ) -> super::DispatchOutcome;
+    fn install_open_file_at_or_above(
+        &self,
+        min_fd: i32,
+        open_file: OpenFile,
+    ) -> Result<i32, OpenFile>;
     fn detach_fd_from_epolls(&self, fd: i32);
     fn close_open_file_and_free_pty(&self, open_file: &OpenFile);
     fn note_fd_closed(&self, fd: i32);
@@ -1443,6 +1448,13 @@ impl ProcCrossSubsystem for SyscallDispatcher {
         fd_flags: u64,
     ) -> super::DispatchOutcome {
         self.install_fd_with_status_flags(description, status_flags, fd_flags)
+    }
+    fn install_open_file_at_or_above(
+        &self,
+        min_fd: i32,
+        open_file: OpenFile,
+    ) -> Result<i32, OpenFile> {
+        self.install_fd_at_or_above(min_fd, open_file)
     }
     fn detach_fd_from_epolls(&self, fd: i32) {
         self.detach_fd_from_epolls(fd);

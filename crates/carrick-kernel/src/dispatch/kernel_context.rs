@@ -6,6 +6,19 @@ use carrick_fatal::carrick_fatal;
 
 use super::{SyscallDispatcher, close_open_file, resources};
 
+/// Retire the one-task adapter's host-PID credential projection exactly when
+/// this carrier first changes execution models. Logical HVPatch children share
+/// the carrier PID, so later dispatcher binds have no external projection to
+/// retire and must not issue an `unlink(2)` per guest fork.
+fn enter_hvpatch_lane_with(
+    lane: &std::sync::atomic::AtomicBool,
+    unpublish_legacy_projection: impl FnOnce(),
+) {
+    if !lane.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        unpublish_legacy_projection();
+    }
+}
+
 /// How carrick's own kernel graph sees a guest-supplied pid that names some
 /// OTHER Linux process. See [`SyscallDispatcher::guest_process_target`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,7 +135,7 @@ impl SyscallDispatcher {
             process_fs_context.set_cwd(launch_cwd);
             process_fs_context.set_chroot_root(launch_chroot_root);
         }
-        super::HVPATCH_LANE.store(true, std::sync::atomic::Ordering::Release);
+        enter_hvpatch_lane_with(&super::HVPATCH_LANE, crate::cred_ipc::unpublish);
         let namespace_pid = self.identity_snapshot(process_context).pid;
         self.mm_binding
             .rebind_prepared_root(process_context.shared().mm().id());
@@ -138,9 +151,6 @@ impl SyscallDispatcher {
         *self.kernel_binding.write() = process.task_binding();
         *self.timer_delivery.write() = Some(process.process_timer_delivery());
         self.commit_sysv_fork_inheritance();
-        // HVPatch multiplexes Linux tasks inside one host PID, so the mature
-        // one-task adapter's host-PID credential projection is inapplicable.
-        crate::cred_ipc::unpublish();
         let mut proc = self.proc.lock();
         proc.bind_hvpatch_identity(process.pid() as u32, namespace_pid);
         proc.hvpatch_process = Some(process);
@@ -522,6 +532,22 @@ mod tests {
     use carrick_abi::LINUX_FD_CLOEXEC;
     use carrick_vfs::fs_backend::FsBackend;
     use parking_lot::RwLock;
+
+    #[test]
+    fn entering_hvpatch_lane_unpublishes_legacy_projection_only_once() {
+        let lane = std::sync::atomic::AtomicBool::new(false);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        enter_hvpatch_lane_with(&lane, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        enter_hvpatch_lane_with(&lane, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        assert!(lane.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn one_task_adapter_registers_explicit_linux_tid_for_backend_thread() {

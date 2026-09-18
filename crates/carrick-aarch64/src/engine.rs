@@ -2966,7 +2966,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let carrier_root = vm.carrier_maintenance_root().ok();
         let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid, carrier_root);
         vm.refresh_fork_process_state(&mut flush)?;
-        vm.refresh_vcpu_after_frame_cow(vcpu)
+        vm.refresh_vcpu_after_frame_cow(vcpu, None)
     }
 
     fn install_stage1_table_arena_source(
@@ -3007,7 +3007,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let ttbr0 = fault_page_tables.map_or(0, |(ttbr, _)| ttbr);
         let resolution = vm.resolve_frame_cow_fault(syndrome, far, ttbr0, &mut flush)?;
         if matches!(resolution, carrick_hal::CowFaultResolution::Resolved { .. }) {
-            vm.refresh_vcpu_after_frame_cow(vcpu)?;
+            vm.refresh_vcpu_after_frame_cow(vcpu, Some(far))?;
             self.last_fault_esr = 0;
         }
         Ok(resolution)

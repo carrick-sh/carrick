@@ -102,6 +102,7 @@ syscall_table! {
     nr::WAIT4 => wait4,
     nr::PROCESS_VM_READV => process_vm_readv,
     nr::PROCESS_VM_WRITEV => process_vm_writev,
+    nr::KCMP => kcmp,
     nr::SECCOMP => sys_seccomp,
     nr::SCHED_GETATTR => sched_getattr,
     nr::GETRANDOM => getrandom,
@@ -1122,6 +1123,53 @@ impl<'a> ProcView<'a> {
         match self.pidfd_target(Some(context), fd)? {
             PidfdTarget::Hvpatch(task) => Some(task),
         }
+    }
+
+    fn live_pidfd_task(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+    ) -> Result<crate::kernel::TaskRef, LinuxErrno> {
+        let Some(PidfdTarget::Hvpatch(key)) = self.pidfd_target(Some(context), fd) else {
+            return Err(LINUX_EBADF);
+        };
+        let Some(task) = context.kernel().registry().task(key.id) else {
+            return Err(LINUX_ESRCH);
+        };
+        if task.key() != key || !context.kernel().task_key_is_live(key) {
+            return Err(LINUX_ESRCH);
+        }
+        Ok(task)
+    }
+
+    fn ptrace_realcreds_may_access(
+        context: &crate::kernel::KernelContext,
+        target: &crate::kernel::Task,
+    ) -> bool {
+        if context
+            .task()
+            .caps()
+            .has_effective(crate::namespace::process::CAP_SYS_PTRACE)
+        {
+            return true;
+        }
+        let caller = context.resources().credentials();
+        let target_credentials = target.process_credentials();
+        let ids_match = [
+            target_credentials.ruid(),
+            target_credentials.euid(),
+            target_credentials.suid(),
+        ]
+        .into_iter()
+        .all(|uid| uid == caller.ruid())
+            && [
+                target_credentials.rgid(),
+                target_credentials.egid(),
+                target_credentials.sgid(),
+            ]
+            .into_iter()
+            .all(|gid| gid == caller.rgid());
+        ids_match && target.dumpable() != crate::kernel::DumpableMode::Disable
     }
 
     #[inline]
@@ -3380,14 +3428,74 @@ impl<'a> ProcView<'a> {
             Ok(DispatchOutcome::errno(LINUX_ESRCH))
         }
 
-        fn pidfd_getfd(this, cx, _pidfd: Fd, _targetfd: u64, _flags: u64) {
-            // Carrick has no cross-process guest-fd duplication on macOS; a real
-            // implementation needs a host helper to reach into another guest
-            // process's fd table. Report the honest "unimplemented" (ENOSYS)
-            // rather than a fabricated EPERM that would falsely claim the syscall
-            // is implemented-but-denied. pidfd_open/pidfd_send_signal remain
-            // genuinely implemented and are untouched.
-            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
+        fn pidfd_getfd(this, cx, pidfd: Fd, targetfd: u64, flags: u64) {
+            if flags != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let target = match this.live_pidfd_task(cx.kernel, pidfd.0) {
+                Ok(target) => target,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            if !Self::ptrace_realcreds_may_access(cx.kernel, &target) {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
+            let Ok(targetfd) = i32::try_from(targetfd) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let Some(target_files) = target.leader_file_table() else {
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+            };
+            let Some(source) = target_files.read_open_files().get(&targetfd).cloned() else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let duplicate = OpenFile::new(source.description(), LINUX_FD_CLOEXEC);
+            Ok(match this.cross.install_open_file_at_or_above(0, duplicate) {
+                Ok(fd) => DispatchOutcome::returned_i32(fd),
+                Err(_) => DispatchOutcome::errno(crate::linux_abi::LINUX_EMFILE),
+            })
+        }
+
+        fn kcmp(this, cx, pid1: Pid, pid2: Pid, kind: u64, idx1: u64, idx2: u64) {
+            if kind != carrick_abi::LINUX_KCMP_FILE {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let resolve = |pid: Pid| {
+                guest_pid_to_task_id(cx.kernel, pid)
+                    .ok()
+                    .and_then(|id| cx.kernel.kernel().registry().task(id))
+                    .filter(|task| cx.kernel.kernel().task_key_is_live(task.key()))
+            };
+            let Some(first_task) = resolve(pid1) else {
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+            };
+            let Some(second_task) = resolve(pid2) else {
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+            };
+            if !Self::ptrace_realcreds_may_access(cx.kernel, &first_task)
+                || !Self::ptrace_realcreds_may_access(cx.kernel, &second_task)
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
+            let (Ok(idx1), Ok(idx2)) = (i32::try_from(idx1), i32::try_from(idx2)) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let (Some(first_files), Some(second_files)) =
+                (first_task.leader_file_table(), second_task.leader_file_table())
+            else {
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+            };
+            let first = first_files.read_open_files().get(&idx1).cloned();
+            let second = second_files.read_open_files().get(&idx2).cloned();
+            let (Some(first), Some(second)) = (first, second) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            Ok(DispatchOutcome::Returned {
+                value: if Arc::ptr_eq(&first.description, &second.description) {
+                    0
+                } else {
+                    1
+                },
+            })
         }
 
         fn pidfd_send_signal(this, cx, fd: Fd, signum: u64, info: GuestPtr, flags: u64) {
@@ -4243,6 +4351,7 @@ forward_proc_handlers! {
     wait4,
     process_vm_readv,
     process_vm_writev,
+    kcmp,
     sys_seccomp,
     sched_getattr,
     getrandom,
@@ -4447,8 +4556,10 @@ mod kernel_process_dispatch_tests {
     const SYS_PTRACE: u64 = 117;
     const SYS_PROCESS_VM_READV: u64 = 270;
     const SYS_PROCESS_VM_WRITEV: u64 = 271;
+    const SYS_KCMP: u64 = 272;
     const SYS_WAIT4: u64 = 260;
     const SYS_PIDFD_OPEN: u64 = 434;
+    const SYS_PIDFD_GETFD: u64 = 438;
     const LINUX_P_ALL: u64 = 0;
     const LINUX_P_PID: u64 = 1;
     const LINUX_P_PGID: u64 = 2;
@@ -7011,6 +7122,72 @@ mod kernel_process_dispatch_tests {
             .common()
             .set_status_flags(next_flags_clear);
         assert!(!dispatcher.pidfd_is_nonblocking(fd_def));
+    }
+
+    #[test]
+    fn hvpatch_pidfd_getfd_duplicates_the_target_description_and_kcmp_observes_it() {
+        let (_lane, mut dispatcher, _process, root, _lease) = bound_dispatcher(61_435);
+        let child = fork_child(&root, 61_436);
+        let root = refreshed(&root);
+        let mut memory = LinearMemory::new(INFO_ADDR, vec![0; 0x100]);
+        let target_description = kernel_file_description(
+            Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+                base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                path: "/tmp/pidfd-getfd-target".to_owned(),
+                contents: Vec::new(),
+                offset: 0,
+            })),
+            LINUX_O_RDWR,
+        );
+        let target_fd = super::resources::with_captured_resources(&child, || {
+            dispatcher
+                .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&target_description), 0))
+                .expect("install target fd")
+        });
+        let child_pid = u64::try_from(child.task().key().id.raw()).expect("positive child pid");
+        let pidfd = match dispatch(
+            &mut dispatcher,
+            &root,
+            &mut memory,
+            SYS_PIDFD_OPEN,
+            [child_pid, 0, 0, 0, 0, 0],
+        ) {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("expected child pidfd, got {other:?}"),
+        };
+
+        let remote_fd = match dispatch(
+            &mut dispatcher,
+            &root,
+            &mut memory,
+            SYS_PIDFD_GETFD,
+            [pidfd as u64, target_fd as u64, 0, 0, 0, 0],
+        ) {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("expected duplicated target fd, got {other:?}"),
+        };
+        let duplicate = dispatcher.open_file(remote_fd).expect("duplicated fd");
+        assert!(duplicate.close_on_exec());
+        assert!(Arc::ptr_eq(&duplicate.description, &target_description));
+
+        let root_pid = u64::try_from(root.task().key().id.raw()).expect("positive root pid");
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_KCMP,
+                [
+                    root_pid,
+                    child_pid,
+                    0,
+                    remote_fd as u64,
+                    target_fd as u64,
+                    0,
+                ],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
     }
 }
 
