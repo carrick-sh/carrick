@@ -1569,12 +1569,12 @@ impl<'a> NetView<'a> {
                 }
                 socket
                     .recv_oob(&mut target_buf, peek)
-                    .map(|len| (len, Vec::new()))
+                    .map(|len| (len, Vec::new(), false))
             } else {
-                socket.recv_stream_flags(&mut target_buf, 0, peek)
+                socket.recv_stream_record(&mut target_buf, 0, peek)
             };
             match res {
-                Ok((read_len, _rights)) => {
+                Ok((read_len, _rights, sctp_eor)) => {
                     let mut remaining = read_len;
                     let mut cursor = 0usize;
                     for iov in &iovecs {
@@ -1624,6 +1624,9 @@ impl<'a> NetView<'a> {
                     if LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::CMSG_CLOEXEC)
                     {
                         linux_flags |= LinuxMsgFlags::CMSG_CLOEXEC.bits();
+                    }
+                    if sctp_eor {
+                        linux_flags |= LinuxMsgFlags::EOR.bits();
                     }
                     let written_controllen = 0u64;
                     if memory

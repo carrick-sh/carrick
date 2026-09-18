@@ -78,6 +78,8 @@ pub struct PureSocketState {
     pub accept_queue: VecDeque<Arc<PureSocketInner>>,
     pub stream_buf: VecDeque<u8>,
     pub stream_rights: VecDeque<Arc<OpenFile>>,
+    pub sctp_messages: VecDeque<usize>,
+    pub sctp_consumed: usize,
     pub dgram_queue: VecDeque<UnixDatagram>,
     pub creds: LinuxUcred,
     pub peer_creds: Option<LinuxUcred>,
@@ -193,6 +195,8 @@ impl PureSocketInner {
                 accept_queue: VecDeque::new(),
                 stream_buf: VecDeque::new(),
                 stream_rights: VecDeque::new(),
+                sctp_messages: VecDeque::new(),
+                sctp_consumed: 0,
                 dgram_queue: VecDeque::new(),
                 creds,
                 peer_creds: None,
@@ -253,6 +257,8 @@ impl PureSocketInner {
                 accept_queue: VecDeque::new(),
                 stream_buf: VecDeque::new(),
                 stream_rights: VecDeque::new(),
+                sctp_messages: VecDeque::new(),
+                sctp_consumed: 0,
                 dgram_queue: VecDeque::new(),
                 creds: LinuxUcred::default(),
                 peer_creds: None,
@@ -312,8 +318,8 @@ impl PureSocketInner {
             let mut s1 = first.state.lock();
             let mut s2 = second.state.lock();
             // SCTP currently uses this byte-stream transport too. Preserve its
-            // logical protocol without changing the existing transport lifecycle;
-            // record boundaries and MSG_EOR remain a separate conformance gap.
+            // logical protocol and track record boundaries out of band while
+            // sharing the TCP-shaped transport lifecycle.
             let tcp_pair = socket_type == LINUX_SOCK_STREAM
                 && matches!(protocol, LINUX_IPPROTO_TCP | LINUX_IPPROTO_SCTP)
                 && matches!(family, LINUX_AF_INET | LINUX_AF_INET6);
@@ -344,6 +350,9 @@ impl PureSocketInner {
     pub(crate) fn queue_mock_response(&self, bytes: &[u8]) {
         let mut state = self.state.lock();
         state.stream_buf.extend(bytes);
+        if self.protocol == LINUX_IPPROTO_SCTP && !bytes.is_empty() {
+            state.sctp_messages.push_back(bytes.len());
+        }
         if let Some(rec_ref) = &state.connection_record {
             let mut rec = rec_ref.lock();
             rec.bytes_received += bytes.len();
@@ -395,6 +404,8 @@ impl PureSocketInner {
         state.peer_creds = None;
         state.stream_buf.clear();
         state.stream_rights.clear();
+        state.sctp_messages.clear();
+        state.sctp_consumed = 0;
         state.shutdown_read = false;
         state.shutdown_write = false;
         state.tcp_peer_terminal = TcpPeerTerminal::Open;
@@ -406,6 +417,8 @@ impl PureSocketInner {
         peer_state.tcp_peer_terminal = TcpPeerTerminal::Reset;
         peer_state.tcp_send_terminal = true;
         peer_state.so_error = Some(carrick_abi::LINUX_ECONNRESET.get());
+        peer_state.sctp_messages.clear();
+        peer_state.sctp_consumed = 0;
         drop(peer_state);
         drop(state);
         peer.notify_waiters();
@@ -780,6 +793,9 @@ impl PureSocketInner {
             let response_bytes = mock.handle(&state.request_buf);
             if !response_bytes.is_empty() {
                 state.stream_buf.extend(&response_bytes);
+                if self.protocol == LINUX_IPPROTO_SCTP {
+                    state.sctp_messages.push_back(response_bytes.len());
+                }
                 if let Some(rec_ref) = &state.connection_record {
                     let mut rec = rec_ref.lock();
                     rec.bytes_received += response_bytes.len();
@@ -852,6 +868,8 @@ impl PureSocketInner {
                 peer_state.tcp_peer_terminal = TcpPeerTerminal::Reset;
                 peer_state.stream_buf.clear();
                 peer_state.stream_rights.clear();
+                peer_state.sctp_messages.clear();
+                peer_state.sctp_consumed = 0;
                 drop(peer_state);
                 drop(state);
                 peer_arc.notify_waiters();
@@ -871,6 +889,9 @@ impl PureSocketInner {
         if !rights.is_empty() {
             peer_state.stream_rights.extend(rights);
         }
+        if self.protocol == LINUX_IPPROTO_SCTP && to_write > 0 {
+            peer_state.sctp_messages.push_back(to_write);
+        }
         peer_arc.notify_waiters();
         Ok(to_write)
     }
@@ -889,6 +910,16 @@ impl PureSocketInner {
         max_rights: usize,
         peek: bool,
     ) -> Result<(usize, Vec<Arc<OpenFile>>), LinuxErrno> {
+        self.recv_stream_record(buf, max_rights, peek)
+            .map(|(len, rights, _)| (len, rights))
+    }
+
+    pub(crate) fn recv_stream_record(
+        &self,
+        buf: &mut [u8],
+        max_rights: usize,
+        peek: bool,
+    ) -> Result<(usize, Vec<Arc<OpenFile>>, bool), LinuxErrno> {
         // The EOF answer needs the peer's shutdown state, so both halves are
         // locked in the global pair order (never "self, then peer").
         let peer = self.peer_half();
@@ -905,10 +936,10 @@ impl PureSocketInner {
             {
                 return Err(LinuxErrno::new(err));
             }
-            return Ok((0, Vec::new()));
+            return Ok((0, Vec::new(), false));
         }
         if buf.is_empty() {
-            return Ok((0, Vec::new()));
+            return Ok((0, Vec::new(), false));
         }
 
         // A normal MSG_PEEK at the urgent mark must not cross it.  Without
@@ -924,14 +955,14 @@ impl PureSocketInner {
                 for (index, slot) in buf.iter_mut().skip(1).take(suffix_len).enumerate() {
                     *slot = state.stream_buf[index];
                 }
-                return Ok((suffix_len + 1, Vec::new()));
+                return Ok((suffix_len + 1, Vec::new(), false));
             }
 
             let suffix_len = state.stream_buf.len().min(buf.len());
             for (index, slot) in buf.iter_mut().take(suffix_len).enumerate() {
                 *slot = state.stream_buf[index];
             }
-            return Ok((suffix_len, Vec::new()));
+            return Ok((suffix_len, Vec::new(), false));
         }
 
         // TCP urgent data has a cursor separate from its optional out-of-band
@@ -967,31 +998,51 @@ impl PureSocketInner {
             }
             if state.mock_service.is_some() {
                 if state.mock_peer_closed {
-                    return Ok((0, Vec::new()));
+                    return Ok((0, Vec::new(), false));
                 }
                 return Err(LINUX_EAGAIN);
             }
 
             if state.tcp_pair && state.tcp_peer_terminal != TcpPeerTerminal::Open {
-                return Ok((0, Vec::new()));
+                return Ok((0, Vec::new(), false));
             }
 
             let is_peer_alive = peer_state.as_ref().is_some_and(|p| !p.shutdown_write);
             if !is_peer_alive {
-                return Ok((0, Vec::new()));
+                return Ok((0, Vec::new(), false));
             }
             return Err(LINUX_EAGAIN);
         }
         drop(peer_state);
 
         let mark_limit = state.oob_mark.unwrap_or(state.stream_buf.len());
+        let sctp_limit = if self.protocol == LINUX_IPPROTO_SCTP {
+            state
+                .sctp_messages
+                .front()
+                .map(|&len| len.saturating_sub(state.sctp_consumed))
+                .unwrap_or(state.stream_buf.len())
+        } else {
+            state.stream_buf.len()
+        };
         let stream_capacity = buf.len().saturating_sub(usize::from(inline_byte.is_some()));
-        let to_read = stream_capacity.min(state.stream_buf.len()).min(mark_limit);
+        let to_read = stream_capacity
+            .min(state.stream_buf.len())
+            .min(mark_limit)
+            .min(sctp_limit);
         if peek {
             for (i, slot) in buf.iter_mut().take(to_read).enumerate() {
                 *slot = state.stream_buf[i];
             }
-            return Ok((to_read, Vec::new()));
+            let ends_message = if self.protocol == LINUX_IPPROTO_SCTP
+                && to_read > 0
+                && let Some(&len) = state.sctp_messages.front()
+            {
+                state.sctp_consumed + to_read >= len
+            } else {
+                false
+            };
+            return Ok((to_read, Vec::new(), ends_message));
         }
 
         let mut written = 0;
@@ -1009,6 +1060,23 @@ impl PureSocketInner {
             *mark = mark.saturating_sub(to_read);
         }
 
+        let ends_message = if self.protocol == LINUX_IPPROTO_SCTP
+            && to_read > 0
+            && let Some(&len) = state.sctp_messages.front()
+        {
+            let remaining = len.saturating_sub(state.sctp_consumed);
+            if to_read >= remaining {
+                state.sctp_messages.pop_front();
+                state.sctp_consumed = 0;
+                true
+            } else {
+                state.sctp_consumed += to_read;
+                false
+            }
+        } else {
+            false
+        };
+
         let mut rights = Vec::new();
         while rights.len() < max_rights && !state.stream_rights.is_empty() {
             if let Some(right) = state.stream_rights.pop_front() {
@@ -1020,7 +1088,7 @@ impl PureSocketInner {
             peer.notify_waiters();
         }
 
-        Ok((written, rights))
+        Ok((written, rights, ends_message))
     }
 
     pub(crate) fn send_dgram(
@@ -2093,5 +2161,55 @@ mod tests {
         assert_eq!(receiver.poll_mask() & LINUX_EPOLLPRI, LINUX_EPOLLPRI);
         assert_eq!(receiver.recv_oob(&mut empty, false), Ok(0));
         assert_eq!(receiver.poll_mask() & LINUX_EPOLLPRI, 0);
+    }
+
+    fn sctp_pair() -> (Arc<PureSocketInner>, Arc<PureSocketInner>) {
+        PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_SCTP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        )
+    }
+
+    #[test]
+    fn sctp_stream_message_boundaries_and_eor() {
+        let (sender, receiver) = sctp_pair();
+        assert_eq!(sender.send_stream(b"hello", Vec::new()), Ok(5));
+        assert_eq!(sender.send_stream(b"world!", Vec::new()), Ok(6));
+
+        let mut buf = [0u8; 16];
+        // Reading with 16-byte buffer returns only the first 5-byte message and reports EOR = true
+        let (n, _, eor) = receiver.recv_stream_record(&mut buf, 0, false).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..5], b"hello");
+        assert!(eor);
+
+        // Peek with 3-byte buffer on the second 6-byte message returns 3 bytes and reports EOR = false
+        let (n, _, eor) = receiver.recv_stream_record(&mut buf[..3], 0, true).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(&buf[..3], b"wor");
+        assert!(!eor);
+
+        // Peek with 16-byte buffer on the second 6-byte message returns 6 bytes and reports EOR = true
+        let (n, _, eor) = receiver.recv_stream_record(&mut buf, 0, true).unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(&buf[..6], b"world!");
+        assert!(eor);
+
+        // Partial non-peek read of 2 bytes returns 2 bytes and reports EOR = false
+        let (n, _, eor) = receiver
+            .recv_stream_record(&mut buf[..2], 0, false)
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&buf[..2], b"wo");
+        assert!(!eor);
+
+        // Consuming the remaining 4 bytes reports EOR = true
+        let (n, _, eor) = receiver.recv_stream_record(&mut buf, 0, false).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf[..4], b"rld!");
+        assert!(eor);
     }
 }
