@@ -73,7 +73,7 @@ impl<'a> FsView<'a> {
     ) -> Vec<RootFsDirEntry> {
         let streamed = match trusted {
             Some(trusted) if self.trusted_dir_stream_is_exact(trusted, dir_path) => {
-                carrick_vfs::fs_backend::read_host_dir_entries(trusted.fd.raw(), dir_path)
+                carrick_vfs::fs_backend::read_plain_host_dir_entries(trusted.fd.raw(), dir_path)
             }
             _ => None,
         };

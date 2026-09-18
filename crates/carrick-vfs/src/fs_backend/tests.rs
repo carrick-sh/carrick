@@ -713,6 +713,8 @@ fn open_trusted_dir_fd_trusts_only_byte_exact_paths() {
 fn marker_nodes_flip_dir_overlay_interference() {
     let (b, scratch) = host_backend();
     b.make_dir("/walk").unwrap();
+    b.make_dir("/elsewhere").unwrap();
+    b.make_dir("/later").unwrap();
     // Fresh scratch: nothing can make a raw stream lie (a real FIFO has
     // a faithful DT_FIFO, so it is NOT interference).
     assert!(!b.dir_has_overlay_interference("/walk"));
@@ -723,6 +725,19 @@ fn marker_nodes_flip_dir_overlay_interference() {
     b.create_socket("/walk/sock", 0o755).unwrap();
     assert!(b.dir_has_overlay_interference("/walk"));
     assert!(!b.dir_has_overlay_interference("/elsewhere"));
+    reset_host_xattr_read_count();
+    assert!(!b.dir_has_overlay_interference("/elsewhere"));
+    assert_eq!(
+        host_xattr_read_count(),
+        0,
+        "a marker-free directory must retain its generation-bound negative proof"
+    );
+    assert!(!b.dir_has_overlay_interference("/later"));
+    b.create_socket("/later/sock", 0o755).unwrap();
+    assert!(
+        b.dir_has_overlay_interference("/later"),
+        "a marker write must invalidate the cached negative proof"
+    );
     // ... including for a SIBLING backend on the same scratch (the
     // fork-coherence property: the truth is the directory xattr, not the
     // in-process bool).
@@ -2144,7 +2159,7 @@ fn chmod_on_a_socket_marker_node_replaces_its_creation_mode() {
 
 /// The trusted dirent stream must enumerate through its OWN open-file
 /// description. Round 2 of hostfs-opens made `open_trusted_dir_fd` answer a
-/// cache hit with `F_DUPFD`, and `read_host_dir_entries` then `dup`ed that
+/// cache hit with `F_DUPFD`, and the stream reader then `dup`ed that
 /// again and `rewinddir`ed: every listing of one directory shared ONE seek
 /// offset, so two guest processes listing `lib-dynload` at the same time each
 /// saw a subset (`ModuleNotFoundError: No module named '_struct'` in the
@@ -2164,7 +2179,7 @@ fn trusted_dirent_stream_owns_its_seek_offset() {
     let sibling = b
         .open_trusted_dir_fd("/d")
         .expect("trusted dirfd (cache hit)");
-    let listed = read_host_dir_entries(a.as_raw_fd(), "/d").expect("trusted stream");
+    let listed = read_plain_host_dir_entries(a.as_raw_fd(), "/d").expect("trusted stream");
     assert_eq!(listed.len(), 300);
     let sibling_offset = unsafe { libc::lseek(sibling.as_raw_fd(), 0, libc::SEEK_CUR) };
     assert_eq!(
@@ -2188,6 +2203,33 @@ fn trusted_dirent_stream_owns_its_seek_offset() {
     for worker in workers {
         worker.join().unwrap();
     }
+}
+
+/// Once the caller has proved that a directory contains no marker nodes, the
+/// trusted stream must not repeat that xattr proof while enumerating it.  This
+/// is a per-directory hot path: pathlib-style walks open and drain tens of
+/// thousands of directories, so one redundant `fgetxattr` per stream is a
+/// correctness-level amplification rather than bookkeeping noise.
+#[cfg(target_os = "macos")]
+#[test]
+fn trusted_plain_dirent_stream_does_not_repeat_marker_xattr_probe() {
+    let (backend, _scratch) = host_backend();
+    backend.make_dir("/plain").unwrap();
+    backend.create_file("/plain/entry").unwrap();
+
+    // Warm the fork-coherent root marker proof used by stream_dirents itself;
+    // the measured interval begins after the caller has established that this
+    // directory is safe for raw streaming.
+    assert!(!backend.dir_has_overlay_interference("/plain"));
+    reset_host_xattr_read_count();
+
+    let rows = backend.stream_dirents("/plain").expect("trusted stream");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        host_xattr_read_count(),
+        0,
+        "trusted plain stream repeated the already-proved marker xattr read"
+    );
 }
 
 mod serial_host {
@@ -2971,7 +3013,7 @@ mod serial_host {
         );
     }
 
-    /// (b) `getdents64` over a 2,000-entry directory issues <= 2 host `openat` and
+    /// (b) `getdents64` over a 2,000-entry directory issues <= 1 host `openat` and
     /// <= 1 host stat per entry *only* when the stream reports `DT_UNKNOWN`.
     #[cfg(target_os = "macos")]
     #[test]
@@ -2999,8 +3041,8 @@ mod serial_host {
         let stats = test_host_stat_count();
 
         assert!(
-            opens <= 2,
-            "getdents64 over 2,000-entry dir issued {opens} host openat calls (budget <= 2)"
+            opens <= 1,
+            "getdents64 over 2,000-entry dir issued {opens} host openat calls (budget <= 1)"
         );
         // On APFS, readdir yields DT_REG for files, so 0 per-entry stats are needed.
         assert_eq!(
@@ -3038,8 +3080,8 @@ mod serial_host {
         let stats = test_host_stat_count();
 
         assert!(
-            opens <= 2,
-            "getdents64 over /b issued {opens} host openat calls (budget <= 2)"
+            opens <= 1,
+            "getdents64 over /b issued {opens} host openat calls (budget <= 1)"
         );
         assert_eq!(
             stats, 0,
