@@ -744,6 +744,9 @@ impl<'a> FsView<'a> {
             status,
             linux_fd_flags_from_open_flags(flags),
         );
+        if inotify_created {
+            open_file.description.common().set_created(true);
+        }
         let fd = match self.install_admitted_open_file(&mut reservation, open_file) {
             Ok(fd) => fd,
             Err(e) => return Ok(DispatchOutcome::errno(e)),

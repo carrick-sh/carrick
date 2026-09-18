@@ -1422,6 +1422,21 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
             Ok(match command {
+                LINUX_F_CREATED_QUERY => {
+                    if let Some(open_file) = this.open_file(fd.0) {
+                        DispatchOutcome::Returned {
+                            value: if open_file.description.common().created() {
+                                1
+                            } else {
+                                0
+                            },
+                        }
+                    } else if is_stdio_fd(fd.0) {
+                        DispatchOutcome::Returned { value: 0 }
+                    } else {
+                        DispatchOutcome::errno(LINUX_EBADF)
+                    }
+                }
                 LINUX_F_DUPFD => match linux_min_fd(arg) {
                     Ok(min_fd) => this.duplicate_fd(fd.0, min_fd, 0),
                     Err(errno) => DispatchOutcome::errno(errno),

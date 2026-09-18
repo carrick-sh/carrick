@@ -814,6 +814,8 @@ pub struct DescriptionCommon {
     async_sig: AtomicI32,
     /// True for a `memfd_secret(2)` description.
     secretmem: AtomicBool,
+    /// True if this open file description materialized a new file (`F_CREATED_QUERY`).
+    created: AtomicBool,
     owner: Mutex<CapturedAsyncIoOwner>,
     /// `memfd_create(2)`/`F_ADD_SEALS` seal set. `None` = this description does
     /// not support sealing (`F_GET_SEALS`/`F_ADD_SEALS` → `EINVAL`).
@@ -832,6 +834,7 @@ impl DescriptionCommon {
             lease: AtomicI32::new(crate::linux_abi::LINUX_F_UNLCK),
             async_sig: AtomicI32::new(0),
             secretmem: AtomicBool::new(false),
+            created: AtomicBool::new(false),
             owner: Mutex::new(CapturedAsyncIoOwner::default()),
             seals: Arc::new(Mutex::new(None)),
             splice_pushback: Mutex::new(crate::dispatch::SplicePushback::default()),
@@ -848,6 +851,7 @@ impl DescriptionCommon {
             lease: AtomicI32::new(crate::linux_abi::LINUX_F_UNLCK),
             async_sig: AtomicI32::new(0),
             secretmem: AtomicBool::new(false),
+            created: AtomicBool::new(false),
             owner: Mutex::new(CapturedAsyncIoOwner::default()),
             seals,
             splice_pushback: Mutex::new(crate::dispatch::SplicePushback::default()),
@@ -914,6 +918,14 @@ impl DescriptionCommon {
 
     pub(crate) fn set_secretmem(&self, on: bool) {
         self.secretmem.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn created(&self) -> bool {
+        self.created.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_created(&self, created: bool) {
+        self.created.store(created, Ordering::Relaxed);
     }
 
     pub(crate) fn owner(&self) -> AsyncIoOwner {
