@@ -4114,6 +4114,35 @@ pub(crate) fn write_owner_xattr(
 }
 
 impl FsBackend for HostFsBackend {
+    fn statfs(&self) -> Option<carrick_abi::LinuxStatfs> {
+        let mut native = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `root_fd` is the live directory authority for this backend,
+        // and `native` points to writable storage for one statvfs result.
+        let rc = unsafe { libc::fstatvfs(self.root_fd.as_raw_fd(), native.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        // SAFETY: fstatvfs initializes the complete structure on success.
+        let native = unsafe { native.assume_init() };
+        Some(carrick_abi::LinuxStatfs {
+            f_type: carrick_abi::LINUX_OVERLAYFS_SUPER_MAGIC,
+            f_bsize: native.f_bsize as i64,
+            f_blocks: native.f_blocks as u64,
+            f_bfree: native.f_bfree as u64,
+            f_bavail: native.f_bavail as u64,
+            f_files: native.f_files as u64,
+            f_ffree: native.f_ffree as u64,
+            f_fsid: [0, 0],
+            f_namelen: native.f_namemax as i64,
+            f_frsize: native.f_frsize as i64,
+            // Host statvfs flag values are ABI-specific. Do not publish Darwin
+            // bits as Linux ST_* bits; the overlay fallback has always exposed
+            // no filesystem-wide mount flags.
+            f_flags: 0,
+            f_spare: [0; 4],
+        })
+    }
+
     fn serves_dentry_cache(&self) -> bool {
         true
     }

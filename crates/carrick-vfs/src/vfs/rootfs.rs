@@ -146,6 +146,15 @@ impl OpenDispatchResult {
 }
 
 impl RootFsVfs {
+    /// Geometry for the writable root filesystem authority. Host-backed
+    /// overlays report the volume containing their open root descriptor;
+    /// memory overlays retain the deterministic synthetic geometry.
+    pub fn statfs(&self) -> carrick_abi::LinuxStatfs {
+        self.overlay
+            .statfs()
+            .unwrap_or_else(|| super::FsIdentity::Overlay.statfs())
+    }
+
     pub(crate) fn with_namespace_batch<R, E>(
         &self,
         paths: &[&str],

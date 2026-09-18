@@ -56,6 +56,47 @@ fn scenario_unlink_hides_rootfs_path<B: FsBackend>(b: &mut B) {
     ));
 }
 
+#[test]
+fn host_statfs_reports_the_open_backing_volume() {
+    let scratch = tempfile::tempdir().unwrap();
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
+    let mut native = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `root_fd` is a live directory descriptor owned by `backend`, and
+    // `native` points to writable storage for one `statvfs` result.
+    let rc = unsafe { libc::fstatvfs(backend.root_fd.as_raw_fd(), native.as_mut_ptr()) };
+    assert_eq!(
+        rc,
+        0,
+        "fstatvfs failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: a zero return from fstatvfs initializes the complete structure.
+    let native = unsafe { native.assume_init() };
+
+    let reported = backend
+        .statfs()
+        .expect("a host-backed filesystem must report its storage authority");
+    let filesystem_type = reported.f_type;
+    let block_size = reported.f_bsize;
+    let fragment_size = reported.f_frsize;
+    let blocks = reported.f_blocks;
+    let free_blocks = reported.f_bfree;
+    let available_blocks = reported.f_bavail;
+    let files = reported.f_files;
+    let free_files = reported.f_ffree;
+    let name_length = reported.f_namelen;
+
+    assert_eq!(filesystem_type, carrick_abi::LINUX_OVERLAYFS_SUPER_MAGIC);
+    assert_eq!(block_size, native.f_bsize as i64);
+    assert_eq!(fragment_size, native.f_frsize as i64);
+    assert_eq!(blocks, native.f_blocks as u64);
+    assert_eq!(free_blocks, native.f_bfree as u64);
+    assert_eq!(available_blocks, native.f_bavail as u64);
+    assert_eq!(files, native.f_files as u64);
+    assert_eq!(free_files, native.f_ffree as u64);
+    assert_eq!(name_length, native.f_namemax as i64);
+}
+
 fn scenario_rename_overlay_file<B: FsBackend>(b: &mut B) {
     b.create_file("/tmp/src").unwrap();
     b.set_file_contents("/tmp/src", b"hello".to_vec()).unwrap();
