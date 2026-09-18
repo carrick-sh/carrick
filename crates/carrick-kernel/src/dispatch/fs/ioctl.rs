@@ -131,6 +131,7 @@ fn fd_is_proc_maps(this: &FsView<'_>, fd: i32) -> bool {
 
 fn procmap_query(
     this: &FsView<'_>,
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     arg: u64,
 ) -> DispatchOutcome {
@@ -154,14 +155,11 @@ fn procmap_query(
         return DispatchOutcome::errno(LINUX_EINVAL);
     }
 
-    let executable_path = this.proc.lock().executable_path.clone();
-    let (mut maps, brk_current, mmap_next) = {
-        let mem_authority = this.mem();
-        let mem = mem_authority.lock();
-        let mut maps = mem.address_space_regions.clone().unwrap_or_default();
-        maps.extend(mem.dynamic_maps.iter().cloned());
-        (maps, mem.brk_current, mem.mmap_next)
-    };
+    let proc_context = this.synthetic_proc_context(context);
+    let executable_path = proc_context.executable_path;
+    let mut maps = proc_context.address_space_regions.unwrap_or_default();
+    let brk_current = proc_context.brk_current;
+    let mmap_next = proc_context.mmap_next;
     maps.sort_by_key(|map| map.start);
     let query_addr = query.query_addr;
     let covering_or_next = flags & carrick_abi::LINUX_PROCMAP_QUERY_COVERING_OR_NEXT_VMA != 0;
@@ -636,7 +634,7 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
             if ioctl_request == carrick_abi::LINUX_PROCMAP_QUERY && fd_is_proc_maps(this, fd.0) {
-                return Ok(procmap_query(this, &mut *cx.memory, arg));
+                return Ok(procmap_query(this, cx.kernel, &mut *cx.memory, arg));
             }
             let changes_tty_state = matches!(
                 ioctl_request,
