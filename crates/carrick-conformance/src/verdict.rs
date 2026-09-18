@@ -437,6 +437,15 @@ pub fn classify(
         if co == dobs {
             continue; // agree
         }
+        // A native test may self-skip because the condition it is meant to
+        // exercise is unavailable or too fast to measure. If Carrick executes
+        // that same test and it passes, the stronger Carrick observation is not
+        // a regression. Keep the unequal pair visible as a non-gating DIFF;
+        // closure remains strict and will still reject either-side skips.
+        if co == Outcome::Ok && dobs == Outcome::Skipped {
+            known_diffs.push(id.to_string());
+            continue;
+        }
         // diverging — is it excused?
         let by_gap = known_gap_match(id, &suite.known_gaps);
         let by_baseline = base
@@ -858,6 +867,28 @@ mod tests {
         );
         assert_eq!(c.verdict, Verdict::Match);
         assert!(!c.gating);
+    }
+
+    #[test]
+    fn carrick_pass_when_oracle_skips_is_non_gating_diff() {
+        let baseline = {
+            let mut by = HashMap::new();
+            let mut p = BTreeMap::new();
+            p.insert("a".to_string(), [Outcome::Ok, Outcome::Ok]);
+            by.insert("s".to_string(), p);
+            Baseline { by_suite: by }
+        };
+        let c = classify(
+            &suite(&[]),
+            facts(&res(&[("a", Outcome::Ok)]), false),
+            &res(&[("a", Outcome::Skipped)]),
+            &baseline,
+        );
+        assert_eq!(c.verdict, Verdict::Diff);
+        assert!(!c.gating);
+        assert!(c.new_diffs.is_empty());
+        assert_eq!(c.known_diffs, vec!["a".to_string()]);
+        assert_eq!(c.pairs["a"], [Outcome::Ok, Outcome::Skipped]);
     }
 
     #[test]
