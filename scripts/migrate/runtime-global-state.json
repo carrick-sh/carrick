@@ -347,11 +347,11 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
-      "symbol": "strict_durability_enabled::CARRICK_STRICT_DURABILITY",
+      "file": "crates/carrick-kernel/src/dispatch/host_io.rs",
+      "symbol": "flush::CARRICK_STRICT_DURABILITY",
       "fingerprint": "f3814f075ae168bea59b99647f7a4fd37ef9e7d97ac8b1e8c28e1a1e26402c68",
       "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_STRICT_DURABILITY read in strict_durability_enabled::CARRICK_STRICT_DURABILITY (crates/carrick-runtime/src/dispatch/fs/state.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable CARRICK_STRICT_DURABILITY read in flush::CARRICK_STRICT_DURABILITY (crates/carrick-kernel/src/dispatch/host_io.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
