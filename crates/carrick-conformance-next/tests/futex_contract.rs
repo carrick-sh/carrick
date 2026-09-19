@@ -1,4 +1,5 @@
 //! Differential verification of the futex contention contract in carrick-conformance-next.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -64,15 +65,16 @@ fn futex_contract_differential_verification() {
         let mut source_head = String::new();
         for line in content.lines() {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                if val.get("record_type").and_then(|v| v.as_str()) == Some("header") {
-                    if let Some(sh) = val.get("source_head").and_then(|v| v.as_str()) {
-                        source_head = sh.to_string();
-                    }
+                if let (Some("header"), Some(sh)) = (
+                    val.get("record_type").and_then(|v| v.as_str()),
+                    val.get("source_head").and_then(|v| v.as_str()),
+                ) {
+                    source_head = sh.to_string();
                 }
-                if let Some(cid) = val.get("contract_id").and_then(|v| v.as_str()) {
-                    if cid == "kernel.futex.contention" {
-                        found_contract_id = true;
-                    }
+                if val.get("contract_id").and_then(|v| v.as_str())
+                    == Some("kernel.futex.contention")
+                {
+                    found_contract_id = true;
                 }
             }
         }
