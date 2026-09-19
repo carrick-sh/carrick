@@ -775,12 +775,12 @@ bsdvm-acceptance:
 #
 # WHY: 104 agent worktrees regenerated ~500 GiB of `target/` and took the disk to
 # 13 GiB free on 2026-09-04, and a day after a manual sweep 12 rebuilt targets had
-# already put 78 GiB back. Cold rebuilds are cheap here — `~/.cargo/config.toml`
-# wires sccache in as `rustc-wrapper` globally (100% hit rate across worktrees),
-# so deleting a worktree's target costs relink and fingerprint work, not
-# recompilation. That asymmetry is what makes sweeping the right lever, and why
-# a shared CARGO_TARGET_DIR is NOT: cargo locks a target dir exclusively, so one
-# shared dir would serialize every concurrent agent build behind one another.
+# already put 78 GiB back. A shared CARGO_TARGET_DIR is NOT the alternative:
+# cargo locks a target dir exclusively, so one shared dir would serialize every
+# concurrent agent build behind one another. Worktree targets therefore remain
+# isolated and this recipe reclaims only old, inactive build output. Cold
+# rebuilds may recompile dependencies; unrestricted local builds can opt into
+# sccache explicitly with `RUSTC_WRAPPER=/opt/homebrew/bin/sccache`.
 #
 # The main repo's own `target/` is deliberately OUT OF SCOPE. It is not pure build
 # output — it also holds `perf/` (20G), `conformance/` (18G), `host-authority-census/`
