@@ -1,216 +1,60 @@
 ---
 name: carrick-lldb
-description: >-
-  Post-mortem and live debugging of the carrick runtime (the Linux-binary-on-
-  macOS HVF runtime) with lldb + the project's `scripts/carrick_lldb.py` plugin —
-  on a LIVE process (attach) or a CORE file. Reach for this when a `carrick run`/
-  `run-elf` HANGS or WEDGES and you need the guest's recent fork/socket/epoll
-  history, the per-process deadlock topology, or host-thread stacks WITHOUT
-  perturbing the timing — i.e. the cases where `carrick trace` (dtrace) changes
-  the manifestation (intermittent Heisenbugs: nested-fork wedges, lost wakes,
-  epoll/kqueue stalls, "which process is stuck and why"). The always-on in-memory
-  event ring means a core from ANY run carries the history with nothing pre-armed.
-  Complements carrick-trace: use carrick-trace to watch a reproducible guest live;
-  use carrick-lldb when tracing perturbs the bug away, for post-mortem of a hang,
-  or to read carrick's own state (event ring, guest mappings, ESR) from a core.
-compatibility: >-
-  Requires the carrick project + a release build with symbols (the default
-  release retains them; do not strip), macOS on Apple silicon, and lldb. Live
-  attach + `process save-core` work on the adhoc-signed binary as the owning
-  user (no get-task-allow needed); reading a core needs no special privilege.
+description: Use when a Carrick guest hangs, wedges, crashes, or needs live kernel and scheduler inspection, post-mortem analysis, host stacks, event-ring history, or mapping diagnostics; also when asked about carrick debug or Carrick LLDB commands.
 ---
 
-# Debugging carrick with lldb + the event ring
+# Carrick debugging
 
-carrick ships an lldb plugin at `scripts/carrick_lldb.py` and an always-on
-in-memory **event ring** (`crates/carrick-runtime/src/event_ring.rs`). Together
-they give a **zero-perturbation** view of a hung or wedged carrick process —
-live or from a core file. This is the tool for timing-sensitive races that
-`carrick trace` (dtrace) perturbs away (see
-[carrick-trace](../carrick-trace/SKILL.md)); each event-ring slot uses an
-odd/even generation claim around fixed atomic payload stores, so readers reject
-mixed records without adding locks, allocation, syscalls, or formatting to the
-hot path.
+Read the applicable section of [commands.md](references/commands.md) before
+running a diagnostic.
 
-It is what cracked the CPython forkserver-from-forkserver `test_parent_process`
-deadlock: the ring showed the worker `BIND`+`LISTEN` the nested server's listener
-then STOP with no `FORK` — wedged in `prepare_host_fork`'s pump stop — which
-neither dtrace nor eprintln could show without changing the outcome. See
-`docs/archive/forkserver-parent-process-deadlock.md`.
+| Need | Interface | Effect |
+|---|---|---|
+| Live tasks, queues, executors, resource graph | `carrick debug hvpatch-kernel` | Read-only coherent projection; requires responsive carrier |
+| Reproducible hang capture | `carrick debug lldb-run` | Launches workload; deadline/signal capture terminates scoped run |
+| Capture an existing run | `carrick debug lldb-snapshot` | Attaches LLDB; caller owns cleanup |
+| Host stacks, ring, saved host core | `lldb`, then plugin `carrick …` | Live attach pauses process; offline core needs no live target |
+| Intentional kernel termination with evidence | `carrick debug abort` | Destructive abort, not a read-only snapshot |
+| Guest core or diagnostic ledger validation | Other `carrick debug` commands | Input formats are not interchangeable |
 
-## What the event ring records (always on)
+## Safety and evidence
 
-Every carrick process keeps a lock-free ring of its last 8192 events; each
-records `bind / connect / listen / accept / epoll_ctl(ADD) / epoll_pwait / fork /
-exec`. Recording is unconditional (a core from any run has it). The ring is
-per-process and is **reset on each guest fork**, so a per-process core shows that
-process's own history. AF_UNIX `bind`/`connect` carry a `pathhash` so you can
-match a `connect` to the `bind` of the same socket across processes.
+- Use a signed, symbol-bearing binary for HVF guests (`just build` or
+  `just build-debug`). Preserve the exact executable/symbols with cores and
+  record source revision and binary identity. Do not rebuild under a live run.
+- Scope by `CARRICK_RUN_ID` / `--name`. Inspect the **VM carrier**, not merely
+  its CLI parent, namespace supervisor, or file-authority helper. HVPatch guest
+  fork does not create a host process per guest. The carrier owns kernel state.
+- Capture live kernel JSON **before** LLDB attach; its server needs a running
+  carrier. Busy/timeout is evidence, not an empty healthy graph.
+- Do not pre-SIGSTOP macOS targets: this can break LLDB's attach handshake.
+  Attach and debug requests have observer effects, not zero perturbation.
+- Save `modified-memory` cores and all-thread backtraces before deadlock cleanup.
+  Stack-only cores omit ring/statics; full cores can be huge. Missing core memory
+  is not proof that a value was zero or absent.
+- Cleanup with `scripts/sudo/kill.sh <run-id>`, never broad `pkill`. Abort needs
+  authorization to terminate that exact run.
 
-Optional autonomous file dump (perturbing — a 1 Hz watchdog thread): set
-`CARRICK_EVENTRING=<dir>` and each process writes `<dir>/carrick-ring.<pid>`.
-Prefer the lldb reader (below) for real debugging; the file dump is a convenience
-for a quick reproducible run.
+## Namespaces and interpretation
 
-## Loading the plugin
+The audited shell CLI has `carrick debug lldb-run`, `lldb-snapshot`, and
+`lldb-plugin`, **not a top-level `carrick lldb` command**. Importing
+`scripts/carrick_lldb.py` registers `(lldb) carrick` inside LLDB. Check matching
+build help when versions differ; do not invent commands.
 
-```text
-(lldb) command script import /path/to/carrick/scripts/carrick_lldb.py
-(lldb) carrick                       # lists subcommands
-```
+The plugin's guest-process/thread views derive from host thread names, not a
+complete GMP logical-task census. Prefer kernel tables for queued/parked tasks.
+`where` reads host registers, not guest vCPU registers. Mapping-state JSON,
+kernel snapshots, structured post-mortems, guest ELF cores, and host LLDB cores
+are distinct artifacts.
 
-Subcommands: `eventring`, `where`, `mappings`, `gva <addr>`, `decode-esr <hex>`,
-`info`, `load-state <path>`. `eventring` is the one that needs only a target +
-process/core; the rest are guest-mapping helpers that want a debug-state JSON
-(`carrick run --debug-state-path <p>` then `carrick load-state <p>`).
+The always-on ring lives in `crates/carrick-kernel/src/event_ring.rs`. It needs
+no pre-armed tracing; it does not imply zero observer effect. Correlate its
+timeline with stacks and typed identities, not a historical per-guest-fork host
+process model. Ring `ERROR BUSY/GAP/OVERWRITTEN/TORN/UNKNOWN` invalidates range
+completeness. An empty parent ring says nothing about carrier activity.
 
-## Workflow A — deadline runner (preferred for hangs)
-
-Use Carrick's built-in lldb runner when you can reproduce the hang with a normal
-`carrick run` invocation. It owns the child, gives it a scoped run id, redirects
-guest output to a file, waits for a deadline, then attaches lldb to each
-matching `carrick:<run-id>` process and writes the event ring, all host
-backtraces, and modified-memory cores before cleanup:
-
-```sh
-target/release/carrick debug lldb-run \
-  --deadline-seconds 35 \
-  --out-dir target/conformance/logs/lldb-runs \
-  --run-id <run-id> -- \
-  --max-traps 18446744073709551615 --fs host \
-  <image> <guest-command> ...
-```
-
-Everything after `--` is the argument list for `carrick run` **without** the
-`run` word. If the forwarded args do not include `--name`, the runner injects
-`--name <run-id>` and also sets `CARRICK_RUN_ID=<run-id>`, so `ps`, `kill.sh`,
-lldb transcripts, guest logs, and cores all use the same scoped identity. Use
-`--no-core` only for a fast plumbing smoke; real hang triage should keep cores.
-
-Artifacts:
-
-- `<run-id>.manifest.txt` — exact binary, plugin path, deadline, and forwarded
-  run args.
-- `<run-id>.guest.log` — guest stdout/stderr.
-- `<run-id>.ps.txt` — matched host processes.
-- `<run-id>.lldb.txt` — `carrick eventring`, `thread backtrace all`, and lldb
-  status for each matched process.
-- `<run-id>.<pid>.core` — modified-memory core for each matched Carrick process
-  unless `--no-core` was passed.
-
-This is the right first move when a test sometimes passes quickly and sometimes
-wedges: the runner catches it in the act without adding sleeps or hand-written
-process matching to the investigation loop.
-
-## Workflow B — live manual attach
-
-A `carrick run` is **two host processes**: an orchestrator parent and the guest.
-**Attach to the GUEST** — the one whose ring is non-empty. Find pids by the
-proctitle (`carrick:<run-id>`), set with `CARRICK_RUN_ID` (see
-[carrick-trace](../carrick-trace/SKILL.md)):
-
-```sh
-# reproduce the hang, then:
-pids=$(ps -A -o pid=,command= | grep "carrick:<run-id>" | grep -v grep | awk '{print $1}')
-# attach to each (or the guest) and dump its ring + stuck stacks:
-lldb --batch \
-  -o "command script import scripts/carrick_lldb.py" \
-  -o "attach <pid>" \
-  -o "carrick eventring" \
-  -o "thread backtrace all" \
-  -o "detach"
-```
-
-A wedged thread's `bt` plus the ring usually pins it immediately (e.g. a worker
-parked in `SignalPump::stop_inner -> thread::join -> __ulock_wait` with a ring
-ending at `LISTEN` and no `FORK`).
-
-## Workflow C — core file (durable, share-able, no live process)
-
-Use a **`modified-memory`** core: it captures dirty pages (which include the
-written-to event ring + Rust statics) but NOT the multi-GB clean guest-memory
-window, so it stays ~100 MB instead of gigabytes. `--style full` would bloat it
-with the guest aperture; `--style stack` MISSES the ring (it lives in the data
-section, not the stack).
-
-```sh
-# capture from a live (hung) guest:
-lldb -o "attach <pid>" -o "process save-core --style modified-memory /tmp/c.core" -o detach -o quit
-# analyse later / elsewhere — no live process needed:
-lldb -c /tmp/c.core target/release/carrick \
-  -o "command script import scripts/carrick_lldb.py" \
-  -o "carrick eventring" \
-  -o "thread backtrace all"
-```
-
-(A core's `eventring` header shows `pid=0` — cosmetic; the events are real.)
-
-## Operating rules (learned the hard way)
-
-1. **Attach to the GUEST, not the orchestrator parent.** The parent's ring is
-   empty (it runs no guest syscalls); `eventring` shows `total=0`. Pick the pid
-   whose ring is non-empty (or, with `CARRICK_EVENTRING` set, the per-pid file
-   with the most lines).
-
-2. **Cores must be `modified-memory` (or `full`), never `stack`.** The ring is a
-   `.data`/`.bss` static, not on any stack. `stack` cores read back
-   `core file does not contain <addr>`.
-
-3. **The build must retain symbols.** `carrick eventring` finds
-   `carrick_runtime::event_ring::{RING,IDX}` by symbol-name components (the Rust
-   `::h<hash>` suffix is matched, not required to be known). The default release
-   keeps them; a stripped binary breaks the reader.
-
-4. **Reach for this when carrick-trace perturbs the bug.** dtrace's per-syscall
-   probes and any `eprintln!` change a timing-sensitive race's outcome (the bug
-   stops reproducing, or moves). The event ring uses only a bounded generation
-   claim and fixed atomic payload stores, so it (and a passive core read) remain
-   far less perturbing than tracing. For a *reproducible* live guest,
-   [carrick-trace](../carrick-trace/SKILL.md) is still the richer tool
-   (guest↔host syscall correlation, fork-post tree, profile sampling).
-
-5. **Read the ring as a timeline + cross-process.** Reconstruct who-forks-whom
-   from `FORK child_pid=…` (one process's ring) joined to the child's own ring
-   (per-pid cores/attaches); match a `CONNECT pathhash=X` to the `BIND
-   pathhash=X` that created that listener. A process whose ring ENDS abruptly
-   (e.g. at `LISTEN` with no following `FORK`/`CONNECT`) is wedged in whatever it
-   does next — confirm with its thread backtraces.
-
-6. **Symbolicating carrick host stacks:** `thread backtrace all` resolves Rust
-   frames when the binary has symbols. For frame pointers / cleaner stacks build
-   with `RUSTFLAGS="-C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=1`
-   (same as [carrick-trace](../carrick-trace/SKILL.md)'s symbolication note). For
-   the GUEST (vCPU) state,
-   `carrick trace --stack` / a debug-state JSON + `carrick mappings`/`gva` is the
-   route — lldb sees the *host* threads, not the guest registers.
-
-## The `eventring` output
-
-```text
-# carrick event ring  pid=<host pid>  total=<events seen>  showing=<min(total,8192)>
-   <seq> BIND     gfd=<guest fd> hfd=<host fd> pathhash=<0x…>     # AF_UNIX bind
-   <seq> LISTEN   hfd=<host fd>
-   <seq> CONNECT  hfd=<host fd> rc=<0|errno> pathhash=<0x…>
-   <seq> ACCEPT   listener_hfd=<host fd> ret=<new host fd>
-   <seq> EPADD    kq=<epoll-instance kqueue fd> hfd=<watched host fd> events=<0x…>
-   <seq> EPWAIT   kq=<kqueue fd> ready=<n ready> timeout=<ms, -1=block>
-   <seq> FORK     child_pid=<host pid of the forked child>
-   <seq> EXEC     path_present=1
-   <seq> ERROR    BUSY|GAP|OVERWRITTEN|TORN|UNKNOWN ...
-```
-
-Any `ERROR` line invalidates a claim that the displayed range is complete. Save
-it with the core/transcript; do not silently omit the slot or infer the missing
-event.
-
-`kq` ≥ 16384 is a relocated carrick-internal fd (the epoll instance's kqueue);
-`hfd` ≥ 16384 likewise (eventfd/pidfd/wake-pipe backings). A guest blocking on a
-≥16384 host fd in a wait is parked on one of those internal objects.
-
-## Adding more to the ring
-
-To capture a new event class, add a `pub const` kind + a `decode` arm in
-`crates/carrick-runtime/src/event_ring.rs`, a matching arm in
-`scripts/carrick_lldb.py`'s `_EVENTRING_KINDS`, and a `crate::event_ring::rec(…)`
-call at the carrick site. Keep `rec` calls cheap (no allocation/format on the hot
-path — pass ints; hash strings via `event_ring::path_hash`).
+Use [carrick-trace](../carrick-trace/SKILL.md) for reproducible guest syscall
+flow/profiling. Avoid logging that changes races. New ring events require kernel
+writer and plugin decoder updates together, bounded allocation-free recording,
+and tests of both sides.
