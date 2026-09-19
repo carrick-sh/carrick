@@ -36,7 +36,10 @@ impl<'a> FsView<'a> {
         old_fd: i32,
     ) -> Result<Arc<crate::kernel::FileDescription>, LinuxErrno> {
         let duped = (unsafe { libc::dup(old_fd) }).host_syscall_errno()?;
-        crate::dispatch::net::set_host_nonblocking(duped);
+        // Do not call set_host_nonblocking(duped) on bare stdio: `duped` shares
+        // its open file description with host stdio (0/1/2). Mutating host
+        // stdout/stderr to O_NONBLOCK causes host writes (e.g. rust test harness stderr)
+        // to fail with EAGAIN (os error 35: Resource temporarily unavailable).
         let write_kind = HostWriteKind::for_host_fd(duped);
         let pty = self.dup_stdio_pty_role(old_fd);
         let status_flags = if old_fd == 0 {
@@ -128,7 +131,10 @@ impl<'a> FsView<'a> {
                     Ok(duped) => duped,
                     Err(errno) => return DispatchOutcome::errno(errno),
                 };
-                crate::dispatch::net::set_host_nonblocking(duped);
+                // Do not call set_host_nonblocking(duped) on bare stdio: `duped` shares
+                // its open file description with host stdio (0/1/2). Mutating host
+                // stdout/stderr to O_NONBLOCK causes host writes (e.g. rust test harness stderr)
+                // to fail with EAGAIN (os error 35: Resource temporarily unavailable).
                 let write_kind = HostWriteKind::for_host_fd(duped);
                 let pty = self.dup_stdio_pty_role(old_fd);
                 let status_flags = if old_fd == 0 {

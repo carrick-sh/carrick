@@ -1017,6 +1017,7 @@ mod stdio_sink_tests {
 
     #[test]
     fn inherit_dup_redirection_sequence_returns_success() {
+        let saved_flags = unsafe { libc::fcntl(1, libc::F_GETFL) };
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.set_stdio_sink(StdioSink::Inherit);
 
@@ -1051,6 +1052,9 @@ mod stdio_sink_tests {
             close_fd(&mut dispatcher, 10),
             DispatchOutcome::Returned { value: 0 }
         );
+        if saved_flags >= 0 {
+            unsafe { libc::fcntl(1, libc::F_SETFL, saved_flags) };
+        }
     }
 
     #[test]
