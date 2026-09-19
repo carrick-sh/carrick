@@ -960,9 +960,12 @@ impl carrick_hal::SchedulingPolicy for AdversarialPolicy {
         Some((view.cpu, task))
     }
 
-    fn on_tick(&self, _cpu: carrick_hal::GuestCpuId) -> carrick_hal::PreemptOrContinue {
-        // Preempt on every tick: maximal switching, maximal settlement churn.
-        carrick_hal::PreemptOrContinue::Preempt
+    fn on_contention(
+        &self,
+        _context: &carrick_hal::ContentionContext,
+    ) -> carrick_hal::PreemptionAction {
+        // Preempt on contention: maximal switching, maximal settlement churn.
+        carrick_hal::PreemptionAction::Preempt
     }
 }
 
@@ -1146,20 +1149,19 @@ impl carrick_hal::SchedulingPolicy for RecordReplay {
         stolen
     }
 
-    fn on_tick(&self, cpu: carrick_hal::GuestCpuId) -> carrick_hal::PreemptOrContinue {
-        self.inner.on_tick(cpu)
+    fn on_dispatch(&self, context: &carrick_hal::DispatchContext) -> carrick_hal::RunBudget {
+        self.inner.on_dispatch(context)
     }
 
-    fn on_runnable(&self, task: carrick_hal::SchedThreadId, cpu: carrick_hal::GuestCpuId) {
-        self.inner.on_runnable(task, cpu);
+    fn on_contention(
+        &self,
+        context: &carrick_hal::ContentionContext,
+    ) -> carrick_hal::PreemptionAction {
+        self.inner.on_contention(context)
     }
 
-    fn on_block(&self, task: carrick_hal::SchedThreadId, cpu: carrick_hal::GuestCpuId) {
-        self.inner.on_block(task, cpu);
-    }
-
-    fn on_exit(&self, task: carrick_hal::SchedThreadId, cpu: carrick_hal::GuestCpuId) {
-        self.inner.on_exit(task, cpu);
+    fn on_event(&self, event: &carrick_hal::SchedulingEvent) {
+        self.inner.on_event(event);
     }
 }
 
@@ -1167,8 +1169,9 @@ impl carrick_hal::SchedulingPolicy for RecordReplay {
 mod scheduling_policy_tests {
     use super::{AdversarialPolicy, RecordReplay, SchedulingDecision};
     use carrick_hal::{
-        CpuAffinity, CpuLoad, CpuQueueView, GuestCpuId, GuestCpuPolicy, PreemptOrContinue,
-        SchedProcessId, SchedThreadId, SchedulingPolicy, TaskPlacement,
+        ContentionContext, CpuAffinity, CpuLoad, CpuQueueView, DispatchContext, GuestCpuId,
+        GuestCpuPolicy, PreemptionAction, RunBudget, SchedProcessId, SchedThreadId,
+        SchedulingPolicy, TaskPlacement,
     };
     use std::sync::Arc;
 
@@ -1227,9 +1230,21 @@ mod scheduling_policy_tests {
             }),
             None
         );
+        let dispatch_ctx = DispatchContext {
+            thread: SchedThreadId::new(1),
+            process: SchedProcessId::new(1),
+            cpu: GuestCpuId::new(0),
+            load: CpuLoad::default(),
+        };
+        assert_eq!(policy.on_dispatch(&dispatch_ctx), RunBudget::default());
+        let contention_ctx = ContentionContext {
+            running: dispatch_ctx,
+            residency_elapsed: std::time::Duration::from_millis(1),
+            eligible_queued: 1,
+        };
         assert_eq!(
-            policy.on_tick(GuestCpuId::new(0)),
-            PreemptOrContinue::Preempt
+            policy.on_contention(&contention_ctx),
+            PreemptionAction::Preempt
         );
     }
 

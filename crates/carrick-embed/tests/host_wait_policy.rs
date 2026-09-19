@@ -248,7 +248,6 @@ fn handoff(
         let key = running.thread_key();
         let current = scheduler.binding_for_thread(key);
         let census = scheduler.host_wait_census();
-        let ticks = scheduler.tick_preemption();
         // Settle before asserting: a fixture failure must not strand the
         // returning original behind a dropped, still-running spare claim.
         scheduler.settle_exited(running).unwrap();
@@ -265,8 +264,6 @@ fn handoff(
         assert_eq!(slot.waiters.len(), 1);
         assert_eq!(census.entered, 1);
         assert_eq!(census.resumed, 0);
-        // A waiting original has no P and therefore receives no tick.
-        assert_eq!(ticks, 1);
         order.push(key);
     }
     let mut observed = order.clone();

@@ -4,6 +4,8 @@
 //! mm to an ASID-owned stage-1 root over globally addressed frames.
 
 pub mod address;
+#[cfg(any(test, feature = "test-support"))]
+pub mod builder;
 pub(crate) mod carrier_process;
 pub mod clone_plan;
 pub mod container;
@@ -40,6 +42,8 @@ pub use address::{
     SnapshotError, SnapshotTable, Stage1Root, Stage1RootError, Ttbr0, VmaAccess, VmaRevision,
     VmaSnapshotSource, VmaSummary,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use builder::KernelBuilder;
 pub use clone_plan::{
     CloneObjectMode, ClonePlan, ClonePlanError, CloneTaskMode, ForkParentMode, ForkPidfdMode,
     VforkMode,

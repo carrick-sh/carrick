@@ -9,10 +9,11 @@ use carrick_abi::LinuxCloneFlags;
 use carrick_hal::NullHostSignalBridge;
 use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 use carrick_hal::{
-    CpuQueueView, GuestCpuId, SchedProcessId, SchedThreadId, SchedulingPolicy, TaskPlacement,
-    ThreadId,
+    BudgetError, CpuQueueView, GuestCpuId, RunBudget, SchedProcessId, SchedThreadId,
+    SchedulingPolicy, TaskPlacement, ThreadId,
 };
 use carrick_kernel::kernel::objects::MigratableTaskState;
+use carrick_kernel::kernel::scheduler::PreemptionReasons;
 use carrick_kernel::kernel::{
     ClonePlan, ExecutorBinding, ExecutorKick, ExecutorKickToken, Kernel, KernelContext, Scheduler,
 };
@@ -557,4 +558,157 @@ fn default_fifo_policy_never_materializes_snapshots() {
         0,
         "default FIFO must never call steal"
     );
+}
+
+/// Test 6: RunBudget constructor bounds and defaults.
+#[test]
+fn run_budget_constructor_bounds_and_defaults() {
+    assert_eq!(
+        RunBudget::default().quantum(),
+        Duration::from_millis(4),
+        "default budget is 4 ms"
+    );
+
+    assert!(RunBudget::new(Duration::from_millis(1)).is_ok());
+    assert!(RunBudget::new(Duration::from_millis(100)).is_ok());
+
+    assert!(matches!(
+        RunBudget::new(Duration::from_millis(0)),
+        Err(BudgetError::TooSmall { .. })
+    ));
+    assert!(matches!(
+        RunBudget::new(Duration::from_micros(999)),
+        Err(BudgetError::TooSmall { .. })
+    ));
+    assert!(matches!(
+        RunBudget::new(Duration::from_millis(101)),
+        Err(BudgetError::TooLarge { .. })
+    ));
+}
+
+/// Test 7: Multiple executors bound to the same CPU running sibling threads get independent residencies and demand tickets.
+#[test]
+fn one_cpu_two_executors_independent_residencies() {
+    let (kernel, ctx_a, _asids) = bootstrap_kernel(66_001);
+    publish_task(&ctx_a, 900);
+    let ctx_b = create_sibling_thread(&kernel, &ctx_a, 66_002);
+    publish_task(&ctx_b, 901);
+
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let kick_a = Arc::new(TestKick::default());
+    let kick_b = Arc::new(TestKick::default());
+
+    let exec_a = scheduler
+        .register_executor_bound(kick_a, Some(GuestCpuId::new(0)), false)
+        .unwrap();
+    let exec_b = scheduler
+        .register_executor_bound(kick_b, Some(GuestCpuId::new(0)), false)
+        .unwrap();
+
+    scheduler.make_runnable(ctx_a.thread().key()).unwrap();
+    scheduler.make_runnable(ctx_b.thread().key()).unwrap();
+
+    let running_a = scheduler.take(&exec_a).unwrap();
+    let running_b = scheduler.take(&exec_b).unwrap();
+
+    let res_a = scheduler
+        .binding_residency(exec_a.id())
+        .expect("residency for exec_a must exist");
+    let res_b = scheduler
+        .binding_residency(exec_b.id())
+        .expect("residency for exec_b must exist");
+
+    assert_eq!(res_a.cpu, GuestCpuId::new(0));
+    assert_eq!(res_b.cpu, GuestCpuId::new(0));
+    assert_ne!(res_a.binding, res_b.binding);
+    assert_ne!(
+        res_a.ticket, res_b.ticket,
+        "two executors on the same CPU must receive independent demand tickets"
+    );
+
+    scheduler.settle_runnable(running_a).unwrap();
+    scheduler.settle_runnable(running_b).unwrap();
+}
+
+/// Test 8: Setting and clearing fairness preemption reason does not clear concurrent signal reason.
+#[test]
+fn pending_signal_plus_fairness_isolation() {
+    let (kernel, ctx_a, _asids) = bootstrap_kernel(67_001);
+    publish_task(&ctx_a, 950);
+
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let kick = Arc::new(TestKick::default());
+    let exec = scheduler
+        .register_executor_bound(kick, Some(GuestCpuId::new(0)), false)
+        .unwrap();
+
+    scheduler.make_runnable(ctx_a.thread().key()).unwrap();
+    let running = scheduler.take(&exec).unwrap();
+
+    // Initially no preemption reasons:
+    assert!(!scheduler.should_preempt(&running));
+
+    // Add both SIGNAL and FAIRNESS:
+    assert!(scheduler.set_preemption_reason(
+        exec.id(),
+        PreemptionReasons::SIGNAL | PreemptionReasons::FAIRNESS,
+    ));
+
+    let snap = scheduler.binding_residency(exec.id()).unwrap();
+    assert!(snap.reasons.contains(PreemptionReasons::SIGNAL));
+    assert!(snap.reasons.contains(PreemptionReasons::FAIRNESS));
+    assert!(scheduler.should_preempt(&running));
+
+    // Clear FAIRNESS only:
+    assert!(scheduler.clear_preemption_reason(exec.id(), PreemptionReasons::FAIRNESS));
+
+    let snap = scheduler.binding_residency(exec.id()).unwrap();
+    assert!(
+        snap.reasons.contains(PreemptionReasons::SIGNAL),
+        "SIGNAL reason must survive clearing of FAIRNESS"
+    );
+    assert!(
+        !snap.reasons.contains(PreemptionReasons::FAIRNESS),
+        "FAIRNESS reason must be cleared"
+    );
+    assert!(
+        scheduler.should_preempt(&running),
+        "should_preempt must still be true due to surviving SIGNAL reason"
+    );
+
+    scheduler.settle_runnable(running).unwrap();
+}
+
+/// Test 9: 10,000 uncontended syscall steps retain residency without kicks or preemption.
+#[test]
+fn uncontended_syscall_steps_retain_residency() {
+    let (kernel, ctx_a, _asids) = bootstrap_kernel(68_001);
+    publish_task(&ctx_a, 980);
+
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let kick = Arc::new(TestKick::default());
+    let exec = scheduler
+        .register_executor_bound(kick.clone(), Some(GuestCpuId::new(0)), false)
+        .unwrap();
+
+    scheduler.make_runnable(ctx_a.thread().key()).unwrap();
+    let running = scheduler.take(&exec).unwrap();
+
+    for _ in 0..10_000 {
+        scheduler.note_syscall_boundary(&running);
+        assert!(
+            !scheduler.should_preempt(&running),
+            "uncontended syscall must never trigger preemption"
+        );
+        assert!(!scheduler.need_resched());
+    }
+
+    assert_eq!(
+        kick.tokens.lock().len(),
+        0,
+        "uncontended loop must receive zero kicks"
+    );
+    assert!(!kick.kicked.load(Ordering::Acquire));
+
+    scheduler.settle_runnable(running).unwrap();
 }
