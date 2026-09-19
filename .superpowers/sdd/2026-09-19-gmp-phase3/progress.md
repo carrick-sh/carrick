@@ -181,3 +181,13 @@ Integration condition is not met: signed acceptance, contract binding and
 broader gates remain open; incoming-main clippy failure unresolved. Main left
 unchanged, including its three unrelated untracked plans. Resume the committed
 codex/gmp-phase3 branch using the standalone handoff.
+
+Subsequent explicit user direction supersedes the integration deferral above:
+fast-forwarded local main to f3c8685f2 and made the handoff checkout-independent.
+No push; unrelated checkout changes preserved. Post-merge just test-kernel
+exited 101: 2072 parallel kernel tests passed/1 ignored, but semantics had
+78 pass and futex_contention::futex_pi_lock_unlock_deadlock_detection fail
+with "continuation build failed: failed to pin an exact fd description".
+No retry or attribution claim. Log /private/tmp/gmp-phase3-main-kernel.log.
+Concurrent inotify.rs edits appeared during validation and were left untouched.
+The standalone handoff records this new blocker for the next session.
