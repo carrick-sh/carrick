@@ -279,6 +279,7 @@ test-kernel-semantics *ARGS:
 test *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
+    python3 -c 'import fcntl, os; [fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK) for fd in (0, 1, 2)]' 2>/dev/null || true
     if [ "{{os()}}" = "macos" ]; then
         # Runtime tests exercise process-wide signal dispositions, custom-x18
         # transitions, and fork from the test harness. Running those cases on
@@ -315,7 +316,9 @@ test *ARGS:
         # the explicit 8 MiB budget already used by their bounded-stack tests,
         # scoped to the bin-only CLI test process rather than every workspace
         # crate (see `test(debug): bound the jit-shape publication test's stack`).
-        env RUST_MIN_STACK=8388608 cargo test -p carrick-cli --bin carrick {{ARGS}}
+        # carrick-cli includes tests that fork and mutate process-wide env vars
+        # (e.g. supervisor_perf), so serialize test execution to avoid host fork races.
+        env RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 cargo test -p carrick-cli --bin carrick {{ARGS}}
         # carrick-host needs the same serial treatment, for the same reason and
         # one more. Its `guest_cpu` tests `libc::fork()` from the harness and
         # drive a real SIGSTOP/waitpid handshake with the child; its

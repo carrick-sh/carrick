@@ -1278,13 +1278,13 @@ mod tests {
         std::mem::forget(slave_file);
         std::mem::forget(app_file);
 
-        // stop() signals the relay thread, joins it, then closes master + slave.
+        // stop() signals the relay thread, joins it, then closes master + slave,
+        // real_in (real_term) and real_out (real_term).
         relay.stop();
 
-        // Clean up the remaining fds that we held outside the relay.
-        // SAFETY: real_term and real_app_dup are still open at this point.
+        // Clean up real_app_dup which was held outside the relay.
+        // SAFETY: real_app_dup is still open at this point.
         unsafe {
-            libc::close(real_term);
             libc::close(real_app_dup);
         }
     }
@@ -1349,6 +1349,21 @@ mod tests {
         assert!(null_fd >= 0, "open /dev/null failed");
         let (real_app, real_term) = socketpair();
 
+        // Bound blocking read with a 5s receive timeout so test never wedges harness
+        let tv = libc::timeval {
+            tv_sec: 5,
+            tv_usec: 0,
+        };
+        unsafe {
+            libc::setsockopt(
+                real_app,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &tv as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+        }
+
         let relay = PtyRelay::start_for_test(null_fd, real_term).expect("start_for_test");
         let slave = relay.slave_fd();
 
@@ -1370,10 +1385,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         relay.stop();
+        // SAFETY: null_fd and real_term were handed off to and closed by relay.stop().
+        // Only real_app remains open outside the relay.
         unsafe {
-            libc::close(null_fd);
             libc::close(real_app);
-            libc::close(real_term);
         }
     }
 }

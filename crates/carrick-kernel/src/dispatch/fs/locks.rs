@@ -1747,8 +1747,16 @@ impl<'a> FsView<'a> {
                                 return Ok(DispatchOutcome::errno(errno));
                             }
                         }
-                        OpenDescription::HostPipe { host_fd, .. }
-                        | OpenDescription::HostSocket { host_fd, .. } => {
+                        OpenDescription::HostPipe {
+                            host_fd,
+                            stdio_stream,
+                            ..
+                        } => {
+                            if stdio_stream.is_none() {
+                                crate::dispatch::net::set_host_nonblocking(host_fd.raw());
+                            }
+                        }
+                        OpenDescription::HostSocket { host_fd, .. } => {
                             crate::dispatch::net::set_host_nonblocking(host_fd.raw());
                         }
                         _ => {}

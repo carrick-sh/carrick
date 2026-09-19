@@ -624,10 +624,20 @@ fn test_fifo_open_cancellation_releases_reservation_exactly_once() {
         Step::ChildMarker(vec![
             // Child creates FIFO
             Step::Sys(sys::mkfifo("/fifo_cancel", 0o666).ret(0)),
+            // Child opens a probe file in slot 1 (fd 3) so dup3 does not mutate host stdio (fd 0)
+            Step::Sys(
+                sys::openat(
+                    LINUX_AT_FDCWD,
+                    "/probe_cancel.txt",
+                    (LINUX_O_CREAT | LINUX_O_RDWR) as i32,
+                    0o644,
+                )
+                .save(1),
+            ),
             // Child spawns sibling thread (tid 3)
             Step::Sys(sys::clone_thread(0).save(3)),
             Step::ChildMarker(vec![
-                // Sibling thread parks on FIFO read open
+                // Sibling thread parks on FIFO read open -> reserves slot 4
                 Step::Sys(sys::openat(
                     LINUX_AT_FDCWD,
                     "/fifo_cancel",
@@ -637,8 +647,8 @@ fn test_fifo_open_cancellation_releases_reservation_exactly_once() {
             ]),
             // Child leader awaits sibling parked on openat
             await_parked(3, "openat"),
-            // Child leader confirms slot 3 is reserved via dup3 returning EBUSY
-            Step::Sys(sys::dup3(0, 3, 0).errno(LINUX_EBUSY)),
+            // Child leader confirms slot 4 is reserved via dup3 returning EBUSY
+            Step::Sys(sys::dup3(slot(1), 4, 0).errno(LINUX_EBUSY)),
             // Child leader issues exit_group(42), cancelling parked sibling open
             Step::Sys(sys::exit_group(42)),
         ]),
@@ -669,22 +679,32 @@ fn test_fork_during_pending_fifo_open_allows_child_to_allocate_uncommitted_slot(
     let script = vec![
         // 1. Create FIFO
         Step::Sys(sys::mkfifo("/fifo_fork", 0o666).ret(0)),
-        // 2. Spawn sibling thread (tid 2)
+        // 2. Open probe file in slot 1 (fd 3) so dup3 does not mutate host stdio (fd 0)
+        Step::Sys(
+            sys::openat(
+                LINUX_AT_FDCWD,
+                "/probe_fork.txt",
+                (LINUX_O_CREAT | LINUX_O_RDWR) as i32,
+                0o644,
+            )
+            .save(1),
+        ),
+        // 3. Spawn sibling thread (tid 2)
         Step::Sys(sys::clone_thread(0).save(2)),
         Step::ChildMarker(vec![
-            // Sibling parks in FIFO open
-            Step::Sys(sys::openat(LINUX_AT_FDCWD, "/fifo_fork", LINUX_O_RDONLY as i32, 0).ret(3)),
-            Step::Sys(sys::close(3).ret(0)),
+            // Sibling parks in FIFO open -> reserves fd 4
+            Step::Sys(sys::openat(LINUX_AT_FDCWD, "/fifo_fork", LINUX_O_RDONLY as i32, 0).ret(4)),
+            Step::Sys(sys::close(4).ret(0)),
             Step::Sys(sys::exit_thread(0)),
         ]),
-        // 3. Leader awaits sibling parked on openat
+        // 4. Leader awaits sibling parked on openat
         await_parked(2, "openat"),
-        // 4. Leader confirms slot 3 is reserved in parent
-        Step::Sys(sys::dup3(0, 3, 0).errno(LINUX_EBUSY)),
-        // 5. Leader forks child process
+        // 5. Leader confirms slot 4 is reserved in parent
+        Step::Sys(sys::dup3(slot(1), 4, 0).errno(LINUX_EBUSY)),
+        // 6. Leader forks child process
         Step::Sys(sys::fork()),
         Step::ChildMarker(vec![
-            // Child process must NOT have slot 3 reserved; child open allocates lowest slot (fd 3)
+            // Child process must NOT have slot 4 reserved; child open allocates lowest slot (fd 4)
             Step::Sys(
                 sys::openat(
                     LINUX_AT_FDCWD,
@@ -692,16 +712,17 @@ fn test_fork_during_pending_fifo_open_allows_child_to_allocate_uncommitted_slot(
                     (LINUX_O_CREAT | LINUX_O_RDWR) as i32,
                     0o644,
                 )
-                .ret(3),
+                .ret(4),
             ),
-            Step::Sys(sys::close(3).ret(0)),
+            Step::Sys(sys::close(4).ret(0)),
             Step::Sys(sys::exit_group(0)),
         ]),
-        // 6. Leader waits for child process
+        // 7. Leader waits for child process
         Step::Sys(sys::wait4(last_child(), 0)),
-        // 7. Leader opens FIFO for write -> wakes sibling, leader gets slot 4
-        Step::Sys(sys::openat(LINUX_AT_FDCWD, "/fifo_fork", LINUX_O_WRONLY as i32, 0).ret(4)),
-        Step::Sys(sys::close(4).ret(0)),
+        // 8. Leader opens FIFO for write -> wakes sibling, leader gets slot 5
+        Step::Sys(sys::openat(LINUX_AT_FDCWD, "/fifo_fork", LINUX_O_WRONLY as i32, 0).ret(5)),
+        Step::Sys(sys::close(5).ret(0)),
+        Step::Sys(sys::close(slot(1)).ret(0)),
         Step::Sys(sys::exit_group(0)),
     ];
 
