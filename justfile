@@ -154,6 +154,7 @@ lint-domains:
     # base, and a discover run would turn that pre-existing red into a
     # blocked gate for every unrelated change.
     python3 -m unittest scripts/migrate/tests/test_reconcile_rename.py scripts/tests/test_rehome_line_pinned_inventories.py
+    python3 -m unittest scripts/tests/test_conformance_contract_policy.py
     python3 scripts/migrate/check-runtime-global-state.py --check
     python3 scripts/migrate/check-runtime-aborts.py --check
     python3 scripts/migrate/check-task-participant-witnesses.py --check

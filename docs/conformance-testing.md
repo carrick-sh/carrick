@@ -61,6 +61,14 @@ The harness has no CPU execution or guest signal handlers. Its results cover
 kernel semantics exercised by the scripts; guest instruction execution, VMM
 mappings, and runtime integration still require the signed differential gates.
 
+Every test for guest-visible behavior names its conformance contract. A contract
+binds the Linux-visible assertion to deterministic work budgets, so a correct
+value produced through pathological copying, polling, serialization, allocation,
+or backend amplification remains red. Run the structural inner loop through
+`just test-kernel`; signed embed and differential timing claims follow the
+instrumented-versus-uninstrumented evidence boundary in
+[`conformance-contracts.md`](conformance-contracts.md).
+
 ## CI evidence boundary
 
 Public pull requests run source, ABI, host-only kernel-semantic, and target

@@ -439,6 +439,13 @@ These are the rules this project has paid for. Each one names the failure that
 taught it; when you meet a new failure of the same shape, add it here, not to a
 memory file.
 
+### Guest-visible conformance contracts
+
+In Carrick, guest-visible correctness includes Linux semantics and non-pathological operational complexity. Before planning or implementing any change that can affect guest-visible behavior or cost, use [`.agents/skills/carrick-conformance-contract`](.agents/skills/carrick-conformance-contract/SKILL.md), identify the applicable contract, and add one red-first when none exists. Prove semantics and deterministic work budgets in the cheapest capable layer, then complete the applicable signed gates. A semantic pass cannot excuse a structural-budget or runtime-ratio failure. Do not weaken budgets, add retries, increase timeouts, reduce concurrency, poll, or serialize symptoms as closure.
+
+The full contract format, evidence ladder, exemption boundary, and commands live
+in [`docs/conformance-contracts.md`](docs/conformance-contracts.md).
+
 ### The two gates, in order
 
 **Correctness first, then "zero" overhead — and a pathological ratio IS a
