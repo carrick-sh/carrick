@@ -283,16 +283,14 @@ fn inherited_stdio_backpressure_and_pinning_in_host_wait() {
     // Background thread: waits for Task A to enter host wait, verifies CPU 0 is freed,
     // runs Task B on spare executor (MM mutation), then drains pipe to wake Task A.
     let drain_thread = thread::spawn(move || -> Result<(), String> {
-        // Poll host_wait_census until Task A enters host wait
         let start = Instant::now();
         loop {
-            if let Some(census) = worker_scheduler.host_wait_census() {
-                if census.entered >= 1
-                    && !census.slots.is_empty()
-                    && census.slots[0].waiters.len() == 1
-                {
-                    break;
-                }
+            if let Some(census) = worker_scheduler.host_wait_census()
+                && census.entered >= 1
+                && !census.slots.is_empty()
+                && census.slots[0].waiters.len() == 1
+            {
+                break;
             }
             if start.elapsed() > Duration::from_secs(5) {
                 return Err("timed out waiting for Task A to enter host wait".to_string());

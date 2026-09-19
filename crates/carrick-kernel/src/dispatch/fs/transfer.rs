@@ -789,28 +789,25 @@ impl<'a> FsView<'a> {
                             };
                             let res = write_host_pipe_owned(
                                 bytes_to_write,
-                                HostPipeWriteTarget {
-                                    host_signal: self.cross.host_signal(),
-                                    host_fd: host_fd.raw(),
-                                    host_fd_owner: Some(host_fd.clone()),
+                                HostPipeWriteTarget::new(
+                                    host_fd.raw(),
+                                    Some(host_fd.clone()),
                                     nonblocking,
-                                    write_kind: *write_kind,
-                                    pipe_state: self.host_pipe_capacity_state(
-                                        base,
-                                        *pipe_id,
-                                        *is_read_end,
-                                        *bidirectional,
-                                        host_fd.raw(),
-                                    ),
+                                    *write_kind,
                                     tid,
-                                    sigpipe_on_epipe: true,
-                                    authority: wait_authority,
-                                    socket_flow: None,
-                                    socket_cred: None,
-                                    is_stream: false,
-                                },
+                                    wait_authority,
+                                    self.cross.host_signal(),
+                                )
+                                .with_pipe_state(self.host_pipe_capacity_state(
+                                    base,
+                                    *pipe_id,
+                                    *is_read_end,
+                                    *bidirectional,
+                                    host_fd.raw(),
+                                ))
+                                .with_sigpipe(true),
                             );
-                            match res {
+                            match res.unwrap_or(DispatchOutcome::Errno { errno: LINUX_EINTR }) {
                                 DispatchOutcome::Returned { value } => {
                                     let total = usize::try_from(value)
                                         .ok()
@@ -847,21 +844,22 @@ impl<'a> FsView<'a> {
                         let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
                         return write_host_pipe_owned(
                             bytes.to_vec(),
-                            HostPipeWriteTarget {
-                                host_signal: self.cross.host_signal(),
-                                host_fd: host_fd.raw(),
-                                host_fd_owner: Some(host_fd.clone()),
+                            HostPipeWriteTarget::new(
+                                host_fd.raw(),
+                                Some(host_fd.clone()),
                                 nonblocking,
-                                write_kind: HostWriteKind::SocketLike,
-                                pipe_state: None,
+                                HostWriteKind::SocketLike,
                                 tid,
-                                sigpipe_on_epipe: false,
-                                authority: wait_authority,
-                                socket_flow: outbound_flow,
-                                socket_cred: Some(my_cred),
+                                wait_authority,
+                                self.cross.host_signal(),
+                            )
+                            .with_socket_flow(
+                                outbound_flow,
+                                Some(my_cred),
                                 is_stream,
-                            },
-                        );
+                            ),
+                        )
+                        .unwrap_or(DispatchOutcome::Errno { errno: LINUX_EINTR });
                     }
                     OpenDescription::InMemorySocket { socket, .. } => {
                         let socket = Arc::clone(socket);
@@ -915,21 +913,17 @@ impl<'a> FsView<'a> {
                         };
                         return write_host_pipe(
                             bytes,
-                            HostPipeWriteTarget {
-                                host_signal: self.cross.host_signal(),
-                                host_fd: host_fd.raw(),
-                                host_fd_owner: Some(host_fd.clone()),
+                            HostPipeWriteTarget::new(
+                                host_fd.raw(),
+                                Some(host_fd.clone()),
                                 nonblocking,
-                                write_kind: HostWriteKind::RegularFile,
-                                pipe_state: None,
+                                HostWriteKind::RegularFile,
                                 tid,
-                                sigpipe_on_epipe: false,
-                                authority: wait_authority,
-                                socket_flow: None,
-                                socket_cred: None,
-                                is_stream: false,
-                            },
-                        );
+                                wait_authority,
+                                self.cross.host_signal(),
+                            ),
+                        )
+                        .unwrap_or(DispatchOutcome::Errno { errno: LINUX_EINTR });
                     }
                     OpenDescription::File {
                         path,
@@ -1726,16 +1720,18 @@ impl<'a> FsView<'a> {
                     let bytes = &bytes[..room.map_or(bytes.len(), |room| bytes.len().min(room))];
                     Ok(this.splice_write_out(fd.0, 0, bytes, memory, tid, nonblocking))
                 }
-                VmDir::ReadHost(hfd, owner) => Ok(Self::read_host_pipe_iovecs(memory, &iovecs, HostPipeReadTarget {
-                    host_fd: hfd.get(),
-                    host_fd_owner: owner,
-                    nonblocking,
-                    authority: WaitFdAuthority::logical(
-                        this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                VmDir::ReadHost(hfd, owner) => Ok(Self::read_host_pipe_iovecs(
+                    memory,
+                    &iovecs,
+                    HostPipeReadTarget::new(
+                        hfd.get(),
+                        owner,
+                        nonblocking,
+                        WaitFdAuthority::logical(
+                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                        ),
                     ),
-                    socket_flow: None,
-                    is_stream: false,
-                })),
+                )?),
                 VmDir::ReadMem => {
                     let Some((pipe, status_flags)) = this.pipe_reader(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));

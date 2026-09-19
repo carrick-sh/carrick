@@ -11,7 +11,11 @@ use carrick_guest_mem::CurrentMmMemory;
 use super::pipe::{PipeWriteNotification, PipeWriteOperation};
 use super::*;
 use crate::dispatch::fd_table::{DirListing, HostFdRef, HostWriteKind, is_anon_overlay_path};
-use crate::dispatch::{HostPipeWriteTarget, WaitFdAuthority, write_host_pipe_owned};
+use crate::dispatch::io_pipe::{
+    HostPipeReadTarget, HostPipeWriteTarget, HostWaitRunner, read_host_pipe, read_host_pipe_at,
+    write_host_pipe, write_host_pipe_at, write_host_pipe_owned, write_host_pipe_owned_at,
+};
+use crate::dispatch::{SyscallHostWaitReleaser, WaitFdAuthority};
 use crate::kernel::FileSlotNumber;
 use crate::linux_abi::{
     LINUX_EAGAIN, LINUX_EBADF, LINUX_EFAULT, LINUX_EFBIG, LINUX_EINTR, LINUX_EINVAL, LINUX_ENXIO,
@@ -675,6 +679,14 @@ impl<'a> FsView<'a> {
             // cx.memory mutably below.
             let tid = Self::ctx_tid(cx);
             let memory = &mut *cx.memory;
+            let mut host_wait_releaser = SyscallHostWaitReleaser::new(
+                cx.kernel,
+                cx.host_wait,
+                cx.execution_lease,
+                cx.mm_executor.as_deref_mut(),
+            );
+            let host_wait_runner = host_wait_releaser.as_mut().map(|r| this.host_wait_runner(r));
+            let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
             // Guest's intended blocking mode for this fd; passed to the host-fd
             // read helper so a blocking-mode fd hands off to the lockless kqueue
             // wait on EAGAIN instead of blocking under the dispatcher lock. (read has no
@@ -703,14 +715,18 @@ impl<'a> FsView<'a> {
             // process's stdin is — file, pipe, or terminal).
             if fd.0 == 0 && !this.fd_table_contains(0) {
                 crate::dispatch::net::set_host_nonblocking(0);
-                return Ok(read_host_pipe(memory, address, length, HostPipeReadTarget {
-                    host_fd: 0,
-                    host_fd_owner: None,
-                    nonblocking,
-                    authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
-                    socket_flow: None,
-                    is_stream: false,
-                }));
+                return read_host_pipe(
+                    memory,
+                    address,
+                    length,
+                    HostPipeReadTarget::new(
+                        0,
+                        None,
+                        nonblocking,
+                        WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+                    )
+                    .with_host_wait(host_wait_ref),
+                );
             }
             let Ok(number) = FileSlotNumber::for_open_fd(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -994,16 +1010,20 @@ impl<'a> FsView<'a> {
                         }
                         return Ok(DispatchOutcome::returned_len_or_errno(staged.len()));
                     }
-                    let outcome = read_host_pipe(memory, address, length, HostPipeReadTarget {
-                        host_fd: host_fd_raw,
-                        host_fd_owner: Some(host_fd_owner),
-                        nonblocking,
-                        authority: WaitFdAuthority::logical(
-                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
-                        ),
-                        socket_flow: None,
-                        is_stream: false,
-                    });
+                    let outcome = read_host_pipe(
+                        memory,
+                        address,
+                        length,
+                        HostPipeReadTarget::new(
+                            host_fd_raw,
+                            Some(host_fd_owner),
+                            nonblocking,
+                            WaitFdAuthority::logical(
+                                this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                            ),
+                        )
+                        .with_host_wait(host_wait_ref),
+                    )?;
                     // Darwin reports EOF when the last pty slave closes;
                     // Linux's master read contract is EIO after any rescued
                     // tail has drained. Keep ordinary pipes and slave EOFs
@@ -1054,16 +1074,24 @@ impl<'a> FsView<'a> {
                 OpenDescription::HostSocket { host_fd, type_, .. } => {
                     let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
                     let flows = open_file.description.common().socket_flows();
-                    let res = read_host_pipe(memory, address, length, HostPipeReadTarget {
-                        host_fd: host_fd.raw(),
-                        host_fd_owner: Some(host_fd.clone()),
-                        nonblocking,
-                        authority: WaitFdAuthority::logical(
-                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
-                        ),
-                        socket_flow: flows.as_ref().map(|f| &f.inbound),
-                        is_stream,
-                    });
+                    let host_fd_raw = host_fd.raw();
+                    let host_fd_owner = host_fd.clone();
+                    drop(open);
+                    let res = read_host_pipe(
+                        memory,
+                        address,
+                        length,
+                        HostPipeReadTarget::new(
+                            host_fd_raw,
+                            Some(host_fd_owner),
+                            nonblocking,
+                            WaitFdAuthority::logical(
+                                this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                            ),
+                        )
+                        .with_socket_flow(flows.as_ref().map(|f| &f.inbound), is_stream)
+                        .with_host_wait(host_wait_ref),
+                    )?;
                     return Ok(res);
                 }
                 OpenDescription::InMemorySocket { socket, .. } => {
@@ -1112,16 +1140,23 @@ impl<'a> FsView<'a> {
                 // (shared across fork). read_host_pipe is just a
                 // memory-into-guest read(2) wrapper.
                 OpenDescription::HostFile { host_fd, .. } => {
-                    return Ok(read_host_pipe(memory, address, length, HostPipeReadTarget {
-                        host_fd: host_fd.raw(),
-                        host_fd_owner: Some(host_fd.clone()),
-                        nonblocking,
-                        authority: WaitFdAuthority::logical(
-                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
-                        ),
-                        socket_flow: None,
-                        is_stream: false,
-                    }));
+                    let host_fd_raw = host_fd.raw();
+                    let host_fd_owner = host_fd.clone();
+                    drop(open);
+                    return read_host_pipe(
+                        memory,
+                        address,
+                        length,
+                        HostPipeReadTarget::new(
+                            host_fd_raw,
+                            Some(host_fd_owner),
+                            nonblocking,
+                            WaitFdAuthority::logical(
+                                this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                            ),
+                        )
+                        .with_host_wait(host_wait_ref),
+                    );
                 }
             };
             memory.write_bytes(address, &bytes)?;
@@ -1139,8 +1174,16 @@ impl<'a> FsView<'a> {
             let iov = iov.0;
             let iovcnt =
                 usize::try_from(vlen).map_err(|_| DispatchError::LengthTooLarge(vlen))?;
-            let tid = cx.tid();
+            let tid = Self::ctx_tid(cx);
             let memory = &mut *cx.memory;
+            let mut host_wait_releaser = SyscallHostWaitReleaser::new(
+                cx.kernel,
+                cx.host_wait,
+                cx.execution_lease,
+                cx.mm_executor.as_deref_mut(),
+            );
+            let host_wait_runner = host_wait_releaser.as_mut().map(|r| this.host_wait_runner(r));
+            let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
             let iovecs = read_iovecs(memory, iov, iovcnt)?;
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -1163,47 +1206,40 @@ impl<'a> FsView<'a> {
             // offset). Fill each iovec sequentially.
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
                 let hfd = host_fd.raw();
-                if let Some(targets) = prepare_readv_targets(memory, &iovecs)? {
-                    if targets.host_iovecs.is_empty() {
-                        return Ok(DispatchOutcome::Returned { value: 0 });
-                    }
-                    let iovcnt =
-                        i32::try_from(targets.host_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
-                    let n = {
-                        let _host_write = carrick_guest_mem::HostWriteGuard::new(
-                            memory,
-                            &targets.guest_ranges,
-                        );
-                        unsafe { libc::readv(hfd, targets.host_iovecs.as_ptr(), iovcnt) }
-                    };
-                    let n = n.host_syscall_errno()?;
-                    return Ok(DispatchOutcome::returned_isize_or_errno(n));
-                }
-                let mut total = 0i64;
-                for iov in &iovecs {
-                    let len = usize::try_from(iov.iov_len)
-                        .map_err(|_| DispatchError::LengthTooLarge(iov.iov_len))?;
-                    if len == 0 {
-                        continue;
-                    }
-                    match read_host_pipe(memory, iov.iov_base, len, HostPipeReadTarget {
-                        host_fd: hfd,
-                        host_fd_owner: None,
-                        nonblocking: /*nonblocking=*/ false,
-                        authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
-                        socket_flow: None,
-                        is_stream: false,
-                    }) {
-                        DispatchOutcome::Returned { value } => {
-                            total += value;
-                            if (value as usize) < len {
-                                break;
-                            }
+                let owner = Some(host_fd.clone());
+                if host_wait_ref.is_none() {
+                    if let Some(targets) = prepare_readv_targets(memory, &iovecs)? {
+                        if targets.host_iovecs.is_empty() {
+                            return Ok(DispatchOutcome::Returned { value: 0 });
                         }
-                        other => return Ok(other),
+                        let iovcnt =
+                            i32::try_from(targets.host_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
+                        let n = {
+                            let _host_write = carrick_guest_mem::HostWriteGuard::new(
+                                memory,
+                                &targets.guest_ranges,
+                            );
+                            unsafe { libc::readv(hfd, targets.host_iovecs.as_ptr(), iovcnt) }
+                        };
+                        let n = n.host_syscall_errno()?;
+                        return Ok(DispatchOutcome::returned_isize_or_errno(n));
                     }
                 }
-                return Ok(DispatchOutcome::Returned { value: total });
+                drop(open);
+                let outcome = Self::read_host_pipe_iovecs(
+                    memory,
+                    &iovecs,
+                    HostPipeReadTarget::new(
+                        hfd,
+                        owner,
+                        false,
+                        WaitFdAuthority::logical(
+                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                        ),
+                    )
+                    .with_host_wait(host_wait_ref),
+                )?;
+                return Ok(outcome);
             }
             match &*open {
                 OpenDescription::HostPipe {
@@ -1239,16 +1275,19 @@ impl<'a> FsView<'a> {
                         }
                         return Ok(DispatchOutcome::returned_len_or_errno(read_len));
                     }
-                    let outcome = Self::read_host_pipe_iovecs(memory, &iovecs, HostPipeReadTarget {
-                        host_fd: hfd,
-                        host_fd_owner: owner,
-                        nonblocking,
-                        authority: WaitFdAuthority::logical(
-                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
-                        ),
-                        socket_flow: None,
-                        is_stream: false,
-                    });
+                    let outcome = Self::read_host_pipe_iovecs(
+                        memory,
+                        &iovecs,
+                        HostPipeReadTarget::new(
+                            hfd,
+                            owner,
+                            nonblocking,
+                            WaitFdAuthority::logical(
+                                this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                            ),
+                        )
+                        .with_host_wait(host_wait_ref),
+                    )?;
                     return Ok(match (pty_role, outcome) {
                         (
                             Some(crate::vfs::PtyRole {
@@ -1265,16 +1304,20 @@ impl<'a> FsView<'a> {
                     let owner = Some(host_fd.clone());
                     drop(open);
                     let flows = open_file.description.common().socket_flows();
-                    let res = Self::read_host_pipe_iovecs(memory, &iovecs, HostPipeReadTarget {
-                        host_fd: hfd,
-                        host_fd_owner: owner,
-                        nonblocking,
-                        authority: WaitFdAuthority::logical(
-                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
-                        ),
-                        socket_flow: flows.as_ref().map(|f| &f.inbound),
-                        is_stream,
-                    });
+                    let res = Self::read_host_pipe_iovecs(
+                        memory,
+                        &iovecs,
+                        HostPipeReadTarget::new(
+                            hfd,
+                            owner,
+                            nonblocking,
+                            WaitFdAuthority::logical(
+                                this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                            ),
+                        )
+                        .with_socket_flow(flows.as_ref().map(|f| &f.inbound), is_stream)
+                        .with_host_wait(host_wait_ref),
+                    )?;
                     return Ok(res);
                 }
                 OpenDescription::InMemorySocket { socket, .. } => {
@@ -1455,6 +1498,14 @@ impl<'a> FsView<'a> {
             let offset =
                 usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
             let memory = &mut *cx.memory;
+            let mut host_wait_releaser = SyscallHostWaitReleaser::new(
+                cx.kernel,
+                cx.host_wait,
+                cx.execution_lease,
+                cx.mm_executor.as_deref_mut(),
+            );
+            let host_wait_runner = host_wait_releaser.as_mut().map(|r| this.host_wait_runner(r));
+            let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
@@ -1473,24 +1524,26 @@ impl<'a> FsView<'a> {
             // Real host file: positional read via libc::pread (doesn't
             // disturb the shared kernel offset).
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
+                let host_fd_raw = host_fd.raw();
+                let host_fd_owner = host_fd.clone();
+                drop(open);
                 let length = length.min(crate::dispatch::MAX_RW_COUNT);
-                let mut buf = vec![0u8; length];
-                let n = unsafe {
-                    libc::pread(
-                        host_fd.raw(),
-                        buf.as_mut_ptr() as *mut _,
-                        length,
-                        offset as libc::off_t,
+                let outcome = read_host_pipe_at(
+                    memory,
+                    buffer,
+                    length,
+                    offset as i64,
+                    HostPipeReadTarget::new(
+                        host_fd_raw,
+                        Some(host_fd_owner),
+                        false,
+                        WaitFdAuthority::logical(
+                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                        ),
                     )
-                };
-                let n = match n.host_syscall_errno() {
-                    Ok(value) => value as usize,
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                };
-                if n > 0 && memory.write_bytes(buffer, &buf[..n]).is_err() {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
-                return Ok(DispatchOutcome::returned_len_or_errno(n));
+                    .with_host_wait(host_wait_ref),
+                )?;
+                return Ok(outcome);
             }
             let bytes = match &*open {
                 OpenDescription::Closed { .. } => {
@@ -1606,6 +1659,14 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
             }
             let memory = &mut *cx.memory;
+            let mut host_wait_releaser = SyscallHostWaitReleaser::new(
+                cx.kernel,
+                cx.host_wait,
+                cx.execution_lease,
+                cx.mm_executor.as_deref_mut(),
+            );
+            let host_wait_runner = host_wait_releaser.as_mut().map(|r| this.host_wait_runner(r));
+            let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
             let iovecs = read_iovecs(memory, iov, iovcnt)?;
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -1626,33 +1687,43 @@ impl<'a> FsView<'a> {
             // (kernel offset untouched).
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
                 let hfd = host_fd.raw();
-                if let Some(targets) = prepare_readv_targets(memory, &iovecs)? {
-                    if targets.host_iovecs.is_empty() {
-                        return Ok(DispatchOutcome::Returned { value: 0 });
-                    }
-                    let iovcnt =
-                        i32::try_from(targets.host_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
-                    let n = {
-                        let _host_write = carrick_guest_mem::HostWriteGuard::new(
-                            memory,
-                            &targets.guest_ranges,
-                        );
-                        unsafe {
-                            if read_at_current {
-                                libc::readv(hfd, targets.host_iovecs.as_ptr(), iovcnt)
-                            } else {
-                                libc::preadv(
-                                    hfd,
-                                    targets.host_iovecs.as_ptr(),
-                                    iovcnt,
-                                    offset as libc::off_t,
-                                )
-                            }
+                let host_fd_owner = host_fd.clone();
+                if host_wait_ref.is_none() {
+                    if let Some(targets) = prepare_readv_targets(memory, &iovecs)? {
+                        if targets.host_iovecs.is_empty() {
+                            return Ok(DispatchOutcome::Returned { value: 0 });
                         }
-                    };
-                    let n = n.host_syscall_errno()?;
-                    return Ok(DispatchOutcome::returned_isize_or_errno(n));
+                        let iovcnt =
+                            i32::try_from(targets.host_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
+                        let n = {
+                            let _host_write = carrick_guest_mem::HostWriteGuard::new(
+                                memory,
+                                &targets.guest_ranges,
+                            );
+                            unsafe {
+                                if read_at_current {
+                                    libc::readv(hfd, targets.host_iovecs.as_ptr(), iovcnt)
+                                } else {
+                                    libc::preadv(
+                                        hfd,
+                                        targets.host_iovecs.as_ptr(),
+                                        iovcnt,
+                                        offset as libc::off_t,
+                                    )
+                                }
+                            }
+                        };
+                        let n = n.host_syscall_errno()?;
+                        return Ok(DispatchOutcome::returned_isize_or_errno(n));
+                    }
                 }
+                drop(open);
+                let Some(wait_authority) = this
+                    .captured_slot_authority(fd.0)
+                    .map(WaitFdAuthority::logical)
+                else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
                 let mut total = 0i64;
                 let mut cur = offset;
                 for iov in &iovecs {
@@ -1661,29 +1732,28 @@ impl<'a> FsView<'a> {
                     if len == 0 {
                         continue;
                     }
-                    let mut buf = vec![0u8; len];
-                    // BLOCKING-IO-OK: hfd is an OpenDescription::HostFile (the
-                    // `if let HostFile` arm above; stdio returned ESPIPE earlier) —
-                    // a regular host file, never a pipe/socket/tty — so this read
-                    // cannot block the vCPU waiting on a peer.
-                    let n = unsafe {
-                        if read_at_current {
-                            libc::read(hfd, buf.as_mut_ptr() as *mut _, len)
-                        } else {
-                            libc::pread(hfd, buf.as_mut_ptr() as *mut _, len, cur as libc::off_t)
+                    let target = HostPipeReadTarget::new(
+                        hfd,
+                        Some(host_fd_owner.clone()),
+                        false,
+                        wait_authority.clone(),
+                    )
+                    .with_host_wait(host_wait_ref);
+                    let outcome = if read_at_current {
+                        read_host_pipe(memory, iov.iov_base, len, target)?
+                    } else {
+                        read_host_pipe_at(memory, iov.iov_base, len, cur as i64, target)?
+                    };
+                    match outcome {
+                        DispatchOutcome::Returned { value } => {
+                            total += value;
+                            cur += value as usize;
+                            if (value as usize) < len {
+                                break;
+                            }
                         }
-                    };
-                    let n = match n.host_syscall_errno() {
-                        Ok(value) => value as usize,
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                    };
-                    if n > 0 && memory.write_bytes(iov.iov_base, &buf[..n]).is_err() {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
-                    total += n as i64;
-                    cur += n;
-                    if n < len {
-                        break;
+                        DispatchOutcome::Errno { errno } => return Ok(DispatchOutcome::errno(errno)),
+                        other => return Ok(other),
                     }
                 }
                 return Ok(DispatchOutcome::Returned { value: total });
@@ -1765,6 +1835,7 @@ impl<'a> FsView<'a> {
             if offset < 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            let tid = Self::ctx_tid(cx);
             // A zero-length write never accesses the buffer — `pwrite(fd, NULL,
             // 0)` returns 0, NOT EFAULT (Linux checks count before touching the
             // buffer; LTP pwrite03). Only read guest memory when count > 0.
@@ -1778,6 +1849,8 @@ impl<'a> FsView<'a> {
                     }
                 }
             };
+            let host_wait_runner = this.host_wait_runner_for_ctx(cx);
+            let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
             if is_stdio_fd(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
             }
@@ -1815,6 +1888,7 @@ impl<'a> FsView<'a> {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
                 let raw_fd = host_fd.raw();
+                let host_fd_owner = host_fd.clone();
                 let old_len = if !is_append {
                     let mut st: libc::stat = unsafe { core::mem::zeroed() };
                     if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
@@ -1825,34 +1899,29 @@ impl<'a> FsView<'a> {
                 } else {
                     None
                 };
-                let n = unsafe {
-                    if is_append {
-                        // O_APPEND writes at EOF regardless of the offset, but
-                        // pwrite MUST leave the file offset untouched (pwrite04
-                        // checks lseek(SEEK_CUR) is unchanged). Save the offset,
-                        // seek to EOF, write, then restore. (The write goes
-                        // through write(), not pwrite(), which macOS rejects with
-                        // EINVAL on an O_APPEND fd.)
-                        let saved = libc::lseek(raw_fd, 0, libc::SEEK_CUR);
-                        libc::lseek(raw_fd, 0, libc::SEEK_END);
-                        // BLOCKING-IO-OK: HostFile fds are adopted O_NONBLOCK;
-                        // regular-file writes do not park on pipe/socket wait.
-                        let w = libc::write(raw_fd, bytes.as_ptr() as *const _, length);
-                        if saved >= 0 {
-                            libc::lseek(raw_fd, saved, libc::SEEK_SET);
-                        }
-                        w
-                    } else {
-                        libc::pwrite(
-                            raw_fd,
-                            bytes.as_ptr() as *const _,
-                            length,
-                            offset as libc::off_t,
-                        )
-                    }
+                drop(open);
+                let Some(wait_authority) = this
+                    .captured_slot_authority(fd.0)
+                    .map(WaitFdAuthority::logical)
+                else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
-                let n = n.host_syscall_errno()?;
-                if n > 0 {
+                let outcome = write_host_pipe_owned_at(
+                    bytes,
+                    offset,
+                    HostPipeWriteTarget::new(
+                        raw_fd,
+                        Some(host_fd_owner),
+                        false,
+                        HostWriteKind::RegularFile,
+                        tid,
+                        wait_authority,
+                        this.cross.host_signal(),
+                    )
+                    .with_append(is_append)
+                    .with_host_wait(host_wait_ref),
+                )?;
+                if let DispatchOutcome::Returned { value } = outcome && value > 0 {
                     if let Some(old_len) = old_len {
                         punch_unwritten_host_blocks(raw_fd, old_len, offset as u64)?;
                     }
@@ -1860,7 +1929,7 @@ impl<'a> FsView<'a> {
                     let write_offset = if is_append {
                         let mut st: libc::stat = unsafe { core::mem::zeroed() };
                         if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
-                            (st.st_size as u64).saturating_sub(n as u64)
+                            (st.st_size as u64).saturating_sub(value as u64)
                         } else {
                             offset as u64
                         }
@@ -1868,9 +1937,9 @@ impl<'a> FsView<'a> {
                         offset as u64
                     };
                     this.fs
-                        .record_host_sparse_write(raw_fd, write_offset, n as usize);
+                        .record_host_sparse_write(raw_fd, write_offset, value as usize);
                 }
-                return Ok(DispatchOutcome::returned_isize_or_errno(n));
+                return Ok(outcome);
             }
             // In-memory File (memfd / O_TMPFILE fallback): positional write into
             // the cached contents, honoring memfd write/grow seals. Previously an
@@ -2014,6 +2083,7 @@ impl<'a> FsView<'a> {
             let iov = iov.0;
             let iovcnt =
                 usize::try_from(vlen).map_err(|_| DispatchError::LengthTooLarge(vlen))?;
+            let tid = Self::ctx_tid(cx);
             let offset = i64::from_ne_bytes(pos_l.to_ne_bytes());
             // pwritev2 (canonical 287) treats offset == -1 as "use (and advance)
             // the current file offset" — writev semantics. Plain pwritev (70) has
@@ -2034,14 +2104,17 @@ impl<'a> FsView<'a> {
             {
                 return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
             }
-            let memory = &*cx.memory;
-            let iovecs = read_iovecs(memory, iov, iovcnt)?;
-            if offset < 0 && !write_at_current {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            let payloads = match prepare_pwritev_payloads(memory, &iovecs) {
-                Ok(payloads) => payloads,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            let (iovecs, payloads) = {
+                let memory = &*cx.memory;
+                let iovecs = read_iovecs(memory, iov, iovcnt)?;
+                if offset < 0 && !write_at_current {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                let payloads = match prepare_pwritev_payloads(memory, &iovecs) {
+                    Ok(payloads) => payloads,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
+                (iovecs, payloads)
             };
             if is_stdio_fd(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
@@ -2177,6 +2250,7 @@ impl<'a> FsView<'a> {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
                 let hfd = host_fd.raw();
+                let host_fd_owner = host_fd.clone();
                 let saved_offset =
                     is_append.then(|| unsafe { libc::lseek(hfd, 0, libc::SEEK_CUR) });
                 if is_append {
@@ -2200,34 +2274,45 @@ impl<'a> FsView<'a> {
                 } else {
                     None
                 };
-                if let PwritevPayloads::Borrowed(borrowed_iovecs) = &payloads {
-                    if borrowed_iovecs.is_empty() {
-                        return Ok(DispatchOutcome::Returned { value: 0 });
-                    }
-                    let iovcnt =
-                        i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
-                    let n = unsafe {
-                        if at_current {
-                            libc::writev(hfd, borrowed_iovecs.as_ptr(), iovcnt)
-                        } else {
-                            libc::pwritev(
-                                hfd,
-                                borrowed_iovecs.as_ptr(),
-                                iovcnt,
-                                offset as libc::off_t,
-                            )
+                let host_wait_runner = this.host_wait_runner_for_ctx(cx);
+                let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
+                if host_wait_ref.is_none() {
+                    if let PwritevPayloads::Borrowed(borrowed_iovecs) = &payloads {
+                        if borrowed_iovecs.is_empty() {
+                            return Ok(DispatchOutcome::Returned { value: 0 });
                         }
-                    };
-                    restore_offset(saved_offset);
-                    let n = n.host_syscall_errno()?;
-                    if n > 0 {
-                        if let Some(old_len) = old_len {
-                            punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
+                        let iovcnt =
+                            i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
+                        let n = unsafe {
+                            if at_current {
+                                libc::writev(hfd, borrowed_iovecs.as_ptr(), iovcnt)
+                            } else {
+                                libc::pwritev(
+                                    hfd,
+                                    borrowed_iovecs.as_ptr(),
+                                    iovcnt,
+                                    offset as libc::off_t,
+                                )
+                            }
+                        };
+                        restore_offset(saved_offset);
+                        let n = n.host_syscall_errno()?;
+                        if n > 0 {
+                            if let Some(old_len) = old_len {
+                                punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
+                            }
+                            this.invalidate_dentry_host_fd(hfd);
                         }
-                        this.invalidate_dentry_host_fd(hfd);
+                        return Ok(DispatchOutcome::returned_isize_or_errno(n));
                     }
-                    return Ok(DispatchOutcome::returned_isize_or_errno(n));
                 }
+                drop(open);
+                let Some(wait_authority) = this
+                    .captured_slot_authority(fd.0)
+                    .map(WaitFdAuthority::logical)
+                else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
                 let mut total = 0i64;
                 let mut cur = offset;
                 let PwritevPayloads::Staged(staged_iovecs) = &payloads else {
@@ -2238,22 +2323,38 @@ impl<'a> FsView<'a> {
                         continue;
                     }
                     let len = buf.len();
-                    // BLOCKING-IO-OK: hfd is an OpenDescription::HostFile (the
-                    // `if let HostFile` arm above; stdio returned ESPIPE earlier) —
-                    // a regular host file, never a pipe/socket/tty — so this write
-                    // cannot block the vCPU waiting on a peer.
-                    let n = unsafe {
-                        if at_current {
-                            libc::write(hfd, buf.as_ptr() as *const _, len)
-                        } else {
-                            libc::pwrite(hfd, buf.as_ptr() as *const _, len, cur as libc::off_t)
-                        }
+                    let target = HostPipeWriteTarget::new(
+                        hfd,
+                        Some(host_fd_owner.clone()),
+                        false,
+                        HostWriteKind::RegularFile,
+                        tid,
+                        wait_authority.clone(),
+                        this.cross.host_signal(),
+                    )
+                    .with_append(is_append)
+                    .with_host_wait(host_wait_ref);
+                    let outcome = if at_current {
+                        write_host_pipe(buf, target)?
+                    } else {
+                        write_host_pipe_at(buf, cur, target)?
                     };
-                    let n = n.host_syscall_errno()?;
-                    total += n as i64;
-                    cur += n as i64;
-                    if (n as usize) < len {
-                        break;
+                    match outcome {
+                        DispatchOutcome::Returned { value } => {
+                            total += value;
+                            cur += value;
+                            if (value as usize) < len {
+                                break;
+                            }
+                        }
+                        DispatchOutcome::Errno { errno } => {
+                            restore_offset(saved_offset);
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                        other => {
+                            restore_offset(saved_offset);
+                            return Ok(other);
+                        }
                     }
                 }
                 restore_offset(saved_offset);
@@ -2354,6 +2455,7 @@ impl<'a> FsView<'a> {
             let address = buf.0;
             let length =
                 usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
+            let tid = Self::ctx_tid(cx);
             // A zero-length write never accesses the buffer (write(fd, NULL, 0)
             // returns 0, not EFAULT) — only read guest memory when count > 0.
             let mut bytes = if length == 0 {
@@ -2438,7 +2540,6 @@ impl<'a> FsView<'a> {
                         OpenDescription::PipeWriter { pipe, .. } => {
                             let pipe = Arc::clone(pipe);
                             let flags = open_file.description.common().status_flags();
-                            let tid = cx.tid();
                             drop(open);
                             let Some(wait_authority) = this
                                 .captured_slot_authority(fd)
@@ -2535,29 +2636,30 @@ impl<'a> FsView<'a> {
                                     drop(open);
                                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                                 };
+                                let host_wait_runner = this.host_wait_runner_for_ctx(cx);
+                                let host_wait_ref =
+                                    host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
                                 let res = write_host_pipe_owned(
                                     bytes_to_write,
-                                    HostPipeWriteTarget {
-                                        host_signal: this.cross.host_signal(),
-                                        host_fd: host_fd.raw(),
-                                        host_fd_owner: Some(host_fd.clone()),
+                                    HostPipeWriteTarget::new(
+                                        host_fd.raw(),
+                                        Some(host_fd.clone()),
                                         nonblocking,
-                                        write_kind: *write_kind,
-                                        pipe_state: this.host_pipe_capacity_state(
-                                            base,
-                                            *pipe_id,
-                                            *is_read_end,
-                                            *bidirectional,
-                                            host_fd.raw(),
-                                        ),
-                                        tid: cx.tid(),
-                                        sigpipe_on_epipe: true,
-                                        authority: wait_authority,
-                                        socket_flow: None,
-                                        socket_cred: None,
-                                        is_stream: false,
-                                    },
-                                );
+                                        *write_kind,
+                                        tid,
+                                        wait_authority,
+                                        this.cross.host_signal(),
+                                    )
+                                    .with_pipe_state(this.host_pipe_capacity_state(
+                                        base,
+                                        *pipe_id,
+                                        *is_read_end,
+                                        *bidirectional,
+                                        host_fd.raw(),
+                                    ))
+                                    .with_sigpipe(true)
+                                    .with_host_wait(host_wait_ref),
+                                )?;
                                 match res {
                                     DispatchOutcome::Returned { value } => {
                                         let total = usize::try_from(value)
@@ -2611,23 +2713,23 @@ impl<'a> FsView<'a> {
                                 gid: creds.rgid,
                             };
                             let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
+                            let host_wait_runner = this.host_wait_runner_for_ctx(cx);
+                            let host_wait_ref =
+                                host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
                             let out = write_host_pipe_owned(
                                 bytes,
-                                HostPipeWriteTarget {
-                                    host_signal: this.cross.host_signal(),
-                                    host_fd: host_fd.raw(),
-                                    host_fd_owner: Some(host_fd.clone()),
+                                HostPipeWriteTarget::new(
+                                    host_fd.raw(),
+                                    Some(host_fd.clone()),
                                     nonblocking,
-                                    write_kind: HostWriteKind::SocketLike,
-                                    pipe_state: None,
-                                    tid: cx.tid(),
-                                    sigpipe_on_epipe: false,
-                                    authority: wait_authority,
-                                    socket_flow: outbound_flow,
-                                    socket_cred: Some(my_cred),
-                                    is_stream,
-                                },
-                            );
+                                    HostWriteKind::SocketLike,
+                                    tid,
+                                    wait_authority,
+                                    this.cross.host_signal(),
+                                )
+                                .with_socket_flow(outbound_flow, Some(my_cred), is_stream)
+                                .with_host_wait(host_wait_ref),
+                            )?;
                             // Signal-driven I/O readiness edge on the socket peer.
                             let written = match &out {
                                 DispatchOutcome::Returned { value } => *value,
@@ -2720,23 +2822,24 @@ impl<'a> FsView<'a> {
                                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
                             };
                             let raw_fd = host_fd.raw();
+                            let host_fd_owner = host_fd.clone();
+                            drop(open);
+                            let host_wait_runner = this.host_wait_runner_for_ctx(cx);
+                            let host_wait_ref =
+                                host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
                             let out = write_host_pipe_owned(
                                 bytes,
-                                HostPipeWriteTarget {
-                                    host_signal: this.cross.host_signal(),
-                                    host_fd: raw_fd,
-                                    host_fd_owner: Some(host_fd.clone()),
+                                HostPipeWriteTarget::new(
+                                    raw_fd,
+                                    Some(host_fd_owner),
                                     nonblocking,
-                                    write_kind: HostWriteKind::RegularFile,
-                                    pipe_state: None,
-                                    tid: cx.tid(),
-                                    sigpipe_on_epipe: false,
-                                    authority: wait_authority,
-                                    socket_flow: None,
-                                    socket_cred: None,
-                                    is_stream: false,
-                                },
-                            );
+                                    HostWriteKind::RegularFile,
+                                    tid,
+                                    wait_authority,
+                                    this.cross.host_signal(),
+                                )
+                                .with_host_wait(host_wait_ref),
+                            )?;
                             if let DispatchOutcome::Returned { value } = out && value > 0 {
                                 if let Some((old_len, pos)) = old_len {
                                     punch_unwritten_host_blocks(raw_fd, old_len, pos)?;
@@ -2963,6 +3066,7 @@ impl<'a> FsView<'a> {
         fn writev(this, cx, fd: Fd, iov: GuestPtr, vlen: u64) {
 
             let fd = fd.0;
+            let tid = Self::ctx_tid(cx);
             // memfd_secret: no file write method → EINVAL (memfdsecret probe).
             if this.fd_is_secretmem(fd) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -2970,8 +3074,7 @@ impl<'a> FsView<'a> {
             let iov = iov.0;
             let iovcnt =
                 usize::try_from(vlen).map_err(|_| DispatchError::LengthTooLarge(vlen))?;
-            let memory = &*cx.memory;
-            let iovecs = read_iovecs(memory, iov, iovcnt)?;
+            let iovecs = read_iovecs(&*cx.memory, iov, iovcnt)?;
             // A stdio fd the guest explicitly closed (and did not reopen) is
             // genuinely closed: writev is EBADF, not a host-stream/buffer write.
             if this.stdio_is_closed(fd) {
@@ -3079,7 +3182,7 @@ impl<'a> FsView<'a> {
 
             if let Some(target) = host_target
                 && let Some(GatheredIovecBytes { bytes, faulted }) =
-                    gather_bounded_iovec_bytes(memory, &iovecs)?
+                    gather_bounded_iovec_bytes(&*cx.memory, &iovecs)?
             {
                 if bytes.is_empty() {
                     // Nothing transferable: EFAULT only if the emptiness came
@@ -3115,23 +3218,25 @@ impl<'a> FsView<'a> {
                 else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
+                let host_wait_runner = this.host_wait_runner_for_ctx(cx);
+                let host_wait_ref =
+                    host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
                 let outcome = write_host_pipe_owned(
                     bytes,
-                    HostPipeWriteTarget {
-                        host_signal: this.cross.host_signal(),
-                        host_fd: target.host_fd,
-                        host_fd_owner: target.host_fd_owner.clone(),
+                    HostPipeWriteTarget::new(
+                        target.host_fd,
+                        target.host_fd_owner.clone(),
                         nonblocking,
-                        write_kind: target.write_kind,
-                        pipe_state: target.pipe_state,
-                        tid: cx.tid(),
-                        sigpipe_on_epipe: target.sigpipe_on_epipe,
-                        authority: wait_authority,
-                        socket_flow: target.socket_flow,
-                        socket_cred: target.socket_cred,
-                        is_stream: target.is_stream,
-                    },
-                );
+                        target.write_kind,
+                        tid,
+                        wait_authority,
+                        this.cross.host_signal(),
+                    )
+                    .with_pipe_state(target.pipe_state)
+                    .with_sigpipe(target.sigpipe_on_epipe)
+                    .with_socket_flow(target.socket_flow, target.socket_cred, target.is_stream)
+                    .with_host_wait(host_wait_ref),
+                )?;
                 if let DispatchOutcome::Returned { value } = outcome && value > 0 {
                     if let Some((old_len, pos)) = old_len {
                         punch_unwritten_host_blocks(target.host_fd, old_len, pos)?;
@@ -3156,7 +3261,7 @@ impl<'a> FsView<'a> {
                 if iov_len == 0 {
                     continue;
                 }
-                let mut bytes = match memory.read_bytes(iov_base, iov_len) {
+                let mut bytes = match (*cx.memory).read_bytes(iov_base, iov_len) {
                     Ok(bytes) => bytes,
                     Err(_) => {
                         // Bytes already written are already visible in the
@@ -3296,29 +3401,30 @@ impl<'a> FsView<'a> {
                                     else {
                                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                                     };
+                                    let host_wait_runner = this.host_wait_runner_for_ctx(cx);
+                                    let host_wait_ref =
+                                        host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
                                     let res = write_host_pipe_owned(
                                         bytes_to_write,
-                                        HostPipeWriteTarget {
-                                            host_signal: this.cross.host_signal(),
-                                            host_fd: host_fd.raw(),
-                                            host_fd_owner: Some(host_fd.clone()),
+                                        HostPipeWriteTarget::new(
+                                            host_fd.raw(),
+                                            Some(host_fd.clone()),
                                             nonblocking,
-                                            write_kind: *write_kind,
-                                            pipe_state: this.host_pipe_capacity_state(
-                                                base,
-                                                *pipe_id,
-                                                *is_read_end,
-                                                *bidirectional,
-                                                host_fd.raw(),
-                                            ),
-                                            tid: cx.tid(),
-                                            sigpipe_on_epipe: true,
-                                            authority: wait_authority,
-                                            socket_flow: None,
-                                            socket_cred: None,
-                                            is_stream: false,
-                                        },
-                                    );
+                                            *write_kind,
+                                            tid,
+                                            wait_authority,
+                                            this.cross.host_signal(),
+                                        )
+                                        .with_pipe_state(this.host_pipe_capacity_state(
+                                            base,
+                                            *pipe_id,
+                                            *is_read_end,
+                                            *bidirectional,
+                                            host_fd.raw(),
+                                        ))
+                                        .with_sigpipe(true)
+                                        .with_host_wait(host_wait_ref),
+                                    )?;
                                     match res {
                                         DispatchOutcome::Returned { value } => {
                                             let total = usize::try_from(value)
@@ -3357,23 +3463,23 @@ impl<'a> FsView<'a> {
                                     gid: creds.rgid,
                                 };
                                 let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
+                                let host_wait_runner = this.host_wait_runner_for_ctx(cx);
+                                let host_wait_ref =
+                                    host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
                                 outcome = write_host_pipe_owned(
                                     bytes,
-                                    HostPipeWriteTarget {
-                                        host_signal: this.cross.host_signal(),
-                                        host_fd: host_fd.raw(),
-                                        host_fd_owner: Some(host_fd.clone()),
+                                    HostPipeWriteTarget::new(
+                                        host_fd.raw(),
+                                        Some(host_fd.clone()),
                                         nonblocking,
-                                        write_kind: HostWriteKind::SocketLike,
-                                        pipe_state: None,
-                                        tid: cx.tid(),
-                                        sigpipe_on_epipe: false,
-                                        authority: wait_authority,
-                                        socket_flow: outbound_flow,
-                                        socket_cred: Some(my_cred),
-                                        is_stream,
-                                    },
-                                );
+                                        HostWriteKind::SocketLike,
+                                        tid,
+                                        wait_authority,
+                                        this.cross.host_signal(),
+                                    )
+                                    .with_socket_flow(outbound_flow, Some(my_cred), is_stream)
+                                    .with_host_wait(host_wait_ref),
+                                )?;
                                 writeback = None;
                             }
                             OpenDescription::InMemorySocket { socket, .. } => {
@@ -3419,28 +3525,29 @@ impl<'a> FsView<'a> {
                                 let Some(wait_authority) = this
                                     .captured_slot_authority(fd)
                                     .map(WaitFdAuthority::logical)
-                                else {
-                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                                };
+                                    else {
+                                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                                    };
+                                let raw_fd = host_fd.raw();
+                                let host_fd_owner = host_fd.clone();
+                                let host_wait_runner = this.host_wait_runner_for_ctx(cx);
+                                let host_wait_ref =
+                                    host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
                                 outcome = write_host_pipe_owned(
                                     bytes,
-                                    HostPipeWriteTarget {
-                                        host_signal: this.cross.host_signal(),
-                                        host_fd: host_fd.raw(),
-                                        host_fd_owner: Some(host_fd.clone()),
+                                    HostPipeWriteTarget::new(
+                                        raw_fd,
+                                        Some(host_fd_owner),
                                         nonblocking,
-                                        write_kind: HostWriteKind::RegularFile,
-                                        pipe_state: None,
-                                        tid: cx.tid(),
-                                        sigpipe_on_epipe: false,
-                                        authority: wait_authority,
-                                        socket_flow: None,
-                                        socket_cred: None,
-                                        is_stream: false,
-                                    },
-                                );
+                                        HostWriteKind::RegularFile,
+                                        tid,
+                                        wait_authority,
+                                        this.cross.host_signal(),
+                                    )
+                                    .with_host_wait(host_wait_ref),
+                                )?;
                                 if let DispatchOutcome::Returned { value } = outcome && value > 0 {
-                                    this.invalidate_dentry_host_fd(host_fd.raw());
+                                    this.invalidate_dentry_host_fd(raw_fd);
                                 }
                                 writeback = None;
                             }
@@ -3558,7 +3665,7 @@ impl<'a> FsView<'a> {
                             if remaining_len == 0 {
                                 continue;
                             }
-                            match memory.read_bytes(remaining.iov_base, remaining_len) {
+                            match (*cx.memory).read_bytes(remaining.iov_base, remaining_len) {
                                 Ok(bytes) => tail.extend_from_slice(&bytes),
                                 Err(_) => {
                                     // The pipe iterator commits full guest-page
