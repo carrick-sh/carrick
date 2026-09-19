@@ -89,7 +89,8 @@ pub(crate) static CARRIER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex
 pub use builder::{Container, ContainerBuilder, StdioConfig};
 pub use carrier::Carrier;
 pub use contracts::{
-    futex_contention_contract, run_futex_structural_contract, run_futex_timing_contract,
+    futex_contention_contract, futex_requeue_contract, run_futex_requeue_structural_contract,
+    run_futex_requeue_timing_contract, run_futex_structural_contract, run_futex_timing_contract,
 };
 pub use error::{BuildError, EmbedError};
 pub use prepared::PreparedContainer;

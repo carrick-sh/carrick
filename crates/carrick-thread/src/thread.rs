@@ -1716,6 +1716,7 @@ impl FutexTable {
         let mut to_wake = nr_wake.saturating_sub(woken_listeners);
         let mut to_mark = nr_requeue;
         let mut marked = 0u32;
+        let marked_tokens = std::cell::RefCell::new(Vec::new());
         let result = unsafe {
             parking_lot_core::unpark_filter(
                 key_from,
@@ -1727,24 +1728,38 @@ impl FutexTable {
                     if to_mark > 0 {
                         to_mark -= 1;
                         marked += 1;
-                        // Published while the bucket lock is held, so the waiter
-                        // cannot run and miss it. The destination counts it as a
-                        // claimant immediately, so a wake there reaches it even
-                        // while its own enrollment still says the source.
-                        if self
-                            .requeue_redirects
-                            .lock()
-                            .insert(token.0 as u64, to)
-                            .is_none()
-                        {
-                            self.outstanding_redirects.fetch_add(1, Ordering::AcqRel);
-                            to_bucket.pending_redirects.fetch_add(1, Ordering::AcqRel);
-                        }
+                        marked_tokens.borrow_mut().push(token.0 as u64);
                         return FilterOp::Skip;
                     }
                     FilterOp::Stop
                 },
-                |_| UnparkToken(FUTEX_WAKE_TOKEN),
+                |_| {
+                    // Published while the bucket lock is held, so the waiter
+                    // cannot run and miss it. The destination counts it as a
+                    // claimant immediately, so a wake there reaches it even
+                    // while its own enrollment still says the source.
+                    // Batch insertion under a single mutex acquisition avoids
+                    // O(N) lock acquisitions during condvar broadcast.
+                    let tokens = marked_tokens.borrow();
+                    if !tokens.is_empty() {
+                        let mut redirects = self.requeue_redirects.lock();
+                        redirects.reserve(tokens.len());
+                        let mut added = 0usize;
+                        for &tok in tokens.iter() {
+                            if redirects.insert(tok, to).is_none() {
+                                added += 1;
+                            }
+                        }
+                        if added > 0 {
+                            self.outstanding_redirects
+                                .fetch_add(added, Ordering::AcqRel);
+                            to_bucket
+                                .pending_redirects
+                                .fetch_add(added, Ordering::AcqRel);
+                        }
+                    }
+                    UnparkToken(FUTEX_WAKE_TOKEN)
+                },
             )
         };
         let woken = (result.unparked_threads as u32 + woken_listeners).min(nr_wake);
@@ -1809,22 +1824,39 @@ impl FutexTable {
         // concurrent wake on `to` misses it. A marked waiter that a broadcast
         // reaches first moves itself via its redirect instead; either way it
         // lands on `to`, which is why the count returned is the MARKED count.
-        let mut relinked = 0u32;
-        while relinked < marked {
-            let res: UnparkResult = unsafe {
-                parking_lot_core::unpark_requeue(
-                    key_from,
-                    key_to,
-                    || RequeueOp::RequeueOne,
-                    |_, _| UnparkToken(FUTEX_WAKE_TOKEN),
-                )
-            };
-            if res.requeued_threads == 0 {
-                break;
+        if marked > 0 {
+            if to_mark > 0 {
+                // When to_mark > 0, unpark_filter traversed all remaining waiters on
+                // key_from and marked every one of them without hitting the requeue limit.
+                // RequeueAll splices the entire remaining list onto to's bucket in a
+                // single O(1) pointer swap with a single bucket-pair lock acquisition.
+                let _res: UnparkResult = unsafe {
+                    parking_lot_core::unpark_requeue(
+                        key_from,
+                        key_to,
+                        || RequeueOp::RequeueAll,
+                        |_, _| UnparkToken(FUTEX_WAKE_TOKEN),
+                    )
+                };
+            } else {
+                // Bounded requeue where unpark_filter stopped early: relink exactly
+                // `marked` waiters one by one.
+                let mut relinked = 0u32;
+                while relinked < marked {
+                    let res: UnparkResult = unsafe {
+                        parking_lot_core::unpark_requeue(
+                            key_from,
+                            key_to,
+                            || RequeueOp::RequeueOne,
+                            |_, _| UnparkToken(FUTEX_WAKE_TOKEN),
+                        )
+                    };
+                    if res.requeued_threads == 0 {
+                        break;
+                    }
+                    relinked += res.requeued_threads as u32;
+                }
             }
-            relinked += res.requeued_threads as u32;
-            // `have_more_threads` is deliberately NOT consulted: it was observed
-            // reporting "none left" with ~900 waiters still enrolled.
         }
         (woken, (marked + requeued_listeners).min(nr_requeue))
     }

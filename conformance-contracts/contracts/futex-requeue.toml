@@ -1,0 +1,36 @@
+schema_version = 1
+id = "kernel.futex.requeue"
+title = "Futex CMP_REQUEUE batch operation"
+guest_surfaces = ["syscall:futex", "scheduler:continuation", "runtime:platform-futex"]
+semantic_authority = [
+  "man 2 futex",
+  "conformance-probes/probe-inventory.json:futexrequeue",
+]
+fixture = "probe:futexrequeue"
+scale_points = [1, 8, 32, 128]
+rationale = "Requeue operations must move waiters between queues with work proportional to the moved waiter set and bounded lock acquisitions."
+
+[bindings]
+vm_free = "carrick-kernel-example::futex_requeue_contract"
+embed = "carrick-embed::futex_requeue_contract"
+docker = "probe:futexrequeue"
+ecosystem = ["ltp:futex_cmp_requeue01"]
+
+[[structural_budgets]]
+kind = "affine"
+metric = "continuation_enrollments"
+base = 0
+per_unit = 1
+rationale = "Each blocking waiter enrolls exactly once before parking."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "futex_queue_visits"
+base = 1
+per_unit = 2
+rationale = "Requeue inspects the source queue head and moves waiters; destination wake inspects the destination queue head and wakes the requeued set."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20

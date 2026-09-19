@@ -784,6 +784,9 @@
   },
   "futexrequeue": {
     "class": "conformance",
+    "contract_ids": [
+      "kernel.futex.requeue"
+    ],
     "excluded": false,
     "runner": "generic"
   },

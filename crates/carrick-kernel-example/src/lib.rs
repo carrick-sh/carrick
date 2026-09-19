@@ -46,7 +46,10 @@ pub mod report;
 pub mod scripted;
 pub mod sys;
 
-pub use contracts::{futex_contention_contract, futex_contention_scenario};
+pub use contracts::{
+    futex_contention_contract, futex_contention_scenario, futex_requeue_contract,
+    futex_requeue_scenario,
+};
 pub use driver::{block_on_timeout, seed_initial_task_state};
 pub use memory::{GUEST_BASE, GUEST_LEN, TaskMemory};
 pub use operand::{
