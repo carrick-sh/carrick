@@ -35,3 +35,23 @@ contracts = ["kernel.futex.contention"]
 [[surfaces]]
 path = "conformance-probes/src/bin/futexrequeue.rs"
 contracts = ["kernel.futex.requeue"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/objects.rs"
+contracts = ["kernel.fork.filetable"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/objects/task.rs"
+contracts = ["kernel.fork.filetable"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/operations.rs"
+contracts = ["kernel.fork.filetable"]
+
+[[surfaces]]
+path = "conformance-probes/src/bin/forkfiletable.rs"
+contracts = ["kernel.fork.filetable"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/semantics/fork_scaling.rs"
+contracts = ["kernel.fork.filetable"]

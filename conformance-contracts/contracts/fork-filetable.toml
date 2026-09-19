@@ -1,0 +1,36 @@
+schema_version = 1
+id = "kernel.fork.filetable"
+title = "Fork file table copy scaling"
+guest_surfaces = ["syscall:clone", "syscall:fork", "kernel:filetable"]
+semantic_authority = [
+  "man 2 fork",
+  "man 2 clone",
+  "conformance-probes/probe-inventory.json:forkfiletable",
+]
+fixture = "probe:forkfiletable"
+scale_points = [1, 8, 32, 128]
+rationale = "Fork file-table copy cost must scale affinely with populated descriptors, avoiding redundant scans across unallocated descriptor space or unneeded allocations."
+
+[bindings]
+vm_free = "carrick-kernel-example::fork_filetable_contract"
+embed = "carrick-embed::fork_filetable_contract"
+docker = "probe:forkfiletable"
+ecosystem = ["ltp:fork14", "ltp:fork09", "cpython:multiprocessing_fork"]
+
+[[structural_budgets]]
+kind = "exact"
+metric = "task_admissions"
+value = 1
+rationale = "Each fork admits exactly one child task into the kernel."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "guest_memory_copy_bytes"
+base = 96
+per_unit = 32
+rationale = "File table copy memory is affine in populated descriptor count (32 bytes per slot plus 3 stdio slots)."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20

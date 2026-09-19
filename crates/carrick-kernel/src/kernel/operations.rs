@@ -491,6 +491,15 @@ impl ForkReservation {
             self.plan,
             self.kernel.object_ids(),
         )?);
+        if self.plan.files() == CloneObjectMode::Copy
+            && let Some(scope) = self.kernel.work_scope()
+        {
+            let open_files_len = child_resources.files().slot_count();
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::GuestMemoryCopyBytes,
+                96 + (open_files_len as u64) * 32,
+            );
+        }
         drop(file_table_freeze);
         let child_key = TaskKey {
             id: self.child_id,

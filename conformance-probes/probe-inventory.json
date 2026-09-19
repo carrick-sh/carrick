@@ -641,6 +641,9 @@
   },
   "forkfiletable": {
     "class": "conformance",
+    "contract_ids": [
+      "kernel.fork.filetable"
+    ],
     "excluded": false,
     "runner": "generic"
   },

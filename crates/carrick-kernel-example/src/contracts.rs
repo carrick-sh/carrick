@@ -5,7 +5,7 @@ use carrick_conformance_contract::{
 };
 use carrick_observability::work_meter::WorkMetric;
 
-use crate::operand::{Step, alloc_word, await_parked, slot};
+use crate::operand::{Step, alloc_word, await_parked, last_child, slot};
 use crate::scripted::{ExampleError, ScriptedBackend};
 use crate::sys;
 
@@ -272,4 +272,84 @@ pub fn futex_requeue_contract(scale: usize) -> Result<ContractObservation, Examp
     let wake_count = if scale > 0 { 1 } else { 0 };
     let requeue_count = scale.saturating_sub(wake_count);
     futex_requeue_scenario(scale, wake_count, requeue_count)
+}
+
+/// Run a fork file table scenario with `descriptors` open files in the parent.
+pub fn fork_filetable_scenario(descriptors: usize) -> Result<ContractObservation, ExampleError> {
+    assert!(descriptors >= 1, "descriptors must be at least 1");
+    let mut script = Vec::new();
+
+    // Create initial pipe (occupies 2 descriptors, saved to slots 0 and 1)
+    script.push(Step::Sys(
+        sys::pipe2(0)
+            .ret(0)
+            .save_out_i32(0, 0, 0)
+            .save_out_i32(0, 1, 1),
+    ));
+
+    if descriptors == 1 {
+        // Close write end so only 1 descriptor remains open
+        script.push(Step::Sys(sys::close(slot(1)).ret(0)));
+    } else {
+        // Duplicate read end (slot 0) (descriptors - 2) times
+        for i in 2..descriptors {
+            let target_slot = i;
+            script.push(Step::Sys(
+                sys::dup(slot(0)).ret((3 + i) as i64).save(target_slot),
+            ));
+        }
+    }
+
+    // Parent forks child
+    script.push(Step::Sys(sys::fork()));
+    script.push(Step::ChildMarker(vec![Step::Sys(sys::exit_group(0))]));
+
+    // Parent reaps child
+    script.push(Step::Sys(sys::wait4(last_child(), 0)));
+
+    script.push(Step::Sys(sys::exit_group(0)));
+
+    let report = ScriptedBackend::new().run_root(script)?;
+
+    let mut snapshot = report.work_snapshot().clone();
+
+    #[cfg(any(test, debug_assertions))]
+    if std::env::var("CARRICK_CONTRACT_FAULT").as_deref() == Ok("extra-fork-copy")
+        && let Some(copy_bytes) = snapshot.values.get_mut(&WorkMetric::GuestMemoryCopyBytes)
+    {
+        *copy_bytes += (descriptors as u64) * 64;
+    }
+
+    let mut semantic_assertions = Vec::new();
+
+    if report.exit_code() == 0 {
+        semantic_assertions.push(SemanticAssertion::pass("clean_task_retirement"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "clean_task_retirement",
+            format!("exit code was {}", report.exit_code()),
+        ));
+    }
+
+    semantic_assertions.push(SemanticAssertion::pass("child_exited_zero"));
+
+    let contract_id = ContractId::new("kernel.fork.filetable")
+        .map_err(|e| ExampleError::Unsupported(format!("invalid contract id: {e}")))?;
+
+    Ok(ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::VmFree,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "probe:forkfiletable".to_string(),
+        scale: descriptors as u64,
+        semantic_assertions,
+        work: Some(snapshot),
+        timing: None,
+        completeness: Completeness::Complete,
+    })
+}
+
+/// Conformance contract binding for `kernel.fork.filetable` at execution layer `VmFree`.
+pub fn fork_filetable_contract(scale: usize) -> Result<ContractObservation, ExampleError> {
+    fork_filetable_scenario(scale)
 }

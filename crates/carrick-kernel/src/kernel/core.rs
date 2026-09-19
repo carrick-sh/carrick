@@ -513,6 +513,7 @@ pub struct Kernel {
     /// readiness for the per-thread host pending slot. One per kernel (per
     /// VM): the bridge is carrier-wide glue, so every task shares it.
     host_signal: Arc<dyn HostSignalBridge>,
+    work_scope: RwLock<Option<carrick_observability::work_meter::WorkScope>>,
 }
 
 /// A fully constructed container-init graph that is still invisible to the
@@ -1425,6 +1426,7 @@ impl Kernel {
             },
             abort_reason: Arc::new(Mutex::new(None)),
             unpublished_jobs: AtomicUsize::new(0),
+            work_scope: RwLock::new(None),
         });
         container.bind_kernel(&kernel);
         let diag_name = &bootstrap.diagnostic_name;
@@ -1440,6 +1442,14 @@ impl Kernel {
         );
         let context = KernelContext::capture(kernel.clone(), task, leader, TaskRevision::INITIAL);
         Ok((kernel, context))
+    }
+
+    pub fn set_work_scope(&self, scope: carrick_observability::work_meter::WorkScope) {
+        *self.work_scope.write() = Some(scope);
+    }
+
+    pub fn work_scope(&self) -> Option<carrick_observability::work_meter::WorkScope> {
+        self.work_scope.read().clone()
     }
 
     pub fn auditors(&self) -> Arc<crate::observe::auditor::AuditorChain> {
@@ -1924,6 +1934,12 @@ impl Kernel {
         resources: &Arc<ThreadResources>,
         publication: TaskRevision,
     ) {
+        if let Some(scope) = self.work_scope.read().as_ref() {
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::TaskAdmissions,
+                1,
+            );
+        }
         self.observations
             .lock()
             .register_task(task, thread, shared, resources, publication);
