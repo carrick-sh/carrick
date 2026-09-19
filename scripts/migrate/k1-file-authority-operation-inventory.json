@@ -12117,7 +12117,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/inotify.rs",
-      "line": 1566,
+      "line": 1563,
       "categories": [
         "epoll"
       ],
@@ -18508,7 +18508,7 @@
     },
     {
       "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-      "line": 5823,
+      "line": 5838,
       "categories": [
         "mapping"
       ],

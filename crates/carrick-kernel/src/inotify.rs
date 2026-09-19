@@ -1103,7 +1103,7 @@ impl InotifyRegistry {
         state: &std::sync::Arc<InotifyState>,
     ) -> Option<i32> {
         let key = normalize_watch_path(path);
-        self.by_path.read().get(&key).and_then(|watches| {
+        self.by_path.read().get(key).and_then(|watches| {
             watches
                 .iter()
                 .find(|watch| std::sync::Arc::ptr_eq(&watch.state, state))
@@ -1122,7 +1122,7 @@ impl InotifyRegistry {
     ) {
         let key = normalize_watch_path(path);
         let mut by_path = self.by_path.write();
-        let entry = by_path.entry(key).or_default();
+        let entry = by_path.entry(key.to_owned()).or_default();
         // Re-adding the same (instance, wd) updates the mask in place (inotify
         // returns the same wd for a re-add and replaces the mask).
         if let Some(existing) = entry
@@ -1166,7 +1166,7 @@ impl InotifyRegistry {
     /// watches on the parent or on children.
     pub(crate) fn unregister_path(&self, path: &str) {
         let key = normalize_watch_path(path);
-        self.by_path.write().remove(&key);
+        self.by_path.write().remove(key);
     }
 
     /// Move a watch from `from` to `to` (a `rename(2)` of a watched object):
@@ -1181,8 +1181,8 @@ impl InotifyRegistry {
             return;
         }
         let mut by_path = self.by_path.write();
-        if let Some(watches) = by_path.remove(&from_key) {
-            by_path.insert(to_key, watches);
+        if let Some(watches) = by_path.remove(from_key) {
+            by_path.insert(to_key.to_owned(), watches);
         }
     }
 
@@ -1197,7 +1197,7 @@ impl InotifyRegistry {
     /// file, or the directory-self form. `name` is `None` (self events carry no
     /// basename). `is_dir` sets `IN_ISDIR`.
     pub(crate) fn notify_self(&self, path: &str, mask: u32, is_dir: bool) {
-        self.dispatch(&normalize_watch_path(path), mask, is_dir, None, 0, false);
+        self.dispatch(normalize_watch_path(path), mask, is_dir, None, 0, false);
     }
 
     /// Emit a *child* event on the directory containing `path`: e.g. an
@@ -1342,7 +1342,9 @@ impl InotifyRegistry {
                 &mut fired_oneshot,
             );
         }
-        self.retire_oneshot(fired_oneshot);
+        if !fired_oneshot.is_empty() {
+            self.retire_oneshot(fired_oneshot);
+        }
     }
 
     /// Retire every `IN_ONESHOT` watch that just delivered its single event:
@@ -1425,16 +1427,11 @@ fn dispatch_in(
     }
 }
 
-/// Normalize a guest path to the registry key form: collapse to an absolute
-/// path without a trailing slash (except root). Watches and lookups must agree
+/// Normalize a watch path: collapse any trailing slashes so watches and events match
 /// on the exact key, so both sides route through this.
-fn normalize_watch_path(path: &str) -> String {
+fn normalize_watch_path(path: &str) -> &str {
     let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        "/".to_owned()
-    } else {
-        trimmed.to_owned()
-    }
+    if trimmed.is_empty() { "/" } else { trimmed }
 }
 
 /// Split a normalized path into `(parent, basename)`. Root and bare names map to
