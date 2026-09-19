@@ -87,3 +87,43 @@ contracts = ["kernel.inotify.watch"]
 [[surfaces]]
 path = "crates/carrick-kernel-example/tests/semantics/inotify_watch.rs"
 contracts = ["kernel.inotify.watch"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/scheduler/host_wait.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/scheduler.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/host_io.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/net/epoll_ops/write_rearm.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/io_pipe.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/scheduler_handoff.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/host_wait_cancellation.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/stdio_host_wait_contention.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/stdio_inherited_backpressure.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/host_wait_policy.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]

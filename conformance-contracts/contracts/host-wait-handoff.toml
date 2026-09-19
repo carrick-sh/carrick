@@ -1,0 +1,37 @@
+schema_version = 1
+id = "kernel.scheduler.host-wait-handoff"
+title = "Host-wait scheduler handoff"
+guest_surfaces = [
+  "scheduler:host_wait",
+  "syscall:read",
+  "syscall:write",
+  "syscall:pread64",
+  "syscall:pwrite64",
+  "syscall:fsync",
+  "syscall:fdatasync",
+]
+semantic_authority = [
+  "man 2 write",
+  "man 2 read",
+  "man 2 fsync",
+]
+fixture = "scheduler_handoff"
+scale_points = [1, 2, 4, 8]
+rationale = "A host wait must relinquish guest CPU ownership without relinquishing the waiting task's exact execution generation or moving its thread-affine vCPU, keeping guest CPUs available when host operations block."
+
+[bindings]
+vm_free = "carrick-kernel-example::scheduler_handoff"
+embed = "carrick-embed::host_wait_policy"
+docker = "probe:hostwaithandoff"
+ecosystem = ["cpython:io", "go:os"]
+
+[[structural_budgets]]
+kind = "exact"
+metric = "vcpu_migrations"
+value = 0
+rationale = "Host-wait transitions never migrate a thread-affine vCPU to another host thread."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20
