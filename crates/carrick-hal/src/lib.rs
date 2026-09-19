@@ -113,8 +113,10 @@ pub use x8664_arch::{
 };
 pub mod scheduler;
 pub use scheduler::{
-    CpuAffinity, CpuLoad, CpuQueueView, GuestCpuId, GuestCpuPolicy, MAX_GUEST_CPUS,
-    PreemptOrContinue, SchedProcessId, SchedThreadId, SchedulingPolicy, TaskPlacement,
+    BudgetError, ContentionContext, CpuAffinity, CpuLoad, CpuQueueView, DEFAULT_RUN_BUDGET,
+    DispatchContext, GuestCpuId, GuestCpuPolicy, MAX_GUEST_CPUS, MAX_RUN_BUDGET, MIN_RUN_BUDGET,
+    PreemptionAction, RunBudget, SchedProcessId, SchedThreadId, SchedulingEvent,
+    SchedulingEventKind, SchedulingPolicy, SchedulingStopReason, TaskPlacement,
 };
 pub mod vcpu_census;
 pub use vcpu_census::{VcpuCensus, VcpuLiveGuard};

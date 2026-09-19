@@ -655,7 +655,7 @@ where
                     executor_id,
                     ExecutorPoolEvent::OrdinarySyscall { thread, generation },
                 );
-                if scheduler.need_resched() {
+                if scheduler.should_preempt(&running) {
                     break 'quantum (ExecutorExit::Preempted, settlement_auth);
                 }
                 continue 'quantum;

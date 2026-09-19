@@ -9,6 +9,7 @@
 
 use std::cmp;
 use std::fmt;
+use std::time::Duration;
 
 /// The number of guest CPUs (`P`s) the run queue can address.
 ///
@@ -268,11 +269,152 @@ impl TaskPlacement<'_> {
     }
 }
 
-/// The answer [`SchedulingPolicy::on_tick`] gives about the running task.
+/// Error returned when a requested [`RunBudget`] duration is outside accepted bounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PreemptOrContinue {
+pub enum BudgetError {
+    TooSmall { min: Duration, requested: Duration },
+    TooLarge { max: Duration, requested: Duration },
+}
+
+impl fmt::Display for BudgetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooSmall { min, requested } => {
+                write!(f, "quantum {requested:?} is below minimum {min:?}")
+            }
+            Self::TooLarge { max, requested } => {
+                write!(f, "quantum {requested:?} exceeds maximum {max:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BudgetError {}
+
+/// The minimum run budget a policy may grant (1 ms).
+pub const MIN_RUN_BUDGET: Duration = Duration::from_millis(1);
+/// The maximum run budget a policy may grant (100 ms).
+pub const MAX_RUN_BUDGET: Duration = Duration::from_millis(100);
+/// The default run budget granted to dispatched tasks (4 ms).
+pub const DEFAULT_RUN_BUDGET: Duration = Duration::from_millis(4);
+
+/// Validated, nonzero execution duration granted to a dispatched task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RunBudget {
+    quantum: Duration,
+}
+
+impl RunBudget {
+    /// Constructs a budget with the requested quantum, validated against
+    /// [`MIN_RUN_BUDGET`] and [`MAX_RUN_BUDGET`].
+    pub fn new(quantum: Duration) -> Result<Self, BudgetError> {
+        if quantum < MIN_RUN_BUDGET {
+            return Err(BudgetError::TooSmall {
+                min: MIN_RUN_BUDGET,
+                requested: quantum,
+            });
+        }
+        if quantum > MAX_RUN_BUDGET {
+            return Err(BudgetError::TooLarge {
+                max: MAX_RUN_BUDGET,
+                requested: quantum,
+            });
+        }
+        Ok(Self { quantum })
+    }
+
+    pub const fn quantum(&self) -> Duration {
+        self.quantum
+    }
+}
+
+impl Default for RunBudget {
+    fn default() -> Self {
+        Self {
+            quantum: DEFAULT_RUN_BUDGET,
+        }
+    }
+}
+
+/// Context provided to a policy when a task is dispatched to an executor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchContext {
+    pub thread: SchedThreadId,
+    pub process: SchedProcessId,
+    pub cpu: GuestCpuId,
+    pub load: CpuLoad,
+}
+
+/// Context provided to a policy when contention arises for a CPU with a running task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContentionContext {
+    pub running: DispatchContext,
+    pub residency_elapsed: Duration,
+    pub eligible_queued: usize,
+}
+
+/// The answer [`SchedulingPolicy::on_contention`] gives about the running task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreemptionAction {
+    KeepBudget,
+    ShortenTo(Duration),
     Preempt,
-    Continue,
+}
+
+/// Explicit reason why a task ceased running on an execution slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedulingStopReason {
+    Preempted,
+    Yielded,
+    Blocked,
+    HostWait,
+    Control,
+    Exec,
+    Exited,
+}
+
+impl fmt::Display for SchedulingStopReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preempted => write!(f, "preempted"),
+            Self::Yielded => write!(f, "yielded"),
+            Self::Blocked => write!(f, "blocked"),
+            Self::HostWait => write!(f, "host-wait"),
+            Self::Control => write!(f, "control"),
+            Self::Exec => write!(f, "exec"),
+            Self::Exited => write!(f, "exited"),
+        }
+    }
+}
+
+/// State transition kind for a [`SchedulingEvent`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedulingEventKind {
+    Runnable,
+    Dispatch,
+    Stop(SchedulingStopReason),
+    Retire,
+}
+
+impl fmt::Display for SchedulingEventKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Runnable => write!(f, "runnable"),
+            Self::Dispatch => write!(f, "dispatch"),
+            Self::Stop(reason) => write!(f, "stop({reason})"),
+            Self::Retire => write!(f, "retire"),
+        }
+    }
+}
+
+/// Lifecycle notification emitted across scheduling state edges.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchedulingEvent {
+    pub sequence: u64,
+    pub thread: SchedThreadId,
+    pub process: SchedProcessId,
+    pub cpu: Option<GuestCpuId>,
+    pub kind: SchedulingEventKind,
 }
 
 /// A view of one guest CPU's queue, handed to a policy so `pick_next` and
@@ -322,16 +464,22 @@ pub trait SchedulingPolicy: Send + Sync + fmt::Debug {
         None
     }
 
-    /// Periodic tick: should the task currently on `cpu` be preempted?
-    fn on_tick(&self, _cpu: GuestCpuId) -> PreemptOrContinue {
-        PreemptOrContinue::Continue
+    /// Assign an execution budget when a task is dispatched to an executor.
+    ///
+    /// The default is [`RunBudget::default`], granting a 4 ms quantum.
+    fn on_dispatch(&self, _context: &DispatchContext) -> RunBudget {
+        RunBudget::default()
     }
 
-    fn on_runnable(&self, _task: SchedThreadId, _cpu: GuestCpuId) {}
+    /// Invoked when a task is runnable behind an active resident on `running.cpu`.
+    ///
+    /// The policy can preserve the running budget, shorten it, or request immediate preemption.
+    fn on_contention(&self, _context: &ContentionContext) -> PreemptionAction {
+        PreemptionAction::KeepBudget
+    }
 
-    fn on_block(&self, _task: SchedThreadId, _cpu: GuestCpuId) {}
-
-    fn on_exit(&self, _task: SchedThreadId, _cpu: GuestCpuId) {}
+    /// Lifecycle notification across runnable, dispatch, stop, and retire edges.
+    fn on_event(&self, _event: &SchedulingEvent) {}
 }
 
 /// The default policy: per-CPU queues, a `last_cpu` wake that is taken only
@@ -572,6 +720,48 @@ mod tests {
                 CpuAffinity::single(GuestCpuId::new(2))
             )),
             GuestCpuId::new(2)
+        );
+    }
+
+    #[test]
+    fn run_budget_bounds_and_defaults() {
+        assert_eq!(RunBudget::default().quantum(), Duration::from_millis(4));
+
+        assert_eq!(
+            RunBudget::new(Duration::from_millis(1)).unwrap().quantum(),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            RunBudget::new(Duration::from_millis(4)).unwrap().quantum(),
+            Duration::from_millis(4)
+        );
+        assert_eq!(
+            RunBudget::new(Duration::from_millis(100))
+                .unwrap()
+                .quantum(),
+            Duration::from_millis(100)
+        );
+
+        assert_eq!(
+            RunBudget::new(Duration::from_micros(999)),
+            Err(BudgetError::TooSmall {
+                min: Duration::from_millis(1),
+                requested: Duration::from_micros(999),
+            })
+        );
+        assert_eq!(
+            RunBudget::new(Duration::ZERO),
+            Err(BudgetError::TooSmall {
+                min: Duration::from_millis(1),
+                requested: Duration::ZERO,
+            })
+        );
+        assert_eq!(
+            RunBudget::new(Duration::from_millis(101)),
+            Err(BudgetError::TooLarge {
+                max: Duration::from_millis(100),
+                requested: Duration::from_millis(101),
+            })
         );
     }
 }

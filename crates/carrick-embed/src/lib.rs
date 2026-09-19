@@ -109,8 +109,10 @@ pub use carrick_abi::{CanonicalNr, LinuxErrno};
 pub use carrick_engine::{ResolveWarning, RunRequest};
 pub use carrick_guest_mem::{Gpa, GuestMemory, GuestVa, HostVa, MemoryError, SharedFutexLocation};
 pub use carrick_hal::{
-    CpuAffinity, CpuLoad, CpuQueueView, GuestCpuId, GuestCpuPolicy, PreemptOrContinue,
-    SchedulingPolicy, TaskPlacement,
+    BudgetError, ContentionContext, CpuAffinity, CpuLoad, CpuQueueView, DEFAULT_RUN_BUDGET,
+    DispatchContext, GuestCpuId, GuestCpuPolicy, MAX_RUN_BUDGET, MIN_RUN_BUDGET, PreemptionAction,
+    RunBudget, SchedProcessId, SchedThreadId, SchedulingEvent, SchedulingEventKind,
+    SchedulingPolicy, SchedulingStopReason, TaskPlacement,
 };
 pub use carrick_image::{ImageStore, PullPolicy};
 pub use carrick_kernel::dispatch::Signal;
