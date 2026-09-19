@@ -160,6 +160,7 @@ impl ScriptedBackend {
         let work_meter = carrick_observability::work_meter::WorkMeter::default();
         let work_scope = work_meter.new_scope();
         wait_service.set_work_scope(work_scope.clone());
+        root_context.kernel().set_work_scope(work_scope.clone());
 
         let shared = Arc::new(Shared {
             asids,

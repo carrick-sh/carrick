@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use carrick_conformance_contract::{ContractRegistry, evaluate};
 use carrick_kernel_example::contracts::{
-    futex_contention_contract, futex_requeue_contract, futex_requeue_scenario,
+    fork_filetable_contract, futex_contention_contract, futex_requeue_contract,
+    futex_requeue_scenario,
 };
 use carrick_observability::work_meter::WorkMetric;
 
@@ -123,6 +124,42 @@ fn futex_requeue_structural_red_control() {
         } => {
             assert_eq!(scale, 1, "smallest affected scale must be 1");
             assert_eq!(metric, WorkMetric::FutexQueueVisits);
+        }
+        other => panic!("expected ScalingViolation, got: {other:?}"),
+    }
+}
+
+#[test]
+fn fork_filetable_contract_is_semantically_exact_and_affine() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry.require("kernel.fork.filetable").expect("contract");
+    let observations = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| fork_filetable_contract(scale).expect("observation"))
+        .collect::<Vec<_>>();
+    evaluate(contract, &observations).expect("semantic and structural conformance");
+}
+
+#[test]
+fn fork_filetable_structural_red_control() {
+    let fault = std::env::var("CARRICK_CONTRACT_FAULT").unwrap_or_default();
+    if fault != "extra-fork-copy" {
+        return;
+    }
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry.require("kernel.fork.filetable").expect("contract");
+    let observations = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| fork_filetable_contract(scale).expect("observation"))
+        .collect::<Vec<_>>();
+    let err =
+        evaluate(contract, &observations).expect_err("should violate scaling with injected fault");
+    match err {
+        carrick_conformance_contract::EvaluationError::ScalingViolation {
+            scale, metric, ..
+        } => {
+            assert_eq!(scale, 1, "smallest affected scale must be 1");
+            assert_eq!(metric, WorkMetric::GuestMemoryCopyBytes);
         }
         other => panic!("expected ScalingViolation, got: {other:?}"),
     }

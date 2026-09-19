@@ -1961,9 +1961,6 @@ impl FileTable {
 
     pub(super) fn for_fork_copy(id: FileTableId, parent: &Self) -> Self {
         let open_files = parent.open_files.read().clone();
-        if let Some(maximum) = open_files.keys().max() {
-            parent.fd_ceiling.publish(*maximum);
-        }
         for slot in open_files.values() {
             slot.description.retain_fd_ref();
         }
@@ -1976,6 +1973,24 @@ impl FileTable {
             child_next_fd = next;
         }
         let _ = *parent.next_fd.lock();
+        let stdio_cloexec = *parent.stdio_cloexec.lock();
+        let closed_stdio = *parent.closed_stdio.lock();
+        let fd_open_paths = {
+            let guard = parent.fd_open_paths.read();
+            if guard.is_empty() {
+                HashMap::new()
+            } else {
+                guard.clone()
+            }
+        };
+        let epoll_fds = {
+            let guard = parent.epoll_fds.read();
+            if guard.is_empty() {
+                BTreeSet::new()
+            } else {
+                guard.clone()
+            }
+        };
         Self {
             id,
             fd_ceiling: Arc::clone(&parent.fd_ceiling),
@@ -1983,10 +1998,10 @@ impl FileTable {
             next_fd: Mutex::new(child_next_fd),
             reserved_slots: Mutex::new(HashMap::new()),
             next_reservation_id: AtomicU64::new(0),
-            stdio_cloexec: Mutex::new(*parent.stdio_cloexec.lock()),
-            closed_stdio: Mutex::new(*parent.closed_stdio.lock()),
-            fd_open_paths: RwLock::new(parent.fd_open_paths.read().clone()),
-            epoll_fds: RwLock::new(parent.epoll_fds.read().clone()),
+            stdio_cloexec: Mutex::new(stdio_cloexec),
+            closed_stdio: Mutex::new(closed_stdio),
+            fd_open_paths: RwLock::new(fd_open_paths),
+            epoll_fds: RwLock::new(epoll_fds),
             epoll_wake_registry,
             functional_gate: Arc::new(FileTableFunctionalGate::new()),
             functional_refs_active: AtomicBool::new(true),
