@@ -1417,6 +1417,66 @@ impl<M: carrick_guest_mem::CurrentMmMemory> MmExecutorReleaser for super::Syscal
     }
 }
 
+pub(crate) struct SyscallHostWaitReleaser<'s, 'a> {
+    pub(crate) kernel: &'a crate::kernel::KernelContext,
+    pub(crate) host_wait: super::request::HostWaitContext<'a>,
+    pub(crate) execution_lease: &'a crate::kernel::objects::ThreadExecutionLease,
+    pub(crate) mm_executor: &'s mut super::MmExecutorParticipation,
+}
+
+impl<'s, 'a> SyscallHostWaitReleaser<'s, 'a> {
+    pub(crate) fn new(
+        kernel: &'a crate::kernel::KernelContext,
+        host_wait: Option<super::request::HostWaitContext<'a>>,
+        execution_lease: Option<&'a crate::kernel::objects::ThreadExecutionLease>,
+        mm_executor: Option<&'s mut super::MmExecutorParticipation>,
+    ) -> Option<Self> {
+        match (host_wait, execution_lease, mm_executor) {
+            (Some(host_wait), Some(execution_lease), Some(mm_executor)) => Some(Self {
+                kernel,
+                host_wait,
+                execution_lease,
+                mm_executor,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl MmExecutorReleaser for SyscallHostWaitReleaser<'_, '_> {
+    fn host_wait_and_run(
+        &mut self,
+        dispatcher: &SyscallDispatcher,
+        op: &mut dyn FnMut(),
+    ) -> Result<(), super::outcome::DispatchError> {
+        dispatcher.with_host_wait_parts(
+            self.kernel,
+            Some(self.execution_lease),
+            Some(&mut *self.mm_executor),
+            self.host_wait.scheduler,
+            self.host_wait.registration,
+            op,
+        )
+    }
+    fn release_and_run(
+        &mut self,
+        dispatcher: &SyscallDispatcher,
+        op: &mut dyn FnMut(),
+    ) -> Result<(), super::outcome::DispatchError> {
+        let mut f = Some(op);
+        dispatcher.with_current_mm_executor_released_parts(
+            self.kernel,
+            Some(self.execution_lease),
+            Some(&mut *self.mm_executor),
+            || {
+                if let Some(run) = f.take() {
+                    run();
+                }
+            },
+        )
+    }
+}
+
 /// Cross-subsystem capabilities required during process operations.
 pub(in crate::dispatch) trait ProcCrossSubsystem: Send + Sync {
     fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials>;

@@ -312,13 +312,12 @@ fn stdio_writer_mutex_contention_allows_spare_progression_and_mm_mutation() {
         // Wait until both Task A and Task B have entered host wait
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Some(census) = s_c.host_wait_census() {
-                if census.entered >= 2
-                    && !census.slots.is_empty()
-                    && census.slots[0].waiters.len() >= 2
-                {
-                    break;
-                }
+            if let Some(census) = s_c.host_wait_census()
+                && census.entered >= 2
+                && !census.slots.is_empty()
+                && census.slots[0].waiters.len() >= 2
+            {
+                break;
             }
             if Instant::now() > deadline {
                 return Err("timed out waiting for 2 simultaneous host waits".into());

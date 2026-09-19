@@ -48,6 +48,7 @@
 //! and `xattr`.
 pub(in crate::dispatch::fs) use super::LinuxPipe2Flags;
 pub(in crate::dispatch::fs) use super::LinuxSpliceFlags;
+pub(in crate::dispatch::fs) use super::dispatcher::{FsCrossSubsystem, MmExecutorReleaser};
 pub(in crate::dispatch::fs) use super::*;
 pub(in crate::dispatch::fs) use crate::linux_abi::{
     LINUX_ELOOP, LINUX_ENOSPC, LINUX_ENXIO, LINUX_EOVERFLOW, LINUX_SEEK_DATA, LINUX_SEEK_HOLE,
@@ -387,7 +388,52 @@ pub(super) fn path_is_under_or_equal(path: &str, root: &str) -> bool {
 
 use super::fd_table::is_anon_overlay_path;
 
+pub(in crate::dispatch) struct FsHostWaitContext<'cross, 'releaser> {
+    cross: &'cross dyn FsCrossSubsystem,
+    releaser: std::cell::RefCell<&'releaser mut dyn MmExecutorReleaser>,
+}
+
+impl<'cross, 'releaser> FsHostWaitContext<'cross, 'releaser> {
+    pub(in crate::dispatch) fn new(
+        cross: &'cross dyn FsCrossSubsystem,
+        releaser: &'releaser mut dyn MmExecutorReleaser,
+    ) -> Self {
+        Self {
+            cross,
+            releaser: std::cell::RefCell::new(releaser),
+        }
+    }
+}
+
+impl<'cross, 'releaser> super::io_pipe::HostWaitRunner for FsHostWaitContext<'cross, 'releaser> {
+    fn run_with_host_wait(
+        &self,
+        op: &mut dyn FnMut(),
+    ) -> Result<(), super::outcome::DispatchError> {
+        let mut releaser = self.releaser.borrow_mut();
+        self.cross.with_host_wait(&mut **releaser, op)
+    }
+}
+
 impl<'a> FsView<'a> {
+    pub(in crate::dispatch) fn host_wait_runner<'ctx>(
+        &self,
+        releaser: &'ctx mut dyn MmExecutorReleaser,
+    ) -> FsHostWaitContext<'a, 'ctx> {
+        FsHostWaitContext::new(self.cross, releaser)
+    }
+
+    pub(in crate::dispatch) fn host_wait_runner_for_ctx<'ctx, M: CurrentMmMemory>(
+        &self,
+        cx: &'ctx mut super::SyscallCtx<'_, M>,
+    ) -> Option<FsHostWaitContext<'a, 'ctx>> {
+        if cx.host_wait.is_none() {
+            None
+        } else {
+            Some(FsHostWaitContext::new(self.cross, cx))
+        }
+    }
+
     /// Only owned host arguments may cross this boundary. Guest memory and
     /// open-description guards must be released before calling it.
     fn with_host_wait<M: carrick_guest_mem::CurrentMmMemory, T>(
@@ -1620,28 +1666,28 @@ impl<'a> FsView<'a> {
         memory: &mut M,
         iovecs: &[LinuxIovec],
         target: HostPipeReadTarget<'_>,
-    ) -> DispatchOutcome {
+    ) -> Result<DispatchOutcome, super::outcome::DispatchError> {
         let mut total = 0i64;
         for iov in iovecs {
             let len = match usize::try_from(iov.iov_len) {
                 Ok(len) => len,
-                Err(_) => return DispatchOutcome::errno(LINUX_EINVAL),
+                Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             };
             if len == 0 {
                 continue;
             }
-            match read_host_pipe(memory, iov.iov_base, len, target.clone()) {
+            match read_host_pipe(memory, iov.iov_base, len, target.clone())? {
                 DispatchOutcome::Returned { value } => {
                     total += value;
                     if value == 0 || (value as usize) < len {
                         break;
                     }
                 }
-                _ if total > 0 => return DispatchOutcome::Returned { value: total },
-                other => return other,
+                _ if total > 0 => return Ok(DispatchOutcome::Returned { value: total }),
+                other => return Ok(other),
             }
         }
-        DispatchOutcome::Returned { value: total }
+        Ok(DispatchOutcome::Returned { value: total })
     }
 
     /// Linux raises SIGPIPE on the writing thread when a write hits a broken
@@ -1650,18 +1696,26 @@ impl<'a> FsView<'a> {
     /// disposition: a handler runs, SIG_DFL terminates, a blocked SIGPIPE stays
     /// pending. Skip the mark when SIGPIPE is ignored (the common case for
     /// pipe/socket-heavy programs) so we don't queue a signal that's discarded.
+    pub(crate) fn raise_sigpipe_on_epipe_parts(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        outcome: DispatchOutcome,
+    ) -> DispatchOutcome {
+        if matches!(&outcome, DispatchOutcome::Errno { errno } if *errno == LINUX_EPIPE)
+            && !self.signal_is_ignored(kernel, LINUX_SIGPIPE)
+        {
+            self.mark_signal_pending(kernel, tid, LINUX_SIGPIPE);
+        }
+        outcome
+    }
+
     pub(crate) fn raise_sigpipe_on_epipe<M: CurrentMmMemory>(
         &self,
         cx: &SyscallCtx<M>,
         outcome: DispatchOutcome,
     ) -> DispatchOutcome {
-        if matches!(&outcome, DispatchOutcome::Errno { errno } if *errno == LINUX_EPIPE)
-            && !self.signal_is_ignored(cx.kernel, LINUX_SIGPIPE)
-        {
-            let tid = Self::ctx_tid(cx);
-            self.mark_signal_pending(cx.kernel, tid, LINUX_SIGPIPE);
-        }
-        outcome
+        self.raise_sigpipe_on_epipe_parts(cx.kernel, Self::ctx_tid(cx), outcome)
     }
 
     /// The root bypass shared by [`Self::guest_can_modify_dir`] and

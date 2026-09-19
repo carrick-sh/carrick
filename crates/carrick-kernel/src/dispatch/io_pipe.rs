@@ -20,6 +20,13 @@ use carrick_vfs::errno::HostSyscallResult as _;
 pub(crate) const MAX_RW_COUNT: usize = 0x7fff_f000;
 const SMALL_HOST_READ_BUF: usize = 8192;
 
+/// Runner for host I/O operations that can block and need to release
+/// guest CPU (P) and MM participation via host-wait handoff.
+pub(crate) trait HostWaitRunner {
+    fn run_with_host_wait(&self, op: &mut dyn FnMut())
+    -> Result<(), super::outcome::DispatchError>;
+}
+
 /// Captured host-read endpoint, readiness authority, and optional UNIX flow.
 #[derive(Clone)]
 pub(crate) struct HostPipeReadTarget<'a> {
@@ -29,6 +36,51 @@ pub(crate) struct HostPipeReadTarget<'a> {
     pub authority: WaitFdAuthority,
     pub socket_flow: Option<&'a Arc<crate::kernel::UnixFlow>>,
     pub is_stream: bool,
+    pub offset: Option<i64>,
+    pub host_wait: Option<&'a (dyn HostWaitRunner + 'a)>,
+}
+
+impl<'a> HostPipeReadTarget<'a> {
+    pub(crate) fn new(
+        host_fd: i32,
+        host_fd_owner: Option<HostFdRef>,
+        nonblocking: bool,
+        authority: WaitFdAuthority,
+    ) -> Self {
+        Self {
+            host_fd,
+            host_fd_owner,
+            nonblocking,
+            authority,
+            socket_flow: None,
+            is_stream: false,
+            offset: None,
+            host_wait: None,
+        }
+    }
+
+    pub(crate) fn with_socket_flow(
+        mut self,
+        socket_flow: Option<&'a Arc<crate::kernel::UnixFlow>>,
+        is_stream: bool,
+    ) -> Self {
+        self.socket_flow = socket_flow;
+        self.is_stream = is_stream;
+        self
+    }
+
+    pub(crate) fn with_offset(mut self, offset: i64) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    pub(crate) fn with_host_wait(
+        mut self,
+        host_wait: Option<&'a (dyn HostWaitRunner + 'a)>,
+    ) -> Self {
+        self.host_wait = host_wait;
+        self
+    }
 }
 
 /// read(2) on a host-backed fd (pipe/socket/file). Host-backed descriptions are
@@ -41,7 +93,7 @@ pub(crate) fn read_host_pipe_into(
     guest_addr: u64,
     buf: &mut [u8],
     target: HostPipeReadTarget<'_>,
-) -> DispatchOutcome {
+) -> Result<DispatchOutcome, super::outcome::DispatchError> {
     let HostPipeReadTarget {
         host_fd,
         host_fd_owner,
@@ -49,24 +101,56 @@ pub(crate) fn read_host_pipe_into(
         authority,
         socket_flow,
         is_stream,
+        offset,
+        host_wait,
     } = target;
     // BLOCKING-IO-OK: host-backed descriptions are made O_NONBLOCK at creation
     // or adoption sites; EAGAIN becomes WaitOnFds for blocking guest fds.
-    let n = if let Some(flow) = socket_flow {
-        let mut ledger = flow.lock_ledger();
-        let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-        if n > 0 {
-            if is_stream {
-                ledger.consume_stream(n as usize);
-            } else {
-                ledger.consume_dgram();
+    let mut n = 0isize;
+    let read_fn = |buf: &mut [u8]| -> isize {
+        if let Some(flow) = socket_flow {
+            let mut ledger = flow.lock_ledger();
+            let n = unsafe {
+                match offset {
+                    Some(off) => libc::pread(
+                        host_fd,
+                        buf.as_mut_ptr() as *mut _,
+                        buf.len(),
+                        off as libc::off_t,
+                    ),
+                    None => libc::read(host_fd, buf.as_mut_ptr() as *mut _, buf.len()),
+                }
+            };
+            if n > 0 {
+                if is_stream {
+                    ledger.consume_stream(n as usize);
+                } else {
+                    ledger.consume_dgram();
+                }
+            }
+            drop(ledger);
+            n
+        } else {
+            unsafe {
+                match offset {
+                    Some(off) => libc::pread(
+                        host_fd,
+                        buf.as_mut_ptr() as *mut _,
+                        buf.len(),
+                        off as libc::off_t,
+                    ),
+                    None => libc::read(host_fd, buf.as_mut_ptr() as *mut _, buf.len()),
+                }
             }
         }
-        drop(ledger);
-        n
-    } else {
-        unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, buf.len()) }
     };
+    if let Some(hw) = host_wait {
+        hw.run_with_host_wait(&mut || {
+            n = read_fn(buf);
+        })?;
+    } else {
+        n = read_fn(buf);
+    }
     crate::probes::host_pipe_io(host_fd, 0, n as i64);
     if let Err(e) = n.host_syscall_errno() {
         // EINTR: interrupted by a HOST signal. Don't surface it to the guest —
@@ -77,15 +161,15 @@ pub(crate) fn read_host_pipe_into(
         // guest signal is actually pending (has_pending_for). Same discipline as
         // host_sleep_interruptible.
         if e == LINUX_EAGAIN || e == LINUX_EINTR {
-            return would_block_outcome(
+            return Ok(would_block_outcome(
                 host_fd,
                 libc::POLLIN,
                 nonblocking,
                 host_fd_owner,
                 authority,
-            );
+            ));
         }
-        return DispatchOutcome::Errno { errno: e };
+        return Ok(DispatchOutcome::Errno { errno: e });
     }
     let n_usize = n as usize;
     #[cfg(feature = "trace-io")]
@@ -102,11 +186,21 @@ pub(crate) fn read_host_pipe_into(
         );
     }
     if n_usize > 0 && memory.write_bytes(guest_addr, &buf[..n_usize]).is_err() {
-        return DispatchOutcome::Errno {
+        return Ok(DispatchOutcome::Errno {
             errno: LINUX_EFAULT,
-        };
+        });
     }
-    DispatchOutcome::returned_isize_or_errno(n)
+    Ok(DispatchOutcome::returned_isize_or_errno(n))
+}
+
+pub(crate) fn read_host_pipe_at(
+    memory: &mut impl CurrentMmMemory,
+    guest_addr: u64,
+    length: usize,
+    offset: i64,
+    target: HostPipeReadTarget<'_>,
+) -> Result<DispatchOutcome, super::outcome::DispatchError> {
+    read_host_pipe(memory, guest_addr, length, target.with_offset(offset))
 }
 
 pub(crate) fn read_host_pipe(
@@ -114,9 +208,9 @@ pub(crate) fn read_host_pipe(
     guest_addr: u64,
     length: usize,
     target: HostPipeReadTarget<'_>,
-) -> DispatchOutcome {
+) -> Result<DispatchOutcome, super::outcome::DispatchError> {
     if length == 0 {
-        return DispatchOutcome::Returned { value: 0 };
+        return Ok(DispatchOutcome::Returned { value: 0 });
     }
     // Clamp to Linux's MAX_RW_COUNT before staging a host buffer; a huge guest
     // count would otherwise be a one-syscall OOM-abort of the runtime.
@@ -151,6 +245,79 @@ pub struct HostPipeWriteTarget<'a> {
     pub(crate) socket_flow: Option<Arc<crate::kernel::UnixFlow>>,
     pub(crate) socket_cred: Option<crate::kernel::SocketPeerCred>,
     pub(crate) is_stream: bool,
+    pub(crate) offset: Option<i64>,
+    pub(crate) is_append: bool,
+    pub(crate) host_wait: Option<&'a (dyn HostWaitRunner + 'a)>,
+}
+
+impl<'a> HostPipeWriteTarget<'a> {
+    pub(crate) fn new(
+        host_fd: i32,
+        host_fd_owner: Option<HostFdRef>,
+        nonblocking: bool,
+        write_kind: HostWriteKind,
+        tid: crate::thread::ThreadId,
+        authority: WaitFdAuthority,
+        host_signal: &'a dyn carrick_hal::HostSignalBridge,
+    ) -> Self {
+        Self {
+            host_fd,
+            host_fd_owner,
+            nonblocking,
+            write_kind,
+            pipe_state: None,
+            tid,
+            sigpipe_on_epipe: false,
+            authority,
+            host_signal,
+            socket_flow: None,
+            socket_cred: None,
+            is_stream: false,
+            offset: None,
+            is_append: false,
+            host_wait: None,
+        }
+    }
+
+    pub(crate) fn with_pipe_state(mut self, pipe_state: Option<(i64, usize)>) -> Self {
+        self.pipe_state = pipe_state;
+        self
+    }
+
+    pub(crate) fn with_sigpipe(mut self, sigpipe_on_epipe: bool) -> Self {
+        self.sigpipe_on_epipe = sigpipe_on_epipe;
+        self
+    }
+
+    pub(crate) fn with_socket_flow(
+        mut self,
+        socket_flow: Option<Arc<crate::kernel::UnixFlow>>,
+        socket_cred: Option<crate::kernel::SocketPeerCred>,
+        is_stream: bool,
+    ) -> Self {
+        self.socket_flow = socket_flow;
+        self.socket_cred = socket_cred;
+        self.is_stream = is_stream;
+        self
+    }
+
+    pub(crate) fn with_offset(mut self, offset: i64) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    pub(crate) fn with_append(mut self, is_append: bool) -> Self {
+        self.is_append = is_append;
+        self
+    }
+
+    pub(crate) fn with_host_wait(
+        mut self,
+        host_wait: Option<&'a (dyn HostWaitRunner + 'a)>,
+    ) -> Self {
+        self.host_wait = host_wait;
+        self
+    }
 }
 
 impl<'a> HostWritePayload<'a> {
@@ -191,15 +358,34 @@ fn prior_ar_magic_write(host_fd: i32) -> Option<(usize, u64)> {
     AR_MAGIC_WRITES.lock().get(&host_fd).copied()
 }
 
-pub(crate) fn write_host_pipe(bytes: &[u8], target: HostPipeWriteTarget<'_>) -> DispatchOutcome {
+pub(crate) fn write_host_pipe(
+    bytes: &[u8],
+    target: HostPipeWriteTarget<'_>,
+) -> Result<DispatchOutcome, super::outcome::DispatchError> {
     write_host_pipe_payload(HostWritePayload::Borrowed(bytes), target)
 }
 
 pub(crate) fn write_host_pipe_owned(
     bytes: Vec<u8>,
     target: HostPipeWriteTarget<'_>,
-) -> DispatchOutcome {
+) -> Result<DispatchOutcome, super::outcome::DispatchError> {
     write_host_pipe_payload(HostWritePayload::Owned(bytes), target)
+}
+
+pub(crate) fn write_host_pipe_at(
+    bytes: &[u8],
+    offset: i64,
+    target: HostPipeWriteTarget<'_>,
+) -> Result<DispatchOutcome, super::outcome::DispatchError> {
+    write_host_pipe(bytes, target.with_offset(offset))
+}
+
+pub(crate) fn write_host_pipe_owned_at(
+    bytes: Vec<u8>,
+    offset: i64,
+    target: HostPipeWriteTarget<'_>,
+) -> Result<DispatchOutcome, super::outcome::DispatchError> {
+    write_host_pipe_owned(bytes, target.with_offset(offset))
 }
 
 pub(crate) fn host_pipe_write_room(capacity: i64, queued: usize) -> Option<usize> {
@@ -210,7 +396,7 @@ pub(crate) fn host_pipe_write_room(capacity: i64, queued: usize) -> Option<usize
 fn write_host_pipe_payload(
     payload: HostWritePayload<'_>,
     target: HostPipeWriteTarget<'_>,
-) -> DispatchOutcome {
+) -> Result<DispatchOutcome, super::outcome::DispatchError> {
     let HostPipeWriteTarget {
         host_fd,
         host_fd_owner,
@@ -224,6 +410,9 @@ fn write_host_pipe_payload(
         socket_flow,
         socket_cred,
         is_stream,
+        offset: file_offset,
+        is_append,
+        host_wait,
     } = target;
 
     // Always-on, near-zero-cost detector for archive corruption. The predicate
@@ -341,7 +530,7 @@ fn write_host_pipe_payload(
                         if host_signal
                             .has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE)
                         {
-                            return DispatchOutcome::returned_len_or_errno(offset);
+                            return Ok(DispatchOutcome::returned_len_or_errno(offset));
                         }
                         return match BlockingWrite::from_vec(
                             host_fd,
@@ -350,46 +539,109 @@ fn write_host_pipe_payload(
                             tid,
                             sigpipe_on_epipe,
                         ) {
-                            Ok(write) => DispatchOutcome::BlockingWrite(write),
-                            Err(_) => DispatchOutcome::returned_len_or_errno(offset),
+                            Ok(write) => Ok(DispatchOutcome::BlockingWrite(write)),
+                            Err(_) => Ok(DispatchOutcome::returned_len_or_errno(offset)),
                         };
                     }
-                    return would_block_outcome(
+                    return Ok(would_block_outcome(
                         host_fd,
                         libc::POLLOUT,
                         nonblocking,
                         host_fd_owner.clone(),
                         authority.clone(),
-                    );
+                    ));
                 }
                 if nonblocking && offset == 0 && len <= 4096 && len > room {
-                    return would_block_outcome(
+                    return Ok(would_block_outcome(
                         host_fd,
                         libc::POLLOUT,
                         nonblocking,
                         host_fd_owner.clone(),
                         authority.clone(),
-                    );
+                    ));
                 }
                 len = len.min(room);
             }
             // BLOCKING-IO-OK: host_fd was adopted O_NONBLOCK; EAGAIN routes to
             // the lockless wait path below.
-            if let (Some(flow), Some(cred)) = (&socket_flow, socket_cred) {
-                let mut ledger = flow.lock_ledger();
-                let n = unsafe { libc::write(host_fd, bytes[offset..].as_ptr() as *const _, len) };
-                if n > 0 {
-                    if is_stream {
-                        ledger.push_stream(n as usize, cred);
-                    } else {
-                        ledger.push_dgram(n as usize, cred);
+            let write_fn = || -> isize {
+                if let (Some(flow), Some(cred)) = (&socket_flow, socket_cred) {
+                    let mut ledger = flow.lock_ledger();
+                    let n = unsafe {
+                        match file_offset {
+                            Some(off) => {
+                                if is_append {
+                                    let saved = libc::lseek(host_fd, 0, libc::SEEK_CUR);
+                                    libc::lseek(host_fd, 0, libc::SEEK_END);
+                                    let w = libc::write(
+                                        host_fd,
+                                        bytes[offset..].as_ptr() as *const _,
+                                        len,
+                                    );
+                                    if saved >= 0 {
+                                        libc::lseek(host_fd, saved, libc::SEEK_SET);
+                                    }
+                                    w
+                                } else {
+                                    libc::pwrite(
+                                        host_fd,
+                                        bytes[offset..].as_ptr() as *const _,
+                                        len,
+                                        (off + offset as i64) as libc::off_t,
+                                    )
+                                }
+                            }
+                            None => libc::write(host_fd, bytes[offset..].as_ptr() as *const _, len),
+                        }
+                    };
+                    if n > 0 {
+                        if is_stream {
+                            ledger.push_stream(n as usize, cred);
+                        } else {
+                            ledger.push_dgram(n as usize, cred);
+                        }
+                    }
+                    drop(ledger);
+                    n
+                } else {
+                    unsafe {
+                        match file_offset {
+                            Some(off) => {
+                                if is_append {
+                                    let saved = libc::lseek(host_fd, 0, libc::SEEK_CUR);
+                                    libc::lseek(host_fd, 0, libc::SEEK_END);
+                                    let w = libc::write(
+                                        host_fd,
+                                        bytes[offset..].as_ptr() as *const _,
+                                        len,
+                                    );
+                                    if saved >= 0 {
+                                        libc::lseek(host_fd, saved, libc::SEEK_SET);
+                                    }
+                                    w
+                                } else {
+                                    libc::pwrite(
+                                        host_fd,
+                                        bytes[offset..].as_ptr() as *const _,
+                                        len,
+                                        (off + offset as i64) as libc::off_t,
+                                    )
+                                }
+                            }
+                            None => libc::write(host_fd, bytes[offset..].as_ptr() as *const _, len),
+                        }
                     }
                 }
-                drop(ledger);
-                n
+            };
+            let mut n = 0isize;
+            if let Some(hw) = host_wait {
+                hw.run_with_host_wait(&mut || {
+                    n = write_fn();
+                })?;
             } else {
-                unsafe { libc::write(host_fd, bytes[offset..].as_ptr() as *const _, len) }
+                n = write_fn();
             }
+            n
         };
         #[cfg(feature = "trace-tty")]
         if payload.as_slice().contains(&0x0a) {
@@ -410,13 +662,13 @@ fn write_host_pipe_payload(
             // non-blocking, else park on POLLOUT). No-op on Linux, which uses EAGAIN.
             #[cfg(not(target_os = "linux"))]
             if e == crate::linux_abi::LINUX_ENOBUFS && write_kind == HostWriteKind::SocketLike {
-                return would_block_outcome(
+                return Ok(would_block_outcome(
                     host_fd,
                     libc::POLLOUT,
                     nonblocking,
                     host_fd_owner.clone(),
                     authority.clone(),
-                );
+                ));
             }
             // EINTR: interrupted by an internal host signal (e.g. SIGURG vCPU kick).
             // Route through the readiness wait rather than leaking it to the guest
@@ -435,15 +687,15 @@ fn write_host_pipe_payload(
                     )
                 {
                     return match result {
-                        Ok(written) => DispatchOutcome::returned_len_or_errno(written),
-                        Err(errno) => DispatchOutcome::Errno { errno },
+                        Ok(written) => Ok(DispatchOutcome::returned_len_or_errno(written)),
+                        Err(errno) => Ok(DispatchOutcome::Errno { errno }),
                     };
                 }
                 if block_until_complete && offset > 0 {
                     if host_signal
                         .has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE)
                     {
-                        return DispatchOutcome::returned_len_or_errno(offset);
+                        return Ok(DispatchOutcome::returned_len_or_errno(offset));
                     }
                     return match BlockingWrite::from_vec(
                         host_fd,
@@ -452,19 +704,19 @@ fn write_host_pipe_payload(
                         tid,
                         sigpipe_on_epipe,
                     ) {
-                        Ok(write) => DispatchOutcome::BlockingWrite(write),
-                        Err(_) => DispatchOutcome::returned_len_or_errno(offset),
+                        Ok(write) => Ok(DispatchOutcome::BlockingWrite(write)),
+                        Err(_) => Ok(DispatchOutcome::returned_len_or_errno(offset)),
                     };
                 }
-                return would_block_outcome(
+                return Ok(would_block_outcome(
                     host_fd,
                     libc::POLLOUT,
                     nonblocking,
                     host_fd_owner.clone(),
                     authority.clone(),
-                );
+                ));
             }
-            return DispatchOutcome::Errno { errno: e };
+            return Ok(DispatchOutcome::Errno { errno: e });
         }
         if block_until_complete {
             offset += n as usize;
@@ -483,17 +735,19 @@ fn write_host_pipe_payload(
                             tid,
                             sigpipe_on_epipe,
                         ) {
-                            Ok(write) => DispatchOutcome::BlockingWrite(write),
-                            Err(_) => DispatchOutcome::returned_len_or_errno(offset),
+                            Ok(write) => Ok(DispatchOutcome::BlockingWrite(write)),
+                            Err(_) => Ok(DispatchOutcome::returned_len_or_errno(offset)),
                         };
                     }
-                    return DispatchOutcome::returned_len_or_errno(offset);
+                    return Ok(DispatchOutcome::returned_len_or_errno(offset));
                 }
                 continue;
             }
-            return DispatchOutcome::returned_len_or_errno(payload.as_slice().len());
+            return Ok(DispatchOutcome::returned_len_or_errno(
+                payload.as_slice().len(),
+            ));
         }
-        return DispatchOutcome::returned_isize_or_errno(n);
+        return Ok(DispatchOutcome::returned_isize_or_errno(n));
     }
 }
 

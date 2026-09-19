@@ -152,21 +152,18 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let bytes = vec![0xA5; 4 * 1024 * 1024];
         let outcome = write_host_pipe(
             &bytes,
-            HostPipeWriteTarget {
-                host_signal: &carrick_hal::NullHostSignalBridge::default(),
-                host_fd: fds[1],
-                host_fd_owner: None,
-                nonblocking: false,
-                write_kind: HostWriteKind::PipeLike,
-                pipe_state: None,
-                tid: crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0101),
-                sigpipe_on_epipe: true,
-                authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
-                socket_flow: None,
-                socket_cred: None,
-                is_stream: false,
-            },
-        );
+            HostPipeWriteTarget::new(
+                fds[1],
+                None,
+                false,
+                HostWriteKind::PipeLike,
+                crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0101),
+                WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+                &carrick_hal::NullHostSignalBridge::default(),
+            )
+            .with_sigpipe(true),
+        )
+        .unwrap();
 
         unsafe {
             libc::close(fds[0]);
@@ -213,21 +210,17 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let bytes = vec![0x5A; 64 * 1024];
         let outcome = write_host_pipe(
             &bytes,
-            HostPipeWriteTarget {
-                host_signal: &carrick_hal::NullHostSignalBridge::default(),
-                host_fd: fds[1],
-                host_fd_owner: None,
-                nonblocking: true,
-                write_kind: HostWriteKind::PipeLike,
-                pipe_state: None,
-                tid: crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0103),
-                sigpipe_on_epipe: false,
-                authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
-                socket_flow: None,
-                socket_cred: None,
-                is_stream: false,
-            },
-        );
+            HostPipeWriteTarget::new(
+                fds[1],
+                None,
+                true,
+                HostWriteKind::PipeLike,
+                crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0103),
+                WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+                &carrick_hal::NullHostSignalBridge::default(),
+            ),
+        )
+        .unwrap();
 
         unsafe {
             libc::close(fds[0]);
@@ -275,21 +268,17 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let bytes = vec![0x5A; 64 * 1024];
         let outcome = write_host_pipe(
             &bytes,
-            HostPipeWriteTarget {
-                host_signal: &carrick_hal::NullHostSignalBridge::default(),
-                host_fd: fds[0],
-                host_fd_owner: None,
-                nonblocking: true,
-                write_kind: HostWriteKind::SocketLike,
-                pipe_state: None,
-                tid: crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0104),
-                sigpipe_on_epipe: false,
-                authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
-                socket_flow: None,
-                socket_cred: None,
-                is_stream: false,
-            },
-        );
+            HostPipeWriteTarget::new(
+                fds[0],
+                None,
+                true,
+                HostWriteKind::SocketLike,
+                crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0104),
+                WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+                &carrick_hal::NullHostSignalBridge::default(),
+            ),
+        )
+        .unwrap();
 
         unsafe {
             libc::close(fds[0]);

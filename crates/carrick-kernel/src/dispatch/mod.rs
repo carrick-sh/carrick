@@ -770,11 +770,11 @@ pub(crate) use kernel_context::GuestProcessTarget;
 pub(crate) use kernel_context::bootstrap_one_task_binding;
 
 pub mod dispatcher;
-#[allow(unused_imports)]
-pub(crate) use dispatcher::resolv_conf_contents_for_network;
 pub use dispatcher::{
     CarrierBridges, FsView, IpcView, MemView, NetView, ProcView, SignalView, SyscallDispatcher,
 };
+#[allow(unused_imports)]
+pub(crate) use dispatcher::{SyscallHostWaitReleaser, resolv_conf_contents_for_network};
 
 pub mod execution;
 pub mod futex;
@@ -1377,19 +1377,17 @@ impl SyscallDispatcher {
     /// exact thread identity, and running execution lease are authenticated on
     /// both sides. Re-entry failure is fatal because returning to guest code
     /// without census membership would make a later page-table pause unsound.
-    pub(crate) fn with_current_mm_executor_released<M: CurrentMmMemory, T>(
+    pub(crate) fn with_current_mm_executor_released_parts<T>(
         &self,
-        syscall: &mut SyscallCtx<'_, M>,
+        kernel: &crate::kernel::KernelContext,
+        execution_lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+        mm_executor: Option<&mut MmExecutorParticipation>,
         operation: impl FnOnce() -> T,
     ) -> Result<T, DispatchError> {
-        let execution_lease = syscall
-            .execution_lease
-            .ok_or(DispatchError::MmExecutorExecutionLeaseUnavailable)?;
-        let executor = syscall
-            .mm_executor
-            .as_deref_mut()
-            .ok_or(DispatchError::MmExecutorParticipationUnavailable)?;
-        self.validate_current_mm_executor(executor, syscall.kernel, execution_lease)?;
+        let execution_lease =
+            execution_lease.ok_or(DispatchError::MmExecutorExecutionLeaseUnavailable)?;
+        let executor = mm_executor.ok_or(DispatchError::MmExecutorParticipationUnavailable)?;
+        self.validate_current_mm_executor(executor, kernel, execution_lease)?;
         executor.leave_temporarily()?;
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
@@ -1403,12 +1401,12 @@ impl SyscallDispatcher {
 
         match result {
             Ok(value) => {
-                self.validate_current_mm_executor(executor, syscall.kernel, execution_lease)?;
+                self.validate_current_mm_executor(executor, kernel, execution_lease)?;
                 Ok(value)
             }
             Err(payload) => {
                 if let Err(error) =
-                    self.validate_current_mm_executor(executor, syscall.kernel, execution_lease)
+                    self.validate_current_mm_executor(executor, kernel, execution_lease)
                 {
                     tracing::error!(
                         ?error,
@@ -1424,6 +1422,19 @@ impl SyscallDispatcher {
         }
     }
 
+    pub(crate) fn with_current_mm_executor_released<M: CurrentMmMemory, T>(
+        &self,
+        syscall: &mut SyscallCtx<'_, M>,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, DispatchError> {
+        self.with_current_mm_executor_released_parts(
+            syscall.kernel,
+            syscall.execution_lease,
+            syscall.mm_executor.as_deref_mut(),
+            operation,
+        )
+    }
+
     /// Configure host operations before dispatch begins. Forked dispatchers
     /// retain the same implementation.
     pub fn set_host_io(&mut self, host_io: Arc<dyn HostIo>) {
@@ -1434,22 +1445,19 @@ impl SyscallDispatcher {
     /// The operation must not retain pointers into guest memory. All file
     /// endpoints must already be owned; this consumes the dispatch's remaining
     /// file-table access, so no file lookup may follow it in this scope.
-    pub fn with_host_wait<M: CurrentMmMemory, T>(
+    pub fn with_host_wait_parts<T>(
         &self,
-        syscall: &mut SyscallCtx<'_, M>,
+        kernel: &crate::kernel::KernelContext,
+        execution_lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+        mm_executor: Option<&mut MmExecutorParticipation>,
         scheduler: &crate::kernel::Scheduler,
         registration: &crate::kernel::ExecutorRegistration,
         operation: impl FnOnce() -> T,
     ) -> Result<T, DispatchError> {
-        let lease = syscall
-            .execution_lease
-            .ok_or(DispatchError::MmExecutorExecutionLeaseUnavailable)?;
-        let executor = syscall
-            .mm_executor
-            .as_deref_mut()
-            .ok_or(DispatchError::MmExecutorParticipationUnavailable)?;
-        self.validate_current_mm_executor(executor, syscall.kernel, lease)?;
-        resources::finish_files_for_host_wait(syscall.kernel)?;
+        let lease = execution_lease.ok_or(DispatchError::MmExecutorExecutionLeaseUnavailable)?;
+        let executor = mm_executor.ok_or(DispatchError::MmExecutorParticipationUnavailable)?;
+        self.validate_current_mm_executor(executor, kernel, lease)?;
+        resources::finish_files_for_host_wait(kernel)?;
         executor.leave_temporarily()?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let guard = scheduler
@@ -1463,14 +1471,14 @@ impl SyscallDispatcher {
         // A peer may have removed this exact thread while its host operation
         // was in flight. Do not resurrect its MM admission or publish a guest
         // syscall return. Unwind still preserves the original panic payload.
-        if !syscall.kernel.exact_thread_is_live() {
+        if !kernel.exact_thread_is_live() {
             return match result {
                 Ok(_) => Err(DispatchError::HostWaitRetired),
                 Err(payload) => std::panic::resume_unwind(payload),
             };
         }
         if let Err(error) = executor.reenter_exact() {
-            if !syscall.kernel.exact_thread_is_live() {
+            if !kernel.exact_thread_is_live() {
                 return match result {
                     Ok(_) => Err(DispatchError::HostWaitRetired),
                     Err(payload) => std::panic::resume_unwind(payload),
@@ -1481,7 +1489,7 @@ impl SyscallDispatcher {
                 "host wait MM reentry failed: {error}"
             );
         }
-        if !syscall.kernel.exact_thread_is_live() {
+        if !kernel.exact_thread_is_live() {
             executor.leave_temporarily()?;
             return match result {
                 Ok(_) => Err(DispatchError::HostWaitRetired),
@@ -1490,15 +1498,13 @@ impl SyscallDispatcher {
         }
         match result {
             Ok(value) => {
-                self.validate_current_mm_executor(executor, syscall.kernel, lease)?;
+                self.validate_current_mm_executor(executor, kernel, lease)?;
                 value
             }
             Err(payload) => {
                 // Match the existing MM-release boundary: a failed identity
                 // audit cannot turn an in-flight panic into a normal return.
-                if let Err(error) =
-                    self.validate_current_mm_executor(executor, syscall.kernel, lease)
-                {
+                if let Err(error) = self.validate_current_mm_executor(executor, kernel, lease) {
                     carrick_fatal!(
                         "dispatch::mm_executor_reentry",
                         "host wait identity drift during unwind: {error}"
@@ -1507,6 +1513,23 @@ impl SyscallDispatcher {
                 std::panic::resume_unwind(payload)
             }
         }
+    }
+
+    pub fn with_host_wait<M: CurrentMmMemory, T>(
+        &self,
+        syscall: &mut SyscallCtx<'_, M>,
+        scheduler: &crate::kernel::Scheduler,
+        registration: &crate::kernel::ExecutorRegistration,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, DispatchError> {
+        self.with_host_wait_parts(
+            syscall.kernel,
+            syscall.execution_lease,
+            syscall.mm_executor.as_deref_mut(),
+            scheduler,
+            registration,
+            operation,
+        )
     }
 
     pub fn activate_file_authority(
