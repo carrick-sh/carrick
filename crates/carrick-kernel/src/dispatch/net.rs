@@ -3336,6 +3336,7 @@ impl<'a> NetView<'a> {
                 // three normalizations into `assemble_wait` so `pselect6` and
                 // `epoll` share them.)
                 if pollfd.events & LINUX_POLLRDHUP != 0
+                    && pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0
                     && this.socket_guest_type(pollfd.fd).is_some()
                     && this
                         .host_fd_for_poll(pollfd.fd)

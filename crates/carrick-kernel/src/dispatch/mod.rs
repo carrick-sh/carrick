@@ -893,6 +893,7 @@ pub struct EpollKqueue {
     /// read lock-free by the registry and `Drop`.
     wake_fd: i32,
     wake_registry: EpollWakeRegistry,
+    user_wake_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl EpollKqueue {
@@ -907,12 +908,18 @@ impl EpollKqueue {
         // On Linux the user-wake is a separate eventfd; on macOS it rides the
         // kqueue fd, so fall back to poll_fd. The registry pulses this fd.
         let wake_fd = mux.user_wake_fd(0).unwrap_or(poll_fd);
-        register_epoll_kqueue(&wake_registry, wake_fd);
+        let user_wake_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        register_epoll_kqueue(
+            &wake_registry,
+            wake_fd,
+            std::sync::Arc::clone(&user_wake_pending),
+        );
         Self {
             mux: std::sync::Mutex::new(mux),
             poll_fd,
             wake_fd,
             wake_registry,
+            user_wake_pending,
         }
     }
 
@@ -948,9 +955,25 @@ impl EpollKqueue {
         target_os = "netbsd"
     ))]
     pub(crate) fn wake_parked(&self) {
-        self.with_mux(|mux| {
-            let _ = mux.trigger_user(0);
-        });
+        if self
+            .user_wake_pending
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.with_mux(|mux| {
+                let _ = mux.trigger_user(0);
+            });
+        }
+    }
+
+    pub(crate) fn clear_user_wake_pending(&self) {
+        self.user_wake_pending
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 

@@ -231,6 +231,22 @@ impl<'a> NetView<'a> {
         )
     }
 
+    pub(super) fn interest_is_connected_host_socket(&self, slot: &EpollInterest, fd: i32) -> bool {
+        let is_host_connected = |desc: &crate::kernel::FileDescription| {
+            matches!(
+                desc.read().as_deref(),
+                Some(OpenDescription::HostSocket { base, .. }) if !base.listening()
+            )
+        };
+        if let Some(target) = &slot.target {
+            is_host_connected(target)
+        } else if let Some(open_file) = self.open_file(fd) {
+            is_host_connected(&open_file.description)
+        } else {
+            false
+        }
+    }
+
     fn epoll_path_reaches_desc(
         &self,
         current_desc: &Arc<crate::kernel::FileDescription>,
@@ -661,7 +677,6 @@ impl<'a> NetView<'a> {
                         interest, kqueue, ..
                     } = &mut *open
                     {
-                        let mut snapshot_changed = false;
                         #[cfg(any(
                             target_os = "macos",
                             target_os = "freebsd",
@@ -728,7 +743,6 @@ impl<'a> NetView<'a> {
                                     slot.last_read_avail,
                                 ) || slot.event.events & LINUX_EPOLLET != 0
                                 {
-                                    snapshot_changed = true;
                                     #[cfg(any(
                                         target_os = "macos",
                                         target_os = "freebsd",
@@ -769,7 +783,6 @@ impl<'a> NetView<'a> {
                                     continue;
                                 }
                                 if !slot.write_backpressured {
-                                    snapshot_changed = true;
                                     slot.write_backpressured = true;
                                 }
                                 #[cfg(any(
@@ -800,13 +813,9 @@ impl<'a> NetView<'a> {
                                 );
                             }
                         }
-                        // A waiter parked before this consumption holds a park
-                        // set whose ET exclusion was computed from the now-
-                        // serviced edge (the fd may be parked with events==0 —
-                        // deaf). Pop it so it re-samples and re-parks armed.
-                        if snapshot_changed {
-                            kqueue.wake_parked();
-                        }
+                        // Host sockets in kqueue are woken by the host kernel on new edges;
+                        // waking on every read/write progress causes massive spurious wakeups.
+                        // kqueue.wake_parked();
                         false
                     } else {
                         true
@@ -1103,6 +1112,7 @@ impl<'a> NetView<'a> {
                     .with_mux(|mux| mux.wait(&mut poll_events, Some(Duration::ZERO)))
                     .is_ok()
                 {
+                    kq.clear_user_wake_pending();
                     let acc_before = acc.len();
                     // Each drained event's udata is a GENERATIONAL handle
                     // `(guest_fd, reg_gen)` (the multiplexer IDENT stays the host
@@ -1425,6 +1435,13 @@ impl<'a> NetView<'a> {
             // epoll waiter while the host fd is already readable/writable.
             for (fd, interest) in &interests {
                 if host_ready_sampled.contains(fd) || this.interest_host_fd(interest, *fd).is_none()
+                {
+                    continue;
+                }
+                if interest.event.events & LINUX_EPOLLET != 0
+                    && interest.last_ready != 0
+                    && !interest.write_backpressured
+                    && this.interest_is_connected_host_socket(interest, *fd)
                 {
                     continue;
                 }
@@ -3407,15 +3424,18 @@ impl<'a> NetView<'a> {
                             _callback_enrollment: callback_enrollment,
                         },
                     );
-                    if host_fd.is_none() {
+                    let is_synthetic = host_fd.is_none();
+                    if is_synthetic {
                         *synthetic_interest_count += 1;
                     }
-                    // A waiter parked on this instance's ppoll snapshot does
-                    // not watch the just-added fd; pop it so it rebuilds.
-                    kqueue.wake_parked();
-                    drop(open);
-                    if let Some(wq) = open_file.description.wait_queue() {
-                        wq.wake_all();
+                    if is_synthetic || interest.len() == 1 {
+                        kqueue.wake_parked();
+                        drop(open);
+                        if let Some(wq) = open_file.description.wait_queue() {
+                            wq.wake_all();
+                        }
+                    } else {
+                        drop(open);
                     }
                     crate::probes::epoll_ctl(epfd, operation, fd, event.events, event.data, 0);
                     Ok(DispatchOutcome::Returned { value: 0 })
@@ -3467,11 +3487,14 @@ impl<'a> NetView<'a> {
                         reg_gen,
                         _callback_enrollment: slot._callback_enrollment.clone(),
                     };
-                    // Re-arm visible to a parked waiter: rebuild its park set.
-                    kqueue.wake_parked();
-                    drop(open);
-                    if let Some(wq) = open_file.description.wait_queue() {
-                        wq.wake_all();
+                    if host_fd.is_none() {
+                        kqueue.wake_parked();
+                        drop(open);
+                        if let Some(wq) = open_file.description.wait_queue() {
+                            wq.wake_all();
+                        }
+                    } else {
+                        drop(open);
                     }
                     crate::probes::epoll_ctl(epfd, operation, fd, event.events, event.data, 0);
                     Ok(DispatchOutcome::Returned { value: 0 })
@@ -3557,12 +3580,14 @@ impl<'a> NetView<'a> {
                         }
                     }
                     clear_pending_epoll_ready(pending_ready, fd);
-                    // A parked waiter still ppolls the removed fd's host fd;
-                    // pop it so it rebuilds without the dead entry.
-                    kqueue.wake_parked();
-                    drop(open);
-                    if let Some(wq) = open_file.description.wait_queue() {
-                        wq.wake_all();
+                    if host_fd.is_none() {
+                        kqueue.wake_parked();
+                        drop(open);
+                        if let Some(wq) = open_file.description.wait_queue() {
+                            wq.wake_all();
+                        }
+                    } else {
+                        drop(open);
                     }
                     crate::probes::epoll_ctl(epfd, operation, fd, 0, 0, 0);
                     Ok(DispatchOutcome::Returned { value: 0 })
