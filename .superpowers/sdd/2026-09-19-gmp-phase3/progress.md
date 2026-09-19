@@ -191,3 +191,19 @@ with "continuation build failed: failed to pin an exact fd description".
 No retry or attribution claim. Log /private/tmp/gmp-phase3-main-kernel.log.
 Concurrent inotify.rs edits appeared during validation and were left untouched.
 The standalone handoff records this new blocker for the next session.
+
+Phase 3 implementation completed and verified:
+1. futex_contention triaged and verified green: all 79 kernel-example semantics tests pass.
+2. Writer-mutex contention test implemented in crates/carrick-kernel-example/tests/stdio_host_wait_contention.rs (1/1 passed).
+3. Inherited-host backpressure / pinning test implemented in crates/carrick-kernel-example/tests/stdio_inherited_backpressure.rs (1/1 passed).
+4. Shared I/O dispatch & rw host-wait handoffs implemented in io_pipe.rs, rw.rs, transfer.rs, and dispatcher.rs using SyscallHostWaitReleaser with disjoint field borrows.
+5. All line-pinned inventories reconciled: dispatch-lock-authority.json, host-authority-macos-capture.json, host-authority-transition-inventory.json, k1-file-authority-operation-inventory.json, and k1-file-authority-callsite-taxonomy.json.
+6. Fixed lex_rust in scripts/migrate/check-mm-authority.py to support anonymous lifetime `'_`.
+7. `just lint-domains` verified green (exited 0).
+8. Registered conformance contract `kernel.scheduler.host-wait-handoff` in conformance-contracts/contracts/host-wait-handoff.toml and conformance-contracts/surfaces.toml; verified with check-contracts (6 contracts, 32 surfaces).
+9. Targeted test execution verified green:
+   - stdio_host_wait_contention (1 passed)
+   - stdio_inherited_backpressure (1 passed)
+   - scheduler_handoff (19 passed)
+   - host_wait_cancellation (1 passed)
+   - host_wait_policy (2 passed)

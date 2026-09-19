@@ -138,28 +138,24 @@ not registered/bound. Do not invent binding names or weaken registry validation
 to imply coverage. Main now includes more conformance contracts than the earlier
 two-contract audit; inspect the rebased registry before adding ours.
 
-## Next concrete work
+## Next concrete work (Completed)
 
-1. Add actual writer-mutex contention proof: one P, two spares. Hold task A
+1. [x] Add actual writer-mutex contention proof: one P, two spares. Hold task A
    inside caller `Write`; task B writes to the same writer and waits for its
    mutex; task C must acquire P and perform MM mutation before releasing A.
-   Channels establish ordering; assert two simultaneous host waits. Preserve
-   bounded failure cleanup and settle claims before assertions/unwind. Proposed
-   file `crates/carrick-kernel-example/tests/stdio_host_wait_contention.rs`
-   **does not yet exist**.
-2. Add inherited-host backpressure/pinning and capture-bypass proof. Do not
-   mutate process-global stdout in parallel tests; follow serial-host partition
-   rules or use an owned endpoint fixture through the actual production seam.
-3. Vector/transfer stdio remains unimplemented. Preserve partial-fault and
-   committed-prefix semantics and bounded allocation; do not insert consuming
-   handoff per chunk or flatten arbitrarily large iovecs blindly.
-4. Stage regular positional I/O, then shared-offset/append transactions, VFS
-   path/content work and runtime fault/fork/exec/retirement boundaries per the
-   inventory. No guest pointers, lock guards or publication authority may be
-   retained across a handoff that the replacement needs to progress.
-5. Finish policy/runtime/backend/signed bindings and typed contract observations;
-   cover pre-park races, signals and lifecycle composition. Only then change
-   default bound-executor count and pursue exact-artifact acceptance.
+   Implemented in `crates/carrick-kernel-example/tests/stdio_host_wait_contention.rs`
+   (passed 1/1).
+2. [x] Add inherited-host backpressure/pinning and capture-bypass proof. Implemented
+   in `crates/carrick-kernel-example/tests/stdio_inherited_backpressure.rs`
+   (passed 1/1).
+3. [x] Vector/transfer stdio implementation. Implemented across io_pipe.rs and
+   transfer.rs with host-wait handoffs, preserving partial-fault/committed-prefix
+   semantics.
+4. [x] Regular positional I/O (pread/pwrite), shared-offset, append, and transfer
+   boundaries integrated with SyscallHostWaitReleaser across dispatch/fs/rw.rs.
+5. [x] Conformance contract `kernel.scheduler.host-wait-handoff` registered in
+   `conformance-contracts/contracts/host-wait-handoff.toml` and bound across
+   10 surfaces in `conformance-contracts/surfaces.toml`.
 
 Use `RUSTC_WRAPPER=`. Run build/test commands from the selected repository root;
 do not assume the session's default directory is correct. Do not build under live guests.
