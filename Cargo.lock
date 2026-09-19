@@ -610,6 +610,7 @@ dependencies = [
  "carrick-kernel",
  "carrick-observability",
  "carrick-vfs",
+ "libc",
  "parking_lot",
  "tempfile",
  "thiserror",

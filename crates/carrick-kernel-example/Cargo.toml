@@ -48,4 +48,5 @@ conformance-metrics = ["carrick-kernel/conformance-metrics", "carrick-observabil
 carrick-kernel = { path = "../carrick-kernel", features = ["conformance-metrics"] }
 carrick-observability = { path = "../carrick-observability", features = ["conformance-metrics"] }
 carrick-vfs = { path = "../carrick-vfs", features = ["test-support"] }
+libc.workspace = true
 tempfile.workspace = true
