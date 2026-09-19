@@ -359,6 +359,17 @@ impl CowArmedRanges {
     pub(crate) const PAGE_SIZE: u64 = 4 * 1024;
 
     pub(crate) fn arm(&mut self, ranges: &[carrick_aarch64::vmm::ForkCowRange]) {
+        if ranges.is_empty() {
+            return;
+        }
+        if !self.ranges.is_empty() {
+            self.ranges.retain(|old| {
+                !ranges.iter().any(|r| {
+                    r.va <= old.va
+                        && (r.va as u128 + r.len as u128) >= (old.va as u128 + old.len as u128)
+                })
+            });
+        }
         self.ranges.extend_from_slice(ranges);
         self.ranges.sort_by_key(|range| (range.va, range.len));
         self.ranges.dedup();

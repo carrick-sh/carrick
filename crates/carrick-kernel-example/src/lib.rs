@@ -47,9 +47,9 @@ pub mod scripted;
 pub mod sys;
 
 pub use contracts::{
-    fork_filetable_contract, fork_filetable_scenario, futex_contention_contract,
-    futex_contention_scenario, futex_requeue_contract, futex_requeue_scenario,
-    inotify_watch_contract, inotify_watch_scenario,
+    fork_filetable_contract, fork_filetable_scenario, fork_mappings_contract,
+    fork_mappings_scenario, futex_contention_contract, futex_contention_scenario,
+    futex_requeue_contract, futex_requeue_scenario, inotify_watch_contract, inotify_watch_scenario,
 };
 pub use driver::{block_on_timeout, seed_initial_task_state};
 pub use memory::{GUEST_BASE, GUEST_LEN, TaskMemory};

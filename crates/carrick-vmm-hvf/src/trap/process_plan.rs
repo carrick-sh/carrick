@@ -141,6 +141,9 @@ impl ForkOverlayOwnerIndex {
         inventory: &ForkInventoryByStage2,
     ) -> Self {
         note_hot_path_rows(HotPathScan::ForkMappings, mappings.len());
+        if inventory.is_empty() {
+            return Self::default();
+        }
         let mut index = Self::default();
         for (position, overlay) in mappings.iter().enumerate() {
             if inherited_fork_inventory_extents_indexed(custody, overlay, inventory).is_empty() {
@@ -403,7 +406,13 @@ impl HvfTaskState {
             alias_revision_begin,
         );
         let alias_index = process_alias_index(&aliases, self.mm_root_slot, self.container_root);
-        let mut seen_dynamic_aliases = std::collections::HashSet::new();
+        let has_shadowed = self.mappings.shadowed_len() > 0;
+        let mut seen_dynamic_aliases = if has_shadowed {
+            Some(std::collections::HashSet::new())
+        } else {
+            None
+        };
+        let mut dynamic_count = 0usize;
         let mut source_mappings: Vec<ThreadMappingDesc> = self
             .mappings
             .iter()
@@ -418,10 +427,13 @@ impl HvfTaskState {
                     semantic_extent_size(mapping.start, mapping.end),
                     mapping.owner_generation,
                 );
-                if !seen_dynamic_aliases.insert(key) {
-                    return None;
+                if let Some(seen) = &mut seen_dynamic_aliases {
+                    if !seen.insert(key) {
+                        return None;
+                    }
                 }
                 let alias = alias_index.get(&key).copied()?;
+                dynamic_count += 1;
                 let source = ThreadMappingDesc::from_region(mapping);
                 ThreadMappingDesc::from_alias_with_structural_owner(
                     alias,
@@ -509,16 +521,21 @@ impl HvfTaskState {
         // case). Only an exact current local descriptor suppresses a registry
         // row; keying every local descriptor by IPA hid MAP_FIXED private
         // ownership from fork even though stage-1 already selected it.
-        let local_aliases: std::collections::HashSet<ProcessAliasKey> = source_mappings
-            .iter()
-            .map(thread_mapping_process_alias_key)
-            .collect();
-        let missing = missing_process_aliases(
-            &local_aliases,
-            &aliases,
-            self.mm_root_slot,
-            self.container_root,
-        );
+        let all_aliases_covered = !has_shadowed && dynamic_count == alias_index.len();
+        let missing = if all_aliases_covered {
+            Vec::new()
+        } else {
+            let local_aliases: std::collections::HashSet<ProcessAliasKey> = source_mappings
+                .iter()
+                .map(thread_mapping_process_alias_key)
+                .collect();
+            missing_process_aliases(
+                &local_aliases,
+                &aliases,
+                self.mm_root_slot,
+                self.container_root,
+            )
+        };
         let candidate_regions = missing.len() as u64;
         let mut added_regions = 0_u64;
         let mut added_bytes = 0_u64;

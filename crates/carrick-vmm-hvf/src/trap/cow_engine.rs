@@ -16,17 +16,22 @@ impl HvfVmState {
             .lock()
             .process_visible_ordered(self.mm_root_slot, self.container_root);
         let alias_index = process_alias_index(&aliases, self.mm_root_slot, self.container_root);
+        let mut matched_dynamic_aliases = 0usize;
         let mut ranges: Vec<_> = self
             .mappings
             .iter()
             .filter(|mapping| {
+                let is_current = mapping_is_current_for_process_fork_indexed(mapping, &alias_index);
+                if mapping.is_dynamic_alias && is_current {
+                    matched_dynamic_aliases += 1;
+                }
                 mapping.sharing == GuestMappingSharing::Private
                     && mapping.start != crate::memory::LINUX_PAGE_TABLES_BASE
                     && !is_kernel_only_stage1_range(
                         mapping.start,
                         semantic_extent_size(mapping.start, mapping.end),
                     )
-                    && mapping_is_current_for_process_fork_indexed(mapping, &alias_index)
+                    && is_current
             })
             .map(|mapping| carrick_aarch64::vmm::ForkCowRange {
                 va: mapping.start,
@@ -39,32 +44,36 @@ impl HvfVmState {
                 granule: carrick_aarch64::vmm::CowGranule::Compound,
             })
             .collect();
-        let local_aliases = current_process_alias_keys(
-            &self.mappings,
-            &aliases,
-            self.mm_root_slot,
-            self.container_root,
-        );
-        ranges.extend(
-            missing_process_aliases(
-                &local_aliases,
+        let all_aliases_covered =
+            self.mappings.shadowed_len() == 0 && matched_dynamic_aliases == alias_index.len();
+        if !all_aliases_covered {
+            let local_aliases = current_process_alias_keys(
+                &self.mappings,
                 &aliases,
                 self.mm_root_slot,
                 self.container_root,
-            )
-            .into_iter()
-            .filter(|mapping| {
-                mapping.sharing == GuestMappingSharing::Private
-                    && !is_kernel_only_stage1_range(mapping.start, mapping.size)
-            })
-            .map(|mapping| carrick_aarch64::vmm::ForkCowRange {
-                va: mapping.start,
-                len: mapping.size,
-                executable: mapping.perms & 4 != 0,
-                kernel_only: is_kernel_only_stage1_range(mapping.start, mapping.size),
-                granule: carrick_aarch64::vmm::CowGranule::Compound,
-            }),
-        );
+            );
+            ranges.extend(
+                missing_process_aliases(
+                    &local_aliases,
+                    &aliases,
+                    self.mm_root_slot,
+                    self.container_root,
+                )
+                .into_iter()
+                .filter(|mapping| {
+                    mapping.sharing == GuestMappingSharing::Private
+                        && !is_kernel_only_stage1_range(mapping.start, mapping.size)
+                })
+                .map(|mapping| carrick_aarch64::vmm::ForkCowRange {
+                    va: mapping.start,
+                    len: mapping.size,
+                    executable: mapping.perms & 4 != 0,
+                    kernel_only: is_kernel_only_stage1_range(mapping.start, mapping.size),
+                    granule: carrick_aarch64::vmm::CowGranule::Compound,
+                }),
+            );
+        }
         ranges.sort_by_key(|range| (range.va, range.len));
         ranges.dedup_by_key(|range| (range.va, range.len));
         ranges
@@ -5565,6 +5574,13 @@ pub(crate) fn projected_fork_mappings(
                 | ForkMappingDisposition::SharedFrameReadOnly
         )
     {
+        return Ok(vec![ProjectedForkMapping {
+            mapping: mapping.clone(),
+            plan: ForkMappingPlan::preserved(base),
+        }]);
+    }
+
+    if ranges.is_empty() {
         return Ok(vec![ProjectedForkMapping {
             mapping: mapping.clone(),
             plan: ForkMappingPlan::preserved(base),

@@ -124,6 +124,22 @@ pub fn dup(oldfd: impl Into<Operand>) -> Syscall {
     )
 }
 
+/// `mmap(2)` with `MAP_PRIVATE | MAP_ANONYMOUS`.
+pub fn mmap_anon(len: usize) -> Syscall {
+    call(
+        "mmap",
+        nr::MMAP,
+        [
+            0.into(),
+            (len as i64).into(),
+            ((carrick_abi::LINUX_PROT_READ | carrick_abi::LINUX_PROT_WRITE) as i64).into(),
+            ((carrick_abi::LINUX_MAP_PRIVATE | carrick_abi::LINUX_MAP_ANONYMOUS) as i64).into(),
+            (-1i64).into(),
+            0.into(),
+        ],
+    )
+}
+
 /// `wait4(2)`: allocates a 4-byte `Out(4)` status buffer at arg 1.
 pub fn wait4(pid: impl Into<Operand>, options: i32) -> Syscall {
     call(

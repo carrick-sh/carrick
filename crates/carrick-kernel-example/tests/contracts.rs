@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use carrick_conformance_contract::{ContractRegistry, evaluate};
 use carrick_kernel_example::contracts::{
-    fork_filetable_contract, futex_contention_contract, futex_requeue_contract,
-    futex_requeue_scenario, inotify_watch_contract,
+    fork_filetable_contract, fork_mappings_contract, futex_contention_contract,
+    futex_requeue_contract, futex_requeue_scenario, inotify_watch_contract,
 };
 use carrick_observability::work_meter::WorkMetric;
 
@@ -193,6 +193,39 @@ fn inotify_watch_structural_red_control() {
     match err {
         carrick_conformance_contract::EvaluationError::WorkBudgetExceeded { metric, .. } => {
             assert_eq!(metric, WorkMetric::HostBackendCalls);
+        }
+        other => panic!("expected WorkBudgetExceeded, got: {other:?}"),
+    }
+}
+
+#[test]
+fn fork_mappings_contract_is_semantically_exact_and_constant() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry.require("kernel.fork.mappings").expect("contract");
+    let observations = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| fork_mappings_contract(scale).expect("observation"))
+        .collect::<Vec<_>>();
+    evaluate(contract, &observations).expect("semantic and structural conformance");
+}
+
+#[test]
+fn fork_mappings_structural_red_control() {
+    let fault = std::env::var("CARRICK_CONTRACT_FAULT").unwrap_or_default();
+    if fault != "extra-backing-alloc" {
+        return;
+    }
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry.require("kernel.fork.mappings").expect("contract");
+    let observations = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| fork_mappings_contract(scale).expect("observation"))
+        .collect::<Vec<_>>();
+    let err =
+        evaluate(contract, &observations).expect_err("should violate budget with injected fault");
+    match err {
+        carrick_conformance_contract::EvaluationError::WorkBudgetExceeded { metric, .. } => {
+            assert_eq!(metric, WorkMetric::BackingAllocations);
         }
         other => panic!("expected WorkBudgetExceeded, got: {other:?}"),
     }
