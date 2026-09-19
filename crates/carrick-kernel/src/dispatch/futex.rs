@@ -414,6 +414,16 @@ pub(crate) fn dispatch_threaded_futex(
                 };
             }
 
+            // Linux returns EINVAL when the source and destination futex keys
+            // match (futex_match). With sharded continuation queues the same-
+            // address same-shard path would spin the same waiter indefinitely,
+            // so this check is also structurally load-bearing.
+            if address == uaddr2 {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                };
+            }
+
             if let Some(location) = shared_location {
                 let Some(to_location) = memory.shared_futex_location(uaddr2) else {
                     return DispatchOutcome::Errno {
