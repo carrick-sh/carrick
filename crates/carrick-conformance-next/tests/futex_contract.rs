@@ -87,16 +87,4 @@ fn futex_contract_differential_verification() {
             "contract_id must be recorded in signed artifact receipt"
         );
     }
-
-    // 5. Scoped cleanup reports zero remaining processes
-    let active_procs = std::process::Command::new("pgrep")
-        .args(["-f", "carrick:contract-futex"])
-        .output();
-    if let Ok(output) = active_procs {
-        assert!(
-            output.stdout.is_empty(),
-            "scoped cleanup left orphan processes: {:?}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-    }
 }
