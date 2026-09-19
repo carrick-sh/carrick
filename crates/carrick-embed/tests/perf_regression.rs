@@ -105,7 +105,7 @@ fn parse_metric<T: std::str::FromStr>(out: &str, key: &str) -> Option<T> {
     None
 }
 
-/// Futex pingpong latency regression gate: p50 latency must stay below 50 µs ceiling.
+/// Futex pingpong latency regression gate: p50 latency must stay below 25 µs ceiling.
 #[test]
 fn futex_pingpong_p50_under_ceiling() {
     let binary = probe_binary("perf_futex_pingpong");
@@ -124,15 +124,15 @@ fn futex_pingpong_p50_under_ceiling() {
     let Some(p50) = parse_metric::<f64>(&out, "futex_pingpong_p50_us") else {
         panic!("futex_pingpong_p50_us metric must be present in: {out}");
     };
-    // Tightened regression ceiling: 50 µs (calibrated from ~12.8 µs optimized HVF baseline).
-    const CEILING_US: f64 = 50.0;
+    // Tightened release regression ceiling: 25 µs (calibrated from ~3.25 µs optimized HVF baseline).
+    const CEILING_US: f64 = 25.0;
     assert!(
         p50 < CEILING_US,
         "futex pingpong p50={p50} µs exceeds ceiling {CEILING_US} µs ({out})"
     );
 }
 
-/// Fork immediate exit latency regression gate: p50 latency must stay below 5 ms ceiling.
+/// Fork immediate exit latency regression gate: p50 latency must stay below 1.5 ms ceiling.
 #[test]
 fn fork_immediate_exit_p50_under_ceiling() {
     let binary = probe_binary("perf_fork");
@@ -148,15 +148,15 @@ fn fork_immediate_exit_p50_under_ceiling() {
     let Some(p50) = parse_metric::<f64>(&out, "fork_p50_us") else {
         panic!("fork_p50_us metric must be present in: {out}");
     };
-    // Tightened regression ceiling: 5,000 µs (5 ms; calibrated from ~3.4 ms optimized HVF baseline).
-    const CEILING_US: f64 = 5_000.0;
+    // Tightened release regression ceiling: 1,500 µs (1.5 ms; calibrated from ~294 µs optimized HVF baseline).
+    const CEILING_US: f64 = 1_500.0;
     assert!(
         p50 < CEILING_US,
         "fork p50={p50} µs exceeds ceiling {CEILING_US} µs ({out})"
     );
 }
 
-/// Epoll pipe loop latency regression gate: p50 latency must stay below 250 µs ceiling.
+/// Epoll pipe loop latency regression gate: p50 latency must stay below 100 µs ceiling.
 #[test]
 fn epoll_pipe_loop_p50_under_ceiling() {
     let binary = probe_binary("perf_epoll_pipe_loop");
@@ -175,8 +175,8 @@ fn epoll_pipe_loop_p50_under_ceiling() {
     let Some(p50) = parse_metric::<f64>(&out, "epoll_pipe_loop_p50_us") else {
         panic!("epoll_pipe_loop_p50_us metric must be present in: {out}");
     };
-    // Committed regression ceiling: 250 µs (calibrated from ~30-50 µs typical HVF baseline).
-    const CEILING_US: f64 = 250.0;
+    // Tightened release regression ceiling: 100 µs (calibrated from ~68.5 µs optimized HVF baseline).
+    const CEILING_US: f64 = 100.0;
     assert!(
         p50 < CEILING_US,
         "epoll pipe loop p50={p50} µs exceeds ceiling {CEILING_US} µs ({out})"
@@ -203,8 +203,8 @@ fn syscall_floor_gettid_under_ceiling() {
     let Some(p50) = parse_metric::<f64>(&out, "gettid_p50_us") else {
         panic!("gettid_p50_us metric must be present in: {out}");
     };
-    // Committed regression ceiling: 20.0 µs (calibrated from ~8.6 µs debug test build baseline).
-    const CEILING_US: f64 = 20.0;
+    // Tightened release regression ceiling: 2.5 µs (calibrated from ~1.67 µs optimized HVF baseline).
+    const CEILING_US: f64 = 2.5;
     assert!(
         p50 < CEILING_US,
         "gettid trap floor p50={p50} µs exceeds ceiling {CEILING_US} µs ({out})"

@@ -197,9 +197,9 @@ fi
 json_log="$(mktemp -t carrick-test-signed-build)"
 scratch+=("$json_log")
 if [ "$pkg" = "carrick-embed" ]; then
-    cargo test -p "$pkg" --features test-support --no-run --message-format=json >"$json_log"
+    cargo test -p "$pkg" --features test-support --release --no-run --message-format=json >"$json_log"
 else
-    cargo test -p "$pkg" --no-run --message-format=json >"$json_log"
+    cargo test -p "$pkg" --release --no-run --message-format=json >"$json_log"
 fi
 exes=()
 while IFS= read -r exe; do
