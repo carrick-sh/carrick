@@ -404,6 +404,7 @@ pub(crate) struct WatchResCacheEntry {
     generation: u64,
     normalized: PathBuf,
     pub(crate) source_fd: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
+    pub(crate) is_dir: bool,
 }
 
 /// F_GETPATH of a root dir fd → its absolute host path (macOS), used as the
@@ -5730,13 +5731,26 @@ impl FsBackend for HostFsBackend {
                 self.watch_cache_proc_gen.store(proc_gen, Relaxed);
             }
             guard.get(path).and_then(|entry| {
-                (entry.generation == now)
-                    .then(|| (entry.normalized.clone(), entry.source_fd.clone()))
+                (entry.generation == now).then(|| {
+                    (
+                        entry.normalized.clone(),
+                        entry.source_fd.clone(),
+                        entry.is_dir,
+                    )
+                })
             })
         };
-        let (normalized, cached_source_fd) = match cached {
+
+        // Fast path for non-directory cache hits: dup the cached source fd directly
+        // without joining scratch path, re-locking the cache, or issuing symlink_metadata/lstat.
+        if let Some((_normalized, Some(ref source_fd), false)) = cached {
+            let root_fd = dup_host_watch_fd(std::os::fd::AsRawFd::as_raw_fd(&**source_fd))?;
+            return Ok(vec![crate::vfs::WatchFd::unnamed(root_fd)]);
+        }
+
+        let (normalized, cached_is_dir) = match cached {
             // A cached hit is never a tombstone — we don't store those.
-            Some(entry) => entry,
+            Some((norm, _, is_dir)) => (norm, Some(is_dir)),
             None => {
                 let kind = self.lookup_kind(path).ok_or(carrick_abi::LINUX_ENOENT)?;
                 if matches!(kind, OverlayEntryKind::Deleted) {
@@ -5751,37 +5765,37 @@ impl FsBackend for HostFsBackend {
             }
         };
         let host_path = scratch.path().join(&normalized);
-        let root_fd = match cached_source_fd {
-            Some(ref source_fd) => {
-                dup_host_watch_fd(std::os::fd::AsRawFd::as_raw_fd(&**source_fd))?
+        let root_fd = open_host_watch_fd(&host_path)?;
+        let is_dir = match cached_is_dir {
+            Some(is_dir) => is_dir,
+            None => {
+                let metadata =
+                    std::fs::symlink_metadata(&host_path).map_err(io_error_to_linux_errno)?;
+                metadata.is_dir()
             }
-            None => open_host_watch_fd(&host_path)?,
         };
-        let metadata = std::fs::symlink_metadata(&host_path).map_err(io_error_to_linux_errno)?;
-        if !metadata.is_dir() {
-            if cached_source_fd.is_none() {
-                let source_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(root_fd) };
-                let watch_fd = dup_host_watch_fd(std::os::fd::AsRawFd::as_raw_fd(&source_fd))?;
-                let mut guard = self.watch_res_cache.lock();
-                // Bound it: distinct watched paths are normally few, but a
-                // path-diverse guest must not grow this without limit.
-                if guard.len() >= 8192 && !guard.contains_key(path) {
-                    guard.clear();
-                }
-                guard.insert(
-                    path.to_owned(),
-                    WatchResCacheEntry {
-                        generation: gen_at_entry,
-                        normalized,
-                        source_fd: Some(std::sync::Arc::new(source_fd)),
-                    },
-                );
-                return Ok(vec![crate::vfs::WatchFd::unnamed(watch_fd)]);
+        if !is_dir {
+            let source_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(root_fd) };
+            let watch_fd = dup_host_watch_fd(std::os::fd::AsRawFd::as_raw_fd(&source_fd))?;
+            let mut guard = self.watch_res_cache.lock();
+            // Bound it: distinct watched paths are normally few, but a
+            // path-diverse guest must not grow this without limit.
+            if guard.len() >= 8192 && !guard.contains_key(path) {
+                guard.clear();
             }
-            return Ok(vec![crate::vfs::WatchFd::unnamed(root_fd)]);
+            guard.insert(
+                path.to_owned(),
+                WatchResCacheEntry {
+                    generation: gen_at_entry,
+                    normalized,
+                    source_fd: Some(std::sync::Arc::new(source_fd)),
+                    is_dir: false,
+                },
+            );
+            return Ok(vec![crate::vfs::WatchFd::unnamed(watch_fd)]);
         }
 
-        if cached_source_fd.is_none() {
+        if cached_is_dir.is_none() {
             let mut guard = self.watch_res_cache.lock();
             if guard.len() >= 8192 && !guard.contains_key(path) {
                 guard.clear();
@@ -5792,6 +5806,7 @@ impl FsBackend for HostFsBackend {
                     generation: gen_at_entry,
                     normalized: normalized.clone(),
                     source_fd: None,
+                    is_dir: true,
                 },
             );
         }

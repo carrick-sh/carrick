@@ -1051,6 +1051,7 @@ fn host_watch_fds_caches_source_fd_for_stable_fifo() {
     let guard = b.watch_res_cache.lock();
     let entry = guard.get("/stress_fname").expect("cached watch source");
     assert!(entry.source_fd.is_some());
+    assert!(!entry.is_dir);
 }
 
 // -- fd-centric guest-open fast path (fast_open_for_guest) --------

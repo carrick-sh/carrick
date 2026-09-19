@@ -306,8 +306,8 @@ impl SyscallDispatcher {
 
         fn clock_gettime(this, cx, clock_id: u64, address: GuestPtr) {
             let memory = &mut *cx.memory;
-            let clock = Arc::clone(cx.kernel.task().container().clock());
-            let Some(duration) = linux_clock_duration(&clock, clock_id) else {
+            let container = cx.kernel.task().container();
+            let Some(duration) = linux_clock_duration(container.clock(), clock_id) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             let timespec = linux_timespec_from_duration(duration);
@@ -316,8 +316,8 @@ impl SyscallDispatcher {
 
         fn clock_getres(this, cx, clock_id: u64, address: GuestPtr) {
             let memory = &mut *cx.memory;
-            let clock = Arc::clone(cx.kernel.task().container().clock());
-            if linux_clock_duration(&clock, clock_id).is_none() {
+            let container = cx.kernel.task().container();
+            if linux_clock_duration(container.clock(), clock_id).is_none() {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if address.0 == 0 {
@@ -565,8 +565,8 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM));
             }
             // Validate the clock — we only support the same set as clock_gettime.
-            let clock = Arc::clone(cx.kernel.task().container().clock());
-            if linux_clock_duration(&clock, clock_id).is_none() {
+            let container = cx.kernel.task().container();
+            if linux_clock_duration(container.clock(), clock_id).is_none() {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if id_out.0 == 0 {
