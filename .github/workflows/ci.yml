@@ -27,6 +27,16 @@ jobs:
     runs-on: macos-14 # Apple Silicon
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Conformance contract coverage (PR changed surfaces)
+        if: github.event_name == 'pull_request'
+        run: python3 scripts/conformance/check-contract-change.py --root . --base ${{ github.event.pull_request.base.sha }} --head ${{ github.sha }}
+
+      - name: Conformance contract registry validation (push/scheduled/manual)
+        if: github.event_name != 'pull_request'
+        run: cargo run -p carrick-conformance-contract --bin check-contracts -- --root .
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
