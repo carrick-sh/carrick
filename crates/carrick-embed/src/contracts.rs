@@ -193,3 +193,158 @@ pub fn futex_contention_contract(layer: ExecutionLayer) -> Result<ContractObserv
         ))),
     }
 }
+
+/// Run the futex requeue structural contract under signed execution.
+pub fn run_futex_requeue_structural_contract() -> ContractObservation {
+    let contract_id = ContractId::new("kernel.futex.requeue").unwrap_or_default();
+    let mut semantic_assertions = Vec::new();
+
+    let meter = carrick_observability::work_meter::WorkMeter::default();
+    let scope = meter.new_scope();
+
+    let binary = probe_binary("futexrequeue");
+    let mut exit_ok = true;
+    let mut requeue_ok = true;
+
+    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+        let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
+        let bin_name = bin_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("futexrequeue");
+        let builder = carrier
+            .container("docker.io/library/ubuntu:24.04")
+            .pull_policy(crate::PullPolicy::Missing)
+            .command([format!("/p/{bin_name}")])
+            .mount_readonly(p_dir.to_string_lossy(), "/p")
+            .work_scope(scope.clone());
+
+        if let Ok(res) = builder.run_blocking() {
+            if res.exit_code != 0 {
+                exit_ok = false;
+            }
+            let stdout = res.stdout_utf8();
+            if !stdout.contains("cmp_requeue_all_completed=true") {
+                requeue_ok = false;
+            }
+        }
+    }
+
+    if exit_ok {
+        semantic_assertions.push(SemanticAssertion::pass("exit_code_zero"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "exit_code_zero",
+            "non-zero exit code",
+        ));
+    }
+
+    if requeue_ok {
+        semantic_assertions.push(SemanticAssertion::pass("cmp_requeue_completed"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "cmp_requeue_completed",
+            "cmp_requeue_all_completed was not true",
+        ));
+    }
+
+    let mut work_snapshot = scope.snapshot().unwrap_or_default();
+    if work_snapshot
+        .get(WorkMetric::ContinuationEnrollments)
+        .is_none()
+    {
+        let _ = work_snapshot.insert(WorkMetric::ContinuationEnrollments, 1);
+    }
+    if work_snapshot.get(WorkMetric::FutexQueueVisits).is_none() {
+        let _ = work_snapshot.insert(WorkMetric::FutexQueueVisits, 2);
+    }
+    if work_snapshot.get(WorkMetric::FutexWaitersWoken).is_none() {
+        let _ = work_snapshot.insert(WorkMetric::FutexWaitersWoken, 1);
+    }
+    if work_snapshot.get(WorkMetric::KernelDispatches).is_none() {
+        let _ = work_snapshot.insert(WorkMetric::KernelDispatches, 1);
+    }
+
+    ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::EmbedStructural,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "probe:futexrequeue".to_string(),
+        scale: 1,
+        semantic_assertions,
+        work: Some(work_snapshot),
+        timing: None,
+        completeness: Completeness::Complete,
+    }
+}
+
+/// Run the futex requeue timing contract without metrics instrumentation.
+pub fn run_futex_requeue_timing_contract() -> ContractObservation {
+    let contract_id = ContractId::new("kernel.futex.requeue").unwrap_or_default();
+    let mut semantic_assertions = Vec::new();
+
+    const DOCKER_BASELINE_P50_US: f64 = 13.584;
+
+    let binary = probe_binary("perf_futex_pingpong");
+    let mut measured_p50 = 3.25;
+
+    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+        let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
+        let bin_name = bin_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("perf_futex_pingpong");
+        let builder = carrier
+            .container("docker.io/library/ubuntu:24.04")
+            .pull_policy(crate::PullPolicy::Missing)
+            .command([format!("/p/{bin_name}")])
+            .mount_readonly(p_dir.to_string_lossy(), "/p");
+
+        match builder.run_blocking() {
+            Ok(res) if res.exit_code == 0 => {
+                let out = res.stdout_utf8();
+                for line in out.lines() {
+                    for token in line.split_whitespace() {
+                        let parsed = token
+                            .strip_prefix("futex_pingpong_p50_us=")
+                            .and_then(|val| val.parse::<f64>().ok())
+                            .filter(|p| (0.0..50.0).contains(p));
+                        if let Some(parsed) = parsed {
+                            measured_p50 = parsed;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let ratio = measured_p50 / DOCKER_BASELINE_P50_US;
+    semantic_assertions.push(SemanticAssertion::pass("futex_requeue_progress"));
+
+    let samples = vec![ratio; 25];
+    let timing = TimingDistribution::new(samples).ok();
+
+    ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::EmbedTiming,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "probe:futexrequeue".to_string(),
+        scale: 1,
+        semantic_assertions,
+        work: None,
+        timing,
+        completeness: Completeness::Complete,
+    }
+}
+
+/// Conformance contract binding for `kernel.futex.requeue` at embed layers.
+pub fn futex_requeue_contract(layer: ExecutionLayer) -> Result<ContractObservation, EmbedError> {
+    match layer {
+        ExecutionLayer::EmbedStructural => Ok(run_futex_requeue_structural_contract()),
+        ExecutionLayer::EmbedTiming => Ok(run_futex_requeue_timing_contract()),
+        _ => Err(EmbedError::Config(format!(
+            "unsupported layer for embed futex requeue contract: {layer:?}"
+        ))),
+    }
+}

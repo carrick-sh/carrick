@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 
 use carrick_conformance_contract::{ContractRegistry, evaluate};
-use carrick_kernel_example::contracts::futex_contention_contract;
+use carrick_kernel_example::contracts::{
+    futex_contention_contract, futex_requeue_contract, futex_requeue_scenario,
+};
 use carrick_observability::work_meter::WorkMetric;
 
 fn repo_root() -> PathBuf {
@@ -68,6 +70,50 @@ fn futex_structural_red_control() {
     let observations = [1, 8, 32, 128]
         .into_iter()
         .map(|scale| futex_contention_contract(scale, 0).expect("observation"))
+        .collect::<Vec<_>>();
+    let err =
+        evaluate(contract, &observations).expect_err("should violate scaling with injected fault");
+    match err {
+        carrick_conformance_contract::EvaluationError::ScalingViolation {
+            scale, metric, ..
+        } => {
+            assert_eq!(scale, 1, "smallest affected scale must be 1");
+            assert_eq!(metric, WorkMetric::FutexQueueVisits);
+        }
+        other => panic!("expected ScalingViolation, got: {other:?}"),
+    }
+}
+
+#[test]
+fn futex_requeue_contract_is_semantically_exact_and_linear() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry.require("kernel.futex.requeue").expect("contract");
+    let observations = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| futex_requeue_contract(scale).expect("observation"))
+        .collect::<Vec<_>>();
+    evaluate(contract, &observations).expect("requeue semantic and structural conformance");
+}
+
+#[test]
+fn futex_requeue_partial_and_full() {
+    let obs = futex_requeue_scenario(8, 2, 3).expect("partial requeue observation");
+    assert_eq!(obs.work_value(WorkMetric::FutexWaitersWoken), Some(5)); // 2 woken by requeue + 3 woken by dest_wake
+    assert_eq!(obs.work_value(WorkMetric::FutexQueueVisits), Some(10)); // (1 + 2 + 3) + (1 + 3) = 10
+    assert_eq!(obs.work_value(WorkMetric::ContinuationEnrollments), Some(8));
+}
+
+#[test]
+fn futex_requeue_structural_red_control() {
+    let fault = std::env::var("CARRICK_CONTRACT_FAULT").unwrap_or_default();
+    if fault != "extra-futex-requeue-visit" {
+        return;
+    }
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry.require("kernel.futex.requeue").expect("contract");
+    let observations = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| futex_requeue_contract(scale).expect("observation"))
         .collect::<Vec<_>>();
     let err =
         evaluate(contract, &observations).expect_err("should violate scaling with injected fault");
