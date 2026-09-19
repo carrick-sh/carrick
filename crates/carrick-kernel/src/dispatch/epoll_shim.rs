@@ -4,7 +4,13 @@
 //! (the fix for Go's netpollBreak lost-wakeup / high-P netpoller stall).
 use super::*;
 
-pub type EpollWakeRegistry = std::sync::Arc<Mutex<Vec<i32>>>;
+#[derive(Clone, Debug)]
+pub(crate) struct EpollWakeTarget {
+    pub(crate) fd: i32,
+    pub(crate) pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+pub type EpollWakeRegistry = std::sync::Arc<Mutex<Vec<EpollWakeTarget>>>;
 
 /// A retained capability to publish an in-memory readiness wake.
 ///
@@ -38,15 +44,19 @@ pub(crate) fn new_epoll_wake_registry() -> EpollWakeRegistry {
 /// The fd stored is each instance's [`EpollKqueue::wake_fd`]: the kqueue fd on
 /// macOS (EVFILT_USER(0) rides it) or the user-wake `eventfd` on Linux (a
 /// separate fd that, written, makes the epoll `poll_fd` readable).
-pub(crate) fn register_epoll_kqueue(registry: &EpollWakeRegistry, fd: i32) {
+pub(crate) fn register_epoll_kqueue(
+    registry: &EpollWakeRegistry,
+    fd: i32,
+    pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     let mut reg = registry.lock();
-    if !reg.contains(&fd) {
-        reg.push(fd);
+    if !reg.iter().any(|t| t.fd == fd) {
+        reg.push(EpollWakeTarget { fd, pending });
     }
 }
 
 pub(crate) fn unregister_epoll_kqueue(registry: &EpollWakeRegistry, fd: i32) {
-    registry.lock().retain(|&f| f != fd);
+    registry.lock().retain(|t| t.fd != fd);
 }
 
 /// Wake every epoll instance (via its `EVFILT_USER(0)`) so a thread blocked in
@@ -63,7 +73,19 @@ pub(crate) fn unregister_epoll_kqueue(registry: &EpollWakeRegistry, fd: i32) {
 /// pops the parked waiter (reaching the instance's mux without threading a
 /// handle through the registry).
 pub(crate) fn notify_inmem_epoll(registry: &EpollWakeRegistry) {
-    for &fd in registry.lock().iter() {
-        crate::event_mux::trigger_user_wake_fd(fd);
+    let targets = registry.lock().clone();
+    for target in targets {
+        if target
+            .pending
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            crate::event_mux::trigger_user_wake_fd(target.fd);
+        }
     }
 }

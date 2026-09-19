@@ -7,17 +7,30 @@ use carrick_hal::error::OsError;
 use carrick_hal::event::{
     EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, VnodeEvents,
 };
+use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::time::Duration;
 
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct RegisteredFilter {
+    read: bool,
+    write: bool,
+    oob: bool,
+    vnode: bool,
+}
+
 pub struct KqueueMultiplexer {
     kq: Kqueue,
+    registered: HashMap<RawFd, RegisteredFilter>,
 }
 
 impl KqueueMultiplexer {
     pub fn new() -> Result<Self, OsError> {
         let kq = Kqueue::new_internal().ok_or_else(|| OsError::last("KqueueMultiplexer::new"))?;
-        Ok(Self { kq })
+        Ok(Self {
+            kq,
+            registered: HashMap::new(),
+        })
     }
 }
 
@@ -39,6 +52,12 @@ impl EventMultiplexer for KqueueMultiplexer {
             base |= libc::EV_CLEAR;
         }
 
+        let current = self.registered.get(&fd).copied().unwrap_or_default();
+        let mut new_entry = current;
+        new_entry.read = interest.read;
+        new_entry.write = interest.write;
+        new_entry.oob = interest.oob;
+
         let mut changes = Vec::with_capacity(3);
         if interest.read {
             let read = match interest.read_lowat {
@@ -46,14 +65,16 @@ impl EventMultiplexer for KqueueMultiplexer {
                 None => Kevent::read(fd, base),
             };
             changes.push(read.with_udata_u64(token));
-        } else {
-            let _ = self.kq.apply(&[Kevent::read(fd, libc::EV_DELETE)]);
+        } else if current.read {
+            changes.push(Kevent::read(fd, libc::EV_DELETE));
         }
+
         if interest.write {
             changes.push(Kevent::write(fd, base).with_udata_u64(token));
-        } else {
-            let _ = self.kq.apply(&[Kevent::write(fd, libc::EV_DELETE)]);
+        } else if current.write {
+            changes.push(Kevent::write(fd, libc::EV_DELETE));
         }
+
         if interest.oob {
             #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
             {
@@ -61,12 +82,19 @@ impl EventMultiplexer for KqueueMultiplexer {
             }
             #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
             changes.push(Kevent::oob(fd, base).with_udata_u64(token));
-        } else {
-            let _ = self.kq.apply(&[Kevent::oob(fd, libc::EV_DELETE)]);
+        } else if current.oob {
+            #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
+            changes.push(Kevent::oob(fd, libc::EV_DELETE));
         }
 
         if !changes.is_empty() {
             self.kq.apply(&changes).map_err(OsError::from_raw)?;
+        }
+
+        if new_entry == RegisteredFilter::default() {
+            self.registered.remove(&fd);
+        } else {
+            self.registered.insert(fd, new_entry);
         }
         Ok(())
     }
@@ -74,7 +102,9 @@ impl EventMultiplexer for KqueueMultiplexer {
     fn register_vnode(&mut self, fd: RawFd, token: u64, mask: VnodeEvents) -> Result<(), OsError> {
         let note = mask.to_note();
         let ev = Kevent::vnode(fd, note).with_udata_u64(token);
-        self.kq.apply(&[ev]).map_err(OsError::from_raw)
+        self.kq.apply(&[ev]).map_err(OsError::from_raw)?;
+        self.registered.entry(fd).or_default().vnode = true;
+        Ok(())
     }
 
     fn register_user(&mut self, ident: u64) -> Result<(), OsError> {
@@ -103,10 +133,25 @@ impl EventMultiplexer for KqueueMultiplexer {
     }
 
     fn deregister(&mut self, fd: RawFd) -> Result<(), OsError> {
-        let _ = self.kq.apply(&[Kevent::read(fd, libc::EV_DELETE)]);
-        let _ = self.kq.apply(&[Kevent::write(fd, libc::EV_DELETE)]);
-        let _ = self.kq.apply(&[Kevent::oob(fd, libc::EV_DELETE)]);
-        let _ = self.kq.apply(&[Kevent::vnode_delete(fd)]);
+        if let Some(entry) = self.registered.remove(&fd) {
+            let mut deletes = Vec::with_capacity(4);
+            if entry.read {
+                deletes.push(Kevent::read(fd, libc::EV_DELETE));
+            }
+            if entry.write {
+                deletes.push(Kevent::write(fd, libc::EV_DELETE));
+            }
+            if entry.oob {
+                #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
+                deletes.push(Kevent::oob(fd, libc::EV_DELETE));
+            }
+            if entry.vnode {
+                deletes.push(Kevent::vnode_delete(fd));
+            }
+            if !deletes.is_empty() {
+                let _ = self.kq.apply(&deletes);
+            }
+        }
         Ok(())
     }
 
@@ -329,5 +374,46 @@ mod tests {
         assert_eq!(events[0].token, 0xabc);
         assert!(events[0].readiness.read);
         assert!(events[0].eof);
+    }
+
+    #[test]
+    fn register_io_transitions_and_deregister() {
+        let (reader, writer) = UnixStream::pair().expect("socketpair");
+        reader.set_nonblocking(true).expect("reader nonblocking");
+        writer.set_nonblocking(true).expect("writer nonblocking");
+
+        let mut mux = KqueueMultiplexer::new().expect("kqueue");
+        // Register reader for read only
+        mux.register_io(reader.as_raw_fd(), 1, Interest::READ, TriggerMode::Level)
+            .expect("register read");
+        assert!(mux.registered.contains_key(&reader.as_raw_fd()));
+        assert!(mux.registered[&reader.as_raw_fd()].read);
+        assert!(!mux.registered[&reader.as_raw_fd()].write);
+
+        // Transition reader to write only
+        mux.register_io(reader.as_raw_fd(), 1, Interest::WRITE, TriggerMode::Level)
+            .expect("register write");
+        assert!(!mux.registered[&reader.as_raw_fd()].read);
+        assert!(mux.registered[&reader.as_raw_fd()].write);
+
+        // Transition reader to read + write
+        let rw = Interest {
+            read: true,
+            write: true,
+            oob: false,
+            read_lowat: None,
+            mode: TriggerMode::Level,
+        };
+        mux.register_io(reader.as_raw_fd(), 1, rw, TriggerMode::Level)
+            .expect("register read+write");
+        assert!(mux.registered[&reader.as_raw_fd()].read);
+        assert!(mux.registered[&reader.as_raw_fd()].write);
+
+        // Deregister
+        mux.deregister(reader.as_raw_fd()).expect("deregister");
+        assert!(!mux.registered.contains_key(&reader.as_raw_fd()));
+
+        // Deregister unregistered fd should succeed without error
+        mux.deregister(9999).expect("deregister unregistered");
     }
 }

@@ -2563,6 +2563,8 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                     ready |= LinuxEpollEvents::PRI;
                 }
                 if interest.contains(LinuxEpollEvents::RDHUP)
+                    && (ready.contains(LinuxEpollEvents::IN)
+                        || ready.contains(LinuxEpollEvents::HUP))
                     && super::net::host_stream_socket_rdhup(host_fd.raw())
                 {
                     ready |= LinuxEpollEvents::IN | LinuxEpollEvents::RDHUP;
