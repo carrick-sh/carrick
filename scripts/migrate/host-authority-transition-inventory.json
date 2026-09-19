@@ -10822,18 +10822,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/dispatcher.rs:704 in `event_ring_guest_pid`, `std::process::id` acts only on the current carrier event-ring diagnostic fallback used by `event_ring_guest_pid`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/dispatcher.rs:718 in `event_ring_guest_pid`, `std::process::id` acts only on the current carrier event-ring diagnostic fallback used by `event_ring_guest_pid`; no guest identity selects its host target.",
     "review_id": "HA-000497",
     "source": {
-      "byte_end": 31538,
-      "byte_start": 31522,
+      "byte_end": 32209,
+      "byte_start": 32193,
       "column": 32,
       "column_end": 48,
       "column_start": 32,
       "file": "crates/carrick-kernel/src/dispatch/dispatcher.rs",
-      "line": 704,
-      "line_end": 704,
-      "line_start": 704
+      "line": 718,
+      "line_end": 718,
+      "line_start": 718
     }
   },
   {
@@ -13826,18 +13826,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/continuation/wait_service.rs:972 in `try_new`, `std::thread::Builder::new` acts only on the carrier-owned continuation readiness reactor thread used by `new` at line 2875; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/continuation/wait_service.rs:993 in `try_new`, `std::thread::Builder::new` acts only on the carrier-owned continuation readiness reactor thread used by `new` at line 2875; no guest identity selects its host target.",
     "review_id": "HA-000587",
     "source": {
-      "byte_end": 37278,
-      "byte_start": 37253,
+      "byte_end": 37962,
+      "byte_start": 37937,
       "column": 22,
       "column_end": 47,
       "column_start": 22,
       "file": "crates/carrick-kernel/src/kernel/continuation/wait_service.rs",
-      "line": 972,
-      "line_end": 972,
-      "line_start": 972
+      "line": 993,
+      "line_end": 993,
+      "line_start": 993
     }
   },
   {
@@ -14547,18 +14547,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/proc.rs:2265 in `futex`, `std::thread::sleep` acts only on the current process-dispatch wait worker used by `futex`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/proc.rs:2266 in `futex`, `std::thread::sleep` acts only on the current process-dispatch wait worker used by `futex`; no guest identity selects its host target.",
     "review_id": "HA-000605",
     "source": {
-      "byte_end": 103216,
-      "byte_start": 103198,
+      "byte_end": 103271,
+      "byte_start": 103253,
       "column": 29,
       "column_end": 47,
       "column_start": 29,
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 2265,
-      "line_end": 2265,
-      "line_start": 2265
+      "line": 2266,
+      "line_end": 2266,
+      "line_start": 2266
     }
   },
   {
