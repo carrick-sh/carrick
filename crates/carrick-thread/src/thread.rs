@@ -62,11 +62,9 @@
 //!     composes with the generation model (token unparks bypass the per-bucket
 //!     generation check).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-
-use carrick_fatal::carrick_fatal;
 
 use parking_lot::Mutex as ParkingMutex;
 use parking_lot_core::{FilterOp, ParkResult, ParkToken, RequeueOp, UnparkResult, UnparkToken};
@@ -702,7 +700,7 @@ const FUTEX_SLOT_RELEASED: u8 = 2;
 struct FutexQueueSlot {
     id: u64,
     state: AtomicU8,
-    queue: Weak<ParkingMutex<FutexQueue>>,
+    queue: ParkingMutex<Weak<ParkingMutex<FutexQueue>>>,
 }
 
 impl Drop for FutexQueueSlot {
@@ -715,8 +713,9 @@ impl Drop for FutexQueueSlot {
         if self.state.load(Ordering::Acquire) != FUTEX_SLOT_QUEUED {
             return;
         }
-        if let Some(queue) = self.queue.upgrade() {
-            queue.lock().entries.remove(&self.id);
+        let weak = self.queue.lock().clone();
+        if let Some(queue) = weak.upgrade() {
+            queue.lock().remove(self.id);
         }
     }
 }
@@ -728,7 +727,27 @@ impl Drop for FutexQueueSlot {
 #[derive(Default)]
 struct FutexQueue {
     entries: BTreeMap<u64, FutexQueueEntry>,
-    next_ticket: u64,
+    by_addr: HashMap<u64, BTreeSet<u64>>,
+}
+
+impl FutexQueue {
+    fn insert(&mut self, id: u64, entry: FutexQueueEntry) {
+        let addr = entry.addr;
+        self.entries.insert(id, entry);
+        self.by_addr.entry(addr).or_default().insert(id);
+    }
+
+    fn remove(&mut self, id: u64) -> Option<FutexQueueEntry> {
+        let entry = self.entries.remove(&id)?;
+        if let std::collections::hash_map::Entry::Occupied(mut occ) = self.by_addr.entry(entry.addr)
+        {
+            occ.get_mut().remove(&id);
+            if occ.get().is_empty() {
+                occ.remove();
+            }
+        }
+        Some(entry)
+    }
 }
 
 struct FutexQueueEntry {
@@ -759,17 +778,17 @@ type FutexGenerationCallback = Arc<dyn Fn(FutexGenerationEvent) + Send + Sync + 
 /// the slot outlives the [`FutexWait`] token the subscriber passed by value;
 /// dropping the subscription is the waiter leaving the queue.
 pub struct FutexGenerationSubscription {
-    queue: Weak<ParkingMutex<FutexQueue>>,
     slot: Arc<FutexQueueSlot>,
 }
 
 impl Drop for FutexGenerationSubscription {
     fn drop(&mut self) {
-        let Some(queue) = self.queue.upgrade() else {
+        let weak = self.slot.queue.lock().clone();
+        let Some(queue) = weak.upgrade() else {
             return;
         };
         let mut queue = queue.lock();
-        if queue.entries.remove(&self.slot.id).is_some() {
+        if queue.remove(self.slot.id).is_some() {
             self.slot
                 .state
                 .store(FUTEX_SLOT_RELEASED, Ordering::Release);
@@ -1032,10 +1051,9 @@ pub struct FutexTable {
     /// completing in 420 s to timing out at 600 s. Requeues are rare; this makes
     /// the common answer a single relaxed load.
     outstanding_redirects: AtomicUsize,
-    /// Continuation-model wait queue (see [`FutexWait`]). One lock per table:
-    /// `wake` already takes it to publish, so queueing at `prepare_wait` adds
-    /// one acquisition per wait, not a new serialization point.
-    queue: Arc<ParkingMutex<FutexQueue>>,
+    /// Continuation-model wait queues sharded by futex address.
+    queues: Box<[Arc<ParkingMutex<FutexQueue>>; FUTEX_SHARDS]>,
+    next_ticket: AtomicU64,
 }
 
 impl FutexTable {
@@ -1045,7 +1063,10 @@ impl FutexTable {
             interrupt_generation: AtomicU64::new(0),
             requeue_redirects: ParkingMutex::new(HashMap::new()),
             outstanding_redirects: AtomicUsize::new(0),
-            queue: Arc::new(ParkingMutex::new(FutexQueue::default())),
+            queues: Box::new(std::array::from_fn(|_| {
+                Arc::new(ParkingMutex::new(FutexQueue::default()))
+            })),
+            next_ticket: AtomicU64::new(0),
         }
     }
 
@@ -1062,13 +1083,40 @@ impl FutexTable {
         wait: FutexWait,
         callback: FutexGenerationCallback,
     ) -> FutexGenerationEnrollment {
-        let mut queue = self.queue.lock();
+        if wait.is_woken() {
+            return FutexGenerationEnrollment::Ready(FutexGenerationEvent {
+                addr: wait.addr,
+                generation: self.bucket(wait.addr).generation.load(Ordering::Acquire),
+            });
+        }
+
+        let poll_ns = futex_halt_poll_ns();
+        if poll_ns != 0 {
+            let poll_deadline =
+                std::time::Instant::now() + std::time::Duration::from_nanos(poll_ns);
+            while std::time::Instant::now() < poll_deadline {
+                if wait.is_woken() {
+                    return FutexGenerationEnrollment::Ready(FutexGenerationEvent {
+                        addr: wait.addr,
+                        generation: self.bucket(wait.addr).generation.load(Ordering::Acquire),
+                    });
+                }
+                std::hint::spin_loop();
+            }
+        }
+
+        let Some(queue_arc) = wait.slot.queue.lock().clone().upgrade() else {
+            return FutexGenerationEnrollment::Ready(FutexGenerationEvent {
+                addr: wait.addr,
+                generation: self.bucket(wait.addr).generation.load(Ordering::Acquire),
+            });
+        };
+        let mut queue = queue_arc.lock();
         if wait.slot.state.load(Ordering::Acquire) == FUTEX_SLOT_QUEUED
             && let Some(entry) = queue.entries.get_mut(&wait.slot.id)
         {
             entry.callback = Some(callback);
             return FutexGenerationEnrollment::Subscribed(FutexGenerationSubscription {
-                queue: Arc::downgrade(&self.queue),
                 slot: Arc::clone(&wait.slot),
             });
         }
@@ -1093,11 +1141,14 @@ impl FutexTable {
     /// that consumed some OTHER slot cannot release this waiter spuriously.
     fn dequeue(&self, wait: &FutexWait) -> (bool, u64) {
         let bucket = self.bucket(wait.addr);
-        let mut queue = self.queue.lock();
+        let Some(queue_arc) = wait.slot.queue.lock().clone().upgrade() else {
+            return (wait.is_woken(), bucket.generation.load(Ordering::Acquire));
+        };
+        let mut queue = queue_arc.lock();
         let woken = match wait.slot.state.load(Ordering::Acquire) {
             FUTEX_SLOT_WOKEN => true,
             FUTEX_SLOT_QUEUED => {
-                queue.entries.remove(&wait.slot.id);
+                queue.remove(wait.slot.id);
                 wait.slot
                     .state
                     .store(FUTEX_SLOT_RELEASED, Ordering::Release);
@@ -1118,24 +1169,24 @@ impl FutexTable {
     /// callback, an unsubscribed one finds `Ready` when it subscribes. Callbacks
     /// run with the queue lock released.
     fn publish_generation(&self, addr: u64, generation: u64, limit: u32) -> u32 {
+        let queue_arc = self.queue_arc(addr);
         let callbacks = {
-            let mut queue = self.queue.lock();
-            let ids = queue
-                .entries
-                .iter()
-                .filter_map(|(id, entry)| (entry.addr == addr).then_some(*id))
-                .take(usize::try_from(limit).unwrap_or(usize::MAX))
-                .collect::<Vec<_>>();
-            ids.into_iter()
-                .filter_map(|id| {
-                    let entry = queue.entries.remove(&id)?;
-                    // Every token clone is gone but its Drop has not taken the
-                    // lock yet: nobody is waiting, so nobody is woken.
-                    let slot = entry.slot.upgrade()?;
+            let mut queue = queue_arc.lock();
+            let mut callbacks = Vec::new();
+            let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+            while callbacks.len() < limit_usize {
+                let Some(&id) = queue.by_addr.get(&addr).and_then(|s| s.iter().next()) else {
+                    break;
+                };
+                let Some(entry) = queue.remove(id) else {
+                    break;
+                };
+                if let Some(slot) = entry.slot.upgrade() {
                     slot.state.store(FUTEX_SLOT_WOKEN, Ordering::Release);
-                    Some(entry.callback)
-                })
-                .collect::<Vec<_>>()
+                    callbacks.push(entry.callback);
+                }
+            }
+            callbacks
         };
         let count = u32::try_from(callbacks.len()).unwrap_or(u32::MAX);
         let event = FutexGenerationEvent { addr, generation };
@@ -1153,11 +1204,19 @@ impl FutexTable {
         self.interrupt_generation.fetch_add(1, Ordering::AcqRel);
     }
 
+    const fn shard_index(addr: u64) -> usize {
+        let h = addr.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58;
+        (h as usize) % FUTEX_SHARDS
+    }
+
     /// Pick the shard for `addr`. A multiplicative (Fibonacci) hash spreads
     /// aligned futex addresses (which share low bits) across shards.
     fn shard(&self, addr: u64) -> &ParkingMutex<HashMap<u64, Arc<FutexBucket>>> {
-        let h = addr.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58;
-        &self.shards[h as usize % FUTEX_SHARDS]
+        &self.shards[Self::shard_index(addr)]
+    }
+
+    fn queue_arc(&self, addr: u64) -> &Arc<ParkingMutex<FutexQueue>> {
+        &self.queues[Self::shard_index(addr)]
     }
 
     fn bucket(&self, addr: u64) -> Arc<FutexBucket> {
@@ -1190,17 +1249,14 @@ impl FutexTable {
     /// with syscall locks released; a wake that races in between consumes the
     /// slot and the waiter completes without sleeping.
     pub fn prepare_wait(&self, addr: u64) -> FutexWait {
-        let mut queue = self.queue.lock();
-        let id = queue.next_ticket;
-        queue.next_ticket = id
-            .checked_add(1)
-            .unwrap_or_else(|| carrick_fatal!("thread::futex", "futex queue ticket overflow"));
+        let queue_arc = self.queue_arc(addr);
+        let id = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         let slot = Arc::new(FutexQueueSlot {
             id,
             state: AtomicU8::new(FUTEX_SLOT_QUEUED),
-            queue: Arc::downgrade(&self.queue),
+            queue: ParkingMutex::new(Arc::downgrade(queue_arc)),
         });
-        queue.entries.insert(
+        queue_arc.lock().insert(
             id,
             FutexQueueEntry {
                 addr,
@@ -1696,20 +1752,54 @@ impl FutexTable {
         // Queued (continuation-model) waiters move by address rewrite, whether
         // or not they have subscribed yet; a later wake on `to` consumes them.
         let requeued_listeners = if to_mark > 0 {
-            let mut queue = self.queue.lock();
-            let ids = queue
-                .entries
-                .iter()
-                .filter_map(|(id, entry)| (entry.addr == from).then_some(*id))
-                .take(to_mark as usize)
-                .collect::<Vec<_>>();
-            let count = ids.len() as u32;
-            for id in ids {
-                if let Some(entry) = queue.entries.get_mut(&id) {
-                    entry.addr = to;
+            let s_from = Self::shard_index(from);
+            let s_to = Self::shard_index(to);
+            let to_mark_usize = to_mark as usize;
+            if s_from == s_to {
+                let mut queue = self.queues[s_from].lock();
+                let mut requeued = 0u32;
+                while (requeued as usize) < to_mark_usize {
+                    let Some(&id) = queue.by_addr.get(&from).and_then(|s| s.iter().next()) else {
+                        break;
+                    };
+                    let Some(mut entry) = queue.remove(id) else {
+                        break;
+                    };
+                    if let Some(_slot) = entry.slot.upgrade() {
+                        entry.addr = to;
+                        queue.insert(id, entry);
+                        requeued += 1;
+                    }
                 }
+                requeued
+            } else {
+                let (mut q_from, mut q_to) = if s_from < s_to {
+                    let q1 = self.queues[s_from].lock();
+                    let q2 = self.queues[s_to].lock();
+                    (q1, q2)
+                } else {
+                    let q2 = self.queues[s_to].lock();
+                    let q1 = self.queues[s_from].lock();
+                    (q1, q2)
+                };
+                let mut requeued = 0u32;
+                let to_queue_weak = Arc::downgrade(&self.queues[s_to]);
+                while (requeued as usize) < to_mark_usize {
+                    let Some(&id) = q_from.by_addr.get(&from).and_then(|s| s.iter().next()) else {
+                        break;
+                    };
+                    let Some(mut entry) = q_from.remove(id) else {
+                        break;
+                    };
+                    if let Some(slot) = entry.slot.upgrade() {
+                        entry.addr = to;
+                        *slot.queue.lock() = to_queue_weak.clone();
+                        q_to.insert(id, entry);
+                        requeued += 1;
+                    }
+                }
+                requeued
             }
-            count
         } else {
             0
         };
@@ -2800,5 +2890,80 @@ mod generation_subscription_tests {
         drop(subscription);
         table.wake(addr, 1);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn requeue_cross_shard_and_same_shard_continuation_waiters() {
+        let table = FutexTable::new();
+        // Find two addresses in different shards
+        let from_diff = 0x1000u64;
+        let mut to_diff = 0x2000u64;
+        while FutexTable::shard_index(from_diff) == FutexTable::shard_index(to_diff) {
+            to_diff += 0x1000;
+        }
+        assert_ne!(
+            FutexTable::shard_index(from_diff),
+            FutexTable::shard_index(to_diff)
+        );
+
+        // Test cross-shard requeue
+        let wait_cross = table.prepare_wait(from_diff);
+        assert_eq!(table.requeue(from_diff, to_diff, 0, 1), (0, 1));
+        assert_eq!(table.wake(from_diff, 1), 0);
+        assert!(!wait_cross.is_woken());
+        assert_eq!(table.wake(to_diff, 1), 1);
+        assert!(wait_cross.is_woken());
+
+        // Find two addresses in the same shard
+        let from_same = 0x10_0000u64;
+        let mut to_same = 0x10_1000u64;
+        while FutexTable::shard_index(from_same) != FutexTable::shard_index(to_same) {
+            to_same += 0x1000;
+        }
+        assert_eq!(
+            FutexTable::shard_index(from_same),
+            FutexTable::shard_index(to_same)
+        );
+
+        // Test same-shard requeue
+        let wait_same = table.prepare_wait(from_same);
+        assert_eq!(table.requeue(from_same, to_same, 0, 1), (0, 1));
+        assert_eq!(table.wake(from_same, 1), 0);
+        assert!(!wait_same.is_woken());
+        assert_eq!(table.wake(to_same, 1), 1);
+        assert!(wait_same.is_woken());
+    }
+
+    #[test]
+    fn requeue_cross_shard_then_subscribe_fires_on_destination_wake() {
+        let table = FutexTable::new();
+        let from = 0x3000u64;
+        let mut to = 0x4000u64;
+        while FutexTable::shard_index(from) == FutexTable::shard_index(to) {
+            to += 0x1000;
+        }
+
+        let wait = table.prepare_wait(from);
+        assert_eq!(table.requeue(from, to, 0, 1), (0, 1));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let subscription = match table.subscribe_generation(
+            wait.clone(),
+            Arc::new(move |event| {
+                assert_eq!(event.addr(), to);
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+        ) {
+            FutexGenerationEnrollment::Subscribed(sub) => sub,
+            FutexGenerationEnrollment::Ready(_) => panic!("should be subscribed on destination"),
+        };
+
+        assert_eq!(table.wake(from, 1), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(table.wake(to, 1), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(wait.is_woken());
+        drop(subscription);
     }
 }
