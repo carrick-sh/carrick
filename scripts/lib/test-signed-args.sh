@@ -28,6 +28,48 @@ test_signed_validate_run_id() {
     fi
 }
 
+test_signed_validate_features() {
+    local features="${1:-}"
+
+    if [ -z "$features" ]; then
+        return 0
+    fi
+    case "$features" in
+        *[!A-Za-z0-9,_-]*)
+            echo "test-signed: invalid CARRICK_TEST_SIGNED_FEATURES: only ASCII alphanumeric, '-', '_', and ',' are allowed" >&2
+            return 2
+            ;;
+        ,*|*,|*,,*)
+            echo "test-signed: invalid CARRICK_TEST_SIGNED_FEATURES: empty feature name in list" >&2
+            return 2
+            ;;
+    esac
+}
+
+test_signed_cargo_feature_args() {
+    local features="${1:-}"
+
+    if [ -n "$features" ]; then
+        echo "--features" "$features"
+    fi
+}
+
+test_signed_features_json() {
+    local features="${1:-}"
+
+    if [ -z "$features" ]; then
+        echo "[]"
+        return 0
+    fi
+    echo "$features" | awk -F, '{
+        printf "["
+        for (i = 1; i <= NF; i++) {
+            printf "%s\"%s\"", (i > 1 ? "," : ""), $i
+        }
+        printf "]"
+    }'
+}
+
 test_signed_parse_libtest_args() {
     TEST_SIGNED_REQUESTED_FILTER=""
     TEST_SIGNED_HAS_EXACT=0

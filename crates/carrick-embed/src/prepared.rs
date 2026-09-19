@@ -27,6 +27,7 @@ pub struct PreparedContainer {
     shared_buffers: Vec<(String, SharedBuffer)>,
     auditors: Arc<carrick_kernel::observe::AuditorChain>,
     carrier: PreparedCarrierOwnership,
+    work_scope: Option<carrick_observability::work_meter::WorkScope>,
 }
 
 pub(crate) struct PreparedCarrierOwnership {
@@ -44,6 +45,7 @@ impl PreparedContainer {
         shared_buffers: Vec<(String, SharedBuffer)>,
         auditors: Vec<Arc<dyn carrick_kernel::observe::KernelAuditor>>,
         carrier: PreparedCarrierOwnership,
+        work_scope: Option<carrick_observability::work_meter::WorkScope>,
     ) -> Self {
         let launch = carrier.lease.launch().clone();
         let generation = 1;
@@ -62,6 +64,7 @@ impl PreparedContainer {
             shared_buffers,
             auditors,
             carrier,
+            work_scope,
         }
     }
 
@@ -118,6 +121,9 @@ impl PreparedContainer {
             Err(error) => Err(EmbedError::from_runtime(error, Phase::Prepare)),
         };
         retired.store(true, Ordering::Release);
+        if let Some(ref scope) = self.work_scope {
+            scope.retire();
+        }
         if implicit_carrier {
             let shutdown = carrier
                 .shutdown_wait()

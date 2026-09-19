@@ -521,6 +521,11 @@ impl KernelState {
             inherited_hvpatch_runtime
                 .unwrap_or_else(|| Arc::new(HvpatchRuntimeDirectory::default()))
         });
+        if let Some(ref hvpatch_rt) = hvpatch_runtime {
+            if let Some(scope) = dispatcher.work_scope() {
+                hvpatch_rt.set_work_scope(scope);
+            }
+        }
         Self {
             dispatcher,
             reporter: CompatReporter::default(),
@@ -1414,6 +1419,12 @@ where
                 "new syscall trapped while a completion token is still live".to_owned(),
             ));
         }
+        if let Some(scope) = kernel.dispatcher.work_scope() {
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::KernelDispatches,
+                1,
+            );
+        }
         let kernel_context = kernel
             .dispatcher
             .capture_kernel_context(self.linux_tid)
@@ -1481,6 +1492,12 @@ where
                 )
             })?
             .retain_exact();
+        if let Some(scope) = kernel.dispatcher.work_scope() {
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::KernelRedispatches,
+                1,
+            );
+        }
         let request = syscall.request;
         let _syscall_guard = kernel.hvpatch_process.as_ref().and_then(|proc| {
             let (pid, asid) = proc.syscall_trace_identity()?;
@@ -1573,6 +1590,15 @@ where
             }
             let outcome =
                 dispatch_with_panic_backstop(request.number.raw(), self.this_tid, || {
+                    let work_scope = kernel.dispatcher.work_scope();
+                    let make_thread_ctx = || {
+                        let ctx = ThreadCtx::new(self.this_tid, &self.registry, &self.futex);
+                        if let Some(ref scope) = work_scope {
+                            ctx.with_work_scope(scope)
+                        } else {
+                            ctx
+                        }
+                    };
                     let lease_guard = if carrick_kernel::dispatch::syscall_requires_execution_lease(
                         request.number.raw(),
                         request.args,
@@ -1612,7 +1638,7 @@ where
                                         syscall,
                                         engine,
                                         &kernel.reporter,
-                                        ThreadCtx::new(self.this_tid, &self.registry, &self.futex),
+                                        make_thread_ctx(),
                                         MutationDispatchRoute {
                                             guard: &mut mutation,
                                             lease,
@@ -1629,7 +1655,7 @@ where
                                         syscall,
                                         engine,
                                         &kernel.reporter,
-                                        ThreadCtx::new(self.this_tid, &self.registry, &self.futex),
+                                        make_thread_ctx(),
                                         MutationDispatchRoute {
                                             guard: &mut mutation,
                                             lease,
@@ -1657,7 +1683,7 @@ where
                                 syscall,
                                 engine,
                                 &kernel.reporter,
-                                ThreadCtx::new(self.this_tid, &self.registry, &self.futex),
+                                make_thread_ctx(),
                                 OrdinaryDispatchRoute {
                                     lease,
                                     mm_executor: Some(mm_executor),

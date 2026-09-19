@@ -231,6 +231,16 @@ impl WorkScope {
     }
 
     #[cfg(feature = "conformance-metrics")]
+    pub fn is_retired(&self) -> bool {
+        self.state.retired.load(Ordering::SeqCst)
+    }
+
+    #[cfg(not(feature = "conformance-metrics"))]
+    pub fn is_retired(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "conformance-metrics")]
     pub fn add(&self, metric: WorkMetric, amount: u64) -> Result<(), WorkMeterError> {
         if self.state.retired.load(Ordering::SeqCst) {
             return Err(WorkMeterError::RetiredScope);

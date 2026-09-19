@@ -132,6 +132,8 @@ pub struct SyscallDispatcher {
     /// execvp PATH search). Plain `bool`: set once at construction, read at
     /// execve through `&self`.
     pub(crate) exec_host_fs_fallback: bool,
+    pub(crate) work_scope:
+        parking_lot::RwLock<Option<carrick_observability::work_meter::WorkScope>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -231,6 +233,7 @@ impl SyscallDispatcher {
             // Container constructors flip this off (see `with_rootfs*` /
             // `sandbox_exec_to_container`).
             exec_host_fs_fallback: true,
+            work_scope: parking_lot::RwLock::new(None),
         }
     }
 
@@ -274,6 +277,16 @@ impl SyscallDispatcher {
             ))),
         );
         *self.container.write() = Some(container);
+    }
+
+    /// Install an execution-scoped work meter scope on this dispatcher.
+    pub fn set_work_scope(&self, scope: carrick_observability::work_meter::WorkScope) {
+        *self.work_scope.write() = Some(scope);
+    }
+
+    /// Read the execution-scoped work meter scope if one was configured.
+    pub fn work_scope(&self) -> Option<carrick_observability::work_meter::WorkScope> {
+        self.work_scope.read().clone()
     }
 
     /// Seal this run's mount table for terminal retirement. Call only after
@@ -607,6 +620,7 @@ impl SyscallDispatcher {
             signal_pump_requested: std::sync::atomic::AtomicBool::new(false),
             async_signal_wake_owner: self.async_signal_wake_owner,
             exec_host_fs_fallback: self.exec_host_fs_fallback,
+            work_scope: parking_lot::RwLock::new(self.work_scope.read().clone()),
         };
         observe_install(true);
         drop(dispatch);

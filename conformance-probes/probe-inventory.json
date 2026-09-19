@@ -766,6 +766,9 @@
   },
   "futexpingpong": {
     "class": "conformance",
+    "contract_ids": [
+      "kernel.futex.contention"
+    ],
     "excluded": false,
     "runner": "generic"
   },
@@ -811,6 +814,9 @@
   },
   "futexwakeexact": {
     "class": "conformance",
+    "contract_ids": [
+      "kernel.futex.contention"
+    ],
     "excluded": false,
     "runner": "generic"
   },
@@ -1526,6 +1532,9 @@
   },
   "perf_futex_pingpong": {
     "class": "performance",
+    "contract_ids": [
+      "kernel.futex.contention"
+    ],
     "excluded": false,
     "runner": "generic"
   },

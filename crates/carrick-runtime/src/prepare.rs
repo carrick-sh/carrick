@@ -107,6 +107,7 @@ pub struct RuntimeExtensions {
     scheduler: Option<Arc<dyn carrick_hal::SchedulingPolicy>>,
     budget: Option<Arc<carrick_kernel::observe::ResourceBudget>>,
     network_interposer: Option<carrick_kernel::network::interposer::NetworkInterposer>,
+    work_scope: Option<carrick_observability::work_meter::WorkScope>,
 }
 
 impl RuntimeExtensions {
@@ -197,6 +198,15 @@ impl RuntimeExtensions {
         interposer: carrick_kernel::network::interposer::NetworkInterposer,
     ) -> Self {
         self.network_interposer = Some(interposer);
+        self
+    }
+
+    /// Attach an execution-scoped work meter scope to the container.
+    pub fn work_scope(mut self, scope: carrick_observability::work_meter::WorkScope) -> Self {
+        if scope.is_retired() {
+            panic!("cannot attach an already-retired work scope to RuntimeExtensions");
+        }
+        self.work_scope = Some(scope);
         self
     }
 }
@@ -648,6 +658,7 @@ fn prepare_with_lease(
         scheduler,
         budget,
         network_interposer,
+        work_scope,
     } = ext;
     if let Some(policy) = scheduler {
         carrier.install_scheduling_policy(policy)?;
@@ -741,6 +752,9 @@ fn prepare_with_lease(
     }
     for observer in observers {
         dispatcher.install_observer(observer);
+    }
+    if let Some(scope) = work_scope {
+        dispatcher.set_work_scope(scope);
     }
     dispatcher.set_stdio_sink(sink);
     let interactive_session = if spec.process.tty {

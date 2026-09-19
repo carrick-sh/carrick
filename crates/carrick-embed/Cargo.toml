@@ -37,13 +37,20 @@ fs-memory = ["carrick-spec/fs-memory", "carrick-engine/fs-memory", "carrick-runt
 # Read-only internal lifecycle telemetry used by signed Carrick conformance
 # tests. Not enabled for ordinary embedding consumers.
 test-support = []
+conformance-metrics = [
+    "carrick-runtime/conformance-metrics",
+    "carrick-observability/conformance-metrics",
+    "carrick-kernel/conformance-metrics",
+]
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
+carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 carrick-engine = { path = "../carrick-engine", default-features = false }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-hal = { path = "../carrick-hal" }
 carrick-host = { path = "../carrick-host" }
+carrick-observability = { path = "../carrick-observability" }
 carrick-runtime = { path = "../carrick-runtime", default-features = false }
 carrick-kernel = { path = "../carrick-kernel" }
 carrick-vfs = { path = "../carrick-vfs" }
