@@ -35,9 +35,16 @@ carrick-vfs = { path = "../carrick-vfs" }
 carrick-hal = { path = "../carrick-hal", features = ["test-support"] }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-abi = { path = "../carrick-abi" }
+carrick-observability = { path = "../carrick-observability" }
+carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 parking_lot.workspace = true
 thiserror.workspace = true
 
+[features]
+conformance-metrics = ["carrick-kernel/conformance-metrics", "carrick-observability/conformance-metrics"]
+
 [dev-dependencies]
+carrick-kernel = { path = "../carrick-kernel", features = ["conformance-metrics"] }
+carrick-observability = { path = "../carrick-observability", features = ["conformance-metrics"] }
 carrick-vfs = { path = "../carrick-vfs", features = ["test-support"] }
 tempfile.workspace = true

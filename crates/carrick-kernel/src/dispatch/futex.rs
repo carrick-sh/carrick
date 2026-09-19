@@ -59,6 +59,7 @@ pub(crate) fn dispatch_futex_pi(
     word: u32,
     tid: u32,
     futex: Option<&crate::thread::FutexTable>,
+    work_scope: Option<&carrick_observability::work_meter::WorkScope>,
 ) -> DispatchOutcome {
     // The low 30 bits of a PI-futex word hold the owner TID (FUTEX_TID_MASK,
     // imported from carrick-abi); the upper two are FUTEX_WAITERS/OWNER_DIED.
@@ -96,6 +97,16 @@ pub(crate) fn dispatch_futex_pi(
             if let Some(futex) = futex {
                 let woken = futex.wake(address, 1);
                 crate::event_ring::rec_futex_wake(address, woken);
+                if let Some(scope) = work_scope {
+                    let _ = scope.add(
+                        carrick_observability::work_meter::WorkMetric::FutexQueueVisits,
+                        1 + u64::from(woken),
+                    );
+                    let _ = scope.add(
+                        carrick_observability::work_meter::WorkMetric::FutexWaitersWoken,
+                        u64::from(woken),
+                    );
+                }
             }
             DispatchOutcome::Returned { value: 0 }
         }
@@ -115,6 +126,7 @@ pub(crate) fn dispatch_threaded_futex(
     _tid: crate::thread::ThreadId,
     registry: &crate::thread::ThreadRegistry,
     hvpatch_linux_tid: Option<u32>,
+    work_scope: Option<&carrick_observability::work_meter::WorkScope>,
 ) -> DispatchOutcome {
     let address = request.arg(0);
     let operation = request.arg(1);
@@ -203,7 +215,15 @@ pub(crate) fn dispatch_threaded_futex(
                 errno: LINUX_EINVAL,
             };
         };
-        return dispatch_futex_pi(memory, address, command, word, guest_tid, Some(futex));
+        return dispatch_futex_pi(
+            memory,
+            address,
+            command,
+            word,
+            guest_tid,
+            Some(futex),
+            work_scope,
+        );
     }
 
     if !futex_flags.contains(LinuxFutexFlags::PRIVATE) {
@@ -281,6 +301,16 @@ pub(crate) fn dispatch_threaded_futex(
             }
             let n = futex.wake(address, value);
             crate::event_ring::rec_futex_wake(address, n);
+            if let Some(scope) = work_scope {
+                let _ = scope.add(
+                    carrick_observability::work_meter::WorkMetric::FutexQueueVisits,
+                    1 + u64::from(n),
+                );
+                let _ = scope.add(
+                    carrick_observability::work_meter::WorkMetric::FutexWaitersWoken,
+                    u64::from(n),
+                );
+            }
             DispatchOutcome::Returned {
                 value: i64::from(n),
             }
@@ -440,6 +470,16 @@ pub(crate) fn dispatch_threaded_futex(
 
             // Private/anon: real requeue via parking_lot_core::unpark_requeue.
             let (woken, requeued) = futex.requeue(address, uaddr2, nr_wake, nr_requeue);
+            if let Some(scope) = work_scope {
+                let _ = scope.add(
+                    carrick_observability::work_meter::WorkMetric::FutexQueueVisits,
+                    1 + u64::from(woken + requeued),
+                );
+                let _ = scope.add(
+                    carrick_observability::work_meter::WorkMetric::FutexWaitersWoken,
+                    u64::from(woken),
+                );
+            }
             // Linux returns the total number of waiters woken PLUS requeued.
             DispatchOutcome::Returned {
                 value: i64::from(woken + requeued),

@@ -157,6 +157,9 @@ impl ScriptedBackend {
         let wait_service = CarrierWaitService::try_new(scheduler).map_err(|e| {
             ExampleError::Unsupported(format!("carrier wait service init failed: {e}"))
         })?;
+        let work_meter = carrick_observability::work_meter::WorkMeter::default();
+        let work_scope = work_meter.new_scope();
+        wait_service.set_work_scope(work_scope.clone());
 
         let shared = Arc::new(Shared {
             asids,
@@ -168,6 +171,7 @@ impl ScriptedBackend {
             active_wait_tokens: Mutex::new(Vec::new()),
             wait_service,
             process_exit_codes: Mutex::new(std::collections::HashMap::new()),
+            work_scope: work_scope.clone(),
         });
         let process = Arc::new(process);
         let mut dispatcher = SyscallDispatcher::with_bridges(self.bridges);
@@ -223,6 +227,17 @@ impl ScriptedBackend {
             .get(&ROOT_PID)
             .copied()
             .unwrap_or(script_exit_code);
+        let work_snapshot = match work_scope.snapshot() {
+            Ok(s) => s,
+            Err(carrick_observability::work_meter::WorkMeterError::Disabled) => {
+                carrick_observability::work_meter::WorkSnapshot::default()
+            }
+            Err(e) => {
+                return Err(ExampleError::Unsupported(format!(
+                    "work meter snapshot failed: {e}"
+                )));
+            }
+        };
         Ok(RunReport {
             exit_code,
             completions: ledger.completions,
@@ -231,6 +246,7 @@ impl ScriptedBackend {
             tasks_started: ledger.tasks_started,
             dispatches: shared.dispatches.load(Ordering::SeqCst),
             dispatch_events: ledger.dispatch_events,
+            work_snapshot,
         })
     }
 
@@ -266,6 +282,7 @@ pub(crate) struct Shared {
     pub(crate) active_wait_tokens: Mutex<Vec<(TaskKey, ContinuationWakeToken)>>,
     pub(crate) wait_service: CarrierWaitService,
     pub(crate) process_exit_codes: Mutex<std::collections::HashMap<i32, i32>>,
+    pub(crate) work_scope: carrick_observability::work_meter::WorkScope,
 }
 
 impl Shared {

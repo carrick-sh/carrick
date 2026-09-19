@@ -305,6 +305,7 @@ pub struct ThreadCtx<'a> {
     pub tid: crate::thread::ThreadId,
     pub registry: &'a crate::thread::ThreadRegistry,
     pub futex: &'a crate::thread::FutexTable,
+    pub work_scope: Option<&'a carrick_observability::work_meter::WorkScope>,
 }
 
 impl<'a> ThreadCtx<'a> {
@@ -318,6 +319,16 @@ impl<'a> ThreadCtx<'a> {
             tid,
             registry,
             futex,
+            work_scope: None,
         }
+    }
+
+    #[inline]
+    pub fn with_work_scope(
+        mut self,
+        scope: &'a carrick_observability::work_meter::WorkScope,
+    ) -> Self {
+        self.work_scope = Some(scope);
+        self
     }
 }

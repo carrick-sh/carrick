@@ -2249,6 +2249,7 @@ impl<'a> ProcView<'a> {
                     word,
                     guest_tid,
                     thread.map(|t| t.futex),
+                    thread.and_then(|t| t.work_scope),
                 ));
             }
 
@@ -7288,11 +7289,11 @@ mod futex_timeout_tests {
         // A present (non-NULL) timespec of {0, 0}.
         memory.write_bytes(timeout_addr, &[0u8; 16]).unwrap();
 
-        let thread = ThreadCtx {
-            tid: crate::thread::ThreadId::synthetic_for_tests(10),
-            registry: &registry,
-            futex: &futex,
-        };
+        let thread = ThreadCtx::new(
+            crate::thread::ThreadId::synthetic_for_tests(10),
+            &registry,
+            &futex,
+        );
         let out = dispatcher
             .dispatch_normalized(
                 &dispatcher.capture_one_task_context().unwrap(),

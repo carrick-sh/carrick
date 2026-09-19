@@ -4947,11 +4947,7 @@ mod tests {
             ),
             memory: &mut memory,
             reporter: &reporter,
-            thread: Some(crate::dispatch::ThreadCtx {
-                tid: caller,
-                registry: &registry,
-                futex: &futex,
-            }),
+            thread: Some(crate::dispatch::ThreadCtx::new(caller, &registry, &futex)),
             execution_lease: None,
             mm_executor: None,
         };
@@ -5125,11 +5121,7 @@ mod tests {
             ),
             memory: &mut memory,
             reporter: &reporter,
-            thread: Some(crate::dispatch::ThreadCtx {
-                tid: caller,
-                registry: &registry,
-                futex: &futex,
-            }),
+            thread: Some(crate::dispatch::ThreadCtx::new(caller, &registry, &futex)),
             execution_lease: None,
             mm_executor: None,
         };
@@ -5833,11 +5825,7 @@ mod tests {
                 ),
                 memory: &mut memory,
                 reporter: &reporter,
-                thread: Some(crate::dispatch::ThreadCtx {
-                    tid: caller,
-                    registry: &registry,
-                    futex: &futex,
-                }),
+                thread: Some(crate::dispatch::ThreadCtx::new(caller, &registry, &futex)),
                 execution_lease: None,
                 mm_executor: None,
             };

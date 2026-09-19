@@ -600,9 +600,11 @@ name = "carrick-kernel-example"
 version = "0.1.0"
 dependencies = [
  "carrick-abi",
+ "carrick-conformance-contract",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-kernel",
+ "carrick-observability",
  "carrick-vfs",
  "parking_lot",
  "tempfile",
