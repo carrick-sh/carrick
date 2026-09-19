@@ -616,12 +616,20 @@ impl Container {
         if !self.shared_buffers.is_empty() {
             let shm_vfs = crate::vfs::InMemoryFileVfs::new();
             for (name, buffer) in &self.shared_buffers {
-                let node_path = format!("/{name}");
+                let full_path = format!("/dev/carrick/shm/{name}");
                 shm_vfs
-                    .add_host_file(&node_path, buffer.host_fd(), buffer.len() as u64)
+                    .add_host_file(&full_path, buffer.host_fd(), buffer.len() as u64)
                     .map_err(|error| {
                         EmbedError::Config(format!(
-                            "failed to expose shared buffer {name:?} at /dev/carrick/shm/{name}: {error:?}"
+                            "failed to expose shared buffer {name:?} at {full_path}: {error:?}"
+                        ))
+                    })?;
+                let short_path = format!("/{name}");
+                shm_vfs
+                    .add_host_file(&short_path, buffer.host_fd(), buffer.len() as u64)
+                    .map_err(|error| {
+                        EmbedError::Config(format!(
+                            "failed to expose shared buffer {name:?} at {short_path}: {error:?}"
                         ))
                     })?;
             }

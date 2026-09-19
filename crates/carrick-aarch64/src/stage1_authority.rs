@@ -210,6 +210,31 @@ impl Stage1Authority {
         f(manager)
     }
 
+    /// Discard the open undo journal, committing all edits in the current transaction.
+    pub fn commit_undo(&self) {
+        if let Some(manager) = self.inner.lock().manager.as_mut() {
+            manager.commit_undo();
+        }
+    }
+
+    /// Revert uncommitted page table edits recorded in the undo journal to shadow and host memory.
+    ///
+    /// # Safety
+    ///
+    /// `resolver` must return valid host pointers for all touched page table arenas.
+    pub unsafe fn rollback_undo(
+        &self,
+        resolver: impl carrick_mem::page_table::HostArenaResolver,
+    ) -> Vec<u64> {
+        let mut inner = self.inner.lock();
+        let inner = &mut *inner;
+        if let Some(manager) = inner.manager.as_mut() {
+            unsafe { manager.rollback_undo(resolver, inner.arena_source.as_deref_mut()) }
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Perform a scoped, locked edit over the stage-1 page tables if acquired before `deadline`.
     ///
     /// If the `PageTableManager` is not yet present, lazily constructs it using `builder()`.
@@ -1221,5 +1246,95 @@ mod tests {
         assert_eq!(parent.root_base(), Some(LINUX_PAGE_TABLES_BASE));
         assert!(!new_child.shares_exact_authority(&parent));
         assert_eq!(new_child.root_base(), Some(0x9a_0020_0000));
+    }
+
+    #[test]
+    fn stage1_authority_undo_journal_commit_and_rollback() {
+        let manager = PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
+        let authority = Stage1Authority::new_with_manager(Some(manager));
+
+        let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+        let p0 = host_arena0.as_mut_ptr();
+        let resolver = move |base: u64| {
+            if base == LINUX_PAGE_TABLES_BASE {
+                Some(p0)
+            } else {
+                None
+            }
+        };
+
+        let va = 0x40_0000;
+        authority
+            .edit(
+                || panic!("manager must be present"),
+                |editor| {
+                    editor.set_rw(va, 0x1000, false).expect("initial mapping");
+                    unsafe { editor.sync_to_host(resolver).expect("sync") };
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .expect("edit");
+
+        // Open undo, perform edit, then rollback
+        authority
+            .edit(
+                || panic!("manager must be present"),
+                |editor| {
+                    editor.begin_undo();
+                    editor
+                        .set_readonly(va, 0x1000, false)
+                        .expect("readonly edit");
+                    unsafe { editor.sync_to_host(resolver).expect("sync") };
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .expect("edit");
+
+        // Rollback via Stage1Authority::rollback_undo
+        unsafe {
+            authority.rollback_undo(resolver);
+        }
+
+        // Verify that after rollback, the mapping is restored to writable
+        authority
+            .edit(
+                || panic!("manager must be present"),
+                |editor| {
+                    assert!(!editor.undo_is_open());
+                    let desc = editor.debug_walk(va)[3];
+                    assert_eq!(desc & (1 << 7), 0, "must be writable after rollback");
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .expect("verify");
+
+        // Now test commit_undo: open undo, edit, commit
+        authority
+            .edit(
+                || panic!("manager must be present"),
+                |editor| {
+                    editor.begin_undo();
+                    editor
+                        .set_readonly(va, 0x1000, false)
+                        .expect("readonly edit");
+                    unsafe { editor.sync_to_host(resolver).expect("sync") };
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .expect("edit");
+
+        authority.commit_undo();
+
+        authority
+            .edit(
+                || panic!("manager must be present"),
+                |editor| {
+                    assert!(!editor.undo_is_open());
+                    let desc = editor.debug_walk(va)[3];
+                    assert_ne!(desc & (1 << 7), 0, "must remain readonly after commit");
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .expect("verify");
     }
 }

@@ -151,17 +151,6 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// materialized; a recoverable failure restores both authorities.
     pending_process_fork: Option<ParentForkCowRollback>,
 
-    /// Recycled buffer for the fork-time parent page-table pre-image.
-    ///
-    /// Every in-process fork snapshots the parent's stage-1 manager so a failed
-    /// child materialization can restore it byte-for-byte. That snapshot is
-    /// unchanged; only its allocation is reused. The image is
-    /// `LINUX_PAGE_TABLES_SIZE` (1.75 MiB), which the system allocator serves
-    /// from a fresh `mmap`, so a per-fork `clone()` costs an `mmap`, a zero-fill
-    /// fault per page as the copy touches it, and a `munmap`/`madvise` on drop.
-    /// A successful commit hands the buffer back here instead of freeing it.
-    pt_snapshot_scratch: Option<PageTableManager>,
-
     /// When set, records the runtime's exec predecessor-sharing expectation
     /// (`mark_exec_predecessor_shared`) to cross-check against the stage-1
     /// authority's own share decision.
@@ -183,7 +172,6 @@ pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
     page_tables: Stage1Authority,
     protections: Arc<MemoryProtections>,
     pending_process_fork: Option<ParentForkCowRollback>,
-    pt_snapshot_scratch: Option<PageTableManager>,
 }
 
 /// Task-owned runtime authorities that must follow a logical HVPatch task
@@ -261,7 +249,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             page_tables,
             protections,
             pending_process_fork: None,
-            pt_snapshot_scratch: None,
             exec_predecessor_shared: None,
         }
     }
@@ -417,7 +404,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             page_tables,
             protections,
             pending_process_fork,
-            pt_snapshot_scratch,
             ..
         } = self;
         (
@@ -436,7 +422,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 page_tables,
                 protections,
                 pending_process_fork,
-                pt_snapshot_scratch,
             },
             vcpu,
         )
@@ -458,7 +443,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             page_tables,
             protections,
             pending_process_fork,
-            pt_snapshot_scratch,
         } = state;
         Self {
             vm,
@@ -478,7 +462,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             page_tables,
             protections,
             pending_process_fork,
-            pt_snapshot_scratch,
             exec_predecessor_shared: None,
         }
     }
@@ -520,7 +503,6 @@ fn ensure_sparse_page_table_editor(
 }
 
 struct ParentForkCowRollback {
-    page_tables: PageTableManager,
     armed_ranges: Vec<crate::vmm::ForkCowRange>,
 }
 
@@ -767,7 +749,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             page_tables,
             protections,
             pending_process_fork: None,
-            pt_snapshot_scratch: None,
             exec_predecessor_shared: None,
         }
     }
@@ -887,7 +868,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             page_tables,
             protections,
             pending_process_fork: None,
-            pt_snapshot_scratch: None,
             exec_predecessor_shared: None,
         }
     }
@@ -1110,6 +1090,31 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             // was modified, split, or coalesced, so there is no stale TLB entry
             // to invalidate.
             return Ok(());
+        }
+        self.run_stage1_maintenance()
+            .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
+    }
+
+    /// Revert uncommitted page table edits from the undo journal to shadow and host memory,
+    /// and flush stale translations from the stage-1 TLB.
+    fn pt_rollback_undo_and_flush(&mut self) -> Result<(), MemoryError> {
+        const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+        let pt_base = self
+            .vcpu
+            .get_sys_reg(SysReg::Ttbr0)
+            .map_err(|error| MemoryError::HostMap(format!("read TTBR0_EL1: {error}")))?
+            & TTBR_ROOT_MASK;
+        let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
+        let host = self
+            .vm
+            .host_ptr(pt_base, size)
+            .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_string()))?;
+        unsafe {
+            self.page_tables.rollback_undo(|base| {
+                self.vm
+                    .host_ptr(base, size)
+                    .or_else(|| (base == pt_base).then_some(host))
+            });
         }
         self.run_stage1_maintenance()
             .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
@@ -3338,39 +3343,15 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let mut page_tables = self.page_tables.snapshot_image().ok_or_else(|| {
             TrapError::Hypervisor("hvpatch parent page tables are absent".to_owned())
         })?;
-        // Complete pre-transaction image, taken into the recycled buffer when a
-        // previous fork returned one (see `pt_snapshot_scratch`).
-        //
-        // Only an mm-copying fork arms the parent read-only and therefore has
-        // anything to roll back: with no COW ranges the parent's graph is never
-        // edited, and the snapshot below was pure copying. `CLONE_VM` and vfork
-        // take that path, and cpython's forkserver and `subprocess` lean on it.
-        let parent_page_tables_snapshot =
-            (!cow_ranges.is_empty()).then(|| match self.pt_snapshot_scratch.take() {
-                Some(mut reused) => {
-                    reused.clone_from(&page_tables);
-                    reused
-                }
-                None => page_tables.clone(),
-            });
-        // Taken AFTER the parent's rollback pre-image so that image stays a
-        // faithful copy of the parent. From here the manager is the CHILD's
-        // offline graph: no TTBR names it, no host backing has been synced from
-        // it, and this thread is its only owner until `materialize_process`
-        // publishes it. Say so rather than inheriting the parent's per-syscall
-        // exclusivity marker, which describes the parent's last mapping call
-        // and nothing about this image. Left inherited, the child's own
-        // `map_aliased` publication is refused `alloc_table`'s last-resort
-        // reclaim sweep and fails `OutOfTables` with reclaimable tables still
-        // in the graph.
+        // The child's own editable graph: taken directly from the parent's
+        // snapshot. The parent's rollback protection is provided by the bounded
+        // undo journal rather than a full 1.75 MiB cloned pre-image.
         page_tables.declare_offline_private_image();
         let parent_armed_snapshot = self.vm.frame_cow_arm_snapshot();
-        // The child's own editable graph, plus the parent's rollback pre-image
-        // when this fork copies the mm.
         emit_stage(
             HvpatchForkProcessSpecStagePhase::ParentPageTablesClone,
             stage_started,
-            page_tables.copied_bytes() * (1 + u64::from(parent_page_tables_snapshot.is_some())),
+            page_tables.copied_bytes(),
         );
 
         let mut child_source = request.table_arena_source.take();
@@ -3460,23 +3441,15 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
         if !cow_ranges.is_empty() {
             // Final publication transaction. All child allocation, mapping-plan,
-            // ASID, snapshot, and wrapper work is complete. Save the exact live
-            // graph and restore it (including a scoped TLBI) if either the edit
-            // or its fail-closed descriptor authentication fails. Armed-range
-            // metadata is installed only after publication succeeds, so every
-            // pre-commit error leaves both authorities at their prior state.
-            //
-            // The pre-image is taken under exactly this condition above, so a
-            // missing one means the two predicates have drifted apart; refuse
-            // rather than arm the parent with no way back.
-            let Some(parent_page_tables_snapshot) = parent_page_tables_snapshot else {
-                return Err(TrapError::Hypervisor(
-                    "hvpatch fork would arm parent COW ranges without a rollback pre-image"
-                        .to_owned(),
-                ));
-            };
+            // ASID, snapshot, and wrapper work is complete. Open an undo journal
+            // covering the parent's fork-COW arming and restore it (including a
+            // scoped TLBI) if either the edit or its fail-closed descriptor
+            // authentication fails. Armed-range metadata is installed only after
+            // publication succeeds, so every pre-commit error leaves both
+            // authorities at their prior state.
             let publish_parent = (|| -> Result<(), TrapError> {
                 self.pt_edit_and_flush(|manager| {
+                    manager.begin_undo();
                     let mut outcome = PageTableApplyOutcome::default();
                     for range in &cow_ranges {
                         outcome |= if range.kernel_only {
@@ -3554,15 +3527,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             })();
 
             if let Err(error) = publish_parent {
-                let rollback_result = self.pt_edit_and_flush(|editor| {
-                    // Restore the pre-fork image but keep the live manager's
-                    // arena source and adopted extension arenas: a clone
-                    // carries neither, and a parent that lost them could
-                    // never grow again (see `adopt_live_extension_state`).
-                    editor.restore_image(parent_page_tables_snapshot.clone(), 7, 0);
-                    Ok(PageTableApplyOutcome::new(true, true))
-                });
-                if let Err(rollback_error) = rollback_result {
+                if let Err(rollback_error) = self.pt_rollback_undo_and_flush() {
                     carrick_fatal!(
                         "aarch64::fork_cow",
                         "failed page table rollback and TLBI invalidation during parent fork COW setup after error {error}: {rollback_error}"
@@ -3574,7 +3539,6 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             }
             self.vm.arm_frame_cow_ranges(&cow_ranges);
             self.pending_process_fork = Some(ParentForkCowRollback {
-                page_tables: parent_page_tables_snapshot,
                 armed_ranges: parent_armed_snapshot,
             });
         }
@@ -3612,13 +3576,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     }
 
     fn commit_process_fork(&mut self) -> Result<(), TrapError> {
-        // The child is materialized, so the parent pre-image is dead. Keep its
-        // buffer for the next fork rather than returning 1.75 MiB to the
-        // allocator only to ask for it again (see `pt_snapshot_scratch`).
-        self.pt_snapshot_scratch = self
-            .pending_process_fork
-            .take()
-            .map(|rollback| rollback.page_tables);
+        let _ = self.pending_process_fork.take();
+        self.page_tables.commit_undo();
         Ok(())
     }
 
@@ -3626,18 +3585,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let Some(rollback) = self.pending_process_fork.take() else {
             return Ok(());
         };
-        let mut restored = Some(rollback.page_tables);
-        self.pt_edit_and_flush(|editor| {
-            // The pre-fork image is a clone: carry the live manager's arena
-            // source and adopted extension arenas over, or the parent could
-            // never grow again after a refused fork (CPython's `-v` uname
-            // fork lost the root's source this way).
-            if let Some(image) = restored.take() {
-                editor.restore_image(image, 6, 0);
-            }
-            Ok(PageTableApplyOutcome::new(true, true))
-        })
-        .map_err(|error| {
+        self.pt_rollback_undo_and_flush().map_err(|error| {
             TrapError::Hypervisor(format!(
                 "restore parent after failed in-process fork: {error}"
             ))

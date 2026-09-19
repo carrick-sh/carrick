@@ -605,6 +605,11 @@ impl Vfs for InMemoryFileVfs {
                     if dup_fd < 0 {
                         return Err(LINUX_EMFILE);
                     }
+                    if !flags.append {
+                        unsafe {
+                            libc::lseek(dup_fd, 0, libc::SEEK_SET);
+                        }
+                    }
                     return Ok(VfsHandle::HostFd {
                         host_fd: dup_fd,
                         is_read_end: !flags.write,

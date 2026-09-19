@@ -128,14 +128,70 @@ fn write_markers() -> i32 {
     }
 }
 
+fn futex_pingpong(shm_path: &str, rounds: u32) -> i32 {
+    let path_c = match std::ffi::CString::new(shm_path) {
+        Ok(c) => c,
+        Err(_) => return 10,
+    };
+    let fd = unsafe { libc::open(path_c.as_ptr(), libc::O_RDWR) };
+    if fd < 0 {
+        return 11;
+    }
+    let map = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if map == libc::MAP_FAILED {
+        return 12;
+    }
+    let ping_ptr = map as *mut u32;
+    let pong_ptr = unsafe { (map as *mut u8).add(4) } as *mut u32;
+
+    for round in 1..=rounds {
+        // Wait for host to write round to ping_ptr (offset 0)
+        while unsafe { std::ptr::read_volatile(ping_ptr) } != round {
+            unsafe {
+                let ts = libc::timespec {
+                    tv_sec: 1,
+                    tv_nsec: 0,
+                };
+                libc::syscall(
+                    libc::SYS_futex,
+                    ping_ptr,
+                    0, // FUTEX_WAIT
+                    round - 1,
+                    &ts as *const libc::timespec,
+                );
+            }
+        }
+        // Write round to pong_ptr (offset 4) and wake host
+        unsafe {
+            std::ptr::write_volatile(pong_ptr, round);
+            libc::syscall(libc::SYS_futex, pong_ptr, 1, 1); // FUTEX_WAKE
+        }
+    }
+    0
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
+    if args.len() < 2 {
         std::process::exit(64);
     }
     let code = match args[1].as_str() {
         "identity" => identity(),
         "write" => write_markers(),
+        "futex-pingpong" => {
+            let path = args.get(2).map(|s| s.as_str()).unwrap_or("/dev/carrick/shm/bench");
+            let rounds = args.get(3).and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
+            futex_pingpong(path, rounds)
+        }
         _ => 64,
     };
     std::process::exit(code);
