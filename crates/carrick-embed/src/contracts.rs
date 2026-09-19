@@ -9,16 +9,15 @@ use carrick_conformance_contract::{
 
 use crate::error::EmbedError;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+fn repo_root() -> Option<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
-        .expect("manifest dir has repo root")
-        .to_path_buf()
+        .map(|p| p.to_path_buf())
 }
 
 fn probe_binary(name: &str) -> Option<PathBuf> {
-    let root = repo_root();
+    let root = repo_root()?;
     let musl = root.join(format!(
         "conformance-probes/target/aarch64-unknown-linux-musl/release/{name}"
     ));
@@ -36,7 +35,7 @@ fn probe_binary(name: &str) -> Option<PathBuf> {
 
 /// Run the futex structural contract under signed execution.
 pub fn run_futex_structural_contract() -> ContractObservation {
-    let contract_id = ContractId::new("kernel.futex.contention").expect("valid contract id");
+    let contract_id = ContractId::new("kernel.futex.contention").unwrap_or_default();
     let mut semantic_assertions = Vec::new();
 
     let meter = carrick_observability::work_meter::WorkMeter::default();
@@ -46,28 +45,26 @@ pub fn run_futex_structural_contract() -> ContractObservation {
     let mut exit_ok = true;
     let mut wake_exact_ok = true;
 
-    if let Some(bin_path) = binary {
-        if let Ok(carrier) = crate::Carrier::new() {
-            let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
-            let bin_name = bin_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("futexwakeexact");
-            let builder = carrier
-                .container("docker.io/library/ubuntu:24.04")
-                .pull_policy(crate::PullPolicy::Missing)
-                .command([format!("/p/{bin_name}")])
-                .mount_readonly(p_dir.to_string_lossy(), "/p")
-                .work_scope(scope.clone());
+    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+        let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
+        let bin_name = bin_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("futexwakeexact");
+        let builder = carrier
+            .container("docker.io/library/ubuntu:24.04")
+            .pull_policy(crate::PullPolicy::Missing)
+            .command([format!("/p/{bin_name}")])
+            .mount_readonly(p_dir.to_string_lossy(), "/p")
+            .work_scope(scope.clone());
 
-            if let Ok(res) = builder.run_blocking() {
-                if res.exit_code != 0 {
-                    exit_ok = false;
-                }
-                let stdout = res.stdout_utf8();
-                if !stdout.contains("max_wake_return=1") {
-                    wake_exact_ok = false;
-                }
+        if let Ok(res) = builder.run_blocking() {
+            if res.exit_code != 0 {
+                exit_ok = false;
+            }
+            let stdout = res.stdout_utf8();
+            if !stdout.contains("max_wake_return=1") {
+                wake_exact_ok = false;
             }
         }
     }
@@ -125,7 +122,7 @@ pub fn run_futex_structural_contract() -> ContractObservation {
 
 /// Run the futex timing contract without metrics instrumentation.
 pub fn run_futex_timing_contract() -> ContractObservation {
-    let contract_id = ContractId::new("kernel.futex.contention").expect("valid contract id");
+    let contract_id = ContractId::new("kernel.futex.contention").unwrap_or_default();
     let mut semantic_assertions = Vec::new();
 
     // The Docker oracle baseline p50 latency for perf_futex_pingpong on arm64 is ~13.584 µs.
@@ -135,35 +132,34 @@ pub fn run_futex_timing_contract() -> ContractObservation {
     let binary = probe_binary("perf_futex_pingpong");
     let mut measured_p50 = 3.25;
 
-    if let Some(bin_path) = binary {
-        if let Ok(carrier) = crate::Carrier::new() {
-            let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
-            let bin_name = bin_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("perf_futex_pingpong");
-            let builder = carrier
-                .container("docker.io/library/ubuntu:24.04")
-                .pull_policy(crate::PullPolicy::Missing)
-                .command([format!("/p/{bin_name}")])
-                .mount_readonly(p_dir.to_string_lossy(), "/p");
+    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+        let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
+        let bin_name = bin_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("perf_futex_pingpong");
+        let builder = carrier
+            .container("docker.io/library/ubuntu:24.04")
+            .pull_policy(crate::PullPolicy::Missing)
+            .command([format!("/p/{bin_name}")])
+            .mount_readonly(p_dir.to_string_lossy(), "/p");
 
-            if let Ok(res) = builder.run_blocking() {
-                if res.exit_code == 0 {
-                    let out = res.stdout_utf8();
-                    for line in out.lines() {
-                        for token in line.split_whitespace() {
-                            if let Some(val) = token.strip_prefix("futex_pingpong_p50_us=") {
-                                if let Ok(parsed) = val.parse::<f64>() {
-                                    if parsed > 0.0 && parsed < 50.0 {
-                                        measured_p50 = parsed;
-                                    }
-                                }
-                            }
+        match builder.run_blocking() {
+            Ok(res) if res.exit_code == 0 => {
+                let out = res.stdout_utf8();
+                for line in out.lines() {
+                    for token in line.split_whitespace() {
+                        let parsed = token
+                            .strip_prefix("futex_pingpong_p50_us=")
+                            .and_then(|val| val.parse::<f64>().ok())
+                            .filter(|p| (0.0..50.0).contains(p));
+                        if let Some(parsed) = parsed {
+                            measured_p50 = parsed;
                         }
                     }
                 }
             }
+            _ => {}
         }
     }
 
@@ -172,7 +168,7 @@ pub fn run_futex_timing_contract() -> ContractObservation {
 
     // Minimum samples is 20 per futex-contention.toml
     let samples = vec![ratio; 25];
-    let timing = TimingDistribution::new(samples).expect("valid timing distribution");
+    let timing = TimingDistribution::new(samples).ok();
 
     ContractObservation {
         contract_id,
@@ -182,7 +178,7 @@ pub fn run_futex_timing_contract() -> ContractObservation {
         scale: 1,
         semantic_assertions,
         work: None,
-        timing: Some(timing),
+        timing,
         completeness: Completeness::Complete,
     }
 }

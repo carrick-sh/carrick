@@ -864,8 +864,8 @@ impl HvpatchRuntimeDirectory {
                 let s = carrick_kernel::kernel::continuation::CarrierWaitService::new(Arc::clone(
                     &scheduler,
                 ));
-                if let Some(ref scope) = self.work_scope.lock().as_ref() {
-                    s.set_work_scope((*scope).clone());
+                if let Some(scope) = self.work_scope.lock().as_ref() {
+                    s.set_work_scope(scope.clone());
                 }
                 Arc::new(s)
             }))

@@ -36,6 +36,12 @@ impl fmt::Display for ContractId {
     }
 }
 
+impl Default for ContractId {
+    fn default() -> Self {
+        Self("contract.unknown".to_string())
+    }
+}
+
 impl<'de> Deserialize<'de> for ContractId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

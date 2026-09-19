@@ -34,6 +34,7 @@ pub(crate) struct PreparedCarrierOwnership {
     pub(crate) runtime: CarrierRuntime,
     pub(crate) lease: CarrierLease,
     pub(crate) implicit: bool,
+    pub(crate) work_scope: Option<carrick_observability::work_meter::WorkScope>,
 }
 
 impl PreparedContainer {
@@ -45,13 +46,13 @@ impl PreparedContainer {
         shared_buffers: Vec<(String, SharedBuffer)>,
         auditors: Vec<Arc<dyn carrick_kernel::observe::KernelAuditor>>,
         carrier: PreparedCarrierOwnership,
-        work_scope: Option<carrick_observability::work_meter::WorkScope>,
     ) -> Self {
         let launch = carrier.lease.launch().clone();
         let generation = 1;
         let retired = Arc::new(AtomicBool::new(false));
         let current_generation = Arc::new(AtomicU64::new(generation));
         let auditors = Arc::new(carrick_kernel::observe::AuditorChain::new(auditors));
+        let work_scope = carrier.work_scope.clone();
         Self {
             spec,
             warnings,

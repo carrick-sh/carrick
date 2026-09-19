@@ -203,9 +203,6 @@ impl RuntimeExtensions {
 
     /// Attach an execution-scoped work meter scope to the container.
     pub fn work_scope(mut self, scope: carrick_observability::work_meter::WorkScope) -> Self {
-        if scope.is_retired() {
-            panic!("cannot attach an already-retired work scope to RuntimeExtensions");
-        }
         self.work_scope = Some(scope);
         self
     }

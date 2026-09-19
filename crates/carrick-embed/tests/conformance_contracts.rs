@@ -1,6 +1,7 @@
 //! Conformance contract tests for futex contention in carrick-embed.
 //!
 //! Run ONLY through `scripts/test-signed.sh`.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use carrick_conformance_contract::{ContractRegistry, ExecutionLayer, evaluate};
 use carrick_embed::{run_futex_structural_contract, run_futex_timing_contract};
