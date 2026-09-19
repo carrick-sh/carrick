@@ -107,7 +107,7 @@ def lex_rust(source: str) -> list[Token]:
         ):
             quote = source[index + (char in {"b", "c"})]
             start_line = line
-            if quote == "'" and index + 1 < len(source) and source[index + 1].isalpha():
+            if quote == "'" and index + 1 < len(source) and (source[index + 1].isalpha() or source[index + 1] == "_"):
                 end = index + 1
                 while end < len(source) and (source[end].isalnum() or source[end] == "_"):
                     end += 1
