@@ -259,13 +259,33 @@ trait InotifyBackend: Send + Sync {
         watch_fds: Vec<carrick_vfs::WatchFd>,
         mask: u32,
         inner: &Mutex<Inner>,
+        work_scope: Option<&carrick_observability::work_meter::WorkScope>,
     ) -> Result<i32, LinuxErrno>;
     /// Replace the backend registration mask for an existing guest watch.
-    fn update_watch(&self, wd: i32, mask: u32, inner: &Mutex<Inner>) -> Result<(), LinuxErrno>;
+    fn update_watch(
+        &self,
+        wd: i32,
+        mask: u32,
+        inner: &Mutex<Inner>,
+        work_scope: Option<&carrick_observability::work_meter::WorkScope>,
+    ) -> Result<(), LinuxErrno>;
     /// Tear down the backend-side registration for one watched fd of a wd being
     /// removed. Called by `rm_watch`, which already holds the `inner` lock, so it
     /// takes `&mut Inner`.
     fn deregister(&self, host_fd: RawFd, wd: i32, inner: &mut Inner);
+    /// Tear down the backend-side registration for all watched fds of a wd being
+    /// removed in a single batch.
+    fn deregister_batch(
+        &self,
+        host_fds: &[RawFd],
+        wd: i32,
+        inner: &mut Inner,
+        _work_scope: Option<&carrick_observability::work_meter::WorkScope>,
+    ) {
+        for &host_fd in host_fds {
+            self.deregister(host_fd, wd, inner);
+        }
+    }
     /// Drain newly-ready changes and return up to `max_bytes` of encoded Linux
     /// `inotify_event` records; mirrors the old per-platform `read_records`.
     fn read_records(&self, max_bytes: usize, inner: &Mutex<Inner>) -> Result<Vec<u8>, LinuxErrno>;
@@ -297,11 +317,19 @@ impl InotifyBackend for NativeLinuxInotify {
         watch_fds: Vec<carrick_vfs::WatchFd>,
         mask: u32,
         inner: &Mutex<Inner>,
+        work_scope: Option<&carrick_observability::work_meter::WorkScope>,
     ) -> Result<i32, LinuxErrno> {
         if watch_fds.is_empty() {
             return Err(LINUX_EINVAL);
         }
         let host_fds: Vec<RawFd> = watch_fds.iter().map(|watch_fd| watch_fd.host_fd).collect();
+
+        if let Some(scope) = work_scope {
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::HostBackendCalls,
+                1,
+            );
+        }
 
         // Native inotify watches *paths*; resolve each watched fd to the path it
         // currently names (/proc/self/fd/<fd>) and add a kernel watch. The guest
@@ -346,13 +374,25 @@ impl InotifyBackend for NativeLinuxInotify {
         Ok(wd)
     }
 
-    fn update_watch(&self, wd: i32, mask: u32, inner: &Mutex<Inner>) -> Result<(), LinuxErrno> {
+    fn update_watch(
+        &self,
+        wd: i32,
+        mask: u32,
+        inner: &Mutex<Inner>,
+        work_scope: Option<&carrick_observability::work_meter::WorkScope>,
+    ) -> Result<(), LinuxErrno> {
         let host_fds = inner
             .lock()
             .watches
             .get(&wd)
             .map(|watch| watch.host_fds.clone())
             .ok_or(LINUX_EINVAL)?;
+        if let Some(scope) = work_scope {
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::HostBackendCalls,
+                1,
+            );
+        }
         let mut native_wds = Vec::with_capacity(host_fds.len());
         for host_fd in host_fds {
             native_wds
@@ -380,6 +420,22 @@ impl InotifyBackend for NativeLinuxInotify {
             // SAFETY: inotify_rm_watch on our owned inotify fd + valid wd.
             unsafe { libc::inotify_rm_watch(self.inotify_fd, native_wd) };
         }
+    }
+
+    fn deregister_batch(
+        &self,
+        _host_fds: &[RawFd],
+        wd: i32,
+        inner: &mut Inner,
+        work_scope: Option<&carrick_observability::work_meter::WorkScope>,
+    ) {
+        if let Some(scope) = work_scope {
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::HostBackendCalls,
+                1,
+            );
+        }
+        self.deregister(0, wd, inner);
     }
 
     fn read_records(&self, max_bytes: usize, inner: &Mutex<Inner>) -> Result<Vec<u8>, LinuxErrno> {
@@ -469,21 +525,27 @@ impl InotifyBackend for VnodeDiffInotify {
         watch_fds: Vec<carrick_vfs::WatchFd>,
         mask: u32,
         inner: &Mutex<Inner>,
+        work_scope: Option<&carrick_observability::work_meter::WorkScope>,
     ) -> Result<i32, LinuxErrno> {
         if watch_fds.is_empty() {
             return Err(LINUX_EINVAL);
         }
         let host_fds: Vec<RawFd> = watch_fds.iter().map(|watch_fd| watch_fd.host_fd).collect();
 
-        // Register each watched vnode for the requested `NOTE_*` set. The token
-        // is the host fd so `read_records` can map a fired event back to its wd.
+        // Register each watched vnode for the requested `NOTE_*` set in a single batch.
+        // The token is the host fd so `read_records` can map a fired event back to its wd.
         let registered = {
             let events = linux_mask_to_vnode_events(mask);
             let mut mux = self.mux.lock();
-            host_fds.iter().try_for_each(|host_fd| {
-                mux.register_vnode(*host_fd, *host_fd as u64, events)
-                    .map_err(|_| ())
-            })
+            let vnodes: Vec<(RawFd, u64, VnodeEvents)> =
+                host_fds.iter().map(|&fd| (fd, fd as u64, events)).collect();
+            if let Some(scope) = work_scope {
+                let _ = scope.add(
+                    carrick_observability::work_meter::WorkMetric::HostBackendCalls,
+                    1,
+                );
+            }
+            mux.register_vnodes(&vnodes).map_err(|_| ())
         };
         if registered.is_err() {
             // Registration failed: we own the fds, so don't leak them.
@@ -527,7 +589,13 @@ impl InotifyBackend for VnodeDiffInotify {
         Ok(wd)
     }
 
-    fn update_watch(&self, wd: i32, mask: u32, inner: &Mutex<Inner>) -> Result<(), LinuxErrno> {
+    fn update_watch(
+        &self,
+        wd: i32,
+        mask: u32,
+        inner: &Mutex<Inner>,
+        work_scope: Option<&carrick_observability::work_meter::WorkScope>,
+    ) -> Result<(), LinuxErrno> {
         let host_fds = inner
             .lock()
             .watches
@@ -536,10 +604,15 @@ impl InotifyBackend for VnodeDiffInotify {
             .ok_or(LINUX_EINVAL)?;
         let events = linux_mask_to_vnode_events(mask);
         let mut mux = self.mux.lock();
-        for host_fd in host_fds {
-            mux.register_vnode(host_fd, host_fd as u64, events)
-                .map_err(|_| LINUX_ENOSPC)?;
+        let vnodes: Vec<(RawFd, u64, VnodeEvents)> =
+            host_fds.iter().map(|&fd| (fd, fd as u64, events)).collect();
+        if let Some(scope) = work_scope {
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::HostBackendCalls,
+                1,
+            );
         }
+        mux.register_vnodes(&vnodes).map_err(|_| LINUX_ENOSPC)?;
         drop(mux);
         let mut inner = inner.lock();
         let watch = inner.watches.get_mut(&wd).ok_or(LINUX_EINVAL)?;
@@ -549,6 +622,24 @@ impl InotifyBackend for VnodeDiffInotify {
 
     fn deregister(&self, host_fd: RawFd, _wd: i32, _inner: &mut Inner) {
         let _ = self.mux.lock().deregister(host_fd);
+    }
+
+    fn deregister_batch(
+        &self,
+        host_fds: &[RawFd],
+        _wd: i32,
+        _inner: &mut Inner,
+        work_scope: Option<&carrick_observability::work_meter::WorkScope>,
+    ) {
+        if !host_fds.is_empty() {
+            if let Some(scope) = work_scope {
+                let _ = scope.add(
+                    carrick_observability::work_meter::WorkMetric::HostBackendCalls,
+                    1,
+                );
+            }
+            let _ = self.mux.lock().deregister_vnodes(host_fds);
+        }
     }
 
     fn read_records(&self, max_bytes: usize, inner: &Mutex<Inner>) -> Result<Vec<u8>, LinuxErrno> {
@@ -719,6 +810,7 @@ pub struct InotifyState {
     /// (`mux.poll_fd()` on macOS, the inotify fd on Linux).
     poll_fd: RawFd,
     inner: Mutex<Inner>,
+    work_scope: parking_lot::RwLock<Option<carrick_observability::work_meter::WorkScope>>,
 }
 
 impl std::fmt::Debug for InotifyState {
@@ -737,7 +829,16 @@ impl InotifyState {
             backend,
             poll_fd,
             inner: Mutex::new(Inner::new()),
+            work_scope: parking_lot::RwLock::new(None),
         })
+    }
+
+    pub(crate) fn set_work_scope(&self, scope: carrick_observability::work_meter::WorkScope) {
+        *self.work_scope.write() = Some(scope);
+    }
+
+    pub(crate) fn work_scope(&self) -> Option<carrick_observability::work_meter::WorkScope> {
+        self.work_scope.read().clone()
     }
 
     /// The backing pollable fd (the kqueue fd on macOS, the inotify fd on
@@ -759,7 +860,9 @@ impl InotifyState {
         watch_fds: Vec<carrick_vfs::WatchFd>,
         mask: u32,
     ) -> Result<i32, LinuxErrno> {
-        self.backend.add_watch_fds(watch_fds, mask, &self.inner)
+        let scope = self.work_scope();
+        self.backend
+            .add_watch_fds(watch_fds, mask, &self.inner, scope.as_ref())
     }
 
     /// Allocate a watch descriptor with no backend (kqueue/native) registration:
@@ -795,7 +898,9 @@ impl InotifyState {
         let add = requested & carrick_abi::LINUX_IN_MASK_ADD != 0;
         let requested = requested & !carrick_abi::LINUX_IN_MASK_ADD;
         let effective = if add { current | requested } else { requested };
-        self.backend.update_watch(wd, effective, &self.inner)?;
+        let scope = self.work_scope();
+        self.backend
+            .update_watch(wd, effective, &self.inner, scope.as_ref())?;
         Ok(effective)
     }
 
@@ -810,9 +915,13 @@ impl InotifyState {
         let Some(watch) = inner.watches.remove(&wd) else {
             return Err(LINUX_EINVAL);
         };
+        for host_fd in &watch.host_fds {
+            inner.wd_by_fd.remove(host_fd);
+        }
+        let scope = self.work_scope();
+        self.backend
+            .deregister_batch(&watch.host_fds, wd, &mut inner, scope.as_ref());
         for host_fd in watch.host_fds {
-            inner.wd_by_fd.remove(&host_fd);
-            self.backend.deregister(host_fd, wd, &mut inner);
             unsafe { libc::close(host_fd) };
         }
         Ok(())

@@ -195,13 +195,15 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
             exemption.replace(head_sha, final_head_sha), encoding="utf-8"
         )
         subprocess.run(["git", "commit", "-am", "final exemption head"], cwd=self.repo, check=True)
+        git_env = dict(os.environ, GIT_COMMITTER_DATE="2026-09-19T12:00:00", GIT_AUTHOR_DATE="2026-09-19T12:00:00")
+        subprocess.run(["git", "commit", "--amend", "--no-edit"], cwd=self.repo, check=True, env=git_env)
         active_head_sha = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
         ).stdout.strip()
         (exempt_dir / "exemption.toml").write_text(
             exemption.replace(head_sha, active_head_sha), encoding="utf-8"
         )
-        subprocess.run(["git", "commit", "--amend", "--no-edit"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "--amend", "--no-edit"], cwd=self.repo, check=True, env=git_env)
         committed_head = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
         ).stdout.strip()

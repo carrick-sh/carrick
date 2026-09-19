@@ -107,6 +107,24 @@ impl EventMultiplexer for KqueueMultiplexer {
         Ok(())
     }
 
+    fn register_vnodes(&mut self, vnodes: &[(RawFd, u64, VnodeEvents)]) -> Result<(), OsError> {
+        if vnodes.is_empty() {
+            return Ok(());
+        }
+        let kevents: Vec<Kevent> = vnodes
+            .iter()
+            .map(|&(fd, token, mask)| {
+                let note = mask.to_note();
+                Kevent::vnode(fd, note).with_udata_u64(token)
+            })
+            .collect();
+        self.kq.apply(&kevents).map_err(OsError::from_raw)?;
+        for &(fd, _, _) in vnodes {
+            self.registered.entry(fd).or_default().vnode = true;
+        }
+        Ok(())
+    }
+
     fn register_user(&mut self, ident: u64) -> Result<(), OsError> {
         let ev = Kevent::user(ident as usize, libc::EV_ADD | libc::EV_CLEAR);
         self.kq.apply(&[ev]).map_err(OsError::from_raw)
@@ -151,6 +169,34 @@ impl EventMultiplexer for KqueueMultiplexer {
             if !deletes.is_empty() {
                 let _ = self.kq.apply(&deletes);
             }
+        }
+        Ok(())
+    }
+
+    fn deregister_vnodes(&mut self, fds: &[RawFd]) -> Result<(), OsError> {
+        if fds.is_empty() {
+            return Ok(());
+        }
+        let mut deletes = Vec::with_capacity(fds.len());
+        for &fd in fds {
+            if let Some(entry) = self.registered.remove(&fd) {
+                if entry.read {
+                    deletes.push(Kevent::read(fd, libc::EV_DELETE));
+                }
+                if entry.write {
+                    deletes.push(Kevent::write(fd, libc::EV_DELETE));
+                }
+                if entry.oob {
+                    #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
+                    deletes.push(Kevent::oob(fd, libc::EV_DELETE));
+                }
+                if entry.vnode {
+                    deletes.push(Kevent::vnode_delete(fd));
+                }
+            }
+        }
+        if !deletes.is_empty() {
+            let _ = self.kq.apply(&deletes);
         }
         Ok(())
     }
