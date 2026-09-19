@@ -3088,6 +3088,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             crate::thread::ThreadId::synthetic_for_tests(1001),
             &registry,
             None,
+            None,
         );
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
@@ -3122,6 +3123,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             &futex,
             crate::thread::ThreadId::synthetic_for_tests(1001),
             &registry,
+            None,
             None,
         );
 
@@ -3189,6 +3191,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             crate::thread::ThreadId::synthetic_for_tests(1001),
             &registry,
             None,
+            None,
         );
 
         assert_eq!(
@@ -3243,6 +3246,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             &futex,
             crate::thread::ThreadId::synthetic_for_tests(1001),
             &registry,
+            None,
             None,
         );
 

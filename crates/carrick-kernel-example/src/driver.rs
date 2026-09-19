@@ -117,6 +117,15 @@ impl std::task::Wake for ThreadWaker {
 
 /// Drive a future synchronously on the current host thread with a timeout bound.
 pub fn block_on_timeout<F: std::future::Future>(future: F, timeout: Duration) -> Option<F::Output> {
+    block_on_timeout_with_scope(future, timeout, None)
+}
+
+/// Drive a future synchronously on the current host thread with a timeout bound, recording park metrics.
+pub fn block_on_timeout_with_scope<F: std::future::Future>(
+    future: F,
+    timeout: Duration,
+    work_scope: Option<&carrick_observability::work_meter::WorkScope>,
+) -> Option<F::Output> {
     let start = Instant::now();
     let mut future = std::pin::pin!(future);
     let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
@@ -130,6 +139,12 @@ pub fn block_on_timeout<F: std::future::Future>(future: F, timeout: Duration) ->
             return None;
         }
         let remaining = timeout.saturating_sub(elapsed);
+        if let Some(scope) = work_scope {
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::ContinuationParks,
+                1,
+            );
+        }
         std::thread::park_timeout(remaining);
     }
 }
@@ -222,6 +237,10 @@ pub(crate) fn drive(
                 return Ok(death);
             }
 
+            let _ = shared.work_scope.add(
+                carrick_observability::work_meter::WorkMetric::KernelDispatches,
+                1,
+            );
             shared.dispatches.fetch_add(1, Ordering::SeqCst);
             shared.ledger.lock().dispatch_events.push((
                 task.process.pid(),
@@ -230,7 +249,8 @@ pub(crate) fn drive(
             ));
 
             let request = SyscallRequest::new(syscall.nr.raw(), SyscallArgs::from(args));
-            let thread_ctx = ThreadCtx::new(tid, &task.thread_registry, &task.futex_table);
+            let thread_ctx = ThreadCtx::new(tid, &task.thread_registry, &task.futex_table)
+                .with_work_scope(&shared.work_scope);
 
             let mut mem = task.memory.lock();
             let mut executor = disp
@@ -424,8 +444,11 @@ pub(crate) fn drive(
                     // Drive wait service event on host thread. Note: `shared.wake_active_tokens_for_task`
                     // calling `publish_ready` for a retired task is transport notification only:
                     // it prompts this host thread loop to wake and observe exact liveness/retirement.
-                    let event_result =
-                        block_on_timeout(shared.wait_service.event(token), remaining);
+                    let event_result = block_on_timeout_with_scope(
+                        shared.wait_service.event(token),
+                        remaining,
+                        Some(&shared.work_scope),
+                    );
                     shared.unregister_active_token(token);
                     let Some(event_result) = event_result else {
                         let _ = continuation.cancel(CancellationCause::ServiceShutdown);
@@ -525,7 +548,13 @@ pub(crate) fn drive(
                             outcome = next_outcome;
                             continue;
                         }
-                        Ok(None) => break, // redispatch original syscall request
+                        Ok(None) => {
+                            let _ = shared.work_scope.add(
+                                carrick_observability::work_meter::WorkMetric::KernelRedispatches,
+                                1,
+                            );
+                            break; // redispatch original syscall request
+                        }
                         Err(err) => {
                             return Err(ExampleError::Unsupported(format!(
                                 "memory error folding continuation: {err:?}"

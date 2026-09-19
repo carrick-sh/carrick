@@ -447,9 +447,19 @@ pub struct CarrierWaitServiceInner {
     reactor_poll_observer: Mutex<Option<(u64, Arc<std::sync::Barrier>)>>,
     #[cfg(test)]
     test_hooks: ReactorTestHooks,
+    work_scope: Mutex<Option<carrick_observability::work_meter::WorkScope>>,
 }
 
 impl CarrierWaitServiceInner {
+    pub(crate) fn add_metric(
+        &self,
+        metric: carrick_observability::work_meter::WorkMetric,
+        amount: u64,
+    ) {
+        if let Some(scope) = self.work_scope.lock().as_ref() {
+            let _ = scope.add(metric, amount);
+        }
+    }
     pub(super) fn nudge_reactor(&self) {
         let byte = [1u8; 1];
         let _ = unsafe {
@@ -579,6 +589,10 @@ impl CarrierWaitServiceInner {
         };
         drop(removed);
         drop(task_waker);
+        self.add_metric(
+            carrick_observability::work_meter::WorkMetric::ContinuationResumes,
+            1,
+        );
         Ok(())
     }
 
@@ -635,6 +649,12 @@ impl CarrierWaitServiceInner {
         self.nudge_reactor();
         if let Some(waker) = task_waker {
             waker.wake();
+        }
+        if won {
+            self.add_metric(
+                carrick_observability::work_meter::WorkMetric::WakePublications,
+                1,
+            );
         }
         WakePublishReceipt {
             accepted: won,
@@ -967,6 +987,7 @@ impl CarrierWaitService {
             reactor_poll_observer: Mutex::new(None),
             #[cfg(test)]
             test_hooks: ReactorTestHooks::default(),
+            work_scope: Mutex::new(None),
         });
         let weak = Arc::downgrade(&inner);
         let handle = std::thread::Builder::new()
@@ -979,6 +1000,10 @@ impl CarrierWaitService {
             })?;
         *inner.reactor.lock() = Some(handle);
         Ok(Self { inner })
+    }
+
+    pub fn set_work_scope(&self, scope: carrick_observability::work_meter::WorkScope) {
+        *self.inner.work_scope.lock() = Some(scope);
     }
 
     #[allow(clippy::expect_used)]
@@ -1074,6 +1099,10 @@ impl CarrierWaitService {
         // is live so pre-capture signals/readiness cannot strand the task.
         let _ = self.recheck_registration(registration)?;
         self.inner.nudge_reactor();
+        self.inner.add_metric(
+            carrick_observability::work_meter::WorkMetric::ContinuationEnrollments,
+            1,
+        );
         Ok(())
     }
 

@@ -511,6 +511,7 @@ impl SyscallDispatcher {
                     thread.tid,
                     thread.registry,
                     hvpatch_linux_tid,
+                    thread.work_scope,
                 )
             }
             99 => {

@@ -1,6 +1,7 @@
 //! Report and observation records from a completed harness run.
 
 use carrick_abi::LinuxErrno;
+use carrick_observability::work_meter::WorkSnapshot;
 
 /// Record of a completed syscall.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,9 +43,15 @@ pub struct RunReport {
     pub(crate) tasks_started: usize,
     pub(crate) dispatches: usize,
     pub(crate) dispatch_events: Vec<(i32, i32, &'static str)>,
+    pub(crate) work_snapshot: WorkSnapshot,
 }
 
 impl RunReport {
+    /// Work meter snapshot captured during this run.
+    pub fn work_snapshot(&self) -> &WorkSnapshot {
+        &self.work_snapshot
+    }
+
     /// The root task's exit code.
     pub const fn exit_code(&self) -> i32 {
         self.exit_code

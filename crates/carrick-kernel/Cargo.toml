@@ -37,6 +37,7 @@ event-ring-dump = []
 # gets. The product build never enables it either (root `default-members` =
 # carrick-cli, and `just check-layering` fails if that selection does).
 test-support = ["carrick-hal/test-support"]
+conformance-metrics = ["carrick-observability/conformance-metrics"]
 
 # NOTE: no `platform-*` features. This crate selects no VMM and no host
 # backend: the host-OS glue it needs (the kqueue/epoll readiness multiplexer,

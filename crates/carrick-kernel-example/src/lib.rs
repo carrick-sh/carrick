@@ -37,6 +37,7 @@
 //! Dev-only `test-support` instrumentation (such as test-isolated directory entry
 //! visit counters) does not ship in production builds.
 
+pub mod contracts;
 pub mod driver;
 pub mod memory;
 pub mod operand;
@@ -45,6 +46,7 @@ pub mod report;
 pub mod scripted;
 pub mod sys;
 
+pub use contracts::{futex_contention_contract, futex_contention_scenario};
 pub use driver::{block_on_timeout, seed_initial_task_state};
 pub use memory::{GUEST_BASE, GUEST_LEN, TaskMemory};
 pub use operand::{

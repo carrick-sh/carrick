@@ -6,6 +6,7 @@ mod observation;
 mod registry;
 
 pub use evaluate::{ContractFailure, ContractPass, evaluate};
+pub type EvaluationError = ContractFailure;
 pub use model::{
     Budget, ConformanceContract, ContractId, ExecutionLayer, LayerBindings, ModelError,
     RuntimeRatioPolicy, StructuralBudget, SurfaceAssignment, SurfaceRegistry, TimingStatistic,
