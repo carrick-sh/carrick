@@ -203,6 +203,12 @@ pub trait EventMultiplexer: Send {
         mode: TriggerMode,
     ) -> Result<(), OsError>;
     fn register_vnode(&mut self, fd: RawFd, token: u64, mask: VnodeEvents) -> Result<(), OsError>;
+    fn register_vnodes(&mut self, vnodes: &[(RawFd, u64, VnodeEvents)]) -> Result<(), OsError> {
+        for &(fd, token, mask) in vnodes {
+            self.register_vnode(fd, token, mask)?;
+        }
+        Ok(())
+    }
     fn register_user(&mut self, ident: u64) -> Result<(), OsError>;
     fn trigger_user(&self, ident: u64) -> Result<(), OsError>;
     fn register_timer(
@@ -212,6 +218,12 @@ pub trait EventMultiplexer: Send {
         oneshot: bool,
     ) -> Result<(), OsError>;
     fn deregister(&mut self, fd: RawFd) -> Result<(), OsError>;
+    fn deregister_vnodes(&mut self, fds: &[RawFd]) -> Result<(), OsError> {
+        for &fd in fds {
+            self.deregister(fd)?;
+        }
+        Ok(())
+    }
     fn wait(
         &mut self,
         out: &mut Vec<PollEvent>,

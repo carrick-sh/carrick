@@ -55,3 +55,27 @@ contracts = ["kernel.fork.filetable"]
 [[surfaces]]
 path = "crates/carrick-kernel-example/tests/semantics/fork_scaling.rs"
 contracts = ["kernel.fork.filetable"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/event.rs"
+contracts = ["kernel.inotify.watch"]
+
+[[surfaces]]
+path = "crates/carrick-host-bsd/src/multiplexer.rs"
+contracts = ["kernel.inotify.watch"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/inotify.rs"
+contracts = ["kernel.inotify.watch"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fs/notify.rs"
+contracts = ["kernel.inotify.watch"]
+
+[[surfaces]]
+path = "conformance-probes/src/bin/inotifymatrix.rs"
+contracts = ["kernel.inotify.watch"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/semantics/inotify_watch.rs"
+contracts = ["kernel.inotify.watch"]

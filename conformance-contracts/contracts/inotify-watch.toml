@@ -1,0 +1,35 @@
+schema_version = 1
+id = "kernel.inotify.watch"
+title = "Inotify watch scaling"
+guest_surfaces = [
+  "syscall:inotify_init1",
+  "syscall:inotify_add_watch",
+  "syscall:inotify_rm_watch",
+  "kernel:inotify",
+]
+semantic_authority = [
+  "man 2 inotify_init1",
+  "man 2 inotify_add_watch",
+  "man 2 inotify_rm_watch",
+  "conformance-probes/probe-inventory.json:inotifymatrix",
+]
+fixture = "probe:inotifymatrix"
+scale_points = [1, 8, 32, 128]
+rationale = "Inotify directory watch registration and removal must batch backend filter updates into a bounded number of host operations rather than issuing per-entry host calls."
+
+[bindings]
+vm_free = "carrick-kernel-example::inotify_watch_contract"
+embed = "carrick-embed::inotify_watch_contract"
+docker = "probe:inotifymatrix"
+ecosystem = ["ltp:inotify09", "ltp:inotify11"]
+
+[[structural_budgets]]
+kind = "exact"
+metric = "host_backend_calls"
+value = 2
+rationale = "Directory watch registration and removal issue exactly one batched host call each (1 register_vnodes and 1 deregister_vnodes), regardless of directory entry count."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20

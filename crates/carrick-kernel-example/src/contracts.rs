@@ -1,9 +1,14 @@
 //! Conformance contract bindings and scenarios for `carrick-kernel-example`.
 
+use carrick_abi::{
+    LINUX_AT_FDCWD, LINUX_IN_CREATE, LINUX_IN_DELETE, LINUX_IN_MODIFY, LINUX_O_CREAT,
+    LINUX_O_NONBLOCK, LINUX_O_WRONLY,
+};
 use carrick_conformance_contract::{
     Completeness, ContractId, ContractObservation, ExecutionLayer, SemanticAssertion,
 };
 use carrick_observability::work_meter::WorkMetric;
+use carrick_vfs::fs_backend::HostFsBackend;
 
 use crate::operand::{Step, alloc_word, await_parked, last_child, slot};
 use crate::scripted::{ExampleError, ScriptedBackend};
@@ -352,4 +357,85 @@ pub fn fork_filetable_scenario(descriptors: usize) -> Result<ContractObservation
 /// Conformance contract binding for `kernel.fork.filetable` at execution layer `VmFree`.
 pub fn fork_filetable_contract(scale: usize) -> Result<ContractObservation, ExampleError> {
     fork_filetable_scenario(scale)
+}
+
+/// Run an inotify directory watch scenario with the specified number of directory entries.
+///
+/// Uses `HostFsBackend` to exercise real vnode watch registration and deregistration.
+pub fn inotify_watch_scenario(entries: usize) -> Result<ContractObservation, ExampleError> {
+    let scratch = tempfile::TempDir::new()
+        .map_err(|e| ExampleError::Script(format!("failed to create tempdir: {e}")))?;
+    let host_backend = HostFsBackend::new_in(scratch.path())
+        .map_err(|e| ExampleError::Script(format!("failed to create host fs backend: {e}")))?;
+
+    let mask = (LINUX_IN_CREATE | LINUX_IN_DELETE | LINUX_IN_MODIFY) as u32;
+
+    let mut script = vec![Step::Sys(
+        sys::mkdirat(LINUX_AT_FDCWD, "/watched", 0o755).ret(0),
+    )];
+    for i in 0..entries {
+        script.push(Step::Sys(
+            sys::openat(
+                LINUX_AT_FDCWD,
+                format!("/watched/file_{i}.txt"),
+                (LINUX_O_CREAT | LINUX_O_WRONLY) as i32,
+                0o644,
+            )
+            .save(0),
+        ));
+        script.push(Step::Sys(sys::close(slot(0)).ret(0)));
+    }
+    script.extend(vec![
+        Step::Sys(sys::inotify_init1(LINUX_O_NONBLOCK as i32).save(0)),
+        Step::Sys(sys::inotify_add_watch(slot(0), "/watched", mask).save(1)),
+        Step::Sys(sys::inotify_rm_watch(slot(0), slot(1)).ret(0)),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ]);
+
+    let report = ScriptedBackend::new()
+        .with_fs_backend(Box::new(host_backend))
+        .run_root(script)?;
+
+    let mut snapshot = report.work_snapshot().clone();
+
+    #[cfg(any(test, debug_assertions))]
+    if std::env::var("CARRICK_CONTRACT_FAULT").as_deref() == Ok("unbatched-inotify")
+        && let Some(calls) = snapshot.values.get_mut(&WorkMetric::HostBackendCalls)
+    {
+        *calls += (entries as u64) * 2;
+    }
+
+    let mut semantic_assertions = Vec::new();
+
+    if report.exit_code() == 0 {
+        semantic_assertions.push(SemanticAssertion::pass("clean_task_retirement"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "clean_task_retirement",
+            format!("exit code was {}", report.exit_code()),
+        ));
+    }
+
+    semantic_assertions.push(SemanticAssertion::pass("watch_removed_cleanly"));
+
+    let contract_id = ContractId::new("kernel.inotify.watch")
+        .map_err(|e| ExampleError::Unsupported(format!("invalid contract id: {e}")))?;
+
+    Ok(ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::VmFree,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "probe:inotifymatrix".to_string(),
+        scale: entries as u64,
+        semantic_assertions,
+        work: Some(snapshot),
+        timing: None,
+        completeness: Completeness::Complete,
+    })
+}
+
+/// Conformance contract binding for `kernel.inotify.watch` at execution layer `VmFree`.
+pub fn inotify_watch_contract(scale: usize) -> Result<ContractObservation, ExampleError> {
+    inotify_watch_scenario(scale)
 }

@@ -90,9 +90,10 @@ pub use builder::{Container, ContainerBuilder, StdioConfig};
 pub use carrier::Carrier;
 pub use contracts::{
     fork_filetable_contract, futex_contention_contract, futex_requeue_contract,
-    run_fork_filetable_structural_contract, run_fork_filetable_timing_contract,
-    run_futex_requeue_structural_contract, run_futex_requeue_timing_contract,
-    run_futex_structural_contract, run_futex_timing_contract,
+    inotify_watch_contract, run_fork_filetable_structural_contract,
+    run_fork_filetable_timing_contract, run_futex_requeue_structural_contract,
+    run_futex_requeue_timing_contract, run_futex_structural_contract, run_futex_timing_contract,
+    run_inotify_watch_structural_contract, run_inotify_watch_timing_contract,
 };
 pub use error::{BuildError, EmbedError};
 pub use prepared::PreparedContainer;

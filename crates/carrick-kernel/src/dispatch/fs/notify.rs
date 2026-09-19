@@ -237,6 +237,9 @@ impl<'a> FsView<'a> {
             let Some(state) = crate::inotify::InotifyState::new() else {
                 return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EMFILE));
             };
+            if let Some(scope) = cx.kernel.kernel().work_scope() {
+                state.set_work_scope(scope);
+            }
             let description = OpenDescription::Inotify {
                 base: OpenDescriptionBase::new(flags & LINUX_O_NONBLOCK),
                 state: Arc::new(state),
@@ -255,6 +258,11 @@ impl<'a> FsView<'a> {
             let Some(state) = this.inotify_state(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
+            if state.work_scope().is_none()
+                && let Some(scope) = cx.kernel.kernel().work_scope()
+            {
+                state.set_work_scope(scope);
+            }
             let path = read_guest_c_string(&*cx.memory, pathname.0)?;
             if path.is_empty() {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
@@ -334,6 +342,11 @@ impl<'a> FsView<'a> {
             let Some(state) = this.inotify_state(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
+            if state.work_scope().is_none()
+                && let Some(scope) = cx.kernel.kernel().work_scope()
+            {
+                state.set_work_scope(scope);
+            }
             let wd = wd as i32;
             // rm_watch removes the per-instance watch (virtual watches live in
             // the same `watches` table with no host fds, so it finds them too).

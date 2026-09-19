@@ -33,3 +33,6 @@ mod futex_contention;
 mod identity;
 #[path = "semantics/signal.rs"]
 mod signal;
+
+#[path = "semantics/inotify_watch.rs"]
+mod inotify_watch;

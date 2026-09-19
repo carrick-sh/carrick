@@ -868,6 +868,9 @@
   },
   "inotifymatrix": {
     "class": "conformance",
+    "contract_ids": [
+      "kernel.inotify.watch"
+    ],
     "excluded": false,
     "runner": "generic"
   },

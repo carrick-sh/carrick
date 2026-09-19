@@ -12099,7 +12099,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/inotify.rs",
-      "line": 744,
+      "line": 850,
       "categories": [
         "epoll"
       ],
@@ -12108,7 +12108,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/inotify.rs",
-      "line": 834,
+      "line": 948,
       "categories": [
         "epoll"
       ],
@@ -12117,7 +12117,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/inotify.rs",
-      "line": 1457,
+      "line": 1571,
       "categories": [
         "epoll"
       ],

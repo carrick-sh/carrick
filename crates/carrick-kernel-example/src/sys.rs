@@ -1558,3 +1558,44 @@ pub fn mkfifo(path: impl Into<Operand>, mode: u32) -> Syscall {
         0,
     )
 }
+
+/// `inotify_init1(2)`: initialize an inotify instance.
+pub fn inotify_init1(flags: i32) -> Syscall {
+    call(
+        "inotify_init1",
+        nr::INOTIFY_INIT1,
+        [
+            (flags as i64).into(),
+            0.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `inotify_add_watch(2)`: add a watch to an inotify instance.
+pub fn inotify_add_watch(fd: impl Into<Operand>, path: impl Into<Operand>, mask: u32) -> Syscall {
+    call(
+        "inotify_add_watch",
+        nr::INOTIFY_ADD_WATCH,
+        [
+            fd.into(),
+            path.into(),
+            (mask as i64).into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `inotify_rm_watch(2)`: remove an existing watch from an inotify instance.
+pub fn inotify_rm_watch(fd: impl Into<Operand>, wd: impl Into<Operand>) -> Syscall {
+    call(
+        "inotify_rm_watch",
+        nr::INOTIFY_RM_WATCH,
+        [fd.into(), wd.into(), 0.into(), 0.into(), 0.into(), 0.into()],
+    )
+}
