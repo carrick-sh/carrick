@@ -387,6 +387,7 @@ dependencies = [
 name = "carrick-conformance-contract"
 version = "0.1.0"
 dependencies = [
+ "carrick-observability",
  "serde",
  "tempfile",
  "thiserror",
