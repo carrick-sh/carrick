@@ -137,7 +137,6 @@ impl HostWaitToken<'_> {
                     });
                 self.queue.changed.notify_all();
                 drop(state);
-                self.queue.cpus[self.cpu.as_usize()].set_current_task(Some(self.binding.thread));
                 return;
             }
             let owner = slot.owner.as_ref().map(|owner| owner.id);
@@ -282,11 +281,6 @@ impl Scheduler {
         self.queue.inner.changed.notify_all();
         drop(state);
         let guest_cpu = &self.queue.inner.cpus[cpu.as_usize()];
-        let mut current = guest_cpu.current_task.lock();
-        if *current == Some(binding.thread) {
-            *current = None;
-        }
-        drop(current);
         guest_cpu.nudge();
         Ok(HostWaitToken {
             queue: Arc::clone(&self.queue.inner),

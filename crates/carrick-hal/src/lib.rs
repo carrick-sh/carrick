@@ -114,7 +114,7 @@ pub use x8664_arch::{
 pub mod scheduler;
 pub use scheduler::{
     CpuAffinity, CpuLoad, CpuQueueView, GuestCpuId, GuestCpuPolicy, MAX_GUEST_CPUS,
-    PreemptOrContinue, SchedulingPolicy, TaskKey, TaskPlacement,
+    PreemptOrContinue, SchedProcessId, SchedThreadId, SchedulingPolicy, TaskPlacement,
 };
 pub mod vcpu_census;
 pub use vcpu_census::{VcpuCensus, VcpuLiveGuard};

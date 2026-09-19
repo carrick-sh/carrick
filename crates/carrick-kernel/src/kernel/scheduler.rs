@@ -13,7 +13,7 @@ use parking_lot::{Condvar, Mutex};
 
 pub use carrick_hal::{
     CpuAffinity, CpuLoad, CpuQueueView, GuestCpuId, GuestCpuPolicy, PreemptOrContinue,
-    SchedulingPolicy, TaskKey, TaskPlacement, TrapError,
+    SchedProcessId, SchedThreadId, SchedulingPolicy, TaskPlacement, TrapError,
 };
 
 use super::Kernel;
@@ -710,7 +710,6 @@ pub struct GuestCpu {
     ///
     /// Incremented `SeqCst` before the final steal scan; see `wake_ticket`.
     idle: AtomicUsize,
-    current_task: Mutex<Option<ThreadKey>>,
 }
 
 impl GuestCpu {
@@ -721,7 +720,6 @@ impl GuestCpu {
             idle_condvar: Condvar::new(),
             depth: AtomicUsize::new(0),
             idle: AtomicUsize::new(0),
-            current_task: Mutex::new(None),
         }
     }
 
@@ -738,21 +736,6 @@ impl GuestCpu {
     /// the availability half of the placement signal.
     pub fn idle_executors(&self) -> usize {
         self.idle.load(Ordering::SeqCst)
-    }
-
-    pub fn current_task(&self) -> Option<ThreadKey> {
-        *self.current_task.lock()
-    }
-
-    pub(crate) fn set_current_task(&self, task: Option<ThreadKey>) {
-        *self.current_task.lock() = task;
-    }
-
-    fn clear_current_task(&self, expected: ThreadKey) {
-        let mut current = self.current_task.lock();
-        if *current == Some(expected) {
-            *current = None;
-        }
     }
 
     /// Signal this CPU so a parked (or about-to-park) executor re-runs its
@@ -1240,7 +1223,8 @@ impl RunQueueInner {
             _ => declared,
         };
         let placement = TaskPlacement {
-            task: TaskKey::new(thread.task_key().serial.raw()),
+            thread: SchedThreadId::new(thread.key().serial.raw()),
+            process: SchedProcessId::new(thread.task_key().serial.raw()),
             last_cpu: thread.last_cpu(),
             affinity,
             cpus: &loads[..ncpu],
@@ -1294,7 +1278,7 @@ impl RunQueueInner {
         let index = target.as_usize().min(self.cpus.len().saturating_sub(1));
         let cpu = &self.cpus[index];
         let key = row.key;
-        let task = TaskKey::new(row.thread.task_key().serial.raw());
+        let task = SchedThreadId::new(row.thread.key().serial.raw());
 
         let waiter_present = {
             let mut local = cpu.state.lock();
@@ -1356,7 +1340,7 @@ impl RunQueueInner {
             0
         };
         let cpu = &self.cpus[index];
-        let task = TaskKey::new(row.thread.task_key().serial.raw());
+        let task = SchedThreadId::new(row.thread.key().serial.raw());
 
         let waiter_present = {
             let mut local = cpu.state.lock();
@@ -1428,32 +1412,61 @@ impl RunQueueInner {
     }
 
     /// Pop `cpu`'s FIFO head (or the policy's choice), accounting the claim.
+    /// Pop `cpu`'s FIFO head (or the policy's choice), accounting the claim.
     fn pop_local(&self, cpu: &GuestCpu) -> Option<QueueRow> {
+        if !self.policy.inspects_queues() {
+            let mut local = cpu.state.lock();
+            let row = local.rows.pop_front()?;
+            self.finish_removal(&mut local, cpu, row.key);
+            return Some(row);
+        }
+
+        // Custom pick: snapshot under lock, invoke policy callback outside lock,
+        // then reacquire lock and revalidate the chosen row.
+        let (queued, snapshot_entries): (Vec<SchedThreadId>, Vec<(SchedThreadId, QueueKey)>) = {
+            let local = cpu.state.lock();
+            if local.rows.is_empty() {
+                return None;
+            }
+            local
+                .rows
+                .iter()
+                .map(|row| {
+                    let id = SchedThreadId::new(row.thread.key().serial.raw());
+                    (id, (id, row.key))
+                })
+                .unzip()
+        };
+
+        let chosen = self.policy.pick_next(&CpuQueueView {
+            cpu: cpu.id,
+            queued: &queued,
+        });
+
         let mut local = cpu.state.lock();
         if local.rows.is_empty() {
             return None;
         }
-        let position = self.policy_pick(cpu.id, &local).unwrap_or(0);
-        let row = local.rows.remove(position)?;
+
+        let position = if let Some(chosen_id) = chosen {
+            let expected_key = snapshot_entries
+                .iter()
+                .find(|(id, _)| *id == chosen_id)
+                .map(|(_, key)| *key);
+            if let Some(expected_key) = expected_key {
+                local.rows.iter().position(|row| row.key == expected_key)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // If stale or unpicked, take current FIFO head (index 0).
+        let pos = position.unwrap_or(0);
+        let row = local.rows.remove(pos)?;
         self.finish_removal(&mut local, cpu, row.key);
         Some(row)
-    }
-
-    /// Consult `pick_next` only for a policy that asked to see the queues.
-    fn policy_pick(&self, cpu: GuestCpuId, local: &GuestCpuLocalState) -> Option<usize> {
-        if !self.policy.inspects_queues() {
-            return None;
-        }
-        let queued: Vec<TaskKey> = local
-            .rows
-            .iter()
-            .map(|row| TaskKey::new(row.thread.task_key().serial.raw()))
-            .collect();
-        let chosen = self.policy.pick_next(&CpuQueueView {
-            cpu,
-            queued: &queued,
-        })?;
-        queued.iter().position(|task| *task == chosen)
     }
 
     /// Common bookkeeping for taking a row out of a CPU queue: the claim is
@@ -1503,39 +1516,60 @@ impl RunQueueInner {
     }
 
     fn policy_steal(&self, stealer: GuestCpuId) -> Option<QueueRow> {
-        let snapshots: Vec<(GuestCpuId, Vec<TaskKey>)> = self
+        struct CpuStealSnapshot {
+            cpu: GuestCpuId,
+            queued: Vec<SchedThreadId>,
+            entries: Vec<(SchedThreadId, QueueKey)>,
+        }
+
+        let snapshots: Vec<CpuStealSnapshot> = self
             .cpus
             .iter()
             .filter(|cpu| cpu.id != stealer)
             .map(|cpu| {
                 let local = cpu.state.lock();
-                (
-                    cpu.id,
-                    local
-                        .rows
-                        .iter()
-                        .map(|row| TaskKey::new(row.thread.task_key().serial.raw()))
-                        .collect(),
-                )
+                let (queued, entries) = local
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        let id = SchedThreadId::new(row.thread.key().serial.raw());
+                        (id, (id, row.key))
+                    })
+                    .unzip();
+                CpuStealSnapshot {
+                    cpu: cpu.id,
+                    queued,
+                    entries,
+                }
             })
             .collect();
+
         let views: Vec<CpuQueueView<'_>> = snapshots
             .iter()
-            .map(|(cpu, queued)| CpuQueueView {
-                cpu: *cpu,
-                queued: queued.as_slice(),
+            .map(|s| CpuQueueView {
+                cpu: s.cpu,
+                queued: s.queued.as_slice(),
             })
             .collect();
+
         let (victim_id, task) = self.policy.steal(stealer, &views)?;
         if victim_id == stealer {
             return None;
         }
+
+        let snapshot = snapshots.iter().find(|s| s.cpu == victim_id)?;
+        let expected_key = snapshot
+            .entries
+            .iter()
+            .find(|(id, _)| *id == task)
+            .map(|(_, key)| *key)?;
+
         let victim = self.cpus.get(victim_id.as_usize())?;
         let mut local = victim.state.lock();
-        let position = local.rows.iter().position(|row| {
-            row.thread.task_key().serial.raw() == task.as_u64()
-                && row.thread.affinity().is_allowed(stealer)
-        })?;
+        let position = local
+            .rows
+            .iter()
+            .position(|row| row.key == expected_key && row.thread.affinity().is_allowed(stealer))?;
         let row = local.rows.remove(position)?;
         self.finish_removal(&mut local, victim, row.key);
         Some(row)
@@ -3589,9 +3623,6 @@ impl Scheduler {
         }
         let bound_cpu = executor.bound_cpu().unwrap_or(GuestCpuId::new(0));
         row.thread.set_last_cpu(bound_cpu);
-        if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
-            guest_cpu.set_current_task(Some(row.thread.key()));
-        }
         self.need_resched
             .store(self.queue.len() != 0, Ordering::Release);
         Ok(RunnableThread {
@@ -3673,10 +3704,7 @@ impl Scheduler {
             .inner
             .release_handoff(running.binding.executor, false);
         let bound_cpu = running.guest_cpu();
-        if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
-            guest_cpu.clear_current_task(running.thread_key());
-        }
-        let task_key = TaskKey::new(running.thread.task_key().serial.raw());
+        let task_key = SchedThreadId::new(running.thread.key().serial.raw());
         self.queue.inner.policy.on_block(task_key, bound_cpu);
         drop(_transition);
         if observed == GenerationTransitionOutcome::Recorded {
@@ -3743,10 +3771,7 @@ impl Scheduler {
             .inner
             .release_handoff(running.binding.executor, false);
         let bound_cpu = running.guest_cpu();
-        if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
-            guest_cpu.clear_current_task(running.thread_key());
-        }
-        let task_key = TaskKey::new(running.thread.task_key().serial.raw());
+        let task_key = SchedThreadId::new(running.thread.key().serial.raw());
         self.queue.inner.policy.on_block(task_key, bound_cpu);
         drop(_transition);
         #[cfg(test)]
@@ -3919,10 +3944,7 @@ impl Scheduler {
                 self.queue
                     .inner
                     .release_handoff(running.binding.executor, false);
-                let bound_cpu = running.guest_cpu();
-                if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
-                    guest_cpu.clear_current_task(running.thread_key());
-                }
+                let _bound_cpu = running.guest_cpu();
                 drop(_transition);
                 running.finish_claim();
                 Ok(())
@@ -3980,10 +4002,7 @@ impl Scheduler {
         self.queue
             .inner
             .release_handoff(running.binding.executor, false);
-        let bound_cpu = running.guest_cpu();
-        if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
-            guest_cpu.clear_current_task(running.thread_key());
-        }
+        let _bound_cpu = running.guest_cpu();
         drop(_transition);
         self.snapshot_count.fetch_add(1, Ordering::Relaxed);
         let target_cpu = running.thread.last_cpu();
@@ -4034,10 +4053,7 @@ impl Scheduler {
             .inner
             .release_handoff(running.binding.executor, false);
         let bound_cpu = running.guest_cpu();
-        if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
-            guest_cpu.clear_current_task(running.thread_key());
-        }
-        let task_key = TaskKey::new(running.thread.task_key().serial.raw());
+        let task_key = SchedThreadId::new(running.thread.key().serial.raw());
         self.queue.inner.policy.on_exit(task_key, bound_cpu);
         crate::event_ring::rec_hvpatch_settle_step(settle_tid, settle_generation, 3);
         drop(_transition);
@@ -4085,10 +4101,7 @@ impl Scheduler {
             .inner
             .release_handoff(running.binding.executor, false);
         let bound_cpu = running.guest_cpu();
-        if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
-            guest_cpu.clear_current_task(running.thread_key());
-        }
-        let task_key = TaskKey::new(running.thread.task_key().serial.raw());
+        let task_key = SchedThreadId::new(running.thread.key().serial.raw());
         self.queue.inner.policy.on_exit(task_key, bound_cpu);
         crate::event_ring::rec_hvpatch_settle_step(settle_tid, settle_generation, 3);
         drop(_transition);
@@ -6461,18 +6474,12 @@ mod tests {
         let placed = occupied_cpus(&scheduler)[0];
         let running = scheduler.take(&executors[placed.as_usize()]).unwrap();
         assert_eq!(root.thread().last_cpu(), Some(placed));
-        assert_eq!(
-            scheduler.guest_cpus()[placed.as_usize()].current_task(),
-            Some(key),
-        );
+        assert!(scheduler.binding_for_thread(key).is_some());
         scheduler
             .settle_blocked(running, BlockedReason::HostWait)
             .unwrap();
         assert_eq!(scheduler.queued_len(), 0);
-        assert_eq!(
-            scheduler.guest_cpus()[placed.as_usize()].current_task(),
-            None,
-        );
+        assert_eq!(scheduler.binding_for_thread(key), None);
 
         scheduler.wake(key).unwrap();
         assert_eq!(

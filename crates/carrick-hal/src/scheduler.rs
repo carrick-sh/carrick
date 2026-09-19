@@ -45,13 +45,13 @@ impl fmt::Display for GuestCpuId {
     }
 }
 
-/// Policy-facing task identity. This is the kernel task/thread serial, which
+/// Policy-facing thread identity. This is the kernel thread serial, which
 /// is never reused, so a policy may key its own state on it without ever
 /// naming a generation or a host thread.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TaskKey(u64);
+pub struct SchedThreadId(u64);
 
-impl TaskKey {
+impl SchedThreadId {
     pub const fn new(id: u64) -> Self {
         Self(id)
     }
@@ -61,9 +61,30 @@ impl TaskKey {
     }
 }
 
-impl fmt::Display for TaskKey {
+impl fmt::Display for SchedThreadId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "task#{}", self.0)
+        write!(f, "sched-thread#{}", self.0)
+    }
+}
+
+/// Policy-facing process identity. This is the kernel process/task serial,
+/// which groups sibling threads belonging to the same process.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SchedProcessId(u64);
+
+impl SchedProcessId {
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for SchedProcessId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "sched-proc#{}", self.0)
     }
 }
 
@@ -232,7 +253,8 @@ impl CpuLoad {
 /// Everything a policy is told about a task that is becoming runnable.
 #[derive(Clone, Copy, Debug)]
 pub struct TaskPlacement<'a> {
-    pub task: TaskKey,
+    pub thread: SchedThreadId,
+    pub process: SchedProcessId,
     /// The CPU this task last ran on, if it has run.
     pub last_cpu: Option<GuestCpuId>,
     pub affinity: CpuAffinity,
@@ -259,7 +281,7 @@ pub enum PreemptOrContinue {
 pub struct CpuQueueView<'a> {
     pub cpu: GuestCpuId,
     /// Tasks queued on `cpu`, in FIFO order.
-    pub queued: &'a [TaskKey],
+    pub queued: &'a [SchedThreadId],
 }
 
 /// Pluggable scheduling policy: "which guest CPU, which task next".
@@ -286,7 +308,7 @@ pub trait SchedulingPolicy: Send + Sync + fmt::Debug {
 
     /// Choose which queued task `cpu` runs next. `None` = the mechanism's FIFO
     /// head. A returned task that is not in `view.queued` is ignored.
-    fn pick_next(&self, _view: &CpuQueueView<'_>) -> Option<TaskKey> {
+    fn pick_next(&self, _view: &CpuQueueView<'_>) -> Option<SchedThreadId> {
         None
     }
 
@@ -296,7 +318,7 @@ pub trait SchedulingPolicy: Send + Sync + fmt::Debug {
         &self,
         _cpu: GuestCpuId,
         _victims: &[CpuQueueView<'_>],
-    ) -> Option<(GuestCpuId, TaskKey)> {
+    ) -> Option<(GuestCpuId, SchedThreadId)> {
         None
     }
 
@@ -305,11 +327,11 @@ pub trait SchedulingPolicy: Send + Sync + fmt::Debug {
         PreemptOrContinue::Continue
     }
 
-    fn on_runnable(&self, _task: TaskKey, _cpu: GuestCpuId) {}
+    fn on_runnable(&self, _task: SchedThreadId, _cpu: GuestCpuId) {}
 
-    fn on_block(&self, _task: TaskKey, _cpu: GuestCpuId) {}
+    fn on_block(&self, _task: SchedThreadId, _cpu: GuestCpuId) {}
 
-    fn on_exit(&self, _task: TaskKey, _cpu: GuestCpuId) {}
+    fn on_exit(&self, _task: SchedThreadId, _cpu: GuestCpuId) {}
 }
 
 /// The default policy: per-CPU queues, a `last_cpu` wake that is taken only
@@ -422,7 +444,8 @@ mod tests {
         affinity: CpuAffinity,
     ) -> TaskPlacement<'a> {
         TaskPlacement {
-            task: TaskKey::new(7),
+            thread: SchedThreadId::new(7),
+            process: SchedProcessId::new(1),
             last_cpu: last.map(GuestCpuId::new),
             affinity,
             cpus,

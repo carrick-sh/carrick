@@ -808,8 +808,10 @@ fn host_wait_dropped_token_unwinding_with_active_replacement() {
     assert!(!original.in_host_wait());
     assert_eq!(original.bound_cpu(), Some(GuestCpuId::new(0)));
     assert_eq!(
-        scheduler.guest_cpus()[0].current_task(),
-        Some(running.thread_key())
+        scheduler
+            .binding_for_thread(running.thread_key())
+            .map(|b| b.executor()),
+        Some(original.id()),
     );
     worker.join().unwrap();
     scheduler.settle_exited(running).unwrap();

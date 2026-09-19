@@ -929,7 +929,10 @@ impl carrick_hal::SchedulingPolicy for AdversarialPolicy {
         true
     }
 
-    fn pick_next(&self, view: &carrick_hal::CpuQueueView<'_>) -> Option<carrick_hal::TaskKey> {
+    fn pick_next(
+        &self,
+        view: &carrick_hal::CpuQueueView<'_>,
+    ) -> Option<carrick_hal::SchedThreadId> {
         // Not the FIFO head: run the queue in a shuffled order so a settlement
         // is as likely to race a late row as an early one.
         if view.queued.is_empty() {
@@ -942,7 +945,7 @@ impl carrick_hal::SchedulingPolicy for AdversarialPolicy {
         &self,
         cpu: carrick_hal::GuestCpuId,
         victims: &[carrick_hal::CpuQueueView<'_>],
-    ) -> Option<(carrick_hal::GuestCpuId, carrick_hal::TaskKey)> {
+    ) -> Option<(carrick_hal::GuestCpuId, carrick_hal::SchedThreadId)> {
         // Steal at every opportunity, from a random victim and a random
         // position, rather than the mechanism's longest-queue-tail scan.
         let stealable: Vec<&carrick_hal::CpuQueueView<'_>> = victims
@@ -967,16 +970,17 @@ impl carrick_hal::SchedulingPolicy for AdversarialPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulingDecision {
     SelectCpu {
-        task: carrick_hal::TaskKey,
+        thread: carrick_hal::SchedThreadId,
+        process: carrick_hal::SchedProcessId,
         cpu: carrick_hal::GuestCpuId,
     },
     PickNext {
         cpu: carrick_hal::GuestCpuId,
-        task: Option<carrick_hal::TaskKey>,
+        thread: Option<carrick_hal::SchedThreadId>,
     },
     Steal {
         cpu: carrick_hal::GuestCpuId,
-        stolen: Option<(carrick_hal::GuestCpuId, carrick_hal::TaskKey)>,
+        stolen: Option<(carrick_hal::GuestCpuId, carrick_hal::SchedThreadId)>,
     },
 }
 
@@ -1071,15 +1075,21 @@ impl carrick_hal::SchedulingPolicy for RecordReplay {
     }
 
     fn select_cpu(&self, placement: &carrick_hal::TaskPlacement<'_>) -> carrick_hal::GuestCpuId {
-        if let Some(SchedulingDecision::SelectCpu { task, cpu }) = self.next_recorded() {
-            if task == placement.task && placement.affinity.is_allowed(cpu) {
+        if let Some(SchedulingDecision::SelectCpu {
+            thread,
+            process: _,
+            cpu,
+        }) = self.next_recorded()
+        {
+            if thread == placement.thread && placement.affinity.is_allowed(cpu) {
                 return cpu;
             }
             self.diverged();
         }
         let cpu = self.inner.select_cpu(placement);
         self.record(SchedulingDecision::SelectCpu {
-            task: placement.task,
+            thread: placement.thread,
+            process: placement.process,
             cpu,
         });
         cpu
@@ -1089,38 +1099,41 @@ impl carrick_hal::SchedulingPolicy for RecordReplay {
         self.inner.inspects_queues()
     }
 
-    fn pick_next(&self, view: &carrick_hal::CpuQueueView<'_>) -> Option<carrick_hal::TaskKey> {
-        if let Some(SchedulingDecision::PickNext { cpu, task }) = self.next_recorded() {
-            match task {
-                Some(task) if cpu == view.cpu && view.queued.contains(&task) => {
-                    return Some(task);
+    fn pick_next(
+        &self,
+        view: &carrick_hal::CpuQueueView<'_>,
+    ) -> Option<carrick_hal::SchedThreadId> {
+        if let Some(SchedulingDecision::PickNext { cpu, thread }) = self.next_recorded() {
+            match thread {
+                Some(thread) if cpu == view.cpu && view.queued.contains(&thread) => {
+                    return Some(thread);
                 }
                 None if cpu == view.cpu && view.queued.is_empty() => return None,
                 _ => self.diverged(),
             }
         }
-        let task = self.inner.pick_next(view);
+        let thread = self.inner.pick_next(view);
         self.record(SchedulingDecision::PickNext {
             cpu: view.cpu,
-            task,
+            thread,
         });
-        task
+        thread
     }
 
     fn steal(
         &self,
         cpu: carrick_hal::GuestCpuId,
         victims: &[carrick_hal::CpuQueueView<'_>],
-    ) -> Option<(carrick_hal::GuestCpuId, carrick_hal::TaskKey)> {
+    ) -> Option<(carrick_hal::GuestCpuId, carrick_hal::SchedThreadId)> {
         if let Some(SchedulingDecision::Steal {
             cpu: recorded_cpu,
             stolen,
         }) = self.next_recorded()
         {
             let still_applies = match stolen {
-                Some((victim, task)) => victims
+                Some((victim, thread)) => victims
                     .iter()
-                    .any(|view| view.cpu == victim && view.queued.contains(&task)),
+                    .any(|view| view.cpu == victim && view.queued.contains(&thread)),
                 None => true,
             };
             if recorded_cpu == cpu && still_applies {
@@ -1137,15 +1150,15 @@ impl carrick_hal::SchedulingPolicy for RecordReplay {
         self.inner.on_tick(cpu)
     }
 
-    fn on_runnable(&self, task: carrick_hal::TaskKey, cpu: carrick_hal::GuestCpuId) {
+    fn on_runnable(&self, task: carrick_hal::SchedThreadId, cpu: carrick_hal::GuestCpuId) {
         self.inner.on_runnable(task, cpu);
     }
 
-    fn on_block(&self, task: carrick_hal::TaskKey, cpu: carrick_hal::GuestCpuId) {
+    fn on_block(&self, task: carrick_hal::SchedThreadId, cpu: carrick_hal::GuestCpuId) {
         self.inner.on_block(task, cpu);
     }
 
-    fn on_exit(&self, task: carrick_hal::TaskKey, cpu: carrick_hal::GuestCpuId) {
+    fn on_exit(&self, task: carrick_hal::SchedThreadId, cpu: carrick_hal::GuestCpuId) {
         self.inner.on_exit(task, cpu);
     }
 }
@@ -1155,13 +1168,14 @@ mod scheduling_policy_tests {
     use super::{AdversarialPolicy, RecordReplay, SchedulingDecision};
     use carrick_hal::{
         CpuAffinity, CpuLoad, CpuQueueView, GuestCpuId, GuestCpuPolicy, PreemptOrContinue,
-        SchedulingPolicy, TaskKey, TaskPlacement,
+        SchedProcessId, SchedThreadId, SchedulingPolicy, TaskPlacement,
     };
     use std::sync::Arc;
 
     fn placement<'a>(task: u64, last: Option<u32>, cpus: &'a [CpuLoad]) -> TaskPlacement<'a> {
         TaskPlacement {
-            task: TaskKey::new(task),
+            thread: SchedThreadId::new(task),
+            process: SchedProcessId::new(1),
             last_cpu: last.map(GuestCpuId::new),
             affinity: CpuAffinity::all(cpus.len()),
             cpus,
@@ -1183,7 +1197,8 @@ mod scheduling_policy_tests {
 
         // A one-CPU mask leaves nothing to migrate to, so the pin still wins.
         let pinned = TaskPlacement {
-            task: TaskKey::new(7),
+            thread: SchedThreadId::new(7),
+            process: SchedProcessId::new(1),
             last_cpu: Some(GuestCpuId::new(2)),
             affinity: CpuAffinity::single(GuestCpuId::new(2)),
             cpus: &cpus,
@@ -1196,7 +1211,7 @@ mod scheduling_policy_tests {
     fn the_adversary_only_ever_names_a_task_it_was_offered() {
         let policy = AdversarialPolicy::new(2, 999);
         assert!(policy.inspects_queues(), "or it is never consulted at all");
-        let queued: Vec<TaskKey> = (1..=5).map(TaskKey::new).collect();
+        let queued: Vec<SchedThreadId> = (1..=5).map(SchedThreadId::new).collect();
         let view = CpuQueueView {
             cpu: GuestCpuId::new(0),
             queued: &queued,
@@ -1221,8 +1236,8 @@ mod scheduling_policy_tests {
     #[test]
     fn the_adversary_never_steals_from_itself() {
         let policy = AdversarialPolicy::new(3, 4_242);
-        let mine: Vec<TaskKey> = vec![TaskKey::new(1)];
-        let theirs: Vec<TaskKey> = vec![TaskKey::new(2), TaskKey::new(3)];
+        let mine: Vec<SchedThreadId> = vec![SchedThreadId::new(1)];
+        let theirs: Vec<SchedThreadId> = vec![SchedThreadId::new(2), SchedThreadId::new(3)];
         let views = [
             CpuQueueView {
                 cpu: GuestCpuId::new(0),
@@ -1292,13 +1307,15 @@ mod scheduling_policy_tests {
         let replay = RecordReplay::replaying(
             Arc::new(GuestCpuPolicy::new(4)) as Arc<dyn SchedulingPolicy>,
             vec![SchedulingDecision::SelectCpu {
-                task: TaskKey::new(1),
+                thread: SchedThreadId::new(1),
+                process: SchedProcessId::new(1),
                 cpu: GuestCpuId::new(3),
             }],
         );
         // CPU 3 is not in this task's affinity mask any more.
         let pinned = TaskPlacement {
-            task: TaskKey::new(1),
+            thread: SchedThreadId::new(1),
+            process: SchedProcessId::new(1),
             last_cpu: None,
             affinity: CpuAffinity::single(GuestCpuId::new(0)),
             cpus: &cpus,

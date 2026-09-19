@@ -246,16 +246,15 @@ fn handoff(
         let running = scheduler.take(&spare).unwrap();
         let running_cpu = running.guest_cpu();
         let key = running.thread_key();
-        let current = scheduler.guest_cpus()[1].current_task();
-        let other_current = scheduler.guest_cpus()[0].current_task();
+        let current = scheduler.binding_for_thread(key);
         let census = scheduler.host_wait_census();
         let ticks = scheduler.tick_preemption();
         // Settle before asserting: a fixture failure must not strand the
         // returning original behind a dropped, still-running spare claim.
         scheduler.settle_exited(running).unwrap();
         assert_eq!(running_cpu, cpu);
-        assert_eq!(current, Some(key));
-        assert_eq!(other_current, None);
+        assert_eq!(current.as_ref().map(|b| b.thread()), Some(key));
+        assert_eq!(current.as_ref().map(|b| b.executor()), Some(spare.id()));
         let census = census.unwrap();
         assert_eq!(census.slots.len(), 1);
         let slot = census
