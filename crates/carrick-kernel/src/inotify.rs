@@ -1223,7 +1223,7 @@ impl InotifyRegistry {
         child_unlinked: bool,
     ) {
         let norm = normalize_watch_path(path);
-        let (parent, name) = split_parent_name(&norm);
+        let (parent, name) = split_parent_name(norm);
         if name.is_empty() {
             return;
         }
@@ -1245,7 +1245,7 @@ impl InotifyRegistry {
     /// so the stat is pure waste 158k times over. One `HashMap` lookup.
     pub(crate) fn parent_watch_exists_for(&self, child_path: &str) -> bool {
         let norm = normalize_watch_path(child_path);
-        let (parent, name) = split_parent_name(&norm);
+        let (parent, name) = split_parent_name(norm);
         if name.is_empty() {
             return false;
         }
@@ -1262,8 +1262,8 @@ impl InotifyRegistry {
     pub(crate) fn notify_move(&self, from: &str, to: &str, is_dir: bool) {
         let from_norm = normalize_watch_path(from);
         let to_norm = normalize_watch_path(to);
-        let (from_parent, from_name) = split_parent_name(&from_norm);
-        let (to_parent, to_name) = split_parent_name(&to_norm);
+        let (from_parent, from_name) = split_parent_name(from_norm);
+        let (to_parent, to_name) = split_parent_name(to_norm);
         let by_path = self.by_path.read();
         // FROM and TO can land on different watches; cookie pairing only matters
         // when the *same* instance watches both parents, so cache a cookie per
