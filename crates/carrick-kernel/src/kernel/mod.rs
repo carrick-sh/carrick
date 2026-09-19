@@ -134,6 +134,7 @@ pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,
     TaskReservation, ThreadClaim, ThreadReservation,
 };
+pub use scheduler::HostWaitToken;
 pub use scheduler::SubmissionAuthority;
 pub use scheduler::{
     ExecutorBinding, ExecutorKick, ExecutorKickToken, ExecutorRegistration, RunQueue,

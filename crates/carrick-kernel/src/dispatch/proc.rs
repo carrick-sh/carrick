@@ -5762,15 +5762,21 @@ mod kernel_process_dispatch_tests {
     }
 
     #[test]
-    fn syscall_requires_execution_lease_matches_exact_process_vm_numbers() {
+    fn syscall_requires_execution_lease_matches_selected_canonical_numbers() {
         use crate::dispatch::syscall_requires_execution_lease;
         let empty_args = SyscallArgs::from([0; 6]);
         assert!(syscall_requires_execution_lease(270, empty_args));
         assert!(syscall_requires_execution_lease(271, empty_args));
+        assert!(syscall_requires_execution_lease(64, empty_args)); // scalar write
+        for durability in [81, 82, 83, 84, 267] {
+            assert!(syscall_requires_execution_lease(durability, empty_args));
+        }
 
         for ordinary in [
-            0,   // read
-            1,   // write
+            0,   // io_setup, not x86 read
+            1,   // io_destroy, not x86 write
+            63,  // read
+            66,  // writev (not yet an owned host-wait boundary)
             95,  // waitid
             98,  // futex
             124, // sched_yield

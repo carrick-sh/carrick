@@ -112,6 +112,7 @@ impl SyscallDispatcher {
                 reporter,
                 None,
                 OrdinaryDispatchRoute {
+                    host_wait: None,
                     lease,
                     mm_executor: Some(&mut executor),
                 },
@@ -167,6 +168,7 @@ impl SyscallDispatcher {
             reporter,
             thread,
             OrdinaryDispatchRoute {
+                host_wait: None,
                 lease,
                 mm_executor: None,
             },
@@ -267,6 +269,7 @@ impl SyscallDispatcher {
                         reporter,
                         thread,
                         OrdinaryDispatchRoute {
+                            host_wait: None,
                             lease: None,
                             mm_executor: Some(executor),
                         },
@@ -308,6 +311,7 @@ impl SyscallDispatcher {
                         reporter,
                         thread,
                         OrdinaryDispatchRoute {
+                            host_wait: None,
                             lease: None,
                             mm_executor: None,
                         },
@@ -432,9 +436,13 @@ impl SyscallDispatcher {
         // assertion is delivered (the Linux-lane lost-edge wedge — see
         // `epoll_rearm_after_io`). Outcome matters: an EAGAIN write did not
         // consume writable capacity and must not synthesize another OUT edge.
-        resources::with_captured_resources(kernel, || {
-            self.epoll_rearm_after_io(&request, &outcome);
-        });
+        if let Some(rearm) = resources::take_write_rearm() {
+            rearm.complete(&outcome);
+        } else {
+            resources::with_captured_resources(kernel, || {
+                self.epoll_rearm_after_io(&request, &outcome);
+            });
+        }
         Some(Ok(outcome))
     }
 

@@ -177,14 +177,19 @@ impl SyscallCompletionToken {
     }
 }
 
-/// Uniform context handed to every *normalized* syscall handler, so all
-/// handlers share one signature and the dispatch arm is macro-generated.
-/// Built transiently per dispatched syscall (a scoped borrow of guest memory
-/// and the compat reporter), which lets migrated and legacy handlers coexist
-/// while the macro migration proceeds subsystem by subsystem.
-///
-/// See [[plan-syscall-macro-split]].
+/// Explicit executor authority for external host operations. The running
+/// lease is supplied separately by the dispatch route and authenticated at use.
+#[derive(Clone, Copy)]
+pub struct HostWaitContext<'a> {
+    pub scheduler: &'a crate::kernel::Scheduler,
+    pub registration: &'a crate::kernel::ExecutorRegistration,
+}
+
+/// Uniform context handed to every normalized syscall handler. The optional
+/// host-wait capability is explicit; off-executor callers do not fabricate CPU
+/// ownership from a numeric thread ID.
 pub struct SyscallCtx<'a, M: CurrentMmMemory> {
+    pub host_wait: Option<HostWaitContext<'a>>,
     /// Coherent kernel object generation captured once at syscall entry.
     pub kernel: &'a crate::kernel::KernelContext,
     pub request: SyscallRequest,
@@ -280,13 +285,15 @@ impl<M: CurrentMmMemory> SyscallCtx<'_, M> {
 ///
 /// `process_vm_readv` (270), `process_vm_writev` (271), and `ptrace` (117)
 /// memory access requests (`PTRACE_PEEKTEXT`, `PTRACE_PEEKDATA`, `PTRACE_POKETEXT`,
-/// `PTRACE_POKEDATA`) consume the execution lease. Ordinary syscalls and
-/// non-memory ptrace requests return false and execute without acquiring or
+/// `PTRACE_POKEDATA`) consume the execution lease. The selected
+/// filesystem durability operations (`sync`, `fsync`, `fdatasync`,
+/// `sync_file_range`, `syncfs`) and scalar `write` also borrow it for host-wait handoff. Other
+/// ordinary syscalls and non-memory ptrace requests execute without acquiring or
 /// consulting the execution lease lock.
 #[inline]
 pub const fn syscall_requires_execution_lease(nr: u64, args: SyscallArgs) -> bool {
     match nr {
-        270 | 271 => true,
+        64 | 81..=84 | 267 | 270 | 271 => true,
         117 => matches!(
             args.0[0],
             carrick_abi::LINUX_PTRACE_PEEKTEXT

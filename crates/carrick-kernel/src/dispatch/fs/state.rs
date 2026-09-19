@@ -1,9 +1,8 @@
 //! Filesystem and I/O state owned by the syscall dispatcher.
 
 use super::super::*;
-use crate::linux_abi::{LinuxDnotifyMask, LinuxErrno};
+use crate::linux_abi::LinuxDnotifyMask;
 use carrick_fatal::carrick_fatal;
-use carrick_vfs::errno::HostSyscallResult as _;
 
 #[derive(Debug, Clone)]
 pub(in crate::dispatch) struct DnotifyRegistration {
@@ -127,6 +126,7 @@ enum PushbackEnd {
 /// whole dispatcher. Field semantics are unchanged from the former loose
 /// fields (`vfs_mounts`/`rootfs_vfs`).
 pub(in crate::dispatch) struct FsState {
+    pub host_io: std::sync::Arc<dyn crate::dispatch::HostIo>,
     /// Unified VFS mount table. Holds DevVfs at /dev, ProcVfs at
     /// /proc, SysVfs at /sys. The dispatcher consults it first; any
     /// path no mount claims (or that a mount returns ENOSYS for)
@@ -509,18 +509,12 @@ mod forked_descendants_capture_tests {
     }
 }
 
-pub(super) fn flush_host_fd(host_fd: i32) -> Result<(), LinuxErrno> {
-    unsafe { libc::fsync(host_fd) }.host_syscall_errno()?;
-    #[cfg(target_os = "macos")]
-    if strict_durability_enabled() {
-        unsafe { libc::fcntl(host_fd, libc::F_FULLFSYNC) }.host_syscall_errno()?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn strict_durability_enabled() -> bool {
-    std::env::var_os("CARRICK_STRICT_DURABILITY").is_some_and(|value| value != "0")
+#[cfg(test)]
+pub(super) fn flush_host_fd(host_fd: HostFdRef) -> Result<(), carrick_abi::LinuxErrno> {
+    crate::dispatch::HostIo::flush(
+        &crate::dispatch::SystemHostIo,
+        std::os::fd::AsFd::as_fd(&host_fd),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -582,6 +576,7 @@ impl FsState {
     ) -> Self {
         let pty_table = std::sync::Arc::new(parking_lot::Mutex::new(crate::vfs::PtyTable::new()));
         Self {
+            host_io: std::sync::Arc::new(crate::dispatch::SystemHostIo),
             vfs_mounts: std::sync::Arc::new({
                 let mut m = carrick_vfs::VfsMounts::new();
                 m.mount(
@@ -669,6 +664,7 @@ impl FsState {
 
     pub(in crate::dispatch) fn fork_clone(&self) -> Self {
         Self {
+            host_io: std::sync::Arc::clone(&self.host_io),
             vfs_mounts: std::sync::Arc::clone(&self.vfs_mounts),
             rootfs_vfs: std::sync::Arc::clone(&self.rootfs_vfs),
             executable_authorities: std::sync::Arc::clone(&self.executable_authorities),

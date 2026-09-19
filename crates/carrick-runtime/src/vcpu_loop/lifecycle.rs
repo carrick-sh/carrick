@@ -1237,6 +1237,7 @@ pub(crate) mod tests {
             memory.0.insert(0x2000, 22_i32.to_le_bytes().to_vec());
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
+                registration: None,
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: Some(&root_authority),
@@ -1708,6 +1709,7 @@ pub(crate) mod tests {
             memory.0.insert(0x2000, 22_i32.to_le_bytes().to_vec());
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
+                registration: None,
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: Some(&root_authority),
@@ -1822,6 +1824,7 @@ pub(crate) mod tests {
         let mut memory = Memory::default();
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&root_authority),
@@ -1901,6 +1904,7 @@ pub(crate) mod tests {
         let mut memory = Memory::default();
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&root_authority),

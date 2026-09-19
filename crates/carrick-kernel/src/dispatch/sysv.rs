@@ -4855,6 +4855,7 @@ mod ipc_set_tests {
             .expect("stage semop");
         let reporter = CompatReporter::default();
         let mut cx = SyscallCtx {
+            host_wait: None,
             kernel: &child,
             request: SyscallRequest::new(193, SyscallArgs::from([0; 6])),
             memory: &mut memory,
@@ -4991,6 +4992,7 @@ mod ipc_set_tests {
             .write_bytes(SEMOP_TEST_SOPS_ADDR, &sembuf_bytes(sops))
             .expect("stage sembuf array");
         let mut cx = SyscallCtx {
+            host_wait: None,
             kernel: &kernel,
             request: SyscallRequest::new(193, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             memory: &mut memory,
@@ -5058,6 +5060,7 @@ mod ipc_set_tests {
             .write_bytes(SEMOP_TEST_SOPS_ADDR, &sembuf_bytes(sops))
             .expect("stage sembuf array");
         let mut cx = SyscallCtx {
+            host_wait: None,
             kernel: &kernel,
             request: SyscallRequest::new(193, SyscallArgs::from([0; 6])),
             memory: &mut memory,
@@ -6253,6 +6256,7 @@ mod ipc_set_tests {
             memory.write_bytes(mem_addr, &bytes).unwrap();
 
             let mut cx = SyscallCtx {
+                host_wait: None,
                 kernel: &dispatcher.capture_one_task_context().unwrap(),
                 request: SyscallRequest::new(146, SyscallArgs::from([1001, 0, 0, 0, 0, 0])),
                 memory: &mut memory,
@@ -6331,6 +6335,7 @@ mod ipc_set_tests {
             memory.write_bytes(mem_addr, &bytes).unwrap();
 
             let mut cx = SyscallCtx {
+                host_wait: None,
                 kernel: &dispatcher.capture_one_task_context().unwrap(),
                 request: SyscallRequest::new(
                     195,
@@ -6403,6 +6408,7 @@ mod ipc_set_tests {
             memory.write_bytes(mem_addr, &bytes).unwrap();
 
             let mut cx = SyscallCtx {
+                host_wait: None,
                 kernel: &dispatcher.capture_one_task_context().unwrap(),
                 request: SyscallRequest::new(
                     195,

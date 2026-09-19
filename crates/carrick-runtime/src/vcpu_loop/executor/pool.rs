@@ -827,6 +827,7 @@ impl carrick_kernel::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebu
     fn scheduler_rows(&self) -> Vec<carrick_kernel::kernel::debug::DebugSchedulerRow> {
         let summary = self.scheduler.scheduler_summary();
         vec![carrick_kernel::kernel::debug::DebugSchedulerRow {
+            host_wait: summary.host_wait.map(Into::into),
             lifecycle: summary.lifecycle,
             queued_len: summary.queued_len,
             claimed: summary.claimed,
@@ -1473,6 +1474,61 @@ fn append_failures(message: &mut String, failures: Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_host_wait_census_preserves_ownership_and_exact_work_counts() {
+        use carrick_kernel::kernel::debug::KernelDebugAuxProvider;
+        for scale in [1, 8, 32] {
+            let input = carrick_kernel::kernel::RootBootstrap::for_reference_model(
+                13_991,
+                carrick_hal::ThreadId::synthetic_for_tests(13_991),
+                "host wait debug census".to_owned(),
+            )
+            .unwrap();
+            let (kernel, root) = carrick_kernel::kernel::Kernel::bootstrap_root(input).unwrap();
+            root.thread()
+                .publish_initial_task_state(super::super::tests::task_state(&root, 42))
+                .unwrap();
+            let scheduler = Arc::new(Scheduler::new_with_policy(
+                kernel,
+                Arc::new(carrick_hal::GuestCpuPolicy::new(1)),
+            ));
+            let registration = scheduler
+                .register_executor_bound(
+                    Arc::new(crate::vcpu_loop::tests::RuntimeTestExecutorKick::default()),
+                    Some(carrick_hal::GuestCpuId::new(0)),
+                    false,
+                )
+                .unwrap();
+            scheduler.make_runnable(root.thread().key()).unwrap();
+            let running = scheduler.take(&registration).unwrap();
+            let provider = HvpatchKernelDebugAuxProvider::new(
+                Arc::clone(&scheduler),
+                Arc::new(ReceiptLog::default()),
+            );
+            for count in 1..=scale {
+                let token = scheduler.begin_host_wait(&running, &registration).unwrap();
+                let rows = serde_json::to_value(provider.scheduler_rows()).unwrap();
+                let census = &rows[0]["host_wait"];
+                assert_eq!(census["entered"], count);
+                assert_eq!(census["resumed"], count - 1);
+                assert_eq!(census["slots"][0]["cpu"], 0);
+                assert!(census["slots"][0]["owner"].is_null());
+                assert_eq!(
+                    census["slots"][0]["waiters"][0]["thread"]["tid"],
+                    root.thread().key().tid.raw()
+                );
+                assert_eq!(rows[0]["claimed"], 1, "host wait remains a live claim");
+                drop(token);
+            }
+            let rows = serde_json::to_value(provider.scheduler_rows()).unwrap();
+            assert_eq!(rows[0]["host_wait"]["entered"], scale);
+            assert_eq!(rows[0]["host_wait"]["resumed"], scale);
+            assert_eq!(rows[0]["host_wait"]["slots"], serde_json::json!([]));
+            scheduler.settle_exited(running).unwrap();
+            scheduler.unregister_executor(&registration).unwrap();
+        }
+    }
 
     #[test]
     fn empty_asid_invalidation_fanout_does_not_poke_idle_executors() {

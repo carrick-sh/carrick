@@ -24,6 +24,9 @@ use crate::dispatch::{
     OpenDescription, OpenFile, SyscallCtx, SyscallRequest,
 };
 
+mod write_rearm;
+pub(in crate::dispatch) use write_rearm::WriteRearm;
+
 const EPOLL_REBIND_REASON_IO_REARM: u32 = 1;
 const EPOLL_REBIND_REASON_CLOSE_DETACH: u32 = 2;
 
@@ -281,6 +284,21 @@ impl<'a> NetView<'a> {
         last_ready: u32,
         write_backpressured: bool,
     ) -> carrick_hal::event::Interest {
+        let file = self.open_file(fd);
+        Self::description_epoll_effective_interest(
+            file.as_ref().map(|file| &file.description),
+            events,
+            last_ready,
+            write_backpressured,
+        )
+    }
+
+    fn description_epoll_effective_interest(
+        description: Option<&Arc<crate::kernel::FileDescription>>,
+        events: u32,
+        last_ready: u32,
+        write_backpressured: bool,
+    ) -> carrick_hal::event::Interest {
         // Wire→typed seam: the guest event word is a raw u32; epoll ACCEPTS
         // unknown bits, so retain them rather than reject.
         let mut interest = epoll_interest_for(LinuxEpollEvents::from_bits_retain(events));
@@ -310,7 +328,7 @@ impl<'a> NetView<'a> {
         // `epoll_wait` and pollutes the readiness latch with `EPOLLOUT`, masking
         // the real `EPOLLIN|EPOLLHUP` EOF. Suppressing write interest here keeps
         // the host registration faithful to Linux semantics on every host.
-        if interest.write && self.host_fd_is_oneway_pipe_read_end(fd) {
+        if interest.write && description.is_some_and(Self::description_is_oneway_pipe_read_end) {
             interest.write = false;
             interest.read = true;
         }
@@ -323,16 +341,21 @@ impl<'a> NetView<'a> {
         // Keep only the direction the beacon actually represents. Endpoint
         // state changes still pulse the instance user wake through the target's
         // wait-queue callback, so HUP/ERR and later readiness are re-sampled.
-        if let Some(endpoint) = self
-            .open_file(fd)
-            .and_then(|open_file| open_file.description().in_memory_pipe_endpoint())
-        {
+        if let Some(endpoint) = description.and_then(|desc| desc.in_memory_pipe_endpoint()) {
             match endpoint {
                 InMemoryPipeEndpoint::Reader => interest.write = false,
                 InMemoryPipeEndpoint::Writer => interest.read = false,
             }
         }
-        if interest.oob && !self.fd_supports_epoll_oob(fd) {
+        let supports_oob = description.is_some_and(|desc| match desc.read().as_deref() {
+            Some(OpenDescription::HostSocket { .. }) => true,
+            Some(OpenDescription::InMemorySocket { socket, .. }) => {
+                (socket.family() == LINUX_AF_INET || socket.family() == LINUX_AF_INET6)
+                    && socket.socket_type == carrick_abi::LINUX_SOCK_STREAM
+            }
+            _ => false,
+        });
+        if interest.oob && !supports_oob {
             interest.oob = false;
         }
         // FreeBSD/NetBSD kqueue has no usable OOB filter — `register_io` with an

@@ -2829,7 +2829,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let outcome = state
-            .service_threaded_syscall(&kernel, &mut parent_engine, frame)
+            .service_threaded_syscall(&kernel, &mut parent_engine, frame, None)
             .expect("production parent fork dispatch");
         let DispatchOutcome::Fork {
             flags,
@@ -2848,6 +2848,7 @@ pub(crate) mod tests {
 
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut parent_submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&root_authority),
@@ -2932,6 +2933,7 @@ pub(crate) mod tests {
 
         let mut child_engine = CrashCaptureTestEngine::default();
         let mut child_submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&child_authority),
@@ -3082,7 +3084,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let outcome = state
-            .service_threaded_syscall(&kernel, &mut parent_engine, frame)
+            .service_threaded_syscall(&kernel, &mut parent_engine, frame, None)
             .expect("production parent clone dispatch");
         let DispatchOutcome::CloneThread {
             stack,
@@ -3120,6 +3122,7 @@ pub(crate) mod tests {
         };
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut parent_submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&root_authority),
@@ -3190,6 +3193,7 @@ pub(crate) mod tests {
 
         let mut child_engine = CrashCaptureTestEngine::default();
         let mut child_submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&child_authority),
@@ -3357,7 +3361,7 @@ pub(crate) mod tests {
                 ..Default::default()
             };
             let outcome = state
-                .service_threaded_syscall(&kernel, &mut engine, frame)
+                .service_threaded_syscall(&kernel, &mut engine, frame, None)
                 .expect("production nanosleep dispatch");
             assert!(
                 matches!(outcome, DispatchOutcome::WaitOnSleep { .. }),
@@ -3389,6 +3393,7 @@ pub(crate) mod tests {
             };
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
+                registration: None,
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: Some(&root_authority),
@@ -3469,6 +3474,7 @@ pub(crate) mod tests {
                 std::thread::yield_now();
             };
             let mut resumed_submission = executor::ExecutorSubmissionContext {
+                registration: None,
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: Some(&root_authority),
@@ -3603,7 +3609,7 @@ pub(crate) mod tests {
                 ..Default::default()
             };
             let outcome = state
-                .service_threaded_syscall(&kernel, &mut engine, frame)
+                .service_threaded_syscall(&kernel, &mut engine, frame, None)
                 .expect("production nanosleep dispatch");
             assert!(matches!(outcome, DispatchOutcome::WaitOnSleep { .. }));
 
@@ -3631,6 +3637,7 @@ pub(crate) mod tests {
             };
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
+                registration: None,
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: Some(&root_authority),
@@ -3838,7 +3845,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let handler_outcome = state
-            .service_threaded_syscall(&kernel, &mut engine, frame)
+            .service_threaded_syscall(&kernel, &mut engine, frame, None)
             .expect("production preflight and handler");
         assert!(matches!(handler_outcome, DispatchOutcome::Returned { .. }));
 
@@ -3879,6 +3886,7 @@ pub(crate) mod tests {
         };
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&root_authority),
@@ -4587,6 +4595,7 @@ pub(crate) mod tests {
         );
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
@@ -4693,6 +4702,7 @@ pub(crate) mod tests {
                 .0;
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
+                registration: None,
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
@@ -4888,6 +4898,7 @@ pub(crate) mod tests {
                 .0;
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
+                registration: None,
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
@@ -4960,6 +4971,7 @@ pub(crate) mod tests {
                 .0;
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
+                registration: None,
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
@@ -5031,6 +5043,7 @@ pub(crate) mod tests {
                 .0;
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
+                registration: None,
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
@@ -5091,6 +5104,7 @@ pub(crate) mod tests {
                 .0;
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
+                registration: None,
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
@@ -5161,6 +5175,7 @@ pub(crate) mod tests {
                     .0;
                 let need_resched = std::sync::atomic::AtomicBool::new(false);
                 let mut submission = executor::ExecutorSubmissionContext {
+                    registration: None,
                     scheduler: &scheduler,
                     publish_test_descendant: &|_, _| unreachable!(),
                     current: None,
@@ -5247,6 +5262,7 @@ pub(crate) mod tests {
                 .0;
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
+                registration: None,
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
@@ -5309,6 +5325,7 @@ pub(crate) mod tests {
                 .0;
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
+                registration: None,
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
@@ -5463,6 +5480,7 @@ pub(crate) mod tests {
                 .0;
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
+                registration: None,
                 scheduler: &scheduler,
                 publish_test_descendant: &|_, _| unreachable!(),
                 current: None,
@@ -5577,6 +5595,7 @@ pub(crate) mod tests {
             suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
@@ -5646,6 +5665,7 @@ pub(crate) mod tests {
             suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, Some(work));
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
@@ -5715,6 +5735,7 @@ pub(crate) mod tests {
             suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
@@ -5809,6 +5830,7 @@ pub(crate) mod tests {
             suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, Some(work));
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
@@ -5882,6 +5904,7 @@ pub(crate) mod tests {
             suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
@@ -5989,6 +6012,7 @@ pub(crate) mod tests {
             suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, Some(work));
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
@@ -6088,6 +6112,7 @@ pub(crate) mod tests {
         let mut job = suffix_failure_test_job(&kernel, state, phase, None);
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
@@ -6133,6 +6158,7 @@ pub(crate) mod tests {
             .0;
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: None,
@@ -6243,6 +6269,7 @@ pub(crate) mod tests {
 
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut parent_submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&root_authority),
@@ -6316,6 +6343,7 @@ pub(crate) mod tests {
 
         let mut engine = CrashCaptureTestEngine::default();
         let mut child_submission = executor::ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &|_, _| unreachable!(),
             current: Some(&child_authority),

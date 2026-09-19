@@ -1112,6 +1112,7 @@ mod tests {
             ))
         };
         let mut submission = ExecutorSubmissionContext {
+            registration: None,
             scheduler: &scheduler,
             publish_test_descendant: &reject_descendant,
             current: None,

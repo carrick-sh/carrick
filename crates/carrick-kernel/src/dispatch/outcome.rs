@@ -960,6 +960,12 @@ impl CurrentMmMemory for LinearMemory {}
 #[derive(Debug, Error)]
 #[allow(private_interfaces)]
 pub enum DispatchError {
+    #[error("host wait requires the exact outer resource scope")]
+    HostWaitResourceScope,
+    #[error("host wait completed after its exact thread retired")]
+    HostWaitRetired,
+    #[error("host wait authority rejected: {0}")]
+    HostWaitAuthority(crate::kernel::SchedulerError),
     #[error("guest memory read length does not fit this host: {0}")]
     LengthTooLarge(u64),
     #[error("syscall interceptor panicked in container {container_id:?}")]

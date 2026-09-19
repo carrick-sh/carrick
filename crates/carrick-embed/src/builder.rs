@@ -127,6 +127,7 @@ pub struct ContainerBuilder {
     stderr: StdioConfig,
     time: Option<carrick_kernel::kernel::TimeControl>,
     scheduler: Option<std::sync::Arc<dyn carrick_hal::SchedulingPolicy>>,
+    host_io: Option<std::sync::Arc<dyn carrick_kernel::dispatch::HostIo>>,
     budget: Option<carrick_kernel::observe::ResourceBudget>,
     max_traps: usize,
     observers: Vec<std::sync::Arc<dyn carrick_kernel::observe::SyscallObserver>>,
@@ -171,6 +172,7 @@ impl ContainerBuilder {
             stderr: StdioConfig::Captured,
             time: None,
             scheduler: None,
+            host_io: None,
             budget: None,
             max_traps: DEFAULT_MAX_TRAPS,
             observers: Vec::new(),
@@ -382,6 +384,14 @@ impl ContainerBuilder {
         self
     }
 
+    /// Inject external filesystem durability operations. The implementation
+    /// replaces the real host call and is shared by this container's children.
+    /// It must not access guest memory; blocking calls use scheduler handoff.
+    pub fn host_io(mut self, host_io: std::sync::Arc<dyn crate::HostIo>) -> Self {
+        self.host_io = Some(host_io);
+        self
+    }
+
     /// Configure time control for the container.
     pub fn time(mut self, control: carrick_kernel::kernel::TimeControl) -> Self {
         self.time = Some(control);
@@ -546,6 +556,7 @@ impl ContainerBuilder {
             stderr: self.stderr,
             time: self.time,
             scheduler: self.scheduler,
+            host_io: self.host_io,
             budget: self.budget,
             max_traps: self.max_traps,
             observers: self.observers,
@@ -664,6 +675,9 @@ impl Container {
         if let Some(policy) = self.scheduler {
             extensions = extensions.scheduler(policy);
         }
+        if let Some(host_io) = self.host_io {
+            extensions = extensions.host_io(host_io);
+        }
         if let Some(budget) = self.budget {
             extensions = extensions.resource_budget(budget);
         }
@@ -733,6 +747,7 @@ pub struct Container {
     stderr: StdioConfig,
     time: Option<carrick_kernel::kernel::TimeControl>,
     scheduler: Option<std::sync::Arc<dyn carrick_hal::SchedulingPolicy>>,
+    host_io: Option<std::sync::Arc<dyn carrick_kernel::dispatch::HostIo>>,
     budget: Option<carrick_kernel::observe::ResourceBudget>,
     max_traps: usize,
     observers: Vec<std::sync::Arc<dyn carrick_kernel::observe::SyscallObserver>>,

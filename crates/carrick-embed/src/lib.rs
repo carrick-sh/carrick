@@ -114,6 +114,7 @@ pub use carrick_hal::{
 };
 pub use carrick_image::{ImageStore, PullPolicy};
 pub use carrick_kernel::dispatch::Signal;
+pub use carrick_kernel::dispatch::{HostIo, SystemHostIo};
 pub use carrick_kernel::kernel::{
     ClockDomain, ContainerId, LinuxTid, ObjectIdRegistry, RunId, SignedDuration, TaskId, TaskKey,
     TaskSerial, ThreadKey, ThreadSerial, TimeControl, TimeError,

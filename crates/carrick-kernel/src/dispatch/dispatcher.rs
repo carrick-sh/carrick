@@ -857,6 +857,13 @@ pub(crate) fn resolv_conf_contents_for_network(
 
 /// Cross-subsystem capabilities required during filesystem operations (such as fd close lifecycle).
 pub(in crate::dispatch) trait FsCrossSubsystem: Send + Sync {
+    fn with_host_wait(
+        &self,
+        _ctx: &mut dyn MmExecutorReleaser,
+        _op: &mut dyn FnMut(),
+    ) -> Result<(), super::outcome::DispatchError> {
+        Err(super::outcome::DispatchError::MmExecutorParticipationUnavailable)
+    }
     fn host_signal(&self) -> &dyn HostSignalBridge;
     fn detach_fd_from_epolls(&self, _fd: i32) {}
     fn close_open_file_and_free_pty(&self, _open_file: &OpenFile) {}
@@ -993,6 +1000,13 @@ pub(in crate::dispatch) trait FsCrossSubsystem: Send + Sync {
 }
 
 impl FsCrossSubsystem for SyscallDispatcher {
+    fn with_host_wait(
+        &self,
+        ctx: &mut dyn MmExecutorReleaser,
+        op: &mut dyn FnMut(),
+    ) -> Result<(), super::outcome::DispatchError> {
+        ctx.host_wait_and_run(self, op)
+    }
     fn host_signal(&self) -> &dyn HostSignalBridge {
         &*self.host_signal
     }
@@ -1366,6 +1380,11 @@ pub struct NetView<'a> {
 }
 
 pub(in crate::dispatch) trait MmExecutorReleaser {
+    fn host_wait_and_run(
+        &mut self,
+        dispatcher: &SyscallDispatcher,
+        op: &mut dyn FnMut(),
+    ) -> Result<(), super::outcome::DispatchError>;
     fn release_and_run(
         &mut self,
         dispatcher: &SyscallDispatcher,
@@ -1374,6 +1393,16 @@ pub(in crate::dispatch) trait MmExecutorReleaser {
 }
 
 impl<M: carrick_guest_mem::CurrentMmMemory> MmExecutorReleaser for super::SyscallCtx<'_, M> {
+    fn host_wait_and_run(
+        &mut self,
+        dispatcher: &SyscallDispatcher,
+        op: &mut dyn FnMut(),
+    ) -> Result<(), super::outcome::DispatchError> {
+        let context = self
+            .host_wait
+            .ok_or(super::outcome::DispatchError::MmExecutorExecutionLeaseUnavailable)?;
+        dispatcher.with_host_wait(self, context.scheduler, context.registration, op)
+    }
     fn release_and_run(
         &mut self,
         dispatcher: &SyscallDispatcher,

@@ -80,6 +80,7 @@ pub trait NormalizedDispatchRoute {
 }
 
 pub struct OrdinaryDispatchRoute<'lease, 'executor> {
+    pub host_wait: Option<super::request::HostWaitContext<'lease>>,
     pub lease: Option<&'lease crate::kernel::objects::ThreadExecutionLease>,
     pub mm_executor: Option<&'executor mut MmExecutorParticipation>,
 }
@@ -95,6 +96,7 @@ impl NormalizedDispatchRoute for OrdinaryDispatchRoute<'_, '_> {
         thread: Option<ThreadCtx>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         dispatcher.dispatch_normalized_with_lease(SyscallCtx {
+            host_wait: self.host_wait,
             kernel,
             request,
             memory,
@@ -149,6 +151,7 @@ impl SyscallDispatcher {
         thread: Option<ThreadCtx>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         self.dispatch_normalized_with_lease(SyscallCtx {
+            host_wait: None,
             kernel,
             request,
             memory,

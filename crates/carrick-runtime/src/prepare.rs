@@ -105,12 +105,18 @@ pub struct RuntimeExtensions {
     interceptors: Vec<Arc<dyn carrick_kernel::observe::SyscallInterceptor>>,
     time: Option<carrick_kernel::kernel::container::TimeControl>,
     scheduler: Option<Arc<dyn carrick_hal::SchedulingPolicy>>,
+    host_io: Option<Arc<dyn carrick_kernel::dispatch::HostIo>>,
     budget: Option<Arc<carrick_kernel::observe::ResourceBudget>>,
     network_interposer: Option<carrick_kernel::network::interposer::NetworkInterposer>,
     work_scope: Option<carrick_observability::work_meter::WorkScope>,
 }
 
 impl RuntimeExtensions {
+    /// Replace the external filesystem durability operations before boot.
+    pub fn host_io(mut self, host_io: Arc<dyn carrick_kernel::dispatch::HostIo>) -> Self {
+        self.host_io = Some(host_io);
+        self
+    }
     /// Mount `vfs` at the absolute guest path `target` (longest prefix wins,
     /// shadowing the image and any `RunSpec` bind mount at the same point).
     pub fn vfs_mount(mut self, target: Utf8PathBuf, vfs: Box<dyn Vfs>) -> Self {
@@ -653,6 +659,7 @@ fn prepare_with_lease(
         interceptors,
         time,
         scheduler,
+        host_io,
         budget,
         network_interposer,
         work_scope,
@@ -738,6 +745,9 @@ fn prepare_with_lease(
 
     // Extensions go in after the image, bind and rosetta mounts so an
     // embedder's mount at the same point shadows them (re-mount replaces).
+    if let Some(host_io) = host_io {
+        dispatcher.set_host_io(host_io);
+    }
     for (target, vfs) in vfs_mounts {
         dispatcher.register_mount(PathBuf::from(target.as_std_path()), vfs);
     }

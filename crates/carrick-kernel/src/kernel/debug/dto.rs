@@ -527,6 +527,10 @@ pub struct DebugAltstack {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugSchedulerRow {
+    /// None means unavailable (including snapshots from older producers), not
+    /// an empty host-wait population. All fields come from one ledger lock.
+    #[serde(default)]
+    pub host_wait: Option<DebugHostWaitCensus>,
     pub lifecycle: String,
     pub queued_len: usize,
     pub claimed: usize,
@@ -539,6 +543,106 @@ pub struct DebugSchedulerRow {
     pub control_epoch: u64,
     pub need_resched: bool,
     pub snapshot_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugHostWaitCensus {
+    pub entered: u64,
+    pub resumed: u64,
+    pub slots: Vec<DebugHostWaitSlot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugHostWaitSlot {
+    pub root: u32,
+    pub cpu: usize,
+    pub owner: Option<u32>,
+    pub waiters: Vec<DebugHostWaiter>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugHostWaiter {
+    pub executor: u32,
+    pub epoch: u64,
+    pub thread: DebugThreadKey,
+    pub generation: u64,
+    pub returning: bool,
+}
+
+impl From<super::super::scheduler::HostWaitCensus> for DebugHostWaitCensus {
+    fn from(census: super::super::scheduler::HostWaitCensus) -> Self {
+        Self {
+            entered: census.entered,
+            resumed: census.resumed,
+            slots: census
+                .slots
+                .into_iter()
+                .map(|slot| DebugHostWaitSlot {
+                    root: slot.root.raw(),
+                    cpu: slot.cpu.as_usize(),
+                    owner: slot.owner.map(|owner| owner.raw()),
+                    waiters: slot
+                        .waiters
+                        .into_iter()
+                        .map(|(binding, returning)| DebugHostWaiter {
+                            executor: binding.executor().raw(),
+                            epoch: binding.executor_epoch(),
+                            thread: thread_key(binding.thread()),
+                            generation: binding.generation().raw(),
+                            returning,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl DebugHostWaitCensus {
+    fn validate(&self) -> Result<(), KernelDebugDtoError> {
+        let invalid = KernelDebugDtoError::HostWaitInvariant;
+        let outstanding = self
+            .entered
+            .checked_sub(self.resumed)
+            .ok_or_else(|| invalid("resume count exceeds enter count"))?;
+        let mut roots = BTreeSet::new();
+        let mut executors = BTreeSet::new();
+        let mut threads = BTreeSet::new();
+        let mut waiting = 0_u64;
+        for slot in &self.slots {
+            if !roots.insert(slot.root) {
+                return Err(invalid("duplicate conserved slot"));
+            }
+            if slot.owner.is_none() && slot.waiters.is_empty() {
+                return Err(invalid("vacant slot has no waiting claimant"));
+            }
+            if let Some(owner) = slot.owner
+                && !executors.insert(owner)
+            {
+                return Err(invalid("executor owns multiple slots"));
+            }
+            for waiter in &slot.waiters {
+                if !executors.insert(waiter.executor) {
+                    return Err(invalid("executor both owns and waits, or waits twice"));
+                }
+                if !threads.insert(waiter.thread) {
+                    return Err(invalid("thread waits on multiple slots"));
+                }
+                waiting = waiting
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("waiter count overflow"))?;
+            }
+        }
+        if waiting != outstanding {
+            return Err(invalid(
+                "outstanding count differs from exact waiter population",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -647,6 +751,8 @@ pub struct KernelDebugSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum KernelDebugDtoError {
+    #[error("invalid host-wait census: {0}")]
+    HostWaitInvariant(&'static str),
     #[error("unknown kernel debug schema `{0}`")]
     UnknownSchema(String),
     #[error("unknown kernel snapshot schema version {0}")]
@@ -1132,6 +1238,12 @@ impl KernelDebugSnapshot {
         for table in &present {
             if !requested.contains(table) {
                 return Err(KernelDebugDtoError::UnrequestedTable(table.wire_name()));
+            }
+        }
+
+        for row in self.scheduler.as_deref().unwrap_or_default() {
+            if let Some(census) = &row.host_wait {
+                census.validate()?;
             }
         }
 

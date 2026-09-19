@@ -54,6 +54,7 @@ fn test_hardware_kick(raw_vcpu_id: u64) -> super::ExactHardwareKick {
 enum Step {
     Syscalls(usize),
     ComputeUntilKick,
+    HostWait,
     Block,
     Yield,
     Preempt,
@@ -83,6 +84,8 @@ struct FakeBinding {
     entered: parking_lot::Mutex<Option<Arc<Barrier>>>,
     resume: parking_lot::Mutex<Option<Arc<Barrier>>>,
     progress: AtomicUsize,
+    host_wait_entered: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    host_wait_release: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     load_identity: parking_lot::Mutex<Option<TaskLoadIdentity>>,
     required_continuation_sequence: parking_lot::Mutex<Option<u64>>,
     blocked_continuation:
@@ -148,6 +151,8 @@ impl FakeBinding {
             entered: parking_lot::Mutex::new(None),
             resume: parking_lot::Mutex::new(None),
             progress: AtomicUsize::new(0),
+            host_wait_entered: parking_lot::Mutex::new(None),
+            host_wait_release: parking_lot::Mutex::new(None),
             load_identity: parking_lot::Mutex::new(None),
             required_continuation_sequence: parking_lot::Mutex::new(None),
             blocked_continuation: parking_lot::Mutex::new(None),
@@ -922,6 +927,28 @@ impl PersistentExecutor for FakeExecutor {
         self.system_ns = self.system_ns.saturating_add(3_000);
         match step {
             Step::Syscalls(_) => Ok(ExecutorExit::Syscall),
+            Step::HostWait => {
+                let guard = submission.begin_host_wait()?;
+                binding
+                    .host_wait_entered
+                    .lock()
+                    .take()
+                    .expect("entry sender")
+                    .send(())
+                    .expect("host wait entered");
+                let release = binding
+                    .host_wait_release
+                    .lock()
+                    .take()
+                    .expect("release receiver");
+                release
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!("host wait release: {error}"))
+                    })?;
+                drop(guard);
+                Ok(ExecutorExit::Exited)
+            }
             Step::ComputeUntilKick => {
                 let deadline = Instant::now() + Duration::from_secs(2);
                 while !need_resched.load(Ordering::Acquire) && Instant::now() < deadline {
@@ -1398,6 +1425,7 @@ fn hvpatch_quantum_borrows_a_fresh_injected_engine_at_every_boundary() {
         ))
     };
     let mut submission = ExecutorSubmissionContext {
+        registration: None,
         scheduler: &scheduler,
         publish_test_descendant: &reject_descendant,
         current: None,
@@ -2682,6 +2710,7 @@ fn dormant_submission_activates_all_four_exact_authority_shapes() {
         ))
     };
     let worker_submission = ExecutorSubmissionContext {
+        registration: None,
         scheduler: &scheduler,
         publish_test_descendant: &reject_descendant,
         current: Some(&root_authority),
@@ -2988,6 +3017,61 @@ fn start_pool(
         ExecutorBoundaryAudit::production(),
     )
     .expect("start executor pool")
+}
+
+#[test]
+fn host_wait_lends_the_only_cpu_through_the_executor_submission_interface() {
+    let (kernel, root) = bootstrap(15_100);
+    let sibling = sibling(&kernel, &root, 25_100);
+    let scheduler = Arc::new(Scheduler::new_with_policy(
+        kernel,
+        Arc::new(GuestCpuPolicy::new(1)),
+    ));
+    let factory = Arc::new(FakeFactory::default());
+    let waiting = FakeBinding::new(301, [Step::HostWait]);
+    let replacement = FakeBinding::new(302, [Step::Exit]);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (settled_tx, settled_rx) = std::sync::mpsc::channel();
+    *waiting.host_wait_entered.lock() = Some(entered_tx);
+    *waiting.host_wait_release.lock() = Some(release_rx);
+    replacement.notify_on_terminal_settlement(settled_tx);
+    factory.install(&root, Arc::clone(&waiting));
+    factory.install(&sibling, Arc::clone(&replacement));
+    let root_generation = publish(&root, 301);
+    let sibling_generation = publish(&sibling, 302);
+    let pool = ExecutorPool::start(
+        ExecutorPoolConfig {
+            bound_workers: 1,
+            spare_executors: 1,
+            vcpu_ceiling: 3,
+            reserve: 1,
+        },
+        Arc::clone(&scheduler),
+        Arc::clone(&factory),
+        Arc::clone(&factory),
+        ExecutorBoundaryAudit::production(),
+    )
+    .expect("start one CPU with one spare");
+    let root_authority = enqueue_root(&scheduler, &root, root_generation);
+    let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+    if entered.is_err() {
+        let _ = release_tx.send(());
+        drop(root_authority);
+        let shutdown = pool.shutdown();
+        panic!("runtime supplies no host-wait authority: {entered:?}; shutdown: {shutdown:?}");
+    }
+    let sibling_authority = enqueue_root(&scheduler, &sibling, sibling_generation);
+    let progressed = settled_rx.recv_timeout(Duration::from_secs(5));
+    let _ = release_tx.send(());
+    drop(root_authority);
+    drop(sibling_authority);
+    let shutdown = pool.shutdown();
+    entered.expect("runtime supplies exact host-wait authority");
+    progressed.expect("spare must settle sibling while original host call is blocked");
+    shutdown.expect("clean shutdown after handoff");
+    assert_eq!(waiting.progress.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement.progress.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -5867,6 +5951,7 @@ fn test_lazy_vcpu_typed_accessor_forces_materialization() {
     let publish_test_descendant =
         |_c: Arc<carrick_kernel::kernel::Thread>, _g: ExecutionGeneration| Ok(());
     let mut submission = ExecutorSubmissionContext {
+        registration: None,
         scheduler: &scheduler,
         publish_test_descendant: &publish_test_descendant,
         current: None,
@@ -5942,6 +6027,7 @@ fn test_lazy_vcpu_executor_destroy_materializes_resident_task() {
     let publish_test_descendant =
         |_c: Arc<carrick_kernel::kernel::Thread>, _g: ExecutionGeneration| Ok(());
     let mut submission = ExecutorSubmissionContext {
+        registration: None,
         scheduler: &scheduler,
         publish_test_descendant: &publish_test_descendant,
         current: None,
@@ -6013,6 +6099,7 @@ fn test_lazy_vcpu_stale_record_on_reentry_after_other_executor_run_discards_and_
     let publish_test_descendant =
         |_c: Arc<carrick_kernel::kernel::Thread>, _g: ExecutionGeneration| Ok(());
     let mut submission = ExecutorSubmissionContext {
+        registration: None,
         scheduler: &scheduler,
         publish_test_descendant: &publish_test_descendant,
         current: None,
@@ -6111,6 +6198,7 @@ fn test_lazy_vcpu_cross_executor_claim_waits_for_idle_flush_and_overlays_materia
     let publish_test_descendant =
         |_c: Arc<carrick_kernel::kernel::Thread>, _g: ExecutionGeneration| Ok(());
     let mut submission = ExecutorSubmissionContext {
+        registration: None,
         scheduler: &scheduler,
         publish_test_descendant: &publish_test_descendant,
         current: None,

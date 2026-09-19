@@ -388,6 +388,28 @@ pub(super) fn path_is_under_or_equal(path: &str, root: &str) -> bool {
 use super::fd_table::is_anon_overlay_path;
 
 impl<'a> FsView<'a> {
+    /// Only owned host arguments may cross this boundary. Guest memory and
+    /// open-description guards must be released before calling it.
+    fn with_host_wait<M: carrick_guest_mem::CurrentMmMemory, T>(
+        &self,
+        cx: &mut super::SyscallCtx<'_, M>,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, super::DispatchError> {
+        if cx.host_wait.is_none() {
+            return Ok(operation());
+        }
+        let mut operation = Some(operation);
+        let mut result = None;
+        self.cross.with_host_wait(cx, &mut || {
+            let run = operation.take().unwrap_or_else(|| {
+                carrick_fatal!("dispatch::host_wait", "host operation invoked twice")
+            });
+            result = Some(run());
+        })?;
+        Ok(result.unwrap_or_else(|| {
+            carrick_fatal!("dispatch::host_wait", "host operation was not invoked")
+        }))
+    }
     #[inline]
     pub(super) fn captured_file_table(&self) -> Arc<crate::kernel::FileTable> {
         self.cross.captured_file_table()
@@ -1294,7 +1316,7 @@ impl<'a> FsView<'a> {
     pub(in crate::dispatch) fn host_file_fd_for_flush(
         &self,
         fd: i32,
-    ) -> Result<Option<i32>, LinuxErrno> {
+    ) -> Result<Option<HostFdRef>, LinuxErrno> {
         let Some(open_file) = self.open_file(fd) else {
             return if is_stdio_fd(fd) {
                 Ok(None)
@@ -1306,7 +1328,7 @@ impl<'a> FsView<'a> {
             return Ok(None);
         };
         Ok(match &*open {
-            OpenDescription::HostFile { host_fd, .. } => Some(host_fd.raw()),
+            OpenDescription::HostFile { host_fd, .. } => Some(host_fd.clone()),
             _ => None,
         })
     }
@@ -1434,6 +1456,62 @@ impl<'a> FsView<'a> {
                 )
             )
         })
+    }
+
+    /// Scalar writes stage every guest byte before relinquishing execution.
+    /// Writer locking belongs inside the host operation, never across P reacquisition.
+    fn write_owned_stdio_sink<M: carrick_guest_mem::CurrentMmMemory>(
+        &self,
+        cx: &mut super::SyscallCtx<'_, M>,
+        fd: i32,
+        bytes: Vec<u8>,
+        target: Option<Arc<crate::kernel::FileDescription>>,
+    ) -> Result<DispatchOutcome, super::DispatchError> {
+        if !matches!(fd, 1 | 2) {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        }
+        if cx.host_wait.is_none() || bytes.is_empty() {
+            return Ok(self.write_stdio_sink(fd, &bytes));
+        }
+        match self.io.route() {
+            StdioRoute::Captured => {
+                if fd == 1 {
+                    self.io.stdout.lock().extend_from_slice(&bytes);
+                } else {
+                    self.io.stderr.lock().extend_from_slice(&bytes);
+                }
+                Ok(DispatchOutcome::returned_len_or_errno(bytes.len()))
+            }
+            StdioRoute::Inherit => {
+                let Some(pinned) = carrick_host::internal_fd::duplicate_internal_fd(fd) else {
+                    return Ok(DispatchOutcome::errno(crate::host_to_linux_errno(
+                        get_last_error(),
+                    )));
+                };
+                let pinned = HostFdRef::new(pinned);
+                super::resources::stage_write_rearm(
+                    cx.kernel,
+                    super::net::WriteRearm::new(target),
+                )?;
+                self.with_host_wait(cx, move || Self::write_all_stdio(pinned.raw(), &bytes))
+            }
+            StdioRoute::Piped { stdout, stderr } => {
+                let writer = if fd == 1 { stdout } else { stderr };
+                super::resources::stage_write_rearm(
+                    cx.kernel,
+                    super::net::WriteRearm::new(target),
+                )?;
+                self.with_host_wait(cx, move || {
+                    let mut writer = writer.lock();
+                    match std::io::Write::write_all(&mut *writer, &bytes) {
+                        Ok(()) => DispatchOutcome::returned_len_or_errno(bytes.len()),
+                        Err(error) => DispatchOutcome::errno(crate::host_to_linux_errno(
+                            error.raw_os_error().unwrap_or(libc::EIO),
+                        )),
+                    }
+                })
+            }
+        }
     }
 
     /// Deliver a bare-stdio write (fd 1/2 with no `OpenDescription`) to the
@@ -2037,9 +2115,9 @@ impl<'a> FsView<'a> {
 
         fn sync(this, cx) {
 
-            unsafe {
-                libc::sync();
-            }
+            this.with_host_wait(cx, || {
+                this.fs.host_io.sync();
+            })?;
             Ok(DispatchOutcome::Returned { value: 0 })
 
         }
@@ -2052,7 +2130,7 @@ impl<'a> FsView<'a> {
             }
             let host_fd = this.host_file_fd_for_flush(fd.0)?;
             if let Some(host_fd) = host_fd
-                && let Err(errno) = flush_host_fd(host_fd) {
+                && let Err(errno) = this.with_host_wait(cx, || this.fs.host_io.flush(std::os::fd::AsFd::as_fd(&host_fd)))? {
                     return Ok(DispatchOutcome::errno(errno));
                 }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -2071,7 +2149,7 @@ impl<'a> FsView<'a> {
             let fd: Fd = fd;
             match this.host_file_fd_for_flush(fd.0) {
                 Ok(Some(host_fd)) => {
-                    if let Err(errno) = flush_host_fd(host_fd) {
+                    if let Err(errno) = this.with_host_wait(cx, || this.fs.host_io.flush(std::os::fd::AsFd::as_fd(&host_fd)))? {
                         return Ok(DispatchOutcome::errno(errno));
                     }
                     Ok(DispatchOutcome::Returned { value: 0 })
@@ -2137,7 +2215,7 @@ impl<'a> FsView<'a> {
             // Regular / synthetic / in-memory file: best-effort flush a real
             // host fd; otherwise a no-op (the range-cache effect isn't observable).
             if let Ok(Some(host_fd)) = this.host_file_fd_for_flush(fd.0) {
-                let _ = flush_host_fd(host_fd);
+                let _ = this.with_host_wait(cx, || this.fs.host_io.flush(std::os::fd::AsFd::as_fd(&host_fd)))?;
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -2211,7 +2289,7 @@ impl<'a> FsView<'a> {
             let fd: Fd = fd;
             match this.host_file_fd_for_flush(fd.0) {
                 Ok(Some(host_fd)) => {
-                    if let Err(errno) = flush_host_fd(host_fd) {
+                    if let Err(errno) = this.with_host_wait(cx, || this.fs.host_io.flush(std::os::fd::AsFd::as_fd(&host_fd)))? {
                         return Ok(DispatchOutcome::errno(errno));
                     }
                     Ok(DispatchOutcome::Returned { value: 0 })
@@ -2484,7 +2562,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn host_file_fd_for_flush(&self, fd: i32) -> Result<Option<i32>, LinuxErrno> {
+    pub(crate) fn host_file_fd_for_flush(&self, fd: i32) -> Result<Option<HostFdRef>, LinuxErrno> {
         self.fs_view().host_file_fd_for_flush(fd)
     }
 

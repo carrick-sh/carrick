@@ -454,6 +454,193 @@ mod mm_executor_release_tests {
             .expect("settle execution lease");
     }
 
+    #[derive(Debug, Default)]
+    struct HostWaitKick(Mutex<Option<crate::kernel::ExecutorBinding>>);
+
+    impl crate::kernel::ExecutorKick for HostWaitKick {
+        fn try_bind(&self, binding: crate::kernel::ExecutorBinding) -> bool {
+            let mut current = self.0.lock();
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(binding);
+            true
+        }
+        fn unbind(&self, binding: crate::kernel::ExecutorBinding) {
+            let mut current = self.0.lock();
+            if *current == Some(binding) {
+                *current = None;
+            }
+        }
+        fn rebind_exact_with(
+            &self,
+            old: crate::kernel::ExecutorBinding,
+            new: crate::kernel::ExecutorBinding,
+            publish: &mut dyn FnMut() -> bool,
+        ) -> bool {
+            let mut current = self.0.lock();
+            if *current != Some(old) || !publish() {
+                return false;
+            }
+            *current = Some(new);
+            true
+        }
+        fn deliver_exact(&self, _token: crate::kernel::ExecutorKickToken) -> bool {
+            false
+        }
+        fn current_binding(&self) -> Option<crate::kernel::ExecutorBinding> {
+            *self.0.lock()
+        }
+    }
+
+    #[test]
+    fn host_wait_releases_mm_and_cpu_then_restores_both_even_on_unwind() {
+        let (dispatcher, context, lease, mut executor, census, _) = boundary_fixture();
+        context
+            .thread()
+            .yield_from_executor(lease)
+            .expect("return fixture lease");
+        let scheduler = crate::kernel::Scheduler::new_with_policy(
+            Arc::clone(context.kernel()),
+            Arc::new(carrick_hal::GuestCpuPolicy::new(1)),
+        );
+        let registration = scheduler
+            .register_executor_bound(
+                Arc::new(HostWaitKick::default()),
+                Some(carrick_hal::GuestCpuId::new(0)),
+                false,
+            )
+            .expect("register worker");
+        scheduler
+            .make_runnable(context.thread().key())
+            .expect("queue fixture");
+        let running = scheduler.take(&registration).expect("claim fixture");
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x1_0000, vec![0; 0x1000]);
+        {
+            let mut syscall = SyscallCtx {
+                host_wait: None,
+                kernel: &context,
+                request: SyscallRequest::new(82, SyscallArgs::from([0; 6])),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: Some(running.lease()),
+                mm_executor: Some(&mut executor),
+            };
+            let result = dispatcher
+                .with_host_wait(&mut syscall, &scheduler, &registration, || {
+                    assert_eq!(
+                        census.participant_count_for_probe(),
+                        0,
+                        "host operation must not retain MM admission"
+                    );
+                    assert!(registration.in_host_wait());
+                    assert!(registration.bound_cpu().is_none());
+                    73
+                })
+                .expect("host operation");
+            assert_eq!(result, 73);
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = dispatcher.with_host_wait(&mut syscall, &scheduler, &registration, || {
+                    assert_eq!(census.participant_count_for_probe(), 0);
+                    assert!(registration.in_host_wait());
+                    panic!("injected host operation panic");
+                });
+            }));
+            assert!(unwind.is_err());
+        }
+        assert_eq!(census.participant_count_for_probe(), 1);
+        assert_eq!(
+            registration.bound_cpu(),
+            Some(carrick_hal::GuestCpuId::new(0))
+        );
+        assert!(!registration.in_host_wait());
+        drop(executor);
+        scheduler
+            .settle_exited(running)
+            .expect("settle after host wait");
+        scheduler
+            .unregister_executor(&registration)
+            .expect("unregister");
+    }
+
+    #[test]
+    fn retired_host_wait_keeps_mm_unadmitted_on_return_and_unwind() {
+        for unwind in [false, true] {
+            let (dispatcher, context, lease, mut executor, census, _) = boundary_fixture();
+            let sibling_plan = crate::kernel::ClonePlan::from_flags(
+                carrick_abi::LinuxCloneFlags::THREAD
+                    | carrick_abi::LinuxCloneFlags::SIGHAND
+                    | carrick_abi::LinuxCloneFlags::VM,
+            )
+            .unwrap();
+            let _sibling = context
+                .kernel()
+                .reserve_thread_clone(&context, sibling_plan, None)
+                .unwrap()
+                .prepare(carrick_hal::ThreadId::synthetic_for_tests(42))
+                .unwrap()
+                .commit()
+                .unwrap()
+                .start_thread()
+                .unwrap()
+                .into_context();
+            context.thread().yield_from_executor(lease).unwrap();
+            let scheduler = crate::kernel::Scheduler::new_with_policy(
+                Arc::clone(context.kernel()),
+                Arc::new(carrick_hal::GuestCpuPolicy::new(1)),
+            );
+            let registration = scheduler
+                .register_executor_bound(
+                    Arc::new(HostWaitKick::default()),
+                    Some(carrick_hal::GuestCpuId::new(0)),
+                    false,
+                )
+                .unwrap();
+            scheduler.make_runnable(context.thread().key()).unwrap();
+            let running = scheduler.take(&registration).unwrap();
+            let reporter = CompatReporter::default();
+            let mut memory = LinearMemory::new(0x1_0000, vec![0; 0x1000]);
+            let mut syscall = SyscallCtx {
+                host_wait: None,
+                kernel: &context,
+                request: SyscallRequest::new(81, SyscallArgs::from([0; 6])),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: Some(running.lease()),
+                mm_executor: Some(&mut executor),
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                dispatcher.with_host_wait(&mut syscall, &scheduler, &registration, || {
+                    context.kernel().exit_thread(&context, None).unwrap();
+                    if unwind {
+                        panic!("retired host operation panic");
+                    }
+                })
+            }));
+            if unwind {
+                assert!(result.is_err(), "retain original panic");
+            } else {
+                assert!(matches!(result, Ok(Err(DispatchError::HostWaitRetired))));
+            }
+            assert_eq!(
+                census.participant_count_for_probe(),
+                0,
+                "retired thread cannot regain MM admission"
+            );
+            assert!(!registration.in_host_wait());
+            assert_eq!(
+                registration.bound_cpu(),
+                Some(carrick_hal::GuestCpuId::new(0))
+            );
+            drop(executor);
+            scheduler.settle_exited(running).unwrap();
+            scheduler.unregister_executor(&registration).unwrap();
+        }
+    }
+
     #[test]
     fn caller_mm_executor_is_absent_during_operation_and_exact_identity_is_restored() {
         let (dispatcher, context, lease, mut executor, census, tid) = boundary_fixture();
@@ -461,6 +648,7 @@ mod mm_executor_release_tests {
         let mut memory = LinearMemory::new(0x1_0000, vec![0; 0x1000]);
         {
             let mut syscall = SyscallCtx {
+                host_wait: None,
                 kernel: &context,
                 request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
                 memory: &mut memory,
@@ -497,6 +685,7 @@ mod mm_executor_release_tests {
         let mut memory = LinearMemory::new(0x1_0000, vec![0; 0x1000]);
         {
             let mut syscall = SyscallCtx {
+                host_wait: None,
                 kernel: &context,
                 request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
                 memory: &mut memory,
@@ -529,6 +718,7 @@ mod mm_executor_release_tests {
         let mut memory = LinearMemory::new(0x1_0000, vec![0; 0x1000]);
         {
             let mut syscall = SyscallCtx {
+                host_wait: None,
                 kernel: &context,
                 request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
                 memory: &mut memory,
@@ -565,6 +755,7 @@ mod mm_executor_release_tests {
         let mut memory = LinearMemory::new(0x1_0000, vec![0; 0x1000]);
         {
             let mut syscall = SyscallCtx {
+                host_wait: None,
                 kernel: &context,
                 request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
                 memory: &mut memory,
