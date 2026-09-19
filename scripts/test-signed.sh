@@ -83,6 +83,26 @@ done
 entitlements="scripts/entitlements.plist"
 negative_test="unsigned_executable_maps_hv_denied_to_entitlement"
 
+signed_features="${CARRICK_TEST_SIGNED_FEATURES:-}"
+test_signed_validate_features "$signed_features"
+enabled_features_json="$(test_signed_features_json "$signed_features")"
+cargo_feature_flags=()
+if [ -n "$signed_features" ]; then
+    cargo_feature_flags=(--features "$signed_features")
+fi
+
+contract_id="${CARRICK_CONTRACT_ID:-}"
+if [ -z "$contract_id" ] && [[ "${requested_filter:-}" == *"futex"* ]]; then
+    contract_id="kernel.futex.contention"
+fi
+if [ -n "$contract_id" ]; then
+    contract_header_arg=(--arg contract_id "$contract_id")
+    contract_header_entry=',contract_id:$contract_id'
+else
+    contract_header_arg=()
+    contract_header_entry=''
+fi
+
 export CARRICK_RUN_ID="$run_id"
 source_head="$(git rev-parse HEAD)"
 arguments_json="$(jq -nc --args '$ARGS.positional' -- "$@")"
@@ -105,7 +125,9 @@ jq -nc \
     --arg run_id "$run_id" \
     --argjson arguments "$arguments_json" \
     --argjson requested_filter "$requested_filter_json" \
-    '{schema:$schema,record_type:"header",source_head:$source_head,package:$package,arguments:$arguments,requested_test_filter:$requested_filter,carrick_run_id:$run_id}' \
+    --argjson enabled_features "$enabled_features_json" \
+    ${contract_header_arg[@]+"${contract_header_arg[@]}"} \
+    "{schema:\$schema,record_type:\"header\",source_head:\$source_head,package:\$package,arguments:\$arguments,requested_test_filter:\$requested_filter,carrick_run_id:\$run_id,enabled_features:\$enabled_features$contract_header_entry}" \
     >"$receipt_tmp"
 scratch=()
 cleanup() {
@@ -196,11 +218,7 @@ fi
 #    script (a process substitution's exit status would not).
 json_log="$(mktemp -t carrick-test-signed-build)"
 scratch+=("$json_log")
-if [ "$pkg" = "carrick-embed" ]; then
-    cargo test -p "$pkg" --features test-support --release --no-run --message-format=json >"$json_log"
-else
-    cargo test -p "$pkg" --release --no-run --message-format=json >"$json_log"
-fi
+cargo test -p "$pkg" ${cargo_feature_flags[@]+"${cargo_feature_flags[@]}"} --release --no-run --message-format=json >"$json_log"
 exes=()
 while IFS= read -r exe; do
     [ -n "$exe" ] && exes+=("$exe")
@@ -341,7 +359,9 @@ record_executable() {
         --arg cdhash "$cdhash" \
         --arg lc_uuid "$lc_uuid" \
         --arg entitlement_digest "$entitlement_digest" \
-        '{schema:$schema,record_type:"executable",executable_id:$executable_id,canonical_path:$canonical_path,sha256:$sha256,cdhash:$cdhash,lc_uuid:$lc_uuid,entitlement_digest:$entitlement_digest,entitlement_present:true,dof_carrick_present:true}' \
+        --argjson enabled_features "$enabled_features_json" \
+        ${contract_header_arg[@]+"${contract_header_arg[@]}"} \
+        "{schema:\$schema,record_type:\"executable\",executable_id:\$executable_id,canonical_path:\$canonical_path,sha256:\$sha256,cdhash:\$cdhash,lc_uuid:\$lc_uuid,entitlement_digest:\$entitlement_digest,entitlement_present:true,dof_carrick_present:true,enabled_features:\$enabled_features$contract_header_entry}" \
         >>"$receipt_tmp"
 }
 

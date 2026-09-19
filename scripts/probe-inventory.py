@@ -46,8 +46,14 @@ def validate_inventory(
             f"absent_from_disk={sorted(names - sources)})"
         )
     for name, row in inventory.items():
-        if not isinstance(row, dict) or set(row) != {"class", "runner", "excluded"}:
+        if not isinstance(row, dict) or not (
+            {"class", "runner", "excluded"} <= set(row) <= {"class", "runner", "excluded", "contract_ids"}
+        ):
             raise ProbeInventoryError(f"probe inventory row is malformed: {name}")
+        if "contract_ids" in row:
+            contract_ids = row["contract_ids"]
+            if not isinstance(contract_ids, list) or not all(isinstance(c, str) and c for c in contract_ids):
+                raise ProbeInventoryError(f"probe {name} has invalid contract_ids: {contract_ids!r}")
         probe_class = row["class"]
         runner = row["runner"]
         excluded = row["excluded"]

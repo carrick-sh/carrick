@@ -61,6 +61,7 @@ pub struct TestContainer {
     carrier_budget: Option<std::time::Duration>,
     /// Names this container's wedge-capture artifact directory.
     label: Option<String>,
+    work_scope: Option<carrick_observability::work_meter::WorkScope>,
 }
 
 impl std::fmt::Debug for TestContainer {
@@ -105,6 +106,7 @@ impl TestContainer {
             exit_budget: None,
             carrier_budget: None,
             label: None,
+            work_scope: None,
         }
     }
 
@@ -251,6 +253,15 @@ impl TestContainer {
         self
     }
 
+    /// Attach an execution-scoped work meter scope to the container.
+    pub fn work_scope(mut self, scope: carrick_observability::work_meter::WorkScope) -> Self {
+        if scope.is_retired() {
+            panic!("cannot attach an already-retired work scope to TestContainer");
+        }
+        self.work_scope = Some(scope);
+        self
+    }
+
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
         self
@@ -369,6 +380,9 @@ impl TestContainer {
         }
         for auditor in &self.auditors {
             builder = builder.auditor(Arc::clone(auditor));
+        }
+        if let Some(scope) = &self.work_scope {
+            builder = builder.work_scope(scope.clone());
         }
         builder
     }

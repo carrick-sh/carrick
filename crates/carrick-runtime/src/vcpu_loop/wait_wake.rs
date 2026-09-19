@@ -172,6 +172,7 @@ pub(crate) struct HvpatchRuntimeDirectory {
     pub(crate) process_jobs_changed: Condvar,
     shutdown: Mutex<RuntimeDirectoryShutdown>,
     shutdown_changed: Condvar,
+    work_scope: Mutex<Option<carrick_observability::work_meter::WorkScope>>,
 }
 
 #[derive(Default)]
@@ -593,6 +594,7 @@ impl Default for HvpatchRuntimeDirectory {
             process_jobs_changed: Condvar::new(),
             shutdown: Mutex::new(RuntimeDirectoryShutdown::Open),
             shutdown_changed: Condvar::new(),
+            work_scope: Mutex::new(None),
         }
     }
 }
@@ -859,14 +861,23 @@ impl HvpatchRuntimeDirectory {
         let service = {
             let mut slot = self.continuation_wait_service.lock();
             Arc::clone(slot.get_or_insert_with(|| {
-                Arc::new(
-                    carrick_kernel::kernel::continuation::CarrierWaitService::new(Arc::clone(
-                        &scheduler,
-                    )),
-                )
+                let s = carrick_kernel::kernel::continuation::CarrierWaitService::new(Arc::clone(
+                    &scheduler,
+                ));
+                if let Some(ref scope) = self.work_scope.lock().as_ref() {
+                    s.set_work_scope((*scope).clone());
+                }
+                Arc::new(s)
             }))
         };
         (scheduler, service)
+    }
+
+    pub(crate) fn set_work_scope(&self, scope: carrick_observability::work_meter::WorkScope) {
+        if let Some(service) = self.continuation_wait_service.lock().as_ref() {
+            service.set_work_scope(scope.clone());
+        }
+        *self.work_scope.lock() = Some(scope);
     }
 
     #[cfg_attr(

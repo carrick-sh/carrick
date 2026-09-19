@@ -53,6 +53,7 @@ trace-elf = ["carrick-mem/trace-elf"]
 # test sees `cfg(test)`, an integration test does not); a product build never
 # compiles it.
 test-support = ["carrick-hal/test-support", "carrick-kernel/test-support"]
+conformance-metrics = ["carrick-kernel/conformance-metrics", "carrick-observability/conformance-metrics"]
 
 # Platform backend selection (exactly one active at a time). carrick-cli's
 # `default` enables `platform-macos`; a `platform-linux` build links NO HVF.

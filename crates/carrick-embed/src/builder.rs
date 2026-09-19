@@ -134,6 +134,7 @@ pub struct ContainerBuilder {
     auditors: Vec<std::sync::Arc<dyn carrick_kernel::observe::KernelAuditor>>,
     network_interposer: Option<carrick_kernel::network::interposer::NetworkInterposer>,
     shared_buffers: Vec<(String, crate::SharedBuffer)>,
+    work_scope: Option<carrick_observability::work_meter::WorkScope>,
 }
 
 impl ContainerBuilder {
@@ -177,6 +178,7 @@ impl ContainerBuilder {
             auditors: Vec::new(),
             network_interposer: None,
             shared_buffers: Vec::new(),
+            work_scope: None,
         }
     }
 
@@ -404,6 +406,15 @@ impl ContainerBuilder {
         self
     }
 
+    /// Attach an execution-scoped work meter scope to the container.
+    pub fn work_scope(mut self, scope: carrick_observability::work_meter::WorkScope) -> Self {
+        if scope.is_retired() {
+            panic!("cannot attach an already-retired work scope to ContainerBuilder");
+        }
+        self.work_scope = Some(scope);
+        self
+    }
+
     fn validate(&self) -> Result<(), BuildError> {
         if self.image.trim().is_empty() {
             return Err(BuildError::InvalidImageRef {
@@ -545,6 +556,7 @@ impl ContainerBuilder {
             auditors: self.auditors,
             network_interposer: self.network_interposer,
             shared_buffers: self.shared_buffers,
+            work_scope: self.work_scope,
         })
     }
 
@@ -661,6 +673,9 @@ impl Container {
         if let Some(interposer) = self.network_interposer {
             extensions = extensions.network_interposer(interposer);
         }
+        if let Some(ref scope) = self.work_scope {
+            extensions = extensions.work_scope(scope.clone());
+        }
         Ok(PreparedContainer::new(
             spec,
             warnings,
@@ -673,6 +688,7 @@ impl Container {
                 lease: carrier_lease,
                 implicit: implicit_carrier,
             },
+            self.work_scope,
         ))
     }
 
@@ -727,6 +743,7 @@ pub struct Container {
     auditors: Vec<std::sync::Arc<dyn carrick_kernel::observe::KernelAuditor>>,
     network_interposer: Option<carrick_kernel::network::interposer::NetworkInterposer>,
     shared_buffers: Vec<(String, crate::SharedBuffer)>,
+    work_scope: Option<carrick_observability::work_meter::WorkScope>,
 }
 
 impl std::fmt::Debug for Container {

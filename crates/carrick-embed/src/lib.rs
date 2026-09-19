@@ -73,6 +73,7 @@
 //! deterministic replacement for [`Carrier::shutdown`].
 mod builder;
 mod carrier;
+pub mod contracts;
 mod deadline;
 pub(crate) mod entitlement;
 mod error;
@@ -87,6 +88,9 @@ pub(crate) static CARRIER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex
 
 pub use builder::{Container, ContainerBuilder, StdioConfig};
 pub use carrier::Carrier;
+pub use contracts::{
+    futex_contention_contract, run_futex_structural_contract, run_futex_timing_contract,
+};
 pub use error::{BuildError, EmbedError};
 pub use prepared::PreparedContainer;
 pub use result::ContainerResult;

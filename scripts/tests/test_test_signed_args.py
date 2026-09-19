@@ -188,6 +188,42 @@ class SignedTestArgumentTests(unittest.TestCase):
             self.assertTrue(canonical_receipt.exists())
             self.assertFalse(temporary_receipt.exists())
 
+    def test_features_validation(self) -> None:
+        valid_cases = ["", "conformance-metrics", "foo,bar_baz,test-1"]
+        for feat in valid_cases:
+            with self.subTest(feat=feat):
+                res = self.call_library('. "$1"; test_signed_validate_features "$2"', feat)
+                self.assertEqual(res.returncode, 0, res.stderr)
+
+        invalid_cases = ["two words", "invalid/name", ",bad", "bad,", "bad,,bad"]
+        for feat in invalid_cases:
+            with self.subTest(feat=feat):
+                res = self.call_library('. "$1"; test_signed_validate_features "$2"', feat)
+                self.assertEqual(res.returncode, 2, res.stderr)
+                self.assertIn("invalid CARRICK_TEST_SIGNED_FEATURES", res.stderr)
+
+    def test_empty_timing_invocation_emits_no_cargo_feature_flag(self) -> None:
+        res_empty = self.call_library('. "$1"; test_signed_cargo_feature_args "$2"', "")
+        self.assertEqual(res_empty.returncode, 0, res_empty.stderr)
+        self.assertEqual(res_empty.stdout.strip(), "")
+
+        res_feat = self.call_library('. "$1"; test_signed_cargo_feature_args "$2"', "conformance-metrics")
+        self.assertEqual(res_feat.returncode, 0, res_feat.stderr)
+        self.assertEqual(res_feat.stdout.strip(), "--features conformance-metrics")
+
+    def test_features_json_parsing(self) -> None:
+        res_empty = self.call_library('. "$1"; test_signed_features_json "$2"', "")
+        self.assertEqual(res_empty.returncode, 0, res_empty.stderr)
+        self.assertEqual(res_empty.stdout.strip(), "[]")
+
+        res_single = self.call_library('. "$1"; test_signed_features_json "$2"', "conformance-metrics")
+        self.assertEqual(res_single.returncode, 0, res_single.stderr)
+        self.assertEqual(res_single.stdout.strip(), '["conformance-metrics"]')
+
+        res_multi = self.call_library('. "$1"; test_signed_features_json "$2"', "foo,bar")
+        self.assertEqual(res_multi.returncode, 0, res_multi.stderr)
+        self.assertEqual(res_multi.stdout.strip(), '["foo","bar"]')
+
 
 if __name__ == "__main__":
     unittest.main()
