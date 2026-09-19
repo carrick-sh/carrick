@@ -1,0 +1,29 @@
+schema_version = 1
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/futex.rs"
+contracts = ["kernel.futex.contention"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/continuation.rs"
+contracts = ["kernel.futex.contention"]
+
+[[surfaces]]
+path = "crates/carrick-thread/src/platform_futex.rs"
+contracts = ["kernel.futex.contention"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/semantics/futex_contention.rs"
+contracts = ["kernel.futex.contention"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/shared_buffer_futex.rs"
+contracts = ["kernel.futex.contention"]
+
+[[surfaces]]
+path = "conformance-probes/src/bin/futexpingpong.rs"
+contracts = ["kernel.futex.contention"]
+
+[[surfaces]]
+path = "conformance-probes/src/bin/futexwakeexact.rs"
+contracts = ["kernel.futex.contention"]
