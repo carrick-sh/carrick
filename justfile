@@ -155,6 +155,8 @@ lint-domains:
     # blocked gate for every unrelated change.
     python3 -m unittest scripts/migrate/tests/test_reconcile_rename.py scripts/tests/test_rehome_line_pinned_inventories.py
     python3 -m unittest scripts/tests/test_conformance_contract_policy.py
+    cargo run -p carrick-conformance-contract --bin check-contracts -- --root .
+    python3 -m unittest scripts/tests/test_check_contract_change.py
     python3 scripts/migrate/check-runtime-global-state.py --check
     python3 scripts/migrate/check-runtime-aborts.py --check
     python3 scripts/migrate/check-task-participant-witnesses.py --check
@@ -849,3 +851,7 @@ worktree-gc DAYS="14" MODE="dry":
     [ "{{MODE}}" = "dry" ] && [ "$swept" -gt 0 ] && \
         echo "worktree-gc: re-run as 'just worktree-gc {{DAYS}} apply' to delete."
     exit 0
+
+# Check that changed guest surfaces have matching conformance contract evidence
+check-contract-change base head="HEAD":
+    python3 scripts/conformance/check-contract-change.py --root . --base {{base}} --head {{head}}

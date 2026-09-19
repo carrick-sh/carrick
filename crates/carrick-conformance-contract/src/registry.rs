@@ -192,7 +192,7 @@ pub enum RegistryError {
     MissingSemanticAuthority(ContractId),
     #[error("contract {0} has no contract rationale")]
     MissingContractRationale(ContractId),
-    #[error("contract {id} has no {layer:?} binding")]
+    #[error("{id}: missing {layer} binding")]
     MissingBinding {
         id: ContractId,
         layer: ExecutionLayer,

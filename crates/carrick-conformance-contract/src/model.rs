@@ -56,6 +56,18 @@ pub enum ExecutionLayer {
     Ecosystem,
 }
 
+impl fmt::Display for ExecutionLayer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExecutionLayer::VmFree => write!(f, "vm_free"),
+            ExecutionLayer::EmbedStructural => write!(f, "embed_structural"),
+            ExecutionLayer::EmbedTiming => write!(f, "embed_timing"),
+            ExecutionLayer::Docker => write!(f, "docker"),
+            ExecutionLayer::Ecosystem => write!(f, "ecosystem"),
+        }
+    }
+}
+
 pub use carrick_observability::work_meter::WorkMetric;
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
