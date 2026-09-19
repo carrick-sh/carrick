@@ -384,6 +384,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-conformance-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "carrick-conformance-next"
 version = "0.1.0"
 dependencies = [
