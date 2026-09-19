@@ -54,7 +54,15 @@ contracts = ["kernel.fork.filetable"]
 
 [[surfaces]]
 path = "crates/carrick-kernel-example/tests/semantics/fork_scaling.rs"
-contracts = ["kernel.fork.filetable"]
+contracts = ["kernel.fork.filetable", "kernel.fork.mappings"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs"
+contracts = ["kernel.fork.mappings"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/process_plan.rs"
+contracts = ["kernel.fork.mappings"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/event.rs"

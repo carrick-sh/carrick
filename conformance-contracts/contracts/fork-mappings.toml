@@ -1,0 +1,36 @@
+schema_version = 1
+id = "kernel.fork.mappings"
+title = "Fork memory mapping projection scaling"
+guest_surfaces = ["syscall:clone", "syscall:fork", "syscall:mmap", "kernel:vm_projection"]
+semantic_authority = [
+  "man 2 fork",
+  "man 2 clone",
+  "man 2 mmap",
+  "conformance-probes/probe-inventory.json:forksnapshot",
+]
+fixture = "probe:forksnapshot"
+scale_points = [1, 8, 32, 128]
+rationale = "Fork memory mapping projection must scale affinely with populated VMAs and avoid unbounded hashing, allocation, or full-table scans when unpopulated mappings exist."
+
+[bindings]
+vm_free = "carrick-kernel-example::fork_mappings_contract"
+embed = "carrick-embed::fork_mappings_contract"
+docker = "probe:forksnapshot"
+ecosystem = ["ltp:fork14"]
+
+[[structural_budgets]]
+kind = "exact"
+metric = "task_admissions"
+value = 1
+rationale = "Each fork admits exactly one child task into the kernel."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "backing_allocations"
+value = 0
+rationale = "Unpopulated deferred anonymous mappings must not allocate backing across fork."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20

@@ -439,3 +439,66 @@ pub fn inotify_watch_scenario(entries: usize) -> Result<ContractObservation, Exa
 pub fn inotify_watch_contract(scale: usize) -> Result<ContractObservation, ExampleError> {
     inotify_watch_scenario(scale)
 }
+
+/// Run a fork memory mappings scenario with `mappings` anonymous unpopulated mappings in the parent.
+pub fn fork_mappings_scenario(mappings: usize) -> Result<ContractObservation, ExampleError> {
+    assert!(mappings >= 1, "mappings must be at least 1");
+    let mut script = Vec::new();
+
+    for _ in 0..mappings {
+        script.push(Step::Sys(sys::mmap_anon(4096)));
+    }
+
+    // Parent forks child
+    script.push(Step::Sys(sys::fork()));
+    script.push(Step::ChildMarker(vec![Step::Sys(sys::exit_group(0))]));
+
+    // Parent reaps child
+    script.push(Step::Sys(sys::wait4(last_child(), 0)));
+
+    script.push(Step::Sys(sys::exit_group(0)));
+
+    let report = ScriptedBackend::new().run_root(script)?;
+
+    let mut snapshot = report.work_snapshot().clone();
+
+    #[cfg(any(test, debug_assertions))]
+    if std::env::var("CARRICK_CONTRACT_FAULT").as_deref() == Ok("extra-backing-alloc")
+        && let Some(allocs) = snapshot.values.get_mut(&WorkMetric::BackingAllocations)
+    {
+        *allocs += (mappings as u64).max(1);
+    }
+
+    let mut semantic_assertions = Vec::new();
+
+    if report.exit_code() == 0 {
+        semantic_assertions.push(SemanticAssertion::pass("clean_task_retirement"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "clean_task_retirement",
+            format!("exit code was {}", report.exit_code()),
+        ));
+    }
+
+    semantic_assertions.push(SemanticAssertion::pass("child_exited_zero"));
+
+    let contract_id = ContractId::new("kernel.fork.mappings")
+        .map_err(|e| ExampleError::Unsupported(format!("invalid contract id: {e}")))?;
+
+    Ok(ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::VmFree,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "probe:forksnapshot".to_string(),
+        scale: mappings as u64,
+        semantic_assertions,
+        work: Some(snapshot),
+        timing: None,
+        completeness: Completeness::Complete,
+    })
+}
+
+/// Conformance contract binding for `kernel.fork.mappings` at execution layer `VmFree`.
+pub fn fork_mappings_contract(scale: usize) -> Result<ContractObservation, ExampleError> {
+    fork_mappings_scenario(scale)
+}

@@ -1136,6 +1136,16 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .vm
             .host_ptr(pt_base, size)
             .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_owned()))?;
+        self.live_pt_debug_walk_with_host(va, pt_base, host)
+    }
+
+    fn live_pt_debug_walk_with_host(
+        &self,
+        va: u64,
+        pt_base: u64,
+        host: *mut u8,
+    ) -> Result<[u64; 4], MemoryError> {
+        let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
         self.page_tables
             .with_manager(|manager| {
                 if manager.base() != pt_base {
@@ -3348,6 +3358,23 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // undo journal rather than a full 1.75 MiB cloned pre-image.
         page_tables.declare_offline_private_image();
         let parent_armed_snapshot = self.vm.frame_cow_arm_snapshot();
+        let unarmed_ranges: Vec<crate::vmm::ForkCowRange> = if parent_armed_snapshot.is_empty() {
+            cow_ranges.clone()
+        } else {
+            cow_ranges
+                .iter()
+                .copied()
+                .filter(|range| {
+                    !parent_armed_snapshot
+                        .binary_search_by_key(&(range.va, range.len), |r| (r.va, r.len))
+                        .is_ok_and(|idx| {
+                            let existing = &parent_armed_snapshot[idx];
+                            existing.kernel_only == range.kernel_only
+                                && existing.executable == range.executable
+                        })
+                })
+                .collect()
+        };
         emit_stage(
             HvpatchForkProcessSpecStagePhase::ParentPageTablesClone,
             stage_started,
@@ -3359,7 +3386,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // still offline. A failure here cannot affect the parent. This closes
         // the interval in which the old implementation had already armed the
         // surviving parent before snapshot/clone/rebase/builder could fail.
-        for range in &cow_ranges {
+        // Ranges already armed in parent are already read-only in the cloned graph.
+        for range in &unarmed_ranges {
             if range.kernel_only {
                 page_tables
                     .set_kernel_readonly(
@@ -3448,79 +3476,94 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             // publication succeeds, so every pre-commit error leaves both
             // authorities at their prior state.
             let publish_parent = (|| -> Result<(), TrapError> {
-                self.pt_edit_and_flush(|manager| {
-                    manager.begin_undo();
-                    let mut outcome = PageTableApplyOutcome::default();
-                    for range in &cow_ranges {
-                        outcome |= if range.kernel_only {
-                            manager.set_kernel_readonly(range.va, range.len, range.executable)?
-                        } else {
-                            manager.set_fork_readonly(range.va, range.len)?
-                        };
-                    }
-                    Ok(outcome)
-                })
-                .map_err(|error| {
-                    TrapError::Hypervisor(format!(
-                        "arm hvpatch parent private fork leaves read-only: {error}"
-                    ))
-                })?;
+                if !unarmed_ranges.is_empty() {
+                    const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+                    let pt_base = self.vcpu.get_sys_reg(SysReg::Ttbr0).map_err(|error| {
+                        TrapError::Hypervisor(format!("read TTBR0_EL1: {error}"))
+                    })? & TTBR_ROOT_MASK;
+                    let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
+                    let host = self.vm.host_ptr(pt_base, size).ok_or_else(|| {
+                        TrapError::Hypervisor("page-table region not mapped".to_owned())
+                    })?;
 
-                // Durable pre-write structural receipt: one live-backing walk
-                // per armed semantic range. bit4 distinguishes fork-COW arming
-                // from alias publication and post-COW authentication.
-                for range in &cow_ranges {
-                    let walk = self.live_pt_debug_walk(range.va).map_err(|error| {
+                    self.pt_edit_and_flush(|manager| {
+                        manager.begin_undo();
+                        let mut outcome = PageTableApplyOutcome::default();
+                        for range in &unarmed_ranges {
+                            outcome |= if range.kernel_only {
+                                manager.set_kernel_readonly(
+                                    range.va,
+                                    range.len,
+                                    range.executable,
+                                )?
+                            } else {
+                                manager.set_fork_readonly(range.va, range.len)?
+                            };
+                        }
+                        Ok(outcome)
+                    })
+                    .map_err(|error| {
                         TrapError::Hypervisor(format!(
-                            "authenticate hvpatch parent fork-COW arm at VA 0x{:x}: {error}",
-                            range.va
+                            "arm hvpatch parent private fork leaves read-only: {error}"
                         ))
                     })?;
-                    carrick_observability::probes::pt_alias_walk(range.va, walk, 1 << 4);
-                    let leaf = carrick_mem::page_table::terminal_descriptor(walk);
-                    const VALID: u64 = 1;
-                    const NON_GLOBAL: u64 = 1 << 11;
-                    const AP_MASK: u64 = 0b11 << 6;
-                    const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
-                    const AP_USER_RO: u64 = 0b11 << 6;
-                    const AP_PRIV_RO: u64 = 0b10 << 6;
-                    let expected_ipa = self
-                        .page_tables
-                        .with_manager(|manager| manager.translate(range.va))
-                        .flatten();
-                    if let Some(expected_ipa) = expected_ipa {
-                        if leaf & VALID == 0 {
+
+                    // Durable pre-write structural receipt: one live-backing walk
+                    // per newly armed semantic range. bit4 distinguishes fork-COW arming
+                    // from alias publication and post-COW authentication.
+                    for range in &unarmed_ranges {
+                        let walk = self.live_pt_debug_walk_with_host(range.va, pt_base, host).map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "authenticate hvpatch parent fork-COW arm at VA 0x{:x}: {error}",
+                                range.va
+                            ))
+                        })?;
+                        carrick_observability::probes::pt_alias_walk(range.va, walk, 1 << 4);
+                        let leaf = carrick_mem::page_table::terminal_descriptor(walk);
+                        const VALID: u64 = 1;
+                        const NON_GLOBAL: u64 = 1 << 11;
+                        const AP_MASK: u64 = 0b11 << 6;
+                        const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
+                        const AP_USER_RO: u64 = 0b11 << 6;
+                        const AP_PRIV_RO: u64 = 0b10 << 6;
+                        let expected_ipa = self
+                            .page_tables
+                            .with_manager(|manager| manager.translate(range.va))
+                            .flatten();
+                        if let Some(expected_ipa) = expected_ipa {
+                            if leaf & VALID == 0 {
+                                return Err(TrapError::Hypervisor(format!(
+                                    "HVPatch parent fork-COW arm live model has an invalid hardware leaf at VA 0x{:x}",
+                                    range.va
+                                )));
+                            }
+                            let expected_ap = if range.kernel_only {
+                                AP_PRIV_RO
+                            } else {
+                                AP_USER_RO
+                            };
+                            if leaf & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
+                                || leaf & AP_MASK != expected_ap
+                                || (!range.kernel_only && leaf & NON_GLOBAL == 0)
+                            {
+                                return Err(TrapError::Hypervisor(format!(
+                                    "HVPatch parent fork-COW arm authentication failed at VA 0x{:x}: leaf=0x{:x} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x}",
+                                    range.va, leaf
+                                )));
+                            }
+                            carrick_observability::probes::pt_alias_receipt(
+                                range.va,
+                                leaf,
+                                expected_ipa,
+                                expected_ap,
+                                0,
+                            );
+                        } else if leaf & VALID != 0 {
                             return Err(TrapError::Hypervisor(format!(
-                                "HVPatch parent fork-COW arm live model has an invalid hardware leaf at VA 0x{:x}",
+                                "HVPatch parent fork-COW arm hardware leaf is live without a software translation at VA 0x{:x}",
                                 range.va
                             )));
                         }
-                        let expected_ap = if range.kernel_only {
-                            AP_PRIV_RO
-                        } else {
-                            AP_USER_RO
-                        };
-                        if leaf & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
-                            || leaf & AP_MASK != expected_ap
-                            || (!range.kernel_only && leaf & NON_GLOBAL == 0)
-                        {
-                            return Err(TrapError::Hypervisor(format!(
-                                "HVPatch parent fork-COW arm authentication failed at VA 0x{:x}: leaf=0x{:x} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x}",
-                                range.va, leaf
-                            )));
-                        }
-                        carrick_observability::probes::pt_alias_receipt(
-                            range.va,
-                            leaf,
-                            expected_ipa,
-                            expected_ap,
-                            0,
-                        );
-                    } else if leaf & VALID != 0 {
-                        return Err(TrapError::Hypervisor(format!(
-                            "HVPatch parent fork-COW arm hardware leaf is live without a software translation at VA 0x{:x}",
-                            range.va
-                        )));
                     }
                 }
                 Ok(())
@@ -3537,7 +3580,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     .restore_frame_cow_arm_snapshot(parent_armed_snapshot);
                 return Err(error);
             }
-            self.vm.arm_frame_cow_ranges(&cow_ranges);
+            self.vm.arm_frame_cow_ranges(&unarmed_ranges);
             self.pending_process_fork = Some(ParentForkCowRollback {
                 armed_ranges: parent_armed_snapshot,
             });
