@@ -4,12 +4,13 @@ Updated 2026-09-19. **Phase 3 is incomplete. Resume implementation, not promotio
 
 ## Workspace and authority
 
-- Work only in `/Users/tjfontaine/.codex/worktrees/gmp-phase3/carrick`.
-- Branch: `codex/gmp-phase3`.
+- Resume in any Carrick checkout containing the checkpoint commits below.
+  Resolve the repository root and inspect its current status before editing;
+  no particular branch name or worktree path is required.
 - Original base: `93f648aa956feeeb256d4bbd3aaa0c9a60101a8a`.
 - Rebased onto local `main`: `a58a89c219574b9aaad382db67fcf7206dd300f5`.
-- Implementation is preserved as logical checkpoint commits on
-  `codex/gmp-phase3`: runtime/kernel foundation, public regression suites,
+- Implementation is preserved as logical checkpoint commits:
+  runtime/kernel foundation, public regression suites,
   debugging documentation, then this plan/evidence handoff. These are incomplete
   feature checkpoints, not acceptance or promotion commits.
 - Rebase used a recovery stash, still retained:
@@ -17,10 +18,10 @@ Updated 2026-09-19. **Phase 3 is incomplete. Resume implementation, not promotio
   It is a backup, **not something to apply again**. Tracked patch IDs matched
   before/after rebase; all 12 pre-rebase untracked files matched their saved
   hashes. The only tracked overlap, embed `lib.rs`, auto-merged cleanly.
-- No merge into main, push, signed guest run, or default executor-sizing change
-  has been made. Main checkout was not changed. The user requested fast-forward
-  integration only if ready; missing signed integration evidence and a red lint
-  gate mean that condition is not met. Resume this branch, not main.
+- The user explicitly authorized local-main integration as an incomplete
+  checkpoint, deferring the known lint issues. This does not establish signed
+  guest acceptance or Phase 3 completion. No push or default executor-sizing
+  change is authorized by that checkpoint integration.
 - User initially approved Antigravity, then explicitly chose to finish ourselves.
   Three Antigravity drafts were rejected earlier. Use native implementation.
 - User approved bounded native fanout: main owns production, a file-disjoint
@@ -106,7 +107,7 @@ Key new code:
 - `crates/carrick-embed/tests/host_wait_policy.rs`
 
 Other touched files are the existing dispatcher/resource/runtime/debug seams.
-The worktree's debugging skill was also expanded: `.agents/skills/carrick-lldb/`
+The repository's debugging skill was also expanded: `.agents/skills/carrick-lldb/`
 documents `carrick debug`, live kernel tables, LLDB, cores, artifact validation,
 carrier selection and caveats. There is no shell-level `carrick lldb` command.
 
@@ -160,11 +161,11 @@ two-contract audit; inspect the rebased registry before adding ours.
    cover pre-park races, signals and lifecycle composition. Only then change
    default bound-executor count and pursue exact-artifact acceptance.
 
-Use `RUSTC_WRAPPER=`. Build/test commands need the worktree path explicitly;
-the default task cwd may be the main checkout. Do not build under live guests.
+Use `RUSTC_WRAPPER=`. Run build/test commands from the selected repository root;
+do not assume the session's default directory is correct. Do not build under live guests.
 Coordinate one build slot across agents and never overlap Carrick with Docker.
-Do not merge/push without request. The next session should resume this worktree,
-not create another or repeat the already verified foundation.
+Do not push without request. Resume the committed source in the chosen checkout;
+do not repeat the already verified foundation or depend on the original worktree.
 
 ## Post-rebase checks
 
@@ -190,8 +191,9 @@ All implementation agents and the validation chain have stopped.
 
 On the user's subsequent request, work was split into implementation (including
 internal tests), public regression suites, debugging documentation, and this
-handoff/evidence commit. Inspect `git log main..codex/gmp-phase3` for the exact
-four-commit sequence. The first two commits are `4f36777b9` and `58313ffeb`.
+handoff/evidence commit. The commits are `4f36777b9` (implementation),
+`58313ffeb` (public tests), `66a252e24` (debugging documentation), and
+`9e2bdb611` (handoff/evidence). These identifiers are independent of branch names.
 
 Fresh pre-commit validation exited 0: `just test-kernel` (2072 parallel passed,
 1 ignored, plus serial/semantics suites), serial runtime lib (578 passed,
@@ -199,9 +201,9 @@ Fresh pre-commit validation exited 0: `just test-kernel` (2072 parallel passed,
 `/private/tmp/gmp-phase3-checkpoint-{kernel,runtime,policy,fmt}.log`.
 Commit formatting hooks remained enabled.
 
-The conditional request to fast-forward main was not executed: the checkpoint
-is resumable, but not integration-ready under the repository's acceptance
-rules. In addition to incomplete implementation, signed exact-artifact proof,
-contract binding and broader gates remain open; the earlier incoming-main lint
-failure is unresolved. Main's three unrelated untracked plans were untouched.
-No push, branch deletion, worktree removal, or recovery-stash modification.
+The initial conditional integration request was deferred. The user subsequently
+explicitly requested this checkpoint on local main and authorized deferring the
+four incoming lint findings. Signed exact-artifact proof, contract binding,
+broader gates and the remaining implementation are still required for acceptance.
+Preserve unrelated checkout changes. No push, branch deletion, worktree removal,
+or recovery-stash modification is part of this handoff.
