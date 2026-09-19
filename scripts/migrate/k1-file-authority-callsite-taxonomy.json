@@ -377,7 +377,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 195,
+      "line": 201,
       "categories": [
         "table_guard"
       ],
@@ -388,7 +388,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 273,
+      "line": 279,
       "categories": [
         "table_guard"
       ],
@@ -399,7 +399,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 298,
+      "line": 304,
       "categories": [
         "table_guard"
       ],
@@ -410,7 +410,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 349,
+      "line": 355,
       "categories": [
         "table_guard"
       ],
@@ -421,7 +421,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 356,
+      "line": 362,
       "categories": [
         "table_guard"
       ],
@@ -432,7 +432,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 373,
+      "line": 379,
       "categories": [
         "table_guard"
       ],
