@@ -207,3 +207,24 @@ four incoming lint findings. Signed exact-artifact proof, contract binding,
 broader gates and the remaining implementation are still required for acceptance.
 Preserve unrelated checkout changes. No push, branch deletion, worktree removal,
 or recovery-stash modification is part of this handoff.
+
+## Local integration receipt and next validation blocker
+
+Local main was fast-forwarded to `f3c8685f2` on 2026-09-19, preserving unrelated
+checkout changes. No push was performed. Resume from any checkout containing
+that commit and this receipt; the original implementation branch is unnecessary.
+
+Post-merge `RUSTC_WRAPPER= just test-kernel` exited 101. The parallel kernel
+suite passed 2072 tests (1 ignored). The semantics binary passed 78 tests and
+failed `futex_contention::futex_pi_lock_unlock_deadlock_detection`:
+
+```text
+Task { pid: 1, tid: 2, error: Unsupported("continuation build failed: failed to pin an exact fd description") }
+```
+
+Log: `/private/tmp/gmp-phase3-main-kernel.log` (host-local supporting evidence).
+This failure is not attributed yet and was not retried or fixed during handoff.
+Investigate it before claiming the integrated host gate is green. The earlier
+passing checkpoint tests do not override this result. A concurrent modification
+to `crates/carrick-kernel/src/inotify.rs` appeared during validation; it was not
+made or staged by this task. Do not overwrite it or assume a pristine checkout.
