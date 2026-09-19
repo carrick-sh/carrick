@@ -3590,6 +3590,7 @@ mod tests {
         let reporter = crate::compat::CompatReporter::default();
         let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 64]);
         let cx = crate::dispatch::SyscallCtx {
+            host_wait: None,
             kernel: &context,
             request: crate::dispatch::SyscallRequest::new(
                 129,
@@ -3691,6 +3692,7 @@ mod tests {
         let reporter = crate::compat::CompatReporter::default();
         let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 64]);
         let cx = crate::dispatch::SyscallCtx {
+            host_wait: None,
             kernel: &root,
             request: crate::dispatch::SyscallRequest::new(
                 129,
@@ -4940,6 +4942,7 @@ mod tests {
         let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
         let reporter = crate::compat::CompatReporter::default();
         let cx = crate::dispatch::SyscallCtx {
+            host_wait: None,
             kernel: &kernel,
             request: crate::dispatch::SyscallRequest::new(
                 130,
@@ -5114,6 +5117,7 @@ mod tests {
         let reporter = crate::compat::CompatReporter::default();
         let guest_main_tid = i64::from(std::process::id());
         let cx = crate::dispatch::SyscallCtx {
+            host_wait: None,
             kernel: &kernel,
             request: crate::dispatch::SyscallRequest::new(
                 130,
@@ -5435,6 +5439,7 @@ mod tests {
             let reporter = crate::compat::CompatReporter::default();
             let kernel = d.capture_one_task_context().unwrap();
             let cx = crate::dispatch::SyscallCtx {
+                host_wait: None,
                 kernel: &kernel,
                 request: crate::dispatch::SyscallRequest::new(
                     138,
@@ -5500,6 +5505,7 @@ mod tests {
             let reporter = crate::compat::CompatReporter::default();
             let kernel = d.capture_one_task_context().unwrap();
             let cx = crate::dispatch::SyscallCtx {
+                host_wait: None,
                 kernel: &kernel,
                 request: crate::dispatch::SyscallRequest::new(
                     138,
@@ -5599,6 +5605,7 @@ mod tests {
             memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
             let kernel = d.capture_one_task_context().unwrap();
             let cx = crate::dispatch::SyscallCtx {
+                host_wait: None,
                 kernel: &kernel,
                 request: crate::dispatch::SyscallRequest::new(
                     138,
@@ -5694,6 +5701,7 @@ mod tests {
             memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
             let kernel = d.capture_one_task_context().unwrap();
             let cx = crate::dispatch::SyscallCtx {
+                host_wait: None,
                 kernel: &kernel,
                 request: crate::dispatch::SyscallRequest::new(
                     138,
@@ -5774,6 +5782,7 @@ mod tests {
             let reporter = crate::compat::CompatReporter::default();
             let kernel = d.capture_one_task_context().unwrap();
             let cx = crate::dispatch::SyscallCtx {
+                host_wait: None,
                 kernel: &kernel,
                 request: crate::dispatch::SyscallRequest::new(
                     138,
@@ -5818,6 +5827,7 @@ mod tests {
             let siginfo = LinuxSiginfo::rt_queue(34, 1234, 0, 0x00ca_fe42);
             memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
             let cx = crate::dispatch::SyscallCtx {
+                host_wait: None,
                 kernel: &kernel,
                 request: crate::dispatch::SyscallRequest::new(
                     129,

@@ -9,8 +9,10 @@ use std::sync::Arc;
 
 use carrick_fatal::carrick_fatal;
 
-#[derive(Clone)]
 pub(super) struct CapturedResources {
+    file_lease: Option<crate::kernel::objects::FileTableFunctionalLease>,
+    files_finished: bool,
+    write_rearm: Option<super::net::WriteRearm>,
     credentials: Arc<crate::kernel::Credentials>,
     fs_context: Arc<crate::kernel::FsContext>,
     files: Arc<crate::kernel::FileTable>,
@@ -28,6 +30,9 @@ pub(super) struct CapturedResources {
 impl CapturedResources {
     pub(super) fn from_context(context: &crate::kernel::KernelContext) -> Self {
         Self {
+            file_lease: None,
+            files_finished: false,
+            write_rearm: None,
             credentials: context.resources().credentials(),
             fs_context: context.resources().fs_context(),
             files: context.resources().files(),
@@ -45,6 +50,12 @@ impl CapturedResources {
     }
 
     pub(super) fn files(&self) -> Arc<crate::kernel::FileTable> {
+        if self.files_finished {
+            carrick_fatal!(
+                "dispatch::host_wait",
+                "file authority used after owned host operation boundary"
+            );
+        }
         Arc::clone(&self.files)
     }
 
@@ -182,23 +193,25 @@ pub(super) fn with_resources<R>(resources: CapturedResources, operation: impl Fn
 }
 
 fn with_resource_scope<R>(
-    resources: CapturedResources,
+    mut resources: CapturedResources,
     context: *const crate::kernel::KernelContext,
     operation: impl FnOnce() -> R,
 ) -> R {
-    let _file_table_lease = resources
-        .files
-        .acquire_functional_lease()
-        .unwrap_or_else(|| {
-            tracing::error!(
-                file_table = ?resources.files.id(),
-                "captured operation reached a draining FileTable generation"
-            );
-            carrick_fatal!(
-                "dispatch::file_table_lease",
-                "captured operation reached a draining FileTable generation"
-            );
-        });
+    resources.file_lease = Some(
+        resources
+            .files
+            .acquire_functional_lease()
+            .unwrap_or_else(|| {
+                tracing::error!(
+                    file_table = ?resources.files.id(),
+                    "captured operation reached a draining FileTable generation"
+                );
+                carrick_fatal!(
+                    "dispatch::file_table_lease",
+                    "captured operation reached a draining FileTable generation"
+                );
+            }),
+    );
     struct Restore {
         context: *const crate::kernel::KernelContext,
     }
@@ -216,6 +229,72 @@ fn with_resource_scope<R>(
     CAPTURED_RESOURCES.with(|stack| stack.borrow_mut().push(resources));
     let _restore = Restore { context: previous };
     operation()
+}
+
+/// Capture from the handler's selected endpoint, never from a second fd lookup.
+pub(super) fn stage_write_rearm(
+    context: &crate::kernel::KernelContext,
+    rearm: super::net::WriteRearm,
+) -> Result<(), super::DispatchError> {
+    if !ACTIVE_CONTEXT.with(|active| std::ptr::eq(active.get(), context)) {
+        return Err(super::DispatchError::HostWaitResourceScope);
+    }
+    CAPTURED_RESOURCES.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let resources = stack
+            .last_mut()
+            .ok_or(super::DispatchError::HostWaitResourceScope)?;
+        if resources.files_finished || resources.write_rearm.is_some() {
+            return Err(super::DispatchError::HostWaitResourceScope);
+        }
+        resources.write_rearm = Some(rearm);
+        Ok(())
+    })
+}
+
+/// Consume only owned completion state; no file-table use is reacquired.
+pub(super) fn take_write_rearm() -> Option<super::net::WriteRearm> {
+    CAPTURED_RESOURCES.with(|stack| {
+        stack
+            .borrow_mut()
+            .last_mut()
+            .and_then(|scope| scope.write_rearm.take())
+    })
+}
+
+/// Consume this dispatch's file-table access before an owned host operation.
+/// No file-table lookup is permitted afterwards: callers must have pinned all
+/// endpoints and must return the operation's result without recapturing files.
+/// Keeping even a reacquired lease while waiting for P would recreate the
+/// retirement cycle this boundary breaks.
+pub(super) fn finish_files_for_host_wait(
+    context: &crate::kernel::KernelContext,
+) -> Result<(), super::DispatchError> {
+    let active = ACTIVE_CONTEXT.with(Cell::get);
+    if active.is_null() && CAPTURED_RESOURCES.with(|stack| stack.borrow().is_empty()) {
+        // Public MM/scheduler seam used outside a filesystem dispatch scope.
+        return Ok(());
+    }
+    if !std::ptr::eq(active, context) {
+        return Err(super::DispatchError::HostWaitResourceScope);
+    }
+    let lease = CAPTURED_RESOURCES.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        // An outer, different context could retain another blocking lease.
+        if stack.len() != 1 {
+            return Err(super::DispatchError::HostWaitResourceScope);
+        }
+        let resources = stack
+            .last_mut()
+            .ok_or(super::DispatchError::HostWaitResourceScope)?;
+        if resources.files_finished {
+            return Err(super::DispatchError::HostWaitResourceScope);
+        }
+        resources.files_finished = true;
+        Ok(resources.file_lease.take())
+    })?;
+    drop(lease);
+    Ok(())
 }
 
 pub(super) fn with_retiring_file_table<R>(

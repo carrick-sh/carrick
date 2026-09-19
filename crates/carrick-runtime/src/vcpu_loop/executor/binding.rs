@@ -310,6 +310,7 @@ pub(crate) enum TakenExecutionAuthority {
 
 pub struct ExecutorSubmissionContext<'a> {
     pub(crate) scheduler: &'a Scheduler,
+    pub(crate) registration: Option<&'a carrick_kernel::kernel::ExecutorRegistration>,
     #[cfg(test)]
     pub(crate) publish_test_descendant: &'a dyn Fn(
         Arc<carrick_kernel::kernel::Thread>,
@@ -428,6 +429,31 @@ impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
 }
 
 impl ExecutorSubmissionContext<'_> {
+    pub(crate) fn host_wait_context(
+        &self,
+    ) -> Option<carrick_kernel::dispatch::HostWaitContext<'_>> {
+        self.registration
+            .map(|registration| carrick_kernel::dispatch::HostWaitContext {
+                scheduler: self.scheduler,
+                registration,
+            })
+    }
+    /// Temporarily lend this worker's CPU while retaining its live lease.
+    /// The guard must end before the backend touches guest memory again.
+    pub fn begin_host_wait(&self) -> Result<carrick_kernel::kernel::HostWaitToken<'_>, TrapError> {
+        let registration = self.registration.ok_or_else(|| {
+            TrapError::Hypervisor("host wait requires an executor registration".to_owned())
+        })?;
+        let AuthoritySlotState::Live(lease) = &self.authority.state else {
+            return Err(TrapError::Hypervisor(
+                "host wait requires a live execution lease".to_owned(),
+            ));
+        };
+        self.scheduler
+            .begin_host_wait_with_lease(lease, registration)
+            .map_err(|error| TrapError::Hypervisor(error.to_string()))
+    }
+
     pub(crate) fn execution_lease_mut(&mut self) -> Result<&mut ThreadExecutionLease, TrapError> {
         self.authority.as_mut().ok_or_else(|| {
             TrapError::Hypervisor("quantum has no mutable execution lease authority".to_owned())

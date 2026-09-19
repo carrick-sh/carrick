@@ -1394,14 +1394,20 @@ where
         kernel: &Kernel,
         engine: &mut E,
         frame: carrick_hal::RawSyscall,
+        host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
         let mut executor = self.guest_execution.take().ok_or_else(|| {
             RuntimeError::Configuration(
                 "syscall service lacks MM executor participation".to_owned(),
             )
         })?;
-        let result =
-            self.service_threaded_syscall_for_executor(kernel, engine, frame, &mut executor);
+        let result = self.service_threaded_syscall_for_executor(
+            kernel,
+            engine,
+            frame,
+            &mut executor,
+            host_wait,
+        );
         self.guest_execution = Some(executor);
         result
     }
@@ -1412,6 +1418,7 @@ where
         engine: &mut E,
         frame: carrick_hal::RawSyscall,
         mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
+        host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
         self.service_kernel_context = None;
         if !self.syscall_completion.is_idle() {
@@ -1453,13 +1460,20 @@ where
         if let Some(outcome) = prepared_outcome {
             return Ok(outcome);
         }
-        self.redispatch_threaded_syscall_for_executor(kernel, engine, syscall, mm_executor)
+        self.redispatch_threaded_syscall_for_executor(
+            kernel,
+            engine,
+            syscall,
+            mm_executor,
+            host_wait,
+        )
     }
 
     fn redispatch_threaded_syscall(
         &mut self,
         kernel: &Kernel,
         engine: &mut E,
+        host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
         let mut executor = self.guest_execution.take().ok_or_else(|| {
             RuntimeError::Configuration(
@@ -1470,8 +1484,13 @@ where
             .syscall_completion
             .guest("syscall redispatch lost completion token")?
             .syscall();
-        let result =
-            self.redispatch_threaded_syscall_for_executor(kernel, engine, syscall, &mut executor);
+        let result = self.redispatch_threaded_syscall_for_executor(
+            kernel,
+            engine,
+            syscall,
+            &mut executor,
+            host_wait,
+        );
         self.guest_execution = Some(executor);
         result
     }
@@ -1482,6 +1501,7 @@ where
         engine: &mut E,
         syscall: PreparedSyscall,
         mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
+        host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
         let kernel_context = self
             .service_kernel_context
@@ -1685,6 +1705,7 @@ where
                                 &kernel.reporter,
                                 make_thread_ctx(),
                                 OrdinaryDispatchRoute {
+                                    host_wait,
                                     lease,
                                     mm_executor: Some(mm_executor),
                                 },

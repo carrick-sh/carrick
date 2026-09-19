@@ -1560,6 +1560,12 @@ struct HostFdOwner {
 #[derive(Debug, Clone)]
 pub struct HostFdRef(Arc<HostFdOwner>);
 
+impl std::os::fd::AsFd for HostFdRef {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.0.fd)
+    }
+}
+
 impl HostFdRef {
     pub(super) fn new(fd: i32) -> Self {
         Self::with_private_file_source(fd, carrick_guest_mem::PrivateFileSource::Mutable)

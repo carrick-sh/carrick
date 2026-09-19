@@ -2492,8 +2492,11 @@ impl<'a> FsView<'a> {
                                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                                 }
                                 if !this.io.inherits_host_stdio() {
+                                    let rearm_target = Arc::clone(&open_file.description);
                                     drop(open);
-                                    return Ok(this.write_stdio_sink(stream, &bytes));
+                                    drop(io_lease);
+                                    drop(open_file);
+                                    return this.write_owned_stdio_sink(cx, stream, bytes, Some(rearm_target));
                                 }
                             }
                             // pty ends and O_RDWR FIFOs are bidirectional; only
@@ -2953,7 +2956,7 @@ impl<'a> FsView<'a> {
             // never buffered when the sink is live: busybox ash writes its
             // post-Enter newline to fd 2 via write(2), and buffering it left
             // the newline stuck until exit.
-            Ok(this.write_stdio_sink(fd, &bytes))
+            this.write_owned_stdio_sink(cx, fd, bytes, None)
 
         }
 

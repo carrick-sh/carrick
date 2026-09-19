@@ -449,6 +449,7 @@ where
                 resolver.publish_test_descendant(scheduler, parent, child, child_generation)
             };
             let mut submission = ExecutorSubmissionContext {
+                registration: Some(registration),
                 scheduler,
                 #[cfg(test)]
                 publish_test_descendant: &publish_test_descendant,

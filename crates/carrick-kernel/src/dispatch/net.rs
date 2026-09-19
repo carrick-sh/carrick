@@ -262,6 +262,7 @@ pub(super) fn host_socket_is_connected(host_fd: i32) -> bool {
     rc == 0
 }
 pub(super) mod epoll_ops;
+pub(in crate::dispatch) use epoll_ops::WriteRearm;
 #[cfg(test)]
 use epoll_ops::epoll_kqueue_for_wake_test;
 pub(super) mod lifecycle;
@@ -796,7 +797,7 @@ impl<'a> NetView<'a> {
         None
     }
 
-    /// Is `fd` a one-way (non-bidirectional, non-pty) pipe/FIFO READ end?
+    /// Is this description a one-way (non-bidirectional, non-pty) pipe/FIFO READ end?
     ///
     /// Such an fd is NEVER writable under Linux `poll(2)`/`epoll(7)`: a read end
     /// has no write side, so `POLLOUT`/`EPOLLOUT` is impossible there. Most hosts
@@ -813,15 +814,11 @@ impl<'a> NetView<'a> {
     /// EVERY host (Linux/macOS already never assert it there), so this needs no
     /// `cfg`-split — it is a no-op everywhere except FreeBSD/NetBSD, where it
     /// removes the divergence.
-    pub(super) fn host_fd_is_oneway_pipe_read_end(&self, fd: i32) -> bool {
-        if fd < 0 {
-            return false;
-        }
-        let Some(open_file) = self.open_file(fd) else {
-            return false;
-        };
+    pub(super) fn description_is_oneway_pipe_read_end(
+        description: &Arc<crate::kernel::FileDescription>,
+    ) -> bool {
         matches!(
-            open_file.description.read().as_deref(),
+            description.read().as_deref(),
             Some(OpenDescription::HostPipe {
                 is_read_end: true,
                 bidirectional: false,

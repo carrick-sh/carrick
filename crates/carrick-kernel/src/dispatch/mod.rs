@@ -741,8 +741,10 @@ pub(crate) use outcome::{
 #[allow(unused_imports)]
 pub use outcome::{BlockingWriteStep, drive_blocking_record_lock, drive_blocking_write};
 
+pub mod host_io;
 pub mod request;
-pub use request::{MutationSyscallCtx, SyscallCtx, SyscallRequest, ThreadCtx};
+pub use host_io::{HostIo, SystemHostIo};
+pub use request::{HostWaitContext, MutationSyscallCtx, SyscallCtx, SyscallRequest, ThreadCtx};
 #[allow(unused_imports)]
 pub use request::{
     PreparedDispatch, PreparedSyscall, SyscallCompletionToken, syscall_requires_execution_lease,
@@ -1415,6 +1417,91 @@ impl SyscallDispatcher {
                     carrick_fatal!(
                         "dispatch::mm_executor_reentry",
                         "caller-MM executor identity drifted while unwinding released operation"
+                    );
+                }
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    /// Configure host operations before dispatch begins. Forked dispatchers
+    /// retain the same implementation.
+    pub fn set_host_io(&mut self, host_io: Arc<dyn HostIo>) {
+        self.fs.host_io = host_io;
+    }
+
+    /// Run an owned host operation outside both MM admission and CPU ownership.
+    /// The operation must not retain pointers into guest memory. All file
+    /// endpoints must already be owned; this consumes the dispatch's remaining
+    /// file-table access, so no file lookup may follow it in this scope.
+    pub fn with_host_wait<M: CurrentMmMemory, T>(
+        &self,
+        syscall: &mut SyscallCtx<'_, M>,
+        scheduler: &crate::kernel::Scheduler,
+        registration: &crate::kernel::ExecutorRegistration,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, DispatchError> {
+        let lease = syscall
+            .execution_lease
+            .ok_or(DispatchError::MmExecutorExecutionLeaseUnavailable)?;
+        let executor = syscall
+            .mm_executor
+            .as_deref_mut()
+            .ok_or(DispatchError::MmExecutorParticipationUnavailable)?;
+        self.validate_current_mm_executor(executor, syscall.kernel, lease)?;
+        resources::finish_files_for_host_wait(syscall.kernel)?;
+        executor.leave_temporarily()?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let guard = scheduler
+                .begin_host_wait_with_lease(lease, registration)
+                .map_err(DispatchError::HostWaitAuthority)?;
+            let result = operation();
+            // Reclaim the CPU before MM readmission, including during unwind.
+            drop(guard);
+            Ok(result)
+        }));
+        // A peer may have removed this exact thread while its host operation
+        // was in flight. Do not resurrect its MM admission or publish a guest
+        // syscall return. Unwind still preserves the original panic payload.
+        if !syscall.kernel.exact_thread_is_live() {
+            return match result {
+                Ok(_) => Err(DispatchError::HostWaitRetired),
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
+        }
+        if let Err(error) = executor.reenter_exact() {
+            if !syscall.kernel.exact_thread_is_live() {
+                return match result {
+                    Ok(_) => Err(DispatchError::HostWaitRetired),
+                    Err(payload) => std::panic::resume_unwind(payload),
+                };
+            }
+            carrick_fatal!(
+                "dispatch::mm_executor_reentry",
+                "host wait MM reentry failed: {error}"
+            );
+        }
+        if !syscall.kernel.exact_thread_is_live() {
+            executor.leave_temporarily()?;
+            return match result {
+                Ok(_) => Err(DispatchError::HostWaitRetired),
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
+        }
+        match result {
+            Ok(value) => {
+                self.validate_current_mm_executor(executor, syscall.kernel, lease)?;
+                value
+            }
+            Err(payload) => {
+                // Match the existing MM-release boundary: a failed identity
+                // audit cannot turn an in-flight panic into a normal return.
+                if let Err(error) =
+                    self.validate_current_mm_executor(executor, syscall.kernel, lease)
+                {
+                    carrick_fatal!(
+                        "dispatch::mm_executor_reentry",
+                        "host wait identity drift during unwind: {error}"
                     );
                 }
                 std::panic::resume_unwind(payload)

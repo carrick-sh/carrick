@@ -354,10 +354,61 @@ mod tests {
         scheduler: bool,
     }
 
+    #[test]
+    fn host_wait_census_rejects_impossible_counts_and_duplicate_ownership() {
+        let mut snapshot = empty_snapshot();
+        let mut rows = MockAuxProvider {
+            marker: 1,
+            scheduler: true,
+        }
+        .scheduler_rows();
+        let waiter = dto::DebugHostWaiter {
+            executor: 1,
+            epoch: 1,
+            thread: dto::DebugThreadKey { tid: 1, serial: 1 },
+            generation: 1,
+            returning: false,
+        };
+        let census = dto::DebugHostWaitCensus {
+            entered: 1,
+            resumed: 0,
+            slots: vec![dto::DebugHostWaitSlot {
+                root: 1,
+                cpu: 0,
+                owner: None,
+                waiters: vec![waiter],
+            }],
+        };
+        rows[0].host_wait = Some(census.clone());
+        snapshot.scheduler = Some(rows);
+        let requested = BTreeSet::from([KernelDebugTable::Scheduler]);
+        snapshot
+            .validate(&requested)
+            .expect("valid retained host wait");
+        for invalid in 0..3 {
+            let mut broken = census.clone();
+            match invalid {
+                0 => broken.resumed = 2,
+                1 => broken.entered = 2,
+                _ => broken.slots[0].owner = Some(1),
+            }
+            snapshot.scheduler.as_mut().unwrap()[0].host_wait = Some(broken);
+            assert!(
+                snapshot.validate(&requested).is_err(),
+                "invalid host-wait case {invalid} accepted"
+            );
+        }
+        snapshot.scheduler.as_mut().unwrap()[0].host_wait = None;
+        snapshot
+            .validate(&requested)
+            .expect("unavailable is explicit, not fabricated zero");
+    }
+
     impl KernelDebugAuxProvider for MockAuxProvider {
         fn scheduler_rows(&self) -> Vec<DebugSchedulerRow> {
             self.scheduler
                 .then(|| DebugSchedulerRow {
+                    host_wait: None,
                     lifecycle: "open".to_owned(),
                     queued_len: self.marker,
                     claimed: 0,

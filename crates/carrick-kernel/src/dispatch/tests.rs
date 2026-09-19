@@ -1913,6 +1913,131 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         }
     }
 
+    fn staged_write_fixture() -> (Harness, u64, i32, u64) {
+        let mut h = Harness::new();
+        let epfd = returned(h.call(20, [0; 6])) as u64;
+        let pair_addr = h.reserve(8);
+        assert_eq!(returned(h.call(199, [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK, 0, pair_addr, 0, 0])), 0);
+        let pair = h.memory.read_bytes(pair_addr, 8).unwrap();
+        let writer = i32::from_le_bytes(pair[..4].try_into().unwrap());
+        let mut event = [0u8; 16];
+        event[..4].copy_from_slice(&(LINUX_EPOLLOUT | LINUX_EPOLLET).to_le_bytes());
+        event[8..].copy_from_slice(&17u64.to_le_bytes());
+        let event_addr = h.put_bytes(&event);
+        assert_eq!(returned(h.call(21, [epfd, LINUX_EPOLL_CTL_ADD, writer as u64, event_addr, 0, 0])), 0);
+        set_write_latch(&h.dispatcher.open_file(epfd as i32).unwrap(), writer);
+        (h, epfd, writer, event_addr)
+    }
+
+    fn set_write_latch(epoll: &OpenFile, writer: i32) {
+        let mut open = epoll.description.write().unwrap();
+        let OpenDescription::Epoll { interest, .. } = &mut *open else { panic!("epoll") };
+        interest.get_mut(&writer).unwrap().last_ready = LINUX_EPOLLOUT;
+    }
+
+    fn staged_write_state(epoll: &OpenFile, writer: i32) -> (u32, u64, bool, u32, u64) {
+        let open = epoll.description.read().unwrap();
+        let OpenDescription::Epoll { interest, .. } = &*open else { panic!("epoll") };
+        let slot = interest.get(&writer).unwrap();
+        (slot.last_ready, slot.io_gen, slot.write_backpressured, slot.event.events, slot.event.data)
+    }
+
+    #[test]
+    fn staged_write_rearm_consumes_no_file_table_authority() {
+        let (h, epfd, writer, _) = staged_write_fixture();
+        let epoll = h.dispatcher.open_file(epfd as i32).unwrap();
+        let context = h.dispatcher.capture_one_task_context().unwrap();
+        resources::with_captured_resources(&context, || {
+            let receipt = net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description));
+            resources::finish_files_for_host_wait(&context).unwrap();
+            receipt.complete(&DispatchOutcome::Returned { value: 4 });
+        });
+        assert_eq!(staged_write_state(&epoll, writer), (0, 1, false, LINUX_EPOLLOUT | LINUX_EPOLLET, 17));
+    }
+
+    #[test]
+    fn staged_write_rearm_distinguishes_error_eagain_and_progress() {
+        let (h, epfd, writer, _) = staged_write_fixture();
+        let epoll = h.dispatcher.open_file(epfd as i32).unwrap();
+        for outcome in [DispatchOutcome::Returned { value: 0 }, DispatchOutcome::errno(carrick_abi::LINUX_EIO)] {
+            net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description)).complete(&outcome);
+            assert_eq!(staged_write_state(&epoll, writer).0, LINUX_EPOLLOUT);
+            assert_eq!(staged_write_state(&epoll, writer).1, 0);
+        }
+        net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description)).complete(&DispatchOutcome::errno(LINUX_EAGAIN));
+        assert_eq!(staged_write_state(&epoll, writer), (LINUX_EPOLLOUT, 0, true, LINUX_EPOLLOUT | LINUX_EPOLLET, 17));
+        net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description)).complete(&DispatchOutcome::Returned { value: 1 });
+        assert_eq!(staged_write_state(&epoll, writer), (0, 1, false, LINUX_EPOLLOUT | LINUX_EPOLLET, 17));
+    }
+
+    #[test]
+    fn staged_write_rearm_includes_a_registration_added_while_io_is_pending() {
+        let (mut h, epfd, writer, event_addr) = staged_write_fixture();
+        let receipt = net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description));
+        assert_eq!(returned(h.call(21, [epfd, LINUX_EPOLL_CTL_DEL, writer as u64, 0, 0, 0])), 0);
+        assert_eq!(returned(h.call(21, [epfd, LINUX_EPOLL_CTL_ADD, writer as u64, event_addr, 0, 0])), 0);
+        let epoll = h.dispatcher.open_file(epfd as i32).unwrap();
+        set_write_latch(&epoll, writer);
+        receipt.complete(&DispatchOutcome::Returned { value: 4 });
+        assert_eq!(staged_write_state(&epoll, writer), (0, 1, false, LINUX_EPOLLOUT | LINUX_EPOLLET, 17));
+    }
+
+    #[test]
+    fn staged_write_rearm_preserves_modified_events_and_data() {
+        let (mut h, epfd, writer, event_addr) = staged_write_fixture();
+        let receipt = net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description));
+        h.memory.write_bytes(event_addr, &(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes()).unwrap();
+        h.memory.write_bytes(event_addr + 8, &99u64.to_le_bytes()).unwrap();
+        assert_eq!(returned(h.call(21, [epfd, carrick_abi::LINUX_EPOLL_CTL_MOD, writer as u64, event_addr, 0, 0])), 0);
+        receipt.complete(&DispatchOutcome::Returned { value: 4 });
+        let epoll = h.dispatcher.open_file(epfd as i32).unwrap();
+        assert_eq!(staged_write_state(&epoll, writer), (0, 1, false, LINUX_EPOLLIN | LINUX_EPOLLET, 99));
+    }
+
+    #[test]
+    fn staged_write_rearm_includes_current_owners_of_the_same_description() {
+        let (mut h, epfd, writer, event_addr) = staged_write_fixture();
+        let old_epoll = h.dispatcher.open_file(epfd as i32).unwrap();
+        let receipt = net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description));
+        let alias = returned(h.call(23, [epfd, 0, 0, 0, 0, 0]));
+        assert!(alias >= 0);
+        assert_eq!(returned(h.call(57, [epfd, 0, 0, 0, 0, 0])), 0);
+        let replacement = returned(h.call(20, [0; 6])) as u64;
+        assert_eq!(replacement, epfd);
+        assert_eq!(returned(h.call(21, [replacement, LINUX_EPOLL_CTL_ADD, writer as u64, event_addr, 0, 0])), 0);
+        let new_epoll = h.dispatcher.open_file(replacement as i32).unwrap();
+        set_write_latch(&new_epoll, writer);
+        receipt.complete(&DispatchOutcome::Returned { value: 4 });
+        assert_eq!(staged_write_state(&old_epoll, writer).0, 0);
+        assert_eq!(staged_write_state(&old_epoll, writer).1, 1);
+        assert_eq!(staged_write_state(&new_epoll, writer).0, 0);
+        assert_eq!(staged_write_state(&new_epoll, writer).1, 1);
+    }
+
+    #[test]
+    fn staged_write_rearm_does_not_follow_reused_writer_number() {
+        let (mut h, epfd, writer, event_addr) = staged_write_fixture();
+        let old_epoll = h.dispatcher.open_file(epfd as i32).unwrap();
+        let alias = returned(h.call(23, [writer as u64, 0, 0, 0, 0, 0])) as u64;
+        let receipt = net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description));
+        // A dup keeps the original open description registered after fd reuse.
+        let pair_addr = h.reserve(8);
+        assert_eq!(returned(h.call(199, [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK, 0, pair_addr, 0, 0])), 0);
+        let pair = h.memory.read_bytes(pair_addr, 8).unwrap();
+        let replacement = i32::from_le_bytes(pair[..4].try_into().unwrap()) as u64;
+        assert_eq!(returned(h.call(24, [replacement, writer as u64, 0, 0, 0, 0])), writer as i64);
+        let new_epfd = returned(h.call(20, [0; 6])) as u64;
+        assert_eq!(returned(h.call(21, [new_epfd, LINUX_EPOLL_CTL_ADD, writer as u64, event_addr, 0, 0])), 0);
+        let new_epoll = h.dispatcher.open_file(new_epfd as i32).unwrap();
+        set_write_latch(&new_epoll, writer);
+        receipt.complete(&DispatchOutcome::Returned { value: 4 });
+        assert_eq!(staged_write_state(&old_epoll, writer).0, 0);
+        assert_eq!(staged_write_state(&old_epoll, writer).1, 1);
+        assert_eq!(staged_write_state(&new_epoll, writer).0, LINUX_EPOLLOUT);
+        assert_eq!(staged_write_state(&new_epoll, writer).1, 0);
+        assert!(h.dispatcher.open_file(alias as i32).is_some());
+    }
+
     #[test]
     fn epoll_et_write_eagain_after_partial_write_keeps_write_filter_armed() {
         let mut h = Harness::new();

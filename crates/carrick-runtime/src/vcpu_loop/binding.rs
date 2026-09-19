@@ -3691,9 +3691,11 @@ where
                         .into());
                     }
                     (None, Some(outcome)) => outcome,
-                    (None, None) => self
-                        .state
-                        .redispatch_threaded_syscall(&self.kernel, engine)?,
+                    (None, None) => self.state.redispatch_threaded_syscall(
+                        &self.kernel,
+                        engine,
+                        control.submission.host_wait_context(),
+                    )?,
                 };
                 if self.kernel.dispatcher.take_signal_pump_request() {
                     self.kernel
@@ -4182,9 +4184,12 @@ where
             Err(error) => return Err(RuntimeError::Trap(error).into()),
         };
         self.state.trace_syscall(self.traps, frame);
-        let outcome = self
-            .state
-            .service_threaded_syscall(&self.kernel, engine, frame)?;
+        let outcome = self.state.service_threaded_syscall(
+            &self.kernel,
+            engine,
+            frame,
+            control.submission.host_wait_context(),
+        )?;
         if self.kernel.dispatcher.take_signal_pump_request() {
             self.kernel
                 .signal_pump
@@ -4202,7 +4207,22 @@ where
             self.kernel.pt_quiesce(),
             self.kernel.fork_quiesce(),
         );
-        match self.poll_with_engine(engine, control) {
+        let result = self.poll_with_engine(engine, control);
+        self.route_poll_result(result)
+    }
+
+    fn route_poll_result(
+        &mut self,
+        result: Result<executor::ExecutorExit, ProductionHvpatchPollError>,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        match result {
+            Err(ProductionHvpatchPollError::Runtime(RuntimeError::Dispatch(
+                carrick_kernel::dispatch::DispatchError::HostWaitRetired,
+            ))) => {
+                // A peer already removed this exact thread. Do not publish a
+                // syscall return, touch guest registers, or claim process exit.
+                Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)))
+            }
             Err(ProductionHvpatchPollError::Runtime(error)) => {
                 match self.take_pending_exec_terminal() {
                     Some(pending) => Err(ProductionHvpatchPollError::Exec(Box::new(
@@ -5455,6 +5475,53 @@ mod tests {
     use carrick_guest_mem::GuestMemory;
     use std::num::NonZeroU64;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn retired_host_wait_finishes_only_its_thread_without_guest_return() {
+        let (_runtime, scheduler, kernel, root, process, _generation) =
+            test_carrier_graph_with_dispatcher!(72_431, SyscallDispatcher::new());
+        let tid = ThreadId::synthetic_for_tests(72_431);
+        let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(tid)),
+            Arc::new(FutexTable::new()),
+            Arc::new(NoopPlatformFutex),
+            Arc::new(|_| Arc::new(NoopPlatformFutex)),
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            tid,
+            Arc::new(Mutex::new(Vec::new())),
+            kicker,
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.service_kernel_context = Some(root.retain_exact());
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+        // No engine is supplied to this routing boundary: retiring the member
+        // must not complete a syscall or write any guest registers/memory.
+        let routed = job.route_poll_result(Err(ProductionHvpatchPollError::Runtime(
+            RuntimeError::Dispatch(carrick_kernel::dispatch::DispatchError::HostWaitRetired),
+        )));
+        assert!(matches!(routed, Ok(executor::ExecutorExit::Exited)));
+        assert!(matches!(job.phase, HvpatchProductionPhase::Complete));
+        assert!(matches!(
+            job.terminal_result,
+            Some(Ok(VcpuLoopOutcome::ThreadDone))
+        ));
+        assert!(
+            matches!(
+                job.terminal_runtime,
+                PersistentTerminalRuntimeState::Resident
+            ),
+            "member retirement must not start process-wide terminal work"
+        );
+        scheduler.close();
+    }
 
     /// The forkexecstorm wedge: the parked executor's barrier callback woke
     /// only on `Released`, while `publish_quiesce_event` consumes every

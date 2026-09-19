@@ -22,6 +22,10 @@ use super::objects::{
     ThreadExecutionLease, ThreadExecutionState, ThreadKey, ThreadSchedulerAction,
 };
 
+mod host_wait;
+use host_wait::{ExecutorPlacement, HandoffSlot};
+pub use host_wait::{HostWaitCensus, HostWaitSlotSnapshot, HostWaitToken};
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct QueueKey {
     pub(crate) thread: ThreadKey,
@@ -392,8 +396,7 @@ impl Default for AtomicResidencyFlushRequest {
 #[derive(Clone, Debug)]
 pub struct ExecutorRegistration {
     id: ExecutorId,
-    bound_cpu: Option<GuestCpuId>,
-    is_spare: bool,
+    placement: Arc<Mutex<ExecutorPlacement>>,
     close_observation_epoch: Arc<AtomicU64>,
     control_observation_epoch: Arc<AtomicU64>,
     flush_requested: Arc<AtomicResidencyFlushRequest>,
@@ -404,12 +407,16 @@ impl ExecutorRegistration {
         self.id
     }
 
-    pub const fn bound_cpu(&self) -> Option<GuestCpuId> {
-        self.bound_cpu
+    pub fn bound_cpu(&self) -> Option<GuestCpuId> {
+        self.placement.lock().cpu
     }
 
-    pub const fn is_spare(&self) -> bool {
-        self.is_spare
+    pub fn is_spare(&self) -> bool {
+        self.bound_cpu().is_none()
+    }
+
+    pub fn in_host_wait(&self) -> bool {
+        self.placement.lock().waiting
     }
 
     pub fn flush_requested(&self) -> bool {
@@ -425,7 +432,7 @@ impl ExecutorRegistration {
 #[derive(Debug)]
 struct ExecutorEntry {
     kick: Arc<dyn ExecutorKick>,
-    bound_cpu: Option<GuestCpuId>,
+    placement: Arc<Mutex<ExecutorPlacement>>,
     close_observation_epoch: Arc<AtomicU64>,
     control_observation_epoch: Arc<AtomicU64>,
     flush_requested: Arc<AtomicResidencyFlushRequest>,
@@ -486,11 +493,16 @@ impl ExecutorDirectory {
         let close_observation_epoch = Arc::new(AtomicU64::new(0));
         let control_observation_epoch = Arc::new(AtomicU64::new(0));
         let flush_requested = Arc::new(AtomicResidencyFlushRequest::default());
+        let placement = Arc::new(Mutex::new(ExecutorPlacement {
+            cpu: bound_cpu,
+            slot: None,
+            waiting: false,
+        }));
         state.entries.insert(
             id,
             ExecutorEntry {
                 kick,
-                bound_cpu,
+                placement: Arc::clone(&placement),
                 close_observation_epoch: Arc::clone(&close_observation_epoch),
                 control_observation_epoch: Arc::clone(&control_observation_epoch),
                 flush_requested: Arc::clone(&flush_requested),
@@ -498,8 +510,7 @@ impl ExecutorDirectory {
         );
         Ok(ExecutorRegistration {
             id,
-            bound_cpu,
-            is_spare,
+            placement,
             close_observation_epoch,
             control_observation_epoch,
             flush_requested,
@@ -737,6 +748,13 @@ impl GuestCpu {
         *self.current_task.lock() = task;
     }
 
+    fn clear_current_task(&self, expected: ThreadKey) {
+        let mut current = self.current_task.lock();
+        if *current == Some(expected) {
+            *current = None;
+        }
+    }
+
     /// Signal this CPU so a parked (or about-to-park) executor re-runs its
     /// scan. Takes the CPU lock so the bump cannot slip into the window
     /// between an executor's pre-park re-check and its `wait`.
@@ -846,6 +864,9 @@ impl QueueKeyShard {
 #[derive(Debug, Default)]
 struct RunQueueState {
     lifecycle: QueueLifecycle,
+    handoffs: BTreeMap<ExecutorId, HandoffSlot>,
+    host_wait_entered: u64,
+    host_wait_resumed: u64,
     /// Spare executors parked on `changed`. Per-CPU waiters live in each
     /// [`GuestCpuLocalState`]; `close` snapshots both.
     spare_waiters: usize,
@@ -888,6 +909,8 @@ impl WaiterCensus {
 /// so building one never blocks.
 #[derive(Clone, Debug)]
 pub struct SchedulerSummary {
+    /// None means the host-wait ledger was contended, never zero host waits.
+    pub host_wait: Option<HostWaitCensus>,
     pub lifecycle: String,
     pub queued_len: usize,
     pub claimed: usize,
@@ -931,6 +954,8 @@ struct RunQueueInner {
     /// that misses the close and a `close` that misses the decrement cannot
     /// both happen (Dekker): one of the two always runs `maybe_finish_close`.
     lifecycle: AtomicU8,
+    /// Avoid the lifecycle mutex on ordinary, non-handoff settlements.
+    handoff_slots: AtomicUsize,
     wake_admissions: AtomicU64,
     control_epoch: AtomicU64,
     claimed: AtomicUsize,
@@ -2019,6 +2044,7 @@ impl RunQueue {
                 state: Mutex::new(RunQueueState::default()),
                 changed: Condvar::new(),
                 lifecycle: AtomicU8::new(QueueLifecycle::Open as u8),
+                handoff_slots: AtomicUsize::new(0),
                 wake_admissions: AtomicU64::new(0),
                 control_epoch: AtomicU64::new(0),
                 claimed: AtomicUsize::new(0),
@@ -2132,11 +2158,26 @@ impl RunQueue {
         executor: &ExecutorRegistration,
         auditors: Option<&crate::observe::AuditorChain>,
     ) -> Result<QueueRow, RunQueueError> {
-        if executor.is_spare {
-            return self.park_spare(executor);
+        loop {
+            if executor.in_host_wait() {
+                return Err(RunQueueError::ExecutorBusy);
+            }
+            if executor.is_spare() {
+                self.park_spare(executor)?;
+            }
+            if let Some(row) = self.take_row_bound(executor, auditors)? {
+                return Ok(row);
+            }
         }
+    }
+
+    fn take_row_bound(
+        &self,
+        executor: &ExecutorRegistration,
+        auditors: Option<&crate::observe::AuditorChain>,
+    ) -> Result<Option<QueueRow>, RunQueueError> {
         let index = executor
-            .bound_cpu
+            .bound_cpu()
             .map(|cpu| cpu.as_usize())
             .unwrap_or(0)
             .min(self.inner.cpus.len().saturating_sub(1));
@@ -2145,6 +2186,10 @@ impl RunQueue {
         // every path out of the idle state including the early returns.
         let mut idle = IdleAnnouncement::new(&cpu);
         loop {
+            let transferred = executor.placement.lock().slot.is_some();
+            if transferred && self.inner.release_handoff(executor.id, true) {
+                return Ok(None);
+            }
             if executor.flush_requested() {
                 return Err(RunQueueError::FlushRequested);
             }
@@ -2158,10 +2203,10 @@ impl RunQueue {
             }
 
             if let Some(row) = self.inner.pop_local(&cpu) {
-                return Ok(self.claim_taken(&mut idle, cpu.id, row));
+                return Ok(Some(self.claim_taken(&mut idle, cpu.id, row)));
             }
             if let Some(row) = self.inner.try_steal(cpu.id) {
-                return Ok(self.claim_taken(&mut idle, cpu.id, row));
+                return Ok(Some(self.claim_taken(&mut idle, cpu.id, row)));
             }
 
             if self.inner.lifecycle() != QueueLifecycle::Open
@@ -2180,12 +2225,19 @@ impl RunQueue {
                 local.wake_ticket
             };
             idle.announce();
+            // Sample the CPU wake ticket before this ownership recheck. A
+            // returning owner either wins here or changes the ticket before
+            // the final park predicate. Never lock lifecycle under cpu.state.
+            let transferred = executor.placement.lock().slot.is_some();
+            if transferred && self.inner.release_handoff(executor.id, true) {
+                return Ok(None);
+            }
             if let Some(row) = self
                 .inner
                 .pop_local(&cpu)
                 .or_else(|| self.inner.try_steal(cpu.id))
             {
-                return Ok(self.claim_taken(&mut idle, cpu.id, row));
+                return Ok(Some(self.claim_taken(&mut idle, cpu.id, row)));
             }
 
             #[cfg(any(test, feature = "test-support"))]
@@ -2304,10 +2356,9 @@ impl RunQueue {
         None
     }
 
-    /// A spare `M`. It holds no `P`, so it never claims a row in this phase:
-    /// it parks on the lifecycle condvar until a control poke or the close.
-    /// Phase 3 (`handoffp`) is what will hand it a `P` to run.
-    fn park_spare(&self, executor: &ExecutorRegistration) -> Result<QueueRow, RunQueueError> {
+    /// An unbound `M` parks until it can acquire a relinquished slot, or until
+    /// a control, residency-flush, or close request needs servicing.
+    fn park_spare(&self, executor: &ExecutorRegistration) -> Result<(), RunQueueError> {
         let mut state = self.inner.state.lock();
         loop {
             if executor.flush_requested() {
@@ -2320,6 +2371,9 @@ impl RunQueue {
                 != control_epoch
             {
                 return Err(RunQueueError::ControlPoked);
+            }
+            if executor.bound_cpu().is_some() || self.inner.claim_handoff(&mut state, executor) {
+                return Ok(());
             }
             self.inner.maybe_finish_close(&mut state);
             if state.lifecycle == QueueLifecycle::Closed {
@@ -2791,7 +2845,7 @@ struct PendingWake {
 pub struct Scheduler {
     kernel: Arc<Kernel>,
     queue: RunQueue,
-    executors: ExecutorDirectory,
+    executors: Arc<ExecutorDirectory>,
     need_resched: AtomicBool,
     snapshot_count: AtomicU64,
     generation_transition: Mutex<()>,
@@ -2821,7 +2875,7 @@ impl Scheduler {
         Self {
             kernel,
             queue: RunQueue::new(policy),
-            executors: ExecutorDirectory::default(),
+            executors: Arc::new(ExecutorDirectory::default()),
             need_resched: AtomicBool::new(false),
             snapshot_count: AtomicU64::new(0),
             generation_transition: Mutex::new(()),
@@ -2953,7 +3007,7 @@ impl Scheduler {
         let registration =
             self.executors
                 .register(kick, bound_cpu, is_spare, self.queue.inner.cpus.len())?;
-        if let Some(cpu) = registration.bound_cpu {
+        if let Some(cpu) = registration.bound_cpu() {
             self.queue.inner.set_executor_online(cpu, true);
         }
         Ok(registration)
@@ -2963,10 +3017,15 @@ impl Scheduler {
         &self,
         registration: &ExecutorRegistration,
     ) -> Result<(), RunQueueError> {
+        let _transition = self.generation_transition.lock();
+        self.executors.authenticate(registration)?;
+        if registration.placement.lock().slot.is_some() {
+            return Err(RunQueueError::ExecutorBusy);
+        }
         self.queue.retire_executor(registration);
         let result = self.executors.unregister(registration);
         if result.is_ok()
-            && let Some(cpu) = registration.bound_cpu
+            && let Some(cpu) = registration.bound_cpu()
         {
             self.queue.inner.set_executor_online(cpu, false);
             // Whatever is still queued on a CPU that just lost its `M` is
@@ -3511,6 +3570,7 @@ impl Scheduler {
     }
 
     pub fn take(&self, executor: &ExecutorRegistration) -> Result<RunnableThread, RunQueueError> {
+        self.executors.authenticate(executor)?;
         let recorder = self.discard_recorder.lock().clone();
         let auditors = self.kernel.auditors();
         let QueueClaim { row, lease } =
@@ -3527,7 +3587,7 @@ impl Scheduler {
             self.queue.inner.finish_claim();
             return Err(error);
         }
-        let bound_cpu = executor.bound_cpu.unwrap_or(GuestCpuId::new(0));
+        let bound_cpu = executor.bound_cpu().unwrap_or(GuestCpuId::new(0));
         row.thread.set_last_cpu(bound_cpu);
         if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
             guest_cpu.set_current_task(Some(row.thread.key()));
@@ -3553,7 +3613,10 @@ impl Scheduler {
         let (bound_cpu, flush_requested) = {
             let state = self.executors.state.lock();
             match state.entries.get(&executor) {
-                Some(entry) => (entry.bound_cpu, Arc::clone(&entry.flush_requested)),
+                Some(entry) => (
+                    entry.placement.lock().cpu,
+                    Arc::clone(&entry.flush_requested),
+                ),
                 None => return,
             }
         };
@@ -3606,16 +3669,12 @@ impl Scheduler {
             kind,
         );
         self.executors.unbind(running.binding);
-        let bound_cpu = self
-            .executors
-            .state
-            .lock()
-            .entries
-            .get(&running.binding.executor)
-            .and_then(|e| e.bound_cpu)
-            .unwrap_or(GuestCpuId::new(0));
+        self.queue
+            .inner
+            .release_handoff(running.binding.executor, false);
+        let bound_cpu = running.guest_cpu();
         if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
-            guest_cpu.set_current_task(None);
+            guest_cpu.clear_current_task(running.thread_key());
         }
         let task_key = TaskKey::new(running.thread.task_key().serial.raw());
         self.queue.inner.policy.on_block(task_key, bound_cpu);
@@ -3680,16 +3739,12 @@ impl Scheduler {
             kind,
         );
         self.executors.unbind(running.binding);
-        let bound_cpu = self
-            .executors
-            .state
-            .lock()
-            .entries
-            .get(&running.binding.executor)
-            .and_then(|e| e.bound_cpu)
-            .unwrap_or(GuestCpuId::new(0));
+        self.queue
+            .inner
+            .release_handoff(running.binding.executor, false);
+        let bound_cpu = running.guest_cpu();
         if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
-            guest_cpu.set_current_task(None);
+            guest_cpu.clear_current_task(running.thread_key());
         }
         let task_key = TaskKey::new(running.thread.task_key().serial.raw());
         self.queue.inner.policy.on_block(task_key, bound_cpu);
@@ -3861,16 +3916,12 @@ impl Scheduler {
                     SchedulerGenerationTransition::Terminal,
                 );
                 self.executors.unbind(running.binding);
-                let bound_cpu = self
-                    .executors
-                    .state
-                    .lock()
-                    .entries
-                    .get(&running.binding.executor)
-                    .and_then(|e| e.bound_cpu)
-                    .unwrap_or(GuestCpuId::new(0));
+                self.queue
+                    .inner
+                    .release_handoff(running.binding.executor, false);
+                let bound_cpu = running.guest_cpu();
                 if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
-                    guest_cpu.set_current_task(None);
+                    guest_cpu.clear_current_task(running.thread_key());
                 }
                 drop(_transition);
                 running.finish_claim();
@@ -3926,16 +3977,12 @@ impl Scheduler {
             None => GenerationTransitionOutcome::Recorded,
         };
         self.executors.unbind(running.binding);
-        let bound_cpu = self
-            .executors
-            .state
-            .lock()
-            .entries
-            .get(&running.binding.executor)
-            .and_then(|e| e.bound_cpu)
-            .unwrap_or(GuestCpuId::new(0));
+        self.queue
+            .inner
+            .release_handoff(running.binding.executor, false);
+        let bound_cpu = running.guest_cpu();
         if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
-            guest_cpu.set_current_task(None);
+            guest_cpu.clear_current_task(running.thread_key());
         }
         drop(_transition);
         self.snapshot_count.fetch_add(1, Ordering::Relaxed);
@@ -3983,16 +4030,12 @@ impl Scheduler {
             SchedulerGenerationTransition::Terminal,
         );
         self.executors.unbind(running.binding);
-        let bound_cpu = self
-            .executors
-            .state
-            .lock()
-            .entries
-            .get(&running.binding.executor)
-            .and_then(|e| e.bound_cpu)
-            .unwrap_or(GuestCpuId::new(0));
+        self.queue
+            .inner
+            .release_handoff(running.binding.executor, false);
+        let bound_cpu = running.guest_cpu();
         if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
-            guest_cpu.set_current_task(None);
+            guest_cpu.clear_current_task(running.thread_key());
         }
         let task_key = TaskKey::new(running.thread.task_key().serial.raw());
         self.queue.inner.policy.on_exit(task_key, bound_cpu);
@@ -4038,16 +4081,12 @@ impl Scheduler {
             SchedulerGenerationTransition::Terminal,
         );
         self.executors.unbind(running.binding);
-        let bound_cpu = self
-            .executors
-            .state
-            .lock()
-            .entries
-            .get(&running.binding.executor)
-            .and_then(|e| e.bound_cpu)
-            .unwrap_or(GuestCpuId::new(0));
+        self.queue
+            .inner
+            .release_handoff(running.binding.executor, false);
+        let bound_cpu = running.guest_cpu();
         if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
-            guest_cpu.set_current_task(None);
+            guest_cpu.clear_current_task(running.thread_key());
         }
         let task_key = TaskKey::new(running.thread.task_key().serial.raw());
         self.queue.inner.policy.on_exit(task_key, bound_cpu);
@@ -4119,6 +4158,7 @@ impl Scheduler {
         }
         .to_owned();
         SchedulerSummary {
+            host_wait: self.host_wait_census(),
             lifecycle,
             queued_len: self.queue.inner.total_queued.load(Ordering::Acquire),
             claimed: self.queue.inner.claimed.load(Ordering::Acquire),
@@ -4230,7 +4270,7 @@ impl Scheduler {
                 .entries
                 .values()
                 .filter_map(|entry| {
-                    let cpu = entry.bound_cpu?;
+                    let cpu = entry.placement.lock().cpu?;
                     let binding = entry.kick.current_binding()?;
                     Some((cpu, binding.token()))
                 })

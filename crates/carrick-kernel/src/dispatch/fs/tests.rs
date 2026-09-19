@@ -6,6 +6,118 @@ use crate::dispatch::dispatcher::FsCrossSubsystem;
 use std::sync::Arc;
 
 #[test]
+fn host_flush_injection_is_the_real_dispatch_operation() {
+    use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct FailingHostIo(AtomicUsize);
+    impl crate::dispatch::HostIo for FailingHostIo {
+        fn sync(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn flush(&self, fd: BorrowedFd<'_>) -> Result<(), LinuxErrno> {
+            assert!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } >= 0);
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(carrick_abi::LINUX_EIO)
+        }
+    }
+    let host_io = Arc::new(FailingHostIo(AtomicUsize::new(0)));
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_host_io(host_io.clone());
+    let fd = dispatcher
+        .install_fd_at_or_above(
+            3,
+            OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::HostFile {
+                    host_fd: HostFdRef::new(tempfile::tempfile().unwrap().into_raw_fd()),
+                    metadata: RootFsMetadata {
+                        path: "/injected-flush".into(),
+                        kind: RootFsEntryKind::File,
+                        mode: 0o600,
+                        size: 0,
+                    },
+                    base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                    writable: true,
+                })),
+                LINUX_O_RDWR,
+                0,
+            ),
+        )
+        .unwrap();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 64]);
+    for number in [82, 83, 267] {
+        let result = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(number, SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &CompatReporter::default(),
+            )
+            .unwrap();
+        assert_eq!(result, DispatchOutcome::errno(carrick_abi::LINUX_EIO));
+    }
+    for number in [81, 84] {
+        let result = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(number, SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &CompatReporter::default(),
+            )
+            .unwrap();
+        assert_eq!(result, DispatchOutcome::Returned { value: 0 });
+    }
+    assert_eq!(host_io.0.load(Ordering::SeqCst), 5);
+}
+
+/// Closing the guest fd during a host wait must not invalidate its retained
+/// flush target (or allow descriptor reuse to redirect the operation).
+#[test]
+fn flush_target_survives_guest_close() {
+    use std::os::fd::IntoRawFd;
+    let file = tempfile::tempfile().unwrap();
+    let host_fd = file.into_raw_fd();
+    let mut dispatcher = SyscallDispatcher::new();
+    let fd = dispatcher
+        .install_fd_at_or_above(
+            3,
+            OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::HostFile {
+                    host_fd: HostFdRef::new(host_fd),
+                    metadata: RootFsMetadata {
+                        path: std::path::PathBuf::from("/flush-target"),
+                        kind: RootFsEntryKind::File,
+                        mode: 0o600,
+                        size: 0,
+                    },
+                    base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                    writable: true,
+                })),
+                LINUX_O_RDWR,
+                0,
+            ),
+        )
+        .unwrap();
+    let target = dispatcher.host_file_fd_for_flush(fd).unwrap().unwrap();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 64]);
+    let closed = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(57, SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &CompatReporter::default(),
+        )
+        .unwrap();
+    assert!(matches!(closed, DispatchOutcome::Returned { value: 0 }));
+    assert_eq!(
+        flush_host_fd(target),
+        Ok(()),
+        "the in-flight target owns the host fd"
+    );
+}
+
+#[test]
 fn procmap_query_reports_exact_next_filter_and_name_contracts() {
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.set_executable_path("/opt/ltp/testcases/bin/ioctl10");
@@ -9625,6 +9737,7 @@ fn fs_view_direct_construction_and_operations() {
 
     // Test dup handler on FsView
     let mut dup_req = crate::dispatch::SyscallCtx {
+        host_wait: None,
         kernel: &context,
         request: crate::dispatch::SyscallRequest::new(
             23, // dup
@@ -9648,6 +9761,7 @@ fn fs_view_direct_construction_and_operations() {
 
     // Test close handler on FsView
     let mut close_req = crate::dispatch::SyscallCtx {
+        host_wait: None,
         kernel: &context,
         request: crate::dispatch::SyscallRequest::new(
             57, // close
