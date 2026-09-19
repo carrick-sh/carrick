@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 use crate::evaluate::ContractFailure;
 use crate::model::{ContractId, ExecutionLayer, TimingStatistic, WorkMetric};
@@ -92,61 +91,7 @@ impl ContractObservation {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-pub struct WorkSnapshot {
-    values: BTreeMap<WorkMetric, u64>,
-    dropped_events: u64,
-    unknown_metrics: Vec<String>,
-}
-
-impl Default for WorkSnapshot {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl WorkSnapshot {
-    pub fn new() -> Self {
-        Self {
-            values: BTreeMap::new(),
-            dropped_events: 0,
-            unknown_metrics: Vec::new(),
-        }
-    }
-
-    pub fn with_dropped_events(mut self, dropped_events: u64) -> Self {
-        self.dropped_events = dropped_events;
-        self
-    }
-
-    pub fn with_unknown_metrics(mut self, unknown: Vec<String>) -> Self {
-        self.unknown_metrics = unknown;
-        self
-    }
-
-    pub fn insert(&mut self, metric: WorkMetric, value: u64) -> Result<(), ObservationError> {
-        if self.values.insert(metric, value).is_some() {
-            return Err(ObservationError::DuplicateMetric(metric));
-        }
-        Ok(())
-    }
-
-    pub fn get(&self, metric: WorkMetric) -> Option<u64> {
-        self.values.get(&metric).copied()
-    }
-
-    pub fn values(&self) -> &BTreeMap<WorkMetric, u64> {
-        &self.values
-    }
-
-    pub fn dropped_events(&self) -> u64 {
-        self.dropped_events
-    }
-
-    pub fn unknown_metrics(&self) -> &[String] {
-        &self.unknown_metrics
-    }
-}
+pub use carrick_observability::work_meter::WorkSnapshot;
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]

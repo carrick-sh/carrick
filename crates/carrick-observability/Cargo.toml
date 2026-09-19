@@ -13,6 +13,7 @@ path = "src/lib.rs"
 # default). Forwarded from carrick-runtime/trace-syscalls alongside the HVF
 # crate's own gate, mirroring the upstream debug-feature refactor.
 trace-syscalls = []
+conformance-metrics = []
 
 [lints]
 workspace = true

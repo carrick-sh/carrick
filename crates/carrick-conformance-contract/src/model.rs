@@ -56,33 +56,7 @@ pub enum ExecutionLayer {
     Ecosystem,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkMetric {
-    KernelDispatches,
-    KernelRedispatches,
-    ContinuationEnrollments,
-    ContinuationParks,
-    WakePublications,
-    ContinuationResumes,
-    GuestMemoryReadBytes,
-    GuestMemoryWriteBytes,
-    GuestMemoryCopyBytes,
-    GuestMemoryZeroBytes,
-    BackingMaterializedBytes,
-    VfsBackendOperations,
-    DirectoryEntriesVisited,
-    HostBackendCalls,
-    PageTableEdits,
-    PageTableInvalidations,
-    BackingAllocations,
-    TaskAdmissions,
-    VcpuAdmissions,
-    VcpuReleases,
-    VcpuMigrations,
-    FutexQueueVisits,
-    FutexWaitersWoken,
-}
+pub use carrick_observability::work_meter::WorkMetric;
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
