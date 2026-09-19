@@ -174,6 +174,42 @@ pub fn getppid() -> Syscall {
     )
 }
 
+/// `getuid(2)`.
+pub fn getuid() -> Syscall {
+    call(
+        "getuid",
+        nr::GETUID,
+        [0.into(), 0.into(), 0.into(), 0.into(), 0.into(), 0.into()],
+    )
+}
+
+/// `geteuid(2)`.
+pub fn geteuid() -> Syscall {
+    call(
+        "geteuid",
+        nr::GETEUID,
+        [0.into(), 0.into(), 0.into(), 0.into(), 0.into(), 0.into()],
+    )
+}
+
+/// `getgid(2)`.
+pub fn getgid() -> Syscall {
+    call(
+        "getgid",
+        nr::GETGID,
+        [0.into(), 0.into(), 0.into(), 0.into(), 0.into(), 0.into()],
+    )
+}
+
+/// `getegid(2)`.
+pub fn getegid() -> Syscall {
+    call(
+        "getegid",
+        nr::GETEGID,
+        [0.into(), 0.into(), 0.into(), 0.into(), 0.into(), 0.into()],
+    )
+}
+
 /// `pselect6(2)` with a timespec timeout and optional sigmask.
 pub fn pselect6(
     nfds: i32,
@@ -1261,6 +1297,65 @@ pub fn futex_requeue(
     uaddr2: impl Into<Operand>,
 ) -> Syscall {
     futex_requeue_labeled("futex", uaddr, val, val2, uaddr2)
+}
+
+/// `futex(2)` FUTEX_CMP_REQUEUE with private flag and custom label.
+pub fn futex_cmp_requeue_labeled(
+    label: &'static str,
+    uaddr: impl Into<Operand>,
+    val: u32,
+    val2: u32,
+    uaddr2: impl Into<Operand>,
+    val3: u32,
+) -> Syscall {
+    futex_labeled(
+        label,
+        uaddr,
+        carrick_abi::LINUX_FUTEX_CMP_REQUEUE | carrick_abi::LINUX_FUTEX_PRIVATE_FLAG,
+        val as u64,
+        Operand::Lit(val2 as i64),
+        uaddr2,
+        val3 as u64,
+    )
+}
+
+/// `futex(2)` FUTEX_LOCK_PI with private flag and custom label.
+pub fn futex_lock_pi_labeled(label: &'static str, uaddr: impl Into<Operand>) -> Syscall {
+    futex_labeled(
+        label,
+        uaddr,
+        carrick_abi::LINUX_FUTEX_LOCK_PI | carrick_abi::LINUX_FUTEX_PRIVATE_FLAG,
+        0,
+        0,
+        0,
+        0,
+    )
+}
+
+/// `futex(2)` FUTEX_TRYLOCK_PI with private flag and custom label.
+pub fn futex_trylock_pi_labeled(label: &'static str, uaddr: impl Into<Operand>) -> Syscall {
+    futex_labeled(
+        label,
+        uaddr,
+        carrick_abi::LINUX_FUTEX_TRYLOCK_PI | carrick_abi::LINUX_FUTEX_PRIVATE_FLAG,
+        0,
+        0,
+        0,
+        0,
+    )
+}
+
+/// `futex(2)` FUTEX_UNLOCK_PI with private flag and custom label.
+pub fn futex_unlock_pi_labeled(label: &'static str, uaddr: impl Into<Operand>) -> Syscall {
+    futex_labeled(
+        label,
+        uaddr,
+        carrick_abi::LINUX_FUTEX_UNLOCK_PI | carrick_abi::LINUX_FUTEX_PRIVATE_FLAG,
+        0,
+        0,
+        0,
+        0,
+    )
 }
 
 /// `openat(2)`: open a file relative to a directory file descriptor.

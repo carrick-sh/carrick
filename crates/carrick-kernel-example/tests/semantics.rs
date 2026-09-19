@@ -24,3 +24,12 @@ mod epoll;
 mod pidfd;
 #[path = "semantics/unix.rs"]
 mod unix;
+
+#[path = "semantics/fork_scaling.rs"]
+mod fork_scaling;
+#[path = "semantics/futex_contention.rs"]
+mod futex_contention;
+#[path = "semantics/identity.rs"]
+mod identity;
+#[path = "semantics/signal.rs"]
+mod signal;
