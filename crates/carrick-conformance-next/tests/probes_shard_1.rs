@@ -19,7 +19,7 @@ use common::SHARD_1_PROBES;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-const CACHED_SHARD_1_PROBE_COUNT: usize = 154;
+const CACHED_SHARD_1_PROBE_COUNT: usize = 151;
 
 /// Shard 1 subset of baseline expected oracle mismatches for musl.
 pub const MUSL_SHARD_1_EXPECTED_GAPS: &[&str] = common::MUSL_BASELINE_GAPS;
@@ -105,8 +105,8 @@ pub fn probe_campaign_dir(root: &Path, target: &str) -> PathBuf {
 fn test_shard_1_inventory_count_and_sorted() {
     assert_eq!(
         SHARD_1_PROBES.len(),
-        163,
-        "shard 1 must contain exactly 163 generic probes"
+        164,
+        "shard 1 must contain exactly 164 generic probes"
     );
 
     // Hard assert uniqueness and strictly ascending sort order.
@@ -182,8 +182,8 @@ fn test_shard_1_inventory_count_and_sorted() {
 
         assert_eq!(
             computed_shard_1.len(),
-            163,
-            "derived shard 1 must have 163 items"
+            164,
+            "derived shard 1 must have 164 items"
         );
         assert_eq!(
             SHARD_1_PROBES,

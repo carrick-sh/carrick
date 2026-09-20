@@ -364,7 +364,8 @@
       ],
       "claims": [
         "kernel.inotify.readiness.depth-independent",
-        "kernel.inotify.watch.host-registration-bound"
+        "kernel.inotify.watch.host-registration-bound",
+        "kernel.inotify.watch.write-completion"
       ]
     },
     {
@@ -380,7 +381,8 @@
       ],
       "claims": [
         "kernel.inotify.readiness.depth-independent",
-        "kernel.inotify.watch.host-registration-bound"
+        "kernel.inotify.watch.host-registration-bound",
+        "kernel.inotify.watch.write-completion"
       ]
     },
     {
@@ -394,7 +396,8 @@
         "kernel.inotify.watch"
       ],
       "claims": [
-        "kernel.inotify.watch.host-registration-bound"
+        "kernel.inotify.watch.host-registration-bound",
+        "kernel.inotify.watch.write-completion"
       ]
     },
     {
@@ -865,10 +868,13 @@
       "authority": "host",
       "contracts": [
         "kernel.fs.write-seek",
+        "kernel.inotify.watch",
         "kernel.scheduler.host-wait-handoff"
       ],
       "claims": [
         "kernel.fs.write-seek.no-offset-query",
+        "kernel.inotify.watch.host-registration-bound",
+        "kernel.inotify.watch.write-completion",
         "kernel.scheduler.host-wait-handoff.zero-migration"
       ]
     },

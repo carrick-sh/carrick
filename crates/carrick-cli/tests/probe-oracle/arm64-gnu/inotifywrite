@@ -1,0 +1,9 @@
+d7bab231b29b5629
+rejected_write=-1
+rejected_errno=9
+after_rejected=(-1, 11, [])
+empty_write=0
+after_empty=(-1, 11, [])
+successful_write=1
+after_success=(32, 0, [2, 32768])
+drained=(-1, 11, [])
