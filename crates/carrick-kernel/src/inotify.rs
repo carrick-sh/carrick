@@ -221,9 +221,12 @@ impl Inner {
     /// `IN_Q_OVERFLOW` (`wd = -1`) marker and drops this and all subsequent
     /// records until the queue drains. Matches the kernel's overflow behaviour
     /// that `inotify05` asserts.
-    fn push_record(&mut self, record: Vec<u8>) {
+    ///
+    /// Returns true iff the queue transitioned from empty to having queued
+    /// records (i.e. readiness transitioned and the backend must be pulsed).
+    fn push_record(&mut self, record: Vec<u8>) -> bool {
         if self.overflowed {
-            return;
+            return false;
         }
         // Event coalescing (inotify(7)): "If successive output inotify events
         // produced on the inotify file descriptor are identical (same wd, mask,
@@ -233,17 +236,19 @@ impl Inner {
         // identical event — drop the new one. (inotify02 renames the watched dir
         // twice back-to-back, expecting a single coalesced IN_MOVE_SELF.)
         if self.pending.back().is_some_and(|tail| *tail == record) {
-            return;
+            return false;
         }
+        let was_empty = self.pending.is_empty();
         if self.pending.len() >= INOTIFY_MAX_QUEUED_EVENTS {
             self.overflowed = true;
             let overflow = encode_event_raw(-1, carrick_abi::LINUX_IN_Q_OVERFLOW, 0, None);
             self.queued_bytes += overflow.len();
             self.pending.push_back(overflow);
-            return;
+            return was_empty;
         }
         self.queued_bytes += record.len();
         self.pending.push_back(record);
+        was_empty
     }
 
     /// Encoded bytes a `read(2)` could return right now, in O(1).
@@ -972,12 +977,15 @@ impl InotifyState {
     /// for transient children a directory snapshot/diff would miss. The
     /// bounded-queue + `IN_Q_OVERFLOW` policy is enforced here, like a real read.
     pub(crate) fn enqueue(&self, wd: i32, mask: u32, cookie: u32, name: Option<&[u8]>) {
+        let mut inner = self.inner.lock();
+        if inner.overflowed {
+            return;
+        }
         let record = encode_event_raw(wd, mask, cookie, name);
-        self.inner.lock().push_record(record);
-        // The record was produced below the host vnode/native-inotify source,
-        // so make the backend multiplexer itself readable. This is the fd on
-        // which poll, ppoll, and epoll actually park.
-        if self.has_queued_records() {
+        // Pulse the backend multiplexer only when the queue transitions from empty
+        // to non-empty (level readiness). Subsequent enqueues leave the backend
+        // readable without repeated host wake syscalls.
+        if inner.push_record(record) {
             self.backend.wake();
         }
     }
@@ -1113,18 +1121,51 @@ struct RegisteredWatch {
 /// process with its own copy of this in-memory table — so those still flow
 /// through the fork-coherent kqueue path. The registry covers the same-process
 /// operations the kqueue is too coarse for.
+#[derive(Default, Clone)]
+struct RegistryInner {
+    by_path: HashMap<String, Vec<RegisteredWatch>>,
+    by_wd: HashMap<(usize, i32), HashSet<String>>,
+}
+
+impl RegistryInner {
+    /// Remove a path without discarding other aliases of its watch descriptors.
+    fn remove_path(&mut self, path: &str) -> Option<Vec<RegisteredWatch>> {
+        let watches = self.by_path.remove(path)?;
+        for watch in &watches {
+            let key = (std::sync::Arc::as_ptr(&watch.state) as usize, watch.wd);
+            if let Some(paths) = self.by_wd.get_mut(&key) {
+                paths.remove(path);
+                if paths.is_empty() {
+                    self.by_wd.remove(&key);
+                }
+            }
+        }
+        Some(watches)
+    }
+}
+
+/// Dispatch-layer inotify watch table, keyed by the *guest* path each watch was
+/// added on. carrick intercepts every guest fd syscall, so this lets the
+/// open/read/write/close/create/unlink/rename/chmod handlers emit the exact
+/// Linux event a coarse kqueue `NOTE_*` can't (`IN_OPEN`/`IN_ACCESS`/per-write
+/// `IN_MODIFY`/`IN_CLOSE_*`, and transient `IN_CREATE`+`IN_DELETE` pairs).
+///
+/// This complements, and does not replace, the per-instance kqueue/native-
+/// inotify backend: cross-process changes (a forked guest child mutating a
+/// watched directory) are NOT visible here — the child is a separate host
+/// process with its own copy of this in-memory table — so those still flow
+/// through the fork-coherent kqueue path. The registry covers the same-process
+/// operations the kqueue is too coarse for.
 #[derive(Default)]
 pub struct InotifyRegistry {
-    /// Guest path → the watches registered on exactly that path. A directory
-    /// watch is stored under the directory's own path; child events are routed
-    /// by looking up the child's parent path here.
-    by_path: parking_lot::RwLock<HashMap<String, Vec<RegisteredWatch>>>,
+    /// Registry inner state: path-indexed watches and reverse (instance, wd) index.
+    inner: parking_lot::RwLock<RegistryInner>,
 }
 
 impl Clone for InotifyRegistry {
     fn clone(&self) -> Self {
         Self {
-            by_path: parking_lot::RwLock::new(self.by_path.read().clone()),
+            inner: parking_lot::RwLock::new(self.inner.read().clone()),
         }
     }
 }
@@ -1132,7 +1173,7 @@ impl Clone for InotifyRegistry {
 impl std::fmt::Debug for InotifyRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InotifyRegistry")
-            .field("watched_paths", &self.by_path.read().len())
+            .field("watched_paths", &self.inner.read().by_path.len())
             .finish()
     }
 }
@@ -1145,7 +1186,7 @@ impl InotifyRegistry {
         state: &std::sync::Arc<InotifyState>,
     ) -> Option<i32> {
         let key = normalize_watch_path(path);
-        self.by_path.read().get(key).and_then(|watches| {
+        self.inner.read().by_path.get(key).and_then(|watches| {
             watches
                 .iter()
                 .find(|watch| std::sync::Arc::ptr_eq(&watch.state, state))
@@ -1163,8 +1204,8 @@ impl InotifyRegistry {
         mask: u32,
     ) {
         let key = normalize_watch_path(path);
-        let mut by_path = self.by_path.write();
-        let entry = by_path.entry(key.to_owned()).or_default();
+        let mut inner = self.inner.write();
+        let entry = inner.by_path.entry(key.to_owned()).or_default();
         // Re-adding the same (instance, wd) updates the mask in place (inotify
         // returns the same wd for a re-add and replaces the mask).
         if let Some(existing) = entry
@@ -1179,24 +1220,40 @@ impl InotifyRegistry {
                 mask,
             });
         }
+        let ptr = std::sync::Arc::as_ptr(state) as usize;
+        inner
+            .by_wd
+            .entry((ptr, wd))
+            .or_default()
+            .insert(key.to_owned());
     }
 
     /// Drop every registry entry for `wd` of `state` (an `inotify_rm_watch`, or
     /// the inotify fd closing). `state` is compared by pointer so two instances
     /// that reused the same small `wd` don't clobber each other.
     pub(crate) fn unregister(&self, state: &std::sync::Arc<InotifyState>, wd: i32) {
-        let mut by_path = self.by_path.write();
-        by_path.retain(|_, watches| {
-            watches.retain(|w| !(w.wd == wd && std::sync::Arc::ptr_eq(&w.state, state)));
-            !watches.is_empty()
-        });
+        let mut inner = self.inner.write();
+        let ptr = std::sync::Arc::as_ptr(state) as usize;
+        // Visit only this descriptor's paths, then the watches on those paths.
+        if let Some(paths) = inner.by_wd.remove(&(ptr, wd)) {
+            for path in paths {
+                if let Some(watches) = inner.by_path.get_mut(&path) {
+                    watches.retain(|w| !(w.wd == wd && std::sync::Arc::ptr_eq(&w.state, state)));
+                    if watches.is_empty() {
+                        inner.by_path.remove(&path);
+                    }
+                }
+            }
+        }
     }
 
     /// Drop every registry entry belonging to `state` (the whole inotify
     /// instance closing). Called when an inotify fd is closed.
     pub(crate) fn unregister_all(&self, state: &std::sync::Arc<InotifyState>) {
-        let mut by_path = self.by_path.write();
-        by_path.retain(|_, watches| {
+        let mut inner = self.inner.write();
+        let ptr = std::sync::Arc::as_ptr(state) as usize;
+        inner.by_wd.retain(|&(p, _), _| p != ptr);
+        inner.by_path.retain(|_, watches| {
             watches.retain(|w| !std::sync::Arc::ptr_eq(&w.state, state));
             !watches.is_empty()
         });
@@ -1208,7 +1265,8 @@ impl InotifyRegistry {
     /// watches on the parent or on children.
     pub(crate) fn unregister_path(&self, path: &str) {
         let key = normalize_watch_path(path);
-        self.by_path.write().remove(key);
+        let mut inner = self.inner.write();
+        inner.remove_path(key);
     }
 
     /// Move a watch from `from` to `to` (a `rename(2)` of a watched object):
@@ -1222,16 +1280,25 @@ impl InotifyRegistry {
         if from_key == to_key {
             return;
         }
-        let mut by_path = self.by_path.write();
-        if let Some(watches) = by_path.remove(from_key) {
-            by_path.insert(to_key.to_owned(), watches);
+        let mut inner = self.inner.write();
+        if let Some(watches) = inner.remove_path(from_key) {
+            inner.remove_path(to_key);
+            for w in &watches {
+                let ptr = std::sync::Arc::as_ptr(&w.state) as usize;
+                inner
+                    .by_wd
+                    .entry((ptr, w.wd))
+                    .or_default()
+                    .insert(to_key.to_owned());
+            }
+            inner.by_path.insert(to_key.to_owned(), watches);
         }
     }
 
     /// True iff nothing is currently watched (the hot-path fast exit: the fs
     /// handlers skip all event work when no inotify watch exists).
     pub(crate) fn is_empty(&self) -> bool {
-        self.by_path.read().is_empty()
+        self.inner.read().by_path.is_empty()
     }
 
     /// Emit a *self* event on `path` (the watched object itself changed):
@@ -1279,22 +1346,69 @@ impl InotifyRegistry {
         );
     }
 
-    /// Cheap test: does a watch exist on the PARENT directory of `child_path`
-    /// (the only kind of watch `notify_child_excl` can route an event to)? A
-    /// hot write path uses this to SKIP the expensive `path_exists`
-    /// (resolve+stat) that only feeds `IN_EXCL_UNLINK` — when the watch is on
-    /// the file ITSELF and not its parent dir (inotify09), there is no consumer,
-    /// so the stat is pure waste 158k times over. One `HashMap` lookup.
-    pub(crate) fn parent_watch_exists_for(&self, child_path: &str) -> bool {
-        let norm = normalize_watch_path(child_path);
+    /// Emit an inotify event for an open fd operation (read/write): delivers to
+    /// both the parent directory watch (if present and name non-empty) and the
+    /// object's own self watch under a single read lock. `check_child_unlinked`
+    /// is only evaluated if a parent watch with `IN_EXCL_UNLINK` is active.
+    pub(crate) fn notify_fd_event(
+        &self,
+        path: &str,
+        mask: u32,
+        is_dir: bool,
+        check_child_unlinked: impl FnOnce() -> bool,
+    ) {
+        let norm = normalize_watch_path(path);
         let (parent, name) = split_parent_name(norm);
-        if name.is_empty() {
-            return false;
+        let mut fired_oneshot: Vec<OneshotFire> = Vec::new();
+        {
+            let inner = self.inner.read();
+            let mut const_cookie = |_: &std::sync::Arc<InotifyState>| 0;
+
+            // 1. Parent watch (child event) if parent is watched and child has a name
+            if !name.is_empty() {
+                if let Some(parent_watches) = inner.by_path.get(parent) {
+                    if !parent_watches.is_empty() {
+                        let has_excl_unlink = parent_watches
+                            .iter()
+                            .any(|w| w.mask & carrick_abi::LINUX_IN_EXCL_UNLINK != 0);
+                        let child_unlinked = if has_excl_unlink {
+                            check_child_unlinked()
+                        } else {
+                            false
+                        };
+                        dispatch_in(
+                            &inner.by_path,
+                            &InotifyDispatchEvent {
+                                path: parent,
+                                mask,
+                                is_dir,
+                                name: Some(name.as_bytes()),
+                                child_unlinked,
+                            },
+                            &mut const_cookie,
+                            &mut fired_oneshot,
+                        );
+                    }
+                }
+            }
+
+            // 2. Self watch (self event)
+            dispatch_in(
+                &inner.by_path,
+                &InotifyDispatchEvent {
+                    path: norm,
+                    mask,
+                    is_dir,
+                    name: None,
+                    child_unlinked: false,
+                },
+                &mut const_cookie,
+                &mut fired_oneshot,
+            );
         }
-        self.by_path
-            .read()
-            .get(parent)
-            .is_some_and(|watches| !watches.is_empty())
+        if !fired_oneshot.is_empty() {
+            self.retire_oneshot(fired_oneshot);
+        }
     }
 
     /// Emit a rename pair: `IN_MOVED_FROM` (basename of `from`) on `from`'s
@@ -1306,7 +1420,7 @@ impl InotifyRegistry {
         let to_norm = normalize_watch_path(to);
         let (from_parent, from_name) = split_parent_name(from_norm);
         let (to_parent, to_name) = split_parent_name(to_norm);
-        let by_path = self.by_path.read();
+        let inner = self.inner.read();
         // FROM and TO can land on different watches; cookie pairing only matters
         // when the *same* instance watches both parents, so cache a cookie per
         // instance the first time it is touched.
@@ -1324,7 +1438,7 @@ impl InotifyRegistry {
         let mut fired_oneshot: Vec<OneshotFire> = Vec::new();
         if !from_name.is_empty() {
             dispatch_in(
-                &by_path,
+                &inner.by_path,
                 &InotifyDispatchEvent {
                     path: from_parent,
                     mask: carrick_abi::LINUX_IN_MOVED_FROM,
@@ -1338,7 +1452,7 @@ impl InotifyRegistry {
         }
         if !to_name.is_empty() {
             dispatch_in(
-                &by_path,
+                &inner.by_path,
                 &InotifyDispatchEvent {
                     path: to_parent,
                     mask: carrick_abi::LINUX_IN_MOVED_TO,
@@ -1350,7 +1464,7 @@ impl InotifyRegistry {
                 &mut fired_oneshot,
             );
         }
-        drop(by_path);
+        drop(inner);
         self.retire_oneshot(fired_oneshot);
     }
 
@@ -1369,10 +1483,10 @@ impl InotifyRegistry {
     ) {
         let mut fired_oneshot: Vec<OneshotFire> = Vec::new();
         {
-            let by_path = self.by_path.read();
+            let inner = self.inner.read();
             let mut const_cookie = |_: &std::sync::Arc<InotifyState>| cookie;
             dispatch_in(
-                &by_path,
+                &inner.by_path,
                 &InotifyDispatchEvent {
                     path,
                     mask,
@@ -2015,6 +2129,106 @@ mod registry_tests {
 
         // unregister_path drops it entirely.
         reg.unregister_path("/new");
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn registry_rename_replacement_removes_displaced_reverse_entries() {
+        let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
+        let reg = InotifyRegistry::default();
+        let original = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+        reg.register(
+            "/destination",
+            &state,
+            original,
+            carrick_abi::LINUX_IN_MODIFY,
+        );
+        for _ in 0..32 {
+            let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+            reg.register("/source", &state, wd, carrick_abi::LINUX_IN_MODIFY);
+            reg.rename_path("/source", "/destination");
+            let inner = reg.inner.read();
+            assert_eq!(inner.by_path.len(), 1);
+            assert_eq!(
+                inner.by_wd.len(),
+                1,
+                "displaced watches must leave both indexes"
+            );
+        }
+        reg.unregister_path("/destination");
+        assert!(reg.inner.read().by_wd.is_empty());
+    }
+
+    #[test]
+    fn registry_unregister_removes_all_alias_paths() {
+        let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
+        let reg = InotifyRegistry::default();
+        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+        reg.register("/first", &state, wd, carrick_abi::LINUX_IN_MODIFY);
+        reg.register("/alias", &state, wd, carrick_abi::LINUX_IN_MODIFY);
+        reg.unregister(&state, wd);
+        assert!(
+            reg.is_empty(),
+            "unregister must remove every path for the watch"
+        );
+        assert!(reg.inner.read().by_wd.is_empty());
+    }
+
+    #[test]
+    fn registry_path_removal_preserves_other_watch_aliases() {
+        let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
+        let reg = InotifyRegistry::default();
+        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+        for path in ["/first", "/second", "/third"] {
+            reg.register(path, &state, wd, carrick_abi::LINUX_IN_MODIFY);
+        }
+        reg.unregister_path("/third");
+        reg.rename_path("/first", "/second");
+        assert_eq!(reg.watch_descriptor("/second", &state), Some(wd));
+        reg.unregister(&state, wd);
+        assert!(reg.is_empty());
+        assert!(reg.inner.read().by_wd.is_empty());
+    }
+
+    #[test]
+    fn registry_notify_fd_event_delivers_to_both_parent_and_self() {
+        let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
+        let reg = InotifyRegistry::default();
+        let wd_parent = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+        let wd_file = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+        reg.register("/dir", &state, wd_parent, carrick_abi::LINUX_IN_MODIFY);
+        reg.register(
+            "/dir/file.txt",
+            &state,
+            wd_file,
+            carrick_abi::LINUX_IN_MODIFY,
+        );
+        state.mark_dispatch_authoritative();
+
+        let mut unlinked_checked = false;
+        reg.notify_fd_event("/dir/file.txt", carrick_abi::LINUX_IN_MODIFY, false, || {
+            unlinked_checked = true;
+            false
+        });
+        // Neither watch has IN_EXCL_UNLINK, so unlinked check should be skipped.
+        assert!(!unlinked_checked);
+
+        // Read records: parent should get child event (with name "file.txt"),
+        // self should get self event (without name).
+        let bytes = state.read_records(4096).expect("read");
+        let (p_wd, p_mask, _, p_len) = parse_header(&bytes);
+        assert_eq!(p_wd, wd_parent);
+        assert_eq!(p_mask, carrick_abi::LINUX_IN_MODIFY);
+        assert_eq!(&bytes[16..16 + 8], b"file.txt");
+        let rec2 = &bytes[16 + p_len as usize..];
+        let (s_wd, s_mask, _, s_len) = parse_header(rec2);
+        assert_eq!(s_wd, wd_file);
+        assert_eq!(s_mask, carrick_abi::LINUX_IN_MODIFY);
+        assert_eq!(s_len, 0);
+
+        // Unregister uses the reverse index to visit only the watched paths.
+        reg.unregister(&state, wd_parent);
+        reg.unregister(&state, wd_file);
         assert!(reg.is_empty());
     }
 }
