@@ -4821,10 +4821,27 @@ impl HvfVmState {
     }
 
     pub(crate) fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
-        !self.range_no_access(address, length)
-            && self
-                .validate_guest_write_range_with_pristine(address, length, true, true)
-                .is_ok()
+        if self.range_no_access(address, length) {
+            carrick_observability::probes::guest_internal_write_fault(
+                address,
+                length as u64,
+                3,
+                "guest range has no access",
+            );
+            return false;
+        }
+        match self.validate_guest_write_range_with_pristine(address, length, true, true) {
+            Ok(()) => true,
+            Err(error) => {
+                carrick_observability::probes::guest_internal_write_fault(
+                    address,
+                    length as u64,
+                    4,
+                    &error.to_string(),
+                );
+                false
+            }
+        }
     }
 }
 
