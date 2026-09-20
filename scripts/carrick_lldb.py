@@ -648,6 +648,10 @@ _EVENTRING_KINDS = {
         lambda a, b, c: f"tid={c} pc={((a & 0xffffffff) | ((b & 0xffffffff) << 32)):#018x}",
     ),
     63: ("SIGNAL_INJECT", lambda a, b, c: f"tid={a} signal={b} restart={bool(c)}"),
+    64: ("SCHED_DISPATCH", lambda a, b, c: f"tid={a} executor={b} cpu={c}"),
+    65: ("SCHED_PREEMPT", lambda a, b, c: f"tid={a} executor={b} reasons={c:#x}"),
+    66: ("SCHED_BUDGET", lambda a, b, c: f"executor={a} budget_ms={b} generation={c}"),
+    67: ("SCHED_DEADLINE", lambda a, b, c: f"executor={a} deadline_ms={b} ticket={c}"),
 }
 
 

@@ -836,6 +836,7 @@ impl carrick_kernel::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebu
             control_epoch: summary.control_epoch,
             need_resched: summary.need_resched,
             snapshot_count: summary.snapshot_count,
+            residencies: summary.residencies,
         }]
     }
 

@@ -902,6 +902,8 @@ pub struct SchedulerSummary {
     pub control_epoch: u64,
     pub need_resched: bool,
     pub snapshot_count: u64,
+    /// None means the preemption lock was contended, never an empty residency set.
+    pub residencies: Option<Vec<crate::kernel::debug::dto::DebugResidencyRow>>,
 }
 
 /// What a queue insertion did with one exact row. A bare `bool` said only
@@ -927,7 +929,7 @@ impl EnqueueOutcome {
 }
 
 #[derive(Debug)]
-struct RunQueueInner {
+pub(crate) struct RunQueueInner {
     /// Lifecycle ONLY. Never taken to enqueue, claim, finish a claim or
     /// release an authority while the queue is open — that carrier-wide
     /// convoy is what this design exists to remove.
@@ -2651,10 +2653,6 @@ impl RunQueue {
         self.inner.cpu_load(cpu)
     }
 
-    fn snapshot_queued_demands(&self) -> Vec<QueuedDemand> {
-        self.inner.snapshot_queued_demands()
-    }
-
     /// Executors parked right now, across every CPU plus the spare pool,
     /// counted from a state guard the CALLER already holds.
     ///
@@ -2944,7 +2942,7 @@ pub struct Scheduler {
     kernel: Arc<Kernel>,
     queue: RunQueue,
     executors: Arc<ExecutorDirectory>,
-    preemption: Mutex<PreemptionState>,
+    preemption: Arc<Mutex<PreemptionState>>,
     preemption_condvar: Arc<Condvar>,
     snapshot_count: AtomicU64,
     generation_transition: Mutex<()>,
@@ -2990,7 +2988,10 @@ impl Scheduler {
     ) -> Self {
         let event_sequence = Arc::new(AtomicU64::new(1));
         let preemption_condvar = Arc::new(Condvar::new());
-        let preemption = Mutex::new(PreemptionState::new(clock, Arc::clone(&event_sequence)));
+        let preemption = Arc::new(Mutex::new(PreemptionState::new(
+            clock,
+            Arc::clone(&event_sequence),
+        )));
         Self {
             kernel,
             queue: RunQueue::new(policy, event_sequence),
@@ -3736,156 +3737,190 @@ impl Scheduler {
     }
 
     pub fn recompute_demand(&self) {
-        let demands = self.queue.snapshot_queued_demands();
-        let candidates = {
-            let preemption = self.preemption.lock();
-            preemption
-                .residencies
-                .iter()
-                .map(|(exec_id, res)| ResidencyCandidate {
-                    executor: *exec_id,
-                    cpu: res.cpu,
-                    start: res.start,
-                    thread: SchedThreadId::new(res.thread.serial.raw()),
-                    process: SchedProcessId::new(res.binding.thread.serial.raw()),
-                })
-                .collect::<Vec<_>>()
-        };
+        recompute_demand_state(
+            &self.queue.inner,
+            &self.preemption,
+            &self.preemption_condvar,
+        );
+    }
+}
 
-        if candidates.is_empty() {
-            return;
-        }
+pub(super) fn recompute_demand_state(
+    queue: &RunQueueInner,
+    preemption_lock: &Mutex<PreemptionState>,
+    preemption_condvar: &Condvar,
+) {
+    let demands = queue.snapshot_queued_demands();
+    let candidates = {
+        let preemption = preemption_lock.lock();
+        preemption
+            .residencies
+            .iter()
+            .map(|(exec_id, res)| ResidencyCandidate {
+                executor: *exec_id,
+                cpu: res.cpu,
+                start: res.start,
+                thread: SchedThreadId::new(res.thread.serial.raw()),
+                process: SchedProcessId::new(res.binding.thread.serial.raw()),
+            })
+            .collect::<Vec<_>>()
+    };
 
-        // Sort candidates by residency start (oldest residency first)
-        let mut sorted_candidates = candidates.clone();
-        sorted_candidates.sort_by_key(|c| c.start);
+    if candidates.is_empty() {
+        return;
+    }
 
-        let mut matched_executors = std::collections::HashSet::new();
-        let mut candidate_backlog: std::collections::HashMap<ExecutorId, usize> =
-            std::collections::HashMap::new();
+    // Sort candidates by residency start (oldest residency first)
+    let mut sorted_candidates = candidates.clone();
+    sorted_candidates.sort_by_key(|c| c.start);
 
-        for demand in &demands {
-            if let Some(candidate) = sorted_candidates.iter().find(|c| {
-                !matched_executors.contains(&c.executor) && demand.affinity.is_allowed(c.cpu)
-            }) {
-                matched_executors.insert(candidate.executor);
-                *candidate_backlog.entry(candidate.executor).or_insert(0) += 1;
-            } else if let Some(candidate) = sorted_candidates
-                .iter()
-                .find(|c| demand.affinity.is_allowed(c.cpu))
-            {
-                *candidate_backlog.entry(candidate.executor).or_insert(0) += 1;
-            }
-        }
+    let mut matched_executors = std::collections::HashSet::new();
+    let mut candidate_backlog: std::collections::HashMap<ExecutorId, usize> =
+        std::collections::HashMap::new();
 
-        // Call policy.on_contention outside of locks
-        let now = {
-            let preemption = self.preemption.lock();
-            preemption.clock.now()
-        };
-
-        let mut actions = Vec::new();
-        for candidate in &candidates {
-            if matched_executors.contains(&candidate.executor) {
-                let eligible_queued = *candidate_backlog.get(&candidate.executor).unwrap_or(&1);
-                let elapsed = now.saturating_duration_since(candidate.start);
-                let load = self.queue.load_of(candidate.cpu);
-                let dispatch_ctx = DispatchContext {
-                    thread: candidate.thread,
-                    process: candidate.process,
-                    cpu: candidate.cpu,
-                    load,
-                };
-                let contention_ctx = ContentionContext {
-                    running: dispatch_ctx,
-                    residency_elapsed: elapsed,
-                    eligible_queued,
-                };
-                let action = self.queue.inner.policy.on_contention(&contention_ctx);
-                actions.push((candidate.executor, Some(action)));
-            } else {
-                actions.push((candidate.executor, None));
-            }
-        }
-
-        // Apply under preemption lock
-        let mut preemption = self.preemption.lock();
-        let mut notify = false;
-        let now = preemption.clock.now();
-
-        for (executor, maybe_action) in actions {
-            match maybe_action {
-                None => {
-                    // No demand for this executor: cancel unclaimed deadline
-                    if preemption.cancel_deadline(executor) {
-                        notify = true;
-                    }
-                    if let Some(res) = preemption.residencies.get_mut(&executor) {
-                        if !res.ticket_claimed {
-                            res.reasons.remove(PreemptionReasons::FAIRNESS);
-                        }
-                    }
-                }
-                Some(action) => {
-                    if let Some(res) = preemption.residencies.get_mut(&executor) {
-                        let elapsed = now.saturating_duration_since(res.start);
-                        let quantum = res.budget.quantum();
-                        match action {
-                            PreemptionAction::KeepBudget => {
-                                if elapsed >= quantum {
-                                    res.reasons.insert(PreemptionReasons::FAIRNESS);
-                                    let _ = preemption.cancel_deadline(executor);
-                                    notify = true;
-                                } else {
-                                    let deadline = res.start + quantum;
-                                    if !preemption.has_deadline(executor) {
-                                        preemption.schedule_deadline(
-                                            executor,
-                                            deadline,
-                                            PreemptionReasons::FAIRNESS,
-                                        );
-                                        notify = true;
-                                    }
-                                }
-                            }
-                            PreemptionAction::ShortenTo(duration) => {
-                                let effective = duration.min(quantum);
-                                if elapsed >= effective {
-                                    res.reasons.insert(PreemptionReasons::FAIRNESS);
-                                    let _ = preemption.cancel_deadline(executor);
-                                    notify = true;
-                                } else {
-                                    let deadline = res.start + effective;
-                                    let should_schedule = match preemption.deadline_for(executor) {
-                                        Some(existing) => deadline < existing,
-                                        None => true,
-                                    };
-                                    if should_schedule {
-                                        preemption.schedule_deadline(
-                                            executor,
-                                            deadline,
-                                            PreemptionReasons::FAIRNESS,
-                                        );
-                                        notify = true;
-                                    }
-                                }
-                            }
-                            PreemptionAction::Preempt => {
-                                res.reasons.insert(PreemptionReasons::FAIRNESS);
-                                let _ = preemption.cancel_deadline(executor);
-                                notify = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if notify {
-            self.preemption_condvar.notify_all();
+    for demand in &demands {
+        if let Some(candidate) = sorted_candidates
+            .iter()
+            .find(|c| !matched_executors.contains(&c.executor) && demand.affinity.is_allowed(c.cpu))
+        {
+            matched_executors.insert(candidate.executor);
+            *candidate_backlog.entry(candidate.executor).or_insert(0) += 1;
+        } else if let Some(candidate) = sorted_candidates
+            .iter()
+            .find(|c| demand.affinity.is_allowed(c.cpu))
+        {
+            *candidate_backlog.entry(candidate.executor).or_insert(0) += 1;
         }
     }
 
+    // Call policy.on_contention outside of locks
+    let now = {
+        let preemption = preemption_lock.lock();
+        preemption.clock.now()
+    };
+
+    let mut actions = Vec::new();
+    for candidate in &candidates {
+        if matched_executors.contains(&candidate.executor) {
+            let eligible_queued = *candidate_backlog.get(&candidate.executor).unwrap_or(&1);
+            let elapsed = now.saturating_duration_since(candidate.start);
+            let load = queue.cpu_load(candidate.cpu);
+            let dispatch_ctx = DispatchContext {
+                thread: candidate.thread,
+                process: candidate.process,
+                cpu: candidate.cpu,
+                load,
+            };
+            let contention_ctx = ContentionContext {
+                running: dispatch_ctx,
+                residency_elapsed: elapsed,
+                eligible_queued,
+            };
+            let action = queue.policy.on_contention(&contention_ctx);
+            actions.push((candidate.executor, Some(action)));
+        } else {
+            actions.push((candidate.executor, None));
+        }
+    }
+
+    // Apply under preemption lock
+    let mut preemption = preemption_lock.lock();
+    let mut notify = false;
+    let now = preemption.clock.now();
+
+    for (executor, maybe_action) in actions {
+        match maybe_action {
+            None => {
+                // No demand for this executor: cancel unclaimed deadline
+                if preemption.cancel_deadline(executor) {
+                    notify = true;
+                }
+                if let Some(res) = preemption.residencies.get_mut(&executor) {
+                    if !res.ticket_claimed {
+                        res.reasons.remove(PreemptionReasons::FAIRNESS);
+                    }
+                }
+            }
+            Some(action) => {
+                let res_info = preemption
+                    .residencies
+                    .get(&executor)
+                    .map(|r| (r.start, r.budget.quantum(), r.ticket.0));
+                if let Some((start, quantum, ticket)) = res_info {
+                    let elapsed = now.saturating_duration_since(start);
+                    match action {
+                        PreemptionAction::KeepBudget => {
+                            if elapsed >= quantum {
+                                if let Some(res) = preemption.residencies.get_mut(&executor) {
+                                    res.reasons.insert(PreemptionReasons::FAIRNESS);
+                                }
+                                let _ = preemption.cancel_deadline(executor);
+                                notify = true;
+                            } else {
+                                let deadline = start + quantum;
+                                if !preemption.has_deadline(executor) {
+                                    preemption.schedule_deadline(
+                                        executor,
+                                        deadline,
+                                        PreemptionReasons::FAIRNESS,
+                                    );
+                                    crate::event_ring::rec_sched_deadline(
+                                        executor.raw(),
+                                        quantum.as_millis() as u32,
+                                        ticket,
+                                    );
+                                    notify = true;
+                                }
+                            }
+                        }
+                        PreemptionAction::ShortenTo(duration) => {
+                            let effective = duration.min(quantum);
+                            if elapsed >= effective {
+                                if let Some(res) = preemption.residencies.get_mut(&executor) {
+                                    res.reasons.insert(PreemptionReasons::FAIRNESS);
+                                }
+                                let _ = preemption.cancel_deadline(executor);
+                                notify = true;
+                            } else {
+                                let deadline = start + effective;
+                                let should_schedule = match preemption.deadline_for(executor) {
+                                    Some(existing) => deadline < existing,
+                                    None => true,
+                                };
+                                if should_schedule {
+                                    preemption.schedule_deadline(
+                                        executor,
+                                        deadline,
+                                        PreemptionReasons::FAIRNESS,
+                                    );
+                                    crate::event_ring::rec_sched_deadline(
+                                        executor.raw(),
+                                        effective.as_millis() as u32,
+                                        ticket,
+                                    );
+                                    notify = true;
+                                }
+                            }
+                        }
+                        PreemptionAction::Preempt => {
+                            if let Some(res) = preemption.residencies.get_mut(&executor) {
+                                res.reasons.insert(PreemptionReasons::FAIRNESS);
+                            }
+                            let _ = preemption.cancel_deadline(executor);
+                            notify = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if notify {
+        preemption_condvar.notify_all();
+    }
+}
+
+impl Scheduler {
     pub fn take(&self, executor: &ExecutorRegistration) -> Result<RunnableThread, RunQueueError> {
         self.executors.authenticate(executor)?;
         let recorder = self.discard_recorder.lock().clone();
@@ -3922,6 +3957,16 @@ impl Scheduler {
             budget,
             row.thread.key(),
             row.key.generation,
+        );
+        crate::event_ring::rec_sched_dispatch(
+            row.thread.key().serial.raw() as i32,
+            executor.id.raw(),
+            bound_cpu.as_usize(),
+        );
+        crate::event_ring::rec_sched_budget(
+            executor.id.raw(),
+            budget.quantum().as_millis() as u32,
+            row.key.generation.raw(),
         );
         self.queue.inner.policy.on_event(&SchedulingEvent {
             sequence,
@@ -4570,6 +4615,35 @@ impl Scheduler {
             QueueLifecycle::Closed => "closed",
         }
         .to_owned();
+        let residencies = self.preemption.try_lock().map(|preemption| {
+            let now = preemption.clock.now();
+            preemption
+                .residencies
+                .values()
+                .map(|res| {
+                    let deadline_remaining_ns =
+                        preemption.deadline_for(res.binding.executor()).map(|dl| {
+                            if dl > now {
+                                u64::try_from(dl.duration_since(now).as_nanos()).unwrap_or(u64::MAX)
+                            } else {
+                                0
+                            }
+                        });
+                    crate::kernel::debug::dto::DebugResidencyRow {
+                        executor: res.binding.executor().raw(),
+                        thread: crate::kernel::debug::dto::thread_key(res.thread),
+                        generation: res.generation.raw(),
+                        cpu: res.cpu.as_usize(),
+                        ticket: res.ticket.0,
+                        budget_ns: u64::try_from(res.budget.quantum().as_nanos())
+                            .unwrap_or(u64::MAX),
+                        reasons: res.reasons.bits(),
+                        deadline_remaining_ns,
+                        ticket_claimed: res.ticket_claimed,
+                    }
+                })
+                .collect()
+        });
         SchedulerSummary {
             host_wait: self.host_wait_census(),
             lifecycle,
@@ -4579,6 +4653,7 @@ impl Scheduler {
             control_epoch: self.queue.inner.control_epoch.load(Ordering::Acquire),
             need_resched: self.need_resched(),
             snapshot_count: self.snapshot_count(),
+            residencies,
         }
     }
 
@@ -4731,6 +4806,11 @@ impl Scheduler {
                     }
                     drop(preemption);
                     if entry.kick.deliver_exact(req.binding.token()) {
+                        crate::event_ring::rec_sched_preempt(
+                            req.binding.thread().serial.raw() as i32,
+                            req.binding.executor().raw(),
+                            req.reasons.bits(),
+                        );
                         return DeliveryOutcome::Delivered;
                     } else {
                         return DeliveryOutcome::Coalesced;

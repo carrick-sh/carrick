@@ -7,6 +7,7 @@ use carrick_abi::LinuxCloneFlags;
 use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 use carrick_hal::{CpuAffinity, GuestCpuId, SchedulingPolicy, ThreadId};
 use carrick_kernel::kernel::objects::MigratableTaskState;
+use carrick_kernel::kernel::scheduler::PreemptionReasons;
 use carrick_kernel::kernel::{
     ClonePlan, ExecutorBinding, ExecutorKick, ExecutorKickToken, Kernel, KernelContext,
     RootBootstrap, Scheduler,
@@ -313,4 +314,131 @@ fn recorded_adversarial_handoff_replays_without_fallback() {
             "replay must consume the recording, not silently fall back"
         );
     }
+}
+
+#[test]
+fn handoff_disarms_fairness_deadline_and_refreshes_budget_on_resume() {
+    let bootstrap = RootBootstrap::for_one_task_adapter(
+        62_000,
+        ThreadId::synthetic_for_tests(62_000),
+        "preemption handoff".into(),
+        Arc::new(NoSignalCalls),
+    )
+    .unwrap();
+    let (kernel, root) = Kernel::bootstrap_root(bootstrap).unwrap();
+    let cpu = GuestCpuId::new(0);
+    root.thread().set_affinity(CpuAffinity::single(cpu));
+    publish_task(&root, 100);
+
+    let scheduler = Scheduler::new(kernel.clone());
+    let owner = scheduler
+        .register_executor_bound(Arc::new(TestKick::default()), Some(cpu), false)
+        .unwrap();
+    let spare = scheduler
+        .register_executor_bound(Arc::new(TestKick::default()), None, true)
+        .unwrap();
+
+    scheduler.make_runnable(root.thread().key()).unwrap();
+    let original = scheduler.take(&owner).unwrap();
+
+    // Owner has an active residency
+    let res = scheduler.binding_residency(owner.id()).expect("residency");
+    assert_eq!(res.cpu, cpu);
+    assert_eq!(res.reasons, PreemptionReasons::empty());
+
+    // Sibling is queued and creates contention
+    let sibling = create_sibling_thread(&kernel, &root, 62_001);
+    sibling.thread().set_affinity(CpuAffinity::single(cpu));
+    publish_task(&sibling, 200);
+    scheduler.make_runnable(sibling.thread().key()).unwrap();
+
+    // Owner enters host wait: fairness is cancelled, residency suspended
+    let wait = scheduler.begin_host_wait(&original, &owner).unwrap();
+    assert!(wait.is_active());
+    assert!(scheduler.binding_residency(owner.id()).is_none());
+    assert!(!scheduler.has_deadline(owner.id()));
+
+    // Spare claims the slot and runs the sibling with independent residency
+    let running = scheduler.take(&spare).unwrap();
+    assert_eq!(running.guest_cpu(), cpu);
+    let spare_res = scheduler
+        .binding_residency(spare.id())
+        .expect("spare residency");
+    assert_eq!(spare_res.cpu, cpu);
+    assert_eq!(spare_res.thread, sibling.thread().key());
+    scheduler.settle_exited(running).unwrap();
+
+    // End host wait: original reacquires slot, receives fresh residency & budget
+    scheduler.end_host_wait(&original, &owner, wait).unwrap();
+    let restored = scheduler
+        .binding_residency(owner.id())
+        .expect("restored residency");
+    assert_eq!(restored.cpu, cpu);
+    assert!(
+        restored
+            .reasons
+            .contains(PreemptionReasons::HOST_WAIT_RETURN)
+    );
+    assert!(scheduler.should_preempt(&original));
+
+    scheduler.settle_exited(original).unwrap();
+    scheduler.close();
+    scheduler.wait_closed();
+    scheduler.unregister_executor(&spare).unwrap();
+    scheduler.unregister_executor(&owner).unwrap();
+}
+
+#[test]
+fn handoff_preserves_mandatory_control_reasons_through_resume() {
+    let bootstrap = RootBootstrap::for_one_task_adapter(
+        63_000,
+        ThreadId::synthetic_for_tests(63_000),
+        "control reason handoff".into(),
+        Arc::new(NoSignalCalls),
+    )
+    .unwrap();
+    let (kernel, root) = Kernel::bootstrap_root(bootstrap).unwrap();
+    let cpu = GuestCpuId::new(0);
+    root.thread().set_affinity(CpuAffinity::single(cpu));
+    publish_task(&root, 100);
+
+    let scheduler = Scheduler::new(kernel.clone());
+    let owner = scheduler
+        .register_executor_bound(Arc::new(TestKick::default()), Some(cpu), false)
+        .unwrap();
+
+    scheduler.make_runnable(root.thread().key()).unwrap();
+    let original = scheduler.take(&owner).unwrap();
+
+    // Set both mandatory control reasons and fairness
+    assert!(scheduler.set_preemption_reason(
+        owner.id(),
+        PreemptionReasons::SIGNAL | PreemptionReasons::CONTROL | PreemptionReasons::FAIRNESS,
+    ));
+
+    // Begin host wait
+    let wait = scheduler.begin_host_wait(&original, &owner).unwrap();
+    assert!(scheduler.binding_residency(owner.id()).is_none());
+
+    // End host wait
+    scheduler.end_host_wait(&original, &owner, wait).unwrap();
+
+    let restored = scheduler
+        .binding_residency(owner.id())
+        .expect("restored residency");
+    // Mandatory reasons (SIGNAL, CONTROL) and HOST_WAIT_RETURN survive, FAIRNESS was cancelled
+    assert!(restored.reasons.contains(PreemptionReasons::SIGNAL));
+    assert!(restored.reasons.contains(PreemptionReasons::CONTROL));
+    assert!(
+        restored
+            .reasons
+            .contains(PreemptionReasons::HOST_WAIT_RETURN)
+    );
+    assert!(!restored.reasons.contains(PreemptionReasons::FAIRNESS));
+    assert!(scheduler.should_preempt(&original));
+
+    scheduler.settle_exited(original).unwrap();
+    scheduler.close();
+    scheduler.wait_closed();
+    scheduler.unregister_executor(&owner).unwrap();
 }
