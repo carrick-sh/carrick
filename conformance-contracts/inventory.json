@@ -4,9 +4,9 @@
     "bring_up": 246,
     "deferred": 90,
     "planned": 2,
-    "with_claims": 13,
-    "without_claims": 325,
-    "with_evidence": 13,
+    "with_claims": 14,
+    "without_claims": 324,
+    "with_evidence": 10,
     "with_violation_evidence": 1
   },
   "entries": [
@@ -833,10 +833,11 @@
       "support": "bring_up",
       "handler": "filesystem",
       "authority": "host",
-      "contracts": [],
-      "claims": [],
-      "uncovered_behaviors": [
-        "emulated in bring-up without explicit contract claim"
+      "contracts": [
+        "kernel.fs.write-seek"
+      ],
+      "claims": [
+        "kernel.fs.write-seek.no-offset-query"
       ]
     },
     {
@@ -863,9 +864,11 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.fs.write-seek",
         "kernel.scheduler.host-wait-handoff"
       ],
       "claims": [
+        "kernel.fs.write-seek.no-offset-query",
         "kernel.scheduler.host-wait-handoff.zero-migration"
       ]
     },

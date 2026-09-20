@@ -16,6 +16,7 @@ chrono = { workspace = true, features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+sha2.workspace = true
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 carrick-coordinator = { path = "../carrick-coordinator" }
 

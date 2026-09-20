@@ -221,3 +221,16 @@ fn timing_ratio_failure_fails_closed() {
             if (actual - 2.5).abs() < f64::EPSILON && (maximum - 2.0).abs() < f64::EPSILON
     ));
 }
+
+#[test]
+fn unresolved_signed_binding_is_not_execution_coverage() {
+    let registry = ContractRegistry::load(&repo_root()).unwrap();
+    let contract = registry.require("kernel.fs.write-seek").unwrap();
+    let mut obs = observation(ExecutionLayer::EmbedStructural, 1);
+    obs.contract_id = contract.id.clone();
+    obs.fixture_identity = contract.fixture.clone();
+    assert!(matches!(
+        evaluate(contract, &[obs]),
+        Err(ContractFailure::UnsupportedLayer { .. })
+    ));
+}

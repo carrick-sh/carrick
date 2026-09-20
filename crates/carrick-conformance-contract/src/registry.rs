@@ -165,6 +165,14 @@ fn validate_contract(contract: &ConformanceContract) -> Result<(), RegistryError
         (ExecutionLayer::Docker, contract.bindings.docker.as_deref()),
     ] {
         if binding.is_none_or(str::is_empty) {
+            if contract
+                .bindings
+                .unresolved
+                .get(&layer.to_string())
+                .is_some_and(|reason| !reason.trim().is_empty())
+            {
+                continue;
+            }
             return Err(RegistryError::MissingBinding {
                 id: contract.id.clone(),
                 layer,

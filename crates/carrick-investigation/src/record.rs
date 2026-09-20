@@ -69,6 +69,8 @@ pub struct InvestigationHistoryEntry {
 pub struct Investigation {
     pub id: InvestigationId,
     pub stage: Stage,
+    #[serde(default)]
+    pub classification: Option<Stage>,
     pub selected_failure: SelectedFailure,
     pub hypotheses: Vec<Hypothesis>,
     pub resource_usage: ResourceUsage,
@@ -83,6 +85,7 @@ impl Investigation {
         Self {
             id,
             stage: Stage::Queued,
+            classification: None,
             selected_failure,
             hypotheses: Vec::new(),
             resource_usage: ResourceUsage::default(),
@@ -99,6 +102,28 @@ impl Investigation {
 
     pub fn transition(&mut self, next: Stage) -> Result<(), InvestigationError> {
         Stage::validate_transition(&self.stage, &next)?;
+        if let Stage::Reducing { .. } = &next
+            && let Some(classification) = &self.classification
+        {
+            Stage::validate_transition(classification, &next)?;
+        }
+        if let Stage::Diagnosing { red_evidence, .. } = &next {
+            let Some(Stage::Classified { contract, .. }) = &self.classification else {
+                return Err(InvestigationError::InvalidEvidence(
+                    "classification identity missing; reclassify legacy investigation".into(),
+                ));
+            };
+            for path in red_evidence {
+                if crate::evidence::validate_red(Path::new(path))?.contract != *contract {
+                    return Err(InvestigationError::InvalidEvidence(
+                        "receipt contract differs from classification".into(),
+                    ));
+                }
+            }
+        }
+        if matches!(next, Stage::Classified { .. }) {
+            self.classification = Some(next.clone());
+        }
         let now = Utc::now();
         self.history.push(InvestigationHistoryEntry {
             timestamp: now,
@@ -130,6 +155,16 @@ impl Investigation {
         match &self.stage {
             Stage::Parked { prior_stage, .. } => {
                 let restored = *prior_stage.clone();
+                if let Stage::Diagnosing { red_evidence, .. } = &restored {
+                    for path in red_evidence {
+                        crate::evidence::validate_red(Path::new(path))?;
+                    }
+                }
+                if matches!(restored, Stage::ReviewReady { .. }) {
+                    return Err(InvestigationError::InvalidEvidence(
+                        "review-ready investigations must be revalidated before resumption".into(),
+                    ));
+                }
                 let now = Utc::now();
                 self.history.push(InvestigationHistoryEntry {
                     timestamp: now,

@@ -143,6 +143,6 @@ fn live_registry_loads_all_claims() {
         .unwrap();
     let registry = carrick_conformance_contract::ContractRegistry::load(repo_root)
         .expect("live registry should load");
-    assert_eq!(registry.contracts().len(), 11);
-    assert_eq!(registry.claims().len(), 11);
+    assert_eq!(registry.contracts().len(), 12);
+    assert_eq!(registry.claims().len(), 12);
 }

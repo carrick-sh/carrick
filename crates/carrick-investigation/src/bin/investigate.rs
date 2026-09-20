@@ -15,8 +15,9 @@ fn print_usage() {
   investigate prioritize --from-results <results.jsonl>
   investigate classify --id <id> --contract <contract-id> [--requires-guest <reason> | --vm-free <cap>]
   investigate reduce --id <id> --layer <layer> --mechanism <text>
-  investigate diagnose --id <id> --evidence <text> [--fixture-active]
+  investigate diagnose --id <id> --evidence <receipt.json> [--fixture-active]
   investigate review --id <id> --package <path>
+  investigate run-write-seek --output <new-directory>
   investigate status [--id <id>]
   investigate park --id <id> --reason <reason> [--resumption <condition>]
   investigate resume --id <id>
@@ -44,6 +45,7 @@ fn main() {
 fn run(args: &[String]) -> Result<(), String> {
     let command = &args[0];
     match command.as_str() {
+        "run-write-seek" => handle_write_seek(&args[1..]),
         "new" => handle_new(&args[1..]),
         "prioritize" => handle_prioritize(&args[1..]),
         "classify" => handle_classify(&args[1..]),
@@ -354,14 +356,18 @@ fn handle_classify(args: &[String]) -> Result<(), String> {
     let contract_id =
         ContractId::new(&contract_str).map_err(|e| format!("invalid contract id: {e}"))?;
 
+    let registry = carrick_conformance_contract::ContractRegistry::load(Path::new("."))
+        .map_err(|e| e.to_string())?;
+    registry.require(&contract_str).map_err(|e| e.to_string())?;
+    if guest_rationale.is_some() == vm_free_cap.is_some() {
+        return Err("supply exactly one explicit --requires-guest or --vm-free decision".into());
+    }
     let capability = if let Some(rat) = guest_rationale {
         CapabilityClass::RequiresGuest { rationale: rat }
     } else if let Some(cap) = vm_free_cap {
         CapabilityClass::VmFreeExisting { capability: cap }
     } else {
-        CapabilityClass::RequiresGuest {
-            rationale: "default guest classification".to_string(),
-        }
+        return Err("explicit capability decision required".into());
     };
 
     let path = default_dir().join(format!("{id_str}.jsonl"));
@@ -434,7 +440,7 @@ fn handle_reduce(args: &[String]) -> Result<(), String> {
 fn handle_diagnose(args: &[String]) -> Result<(), String> {
     let mut id_arg = None;
     let mut evidence = Vec::new();
-    let mut fixture_active = true;
+    let mut fixture_active = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -520,5 +526,62 @@ fn handle_review(args: &[String]) -> Result<(), String> {
         id_str,
         path.display()
     );
+    Ok(())
+}
+
+/// The registered VM-free pilot producer is built from the measured source
+/// immediately before execution; arbitrary binaries are not accepted by this CLI.
+fn handle_write_seek(args: &[String]) -> Result<(), String> {
+    if args.len() != 2 || args[0] != "--output" {
+        return Err("usage: investigate run-write-seek --output <new-directory>".into());
+    }
+    let root = std::env::current_dir().map_err(|e| e.to_string())?;
+    let coordinator =
+        carrick_coordinator::Coordinator::new(carrick_coordinator::Coordinator::default_dir())
+            .map_err(|e| e.to_string())?;
+    let _lease = coordinator
+        .try_acquire(
+            carrick_coordinator::ResourceClass::TimingWindow,
+            carrick_coordinator::LeaseOwner {
+                host: "local".into(),
+                pid: std::process::id(),
+                run_id: format!("write-seek-{}", std::process::id()),
+                investigation_id: None,
+            },
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "coordinated execution window busy; queue the experiment".to_string())?;
+    let before =
+        carrick_investigation::evidence::source_identity(&root).map_err(|e| e.to_string())?;
+    let status = std::process::Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "carrick-kernel-example",
+            "--features",
+            "conformance-metrics",
+            "--bin",
+            "write-seek-observation",
+        ])
+        .env("RUSTC_WRAPPER", "")
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("VM-free producer build failed".into());
+    }
+    if carrick_investigation::evidence::source_identity(&root).map_err(|e| e.to_string())? != before
+    {
+        return Err("source changed during build; no experiment admitted".into());
+    }
+    let receipt = carrick_investigation::evidence::capture_vm_free(
+        &root,
+        &root.join("target/debug/write-seek-observation"),
+        &[],
+        Path::new(&args[1]),
+        ContractId::new("kernel.fs.write-seek").map_err(|e| e.to_string())?,
+        std::time::Duration::from_secs(30),
+    )
+    .map_err(|e| e.to_string())?;
+    println!("{}", receipt.display());
     Ok(())
 }

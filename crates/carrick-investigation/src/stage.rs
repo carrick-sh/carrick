@@ -34,6 +34,8 @@ pub enum Stage {
 
 #[derive(Debug, thiserror::Error)]
 pub enum InvestigationError {
+    #[error("invalid evidence: {0}")]
+    InvalidEvidence(String),
     #[error("invalid transition from {from:?} to {to:?}: {reason}")]
     InvalidTransition {
         from: String,
@@ -73,16 +75,48 @@ impl Stage {
     pub fn validate_transition(from: &Stage, to: &Stage) -> Result<(), InvestigationError> {
         match (from, to) {
             // Queued -> Classified
-            (Stage::Queued, Stage::Classified { .. }) => Ok(()),
+            (Stage::Queued, Stage::Classified { capability, .. }) => {
+                let text = match capability {
+                    CapabilityClass::VmFreeExisting { capability } => capability,
+                    CapabilityClass::VmFreeExtension {
+                        capability,
+                        rationale,
+                    } => {
+                        if rationale.trim().is_empty() {
+                            return Err(InvestigationError::InvalidEvidence(
+                                "missing extension rationale".into(),
+                            ));
+                        }
+                        capability
+                    }
+                    CapabilityClass::RequiresGuest { rationale } => rationale,
+                };
+                if text.trim().is_empty() {
+                    return Err(InvestigationError::InvalidEvidence(
+                        "explicit capability decision required".into(),
+                    ));
+                }
+                Ok(())
+            }
 
             // Classified -> Reducing
             (
-                Stage::Classified { .. },
+                Stage::Classified { capability, .. },
                 Stage::Reducing {
                     preserved_mechanisms,
-                    ..
+                    layer,
                 },
             ) => {
+                let vm_free = matches!(
+                    capability,
+                    CapabilityClass::VmFreeExisting { .. }
+                        | CapabilityClass::VmFreeExtension { .. }
+                );
+                if vm_free != (*layer == ExecutionLayer::VmFree) {
+                    return Err(InvestigationError::InvalidEvidence(
+                        "reduction layer contradicts capability decision".into(),
+                    ));
+                }
                 if preserved_mechanisms.is_empty() {
                     return Err(InvestigationError::MissingPreservedMechanisms);
                 }
@@ -91,7 +125,7 @@ impl Stage {
 
             // Reducing -> Diagnosing
             (
-                Stage::Reducing { .. },
+                Stage::Reducing { layer, .. },
                 Stage::Diagnosing {
                     red_evidence,
                     fixture_active,
@@ -102,6 +136,14 @@ impl Stage {
                 }
                 if !fixture_active {
                     return Err(InvestigationError::FixtureNotActive);
+                }
+                for path in red_evidence {
+                    let receipt = crate::evidence::validate_red(std::path::Path::new(path))?;
+                    if receipt.layer != *layer {
+                        return Err(InvestigationError::InvalidEvidence(
+                            "evidence layer mismatch".into(),
+                        ));
+                    }
                 }
                 Ok(())
             }
@@ -122,13 +164,40 @@ impl Stage {
 
             // Diagnosing -> ReviewReady
             (
-                Stage::Diagnosing { .. },
+                Stage::Diagnosing { red_evidence, .. },
                 Stage::ReviewReady {
                     review_package_path,
                 },
             ) => {
                 if review_package_path.as_os_str().is_empty() {
                     return Err(InvestigationError::MissingReviewPackage);
+                }
+                let package: crate::ReviewPackage =
+                    serde_json::from_slice(&std::fs::read(review_package_path)?)?;
+                package.validate()?;
+                for path in red_evidence {
+                    if !package.diagnosis.causal_evidence.contains(path) {
+                        return Err(InvestigationError::InvalidEvidence(
+                            "review must reference every validated receipt".into(),
+                        ));
+                    }
+                    let receipt = crate::evidence::validate_red(std::path::Path::new(path))?;
+                    if receipt.contract != package.failing_contract {
+                        return Err(InvestigationError::InvalidEvidence(
+                            "review contract differs from red evidence".into(),
+                        ));
+                    }
+                    let registry =
+                        carrick_conformance_contract::ContractRegistry::load(&receipt.root)
+                            .map_err(|e| InvestigationError::InvalidEvidence(e.to_string()))?;
+                    if registry
+                        .get_claim(&package.failing_claim)
+                        .is_none_or(|c| c.contract != package.failing_contract)
+                    {
+                        return Err(InvestigationError::InvalidEvidence(
+                            "review claim is not registered for this contract".into(),
+                        ));
+                    }
                 }
                 Ok(())
             }
