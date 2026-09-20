@@ -31,7 +31,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/dispatcher.rs::SnapshotError::fork_clone_with_prepared_mm_authorized_observed::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/dispatcher.rs",
-      "line": 608,
+      "line": 628,
       "item": "SnapshotError::fork_clone_with_prepared_mm_authorized_observed",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -40,7 +40,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/dispatcher.rs::SnapshotError::event_ring_guest_pid::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/dispatcher.rs",
-      "line": 715,
+      "line": 735,
       "item": "SnapshotError::event_ring_guest_pid",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -49,7 +49,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/dispatcher.rs::String::set_executable_path::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/dispatcher.rs",
-      "line": 744,
+      "line": 764,
       "item": "String::set_executable_path",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -58,7 +58,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/dispatcher.rs::String::enter_binfmt::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/dispatcher.rs",
-      "line": 759,
+      "line": 779,
       "item": "String::enter_binfmt",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -67,7 +67,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/dispatcher.rs::String::set_native_x86_64::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/dispatcher.rs",
-      "line": 771,
+      "line": 791,
       "item": "String::set_native_x86_64",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -76,7 +76,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/dispatcher.rs::ExecSource::set_executable_identity_inner::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/dispatcher.rs",
-      "line": 819,
+      "line": 839,
       "item": "ExecSource::set_executable_identity_inner",
       "category": "proc",
       "expression": ".proc.lock()",
