@@ -1,0 +1,51 @@
+schema_version = 1
+id = "kernel.fork.stage1-image"
+title = "Fork stage-1 image recycling"
+guest_surfaces = ["syscall:clone", "syscall:fork", "syscall:wait4", "kernel:stage1_image"]
+semantic_authority = [
+  "man 2 fork",
+  "man 2 wait4",
+  "conformance-probes/probe-inventory.json:forkserial",
+]
+fixture = "probe:forkserial"
+scale_points = [1, 8, 32, 128]
+rationale = "Every forked child owns a private stage-1 page-table software image (1.75 MiB arena set) for its lifetime. A serial fork/exit/wait storm must recycle retired images through the process tree's bounded pool: fresh image allocations are bounded by the number of concurrently live child images, never by the fork count. The VM-free layer has no stage-1 projection and proves only the semantics and one task admission per fork; the image budget is proven under signed execution."
+
+[bindings]
+vm_free = "carrick-kernel-example::fork_stage1_image_contract"
+embed = "carrick-embed::fork_stage1_image_contract"
+docker = "probe:forkserial"
+ecosystem = ["ltp:fork14", "ltp:fork09"]
+
+[[structural_budgets]]
+kind = "affine"
+metric = "task_admissions"
+base = 0
+per_unit = 1
+rationale = "Each serial fork admits exactly one child task into the kernel."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "page_table_image_allocations"
+base = 2
+per_unit = 0
+rationale = "One child image is live at a time and at most one is still in teardown when the next fork runs, so fresh image allocations stay constant as the fork count grows; a per-fork allocation is the 28 GiB madvise churn ltp-fork14 exposed."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "host_mapping_allocations"
+base = 0
+per_unit = 1
+rationale = "A child's stage-1 root tables come from the carrier's pre-mapped root-slot pool, never a per-fork host mmap; the one remaining per-fork host mapping is the child's private EL1 kernel-state page."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "fork_projection_rows_visited"
+base = 32
+per_unit = 24
+rationale = "Each fork's COW projection scans the process's own mapping and alias rows (about 19 for the fixture); rows superseded by earlier COW splits are pruned before the scan, so the work per fork never grows with the number of forks already performed."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20

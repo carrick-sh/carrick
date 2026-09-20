@@ -4,9 +4,10 @@ use std::path::PathBuf;
 
 use carrick_conformance_contract::{ContractRegistry, evaluate};
 use carrick_kernel_example::contracts::{
-    fork_filetable_contract, fork_mappings_contract, futex_contention_contract,
-    futex_requeue_contract, futex_requeue_scenario, inotify_watch_contract,
-    scheduler_cost_contract, scheduler_lifecycle_contract, scheduler_progress_contract,
+    fork_filetable_contract, fork_mappings_contract, fork_stage1_image_contract,
+    futex_contention_contract, futex_requeue_contract, futex_requeue_scenario,
+    inotify_watch_contract, scheduler_cost_contract, scheduler_lifecycle_contract,
+    scheduler_progress_contract,
 };
 use carrick_observability::work_meter::WorkMetric;
 
@@ -269,4 +270,49 @@ fn scheduler_cost_contract_is_semantically_exact_and_constant() {
         .map(|scale| scheduler_cost_contract(scale).expect("observation"))
         .collect::<Vec<_>>();
     evaluate(contract, &observations).expect("scheduler cost conformance");
+}
+
+#[test]
+fn fork_stage1_image_contract_admits_one_task_per_serial_fork() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry
+        .require("kernel.fork.stage1-image")
+        .expect("contract");
+    let observations = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| fork_stage1_image_contract(scale).expect("observation"))
+        .collect::<Vec<_>>();
+    for (scale, obs) in [1u64, 8, 32, 128].into_iter().zip(&observations) {
+        assert_eq!(obs.work_value(WorkMetric::TaskAdmissions), Some(scale));
+        // The scripted dispatcher has no stage-1 image; the budget is proven
+        // under signed execution and must read as zero, never as unknown, here.
+        assert_eq!(
+            obs.work_value(WorkMetric::PageTableImageAllocations),
+            Some(0)
+        );
+    }
+    evaluate(contract, &observations).expect("serial fork semantic and admission conformance");
+}
+
+#[test]
+fn fork_stage1_image_structural_red_control() {
+    let fault = std::env::var("CARRICK_CONTRACT_FAULT").unwrap_or_default();
+    if fault != "extra-task-admission" {
+        return;
+    }
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry
+        .require("kernel.fork.stage1-image")
+        .expect("contract");
+    let observations = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| fork_stage1_image_contract(scale).expect("observation"))
+        .collect::<Vec<_>>();
+    let err = evaluate(contract, &observations).expect_err("injected admissions must violate");
+    match err {
+        carrick_conformance_contract::EvaluationError::ScalingViolation { metric, .. } => {
+            assert_eq!(metric, WorkMetric::TaskAdmissions);
+        }
+        other => panic!("expected ScalingViolation, got: {other:?}"),
+    }
 }

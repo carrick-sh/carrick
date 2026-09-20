@@ -58,11 +58,59 @@ contracts = ["kernel.fork.filetable", "kernel.fork.mappings"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs"
-contracts = ["kernel.fork.mappings"]
+contracts = ["kernel.fork.mappings", "kernel.fork.stage1-image"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/process_plan.rs"
-contracts = ["kernel.fork.mappings"]
+contracts = ["kernel.fork.mappings", "kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-aarch64/src/stage1_authority.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-aarch64/src/engine.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-mem/src/page_table.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/quiesce.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "conformance-probes/src/bin/forkserial.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/task_mapping_index.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/memory_protection.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/persistent_executor.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/dispatcher.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/kernel_context.rs"
+contracts = ["kernel.fork.stage1-image"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/event.rs"

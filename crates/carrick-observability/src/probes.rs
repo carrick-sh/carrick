@@ -1912,6 +1912,12 @@ pub enum HvpatchForkProcessSpecStagePhase {
     BackendSpecFinalize = 9,
     WrapperProtections = 10,
     Total = 11,
+    /// Parent COW-range projection plus read-only arming of the child's
+    /// offline image (`units` = ranges armed).
+    CowRangeProjection = 12,
+    /// Parent live-table COW arming, flush and authentication (`units` =
+    /// ranges newly armed on the parent).
+    ParentCowPublication = 13,
 }
 
 impl HvpatchForkProcessSpecStagePhase {

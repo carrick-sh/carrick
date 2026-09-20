@@ -279,9 +279,29 @@ impl SyscallDispatcher {
         *self.container.write() = Some(container);
     }
 
-    /// Install an execution-scoped work meter scope on this dispatcher.
+    /// Install an execution-scoped work meter scope on this dispatcher and on
+    /// the kernel graph it is bound to. Task admissions are counted by the
+    /// kernel at publication, so a scope that stops at the dispatcher reads
+    /// `task_admissions == 0` for every guest fork (`kernel.fork.stage1-image`
+    /// caught the signed fork bindings padding that hole with a default).
     pub fn set_work_scope(&self, scope: carrick_observability::work_meter::WorkScope) {
+        self.kernel_binding
+            .read()
+            .kernel()
+            .set_work_scope(scope.clone());
         *self.work_scope.write() = Some(scope);
+    }
+
+    /// Rebind this dispatcher to a task on a (possibly different) kernel graph
+    /// and carry the execution work scope over to that kernel. The dispatcher
+    /// is built on a bootstrap one-task kernel and rebinds at boot, fork
+    /// install and exec; a scope installed before that rebind must follow it
+    /// or the kernel's admission counters silently stay at zero.
+    pub(crate) fn rebind_kernel(&self, binding: crate::kernel::KernelTaskBinding) {
+        if let Some(scope) = self.work_scope.read().as_ref() {
+            binding.kernel().set_work_scope(scope.clone());
+        }
+        *self.kernel_binding.write() = binding;
     }
 
     /// Read the execution-scoped work meter scope if one was configured.

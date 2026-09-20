@@ -1518,12 +1518,24 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         Some(self.state.protections_ref())
     }
 
-    fn fork_cow_ranges(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
+    fn fork_cow_ranges(&mut self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
         self.state.fork_cow_ranges()
     }
 
     fn arm_frame_cow_ranges(&mut self, ranges: &[carrick_aarch64::vmm::ForkCowRange]) {
         self.state.arm_frame_cow_ranges(ranges);
+    }
+
+    fn last_fork_host_mapping_allocations(&self) -> u64 {
+        self.state
+            .last_fork_host_mapping_allocations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn last_fork_projection_rows_visited(&self) -> u64 {
+        self.state
+            .last_fork_projection_rows_visited
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn frame_cow_arm_snapshot(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {

@@ -550,6 +550,9 @@ impl HvfVmState {
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
             _vcpu_guard: Some(vcpu_census().created()),
+            cached_fork_alias_snapshot: parking_lot::Mutex::new(None),
+            last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64::new(0),
+            last_fork_projection_rows_visited: std::sync::atomic::AtomicU64::new(0),
         };
         state.publish_live_vcpu();
         state.seed_readonly_spans_from_plan(plan);

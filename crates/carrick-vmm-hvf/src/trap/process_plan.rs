@@ -361,6 +361,7 @@ impl HvfTaskState {
         mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
         syscall_transport: HvfSyscallTransport,
         carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
+        cached_snapshot: Option<ForkAliasSnapshot>,
     ) -> Result<ProcessSpecPlan, TrapError> {
         use carrick_observability::probes::{
             HvpatchForkProcessSpecStage, HvpatchForkProcessSpecStagePhase,
@@ -391,13 +392,75 @@ impl HvfTaskState {
                 TrapError::Hypervisor("hvpatch child stage-1 root slot overflow".to_owned())
             })?;
         let mut cursor = request.root_slot_base;
-        let (alias_revision_begin, aliases) = {
-            let registry = alias_registry().lock();
-            (
-                registry.revision(),
-                registry.process_visible_ordered(self.mm_root_slot, self.container_root),
-            )
-        };
+        let current_revision = alias_registry()
+            .lock()
+            .process_visible_revision(self.mm_root_slot, self.container_root);
+        let (alias_revision_begin, aliases, alias_index, mut source_mappings, all_aliases_covered) =
+            if let Some(cached) = cached_snapshot
+                && cached.revision == current_revision
+                && cached.mm_root_slot == self.mm_root_slot
+                && cached.container_root == self.container_root
+            {
+                (
+                    cached.revision,
+                    cached.aliases,
+                    cached.alias_index,
+                    cached.source_mappings,
+                    cached.all_aliases_covered,
+                )
+            } else {
+                let registry = alias_registry().lock();
+                let revision =
+                    registry.process_visible_revision(self.mm_root_slot, self.container_root);
+                let aliases = std::sync::Arc::new(
+                    registry.process_visible_ordered(self.mm_root_slot, self.container_root),
+                );
+                let alias_index = std::sync::Arc::new(process_alias_index(
+                    &aliases,
+                    self.mm_root_slot,
+                    self.container_root,
+                ));
+                let has_shadowed = self.mappings.shadowed_len() > 0;
+                let mut seen_dynamic_aliases = if has_shadowed {
+                    Some(ProcessAliasSet::with_capacity_and_hasher(
+                        self.mappings.len(),
+                        FastKeyBuildHasher::default(),
+                    ))
+                } else {
+                    None
+                };
+                let mut dynamic_count = 0usize;
+                let source_mappings: Vec<ThreadMappingDesc> = self
+                    .mappings
+                    .iter()
+                    .filter_map(|mapping| {
+                        if !mapping.is_dynamic_alias {
+                            return Some(ThreadMappingDesc::from_region(mapping));
+                        }
+                        let key = (
+                            mapping.start,
+                            mapping.ipa,
+                            mapping.host_addr as usize,
+                            semantic_extent_size(mapping.start, mapping.end),
+                            mapping.owner_generation,
+                        );
+                        if let Some(seen) = &mut seen_dynamic_aliases {
+                            if !seen.insert(key) {
+                                return None;
+                            }
+                        }
+                        let alias = alias_index.get(&key).copied()?;
+                        dynamic_count += 1;
+                        let source = ThreadMappingDesc::from_region(mapping);
+                        ThreadMappingDesc::from_alias_with_structural_owner(
+                            alias,
+                            std::slice::from_ref(&source),
+                        )
+                    })
+                    .collect();
+                let all_covered = dynamic_count == alias_index.len();
+                (revision, aliases, alias_index, source_mappings, all_covered)
+            };
         record_alias_revision(
             CowDiagnosticAliasRevisionSite::ForkSnapshotBegin,
             &carrier_foreign_mm_transport.custody,
@@ -405,42 +468,6 @@ impl HvfTaskState {
             0,
             alias_revision_begin,
         );
-        let alias_index = process_alias_index(&aliases, self.mm_root_slot, self.container_root);
-        let has_shadowed = self.mappings.shadowed_len() > 0;
-        let mut seen_dynamic_aliases = if has_shadowed {
-            Some(std::collections::HashSet::new())
-        } else {
-            None
-        };
-        let mut dynamic_count = 0usize;
-        let mut source_mappings: Vec<ThreadMappingDesc> = self
-            .mappings
-            .iter()
-            .filter_map(|mapping| {
-                if !mapping.is_dynamic_alias {
-                    return Some(ThreadMappingDesc::from_region(mapping));
-                }
-                let key = (
-                    mapping.start,
-                    mapping.ipa,
-                    mapping.host_addr as usize,
-                    semantic_extent_size(mapping.start, mapping.end),
-                    mapping.owner_generation,
-                );
-                if let Some(seen) = &mut seen_dynamic_aliases {
-                    if !seen.insert(key) {
-                        return None;
-                    }
-                }
-                let alias = alias_index.get(&key).copied()?;
-                dynamic_count += 1;
-                let source = ThreadMappingDesc::from_region(mapping);
-                ThreadMappingDesc::from_alias_with_structural_owner(
-                    alias,
-                    std::slice::from_ref(&source),
-                )
-            })
-            .collect();
         // Fork-union audit: `CARRICK_FORK_DEBUG_VA=<hex guest VA>` reports every
         // LOCAL mapping row covering that VA and whether the alias index kept
         // it. The `[FORKDBG] mapping` block further down only prints rows that
@@ -521,11 +548,10 @@ impl HvfTaskState {
         // case). Only an exact current local descriptor suppresses a registry
         // row; keying every local descriptor by IPA hid MAP_FIXED private
         // ownership from fork even though stage-1 already selected it.
-        let all_aliases_covered = !has_shadowed && dynamic_count == alias_index.len();
         let missing = if all_aliases_covered {
             Vec::new()
         } else {
-            let local_aliases: std::collections::HashSet<ProcessAliasKey> = source_mappings
+            let local_aliases: ProcessAliasSet = source_mappings
                 .iter()
                 .map(thread_mapping_process_alias_key)
                 .collect();
@@ -858,11 +884,27 @@ impl HvfTaskState {
                 continue;
             }
 
+            // The child's stage-1 root tables own their whole 2 MiB root slot:
+            // the table image is `LINUX_PAGE_TABLES_SIZE` (1.75 MiB), but the
+            // carrier's pre-mapped root-slot pool hands out exact slots, and an
+            // exact-extent mapping is what lets the pool serve it. Sizing the
+            // extent to the image instead sent every fork through a fresh host
+            // `mmap`/`munmap` (`kernel.fork.stage1-image`,
+            // `host_mapping_allocations`). The guest-visible span (`size`,
+            // `end`) is unchanged; only the physical backing extent grows.
+            let physical_size = if disposition == ForkMappingDisposition::IndependentPageTables
+                && mapping.physical_size <= crate::frame_pool::ROOT_SLOT_SIZE
+                && request.root_slot_size >= crate::frame_pool::ROOT_SLOT_SIZE as u64
+            {
+                crate::frame_pool::ROOT_SLOT_SIZE
+            } else {
+                mapping.physical_size
+            };
             const TWO_MIB: u64 = 2 * 1024 * 1024;
             let (physical_ipa, stage2_lease) = match disposition {
                 ForkMappingDisposition::IndependentPageTables => {
                     let packing_alignment = if mapping.start.is_multiple_of(TWO_MIB)
-                        && (mapping.physical_size as u64) >= TWO_MIB
+                        && (physical_size as u64) >= TWO_MIB
                     {
                         TWO_MIB
                     } else {
@@ -870,13 +912,9 @@ impl HvfTaskState {
                     };
                     cursor = align_up(cursor, packing_alignment)?;
                     let physical_ipa = cursor;
-                    cursor = cursor
-                        .checked_add(mapping.physical_size as u64)
-                        .ok_or_else(|| {
-                            TrapError::Hypervisor(
-                                "hvpatch child page-table root overflow".to_owned(),
-                            )
-                        })?;
+                    cursor = cursor.checked_add(physical_size as u64).ok_or_else(|| {
+                        TrapError::Hypervisor("hvpatch child page-table root overflow".to_owned())
+                    })?;
                     if cursor > root_slot_end {
                         return Err(TrapError::Hypervisor(format!(
                             "hvpatch child page tables need more than {}-byte root slot",
@@ -887,14 +925,14 @@ impl HvfTaskState {
                         physical_ipa,
                         Some(GlobalFrameStage2Lease::fixed(
                             physical_ipa,
-                            mapping.physical_size as u64,
+                            physical_size as u64,
                         )),
                     )
                 }
                 ForkMappingDisposition::IndependentKernelState
                 | ForkMappingDisposition::IndependentGuestZeroed => {
                     let lease = GlobalFrameStage2Lease::reserve(
-                        mapping.physical_size as u64,
+                        physical_size as u64,
                         CowArmedRanges::COMPOUND_SIZE,
                     )?;
                     let physical_ipa = lease.base;
@@ -928,14 +966,14 @@ impl HvfTaskState {
                 }
             };
             let host = if disposition == ForkMappingDisposition::IndependentPageTables
-                && mapping.physical_size == crate::frame_pool::ROOT_SLOT_SIZE
+                && physical_size == crate::frame_pool::ROOT_SLOT_SIZE
             {
                 if let Some(pool) = carrier_foreign_mm_transport.custody.root_slot_pool() {
                     if let Some(handle) = pool.allocate_slot_at(physical_ipa) {
                         ProcessMappingHost::PooledRootSlot { handle }
                     } else {
                         let owned = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-                            mapping.physical_size,
+                            physical_size,
                             host_kind,
                         )
                         .map_err(|error| {
@@ -947,7 +985,7 @@ impl HvfTaskState {
                     }
                 } else {
                     let owned = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-                        mapping.physical_size,
+                        physical_size,
                         host_kind,
                     )
                     .map_err(|error| {
@@ -959,7 +997,7 @@ impl HvfTaskState {
                 }
             } else {
                 let owned = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-                    mapping.physical_size,
+                    physical_size,
                     host_kind,
                 )
                 .map_err(|error| {
@@ -979,7 +1017,7 @@ impl HvfTaskState {
                     std::ptr::copy_nonoverlapping(
                         mapping.physical_host_addr,
                         host.ptr(),
-                        mapping.physical_size,
+                        physical_size,
                     );
                 }
                 let window = mapping
@@ -997,7 +1035,7 @@ impl HvfTaskState {
                             usize::try_from(*len)
                                 .ok()
                                 .and_then(|len| start.checked_add(len))
-                                .is_some_and(|end| end <= mapping.physical_size)
+                                .is_some_and(|end| end <= physical_size)
                         })
                     });
                     let (Some(frame_offset), Ok(len)) = (frame_offset, usize::try_from(*len))
@@ -1005,7 +1043,7 @@ impl HvfTaskState {
                         return Err(TrapError::Hypervisor(format!(
                             "HVPatch MADV_WIPEONFORK range +0x{offset:x}+0x{len:x} escapes the \
                              frame at VA 0x{:x} (physical size 0x{:x})",
-                            mapping.start, mapping.physical_size
+                            mapping.start, physical_size
                         )));
                     };
                     // SAFETY: bounds-checked against `physical_size` above, and
@@ -1024,7 +1062,7 @@ impl HvfTaskState {
                     std::ptr::copy_nonoverlapping(
                         mapping.physical_host_addr,
                         host.ptr(),
-                        mapping.physical_size,
+                        physical_size,
                     );
                 }
             }
@@ -1086,7 +1124,7 @@ impl HvfTaskState {
                 size: mapping.size,
                 physical_ipa,
                 physical_host_addr,
-                physical_size: mapping.physical_size,
+                physical_size: physical_size,
                 inventory_backing,
                 perms: mapping.perms,
                 is_dynamic_alias: mapping.is_dynamic_alias,
@@ -1100,7 +1138,7 @@ impl HvfTaskState {
             });
             inventory_mappings.push(ProcessInventoryDesc {
                 gpa: physical_ipa,
-                length: mapping.physical_size as u64,
+                length: physical_size as u64,
                 permissions: {
                     let raw = u64::from(mapping.perms);
                     carrick_hal::MemPerms {
@@ -1112,7 +1150,7 @@ impl HvfTaskState {
                 inherited_frame: None,
                 inherited_mapping: None,
                 backing: inventory_backing,
-                stage2_lease: (physical_ipa, mapping.physical_size as u64),
+                stage2_lease: (physical_ipa, physical_size as u64),
                 stage2_owner: InventoryStage2OwnerIdentity {
                     host_addr: physical_host_addr as usize,
                     generation: 0,

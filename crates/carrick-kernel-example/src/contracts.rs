@@ -503,6 +503,87 @@ pub fn fork_mappings_contract(scale: usize) -> Result<ContractObservation, Examp
     fork_mappings_scenario(scale)
 }
 
+/// Run a serial fork storm: `forks` children created one at a time, each
+/// exiting 0 and reaped by the parent before the next fork.
+///
+/// This is the VM-free half of `kernel.fork.stage1-image`. The scripted
+/// dispatcher has no stage-1 projection, so it proves the Linux semantics
+/// (every child reaped with status 0) and exactly one task admission per fork;
+/// `page_table_image_allocations` is proven under signed execution.
+pub fn fork_serial_scenario(forks: usize) -> Result<ContractObservation, ExampleError> {
+    assert!(forks >= 1, "forks must be at least 1");
+    let mut script = Vec::new();
+
+    // The scripted kernel hands out child PIDs sequentially from 2, so every
+    // reap asserts its exact child pid the way `waitpid(pid, ..)` does.
+    for i in 0..forks {
+        let child_pid = 2 + i as i64;
+        script.push(Step::Sys(sys::fork().ret(child_pid)));
+        script.push(Step::ChildMarker(vec![Step::Sys(sys::exit_group(0))]));
+        script.push(Step::Sys(sys::wait4(last_child(), 0).ret(child_pid)));
+    }
+
+    script.push(Step::Sys(sys::exit_group(0)));
+
+    let report = ScriptedBackend::new().run_root(script)?;
+
+    let mut snapshot = report.work_snapshot().clone();
+
+    #[cfg(any(test, debug_assertions))]
+    if std::env::var("CARRICK_CONTRACT_FAULT").as_deref() == Ok("extra-task-admission")
+        && let Some(admissions) = snapshot.values.get_mut(&WorkMetric::TaskAdmissions)
+    {
+        *admissions += (forks as u64).max(1);
+    }
+
+    let mut semantic_assertions = Vec::new();
+
+    if report.exit_code() == 0 {
+        semantic_assertions.push(SemanticAssertion::pass("clean_task_retirement"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "clean_task_retirement",
+            format!("exit code was {}", report.exit_code()),
+        ));
+    }
+
+    // Every fork and reap returned its exact child pid (asserted by the
+    // script), so a completed run means each child was reaped; each child
+    // additionally retired through exactly one `exit_group`.
+    let children_exited = (0..forks).all(|i| {
+        let child_tid = 2 + i as i32;
+        report.dispatches_for_tid(child_tid, "exit_group") == 1
+    });
+    if children_exited {
+        semantic_assertions.push(SemanticAssertion::pass("children_exited_zero"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "children_exited_zero",
+            "a child did not retire through exactly one exit_group",
+        ));
+    }
+
+    let contract_id = ContractId::new("kernel.fork.stage1-image")
+        .map_err(|e| ExampleError::Unsupported(format!("invalid contract id: {e}")))?;
+
+    Ok(ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::VmFree,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "probe:forkserial".to_string(),
+        scale: forks as u64,
+        semantic_assertions,
+        work: Some(snapshot),
+        timing: None,
+        completeness: Completeness::Complete,
+    })
+}
+
+/// Conformance contract binding for `kernel.fork.stage1-image` at execution layer `VmFree`.
+pub fn fork_stage1_image_contract(scale: usize) -> Result<ContractObservation, ExampleError> {
+    fork_serial_scenario(scale)
+}
+
 use carrick_kernel::kernel::ExecutorKick;
 
 #[derive(Debug, Default)]

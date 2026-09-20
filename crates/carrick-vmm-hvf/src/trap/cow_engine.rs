@@ -11,11 +11,70 @@ impl HvfVmState {
     /// mapping: a later mprotect-to-write must still take frame COW rather than
     /// silently sharing the parent's frame. The alias registry supplies mappings
     /// installed by sibling vCPUs and filters retired lifetime-owner rows.
-    pub(crate) fn fork_cow_ranges(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
-        let aliases = alias_registry()
+    pub(crate) fn fork_cow_ranges(&mut self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
+        // Retire the rows (and their registry aliases) that earlier COW splits
+        // superseded, so the projection below scans this process's mappings,
+        // never its fork history.
+        let superseded = self.mappings.drain_superseded_shadow_rows();
+        if !superseded.is_empty() {
+            let keys: std::collections::HashSet<ProcessAliasKey> = superseded
+                .iter()
+                .map(mapped_region_process_alias_key)
+                .collect();
+            let mut registry = alias_registry().lock();
+            let stale: Vec<AliasBacking> = registry
+                .process_visible_ordered(self.mm_root_slot, self.container_root)
+                .into_iter()
+                .filter(|alias| {
+                    keys.contains(&(
+                        alias.start,
+                        alias.ipa,
+                        alias.host_addr,
+                        alias.size,
+                        alias.owner_generation,
+                    ))
+                })
+                .collect();
+            registry.remove_exact_values_in_batch(&stale);
+        }
+        let current_revision = alias_registry()
             .lock()
-            .process_visible_ordered(self.mm_root_slot, self.container_root);
-        let alias_index = process_alias_index(&aliases, self.mm_root_slot, self.container_root);
+            .process_visible_revision(self.mm_root_slot, self.container_root);
+        {
+            let guard = self.cached_fork_alias_snapshot.lock();
+            if let Some(cached) = guard.as_ref() {
+                if cached.revision == current_revision
+                    && cached.mm_root_slot == self.mm_root_slot
+                    && cached.container_root == self.container_root
+                {
+                    self.last_fork_projection_rows_visited
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    return cached.cow_ranges.clone();
+                }
+            }
+        }
+        let aliases = std::sync::Arc::new(
+            alias_registry()
+                .lock()
+                .process_visible_ordered(self.mm_root_slot, self.container_root),
+        );
+        // A rebuild visits every mapping row and every visible alias row.
+        // Contracts charge this as `fork_projection_rows_visited`.
+        self.last_fork_projection_rows_visited.store(
+            (self.mappings.len() + aliases.len()) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let alias_index = std::sync::Arc::new(process_alias_index(
+            &aliases,
+            self.mm_root_slot,
+            self.container_root,
+        ));
+        let has_shadowed = self.mappings.shadowed_len() > 0;
+        let mut seen_dynamic_aliases = if has_shadowed {
+            Some(ProcessAliasSet::with_hasher(FastKeyBuildHasher::default()))
+        } else {
+            None
+        };
         let mut matched_dynamic_aliases = 0usize;
         let mut ranges: Vec<_> = self
             .mappings
@@ -23,7 +82,14 @@ impl HvfVmState {
             .filter(|mapping| {
                 let is_current = mapping_is_current_for_process_fork_indexed(mapping, &alias_index);
                 if mapping.is_dynamic_alias && is_current {
-                    matched_dynamic_aliases += 1;
+                    let key = mapped_region_process_alias_key(mapping);
+                    if let Some(seen) = &mut seen_dynamic_aliases {
+                        if seen.insert(key) {
+                            matched_dynamic_aliases += 1;
+                        }
+                    } else {
+                        matched_dynamic_aliases += 1;
+                    }
                 }
                 mapping.sharing == GuestMappingSharing::Private
                     && mapping.start != crate::memory::LINUX_PAGE_TABLES_BASE
@@ -44,15 +110,19 @@ impl HvfVmState {
                 granule: carrick_aarch64::vmm::CowGranule::Compound,
             })
             .collect();
-        let all_aliases_covered =
-            self.mappings.shadowed_len() == 0 && matched_dynamic_aliases == alias_index.len();
+        let all_aliases_covered = matched_dynamic_aliases == alias_index.len();
         if !all_aliases_covered {
-            let local_aliases = current_process_alias_keys(
-                &self.mappings,
-                &aliases,
-                self.mm_root_slot,
-                self.container_root,
-            );
+            let local_aliases: ProcessAliasSet = if let Some(seen) = seen_dynamic_aliases {
+                seen
+            } else {
+                self.mappings
+                    .iter()
+                    .filter(|mapping| {
+                        mapping_is_current_for_process_fork_indexed(mapping, &alias_index)
+                    })
+                    .map(mapped_region_process_alias_key)
+                    .collect()
+            };
             ranges.extend(
                 missing_process_aliases(
                     &local_aliases,
@@ -74,8 +144,53 @@ impl HvfVmState {
                 }),
             );
         }
+        let mut seen_for_source = if has_shadowed {
+            Some(ProcessAliasSet::with_capacity_and_hasher(
+                self.mappings.len(),
+                FastKeyBuildHasher::default(),
+            ))
+        } else {
+            None
+        };
+        let source_mappings: Vec<ThreadMappingDesc> = self
+            .mappings
+            .iter()
+            .filter_map(|mapping| {
+                if !mapping.is_dynamic_alias {
+                    return Some(ThreadMappingDesc::from_region(mapping));
+                }
+                let key = (
+                    mapping.start,
+                    mapping.ipa,
+                    mapping.host_addr as usize,
+                    semantic_extent_size(mapping.start, mapping.end),
+                    mapping.owner_generation,
+                );
+                if let Some(seen) = &mut seen_for_source {
+                    if !seen.insert(key) {
+                        return None;
+                    }
+                }
+                let alias = alias_index.get(&key).copied()?;
+                let source = ThreadMappingDesc::from_region(mapping);
+                ThreadMappingDesc::from_alias_with_structural_owner(
+                    alias,
+                    std::slice::from_ref(&source),
+                )
+            })
+            .collect();
         ranges.sort_by_key(|range| (range.va, range.len));
         ranges.dedup_by_key(|range| (range.va, range.len));
+        *self.cached_fork_alias_snapshot.lock() = Some(ForkAliasSnapshot {
+            revision: current_revision,
+            mm_root_slot: self.mm_root_slot,
+            container_root: self.container_root,
+            cow_ranges: ranges.clone(),
+            source_mappings,
+            all_aliases_covered,
+            aliases,
+            alias_index,
+        });
         ranges
     }
 

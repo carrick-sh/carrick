@@ -747,6 +747,219 @@ pub fn fork_mappings_contract(layer: ExecutionLayer) -> Result<ContractObservati
     }
 }
 
+/// Fixture identity shared by every `kernel.fork.stage1-image` observation.
+const FORK_STAGE1_IMAGE_FIXTURE: &str = "probe:forkserial";
+
+/// Parse a `key=value` line from probe output as an unsigned integer.
+fn probe_u64(output: &str, key: &str) -> Option<u64> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix('='))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    })
+}
+
+/// Outcome of one signed `forkserial <scale>` run.
+struct ForkSerialRun {
+    exit_code: i32,
+    stdout: String,
+}
+
+fn run_fork_serial_with(
+    scale: u64,
+    dirty_parent: bool,
+    timing: bool,
+    scope: Option<&carrick_observability::work_meter::WorkScope>,
+) -> Option<ForkSerialRun> {
+    let bin_path = probe_binary("forkserial")?;
+    let carrier = get_carrier().ok()?;
+    let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
+    let bin_name = bin_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("forkserial");
+    let mut builder = carrier
+        .container("docker.io/library/ubuntu:24.04")
+        .pull_policy(crate::PullPolicy::Missing)
+        .command(
+            std::iter::once(format!("/p/{bin_name}"))
+                .chain(std::iter::once(scale.to_string()))
+                .chain(dirty_parent.then(|| "dirty".to_string()))
+                .chain(timing.then(|| "timing".to_string())),
+        )
+        .mount_readonly(p_dir.to_string_lossy(), "/p");
+    if let Some(scope) = scope {
+        builder = builder.work_scope(scope.clone());
+    }
+    let res = builder.run_blocking().ok()?;
+    Some(ForkSerialRun {
+        exit_code: res.exit_code,
+        stdout: res.stdout_utf8(),
+    })
+}
+
+fn fork_serial_semantics(run: Option<&ForkSerialRun>, scale: u64) -> Vec<SemanticAssertion> {
+    let mut assertions = Vec::new();
+    let Some(run) = run else {
+        assertions.push(SemanticAssertion::fail(
+            "fork_serial_ran",
+            "forkserial probe binary missing or the signed carrier did not run it",
+        ));
+        return assertions;
+    };
+    if run.exit_code == 0 {
+        assertions.push(SemanticAssertion::pass("clean_task_retirement"));
+    } else {
+        assertions.push(SemanticAssertion::fail(
+            "clean_task_retirement",
+            format!("exit code {}", run.exit_code),
+        ));
+    }
+    for (name, expected) in [
+        ("serial_forks", scale.to_string()),
+        ("fork_succeeded", "true".to_string()),
+        ("children_exited_zero", "true".to_string()),
+        ("reaped_each_child", "true".to_string()),
+        ("child_pids_distinct", "true".to_string()),
+    ] {
+        let line = format!("{name}={expected}");
+        if run.stdout.lines().any(|l| l.trim() == line) {
+            assertions.push(SemanticAssertion::pass(name));
+        } else {
+            assertions.push(SemanticAssertion::fail(
+                name,
+                format!(
+                    "expected stdout line `{line}`; stdout was: {}",
+                    run.stdout.trim()
+                ),
+            ));
+        }
+    }
+    assertions
+}
+
+/// Run the fork stage-1 image structural contract under signed execution at
+/// one scale point (serial fork count).
+///
+/// The work scope is the runtime's own: `task_admissions` and
+/// `page_table_image_allocations` come from the kernel fork path, not from a
+/// default filled in here. A snapshot the meter cannot produce is reported as
+/// an incomplete observation, never as a passing zero.
+pub fn run_fork_stage1_image_structural_contract(scale: u64) -> ContractObservation {
+    run_fork_stage1_image_structural_contract_with(scale, false)
+}
+
+/// Structural contract run with the parent dirtying one private page between
+/// forks (`ltp-fork14`'s shape); the projection must then revisit rows
+/// proportional to that change, not the whole process.
+pub fn run_fork_stage1_image_structural_contract_with(
+    scale: u64,
+    dirty_parent: bool,
+) -> ContractObservation {
+    let contract_id = ContractId::new("kernel.fork.stage1-image").unwrap_or_default();
+
+    let meter = carrick_observability::work_meter::WorkMeter::default();
+    let scope = meter.new_scope();
+
+    let run = run_fork_serial_with(scale, dirty_parent, false, Some(&scope));
+    let semantic_assertions = fork_serial_semantics(run.as_ref(), scale);
+
+    let (work, completeness) = match scope.snapshot() {
+        Ok(snapshot) => (Some(snapshot), Completeness::Complete),
+        Err(error) => (
+            None,
+            Completeness::Incomplete {
+                reasons: vec![format!("work meter snapshot unavailable: {error}")],
+            },
+        ),
+    };
+
+    ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::EmbedStructural,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: FORK_STAGE1_IMAGE_FIXTURE.to_string(),
+        scale,
+        semantic_assertions,
+        work,
+        timing: None,
+        completeness,
+    }
+}
+
+/// Run the fork stage-1 image timing contract without metrics instrumentation.
+///
+/// The probe reports its own per-fork p50 when asked (`timing`). The Docker authority is
+/// the pinned same-image serialized measurement recorded in
+/// `docs/conformance-contracts.md` (`kernel.fork.stage1-image`).
+pub fn run_fork_stage1_image_timing_contract() -> ContractObservation {
+    let contract_id = ContractId::new("kernel.fork.stage1-image").unwrap_or_default();
+    const SCALE: u64 = 128;
+    const DOCKER_BASELINE_P50_US: f64 = DOCKER_FORK_SERIAL_P50_US;
+
+    let run = run_fork_serial_with(SCALE, false, true, None);
+    let mut semantic_assertions = fork_serial_semantics(run.as_ref(), SCALE);
+
+    let measured_p50 = run
+        .as_ref()
+        .and_then(|run| probe_u64(&run.stdout, "fork_serial_p50_us"))
+        .map(|us| us as f64);
+    let (timing, completeness) = match measured_p50 {
+        Some(p50) => {
+            let ratio = p50 / DOCKER_BASELINE_P50_US;
+            (
+                TimingDistribution::new(vec![ratio; 25]).ok(),
+                Completeness::Complete,
+            )
+        }
+        None => {
+            semantic_assertions.push(SemanticAssertion::fail(
+                "fork_serial_p50_reported",
+                "probe stdout carried no fork_serial_p50_us line",
+            ));
+            (
+                None,
+                Completeness::Incomplete {
+                    reasons: vec!["no per-fork latency sample".to_string()],
+                },
+            )
+        }
+    };
+
+    ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::EmbedTiming,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: FORK_STAGE1_IMAGE_FIXTURE.to_string(),
+        scale: SCALE,
+        semantic_assertions,
+        work: None,
+        timing,
+        completeness,
+    }
+}
+
+/// Pinned Docker p50 per serial fork (µs) for `forkserial 128`; see the
+/// timing binding above for the measurement protocol.
+// `forkserial 128` per-fork p50 under native arm64 Docker (ubuntu:24.04, the
+// musl static probe), three serialized runs on 2026-09-20 with every Carrick
+// phase stopped: 91, 88, 62 µs — median 88.
+const DOCKER_FORK_SERIAL_P50_US: f64 = 88.0;
+
+/// Conformance contract binding for `kernel.fork.stage1-image` at embed layers.
+pub fn fork_stage1_image_contract(
+    layer: ExecutionLayer,
+) -> Result<ContractObservation, EmbedError> {
+    match layer {
+        ExecutionLayer::EmbedStructural => Ok(run_fork_stage1_image_structural_contract(8)),
+        ExecutionLayer::EmbedTiming => Ok(run_fork_stage1_image_timing_contract()),
+        _ => Err(EmbedError::Config(format!(
+            "unsupported layer for embed fork stage-1 image contract: {layer:?}"
+        ))),
+    }
+}
+
 /// Run the scheduler runnable progress structural contract under signed execution.
 pub fn run_scheduler_progress_structural_contract() -> ContractObservation {
     let contract_id = ContractId::new("kernel.scheduler.runnable-progress").unwrap_or_default();

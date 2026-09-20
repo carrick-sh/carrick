@@ -680,11 +680,24 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// Exact private writable ranges owned by this mm. HVPatch consumes this
     /// before cloning the stage-1 graph; reference backends retain the empty
     /// default because their host VM mechanism supplies fork COW.
-    fn fork_cow_ranges(&self) -> Vec<ForkCowRange> {
+    fn fork_cow_ranges(&mut self) -> Vec<ForkCowRange> {
         Vec::new()
     }
 
     fn arm_frame_cow_ranges(&mut self, _ranges: &[ForkCowRange]) {}
+
+    /// Fresh host anonymous mappings the most recent `build_process_builder`
+    /// created for the child's per-mm backing (`0` when every backing came
+    /// from a carrier pool). Backends without in-process fork report `0`.
+    fn last_fork_host_mapping_allocations(&self) -> u64 {
+        0
+    }
+
+    /// Mapping and alias rows visited by the most recent `fork_cow_ranges`
+    /// (`0` when its cached projection was reused).
+    fn last_fork_projection_rows_visited(&self) -> u64 {
+        0
+    }
 
     /// Exact pre-fork arm metadata. A failed fork must restore this vector,
     /// rather than subtracting the newly requested ranges (which destroys

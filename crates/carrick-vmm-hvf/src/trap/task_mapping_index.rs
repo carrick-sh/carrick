@@ -481,6 +481,48 @@ impl TaskMappingIndex {
         self.assert_invariants();
     }
 
+    /// Drain displaced dynamic-alias rows that a live row has since superseded
+    /// at the same VA with a different physical extent and that own no
+    /// lifetime-bearing handle (no structural owner, host mapping or stage-2
+    /// lease). These are the parent's leftovers after a COW split whose old
+    /// frame was still borrowed by a child at split time: the parent no longer
+    /// maps that frame at that VA, the child's own rows govern the frame's
+    /// lifetime, and leaving them here grows the parent's row and alias
+    /// population by every fork ever done (`kernel.fork.stage1-image`,
+    /// `fork_projection_rows_visited`). Returns the drained rows so the caller
+    /// retires their registry aliases.
+    pub(crate) fn drain_superseded_shadow_rows(&mut self) -> Vec<HvfMappedRegion> {
+        let mut drained = Vec::new();
+        let mut index = 0;
+        while index < self.shadowed.len() {
+            let row = &self.shadowed[index];
+            let superseded = row.is_dynamic_alias
+                && row.structural_owner.is_none()
+                && row.host_mapping.is_none()
+                && row.stage2_lease.is_none()
+                && self
+                    .live
+                    .range(..=GuestVa(row.start))
+                    .next_back()
+                    .is_some_and(|(_, live)| {
+                        live.start <= row.start
+                            && live.end >= row.end
+                            && (live.physical_ipa, live.owner_generation)
+                                != (row.physical_ipa, row.owner_generation)
+                    });
+            if superseded {
+                note_task_mapping_row_visited();
+                drained.push(self.shadowed.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        if !drained.is_empty() {
+            self.assert_invariants();
+        }
+        drained
+    }
+
     pub(crate) fn retain<F>(&mut self, mut predicate: F)
     where
         F: FnMut(&HvfMappedRegion) -> bool,

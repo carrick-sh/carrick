@@ -5,9 +5,11 @@
 
 use carrick_conformance_contract::{ContractRegistry, ExecutionLayer, evaluate};
 use carrick_embed::{
-    run_futex_requeue_structural_contract, run_futex_requeue_timing_contract,
-    run_futex_structural_contract, run_futex_timing_contract,
+    run_fork_stage1_image_structural_contract, run_fork_stage1_image_structural_contract_with,
+    run_fork_stage1_image_timing_contract, run_futex_requeue_structural_contract,
+    run_futex_requeue_timing_contract, run_futex_structural_contract, run_futex_timing_contract,
 };
+use carrick_observability::work_meter::WorkMetric;
 
 fn repo_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -79,4 +81,76 @@ fn futex_requeue_timing_contract() {
     let contract = registry.require("kernel.futex.requeue").expect("contract");
     let obs = run_futex_requeue_timing_contract();
     evaluate(contract, &[obs]).expect("futex requeue timing contract evaluation");
+}
+
+/// `kernel.fork.stage1-image`: fresh stage-1 image allocations must stay
+/// constant while the serial fork count grows. Runs every contract scale
+/// point on the real runtime work scope (no defaults filled in).
+#[test]
+fn fork_stage1_image_structural_contract() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry
+        .require("kernel.fork.stage1-image")
+        .expect("contract");
+    let observations = [1u64, 8, 32, 128]
+        .into_iter()
+        .map(run_fork_stage1_image_structural_contract)
+        .collect::<Vec<_>>();
+    for obs in &observations {
+        eprintln!(
+            "fork.stage1-image scale={} task_admissions={:?} page_table_image_allocations={:?} host_mapping_allocations={:?} fork_projection_rows_visited={:?} completeness={:?}",
+            obs.scale,
+            obs.work_value(WorkMetric::TaskAdmissions),
+            obs.work_value(WorkMetric::PageTableImageAllocations),
+            obs.work_value(WorkMetric::HostMappingAllocations),
+            obs.work_value(WorkMetric::ForkProjectionRowsVisited),
+            obs.completeness
+        );
+        assert_eq!(
+            obs.work_value(WorkMetric::TaskAdmissions),
+            Some(obs.scale),
+            "one task admission per serial fork at scale {}",
+            obs.scale
+        );
+    }
+    evaluate(contract, &observations).expect("fork stage-1 image structural contract evaluation");
+}
+
+#[test]
+fn fork_stage1_image_timing_contract() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry
+        .require("kernel.fork.stage1-image")
+        .expect("contract");
+    let obs = run_fork_stage1_image_timing_contract();
+    eprintln!("fork.stage1-image timing={:?}", obs.timing);
+    evaluate(contract, &[obs]).expect("fork stage-1 image timing contract evaluation");
+}
+
+/// Same contract with the parent dirtying a private page between forks
+/// (`ltp-fork14`'s shape): each iteration legitimately splits one COW frame,
+/// so the projection may revisit rows proportional to that change only.
+#[test]
+fn fork_stage1_image_structural_contract_dirty_parent() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry
+        .require("kernel.fork.stage1-image")
+        .expect("contract");
+    let observations = [1u64, 8, 32, 128]
+        .into_iter()
+        .map(|scale| run_fork_stage1_image_structural_contract_with(scale, true))
+        .collect::<Vec<_>>();
+    for obs in &observations {
+        eprintln!(
+            "fork.stage1-image(dirty) scale={} task_admissions={:?} page_table_image_allocations={:?} host_mapping_allocations={:?} fork_projection_rows_visited={:?} completeness={:?}",
+            obs.scale,
+            obs.work_value(WorkMetric::TaskAdmissions),
+            obs.work_value(WorkMetric::PageTableImageAllocations),
+            obs.work_value(WorkMetric::HostMappingAllocations),
+            obs.work_value(WorkMetric::ForkProjectionRowsVisited),
+            obs.completeness
+        );
+    }
+    evaluate(contract, &observations)
+        .expect("fork stage-1 image structural contract evaluation (dirty parent)");
 }

@@ -69,6 +69,7 @@ fn carrier_low_rate_stream() -> String {
             "HVPCARRIERLOW|header|program_sha256={}",
             carrier_low_rate_program_sha256()
         ),
+        "HVPCARRIERLOW|image|host_pid=4242|text_base=0x104664000|slide=0x4664000",
         "HVPCARRIERLOW|summary|status=ok|root_exited=1|bounded=0|errors=0|saw_sample=1",
         "HVPCARRIERLOW|sample-population|count=5",
         "HVPCARRIERLOW|section=user-stacks",
