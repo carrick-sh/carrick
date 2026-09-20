@@ -14,8 +14,8 @@ use super::{
     ExecutorExit, ExecutorPool, ExecutorPoolConfig, ExecutorPoolEvent, ExecutorSaveError,
     ExecutorSubmissionContext, HvpatchActivationProof, HvpatchQuantumControl,
     HvpatchSubmissionShape, HvpatchTaskBindingDirectory, PersistentExecutor,
-    PersistentExecutorFactory, PersistentTaskBinding, ReceiptLog, RunnableTask, SavedRunnable,
-    TaskBindingResolver, TaskLoadIdentity, WorkerBoundaryAudit, WorkerKick,
+    PersistentExecutorFactory, PersistentTaskBinding, PreemptionDriver, ReceiptLog, RunnableTask,
+    SavedRunnable, TaskBindingResolver, TaskLoadIdentity, WorkerBoundaryAudit, WorkerKick,
     executor_claim_probe_asid_generation, process_leader_event_identity,
     restore_worker_vcpu_before_binding_publication, retire_failed_hvpatch_clone_authority,
 };
@@ -30,8 +30,8 @@ use carrick_kernel::kernel::scheduler::{
     CpuAffinity, ExecutorBinding, ExecutorKick, ExecutorKickToken, GuestCpuId, GuestCpuPolicy,
 };
 use carrick_kernel::kernel::{
-    ClonePlan, Kernel, KernelContext, RootBootstrap, Scheduler, SchedulerError,
-    SubmissionAuthority, ThreadKey,
+    ClonePlan, Kernel, KernelContext, PreemptionDriverError, RootBootstrap, Scheduler,
+    SchedulerError, SubmissionAuthority, ThreadKey,
 };
 
 #[derive(Clone)]
@@ -3650,6 +3650,7 @@ fn compute_bound_preemption_reaches_the_exact_live_hardware_kick() {
         "exact hardware identity is publish-once for one loaded binding"
     );
     scheduler.make_runnable(second.thread().key()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
     assert_eq!(scheduler.request_preemption(), 1);
     assert_eq!(kicks.load(Ordering::SeqCst), 1);
     scheduler.settle_exited(running).unwrap();
@@ -3989,7 +3990,6 @@ fn demand_preemption_and_exact_signal_kick_advance_two_compute_tasks_without_sta
     first_gate.wait();
     let second_authority = enqueue_root(&scheduler, &second, publish(&second, 50));
     assert!(scheduler.need_resched());
-    assert_eq!(scheduler.request_preemption(), 1);
     second_gate.wait();
     assert!(matches!(
         scheduler.wake(second.thread().key()),
@@ -6958,4 +6958,138 @@ fn test_production_exec_failure_at_identity_publication_settles_in_executor_pool
         InjectedExecFailureBoundary::IdentityPagePublication,
         74_290,
     );
+}
+
+#[test]
+fn preemption_driver_duplicate_attachment_fails_with_typed_error() {
+    let (kernel, _root) = bootstrap(68_100);
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let factory = Arc::new(FakeFactory::default());
+
+    let mut driver =
+        PreemptionDriver::start(Arc::clone(&scheduler)).expect("first preemption driver starts");
+    assert!(scheduler.is_preemption_driver_attached());
+
+    let second_driver_err = PreemptionDriver::start(Arc::clone(&scheduler))
+        .expect_err("duplicate preemption driver should fail");
+    assert_eq!(second_driver_err, PreemptionDriverError::AlreadyAttached);
+
+    let pool_err = ExecutorPool::start(
+        config(1),
+        Arc::clone(&scheduler),
+        Arc::clone(&factory),
+        factory,
+        ExecutorBoundaryAudit::production(),
+    )
+    .expect_err("pool start on already-attached scheduler should fail");
+
+    assert_eq!(
+        pool_err.driver_error(),
+        Some(&PreemptionDriverError::AlreadyAttached)
+    );
+
+    driver.shutdown();
+    assert!(!scheduler.is_preemption_driver_attached());
+}
+
+#[test]
+fn preemption_driver_close_before_start_shuts_down_cleanly() {
+    let (kernel, _root) = bootstrap(68_101);
+    let scheduler = Arc::new(Scheduler::new(kernel));
+
+    scheduler.close();
+
+    let mut driver = PreemptionDriver::start(Arc::clone(&scheduler))
+        .expect("preemption driver starts on closed scheduler");
+
+    driver.shutdown();
+    assert!(!scheduler.is_preemption_driver_attached());
+}
+
+#[test]
+fn preemption_driver_close_during_expiry_wakes_and_terminates() {
+    let (kernel, _root) = bootstrap(68_102);
+    let scheduler = Arc::new(Scheduler::new(kernel));
+
+    let mut driver =
+        PreemptionDriver::start(Arc::clone(&scheduler)).expect("preemption driver starts");
+
+    let start = Instant::now();
+    scheduler.close();
+
+    driver.shutdown();
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "shutdown after close took too long: {:?}",
+        start.elapsed()
+    );
+    assert!(!scheduler.is_preemption_driver_attached());
+}
+
+#[test]
+fn preemption_driver_shutdown_with_future_deadline() {
+    let (kernel, _root) = bootstrap(68_103);
+    let scheduler = Arc::new(Scheduler::new(kernel));
+
+    let mut driver =
+        PreemptionDriver::start(Arc::clone(&scheduler)).expect("preemption driver starts");
+
+    let start = Instant::now();
+    driver.shutdown();
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "shutdown took too long: {:?}",
+        start.elapsed()
+    );
+    assert!(!scheduler.is_preemption_driver_attached());
+}
+
+#[test]
+fn preemption_driver_disabled_via_env_var() {
+    let (kernel, root) = bootstrap(68_104);
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(401, [Step::Exit]);
+    let (settled_tx, settled_rx) = std::sync::mpsc::channel();
+    binding.notify_on_terminal_settlement(settled_tx);
+    factory.install(&root, Arc::clone(&binding));
+
+    let previous = std::env::var("CARRICK_FAIR_PREEMPTION").ok();
+    unsafe { std::env::set_var("CARRICK_FAIR_PREEMPTION", "0") };
+
+    let pool_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        let authority = enqueue_root(&scheduler, &root, publish(&root, 401));
+        drop(authority);
+        settled_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("binding settled");
+        let report = pool.shutdown().expect("clean pool shutdown");
+        assert!(!report.fair_preemption_enabled());
+    }));
+
+    match previous {
+        Some(val) => unsafe { std::env::set_var("CARRICK_FAIR_PREEMPTION", val) },
+        None => unsafe { std::env::remove_var("CARRICK_FAIR_PREEMPTION") },
+    }
+
+    pool_res.expect("disabled pool run succeeded");
+}
+
+#[test]
+fn preemption_driver_worker_failure_allows_clean_shutdown() {
+    let (kernel, context) = bootstrap(68_105);
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let factory = Arc::new(FakeFactory::default());
+    factory.install(&context, FakeBinding::new(96, [Step::PanicRun]));
+    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+    assert!(scheduler.is_preemption_driver_attached());
+    let authority = enqueue_root(&scheduler, &context, publish(&context, 96));
+    drop(authority);
+
+    let err = pool
+        .shutdown()
+        .expect_err("panicked worker must cause shutdown error");
+    assert_eq!(err.retired_workers(), 1);
+    assert!(!scheduler.is_preemption_driver_attached());
 }

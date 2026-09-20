@@ -24,6 +24,9 @@ pub use backend::*;
 pub mod pool;
 pub use pool::*;
 
+pub mod preemption;
+pub use preemption::*;
+
 pub(crate) fn probe_executor_lifecycle(
     executor: ExecutorId,
     phase: crate::probes::HvpatchExecutorLifecyclePhase,

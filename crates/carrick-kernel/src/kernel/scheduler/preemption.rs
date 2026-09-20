@@ -165,6 +165,15 @@ pub enum DeliveryOutcome {
     Coalesced,
 }
 
+/// Typed error when attaching or spawning a preemption driver.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum PreemptionDriverError {
+    #[error("a preemption driver is already attached to this scheduler")]
+    AlreadyAttached,
+    #[error("failed to spawn preemption driver thread: {0}")]
+    SpawnFailed(String),
+}
+
 /// Internal preemption state owned by the [`crate::kernel::Scheduler`].
 pub struct PreemptionState {
     pub(crate) residencies: BTreeMap<ExecutorId, BindingResidency>,
@@ -174,6 +183,7 @@ pub struct PreemptionState {
     pub(crate) event_sequence: Arc<AtomicU64>,
     pub(crate) clock: Arc<dyn MonotonicClock>,
     pub(crate) shutdown: bool,
+    pub(crate) driver_attached: bool,
 }
 
 impl fmt::Debug for PreemptionState {
@@ -188,6 +198,7 @@ impl fmt::Debug for PreemptionState {
             )
             .field("clock", &self.clock)
             .field("shutdown", &self.shutdown)
+            .field("driver_attached", &self.driver_attached)
             .finish()
     }
 }
@@ -202,6 +213,7 @@ impl PreemptionState {
             event_sequence,
             clock,
             shutdown: false,
+            driver_attached: false,
         }
     }
 
@@ -331,6 +343,23 @@ impl PreemptionState {
 
     pub fn is_shutdown(&self) -> bool {
         self.shutdown
+    }
+
+    pub fn attach_driver(&mut self) -> Result<(), PreemptionDriverError> {
+        if self.driver_attached {
+            return Err(PreemptionDriverError::AlreadyAttached);
+        }
+        self.driver_attached = true;
+        Ok(())
+    }
+
+    pub fn detach_driver(&mut self) {
+        self.driver_attached = false;
+        self.shutdown = false;
+    }
+
+    pub fn is_driver_attached(&self) -> bool {
+        self.driver_attached
     }
 
     pub fn schedule_deadline(
