@@ -253,10 +253,13 @@ fn inotify_readiness_structural_red_control() {
     let err =
         evaluate(contract, &observations).expect_err("should violate budget with injected fault");
     match err {
-        carrick_conformance_contract::EvaluationError::WorkBudgetExceeded { metric, .. } => {
+        carrick_conformance_contract::EvaluationError::ScalingViolation {
+            scale, metric, ..
+        } => {
+            assert_eq!(scale, 1, "smallest affected scale must be 1");
             assert_eq!(metric, WorkMetric::InotifyQueueVisits);
         }
-        other => panic!("expected WorkBudgetExceeded, got: {other:?}"),
+        other => panic!("expected ScalingViolation, got: {other:?}"),
     }
 }
 
