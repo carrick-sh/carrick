@@ -2698,6 +2698,14 @@
     "excluded": false,
     "runner": "generic"
   },
+  "writeseek": {
+    "class": "conformance",
+    "runner": "generic",
+    "excluded": false,
+    "contract_ids": [
+      "kernel.fs.write-seek"
+    ]
+  },
   "writevpartial": {
     "class": "conformance",
     "excluded": false,
