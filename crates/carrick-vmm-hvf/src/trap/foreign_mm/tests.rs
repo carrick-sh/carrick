@@ -4289,6 +4289,11 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         }),
         "fork planning must retain the exact authenticated overlay owner",
     );
+    // The overlay plan holds the child's pooled root slot; the pool refuses a
+    // second plan for the same slot while it is held (an owned mapping there
+    // would collide with the pool's pre-map), so release it before the
+    // fail-closed attempts below exercise the vvar authentication.
+    drop(overlay_plan);
 
     let mut arbitrary_child_page_tables = make_child_page_tables(overlay_ipa + vvar_len);
     let error = match parent.build_process_plan(

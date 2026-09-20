@@ -373,35 +373,65 @@ impl MmAccessState {
                 continue;
             }
 
-            let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-                TWO_MIB,
-                crate::host_mapping::HostMappingKind::PerMmKernelState,
-            )
-            .map_err(|error| {
-                TrapError::Hypervisor(format!(
-                    "allocate stage-1 extension arena host backing: {error}"
-                ))
-            })?;
+            // A stage-1 extension arena is a 2 MiB slot out of the same
+            // root-slot arena the carrier pre-maps, so it must come from that
+            // pool: mapping private backing at a pre-mapped IPA fails
+            // (`HV_ERROR`), and this path lowers that failure to a guest
+            // SIGSEGV (CPython's `test_compiler_recursion_limit` grew the mmap
+            // arena until its tables needed a new extension).
+            let pooled = custody
+                .root_slot_pool()
+                .and_then(|pool| pool.allocate_slot_at(base));
+            let (host_addr, host_mapping, mut lease, pooled) = match pooled {
+                Some(handle) => {
+                    let host_addr = handle.as_mut_ptr();
+                    let mut lease = GlobalFrameStage2Lease::fixed(base, TWO_MIB as u64);
+                    lease.mark_pre_mapped();
+                    (host_addr, None, lease, Some(handle))
+                }
+                None => {
+                    if custody
+                        .root_slot_pool()
+                        .is_some_and(|pool| pool.contains_ipa(base))
+                    {
+                        return Err(TrapError::Hypervisor(format!(
+                            "stage-1 extension arena IPA 0x{base:x} is still held by the root-slot pool"
+                        )));
+                    }
+                    let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                        TWO_MIB,
+                        crate::host_mapping::HostMappingKind::PerMmKernelState,
+                    )
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "allocate stage-1 extension arena host backing: {error}"
+                        ))
+                    })?;
 
-            let rc = unsafe {
-                inventory_hv_vm_map(
-                    host_mapping.as_ptr().cast(),
-                    base,
-                    TWO_MIB,
-                    u64::from(root_perms),
-                )
+                    let rc = unsafe {
+                        inventory_hv_vm_map(
+                            host_mapping.as_ptr().cast(),
+                            base,
+                            TWO_MIB,
+                            u64::from(root_perms),
+                        )
+                    };
+                    if rc != 0 {
+                        return Err(TrapError::ChildMapFailed {
+                            host_addr: host_mapping.as_ptr() as u64,
+                            guest_start: base,
+                            size: TWO_MIB,
+                            code: rc as u32,
+                        });
+                    }
+
+                    let mut lease = GlobalFrameStage2Lease::fixed(base, TWO_MIB as u64);
+                    lease.mark_mapped();
+                    let host_addr = host_mapping.as_ptr();
+                    (host_addr, Some(host_mapping), lease, None)
+                }
             };
-            if rc != 0 {
-                return Err(TrapError::ChildMapFailed {
-                    host_addr: host_mapping.as_ptr() as u64,
-                    guest_start: base,
-                    size: TWO_MIB,
-                    code: rc as u32,
-                });
-            }
-
-            let mut lease = GlobalFrameStage2Lease::fixed(base, TWO_MIB as u64);
-            lease.mark_mapped();
+            let _ = &mut lease;
 
             let mut region = HvfMappedRegion {
                 start: base,
@@ -410,11 +440,11 @@ impl MmAccessState {
                 physical_ipa: base,
                 physical_size: TWO_MIB,
                 owner_generation: 0,
-                host_addr: host_mapping.as_ptr(),
+                host_addr,
                 size: TWO_MIB,
                 perms: root_perms,
                 memory: None,
-                host_mapping: Some(host_mapping),
+                host_mapping,
                 structural_owner: None,
                 stage2_lease: None,
                 is_dynamic_alias: false,
@@ -424,7 +454,12 @@ impl MmAccessState {
                 shared_key_offset: 0,
             };
 
-            let _ = publish_exec_region_host_owner_in(custody, &mut region, lease, None)?;
+            let _ = match pooled {
+                Some(handle) => {
+                    publish_pooled_exec_root_owner_in(custody, &mut region, lease, handle)?
+                }
+                None => publish_exec_region_host_owner_in(custody, &mut region, lease, None)?,
+            };
 
             if let Some(owner) = &region.structural_owner {
                 self.install_structural_mapping_authority(None, std::sync::Arc::clone(owner))?;
