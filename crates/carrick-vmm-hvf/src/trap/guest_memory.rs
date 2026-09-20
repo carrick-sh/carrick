@@ -4,6 +4,37 @@
 
 use super::*;
 
+#[derive(Debug, PartialEq, Eq)]
+enum MissingMappingResolution<T> {
+    Pristine,
+    Published(T),
+    Missing,
+}
+
+/// Resolve the handoff from deferred pristine provenance to a published
+/// mapping. Sparse publication holds the deferred-state lock until stage-1,
+/// alias, and local mapping publication are complete, then removes pristine
+/// provenance. Therefore a failed pristine observation is also an acquire
+/// boundary after which the mapping must be observed again.
+fn resolve_missing_mapping_after_pristine_handoff<T>(
+    state: Option<&carrick_guest_mem::DeferredAnonymousState>,
+    start: carrick_guest_mem::GuestVa,
+    len: usize,
+    published_lookup: impl FnOnce() -> u64,
+    published_mapping: impl FnOnce(u64) -> Option<T>,
+) -> MissingMappingResolution<T> {
+    let Some(state) = state else {
+        return MissingMappingResolution::Missing;
+    };
+    if state.covers_pristine(start, len) {
+        MissingMappingResolution::Pristine
+    } else if let Some(mapping) = published_mapping(published_lookup()) {
+        MissingMappingResolution::Published(mapping)
+    } else {
+        MissingMappingResolution::Missing
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[inline]
 pub(crate) unsafe fn volatile_copy_from_guest(src: *const u8, dst: *mut u8, len: usize) {
@@ -814,47 +845,48 @@ impl HvfVmState {
             // overlay VA's copy will hit (the translated overlay IPA), so the
             // overlay's guest_writable flag — not the stale shared region's — gates.
             let lookup_address = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
-            let Some(mapping) = self.mapping_for_range(lookup_address, chunk_len) else {
+            let mapping = self.mapping_for_range(lookup_address, chunk_len);
+            let mapping = if let Some(mapping) = mapping {
+                mapping
+            } else if allow_pristine
+                && !self
+                    .protections
+                    .range_write_denied(chunk_address, chunk_len)
+            {
                 // Prevalidation may accept explicit pristine provenance. Actual
                 // writes still materialize and authenticate their physical owner.
-                if allow_pristine
-                    && !self
-                        .protections
-                        .range_write_denied(chunk_address, chunk_len)
-                    && self.deferred_anonymous_state().is_some_and(|state| {
-                        state.covers_pristine(carrick_guest_mem::GuestVa(chunk_address), chunk_len)
-                    })
-                {
-                    checked += chunk_len;
-                    continue;
+                // If publication won while the initial lookup ran, the pristine
+                // lock serializes us behind its complete mapping publication.
+                let deferred = self.deferred_anonymous_state();
+                match resolve_missing_mapping_after_pristine_handoff(
+                    deferred.as_deref(),
+                    carrick_guest_mem::GuestVa(chunk_address),
+                    chunk_len,
+                    || self.syscall_buffer_lookup_addr(chunk_address, chunk_len),
+                    |published_lookup| self.mapping_for_range(published_lookup, chunk_len),
+                ) {
+                    MissingMappingResolution::Pristine => {
+                        checked += chunk_len;
+                        continue;
+                    }
+                    MissingMappingResolution::Published(mapping) => mapping,
+                    MissingMappingResolution::Missing => {
+                        self.report_missing_write_mapping(
+                            chunk_address,
+                            chunk_len,
+                            lookup_address,
+                            allow_pristine,
+                        );
+                        return Err(MemoryError::OutOfBounds { address, length });
+                    }
                 }
-                // `MemoryError::OutOfBounds` renders as "guest memory read is out
-                // of bounds", which is wrong three times over on this path: it is
-                // a WRITE, the address is usually mapped, and the real reason is
-                // that `mapping_for_range` REJECTED a covering region as not
-                // live. Say so — this exact silence cost a full investigation to
-                // get behind.
-                if let Some(region) = self
-                    .mappings
-                    .iter()
-                    .find(|m| m.start <= lookup_address && lookup_address < m.end)
-                {
-                    tracing::error!(
-                        va = format!("0x{lookup_address:x}"),
-                        len = chunk_len,
-                        region = format!("[0x{:x}..0x{:x})", region.start, region.end),
-                        physical_ipa = format!("0x{:x}", region.physical_ipa),
-                        reusable_global_frame = is_reusable_global_frame_extent(
-                            region.physical_ipa,
-                            region.physical_size as u64
-                        ),
-                        owns_host_mapping = region.host_mapping.is_some(),
-                        owns_stage2_lease = region.stage2_lease.is_some(),
-                        owner_generation = region.owner_generation,
-                        "guest write rejected: a region covers this VA but failed \
-                         the global-frame owner-liveness check"
-                    );
-                }
+            } else {
+                self.report_missing_write_mapping(
+                    chunk_address,
+                    chunk_len,
+                    lookup_address,
+                    allow_pristine,
+                );
                 return Err(MemoryError::OutOfBounds { address, length });
             };
             if require_guest_writable
@@ -863,11 +895,63 @@ impl HvfVmState {
                         .protections
                         .range_write_denied(chunk_address, chunk_len))
             {
+                carrick_observability::probes::guest_internal_write_fault(
+                    chunk_address,
+                    chunk_len as u64,
+                    7,
+                    &format!(
+                        "mapping permission refused: guest_writable={}",
+                        mapping.guest_writable
+                    ),
+                );
                 return Err(MemoryError::OutOfBounds { address, length });
             }
             checked += chunk_len;
         }
         Ok(())
+    }
+
+    fn report_missing_write_mapping(
+        &self,
+        chunk_address: u64,
+        chunk_len: usize,
+        lookup_address: u64,
+        allow_pristine: bool,
+    ) {
+        carrick_observability::probes::guest_internal_write_fault(
+            chunk_address,
+            chunk_len as u64,
+            6,
+            &format!(
+                "no authenticated mapping: allow_pristine={allow_pristine} denied_now={} mapping_now={} pristine_now={}",
+                self.protections
+                    .range_write_denied(chunk_address, chunk_len),
+                self.mapping_for_range(lookup_address, chunk_len).is_some(),
+                self.deferred_anonymous_state().is_some_and(|state| state
+                    .covers_pristine(carrick_guest_mem::GuestVa(chunk_address), chunk_len)),
+            ),
+        );
+        if let Some(region) = self
+            .mappings
+            .iter()
+            .find(|m| m.start <= lookup_address && lookup_address < m.end)
+        {
+            tracing::error!(
+                va = format!("0x{lookup_address:x}"),
+                len = chunk_len,
+                region = format!("[0x{:x}..0x{:x})", region.start, region.end),
+                physical_ipa = format!("0x{:x}", region.physical_ipa),
+                reusable_global_frame = is_reusable_global_frame_extent(
+                    region.physical_ipa,
+                    region.physical_size as u64
+                ),
+                owns_host_mapping = region.host_mapping.is_some(),
+                owns_stage2_lease = region.stage2_lease.is_some(),
+                owner_generation = region.owner_generation,
+                "guest write rejected: a region covers this VA but failed \
+                 the global-frame owner-liveness check"
+            );
+        }
     }
 
     pub(crate) fn guest_copy_chunk(
@@ -940,5 +1024,58 @@ impl HvfVmState {
                 mapping_ipa,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_mapping_is_rechecked_after_pristine_publication_commits() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, mpsc};
+
+        let state = Arc::new(carrick_guest_mem::DeferredAnonymousState::new());
+        let start = carrick_guest_mem::GuestVa(0x6001_0000_0000);
+        state.reserve_fresh(start, 4096).unwrap();
+        let published_lookup = Arc::new(AtomicU64::new(0));
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let publisher_state = Arc::clone(&state);
+        let publisher_lookup = Arc::clone(&published_lookup);
+        let publisher = std::thread::spawn(move || {
+            let transition = publisher_state.begin_materialization(start, 4096).unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            // Sparse publication makes the new translation and mapping visible
+            // before it commits pristine provenance and releases this lock.
+            publisher_lookup.store(0x9000, Ordering::Release);
+            transition.commit();
+        });
+        held_rx.recv().unwrap();
+
+        let validator_state = Arc::clone(&state);
+        let validator_lookup = Arc::clone(&published_lookup);
+        let (started_tx, started_rx) = mpsc::channel();
+        let validator = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            resolve_missing_mapping_after_pristine_handoff(
+                Some(&validator_state),
+                start,
+                4096,
+                || validator_lookup.load(Ordering::Acquire),
+                |lookup| (lookup == 0x9000).then_some(41_u64),
+            )
+        });
+        started_rx.recv().unwrap();
+        release_tx.send(()).unwrap();
+
+        assert_eq!(
+            validator.join().unwrap(),
+            MissingMappingResolution::Published(41),
+        );
+        publisher.join().unwrap();
     }
 }
