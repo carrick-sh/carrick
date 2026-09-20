@@ -28,8 +28,8 @@ use super::objects::{
 pub mod preemption;
 pub use preemption::{
     BindingResidency, BindingResidencySnapshot, DeadlineEntry, DeliveryOutcome, DemandTicket,
-    HostMonotonicClock, ManualClock, MonotonicClock, PreemptionReasons, PreemptionRequest,
-    PreemptionState, PreemptionWork,
+    HostMonotonicClock, ManualClock, MonotonicClock, PreemptionDriverError, PreemptionReasons,
+    PreemptionRequest, PreemptionState, PreemptionWork,
 };
 
 mod host_wait;
@@ -3704,6 +3704,7 @@ impl Scheduler {
     /// Only a claimable row is work an executor can be sent looking for.
     fn after_insertion(&self, outcome: EnqueueOutcome) {
         if outcome == EnqueueOutcome::Claimable {
+            let _ = self.executors.has_running();
             self.recompute_demand();
         }
     }
@@ -4766,6 +4767,21 @@ impl Scheduler {
         }
     }
 
+    /// Attach a preemption driver to this scheduler.
+    pub fn attach_preemption_driver(&self) -> Result<(), PreemptionDriverError> {
+        self.preemption.lock().attach_driver()
+    }
+
+    /// Detach the preemption driver from this scheduler.
+    pub fn detach_preemption_driver(&self) {
+        self.preemption.lock().detach_driver();
+    }
+
+    /// Check if a preemption driver is attached to this scheduler.
+    pub fn is_preemption_driver_attached(&self) -> bool {
+        self.preemption.lock().is_driver_attached()
+    }
+
     /// Stop the preemption driver loop.
     pub fn stop_preemption_driver(&self) {
         let mut preemption = self.preemption.lock();
@@ -4784,6 +4800,7 @@ impl Scheduler {
 
     pub fn close(&self) {
         self.queue.close();
+        self.stop_preemption_driver();
     }
 
     pub fn wait_closed(&self) {
@@ -6724,6 +6741,7 @@ mod tests {
             *progress.entry(running.thread_key()).or_insert(0_u32) += 1;
             assert!(scheduler.need_resched());
             if progress.values().sum::<u32>() == 1 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
                 assert_eq!(scheduler.request_preemption(), 1);
                 assert_eq!(kicks.tokens.lock().as_slice(), &[running.binding.token()]);
             }

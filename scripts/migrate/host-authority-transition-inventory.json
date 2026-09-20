@@ -14096,18 +14096,45 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor/pool.rs:1202 in `start`, `std::thread::Builder::new` acts only on the bounded carrier-owned persistent executor thread used by `start` at line 2878; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor/pool.rs:1217 in `start`, `std::thread::Builder::new` acts only on the bounded carrier-owned persistent executor thread used by `start` at line 2878; no guest identity selects its host target.",
     "review_id": "HA-000588",
     "source": {
-      "byte_end": 45198,
-      "byte_start": 45173,
+      "byte_end": 45746,
+      "byte_start": 45721,
       "column": 30,
       "column_end": 55,
       "column_start": 30,
       "file": "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs",
-      "line": 1202,
-      "line_end": 1202,
-      "line_start": 1202
+      "line": 1217,
+      "line_end": 1217,
+      "line_start": 1217
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "bounded carrier-owned scheduling preemption driver thread used by `start` at line 45"
+    },
+    "expansion": null,
+    "operation": "std::thread::Builder::new",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor/preemption.rs:45 in `start`, `std::thread::Builder::new` acts only on the bounded carrier-owned scheduling preemption driver thread used by `start` at line 45; no guest identity selects its host target.",
+    "review_id": "HA-000669",
+    "source": {
+      "byte_end": 1545,
+      "byte_start": 1520,
+      "column": 28,
+      "column_end": 53,
+      "column_start": 28,
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/preemption.rs",
+      "line": 45,
+      "line_end": 45,
+      "line_start": 45
     }
   },
   {
@@ -15531,18 +15558,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor.rs:1374 in `run_executor_loop`, `std::thread::yield_now` acts only on the current persistent executor host thread after one settled quantum used by `run_executor_loop` at line 3931; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor.rs:1377 in `run_executor_loop`, `std::thread::yield_now` acts only on the current persistent executor host thread after one settled quantum used by `run_executor_loop` at line 3931; no guest identity selects its host target.",
     "review_id": "HA-000638",
     "source": {
-      "byte_end": 61680,
-      "byte_start": 61658,
+      "byte_end": 61724,
+      "byte_start": 61702,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-      "line": 1374,
-      "line_end": 1374,
-      "line_start": 1374
+      "line": 1377,
+      "line_end": 1377,
+      "line_start": 1377
     }
   }
 ]

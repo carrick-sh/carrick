@@ -1,10 +1,10 @@
 {
   "catalog_sha256": "aa230c66221233fd4f87b931261e33b4975eedfb45efa04d6929a502a7d392ad",
   "diagnostic_counts": {
-    "macos-cli-default": 577,
+    "macos-cli-default": 578,
     "macos-hvf-default": 96,
-    "macos-runtime-default": 448,
-    "merged": 577
+    "macos-runtime-default": 449,
+    "merged": 578
   },
   "executed_profiles": [
     "macos-cli-default",
@@ -10511,15 +10511,35 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 45198,
-        "byte_start": 45173,
+        "byte_end": 45746,
+        "byte_start": 45721,
         "column": 30,
         "column_end": 55,
         "column_start": 30,
         "file": "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs",
-        "line": 1202,
-        "line_end": 1202,
-        "line_start": 1202
+        "line": 1217,
+        "line_end": 1217,
+        "line_start": 1217
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
+      "expansion": null,
+      "operation": "std::thread::Builder::new",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 1545,
+        "byte_start": 1520,
+        "column": 28,
+        "column_end": 53,
+        "column_start": 28,
+        "file": "crates/carrick-runtime/src/vcpu_loop/executor/preemption.rs",
+        "line": 45,
+        "line_end": 45,
+        "line_start": 45
       }
     },
     {
@@ -11575,21 +11595,21 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 61680,
-        "byte_start": 61658,
+        "byte_end": 61724,
+        "byte_start": 61702,
         "column": 13,
         "column_end": 35,
         "column_start": 13,
         "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-        "line": 1374,
-        "line_end": 1374,
-        "line_start": 1374
+        "line": 1377,
+        "line_end": 1377,
+        "line_start": 1377
       }
     }
   ],
-  "rows_sha256": "7a93a1a4aa1549e2c61e10af2dd3a5f41195d53176323da00a48d6387b602fcd",
+  "rows_sha256": "344b818d43f638533aa9285c6ce170f564807212b1a2dda45ec98c88f158c693",
   "schema": 1,
-  "source_head": "b1ac1bc79438fb11f648818606a090970272aa81",
+  "source_head": "471d95f25950d53210246005767630382101b1c6",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",

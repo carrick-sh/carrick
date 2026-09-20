@@ -1016,6 +1016,7 @@ where
     >,
 {
     scheduler: Arc<Scheduler>,
+    driver: super::preemption::PreemptionDriver,
     handles: Vec<WorkerHandle>,
     receipts: Arc<ReceiptLog>,
     _factory: std::marker::PhantomData<F>,
@@ -1082,11 +1083,16 @@ where
 pub struct ExecutorPoolStartError {
     configured_workers: usize,
     message: String,
+    driver_error: Option<carrick_kernel::kernel::PreemptionDriverError>,
 }
 
 impl ExecutorPoolStartError {
     pub const fn configured_workers(&self) -> usize {
         self.configured_workers
+    }
+
+    pub fn driver_error(&self) -> Option<&carrick_kernel::kernel::PreemptionDriverError> {
+        self.driver_error.as_ref()
     }
 }
 
@@ -1096,6 +1102,7 @@ pub struct ExecutorPoolReport {
     created: usize,
     destroyed: usize,
     joined: usize,
+    fair_preemption_enabled: bool,
 }
 
 impl ExecutorPoolReport {
@@ -1109,6 +1116,10 @@ impl ExecutorPoolReport {
 
     pub const fn joined(&self) -> usize {
         self.joined
+    }
+
+    pub const fn fair_preemption_enabled(&self) -> bool {
+        self.fair_preemption_enabled
     }
 
     pub fn events(&self) -> &[ExecutorPoolReceipt] {
@@ -1154,6 +1165,7 @@ where
                 .map_err(|error| ExecutorPoolStartError {
                     configured_workers: 0,
                     message: error.to_string(),
+                    driver_error: None,
                 })?;
         let spare_workers =
             config
@@ -1161,6 +1173,7 @@ where
                 .map_err(|error| ExecutorPoolStartError {
                     configured_workers: 0,
                     message: error.to_string(),
+                    driver_error: None,
                 })?;
         let configured_workers = bound_workers + spare_workers;
         resolver
@@ -1168,6 +1181,7 @@ where
             .map_err(|error| ExecutorPoolStartError {
                 configured_workers,
                 message: format!("install combined task resolver: {error}"),
+                driver_error: None,
             })?;
         let receipts = Arc::new(ReceiptLog::default());
         let debug_aux_provider: Arc<dyn carrick_kernel::kernel::debug::KernelDebugAuxProvider> =
@@ -1183,6 +1197,7 @@ where
                 .map_err(|error| ExecutorPoolStartError {
                     configured_workers,
                     message: format!("publish carrier debug provider: {error}"),
+                    driver_error: None,
                 })?,
         );
         let control = Arc::new(PoolControl::new(configured_workers, Arc::clone(&scheduler)));
@@ -1223,6 +1238,7 @@ where
                     return Err(ExecutorPoolStartError {
                         configured_workers,
                         message,
+                        driver_error: None,
                     });
                 }
             };
@@ -1292,6 +1308,7 @@ where
             return Err(ExecutorPoolStartError {
                 configured_workers,
                 message,
+                driver_error: None,
             });
         }
 
@@ -1302,6 +1319,7 @@ where
                 return Err(ExecutorPoolStartError {
                     configured_workers,
                     message,
+                    driver_error: None,
                 });
             }
         }
@@ -1311,8 +1329,22 @@ where
                 as Arc<dyn carrick_kernel::kernel::scheduler::DiscardRecorder>);
         let debug_aux_registration = debug_aux_publication.commit();
 
+        let driver = match super::preemption::PreemptionDriver::start(Arc::clone(&scheduler)) {
+            Ok(driver) => driver,
+            Err(error) => {
+                let mut message = format!("preemption driver start failed: {error}");
+                append_failures(&mut message, stop_and_join_startup(handles));
+                return Err(ExecutorPoolStartError {
+                    configured_workers,
+                    message,
+                    driver_error: Some(error),
+                });
+            }
+        };
+
         Ok(Self {
             scheduler,
+            driver,
             handles,
             receipts,
             _factory: std::marker::PhantomData,
@@ -1350,7 +1382,9 @@ where
             .invalidate_external_timeout(retirement, timeout)
     }
 
-    pub fn shutdown(self) -> Result<ExecutorPoolReport, ExecutorPoolShutdownError> {
+    pub fn shutdown(mut self) -> Result<ExecutorPoolReport, ExecutorPoolShutdownError> {
+        let fair_preemption_enabled = self.driver.is_enabled();
+        self.driver.shutdown();
         self.scheduler
             .kernel()
             .unregister_debug_aux_provider(self.debug_aux_registration);
@@ -1406,6 +1440,7 @@ where
             created,
             destroyed,
             joined,
+            fair_preemption_enabled,
         };
         if failures.is_empty() {
             Ok(report)
