@@ -49,7 +49,8 @@ pub mod sys;
 pub use contracts::{
     fork_filetable_contract, fork_filetable_scenario, fork_mappings_contract,
     fork_mappings_scenario, futex_contention_contract, futex_contention_scenario,
-    futex_requeue_contract, futex_requeue_scenario, inotify_watch_contract, inotify_watch_scenario,
+    futex_requeue_contract, futex_requeue_scenario, inotify_readiness_contract,
+    inotify_readiness_scenario, inotify_watch_contract, inotify_watch_scenario,
     scheduler_cost_contract, scheduler_cost_scenario, scheduler_lifecycle_contract,
     scheduler_lifecycle_scenario, scheduler_progress_contract, scheduler_progress_scenario,
 };

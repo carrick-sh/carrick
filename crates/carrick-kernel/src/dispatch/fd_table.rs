@@ -2363,7 +2363,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             }
             OpenDescription::Inotify { state, .. } => {
                 let mut ready = LinuxEpollEvents::empty();
-                if state.queued_bytes() > 0 {
+                if state.has_queued_records() {
                     ready |= LinuxEpollEvents::IN;
                 }
                 let mut pfd = libc::pollfd {

@@ -616,6 +616,84 @@ pub fn run_inotify_watch_timing_contract() -> ContractObservation {
     }
 }
 
+/// Run the inotify readiness structural contract under signed execution.
+///
+/// The `inotifyqueue` probe deepens an inotify queue without draining it, so
+/// the measured `InotifyQueueVisits` is exactly what answering readiness cost
+/// over that whole queue. It must stay zero: readiness is a non-emptiness
+/// question.
+pub fn run_inotify_readiness_structural_contract() -> ContractObservation {
+    let contract_id = ContractId::new("kernel.inotify.readiness").unwrap_or_default();
+    let mut semantic_assertions = Vec::new();
+
+    let meter = carrick_observability::work_meter::WorkMeter::default();
+    let scope = meter.new_scope();
+
+    let binary = probe_binary("inotifyqueue");
+    let mut exit_ok = true;
+    let mut completeness = Completeness::Complete;
+
+    match (binary, crate::Carrier::new()) {
+        (Some(bin_path), Ok(carrier)) => {
+            let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
+            let bin_name = bin_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("inotifyqueue");
+            let builder = carrier
+                .container("docker.io/library/ubuntu:24.04")
+                .pull_policy(crate::PullPolicy::Missing)
+                .command([format!("/p/{bin_name}")])
+                .mount_readonly(p_dir.to_string_lossy(), "/p")
+                .work_scope(scope.clone());
+
+            match builder.run_blocking() {
+                Ok(res) if res.exit_code != 0 => exit_ok = false,
+                Ok(_) => {}
+                // A probe that never ran measured nothing. Saying so is the
+                // contract's IncompleteMeasurement, not a zero-visit pass.
+                Err(_) => completeness = Completeness::Incomplete,
+            }
+        }
+        _ => completeness = Completeness::Incomplete,
+    }
+
+    if exit_ok {
+        semantic_assertions.push(SemanticAssertion::pass("clean_task_retirement"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "clean_task_retirement",
+            "non-zero exit code",
+        ));
+    }
+
+    let work_snapshot = scope.snapshot().unwrap_or_default();
+
+    ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::EmbedStructural,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "probe:inotifyqueue".to_string(),
+        scale: 1,
+        semantic_assertions,
+        work: Some(work_snapshot),
+        timing: None,
+        completeness,
+    }
+}
+
+/// Conformance contract binding for `kernel.inotify.readiness` at embed layers.
+pub fn inotify_readiness_contract(
+    layer: ExecutionLayer,
+) -> Result<ContractObservation, EmbedError> {
+    match layer {
+        ExecutionLayer::EmbedStructural => Ok(run_inotify_readiness_structural_contract()),
+        _ => Err(EmbedError::Config(format!(
+            "unsupported layer for embed inotify readiness contract: {layer:?}"
+        ))),
+    }
+}
+
 /// Conformance contract binding for `kernel.inotify.watch` at embed layers.
 pub fn inotify_watch_contract(layer: ExecutionLayer) -> Result<ContractObservation, EmbedError> {
     match layer {

@@ -45,6 +45,10 @@ pub enum WorkMetric {
     /// projection. A cached projection visits none; an invalidated one must
     /// visit rows proportional to what changed, never the whole process.
     ForkProjectionRowsVisited,
+    /// Queued inotify records inspected while answering a readiness question.
+    /// Readiness is a non-emptiness question, so it must not scale with queue
+    /// depth: a full scan per enqueue makes an undrained watcher quadratic.
+    InotifyQueueVisits,
     BackingAllocations,
     TaskAdmissions,
     VcpuAdmissions,
@@ -55,7 +59,7 @@ pub enum WorkMetric {
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 26;
+    pub const COUNT: usize = 27;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -76,6 +80,7 @@ impl WorkMetric {
         Self::PageTableImageAllocations,
         Self::HostMappingAllocations,
         Self::ForkProjectionRowsVisited,
+        Self::InotifyQueueVisits,
         Self::BackingAllocations,
         Self::TaskAdmissions,
         Self::VcpuAdmissions,
