@@ -320,3 +320,42 @@ and its entitlement negative control, with zero scoped leftovers; see
 The selected policy tests exercise kernel APIs; their signed execution
 does not itself prove guest workload behavior. Release measurements and
 the full promotion ladder remain pending.
+
+## Post-handoff gate and setid crash attribution (2026-09-20)
+
+The release built from `995c738a2` plus the preserved FS/VFS worktree
+changes has SHA-256
+`cb9da4a56ec5fd83eabbb21250d27deb2e7dcbbdab6500193673157a9ef5fe04`,
+CDHash `f04ba8f97c830a8a3afded2e6cc6b34e199f2ffb`, and LC_UUID
+`08A1ED96-F0CE-3825-8890-976816689F1E`. The entitlement and DOF section
+were verified; see `host-return-cli-artifact.json` and
+`host-return-worktree.patch` under the investigation directory. The earlier
+CLI is preserved there as `carrick-bcbb4668628a0c15139fcb25dd44026a684923b5ca16f1b8012f5fe2615ad511`
+so the modified-memory core remains interpretable after relinking.
+
+The public signed probe gate failed. All 910 generic rows executed exactly
+once; GNU `setidthreadchurn` exited 139 after 72 traps in 66 ms, with all
+three expected lines missing. The other 909 rows had no differences.
+Dedicated/retained phases did not run, and smoke/full promotion stopped.
+The entitlement negative control passed and scoped cleanup reported zero
+leftovers. See `host-return-probes.log` and `host-return-probe-counts.json`.
+
+Diagnostic attribution is preserved in `setid-attribution/`. Two focused
+signed-embed samples passed. The preserved pre-change CLI then produced
+exit 0 and exit 139 in two samples; the new CLI produced two exit-zero
+samples. These observations demonstrate an intermittent pre-existing
+crash; passing diagnostic samples do not repair the failed gate.
+
+The existing `hvpatch-go-signal-resume.d` instrument captured the failing
+sequence in `signal-trace-7.raw` (timestamp ordering in `.ordered`). Linux
+thread 6 received signal 33 at timestamp 489598789120000 on host thread
+28858619, with no subsequent successful signal-inject record. Other
+threads injected that handler successfully. Init later issued exit_group
+with code 139. The trace command itself returned zero, so its exit status
+is not guest acceptance. The missing injection event narrows investigation
+to signal-frame setup; it does not yet prove which frame validation or
+guest-memory write failed. All diagnostic IDs were reaped.
+
+Next: observe the exact signal-frame memory error before changing memory
+or signal semantics. Preserve this failure and the complete promotion
+requirements; no retry or known-gap treatment is accepted as closure.
