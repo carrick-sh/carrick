@@ -1278,6 +1278,20 @@ where
                 return Err(error);
             }
         };
+        if let Some(scope) = kernel.dispatcher.work_scope() {
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::PageTableImageAllocations,
+                ops.last_fork_stage1_image_allocations(memory),
+            );
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::HostMappingAllocations,
+                ops.last_fork_host_mapping_allocations(memory),
+            );
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::ForkProjectionRowsVisited,
+                ops.last_fork_projection_rows_visited(memory),
+            );
+        }
         if external_exec
             .as_mut()
             .is_some_and(|work| !work.begin_publication())

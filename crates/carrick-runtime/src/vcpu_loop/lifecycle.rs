@@ -203,6 +203,23 @@ pub(crate) trait HvpatchProcessBackendOps<E: ThreadedEngine, M: CurrentMmMemory>
         asid_generation: u64,
     ) -> Result<HvpatchProcessPreparation<Self::Prepared>, RuntimeError>;
     fn abort(&mut self, prepared: Self::Prepared) -> Result<(), RuntimeError>;
+    /// Fresh stage-1 software-image allocations charged to the fork that
+    /// `prepare` just completed. Charged to the execution work scope as
+    /// `page_table_image_allocations`; backends without a stage-1 image
+    /// report `0`.
+    fn last_fork_stage1_image_allocations(&self, _memory: &M) -> u64 {
+        0
+    }
+    /// Fresh host anonymous mappings created for the child that `prepare`
+    /// just built; charged as `host_mapping_allocations`.
+    fn last_fork_host_mapping_allocations(&self, _memory: &M) -> u64 {
+        0
+    }
+    /// Rows visited computing the fork COW projection; charged as
+    /// `fork_projection_rows_visited`.
+    fn last_fork_projection_rows_visited(&self, _memory: &M) -> u64 {
+        0
+    }
     fn commit_parent(&mut self, memory: &mut M) -> Result<(), RuntimeError>;
     fn rollback_parent(&mut self, memory: &mut M) -> Result<(), RuntimeError>;
     fn abort_and_rollback_prepared(
@@ -362,6 +379,18 @@ where
             }
         };
         Ok((prepared, cpu, memory.fresh_fork_kicker()))
+    }
+
+    fn last_fork_stage1_image_allocations(&self, memory: &E) -> u64 {
+        memory.last_fork_stage1_image_allocations()
+    }
+
+    fn last_fork_host_mapping_allocations(&self, memory: &E) -> u64 {
+        memory.last_fork_host_mapping_allocations()
+    }
+
+    fn last_fork_projection_rows_visited(&self, memory: &E) -> u64 {
+        memory.last_fork_projection_rows_visited()
     }
 
     fn abort(&mut self, prepared: Self::Prepared) -> Result<(), RuntimeError> {

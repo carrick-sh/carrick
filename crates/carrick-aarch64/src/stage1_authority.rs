@@ -6,6 +6,7 @@
 //! and prevents arena-source leaks across clone, rollback, and execve transitions.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -30,6 +31,101 @@ struct Stage1AuthorityInner {
     arena_source: Option<Box<dyn TableArenaSource>>,
     vfork_shares: usize,
     engines: usize,
+    /// Recycle pool shared by this authority and every child authority it
+    /// forks. The retiring image of an exited process returns here on drop.
+    image_pool: Arc<Stage1ImagePool>,
+}
+
+impl Drop for Stage1AuthorityInner {
+    fn drop(&mut self) {
+        if let Some(image) = self.manager.take() {
+            self.image_pool.recycle(image);
+        }
+    }
+}
+
+/// Bounded recycle pool for retired stage-1 software images.
+///
+/// A forked child owns a private `PageTableManager` image (one 1.75 MiB arena
+/// set plus any extension arenas) for its whole lifetime. Dropping it on exit
+/// and allocating a fresh one on the next fork turned a 16k-child fork storm
+/// (`ltp-fork14`) into ~28 GiB of host `mmap`/`madvise(MADV_FREE_REUSABLE)`
+/// churn. Retired images return here and the next fork clones the parent into
+/// a recycled buffer with `clone_from`, so steady-state image allocations are
+/// bounded by the number of concurrently live child images, never by fork
+/// count (`kernel.fork.stage1-image`).
+///
+/// The pool travels with the authority: a child authority inherits its
+/// parent's pool; an authority built for an exec'd image starts a fresh one.
+/// Buffers are content-agnostic host heap; the clone overwrites every
+/// descriptor word and scalar, so a recycled image is indistinguishable from
+/// a fresh clone.
+pub struct Stage1ImagePool {
+    images: Mutex<Vec<PageTableManager>>,
+    capacity: usize,
+    fresh_allocations: AtomicU64,
+    recycled_images: AtomicU64,
+}
+
+impl std::fmt::Debug for Stage1ImagePool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stage1ImagePool")
+            .field("retained", &self.retained())
+            .field("capacity", &self.capacity)
+            .field("fresh_allocations", &self.fresh_allocations())
+            .field("recycled_images", &self.recycled_images())
+            .finish()
+    }
+}
+
+impl Stage1ImagePool {
+    /// Retained images per process tree. A serial fork/exit/wait loop keeps at
+    /// most one child image live plus one in teardown; the headroom covers a
+    /// few concurrently exiting children without pinning unbounded memory.
+    pub const DEFAULT_CAPACITY: usize = 4;
+
+    pub fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            images: Mutex::new(Vec::with_capacity(capacity)),
+            capacity,
+            fresh_allocations: AtomicU64::new(0),
+            recycled_images: AtomicU64::new(0),
+        })
+    }
+
+    /// Take a retired image buffer, if one is retained.
+    pub fn take(&self) -> Option<PageTableManager> {
+        self.images.lock().pop()
+    }
+
+    /// Return a retired image. Beyond `capacity` the image is dropped.
+    pub fn recycle(&self, image: PageTableManager) {
+        let mut images = self.images.lock();
+        if images.len() < self.capacity {
+            images.push(image);
+            self.recycled_images.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_fresh_allocation(&self) {
+        self.fresh_allocations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Images currently retained for reuse.
+    pub fn retained(&self) -> usize {
+        self.images.lock().len()
+    }
+
+    /// Fresh image allocations performed because no retired image was
+    /// available.
+    pub fn fresh_allocations(&self) -> u64 {
+        self.fresh_allocations.load(Ordering::Relaxed)
+    }
+
+    /// Images returned to the pool over its lifetime.
+    pub fn recycled_images(&self) -> u64 {
+        self.recycled_images.load(Ordering::Relaxed)
+    }
 }
 
 /// The concrete Rust type governing stage-1 page-table translation and arena growth.
@@ -65,26 +161,43 @@ impl std::fmt::Debug for Stage1Authority {
 impl Stage1Authority {
     /// Create a new, unpopulated stage-1 authority in the `Exclusive` state.
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(Stage1AuthorityInner {
-                manager: None,
-                arena_source: None,
-                vfork_shares: 0,
-                engines: 1,
-            })),
-        }
+        Self::new_with_manager(None)
     }
 
     /// Create a stage-1 authority pre-populated with an optional manager in the `Exclusive` state.
+    ///
+    /// The authority starts its own [`Stage1ImagePool`]; fork children created
+    /// through [`Self::child_with_manager`] share it.
     pub fn new_with_manager(manager: Option<PageTableManager>) -> Self {
+        Self::with_pool(
+            manager,
+            Stage1ImagePool::new(Stage1ImagePool::DEFAULT_CAPACITY),
+        )
+    }
+
+    fn with_pool(manager: Option<PageTableManager>, image_pool: Arc<Stage1ImagePool>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Stage1AuthorityInner {
                 manager,
                 arena_source: None,
                 vfork_shares: 0,
                 engines: 1,
+                image_pool,
             })),
         }
+    }
+
+    /// Create the `Exclusive` authority of a forked child around its private
+    /// image. The child shares this authority's image pool, so its image
+    /// returns to the parent's pool when the child retires.
+    pub fn child_with_manager(&self, manager: PageTableManager) -> Self {
+        let image_pool = Arc::clone(&self.inner.lock().image_pool);
+        Self::with_pool(Some(manager), image_pool)
+    }
+
+    /// The image recycle pool shared across this authority's process tree.
+    pub fn image_pool(&self) -> Arc<Stage1ImagePool> {
+        Arc::clone(&self.inner.lock().image_pool)
     }
 
     /// Replace or update the inner manager directly. Used primarily for test harnesses and initialization.
@@ -184,6 +297,25 @@ impl Stage1Authority {
     /// owned by this `Stage1Authority`.
     pub fn snapshot_image(&self) -> Option<PageTableManager> {
         self.inner.lock().manager.clone()
+    }
+
+    /// Snapshot the current image into a recycled buffer when the pool holds
+    /// one, cloning fresh otherwise. Returns the image and whether a fresh
+    /// host allocation was needed (`true` = fresh). A recycled image is
+    /// `clone_from`-overwritten, so its contents equal [`Self::snapshot_image`].
+    pub fn snapshot_image_recycled(&self) -> Option<(PageTableManager, bool)> {
+        let guard = self.inner.lock();
+        let source = guard.manager.as_ref()?;
+        match guard.image_pool.take() {
+            Some(mut image) => {
+                image.clone_from(source);
+                Some((image, false))
+            }
+            None => {
+                guard.image_pool.record_fresh_allocation();
+                Some((source.clone(), true))
+            }
+        }
     }
 
     /// Execute a closure with a reference to the inner `PageTableManager`, if present.
@@ -496,6 +628,7 @@ impl Stage1Authority {
             };
             if let Some(mut old) = old_mgr.take() {
                 retirer(&mut old)?;
+                self.inner.lock().image_pool.recycle(old);
             }
             // The retired image's source retires with it: its extension
             // arenas were just handed back and the replacement lease brings
@@ -889,6 +1022,77 @@ mod tests {
         fn return_arena(&mut self, gpa: Gpa) {
             self.returned.lock().unwrap().push(gpa);
         }
+    }
+
+    #[test]
+    fn retiring_child_authority_returns_its_image_to_the_shared_pool() {
+        // `kernel.fork.stage1-image`: the parent forks, the child owns a
+        // private image, the child exits. The image must come back to the
+        // parent's pool so the next fork clones into it instead of allocating.
+        let parent = Stage1Authority::new_with_manager(Some(PageTableManager::new(
+            stage1_hvpatch_page_tables(),
+            LINUX_PAGE_TABLES_BASE,
+        )));
+        let pool = parent.image_pool();
+        assert_eq!(pool.retained(), 0);
+
+        let (image, fresh) = parent.snapshot_image_recycled().expect("parent image");
+        assert!(fresh, "an empty pool forces one fresh allocation");
+        assert_eq!(pool.fresh_allocations(), 1);
+        let child = parent.child_with_manager(image);
+        assert!(Arc::ptr_eq(&child.image_pool(), &pool));
+
+        drop(child);
+        assert_eq!(pool.retained(), 1, "the retiring child image is recycled");
+        assert_eq!(pool.recycled_images(), 1);
+
+        let (image, fresh) = parent.snapshot_image_recycled().expect("parent image");
+        assert!(!fresh, "the second fork reuses the recycled image");
+        assert_eq!(pool.fresh_allocations(), 1);
+        assert_eq!(pool.retained(), 0);
+        assert_eq!(image.base(), LINUX_PAGE_TABLES_BASE);
+        assert_eq!(
+            image.copied_bytes(),
+            parent
+                .with_manager(|manager| manager.copied_bytes())
+                .expect("parent manager"),
+            "a recycled image carries the exact parent snapshot"
+        );
+    }
+
+    #[test]
+    fn image_pool_is_bounded_and_exec_recycles_the_retired_image() {
+        let pool = Stage1ImagePool::new(2);
+        for _ in 0..3 {
+            pool.recycle(PageTableManager::new(
+                stage1_hvpatch_page_tables(),
+                LINUX_PAGE_TABLES_BASE,
+            ));
+        }
+        assert_eq!(pool.retained(), 2, "images beyond capacity are dropped");
+        assert_eq!(pool.recycled_images(), 2);
+
+        let mut authority = Stage1Authority::new_with_manager(Some(PageTableManager::new(
+            stage1_hvpatch_page_tables(),
+            LINUX_PAGE_TABLES_BASE,
+        )));
+        let pool = authority.image_pool();
+        authority
+            .replace_for_exec(
+                || {
+                    Ok::<_, PageTableError>(Some(PageTableManager::new(
+                        stage1_hvpatch_page_tables(),
+                        LINUX_PAGE_TABLES_BASE,
+                    )))
+                },
+                |_| Ok(()),
+            )
+            .expect("exec replacement");
+        assert_eq!(
+            pool.retained(),
+            1,
+            "the pre-exec image is recycled for the exec'd process's forks"
+        );
     }
 
     #[test]

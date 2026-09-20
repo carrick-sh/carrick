@@ -105,8 +105,8 @@ pub fn probe_campaign_dir(root: &Path, target: &str) -> PathBuf {
 fn test_shard_1_inventory_count_and_sorted() {
     assert_eq!(
         SHARD_1_PROBES.len(),
-        162,
-        "shard 1 must contain exactly 162 generic probes"
+        163,
+        "shard 1 must contain exactly 163 generic probes"
     );
 
     // Hard assert uniqueness and strictly ascending sort order.
@@ -182,8 +182,8 @@ fn test_shard_1_inventory_count_and_sorted() {
 
         assert_eq!(
             computed_shard_1.len(),
-            162,
-            "derived shard 1 must have 162 items"
+            163,
+            "derived shard 1 must have 163 items"
         );
         assert_eq!(
             SHARD_1_PROBES,

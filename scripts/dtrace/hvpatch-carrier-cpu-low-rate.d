@@ -66,6 +66,20 @@ dtrace:::BEGIN
     saw_sample = 0;
 }
 
+/*
+ * Exact Mach-O identity of the traced carrier so the raw stack population can
+ * be symbolicated offline (`atos -o target/release/carrick -l <text_base>`).
+ * Provider ABI: carrick*:::host-image-base(host_pid, runtime_TEXT_base, slide,
+ * path), qualified live on Darwin/arm64 (macOS 27.0, 2026-09-19); the probe
+ * fires once per carrier before any guest instruction runs.
+ */
+carrick*:::host-image-base
+/pid == $target || progenyof($target)/
+{
+    printf("HVPCARRIERLOW|image|host_pid=%d|text_base=0x%llx|slide=0x%llx\n",
+        (int)arg0, (uint64_t)arg1, (uint64_t)arg2);
+}
+
 profile-97
 /pid == $target || progenyof($target)/
 {

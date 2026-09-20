@@ -148,7 +148,7 @@ impl SyscallDispatcher {
             );
         });
         process.bind_mm_mutation_authority(self.foreign_mm_mutation_authority(stage1));
-        *self.kernel_binding.write() = process.task_binding();
+        self.rebind_kernel(process.task_binding());
         *self.timer_delivery.write() = Some(process.process_timer_delivery());
         self.commit_sysv_fork_inheritance();
         let mut proc = self.proc.lock();
@@ -200,7 +200,7 @@ impl SyscallDispatcher {
         let old_files = prepared.old_file_table();
         let kernel = Arc::clone(self.kernel_binding.read().kernel());
         let context = kernel.commit_exec(prepared, None)?;
-        *self.kernel_binding.write() = context.task_binding();
+        self.rebind_kernel(context.task_binding());
         self.publish_external_credential_projection(&context, &context.resources().credentials());
         let successor_files = context.resources().files();
         self.close_draining_file_table(
@@ -323,7 +323,7 @@ impl SyscallDispatcher {
             .replace_signal_state(crate::kernel::ThreadSignalState::for_fork(
                 &inherited_signal_state,
             ));
-        *self.kernel_binding.write() = context.task_binding();
+        self.rebind_kernel(context.task_binding());
         self.publish_external_credential_projection(&context, &context.resources().credentials());
         Ok(context)
     }

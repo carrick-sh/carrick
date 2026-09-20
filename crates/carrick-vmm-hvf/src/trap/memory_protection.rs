@@ -561,6 +561,12 @@ pub(crate) struct AliasRegistry {
     /// Monotonic semantic-mutation revision used only to prove that a fork
     /// snapshot and delayed retirement observed one coherent alias view.
     pub(crate) revision: u64,
+    /// Per-scope monotonic revision. A fork cache keyed on the process-visible
+    /// scopes avoids invalidation when a DIFFERENT scope (e.g. a child's
+    /// `MmRootSlot`) is the only one that mutated. The global `revision` is
+    /// still bumped on every mutation for consumers that need a carrier-wide
+    /// epoch (retirement coherence).
+    pub(crate) scope_revisions: std::collections::BTreeMap<AliasOwnershipScope, u64>,
     /// Maintained total of every bucket's length; see [`Self::len`].
     pub(crate) rows: usize,
     /// Exact physical stage-2 start index used by delayed owner retirement.
@@ -607,6 +613,38 @@ impl AliasRegistry {
 
     pub(crate) fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Bump the per-scope revision for `scope`. Called alongside
+    /// `bump_revision()` at every mutation site that knows which scope
+    /// changed. `clear()` bumps ALL live scope revisions since it drains
+    /// every bucket.
+    pub(crate) fn bump_scope_revision(&mut self, scope: AliasOwnershipScope) {
+        let entry = self.scope_revisions.entry(scope).or_insert(0);
+        *entry = entry.checked_add(1).unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "scope revision counter overflow: scope={:?} revision={}",
+                scope,
+                *entry
+            );
+        });
+    }
+
+    /// Max revision across the two scopes a process can see. The fork cache
+    /// uses this instead of the global `revision()` so that mutations in
+    /// OTHER processes' `MmRootSlot` scopes do not invalidate the cache.
+    pub(crate) fn process_visible_revision(
+        &self,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    ) -> u64 {
+        let scopes = Self::process_visible_scopes(mm_root_slot, container_root);
+        scopes
+            .iter()
+            .map(|scope| self.scope_revisions.get(scope).copied().unwrap_or(0))
+            .max()
+            .unwrap_or(0)
     }
 
     pub(crate) fn rebuild_exact_scope(&mut self, scope: AliasOwnershipScope) {
@@ -916,6 +954,7 @@ impl AliasRegistry {
 
     pub(crate) fn push(&mut self, alias: AliasBacking) {
         self.bump_revision();
+        self.bump_scope_revision(alias.ownership_scope);
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         self.place_in_scope_bucket(seq, alias);
@@ -945,6 +984,11 @@ impl AliasRegistry {
     pub(crate) fn clear(&mut self) {
         if self.rows != 0 {
             self.bump_revision();
+            // Bump every scope that had rows — their content is drained.
+            let scopes: Vec<_> = self.by_scope.keys().copied().collect();
+            for scope in scopes {
+                self.bump_scope_revision(scope);
+            }
         }
         self.by_scope.clear();
         self.exact_first_by_scope.clear();
@@ -1123,6 +1167,7 @@ impl AliasRegistry {
         };
         if changed {
             self.bump_revision();
+            self.bump_scope_revision(scope);
         }
         self.index_remove(seq, previous);
         self.index_insert(seq, updated);
@@ -1197,6 +1242,13 @@ impl AliasRegistry {
         self.rows = self.rows.saturating_sub(dropped.len());
         if !dropped.is_empty() {
             self.bump_revision();
+            let mut affected_scopes = std::collections::BTreeSet::new();
+            for &(_, alias) in &dropped {
+                affected_scopes.insert(alias.ownership_scope);
+            }
+            for scope in affected_scopes {
+                self.bump_scope_revision(scope);
+            }
         }
         for (seq, alias) in dropped {
             self.index_remove(seq, alias);
@@ -1215,6 +1267,7 @@ impl AliasRegistry {
         self.exact_first_by_scope.remove(&scope);
         self.physical_size_counts_by_scope.remove(&scope);
         self.bump_revision();
+        self.bump_scope_revision(scope);
         self.rows = self.rows.saturating_sub(bucket.rows.len());
         note_alias_state_rows_scanned(bucket.rows.len());
         for &(seq, alias) in &bucket.rows {
@@ -1252,6 +1305,7 @@ impl AliasRegistry {
         }
         if !dropped.is_empty() {
             self.bump_revision();
+            self.bump_scope_revision(scope);
         }
         self.rebuild_exact_scope(scope);
         dropped.into_iter().map(|(_, alias)| alias).collect()
@@ -1278,6 +1332,7 @@ impl AliasRegistry {
         let replacement = rebuild(previous.clone());
         if replacement != previous {
             self.bump_revision();
+            self.bump_scope_revision(scope);
         }
         self.rows = self
             .rows
@@ -1388,6 +1443,7 @@ impl AliasRegistry {
             };
             if changed {
                 self.bump_revision();
+                self.bump_scope_revision(scope);
             }
             self.index_remove(seq, previous);
             self.index_insert(seq, alias);
@@ -1559,6 +1615,7 @@ impl AliasRegistry {
             }
             self.rows = self.rows.saturating_sub(removed_in_scope.len());
             self.bump_revision();
+            self.bump_scope_revision(scope);
 
             let first_removed = removed_in_scope[0].0;
             if let Some(bucket) = self.by_scope.get_mut(&scope) {
@@ -2502,8 +2559,8 @@ pub(crate) fn alias_is_owned_by_process(
 /// vCPU's local mapping ledger. The caller additionally checks the live stage-1
 /// translation and backing lifetime before copying them.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn missing_process_aliases(
-    local_aliases: &std::collections::HashSet<ProcessAliasKey>,
+pub(crate) fn missing_process_aliases<S: core::hash::BuildHasher>(
+    local_aliases: &std::collections::HashSet<ProcessAliasKey, S>,
     aliases: &[AliasBacking],
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
@@ -2532,6 +2589,42 @@ pub(crate) fn missing_process_aliases(
 /// index makes one pass over the registry and answers each mapping in O(1).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) type ProcessAliasKey = (u64, u64, usize, usize, u64);
+
+/// Extremely fast non-cryptographic hasher for fork-path alias indices,
+/// replacing SipHash which otherwise consumes 40%+ of CPU in fork-heavy workloads.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default, Clone, Copy)]
+pub(crate) struct FastKeyHasher(u64);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl core::hash::Hasher for FastKeyHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517cc1b727220a95);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) type FastKeyBuildHasher = core::hash::BuildHasherDefault<FastKeyHasher>;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) type ProcessAliasMap<V> =
+    std::collections::HashMap<ProcessAliasKey, V, FastKeyBuildHasher>;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) type ProcessAliasSet = std::collections::HashSet<ProcessAliasKey, FastKeyBuildHasher>;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn process_alias_key(alias: AliasBacking) -> ProcessAliasKey {
@@ -2574,8 +2667,9 @@ pub(crate) fn process_alias_index(
     aliases: &[AliasBacking],
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
-) -> std::collections::HashMap<ProcessAliasKey, AliasBacking> {
-    let mut index = std::collections::HashMap::with_capacity(aliases.len());
+) -> ProcessAliasMap<AliasBacking> {
+    let mut index =
+        ProcessAliasMap::with_capacity_and_hasher(aliases.len(), FastKeyBuildHasher::default());
     for alias in aliases {
         if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root) {
             index
@@ -2596,7 +2690,7 @@ pub(crate) fn process_alias_index(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn mapping_is_current_for_process_fork_indexed(
     mapping: &HvfMappedRegion,
-    index: &std::collections::HashMap<ProcessAliasKey, AliasBacking>,
+    index: &ProcessAliasMap<AliasBacking>,
 ) -> bool {
     !mapping.is_dynamic_alias
         || index.contains_key(&(
@@ -2608,13 +2702,14 @@ pub(crate) fn mapping_is_current_for_process_fork_indexed(
         ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn current_process_alias_keys<'a>(
     mappings: impl IntoIterator<Item = &'a HvfMappedRegion>,
     aliases: &[AliasBacking],
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
-) -> std::collections::HashSet<ProcessAliasKey> {
+) -> ProcessAliasSet {
     let index = process_alias_index(aliases, mm_root_slot, container_root);
     mappings
         .into_iter()
@@ -2840,6 +2935,7 @@ pub(crate) fn unregister_alias_entries(
             .saturating_sub(removed_count)
             .saturating_add(inserted_count);
         registry.bump_revision();
+        registry.bump_scope_revision(scope);
         registry.promote_exact_first_keys(scope, &touched_keys);
         registry.drop_empty_scope(scope);
     }

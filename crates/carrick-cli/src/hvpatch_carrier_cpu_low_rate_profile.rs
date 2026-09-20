@@ -34,6 +34,8 @@ pub(crate) struct HvpatchCarrierCpuLowRateSummary {
     pub(crate) stack_population: u64,
     pub(crate) stack_count: u64,
     pub(crate) program_sha256: String,
+    /// Runtime `__TEXT` base of the traced carrier (`atos -l` input).
+    pub(crate) image_text_base: String,
     pub(crate) raw: String,
 }
 
@@ -50,6 +52,7 @@ impl HvpatchCarrierCpuLowRateSummary {
         let mut summary = None;
         let mut header = None;
         let mut population = None;
+        let mut image_text_base = None;
         let mut section_seen = false;
         let mut stack_frames = 0_u64;
         let mut stack_count = 0_u64;
@@ -80,6 +83,17 @@ impl HvpatchCarrierCpuLowRateSummary {
                         record.exact_fields(&["count"])?;
                         if population.replace(record.u64("count")?).is_some() {
                             bail!("duplicate {PREFIX} sample-population");
+                        }
+                    }
+                    "image" => {
+                        // Exact Mach-O identity of the traced carrier, so the
+                        // retained raw stacks can be symbolicated offline.
+                        record.exact_fields(&["host_pid", "text_base", "slide"])?;
+                        if image_text_base
+                            .replace(record.value("text_base")?.to_owned())
+                            .is_some()
+                        {
+                            bail!("duplicate {PREFIX} image");
                         }
                     }
                     "section=user-stacks" => {
@@ -146,22 +160,27 @@ impl HvpatchCarrierCpuLowRateSummary {
             );
         }
 
+        let image_text_base = image_text_base
+            .ok_or_else(|| anyhow!("{PREFIX} stream has no carrier image record"))?;
+
         Ok(Self {
             sample_population,
             stack_population,
             stack_count,
             program_sha256: program_sha256(),
+            image_text_base,
             raw,
         })
     }
 
     pub(crate) fn render_human(&self) -> String {
         format!(
-            "HVPatch carrier low-rate CPU: samples={}, user_stacks={}, stack_count_closure={}, bundled_program_sha256={}, raw_bytes={}",
+            "HVPatch carrier low-rate CPU: samples={}, user_stacks={}, stack_count_closure={}, bundled_program_sha256={}, image_text_base={}, raw_bytes={}",
             self.sample_population,
             self.stack_count,
             self.stack_population,
             self.program_sha256,
+            self.image_text_base,
             self.raw.len(),
         )
     }

@@ -1429,6 +1429,9 @@ impl HvfVmState {
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
             _vcpu_guard: Some(vcpu_census().created()),
+            cached_fork_alias_snapshot: parking_lot::Mutex::new(None),
+            last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64::new(0),
+            last_fork_projection_rows_visited: std::sync::atomic::AtomicU64::new(0),
         };
         state.publish_live_vcpu();
         Self::configure_executor_invariants(&vcpu)?;
@@ -1623,6 +1626,9 @@ impl HvfVmState {
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
             _vcpu_guard: Some(vcpu_census().created()),
+            cached_fork_alias_snapshot: parking_lot::Mutex::new(None),
+            last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64::new(0),
+            last_fork_projection_rows_visited: std::sync::atomic::AtomicU64::new(0),
         };
         state.publish_live_vcpu();
 
@@ -1646,6 +1652,7 @@ impl HvfVmState {
         page_tables: &mut crate::page_table::PageTableManager,
         cow_ranges: &[carrick_aarch64::vmm::ForkCowRange],
     ) -> Result<ProcessSpec, TrapError> {
+        let cached_snapshot = self.cached_fork_alias_snapshot.lock().clone();
         let plan = self.task.build_process_plan(
             request,
             page_tables,
@@ -1653,7 +1660,15 @@ impl HvfVmState {
             std::sync::Arc::clone(&self.mailbox_slots),
             self.syscall_transport,
             std::sync::Arc::clone(&self.carrier_foreign_mm_transport),
+            cached_snapshot,
         )?;
+        let owned_host_mappings = plan
+            .mappings
+            .iter()
+            .filter(|mapping| matches!(mapping.host, ProcessMappingHost::Owned(_)))
+            .count() as u64;
+        self.last_fork_host_mapping_allocations
+            .store(owned_host_mappings, std::sync::atomic::Ordering::Relaxed);
         Ok(ProcessSpec::new((*self._vm).clone(), plan))
     }
 }

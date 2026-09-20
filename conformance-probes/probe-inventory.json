@@ -549,6 +549,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "fdceiling": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "fdio": {
     "class": "conformance",
     "excluded": false,
@@ -590,11 +595,6 @@
     "runner": "generic"
   },
   "fifonode": {
-    "class": "conformance",
-    "excluded": false,
-    "runner": "generic"
-  },
-  "fdceiling": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
@@ -674,6 +674,14 @@
   },
   "forkreadexitcow": {
     "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forkserial": {
+    "class": "conformance",
+    "contract_ids": [
+      "kernel.fork.stage1-image"
+    ],
     "excluded": false,
     "runner": "generic"
   },

@@ -177,3 +177,46 @@ The signed binding reuses Carrick's futex probes to prove guest execution. A
 separate uninstrumented release run compares the pinned futex distribution with
 same-image Docker. The existing tests remain until the contract has demonstrated
 equivalent or stronger failure detection.
+
+## Fork stage-1 image example
+
+`kernel.fork.stage1-image` is the first contract whose structural budget lives
+entirely in the VMM layer. Every forked child owns a private stage-1
+page-table software image (a 1.75 MiB arena set) for its lifetime; `ltp-fork14`
+creates 16k children this way, and allocating a fresh image per fork produced
+~28 GiB of host `mmap`/`madvise(MADV_FREE_REUSABLE)` churn. The fixture is
+`forkserial <n>`: `n` serial fork/`_exit(0)`/`waitpid` rounds from one parent.
+
+- Linux authority: `man 2 fork`, `man 2 wait4`. Every child exits 0 and each
+  `waitpid` returns its own child's pid.
+- Structural invariant: `task_admissions` is exactly one per fork, and
+  `page_table_image_allocations` (fresh image allocations, counted where the
+  parent clones its image for the child) is bounded by the number of
+  concurrently live child images, `2 + 0·n`, never by the fork count. Retired
+  images return to the process tree's bounded `Stage1ImagePool` and the next
+  fork clones into a recycled buffer. `host_mapping_allocations` (fresh host
+  `mmap`s for the child's per-mm backing) is `0 + 1·n`: the root tables come
+  from the carrier's pre-mapped root-slot pool and only the child's private
+  EL1 kernel-state page is still a per-fork host mapping.
+  `fork_projection_rows_visited` is `32 + 24·n`: the COW projection scans the
+  process's own rows, and rows superseded by earlier COW splits (the parent's
+  post-fork stack and data writes) are pruned before the scan, so the work per
+  fork never grows with the forks already performed (before the prune the
+  fixture visited 15455 rows at 128 forks; after it, 2430).
+- Layers: the VM-free binding has no stage-1 projection, so it proves the
+  semantics and the admission budget and reports the image metric as an
+  exact zero. The signed embed structural binding runs the probe on the
+  runtime's own work scope at 1, 8, 32 and 128 forks. The timing binding reads
+  the probe's per-fork p50 from an uninstrumented signed run against the
+  pinned same-image Docker measurement recorded beside the binding.
+- Status (2026-09-20): structural bindings green at 1/8/32/128. The timing
+  binding is red: 205 µs per serial fork under the signed carrier versus
+  88 µs under Docker (2.33x against the 2.0x policy), and `ltp-fork14` sits at
+  3.8x (6.2 s versus 1.6 s; it was 15.4x). Named remaining levers, in order:
+  the pre-mapped root-slot pool is created lazily at the first fork and
+  collides with an exec'd process's slot (`HV_ERROR` at the 128 MiB pre-map),
+  so every exec'd forker still pays a 2 MiB host `mmap` per fork; the
+  executor boundary audit issues about five `pthread_sigmask` and four
+  `thread_selfusage` host calls per fork; and the parent's post-fork COW
+  splits cost about 15% of carrier CPU. The timing gate stays red until the
+  ratio meets policy; it is not widened.

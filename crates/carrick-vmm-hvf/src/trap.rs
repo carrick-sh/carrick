@@ -1008,6 +1008,29 @@ pub(crate) struct HvfVmState {
     /// Cloneable worker-local handle for `hv_vcpus_exit`.
     pub(crate) vcpu_handle: applevisor::vcpu::VcpuHandle,
     pub(crate) _vcpu_guard: Option<carrick_hal::VcpuLiveGuard>,
+    pub(crate) cached_fork_alias_snapshot: parking_lot::Mutex<Option<ForkAliasSnapshot>>,
+    /// Fresh host anonymous mappings the most recent `build_process_spec`
+    /// created for the child (`ProcessMappingHost::Owned`); pooled root slots
+    /// and borrowed parent frames do not count. Charged by the runtime as
+    /// `host_mapping_allocations`.
+    pub(crate) last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64,
+    /// Mapping and alias rows the most recent `fork_cow_ranges` visited
+    /// (`0` on a cached projection). Charged by the runtime as
+    /// `fork_projection_rows_visited`.
+    pub(crate) last_fork_projection_rows_visited: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone)]
+pub(crate) struct ForkAliasSnapshot {
+    pub(crate) revision: u64,
+    pub(crate) mm_root_slot: Option<(u64, u64)>,
+    pub(crate) container_root: ContainerRootToken,
+    pub(crate) cow_ranges: Vec<carrick_aarch64::vmm::ForkCowRange>,
+    pub(crate) source_mappings: Vec<ThreadMappingDesc>,
+    pub(crate) all_aliases_covered: bool,
+    pub(crate) aliases: std::sync::Arc<Vec<AliasBacking>>,
+    pub(crate) alias_index: std::sync::Arc<ProcessAliasMap<AliasBacking>>,
 }
 
 /// Every backend field whose authority follows a logical HVPatch task rather
@@ -2204,7 +2227,11 @@ fn authenticated_structural_owner_record_in(
         && snapshot.perms == u64::from(perms)
         && snapshot.logical_owner == Some(logical_owner)
         && snapshot.mapped
-        && snapshot.backend_map_installed
+        // A pooled root slot is backend-mapped once by the pool's own lease;
+        // its per-process record is pre-mapped (`mark_pre_mapped`) and custody
+        // skips the backend unmap for it, so the record authenticates on the
+        // pool's mapping rather than a per-record one.
+        && (snapshot.backend_map_installed || custody.is_pooled_ipa(physical_ipa))
         && !snapshot.retirement_requested
         && !snapshot.terminalized_by_vm_destroy)
         .then_some(identity)
@@ -6852,6 +6879,9 @@ impl HvfVmState {
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
             _vcpu_guard: Some(vcpu_census().created()),
+            cached_fork_alias_snapshot: parking_lot::Mutex::new(None),
+            last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64::new(0),
+            last_fork_projection_rows_visited: std::sync::atomic::AtomicU64::new(0),
         };
         state.publish_live_vcpu();
         let mailbox = match state.allocate_mailbox_for_vcpu(&vcpu) {

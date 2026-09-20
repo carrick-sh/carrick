@@ -2432,6 +2432,30 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         None
     }
 
+    /// Fresh stage-1 software-image allocations performed by this engine's
+    /// most recent `build_process_spec`. `0` when the child's image reused a
+    /// recycled buffer; backends without in-process fork report `0`. The
+    /// runtime charges it to the execution work scope as
+    /// `page_table_image_allocations`.
+    fn last_fork_stage1_image_allocations(&self) -> u64 {
+        0
+    }
+
+    /// Fresh host anonymous mappings created by this engine's most recent
+    /// `build_process_spec` for the child's per-mm backing. `0` when every
+    /// backing came from a carrier pool. Charged to the execution work scope
+    /// as `host_mapping_allocations`.
+    fn last_fork_host_mapping_allocations(&self) -> u64 {
+        0
+    }
+
+    /// Mapping and alias rows this engine visited to compute the most recent
+    /// fork's COW projection (`0` when the cached projection was reused).
+    /// Charged to the execution work scope as `fork_projection_rows_visited`.
+    fn last_fork_projection_rows_visited(&self) -> u64 {
+        0
+    }
+
     /// Fail-closed backend-owned executor boundary audit. Transitional M:N
     /// workers call this only while the task is fully saved and owns no live
     /// executor/vCPU authority.

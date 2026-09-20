@@ -33,6 +33,18 @@ pub enum WorkMetric {
     HostBackendCalls,
     PageTableEdits,
     PageTableInvalidations,
+    /// Fresh host-heap allocations of a stage-1 page-table software image
+    /// (one 1.75 MiB arena set). A child process needs an image, but a
+    /// fork storm must recycle retired images rather than allocate per fork.
+    PageTableImageAllocations,
+    /// Fresh host anonymous mappings (`mmap`) created on behalf of one guest
+    /// operation, such as a forked child's per-mm kernel-state backing. Pooled
+    /// or recycled host backing does not count.
+    HostMappingAllocations,
+    /// Mapping and alias rows visited while (re)computing a fork's COW
+    /// projection. A cached projection visits none; an invalidated one must
+    /// visit rows proportional to what changed, never the whole process.
+    ForkProjectionRowsVisited,
     BackingAllocations,
     TaskAdmissions,
     VcpuAdmissions,
@@ -43,7 +55,7 @@ pub enum WorkMetric {
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 23;
+    pub const COUNT: usize = 26;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -61,6 +73,9 @@ impl WorkMetric {
         Self::HostBackendCalls,
         Self::PageTableEdits,
         Self::PageTableInvalidations,
+        Self::PageTableImageAllocations,
+        Self::HostMappingAllocations,
+        Self::ForkProjectionRowsVisited,
         Self::BackingAllocations,
         Self::TaskAdmissions,
         Self::VcpuAdmissions,

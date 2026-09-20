@@ -137,6 +137,11 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// named failure carrying the walk.
     stale_stage1_retry: (u64, u32),
 
+    /// Fresh stage-1 image allocations of the most recent `build_process_spec`
+    /// (`0` when the child image came from the recycle pool). Read by the
+    /// runtime and charged as `page_table_image_allocations`.
+    last_fork_image_allocations: u64,
+
     // ── shared memory state (the X86EngineCore parallels) ──
     /// Live stage-1 page-table authority over the guest's own translation tables at
     /// `LINUX_PAGE_TABLES_BASE` and extension arena source.
@@ -239,6 +244,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             stale_stage1_retry: (0, 0),
+            last_fork_image_allocations: 0,
             last_fault_esr: 0,
             last_exit_class: 0,
             is_forked_child: false,
@@ -459,6 +465,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_guest_run_receipt_ns,
             // A task adopted from a snapshot starts with no stale fault.
             stale_stage1_retry: (0, 0),
+            last_fork_image_allocations: 0,
             page_tables,
             protections,
             pending_process_fork,
@@ -739,6 +746,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             stale_stage1_retry: (0, 0),
+            last_fork_image_allocations: 0,
             last_fault_esr: 0,
             last_exit_class: 0,
             is_forked_child: false,
@@ -858,6 +866,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             stale_stage1_retry: (0, 0),
+            last_fork_image_allocations: 0,
             last_fault_esr: 0,
             last_exit_class: 0,
             is_forked_child: false,
@@ -2848,6 +2857,18 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.frame_cow_owner_inventory()
     }
 
+    fn last_fork_stage1_image_allocations(&self) -> u64 {
+        self.last_fork_image_allocations
+    }
+
+    fn last_fork_host_mapping_allocations(&self) -> u64 {
+        self.vm.last_fork_host_mapping_allocations()
+    }
+
+    fn last_fork_projection_rows_visited(&self) -> u64 {
+        self.vm.last_fork_projection_rows_visited()
+    }
+
     fn audit_executor_boundary(&mut self) -> Result<(), TrapError> {
         self.vm.audit_executor_boundary(&mut self.vcpu)
     }
@@ -3350,12 +3371,16 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         );
 
         let stage_started = std::time::Instant::now();
-        let mut page_tables = self.page_tables.snapshot_image().ok_or_else(|| {
-            TrapError::Hypervisor("hvpatch parent page tables are absent".to_owned())
-        })?;
-        // The child's own editable graph: taken directly from the parent's
-        // snapshot. The parent's rollback protection is provided by the bounded
-        // undo journal rather than a full 1.75 MiB cloned pre-image.
+        // The child's own editable graph, cloned from the parent into a
+        // recycled image buffer whenever the process tree's pool holds one
+        // (`kernel.fork.stage1-image`): a fork storm must not allocate and
+        // free a 1.75 MiB arena set per child. The parent's rollback
+        // protection is the bounded undo journal, not a cloned pre-image.
+        let (mut page_tables, fresh_image) =
+            self.page_tables.snapshot_image_recycled().ok_or_else(|| {
+                TrapError::Hypervisor("hvpatch parent page tables are absent".to_owned())
+            })?;
+        self.last_fork_image_allocations = u64::from(fresh_image);
         page_tables.declare_offline_private_image();
         let parent_armed_snapshot = self.vm.frame_cow_arm_snapshot();
         let unarmed_ranges: Vec<crate::vmm::ForkCowRange> = if parent_armed_snapshot.is_empty() {
@@ -3382,6 +3407,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         );
 
         let mut child_source = request.table_arena_source.take();
+        let stage_started = std::time::Instant::now();
         // Prepare the child's independent stage-1 graph read-only while it is
         // still offline. A failure here cannot affect the parent. This closes
         // the interval in which the old implementation had already armed the
@@ -3412,6 +3438,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             }
         }
 
+        emit_stage(
+            HvpatchForkProcessSpecStagePhase::CowRangeProjection,
+            stage_started,
+            unarmed_ranges.len() as u64,
+        );
+
         let stage_started = std::time::Instant::now();
         let child_root = request.child_ttbr0 & ((1_u64 << 48) - 1);
         page_tables
@@ -3427,7 +3459,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let builder = self
             .vm
             .build_process_builder(request, &mut page_tables, &cow_ranges)?;
-        let child_authority = Stage1Authority::new_with_manager(Some(page_tables));
+        let child_authority = self.page_tables.child_with_manager(page_tables);
         if let Some(source) = child_source {
             child_authority.install_source(source).map_err(|error| {
                 TrapError::Hypervisor(format!("set child arena source: {error:?}"))
@@ -3468,6 +3500,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         };
 
         if !cow_ranges.is_empty() {
+            let stage_started = std::time::Instant::now();
             // Final publication transaction. All child allocation, mapping-plan,
             // ASID, snapshot, and wrapper work is complete. Open an undo journal
             // covering the parent's fork-COW arming and restore it (including a
@@ -3584,6 +3617,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             self.pending_process_fork = Some(ParentForkCowRollback {
                 armed_ranges: parent_armed_snapshot,
             });
+            emit_stage(
+                HvpatchForkProcessSpecStagePhase::ParentCowPublication,
+                stage_started,
+                unarmed_ranges.len() as u64,
+            );
         }
         emit_stage(HvpatchForkProcessSpecStagePhase::Total, total_started, 0);
         Ok(spec)

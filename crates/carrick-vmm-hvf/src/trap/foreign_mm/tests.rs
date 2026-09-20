@@ -3636,6 +3636,7 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
             Arc::new(MailboxSlotAllocator::new()),
             HvfSyscallTransport::Mailbox,
             Arc::clone(&transport),
+            None,
         )
         .expect("build_process_plan succeeds for multi-arena stage1");
 
@@ -4277,6 +4278,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
             Arc::new(MailboxSlotAllocator::new()),
             HvfSyscallTransport::Mailbox,
             Arc::clone(&transport),
+            None,
         )
         .expect("an authenticated stage-1 overlay must supersede the stale coarse vvar row");
     assert!(
@@ -4296,6 +4298,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         Arc::new(MailboxSlotAllocator::new()),
         HvfSyscallTransport::Mailbox,
         Arc::clone(&transport),
+        None,
     ) {
         Ok(_) => {
             panic!("an arbitrary translated IPA without an overlay owner must fail closed")
@@ -4323,6 +4326,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         Arc::new(MailboxSlotAllocator::new()),
         HvfSyscallTransport::Mailbox,
         Arc::clone(&transport),
+        None,
     ) {
         Ok(_) => panic!("a live vvar PTE without its structural owner must fail closed"),
         Err(error) => error,
@@ -4355,6 +4359,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
             Arc::new(MailboxSlotAllocator::new()),
             HvfSyscallTransport::Mailbox,
             Arc::clone(&transport),
+            None,
         )
         .expect("build child plan with structural vvar");
     assert!(
@@ -4636,6 +4641,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
             Arc::new(MailboxSlotAllocator::new()),
             HvfSyscallTransport::Mailbox,
             Arc::clone(&transport),
+            None,
         )
         .expect("fork refreshed child-private vvar into grandchild");
     assert!(
@@ -6215,6 +6221,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             Arc::new(MailboxSlotAllocator::new()),
             HvfSyscallTransport::Mailbox,
             Arc::clone(&carrier_foreign_mm_transport),
+            None,
         )
         .expect("build_process_plan for child");
 
