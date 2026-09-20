@@ -222,3 +222,14 @@ creates 16k children this way, and allocating a fresh image per fork produced
   `pthread_sigmask` and four `thread_selfusage` host calls per fork, and the
   parent's post-fork COW splits cost about 15% of carrier CPU. The timing
   gate stays red until the ratio meets policy; it is not widened.
+- A pre-mapped carrier pool owns its whole IPA range. Once the root-slot pool
+  is created at VM creation, every consumer of that arena — a forked child's
+  root table, an exec'd image's root table, and a live stage-1 extension
+  arena — must take its slot from the pool, and a retiring owner must hand
+  the slot back at its retirement proof rather than at its last reference.
+  A missed consumer maps private backing over the pre-map, and that
+  `HV_ERROR` reaches the guest as a SIGSEGV: CPython's
+  `test_compiler_recursion_limit` died that way while Docker passed. The
+  `pagetablegrow` probe and the `kernel.fork.stage1-image` bindings are the
+  standing guards; `scripts/dtrace/hvpatch-stage1-faults.d` names the exact
+  refused mapping when one slips through.
