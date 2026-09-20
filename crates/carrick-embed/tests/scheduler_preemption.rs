@@ -24,7 +24,8 @@ fn repo_root() -> PathBuf {
 }
 
 #[test]
-fn scheduler_progress_structural_and_timing_receipts_are_distinct() {
+fn scheduler_preemption_progress_structural_and_timing_receipts_are_distinct() {
+    let _guest = common::guest_lock();
     let structural = run_scheduler_progress_structural_contract();
     let timing = run_scheduler_progress_timing_contract();
     assert_eq!(structural.layer, ExecutionLayer::EmbedStructural);
@@ -38,7 +39,8 @@ fn scheduler_progress_structural_and_timing_receipts_are_distinct() {
 }
 
 #[test]
-fn scheduler_progress_contract() {
+fn scheduler_preemption_progress_contract() {
+    let _guest = common::guest_lock();
     let registry = ContractRegistry::load(&repo_root()).expect("registry");
     let contract = registry
         .require("kernel.scheduler.runnable-progress")
@@ -50,7 +52,8 @@ fn scheduler_progress_contract() {
 }
 
 #[test]
-fn scheduler_lifecycle_structural_and_timing_receipts_are_distinct() {
+fn scheduler_preemption_lifecycle_structural_and_timing_receipts_are_distinct() {
+    let _guest = common::guest_lock();
     let structural = run_scheduler_lifecycle_structural_contract();
     let timing = run_scheduler_lifecycle_timing_contract();
     assert_eq!(structural.layer, ExecutionLayer::EmbedStructural);
@@ -64,7 +67,8 @@ fn scheduler_lifecycle_structural_and_timing_receipts_are_distinct() {
 }
 
 #[test]
-fn scheduler_lifecycle_contract() {
+fn scheduler_preemption_lifecycle_contract() {
+    let _guest = common::guest_lock();
     let registry = ContractRegistry::load(&repo_root()).expect("registry");
     let contract = registry
         .require("kernel.scheduler.preemption-lifecycle")
@@ -76,7 +80,8 @@ fn scheduler_lifecycle_contract() {
 }
 
 #[test]
-fn scheduler_cost_structural_and_timing_receipts_are_distinct() {
+fn scheduler_preemption_cost_structural_and_timing_receipts_are_distinct() {
+    let _guest = common::guest_lock();
     let structural = run_scheduler_cost_structural_contract();
     let timing = run_scheduler_cost_timing_contract();
     assert_eq!(structural.layer, ExecutionLayer::EmbedStructural);
@@ -90,7 +95,8 @@ fn scheduler_cost_structural_and_timing_receipts_are_distinct() {
 }
 
 #[test]
-fn scheduler_cost_contract() {
+fn scheduler_preemption_cost_contract() {
+    let _guest = common::guest_lock();
     let registry = ContractRegistry::load(&repo_root()).expect("registry");
     let contract = registry
         .require("kernel.scheduler.preemption-cost")
@@ -99,6 +105,22 @@ fn scheduler_cost_contract() {
     evaluate(contract, &[obs]).expect("scheduler cost structural contract evaluation");
     let timing_obs = run_scheduler_cost_timing_contract();
     evaluate(contract, &[timing_obs]).expect("scheduler cost timing contract evaluation");
+}
+
+fn carrier_or_fail() -> Carrier {
+    for _ in 0..50 {
+        match Carrier::new() {
+            Ok(c) => return c,
+            Err(EmbedError::Entitlement) => panic!(
+                "HV_DENIED (0xfae94007): test executable lacks hypervisor entitlement. Run via `just test-embed`."
+            ),
+            Err(EmbedError::CarrierAlreadyActive) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("carrier initialization failed: {e}"),
+        }
+    }
+    panic!("carrier initialization timed out waiting for prior carrier to retire");
 }
 
 #[test]
@@ -119,13 +141,7 @@ fn scheduler_preemption_guest_compute_progress() {
         .and_then(|n| n.to_str())
         .expect("bin name");
 
-    let carrier = match Carrier::new() {
-        Ok(c) => c,
-        Err(EmbedError::Entitlement) => panic!(
-            "HV_DENIED (0xfae94007): test executable lacks hypervisor entitlement. Run via `just test-embed`."
-        ),
-        Err(e) => panic!("carrier initialization failed: {e}"),
-    };
+    let carrier = carrier_or_fail();
 
     let builder = carrier
         .container(common::SMOKE_IMAGE)

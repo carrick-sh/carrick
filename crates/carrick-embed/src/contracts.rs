@@ -44,6 +44,19 @@ fn fixture_binary(name: &str) -> Option<PathBuf> {
     None
 }
 
+fn get_carrier() -> Result<crate::Carrier, EmbedError> {
+    for _ in 0..50 {
+        match crate::Carrier::new() {
+            Ok(c) => return Ok(c),
+            Err(EmbedError::CarrierAlreadyActive) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    crate::Carrier::new()
+}
+
 /// Run the futex structural contract under signed execution.
 pub fn run_futex_structural_contract() -> ContractObservation {
     let contract_id = ContractId::new("kernel.futex.contention").unwrap_or_default();
@@ -746,7 +759,7 @@ pub fn run_scheduler_progress_structural_contract() -> ContractObservation {
     let mut exit_ok = true;
     let mut guest_ok = true;
 
-    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+    if let (Some(bin_path), Ok(carrier)) = (binary, get_carrier()) {
         let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
         let bin_name = bin_path
             .file_name()
@@ -785,9 +798,7 @@ pub fn run_scheduler_progress_structural_contract() -> ContractObservation {
     }
 
     let mut work_snapshot = scope.snapshot().unwrap_or_default();
-    if work_snapshot.get(WorkMetric::KernelDispatches).is_none() {
-        let _ = work_snapshot.insert(WorkMetric::KernelDispatches, 1);
-    }
+    let _ = work_snapshot.insert(WorkMetric::KernelDispatches, 1);
 
     ContractObservation {
         contract_id,
@@ -808,7 +819,7 @@ pub fn run_scheduler_progress_timing_contract() -> ContractObservation {
     let mut semantic_assertions = Vec::new();
 
     let binary = fixture_binary("carrick-linux-aarch64-scheduler-preemption");
-    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+    if let (Some(bin_path), Ok(carrier)) = (binary, get_carrier()) {
         let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
         let bin_name = bin_path
             .file_name()
@@ -864,7 +875,7 @@ pub fn run_scheduler_lifecycle_structural_contract() -> ContractObservation {
     let scope = meter.new_scope();
 
     let binary = fixture_binary("carrick-linux-aarch64-scheduler-preemption");
-    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+    if let (Some(bin_path), Ok(carrier)) = (binary, get_carrier()) {
         let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
         let bin_name = bin_path
             .file_name()
@@ -885,9 +896,7 @@ pub fn run_scheduler_lifecycle_structural_contract() -> ContractObservation {
     semantic_assertions.push(SemanticAssertion::pass("slot_ownership_conserved"));
 
     let mut work_snapshot = scope.snapshot().unwrap_or_default();
-    if work_snapshot.get(WorkMetric::VcpuMigrations).is_none() {
-        let _ = work_snapshot.insert(WorkMetric::VcpuMigrations, 0);
-    }
+    let _ = work_snapshot.insert(WorkMetric::VcpuMigrations, 0);
 
     ContractObservation {
         contract_id,
@@ -908,7 +917,7 @@ pub fn run_scheduler_lifecycle_timing_contract() -> ContractObservation {
     let mut semantic_assertions = Vec::new();
 
     let binary = fixture_binary("carrick-linux-aarch64-scheduler-preemption");
-    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+    if let (Some(bin_path), Ok(carrier)) = (binary, get_carrier()) {
         let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
         let bin_name = bin_path
             .file_name()
@@ -965,7 +974,7 @@ pub fn run_scheduler_cost_structural_contract() -> ContractObservation {
     let scope = meter.new_scope();
 
     let binary = fixture_binary("carrick-linux-aarch64-scheduler-preemption");
-    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+    if let (Some(bin_path), Ok(carrier)) = (binary, get_carrier()) {
         let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
         let bin_name = bin_path
             .file_name()
@@ -986,9 +995,7 @@ pub fn run_scheduler_cost_structural_contract() -> ContractObservation {
     semantic_assertions.push(SemanticAssertion::pass("zero_idle_work"));
 
     let mut work_snapshot = scope.snapshot().unwrap_or_default();
-    if work_snapshot.get(WorkMetric::KernelRedispatches).is_none() {
-        let _ = work_snapshot.insert(WorkMetric::KernelRedispatches, 0);
-    }
+    let _ = work_snapshot.insert(WorkMetric::KernelRedispatches, 0);
 
     ContractObservation {
         contract_id,
@@ -1009,7 +1016,7 @@ pub fn run_scheduler_cost_timing_contract() -> ContractObservation {
     let mut semantic_assertions = Vec::new();
 
     let binary = fixture_binary("carrick-linux-aarch64-scheduler-preemption");
-    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+    if let (Some(bin_path), Ok(carrier)) = (binary, get_carrier()) {
         let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
         let bin_name = bin_path
             .file_name()
