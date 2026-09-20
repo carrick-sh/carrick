@@ -17,6 +17,7 @@ fn print_usage() {
   investigate reduce --id <id> --layer <layer> --mechanism <text>
   investigate diagnose --id <id> --evidence <receipt.json> [--fixture-active]
   investigate review --id <id> --package <path>
+  investigate source-identity
   investigate run-write-seek --output <new-directory>
   investigate status [--id <id>]
   investigate park --id <id> --reason <reason> [--resumption <condition>]
@@ -46,6 +47,18 @@ fn run(args: &[String]) -> Result<(), String> {
     let command = &args[0];
     match command.as_str() {
         "run-write-seek" => handle_write_seek(&args[1..]),
+        "source-identity" => {
+            if args.len() != 1 {
+                return Err("source-identity accepts no arguments".into());
+            }
+            let root = std::env::current_dir().map_err(|e| e.to_string())?;
+            println!(
+                "{}",
+                carrick_investigation::evidence::source_identity(&root)
+                    .map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
         "new" => handle_new(&args[1..]),
         "prioritize" => handle_prioritize(&args[1..]),
         "classify" => handle_classify(&args[1..]),

@@ -181,7 +181,8 @@ pub const SHARD_0_PROBES: &[&str] = &[
     "waitidcputime",
     "waitpgid",
     "windowcoherence",
-    "xsignal",
+    "xprocsigign",
+    "zerolenio",
 ];
 
 /// Exact materialized Shard 1 probe list: index % 3 == 1 over generic conformance probes.
@@ -347,8 +348,8 @@ pub const SHARD_1_PROBES: &[&str] = &[
     "vmsplicepipe",
     "waitidsiuid",
     "waitrestart",
-    "writevpartial",
-    "xthreadsig",
+    "writeseek",
+    "xsignal",
 ];
 
 /// Exact materialized list of generic conformance probes for shard 2 (index % 3 == 2).
@@ -515,8 +516,8 @@ pub const SHARD_2_PROBES: &[&str] = &[
     "waitexitstorm",
     "waitidspec",
     "waitsiblingsigchld",
-    "xprocsigign",
-    "zerolenio",
+    "writevpartial",
+    "xthreadsig",
 ];
 
 /// Per-probe additions to the generic container launch request.
@@ -759,7 +760,7 @@ fn special_policy_names_are_unique_in_the_generic_shard_union() {
         SHARD_0_PROBES.len() + SHARD_1_PROBES.len() + SHARD_2_PROBES.len(),
         "generic shard arrays must form a unique union"
     );
-    assert_eq!(union.len(), 489, "generic shard union must remain complete");
+    assert_eq!(union.len(), 490, "generic shard union must remain complete");
 
     for (special, _) in SPECIAL_PROBE_LAUNCH_POLICIES {
         let occurrences = shards

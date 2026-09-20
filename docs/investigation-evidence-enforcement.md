@@ -43,12 +43,24 @@ semantics remain the return-value, offset and content authority. It isolates one
 mechanism reported in inotify09's thread B; it does not reproduce the complete
 inotify workload, prove the claimed 35-microsecond timing, or close its 2x gate.
 
-Signed and Docker bindings are explicitly unresolved. The registry can describe
-such reduction-stage contracts; evaluating an absent binding still returns
-UnsupportedLayer. Do not treat registration or VM-free red evidence as signed
-acceptance. Inotify's existing watch and readiness claims are corrected to their
-real VM-free capability, with coverage marked bound rather than unverified HEAD
-execution evidence.
+The signed binding now executes the `writeseek` guest probe on a fresh writable
+host-backed mount at every scale. It requires an explicit source SHA-256 and a
+digest-pinned image, rejects missing or malformed output, records the actual work
+scope, and shuts down each carrier before starting the next. Observation capture
+and strict budget evaluation are separate tests: successful capture is not a
+budget pass. `investigate source-identity` computes the source digest for this run.
+
+The same probe is registered in conformance-next with source-hashed native ARM64
+Docker oracle output for musl and GNU libc. Oracle observations at all four scales
+are retained under `target/investigations/write-seek-bindings/`, with commands,
+image identity and executable hashes in `docker-receipts.json`. This is semantic
+evidence; Docker does not measure Carrick's internal work counter. Signed receipts
+are not yet accepted by the investigation CLI's VM-free receipt adapter.
+
+Inotify's existing watch and readiness claims describe their real VM-free
+capability, with coverage marked bound rather than unverified HEAD execution
+evidence. Registration and semantic parity alone do not establish signed budget
+acceptance or the full workload's runtime ratio.
 
 ## Review boundary
 
@@ -74,7 +86,61 @@ An existing temporary-borrow error in `with_recorded_fd_open_path` was corrected
 by retaining the captured table while its path guard lives. This compile-only
 repair remains alongside the user's existing uncommitted method.
 
-The strict `check-contracts` promotion check deliberately remains red for the
-new contract's missing embed binding. The descriptor loader can represent its
-explicit unresolved bindings for investigation, but this work does not weaken
-the strict promotion check or supply placeholder runner names to make it green.
+The strict `check-contracts` registration check now passes with real embed and
+Docker bindings. The zero-query structural budget is unchanged. A binding-presence
+regression was witnessed red before these bindings were added, then green. The
+registry check establishes binding completeness, not an execution verdict.
+
+## Running the signed reduction
+
+Build both `writeseek` guest libc variants and obtain the native ARM64 image's
+verified digest before running this sequence. Set `CARRICK_WRITE_SEEK_IMAGE` to
+that digest-pinned reference; a mutable tag is rejected. Run Docker observations
+in a separate phase from Carrick execution.
+
+```sh
+export CARRICK_OBSERVATION_SOURCE="$(target/debug/investigate source-identity)"
+export CARRICK_TEST_SIGNED_FEATURES=conformance-metrics
+export CARRICK_CONTRACT_ID=kernel.fs.write-seek
+export CARRICK_RUN_ID=write-seek-capture
+export CARRICK_WRITE_SEEK_OBSERVATIONS="$PWD/target/write-seek-observations.json"
+RUSTC_WRAPPER= scripts/test-signed.sh carrick-embed write_seek_contract_observations --exact --nocapture
+```
+
+The signer records executable identities, entitlement checks, its negative
+control and scoped cleanup in
+`target/test-results/carrick-embed-signed-artifacts.jsonl`. Preserve that receipt
+alongside the source digest, both probe executable hashes, image digest and
+observations. Run `write_seek_contract_budget --exact --nocapture --test-threads=1`
+on the same signed test executable to evaluate the captured workload's budget
+with a fresh execution. Preserve its separate exit status and log: a nonzero
+configuration/entitlement error is not structural red evidence. Do not relink or
+re-sign between the two executions when claiming the same artifact.
+
+## Signed checkpoint (2026-09-20)
+
+Both native ARM64 Docker libc variants passed at scales 1, 8, 32 and 128. Signed
+capture passed all semantic assertions at those scales and observed respectively
+1, 8, 32 and 128 preparatory host position queries. The same signed executable's
+strict budget test exited 101 with `ScalingViolation` at scale 1: actual 1,
+maximum 0. This is an executed performance-contract failure, not a missing runner.
+The unentitled negative control passed; both scoped cleanup checks found zero
+remaining guests. The original inotify09 timing and broader promotion gates
+remain unqualified.
+
+The checkpoint used source HEAD `dd43066bef70d92f85a8ba99235ad31124b18452` plus the
+working-tree source digest
+`84d78973185a6f4ed3a68e3de01124db6e1c7d98309d7de72edd46cc9725aade`, including the
+pre-existing runtime changes. The signed executable SHA-256 was
+`d9da51ce575623c1b23b923b693d3325ca3764a2349f5f4ac56eebb4a516b7fa`, unchanged
+across capture and budget evaluation. Exact CDHash, LC_UUID, entitlement and DOF
+presence are in `target/investigations/write-seek-bindings/signed-artifacts.jsonl`;
+`signed-observations.json`, `signed-budget.log`, `signed-budget.exit`, and
+`budget-cleanup.log` retain the results. These target artifacts are local receipts,
+not committed coverage attestations.
+
+Contract tests (30), investigation tests (13), and the output-parser unit test
+passed. Inventory/strategy checks, formatting, and focused tooling clippy passed.
+Embed clippy with warnings denied remains blocked by the pre-existing unused
+`sought_past_eof` field and methods; no warning suppression was added. Independent
+static review of the binding changes found no blocking issues.

@@ -225,12 +225,17 @@ fn timing_ratio_failure_fails_closed() {
 #[test]
 fn unresolved_signed_binding_is_not_execution_coverage() {
     let registry = ContractRegistry::load(&repo_root()).unwrap();
-    let contract = registry.require("kernel.fs.write-seek").unwrap();
+    let mut contract = registry.require("kernel.fs.write-seek").unwrap().clone();
+    contract.bindings.embed = None;
+    contract.bindings.unresolved.insert(
+        "embed_structural".into(),
+        "test: binding not implemented".into(),
+    );
     let mut obs = observation(ExecutionLayer::EmbedStructural, 1);
     obs.contract_id = contract.id.clone();
     obs.fixture_identity = contract.fixture.clone();
     assert!(matches!(
-        evaluate(contract, &[obs]),
+        evaluate(&contract, &[obs]),
         Err(ContractFailure::UnsupportedLayer { .. })
     ));
 }

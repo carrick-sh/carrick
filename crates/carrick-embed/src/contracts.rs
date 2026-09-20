@@ -1,5 +1,8 @@
 //! Conformance contract bindings for carrick-embed.
 
+mod write_seek;
+pub use write_seek::write_seek_structural_contract;
+
 use std::path::{Path, PathBuf};
 
 use carrick_conformance_contract::{
