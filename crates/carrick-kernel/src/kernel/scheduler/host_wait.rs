@@ -129,7 +129,9 @@ impl HostWaitToken<'_> {
                 self.queue.set_executor_online(self.cpu, true);
                 // Once the original owner is back and nobody is waiting,
                 // return to the ordinary, non-handoff fast path.
-                if slot.waiters.is_empty() && slot.root.id == self.registration.id {
+                let handoff_complete =
+                    slot.waiters.is_empty() && slot.root.id == self.registration.id;
+                if handoff_complete {
                     self.registration.placement.lock().slot = None;
                     state.handoffs.remove(&self.slot);
                     self.queue.handoff_slots.fetch_sub(1, Ordering::Release);
@@ -151,7 +153,15 @@ impl HostWaitToken<'_> {
                 };
                 let budget = self.queue.policy.on_dispatch(&dispatch_ctx);
                 let mut reasons_to_restore = self.preserved_reasons;
-                reasons_to_restore.insert(PreemptionReasons::HOST_WAIT_RETURN);
+                // A surviving handoff still needs a settlement boundary to
+                // release its conserved slot. Once the original owner has
+                // drained the handoff, returning from host I/O alone is not
+                // preemption demand. Mandatory reasons remain independent.
+                if handoff_complete {
+                    reasons_to_restore.remove(PreemptionReasons::HOST_WAIT_RETURN);
+                } else {
+                    reasons_to_restore.insert(PreemptionReasons::HOST_WAIT_RETURN);
+                }
                 let (_ticket, sequence) = {
                     let mut preemption = self.preemption.lock();
                     let (ticket, seq) = preemption.register_residency(

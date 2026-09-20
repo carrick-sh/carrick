@@ -290,3 +290,33 @@ ledger IDs, with exit zero; see `cleanup-completed.log`.
 Parity remains open. Diagnose the dispatch/preemption and mapping-audit
 behavior before changing runtime code; do not infer closure from a
 successful neighboring run or from the debugger capture.
+
+## Host-wait return preemption reduction (2026-09-20)
+
+The captured `SCHED_PREEMPT reasons=0x10` decodes to
+`HOST_WAIT_RETURN`. `HostWaitToken::resume` previously inserted that
+mandatory preemption reason on every host-operation return, including an
+original owner that had fully drained its handoff with no runnable peers.
+The applicable unchanged contract is `kernel.scheduler.preemption-cost`:
+uncontended execution must not incur spurious redispatches.
+
+`uncontended_host_wait_return_has_zero_spurious_preemptions` failed on
+the pre-fix implementation at scale 1 (one spurious preemption, expected
+zero); `/tmp/carrick-host-return-red.log` records the executable failure.
+The first correction passed all 20 `scheduler_handoff` tests, including
+scales 1, 8, 32, and 128. Review then identified an inherited return bit
+from a previous nested wait: final handoff completion must clear that bit
+as well as avoid inserting it. Mandatory signal/control reasons and the
+return boundary for surviving handoffs remain required.
+
+This is a demonstrated structural defect, not yet a proven explanation
+for the loaded Go failure. The final nested regression also failed before its correction
+(`host-return-nested-red.log`), and the final full handoff suite passed
+21/21 (`host-return-final-green.log`). Both empty mandatory-reason state
+and pending SIGNAL/CONTROL are covered. Review found no further important
+issues. Final signed helper run passed all four selected handoff policy tests
+and its entitlement negative control, with zero scoped leftovers; see
+`host-return-final-signed.log` and `host-return-final-signed-artifacts.jsonl`.
+The selected policy tests exercise kernel APIs; their signed execution
+does not itself prove guest workload behavior. Release measurements and
+the full promotion ladder remain pending.

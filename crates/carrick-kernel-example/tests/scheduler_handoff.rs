@@ -1238,3 +1238,104 @@ fn run_injected_host_operation(retire_waiter: bool, operation: InjectedOperation
         );
     }
 }
+
+/// kernel.scheduler.preemption-cost: completing an uncontended external
+/// operation must not manufacture demand for a scheduler round trip.
+#[test]
+fn uncontended_host_wait_return_has_zero_spurious_preemptions() {
+    for scale in [1, 8, 32, 128] {
+        let (kernel, ctx, _asids) = bootstrap_kernel(59_100);
+        publish_task(&ctx, 1300);
+        let scheduler = Scheduler::new_with_policy(kernel, Arc::new(GuestCpuPolicy::new(1)));
+        let executor = scheduler
+            .register_executor_bound(
+                Arc::new(TestKick::default()),
+                Some(GuestCpuId::new(0)),
+                false,
+            )
+            .unwrap();
+        scheduler.make_runnable(ctx.thread().key()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        let mut spurious = 0;
+        for _ in 0..scale {
+            let wait = scheduler.begin_host_wait(&running, &executor).unwrap();
+            scheduler.end_host_wait(&running, &executor, wait).unwrap();
+            spurious += usize::from(scheduler.should_preempt(&running));
+        }
+        let census = scheduler.host_wait_census().unwrap();
+        assert_eq!(census.entered, scale);
+        assert_eq!(census.resumed, scale);
+        assert!(census.slots.is_empty());
+        scheduler.settle_exited(running).unwrap();
+        assert_eq!(spurious, 0, "scale={scale}: uncontended host returns");
+    }
+}
+
+/// A return reason belongs to the surviving handoff, not to the executor's
+/// next residency after that handoff has completely drained.
+#[test]
+fn nested_host_wait_final_return_clears_stale_handoff_reason() {
+    use carrick_kernel::kernel::scheduler::PreemptionReasons;
+
+    for mandatory in [false, true] {
+        let (kernel, root, _asids) = bootstrap_kernel(59_200);
+        let child = create_sibling_thread(&kernel, &root, 59_201);
+        publish_task(&root, 1400);
+        publish_task(&child, 1401);
+        let scheduler = Scheduler::new_with_policy(kernel, Arc::new(GuestCpuPolicy::new(1)));
+        let owner = scheduler
+            .register_executor_bound(
+                Arc::new(TestKick::default()),
+                Some(GuestCpuId::new(0)),
+                false,
+            )
+            .unwrap();
+        let replacement = scheduler
+            .register_executor_bound(Arc::new(TestKick::default()), None, true)
+            .unwrap();
+        scheduler.make_runnable(root.thread().key()).unwrap();
+        let original = scheduler.take(&owner).unwrap();
+        let first_wait = scheduler.begin_host_wait(&original, &owner).unwrap();
+        scheduler.make_runnable(child.thread().key()).unwrap();
+        let replacing = scheduler.take(&replacement).unwrap();
+        let child_wait = scheduler.begin_host_wait(&replacing, &replacement).unwrap();
+
+        scheduler
+            .end_host_wait(&original, &owner, first_wait)
+            .unwrap();
+        assert!(
+            scheduler
+                .binding_residency(owner.id())
+                .unwrap()
+                .reasons
+                .contains(PreemptionReasons::HOST_WAIT_RETURN)
+        );
+        if mandatory {
+            assert!(scheduler.set_preemption_reason(
+                owner.id(),
+                PreemptionReasons::SIGNAL | PreemptionReasons::CONTROL,
+            ));
+        }
+        // Another host operation starts before the returning root settles.
+        // Its saved reasons therefore include the earlier handoff return bit.
+        let final_wait = scheduler.begin_host_wait(&original, &owner).unwrap();
+        scheduler
+            .end_host_wait(&replacing, &replacement, child_wait)
+            .unwrap();
+        scheduler.settle_exited(replacing).unwrap();
+        scheduler
+            .end_host_wait(&original, &owner, final_wait)
+            .unwrap();
+
+        let reasons = scheduler.binding_residency(owner.id()).unwrap().reasons;
+        assert!(!reasons.contains(PreemptionReasons::HOST_WAIT_RETURN));
+        assert_eq!(reasons.contains(PreemptionReasons::SIGNAL), mandatory);
+        assert_eq!(reasons.contains(PreemptionReasons::CONTROL), mandatory);
+        assert_eq!(scheduler.should_preempt(&original), mandatory);
+        let census = scheduler.host_wait_census().unwrap();
+        assert_eq!(census.entered, 3);
+        assert_eq!(census.resumed, 3);
+        assert!(census.slots.is_empty());
+        scheduler.settle_exited(original).unwrap();
+    }
+}
