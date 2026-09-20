@@ -17,3 +17,13 @@ fixture_requirements = ["probe:inotifyqueue"]
 related_contracts = ["kernel.inotify.watch"]
 capability = { class = "vm-free-existing", capability = "carrick-kernel-example::inotify_readiness_contract" }
 coverage = { status = "bound", layer = "vm-free" }
+
+[[claims]]
+id = "kernel.inotify.watch.write-completion"
+contract = "kernel.inotify.watch"
+description = "Modification events follow positive write completion; rejected and empty writes preserve one-shot watches"
+linux_authority = ["man 2 write", "man 7 inotify", "probe:inotifywrite"]
+fixture_requirements = ["probe:inotifywrite", "probe:inotifymatrix"]
+related_contracts = ["kernel.fs.write-seek"]
+capability = { class = "vm-free-existing", capability = "carrick-kernel-example::inotify_watch_contract and semantics::inotify_watch" }
+coverage = { status = "bound", layer = "vm-free" }

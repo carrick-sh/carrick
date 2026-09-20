@@ -2513,18 +2513,6 @@ impl<'a> FsView<'a> {
 
             let nonblocking = this.io_is_nonblocking(fd, 0);
 
-            // inotify IN_MODIFY: a non-empty write(2) to a watched regular file
-            // emits IN_MODIFY on it. A zero-length write touches nothing and
-            // generates no event, matching Linux. Fast-exits when unwatched.
-            if length > 0 {
-                this.inotify_emit_for_fd(fd, carrick_abi::LINUX_IN_MODIFY);
-                this.fanotify_emit_for_fd(
-                    cx.kernel,
-                    fd,
-                    carrick_abi::LinuxFanotifyEvents::MODIFY,
-                );
-            }
-
             #[cfg(feature = "trace-io")]
             if !bytes.is_empty() {
                 let has = this.open_file(fd).is_some();
@@ -2561,10 +2549,12 @@ impl<'a> FsView<'a> {
                 }
                 let outcome: DispatchOutcome;
                 let writeback: Option<FileWriteback>;
+                let modified_path;
                 {
                     let Some(mut open) = open_file.description.write() else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
+                    modified_path = this.file_write_notification_path(&open, length);
                     match &mut *open {
                         OpenDescription::SyntheticDevice { kind, .. } => {
                             match kind {
@@ -2893,7 +2883,7 @@ impl<'a> FsView<'a> {
                                 bytes,
                                 HostPipeWriteTarget::new(
                                     raw_fd,
-                                    Some(host_fd_owner),
+                                    Some(host_fd_owner.clone()),
                                     nonblocking,
                                     HostWriteKind::RegularFile,
                                     tid,
@@ -2903,10 +2893,14 @@ impl<'a> FsView<'a> {
                                 .with_host_wait(host_wait_ref),
                             )?;
                             if let DispatchOutcome::Returned { value } = out && value > 0 {
-                                if let Some((old_len, pos)) = old_len {
-                                    punch_unwritten_host_blocks(raw_fd, old_len, pos)?;
-                                }
+                                // Publish metadata before waking a watch consumer.
+                                // A stat between writes can repopulate this cache.
                                 this.invalidate_dentry_host_fd(raw_fd);
+                                let punch_result = if let Some((old_len, pos)) = old_len {
+                                    punch_unwritten_host_blocks(raw_fd, old_len, pos)
+                                } else {
+                                    Ok(())
+                                };
                                 if let Some(write_offset) = write_offset {
                                     this.fs.record_host_sparse_write(
                                         raw_fd,
@@ -2914,6 +2908,10 @@ impl<'a> FsView<'a> {
                                         value as usize,
                                     );
                                 }
+                                // The host write already changed bytes even if
+                                // subsequent sparse maintenance failed.
+                                this.notify_file_write_result(cx.kernel, modified_path.as_deref(), &out);
+                                punch_result?;
                             }
                             return Ok(out);
                         }
@@ -3027,10 +3025,13 @@ impl<'a> FsView<'a> {
                             let result = task.with_user_ns(|ns| {
                                 crate::vfs::proc::write_userns_map(ns, privileged, path, &bytes)
                             });
-                            return Ok(match result {
+                            let outcome = match result {
                                 Ok(n) => DispatchOutcome::returned_len_or_errno(n),
                                 Err(errno) => DispatchOutcome::errno(errno),
-                            });
+                            };
+                            drop(open);
+                            this.notify_file_write_result(cx.kernel, modified_path.as_deref(), &outcome);
+                            return Ok(outcome);
                         }
                         OpenDescription::SyntheticFile { path, .. }
                             if crate::vfs::proc::is_writable_tunable_path(path) =>
@@ -3051,7 +3052,7 @@ impl<'a> FsView<'a> {
                             // process's file from the test child.
                             let parsed =
                                 crate::vfs::proc::parse_tunable_write(path, &bytes);
-                            return Ok(match parsed {
+                            let outcome = match parsed {
                                 Err(errno) => DispatchOutcome::errno(errno),
                                 Ok(crate::vfs::proc::TunableWrite::Ignored) => {
                                     DispatchOutcome::returned_len_or_errno(bytes.len())
@@ -3088,7 +3089,10 @@ impl<'a> FsView<'a> {
                                         }
                                     }
                                 }
-                            });
+                            };
+                            drop(open);
+                            this.notify_file_write_result(cx.kernel, modified_path.as_deref(), &outcome);
+                            return Ok(outcome);
                         }
                         // write(2) on a perf event fd is EINVAL (verified
                         // against the Docker oracle), not EBADF.
@@ -3110,6 +3114,7 @@ impl<'a> FsView<'a> {
                         .rootfs_vfs
                         .write_file_range(&path, offset, &bytes, final_size);
                 }
+                this.notify_file_write_result(cx.kernel, modified_path.as_deref(), &outcome);
                 return Ok(outcome);
             }
             // A stdio fd the guest explicitly closed (and did not reopen) is

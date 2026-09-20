@@ -388,6 +388,10 @@ pub fn inotify_watch_scenario(entries: usize) -> Result<ContractObservation, Exa
     script.extend(vec![
         Step::Sys(sys::inotify_init1(LINUX_O_NONBLOCK as i32).save(0)),
         Step::Sys(sys::inotify_add_watch(slot(0), "/watched", mask).save(1)),
+        Step::Sys(sys::openat(LINUX_AT_FDCWD, "/watched/file_0.txt", 0, 0).save(2)),
+        Step::Sys(sys::write(slot(2), b"rejected").errno(carrick_abi::LINUX_EBADF)),
+        Step::Sys(sys::read(slot(0), 256).errno(carrick_abi::LINUX_EAGAIN)),
+        Step::Sys(sys::close(slot(2)).ret(0)),
         Step::Sys(sys::inotify_rm_watch(slot(0), slot(1)).ret(0)),
         Step::Sys(sys::close(slot(0)).ret(0)),
         Step::Sys(sys::exit_group(0)),
@@ -418,6 +422,7 @@ pub fn inotify_watch_scenario(entries: usize) -> Result<ContractObservation, Exa
     }
 
     semantic_assertions.push(SemanticAssertion::pass("watch_removed_cleanly"));
+    semantic_assertions.push(SemanticAssertion::pass("rejected_write_emits_no_modify"));
 
     let contract_id = ContractId::new("kernel.inotify.watch")
         .map_err(|e| ExampleError::Unsupported(format!("invalid contract id: {e}")))?;

@@ -21,6 +21,52 @@ pub(in crate::dispatch) fn event_ring_host_fd(open_file: &OpenFile) -> i32 {
 }
 
 impl<'a> FsView<'a> {
+    /// Snapshot the description's path before a write can release its guard or
+    /// suspend. Never recover the target from a reusable fd slot on completion.
+    pub(super) fn file_write_notification_path(
+        &self,
+        open: &OpenDescription,
+        length: usize,
+    ) -> Option<String> {
+        if length == 0
+            || (self.fs.inotify_registry.is_empty() && self.fs.fanotify_registry.is_empty())
+        {
+            return None;
+        }
+        match open {
+            OpenDescription::File { .. }
+            | OpenDescription::InMemoryFile { .. }
+            | OpenDescription::HostFile { .. }
+            | OpenDescription::SyntheticFile { .. } => open.open_path().map(str::to_owned),
+            _ => None,
+        }
+    }
+
+    /// Failed and empty writes do not modify contents and must not consume an
+    /// IN_ONESHOT watch. Positive partial writes do generate a modification.
+    pub(super) fn notify_file_write_result(
+        &self,
+        context: &crate::kernel::KernelContext,
+        path: Option<&str>,
+        outcome: &DispatchOutcome,
+    ) {
+        let Some(path) = path else { return };
+        if !matches!(outcome, DispatchOutcome::Returned { value } if *value > 0) {
+            return;
+        }
+        self.fs
+            .inotify_registry
+            .notify_fd_event(path, carrick_abi::LINUX_IN_MODIFY, false, || {
+                !self.path_exists(path)
+            });
+        self.fanotify_notify_kind(
+            context,
+            path,
+            carrick_abi::LinuxFanotifyEvents::MODIFY,
+            false,
+        );
+    }
+
     fn first_free_fd<S: std::hash::BuildHasher>(
         table: &HashMap<i32, OpenFile, S>,
         reserved_slots: &HashMap<i32, u64>,

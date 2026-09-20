@@ -6,9 +6,12 @@ guest_surfaces = [
   "syscall:inotify_add_watch",
   "syscall:inotify_rm_watch",
   "kernel:inotify",
+  "syscall:write",
 ]
 semantic_authority = [
   "man 2 inotify_init1",
+  "man 2 write",
+  "man 7 inotify",
   "man 2 inotify_add_watch",
   "man 2 inotify_rm_watch",
   "conformance-probes/probe-inventory.json:inotifymatrix",

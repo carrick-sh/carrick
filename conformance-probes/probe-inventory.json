@@ -890,6 +890,14 @@
     "excluded": false,
     "runner": "generic"
   },
+  "inotifywrite": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic",
+    "contract_ids": [
+      "kernel.inotify.watch"
+    ]
+  },
   "inzonetcp": {
     "class": "conformance",
     "excluded": false,
