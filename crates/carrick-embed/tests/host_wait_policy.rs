@@ -375,11 +375,11 @@ fn handoff_disarms_fairness_deadline_and_refreshes_budget_on_resume() {
         .expect("restored residency");
     assert_eq!(restored.cpu, cpu);
     assert!(
-        restored
+        !restored
             .reasons
             .contains(PreemptionReasons::HOST_WAIT_RETURN)
     );
-    assert!(scheduler.should_preempt(&original));
+    assert!(!scheduler.should_preempt(&original));
 
     scheduler.settle_exited(original).unwrap();
     scheduler.close();
@@ -426,11 +426,12 @@ fn handoff_preserves_mandatory_control_reasons_through_resume() {
     let restored = scheduler
         .binding_residency(owner.id())
         .expect("restored residency");
-    // Mandatory reasons (SIGNAL, CONTROL) and HOST_WAIT_RETURN survive, FAIRNESS was cancelled
+    // Mandatory reasons survive. Fairness was cancelled and the completed
+    // handoff itself does not manufacture a new preemption reason.
     assert!(restored.reasons.contains(PreemptionReasons::SIGNAL));
     assert!(restored.reasons.contains(PreemptionReasons::CONTROL));
     assert!(
-        restored
+        !restored
             .reasons
             .contains(PreemptionReasons::HOST_WAIT_RETURN)
     );
