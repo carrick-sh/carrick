@@ -122,11 +122,11 @@ contracts = ["kernel.inotify.watch"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/inotify.rs"
-contracts = ["kernel.inotify.watch"]
+contracts = ["kernel.inotify.watch", "kernel.inotify.readiness"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/fs/notify.rs"
-contracts = ["kernel.inotify.watch"]
+contracts = ["kernel.inotify.watch", "kernel.inotify.readiness"]
 
 [[surfaces]]
 path = "conformance-probes/src/bin/inotifymatrix.rs"
@@ -135,6 +135,10 @@ contracts = ["kernel.inotify.watch"]
 [[surfaces]]
 path = "crates/carrick-kernel-example/tests/semantics/inotify_watch.rs"
 contracts = ["kernel.inotify.watch"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fd_table.rs"
+contracts = ["kernel.inotify.readiness"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/scheduler/host_wait.rs"

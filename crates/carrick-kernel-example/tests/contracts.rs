@@ -6,8 +6,8 @@ use carrick_conformance_contract::{ContractRegistry, evaluate};
 use carrick_kernel_example::contracts::{
     fork_filetable_contract, fork_mappings_contract, fork_stage1_image_contract,
     futex_contention_contract, futex_requeue_contract, futex_requeue_scenario,
-    inotify_watch_contract, scheduler_cost_contract, scheduler_lifecycle_contract,
-    scheduler_progress_contract,
+    inotify_readiness_contract, inotify_watch_contract, scheduler_cost_contract,
+    scheduler_lifecycle_contract, scheduler_progress_contract,
 };
 use carrick_observability::work_meter::WorkMetric;
 
@@ -195,6 +195,66 @@ fn inotify_watch_structural_red_control() {
     match err {
         carrick_conformance_contract::EvaluationError::WorkBudgetExceeded { metric, .. } => {
             assert_eq!(metric, WorkMetric::HostBackendCalls);
+        }
+        other => panic!("expected WorkBudgetExceeded, got: {other:?}"),
+    }
+}
+
+#[test]
+fn inotify_readiness_contract_does_not_scan_the_queue() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry
+        .require("kernel.inotify.readiness")
+        .expect("contract");
+    let observations = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| inotify_readiness_contract(scale).expect("observation"))
+        .collect::<Vec<_>>();
+    evaluate(contract, &observations).expect("semantic and structural conformance");
+}
+
+/// Readiness is a non-emptiness question, so a deeper queue must not make it
+/// more expensive. This is the shape LTP's `inotify09` sustains for millions of
+/// iterations, where an O(depth) readiness answer becomes O(depth^2) overall.
+#[test]
+fn inotify_readiness_cost_does_not_grow_with_queue_depth() {
+    let visits = |observation: &carrick_conformance_contract::ContractObservation| {
+        observation
+            .work
+            .as_ref()
+            .and_then(|work| work.get(WorkMetric::InotifyQueueVisits))
+            .expect("inotify queue visits must be measured")
+    };
+    let shallow = inotify_readiness_contract(8).expect("shallow queue");
+    let deep = inotify_readiness_contract(128).expect("deep queue");
+    assert_eq!(
+        visits(&shallow),
+        visits(&deep),
+        "readiness inspected {} records at depth 8 and {} at depth 128",
+        visits(&shallow),
+        visits(&deep),
+    );
+}
+
+#[test]
+fn inotify_readiness_structural_red_control() {
+    let fault = std::env::var("CARRICK_CONTRACT_FAULT").unwrap_or_default();
+    if fault != "scanning-inotify-readiness" {
+        return;
+    }
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry
+        .require("kernel.inotify.readiness")
+        .expect("contract");
+    let observations = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| inotify_readiness_contract(scale).expect("observation"))
+        .collect::<Vec<_>>();
+    let err =
+        evaluate(contract, &observations).expect_err("should violate budget with injected fault");
+    match err {
+        carrick_conformance_contract::EvaluationError::WorkBudgetExceeded { metric, .. } => {
+            assert_eq!(metric, WorkMetric::InotifyQueueVisits);
         }
         other => panic!("expected WorkBudgetExceeded, got: {other:?}"),
     }

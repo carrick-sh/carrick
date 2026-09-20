@@ -882,6 +882,14 @@
     "excluded": false,
     "runner": "generic"
   },
+  "inotifyqueue": {
+    "class": "conformance",
+    "contract_ids": [
+      "kernel.inotify.readiness"
+    ],
+    "excluded": false,
+    "runner": "generic"
+  },
   "inzonetcp": {
     "class": "conformance",
     "excluded": false,

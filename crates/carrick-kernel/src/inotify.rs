@@ -162,6 +162,14 @@ struct Inner {
     /// rest here, like the kernel's event queue). On Linux this only buffers a
     /// short-read remainder; on macOS it also holds synthesized records.
     pending: std::collections::VecDeque<Vec<u8>>,
+    /// Running total of `pending`'s encoded bytes, maintained by
+    /// [`Inner::push_record`] and [`drain_pending`] — the only two places that
+    /// touch the queue. `ioctl(FIONREAD)` and readiness both need this number
+    /// on hot paths, and summing the queue for it is O(depth) per event and
+    /// O(depth^2) over a watcher that does not drain, which is what LTP's
+    /// `inotify09` sustains. The kernel likewise keeps a running count rather
+    /// than walking its event list.
+    queued_bytes: usize,
     /// Set once the queue hit [`INOTIFY_MAX_QUEUED_EVENTS`] and an
     /// `IN_Q_OVERFLOW` marker was appended, so later enqueues are dropped (the
     /// kernel keeps exactly one overflow record at the tail and stops queuing).
@@ -198,6 +206,7 @@ impl Inner {
             watches: HashMap::new(),
             wd_by_fd: HashMap::new(),
             pending: std::collections::VecDeque::new(),
+            queued_bytes: 0,
             overflowed: false,
             next_cookie: 1,
             #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
@@ -228,15 +237,18 @@ impl Inner {
         }
         if self.pending.len() >= INOTIFY_MAX_QUEUED_EVENTS {
             self.overflowed = true;
-            self.pending.push_back(encode_event_raw(
-                -1,
-                carrick_abi::LINUX_IN_Q_OVERFLOW,
-                0,
-                None,
-            ));
+            let overflow = encode_event_raw(-1, carrick_abi::LINUX_IN_Q_OVERFLOW, 0, None);
+            self.queued_bytes += overflow.len();
+            self.pending.push_back(overflow);
             return;
         }
+        self.queued_bytes += record.len();
         self.pending.push_back(record);
+    }
+
+    /// Encoded bytes a `read(2)` could return right now, in O(1).
+    fn queued_bytes(&self) -> usize {
+        self.queued_bytes
     }
 }
 
@@ -904,9 +916,33 @@ impl InotifyState {
         Ok(effective)
     }
 
-    /// Number of already-formatted records queued for the next guest read.
+    /// Whether any already-formatted record is queued for the next guest read.
+    ///
+    /// Readiness is a non-emptiness question, and inotify(7) answers it without
+    /// walking the queue. Carrick must too: an instance queues up to
+    /// `INOTIFY_MAX_QUEUED_EVENTS` records before `IN_Q_OVERFLOW`, every
+    /// enqueue re-arms backend readiness and every `epoll_wait` consults it, so
+    /// summing the queued bytes here costs O(depth) per event and O(depth^2)
+    /// over a watcher that does not drain. `push_record` only ever queues
+    /// whole `inotify_event` records, which are never shorter than the 16-byte
+    /// header, so a non-empty queue always carries readable bytes.
+    /// Encoded bytes a `read(2)` could return right now, for `ioctl(FIONREAD)`.
+    /// Maintained, not summed: see [`Inner::queued_bytes`].
     pub(crate) fn queued_bytes(&self) -> usize {
-        self.inner.lock().pending.iter().map(Vec::len).sum()
+        self.inner.lock().queued_bytes()
+    }
+
+    pub(crate) fn has_queued_records(&self) -> bool {
+        let ready = !self.inner.lock().pending.is_empty();
+        if let Some(scope) = self.work_scope() {
+            // Zero, always: the answer inspected no record. The counter exists
+            // so a future scan cannot creep back in unnoticed.
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::InotifyQueueVisits,
+                0,
+            );
+        }
+        ready
     }
 
     /// Remove a watch by descriptor; closes its fd. Unknown wd → EINVAL.
@@ -941,7 +977,7 @@ impl InotifyState {
         // The record was produced below the host vnode/native-inotify source,
         // so make the backend multiplexer itself readable. This is the fd on
         // which poll, ppoll, and epoll actually park.
-        if self.queued_bytes() != 0 {
+        if self.has_queued_records() {
             self.backend.wake();
         }
     }
@@ -982,7 +1018,7 @@ impl InotifyState {
         // A backend wait consumes the user wake. Re-arm it when a short read or
         // EINVAL leaves complete records queued so readiness remains level-
         // triggered until the queue is fully drained.
-        if self.queued_bytes() != 0 {
+        if self.has_queued_records() {
             self.backend.wake();
         }
         result
@@ -1038,12 +1074,18 @@ fn drain_pending(inner: &mut Inner, max_bytes: usize) -> Result<Vec<u8>, LinuxEr
         let Some(record) = inner.pending.pop_front() else {
             break;
         };
+        inner.queued_bytes = inner.queued_bytes.saturating_sub(record.len());
         out.extend_from_slice(&record);
     }
     // Once the queue is fully drained the overflow latch lifts, so a watch that
     // keeps firing after the guest catches up can re-fill and overflow again.
     if inner.pending.is_empty() {
         inner.overflowed = false;
+        debug_assert_eq!(
+            inner.queued_bytes, 0,
+            "queued_bytes must track pending exactly"
+        );
+        inner.queued_bytes = 0;
     }
     Ok(out)
 }
@@ -1754,6 +1796,72 @@ mod registry_tests {
         let (_, _, _, len) = parse_header(&rec);
         assert_eq!(len, 8);
         assert_eq!(rec.len(), INOTIFY_EVENT_HEADER_SIZE + 8);
+    }
+
+    /// The running byte count is a second copy of the queue's state, so it can
+    /// drift. `ioctl(FIONREAD)` must report the exact bytes a `read(2)` would
+    /// return, through coalescing, overflow, a short read and a full drain.
+    #[test]
+    fn maintained_queued_bytes_equals_the_true_pending_sum() {
+        let truth = |inner: &Inner| inner.pending.iter().map(Vec::len).sum::<usize>();
+        let mut inner = Inner::new();
+        assert_eq!(inner.queued_bytes(), 0);
+
+        for i in 0..64u32 {
+            inner.push_record(encode_event_raw(
+                1,
+                carrick_abi::LINUX_IN_MODIFY,
+                i,
+                Some(format!("child_{i}").as_bytes()),
+            ));
+        }
+        assert_eq!(inner.queued_bytes(), truth(&inner), "after distinct pushes");
+
+        // A byte-identical repeat coalesces away and must not be counted.
+        let repeat = encode_event_raw(1, carrick_abi::LINUX_IN_MODIFY, 99, Some(b"tail"));
+        inner.push_record(repeat.clone());
+        let after_first = inner.queued_bytes();
+        inner.push_record(repeat);
+        assert_eq!(
+            inner.queued_bytes(),
+            after_first,
+            "a coalesced repeat adds no bytes"
+        );
+        assert_eq!(inner.queued_bytes(), truth(&inner), "after coalescing");
+
+        // A short read leaves the remainder counted exactly.
+        let first_len = inner.pending.front().map(Vec::len).unwrap_or(0);
+        let short = drain_pending(&mut inner, first_len).expect("short read");
+        assert_eq!(short.len(), first_len);
+        assert_eq!(inner.queued_bytes(), truth(&inner), "after a short read");
+
+        // Overflow appends one marker, which is itself readable.
+        while inner.pending.len() < INOTIFY_MAX_QUEUED_EVENTS {
+            let cookie = inner.pending.len() as u32;
+            inner.push_record(encode_event_raw(
+                1,
+                carrick_abi::LINUX_IN_MODIFY,
+                cookie,
+                Some(b"fill"),
+            ));
+        }
+        inner.push_record(encode_event_raw(
+            1,
+            carrick_abi::LINUX_IN_MODIFY,
+            u32::MAX,
+            Some(b"overflow"),
+        ));
+        assert!(inner.overflowed);
+        assert_eq!(inner.queued_bytes(), truth(&inner), "after overflow");
+
+        let drained = drain_pending(&mut inner, usize::MAX).expect("full drain");
+        assert!(inner.pending.is_empty());
+        assert_eq!(
+            inner.queued_bytes(),
+            0,
+            "a drained queue reports zero bytes"
+        );
+        assert!(drained.len() >= INOTIFY_EVENT_HEADER_SIZE);
     }
 
     #[test]

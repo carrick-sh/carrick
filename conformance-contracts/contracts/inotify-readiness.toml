@@ -1,0 +1,40 @@
+schema_version = 1
+id = "kernel.inotify.readiness"
+title = "Inotify readiness cost is independent of queue depth"
+guest_surfaces = [
+  "syscall:inotify_init1",
+  "syscall:inotify_add_watch",
+  "syscall:read",
+  "syscall:epoll_wait",
+  "kernel:inotify",
+]
+semantic_authority = [
+  "man 7 inotify",
+  "man 2 read",
+  "man 2 epoll_wait",
+]
+fixture = "probe:inotifyqueue"
+scale_points = [1, 8, 32, 128]
+rationale = """
+inotify(7) queues up to /proc/sys/fs/inotify/max_queued_events records per
+instance before IN_Q_OVERFLOW. Whether an instance is readable is a
+non-emptiness question about that queue, and Linux answers it without walking
+the queue. Carrick must do the same: every enqueue re-arms backend readiness,
+and every epoll_wait consults it, so a readiness answer that inspects the
+queued records costs O(depth) per event and O(depth^2) over a watcher that
+does not drain. LTP's inotify09 enqueues millions of undrained records, which
+is where that term dominates.
+"""
+
+[bindings]
+vm_free = "carrick-kernel-example::inotify_readiness_contract"
+embed = "carrick-embed::inotify_readiness_contract"
+docker = "probe:inotifyqueue"
+ecosystem = ["ltp:inotify09", "ltp:inotify11"]
+
+[[structural_budgets]]
+kind = "affine"
+metric = "inotify_queue_visits"
+base = 0
+per_unit = 0
+rationale = "Answering 'is this inotify instance readable' inspects no queued record, at any queue depth."

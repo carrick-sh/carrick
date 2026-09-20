@@ -90,10 +90,11 @@ pub use builder::{Container, ContainerBuilder, StdioConfig};
 pub use carrier::Carrier;
 pub use contracts::{
     fork_filetable_contract, fork_mappings_contract, fork_stage1_image_contract,
-    futex_contention_contract, futex_requeue_contract, inotify_watch_contract,
-    run_fork_filetable_structural_contract, run_fork_filetable_timing_contract,
-    run_fork_mappings_structural_contract, run_fork_mappings_timing_contract,
-    run_fork_stage1_image_structural_contract, run_fork_stage1_image_structural_contract_via_shell,
+    futex_contention_contract, futex_requeue_contract, inotify_readiness_contract,
+    inotify_watch_contract, run_fork_filetable_structural_contract,
+    run_fork_filetable_timing_contract, run_fork_mappings_structural_contract,
+    run_fork_mappings_timing_contract, run_fork_stage1_image_structural_contract,
+    run_fork_stage1_image_structural_contract_via_shell,
     run_fork_stage1_image_structural_contract_with, run_fork_stage1_image_timing_contract,
     run_futex_requeue_structural_contract, run_futex_requeue_timing_contract,
     run_futex_structural_contract, run_futex_timing_contract,

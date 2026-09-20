@@ -440,6 +440,117 @@ pub fn inotify_watch_contract(scale: usize) -> Result<ContractObservation, Examp
     inotify_watch_scenario(scale)
 }
 
+/// Fill an inotify instance's queue with `events` undrained records, the shape
+/// LTP's `inotify09` sustains for millions of iterations.
+///
+/// Every enqueue re-arms backend readiness and every `epoll_wait` consults it,
+/// so this scenario measures what a readiness answer costs as the queue grows.
+/// The guest never reads the instance, so the queue only deepens.
+pub fn inotify_readiness_scenario(events: usize) -> Result<ContractObservation, ExampleError> {
+    assert!(events >= 1, "events must be at least 1");
+    let scratch = tempfile::TempDir::new()
+        .map_err(|e| ExampleError::Script(format!("failed to create tempdir: {e}")))?;
+    let host_backend = HostFsBackend::new_in(scratch.path())
+        .map_err(|e| ExampleError::Script(format!("failed to create host fs backend: {e}")))?;
+
+    let mask = (LINUX_IN_CREATE | LINUX_IN_DELETE | LINUX_IN_MODIFY) as u32;
+
+    let mut script = vec![
+        Step::Sys(sys::mkdirat(LINUX_AT_FDCWD, "/watched", 0o755).ret(0)),
+        Step::Sys(sys::inotify_init1(LINUX_O_NONBLOCK as i32).save(0)),
+        Step::Sys(sys::inotify_add_watch(slot(0), "/watched", mask).save(1)),
+    ];
+    // Each distinct name is a distinct record, so none of these coalesce away
+    // (inotify(7) coalesces only byte-identical back-to-back events).
+    for i in 0..events {
+        script.push(Step::Sys(
+            sys::openat(
+                LINUX_AT_FDCWD,
+                format!("/watched/queued_{i}.txt"),
+                (LINUX_O_CREAT | LINUX_O_WRONLY) as i32,
+                0o644,
+            )
+            .save(2),
+        ));
+        script.push(Step::Sys(sys::close(slot(2)).ret(0)));
+    }
+    script.extend(vec![
+        // FIONREAD proves the queue really deepened: a zero-visit readiness
+        // answer over an empty queue would otherwise be indistinguishable from
+        // the property under test.
+        Step::Sys(sys::ioctl_fionread_labeled("queue_depth", slot(0)).ret(0)),
+        Step::Sys(sys::inotify_rm_watch(slot(0), slot(1)).ret(0)),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ]);
+
+    let report = ScriptedBackend::new()
+        .with_fs_backend(Box::new(host_backend))
+        .run_root(script)?;
+
+    let queue_depth_bytes = report
+        .outputs()
+        .iter()
+        .find(|output| output.label == "queue_depth")
+        .and_then(|output| output.bytes.get(..4))
+        .map(|bytes| i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .unwrap_or(-1);
+
+    let mut snapshot = report.work_snapshot().clone();
+
+    #[cfg(any(test, debug_assertions))]
+    if std::env::var("CARRICK_CONTRACT_FAULT").as_deref() == Ok("scanning-inotify-readiness") {
+        let injected = (events as u64) * (events as u64 + 1) / 2;
+        *snapshot
+            .values
+            .entry(WorkMetric::InotifyQueueVisits)
+            .or_insert(0) += injected;
+    }
+
+    let mut semantic_assertions = Vec::new();
+
+    if report.exit_code() == 0 {
+        semantic_assertions.push(SemanticAssertion::pass("clean_task_retirement"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "clean_task_retirement",
+            format!("exit code was {}", report.exit_code()),
+        ));
+    }
+
+    // Every created child yields at least one IN_CREATE record, and every
+    // record is at least a 16-byte `struct inotify_event` header.
+    let minimum_queued_bytes = (events as i32).saturating_mul(16);
+    if queue_depth_bytes >= minimum_queued_bytes {
+        semantic_assertions.push(SemanticAssertion::pass("queue_left_undrained"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "queue_left_undrained",
+            format!("FIONREAD reported {queue_depth_bytes} bytes, expected at least {minimum_queued_bytes}"),
+        ));
+    }
+
+    let contract_id = ContractId::new("kernel.inotify.readiness")
+        .map_err(|e| ExampleError::Unsupported(format!("invalid contract id: {e}")))?;
+
+    Ok(ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::VmFree,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "probe:inotifyqueue".to_string(),
+        scale: events as u64,
+        semantic_assertions,
+        work: Some(snapshot),
+        timing: None,
+        completeness: Completeness::Complete,
+    })
+}
+
+/// Conformance contract binding for `kernel.inotify.readiness` at execution layer `VmFree`.
+pub fn inotify_readiness_contract(scale: usize) -> Result<ContractObservation, ExampleError> {
+    inotify_readiness_scenario(scale)
+}
+
 /// Run a fork memory mappings scenario with `mappings` anonymous unpopulated mappings in the parent.
 pub fn fork_mappings_scenario(mappings: usize) -> Result<ContractObservation, ExampleError> {
     assert!(mappings >= 1, "mappings must be at least 1");

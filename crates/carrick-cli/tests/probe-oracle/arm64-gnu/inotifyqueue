@@ -1,0 +1,15 @@
+0f1337092e5da82c
+empty_instance_not_readable=true
+empty_instance_fionread_zero=true
+deep_queue_stays_readable=true
+deep_queue_fionread_monotonic=true
+deep_queue_holds_every_name=true
+identical_repeat_coalesces=true
+distinct_names_do_not_coalesce=true
+partial_read_returns_whole_records=true
+partial_read_consumes_exactly_what_it_returned=true
+partial_read_leaves_remainder=true
+readable_until_fully_drained=true
+full_drain_empties_queue=true
+drained_instance_not_readable=true
+watch_removed_cleanly=true
