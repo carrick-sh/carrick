@@ -212,9 +212,9 @@ creates 16k children this way, and allocating a fresh image per fork produced
 - Status (2026-09-20): structural bindings green at 1/8/32/128. The timing
   binding is red: 205 µs per serial fork under the signed carrier versus
   88 µs under Docker (2.33x against the 2.0x policy), and `ltp-fork14` sits at
-  3.7x (6.0 s versus 1.6 s; it was 15.4x), `ltp-epoll-ltp` (the same serial
-  fork shape: 12,468 clone/exit/wait rounds) at 3.5x from 11.5x, and
-  `ltp-fork09` at 1.6x from 3.2x. The root-slot pool is now created at VM
+  3.41x (5.6 s versus 1.6 s; it was 15.4x), `ltp-epoll-ltp` (the same serial
+  fork shape: 12,468 clone/exit/wait rounds) at 3.07x from 11.5x, and
+  `ltp-fork09` at 1.63x from 3.2x, each measured alone on a quiet host. The root-slot pool is now created at VM
   creation and an exec'd image's root table is drawn from it too, so the
   `sh -c` launch shape every harness LTP row uses no longer pays a 2 MiB host
   `mmap` per fork (the `via_shell` structural binding proves it). Named
@@ -233,3 +233,10 @@ creates 16k children this way, and allocating a fresh image per fork produced
   `pagetablegrow` probe and the `kernel.fork.stage1-image` bindings are the
   standing guards; `scripts/dtrace/hvpatch-stage1-faults.d` names the exact
   refused mapping when one slips through.
+- The next pathology class above the fork family is the guest syscall floor,
+  not another algorithm. `ltp-inotify09` issues about 15 million syscalls
+  (2.99 million each of `inotify_add_watch`, `inotify_rm_watch`, `lseek`,
+  `clock_gettime` and `write`; LTP's fuzzy-sync helpers use raw syscalls, so
+  `clock_gettime` never reaches the vDSO) and spends 5.5 microseconds per
+  syscall against Docker's 0.69. No per-operation budget is violated there,
+  so a contract for that class must budget the syscall round trip itself.
