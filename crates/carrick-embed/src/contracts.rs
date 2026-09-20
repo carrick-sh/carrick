@@ -772,6 +772,19 @@ fn run_fork_serial_with(
     timing: bool,
     scope: Option<&carrick_observability::work_meter::WorkScope>,
 ) -> Option<ForkSerialRun> {
+    run_fork_serial_launched(scale, dirty_parent, timing, false, scope)
+}
+
+/// `via_shell` launches the probe as `/bin/sh -c`, so the forking parent is
+/// an exec'd process: its stage-1 root slot came from the exec path, the
+/// shape every harness LTP row has.
+fn run_fork_serial_launched(
+    scale: u64,
+    dirty_parent: bool,
+    timing: bool,
+    via_shell: bool,
+    scope: Option<&carrick_observability::work_meter::WorkScope>,
+) -> Option<ForkSerialRun> {
     let bin_path = probe_binary("forkserial")?;
     let carrier = get_carrier().ok()?;
     let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
@@ -779,15 +792,26 @@ fn run_fork_serial_with(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("forkserial");
+    let argv: Vec<String> = std::iter::once(format!("/p/{bin_name}"))
+        .chain(std::iter::once(scale.to_string()))
+        .chain(dirty_parent.then(|| "dirty".to_string()))
+        .chain(timing.then(|| "timing".to_string()))
+        .collect();
+    let command: Vec<String> = if via_shell {
+        // `exec` keeps the shell from forking first: the probe replaces the
+        // shell in place, so the forking parent is exactly an exec'd task.
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("exec {}", argv.join(" ")),
+        ]
+    } else {
+        argv
+    };
     let mut builder = carrier
         .container("docker.io/library/ubuntu:24.04")
         .pull_policy(crate::PullPolicy::Missing)
-        .command(
-            std::iter::once(format!("/p/{bin_name}"))
-                .chain(std::iter::once(scale.to_string()))
-                .chain(dirty_parent.then(|| "dirty".to_string()))
-                .chain(timing.then(|| "timing".to_string())),
-        )
+        .command(command)
         .mount_readonly(p_dir.to_string_lossy(), "/p");
     if let Some(scope) = scope {
         builder = builder.work_scope(scope.clone());
@@ -857,12 +881,26 @@ pub fn run_fork_stage1_image_structural_contract_with(
     scale: u64,
     dirty_parent: bool,
 ) -> ContractObservation {
+    run_fork_stage1_image_structural_contract_launched(scale, dirty_parent, false)
+}
+
+/// Structural contract run whose forking parent was exec'd by `/bin/sh -c`,
+/// the launch shape of every harness LTP row.
+pub fn run_fork_stage1_image_structural_contract_via_shell(scale: u64) -> ContractObservation {
+    run_fork_stage1_image_structural_contract_launched(scale, false, true)
+}
+
+fn run_fork_stage1_image_structural_contract_launched(
+    scale: u64,
+    dirty_parent: bool,
+    via_shell: bool,
+) -> ContractObservation {
     let contract_id = ContractId::new("kernel.fork.stage1-image").unwrap_or_default();
 
     let meter = carrick_observability::work_meter::WorkMeter::default();
     let scope = meter.new_scope();
 
-    let run = run_fork_serial_with(scale, dirty_parent, false, Some(&scope));
+    let run = run_fork_serial_launched(scale, dirty_parent, false, via_shell, Some(&scope));
     let semantic_assertions = fork_serial_semantics(run.as_ref(), scale);
 
     let (work, completeness) = match scope.snapshot() {

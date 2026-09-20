@@ -818,6 +818,14 @@ pub(in crate::trap) fn create_vm_with_admission(
             // if that destroy fails the flag correctly stays set -- a VM does
             // still exist.
             CARRIER_VM_LIVE.store(true, std::sync::atomic::Ordering::Release);
+            // Stand the pre-mapped root-slot pool up now, while no stage-1
+            // root slot is mapped yet. Created lazily at the first fork, its
+            // 128 MiB pre-map collided with an already-exec'd process's Owned
+            // root slot (`HV_ERROR`), the pool marked itself failed for the
+            // carrier's lifetime, and every fork paid a 2 MiB host
+            // `mmap`/`munmap` (`kernel.fork.stage1-image`,
+            // `host_mapping_allocations`).
+            let _ = custody.root_slot_pool();
             Ok((
                 vm,
                 permit,
@@ -7004,7 +7012,16 @@ impl HvfVmState {
     }
 
     fn global_frame_exec_plan(&self, plan: &GuestMappingPlan) -> Result<GlobalExecPlan, TrapError> {
-        prepare_global_exec_plan(plan, self.pending_exec_mm_root_slot.or(self.mm_root_slot))
+        let mm_root_slot = self.pending_exec_mm_root_slot.or(self.mm_root_slot);
+        let pool_backed_root = mm_root_slot.is_some_and(|(base, size)| {
+            size == crate::frame_pool::ROOT_SLOT_SIZE as u64
+                && self
+                    .carrier_foreign_mm_transport
+                    .custody
+                    .root_slot_pool()
+                    .is_some_and(|pool| pool.contains_ipa(base))
+        });
+        prepare_global_exec_plan_with_root_backing(plan, mm_root_slot, pool_backed_root)
     }
 }
 

@@ -581,7 +581,7 @@ impl HvfVmState {
                         &state.carrier_foreign_mm_transport.custody,
                         mapping,
                     )?;
-                    let install = exec_stage2_install(mapping, &region);
+                    let install = exec_stage2_install(mapping, &region, false);
                     let rc = unsafe {
                         inventory_hv_vm_map(
                             install.host.cast(),

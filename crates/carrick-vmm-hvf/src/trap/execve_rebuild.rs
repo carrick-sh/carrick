@@ -307,6 +307,9 @@ pub(crate) struct ExecStage2Install {
     pub(crate) host: *mut u8,
     pub(crate) perms: u64,
     pub(crate) replay_registered: bool,
+    /// The extent is already stage-2 mapped by the root-slot pool's own
+    /// lease: the transaction neither maps nor unmaps it.
+    pub(crate) pre_mapped: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -431,6 +434,7 @@ impl ExecStage2Install {
             host: std::ptr::null_mut(),
             perms: 0,
             replay_registered: false,
+            pre_mapped: false,
         }
     }
 }
@@ -528,6 +532,17 @@ pub(crate) fn prepare_global_exec_plan(
     plan: &GuestMappingPlan,
     mm_root_slot: Option<(u64, u64)>,
 ) -> Result<GlobalExecPlan, TrapError> {
+    prepare_global_exec_plan_with_root_backing(plan, mm_root_slot, false)
+}
+
+/// [`prepare_global_exec_plan`] naming whether the replacement stage-1 root
+/// slot is served by the carrier's pre-mapped root-slot pool, in which case
+/// the table's lease spans the whole slot.
+pub(crate) fn prepare_global_exec_plan_with_root_backing(
+    plan: &GuestMappingPlan,
+    mm_root_slot: Option<(u64, u64)>,
+    pool_backed_root: bool,
+) -> Result<GlobalExecPlan, TrapError> {
     let old_root = plan.stage1_page_tables_base.ok_or_else(|| {
         TrapError::Hypervisor("hvpatch exec image has no stage-1 tables".to_owned())
     })?;
@@ -569,10 +584,17 @@ pub(crate) fn prepare_global_exec_plan(
                     mapping.mapped_size
                 )));
             }
-            let lease = GlobalFrameStage2Lease::fixed(root_slot_base, mapping.mapped_size);
+            // A pool-backed root owns its whole slot (the pool hands out
+            // exact slots); an allocator-backed root leases only its image.
+            let lease_length = if pool_backed_root {
+                root_slot_size
+            } else {
+                mapping.mapped_size
+            };
+            let lease = GlobalFrameStage2Lease::fixed(root_slot_base, lease_length);
             if lease
                 .base
-                .checked_add(mapping.mapped_size)
+                .checked_add(lease_length)
                 .is_none_or(|end| end > root_slot_base.saturating_add(root_slot_size))
             {
                 return Err(TrapError::Hypervisor(format!(
@@ -977,8 +999,36 @@ impl HvfVmState {
                         key.0, key.1
                     ))
                 })?;
-                let region = prepare_exec_region_raw_in(&custody, mapping)?;
-                prepared_exec_regions.push((region, lease));
+                let pooled_root_lease = mapping.guest_start
+                    == crate::memory::LINUX_PAGE_TABLES_BASE
+                    && lease.length() > mapping.mapped_size;
+                if pooled_root_lease {
+                    // The plan leased the whole root slot because the pool
+                    // serves it. Take the slot; if it is momentarily held by a
+                    // retiring predecessor, back the same 2 MiB extent with an
+                    // owned mapping so the lease and the record stay exact.
+                    let handle = custody
+                        .root_slot_pool()
+                        .and_then(|pool| pool.allocate_slot_at(mapping.ipa_start));
+                    match handle {
+                        Some(handle) => {
+                            let region =
+                                prepare_pooled_exec_root_region_in(&custody, mapping, &handle)?;
+                            prepared_exec_regions.push((region, lease, Some(handle)));
+                        }
+                        None => {
+                            let region = prepare_exec_region_raw_in_sized(
+                                &custody,
+                                mapping,
+                                lease.length(),
+                            )?;
+                            prepared_exec_regions.push((region, lease, None));
+                        }
+                    }
+                } else {
+                    let region = prepare_exec_region_raw_in(&custody, mapping)?;
+                    prepared_exec_regions.push((region, lease, None));
+                }
             }
             if !stage2_leases.is_empty() {
                 return Err(TrapError::Hypervisor(format!(
@@ -1040,7 +1090,9 @@ impl HvfVmState {
                         && !is_persistent_executor_carrier_guest_mapping(mapping)
                 })
                 .zip(prepared_exec_regions.iter())
-                .map(|(mapping, (region, _))| exec_stage2_install(mapping, region))
+                .map(|(mapping, (region, _, handle))| {
+                    exec_stage2_install(mapping, region, handle.is_some())
+                })
                 .collect::<Vec<_>>();
             let authority_before = self.exec_authority_fingerprint();
             let switch_result = switch_exec_stage2_transaction(
@@ -1048,6 +1100,9 @@ impl HvfVmState {
                 &replacement,
                 exec_stage2_fail_after_maps(),
                 |extent| {
+                    if extent.pre_mapped {
+                        return Ok(());
+                    }
                     crate::probes::hvpatch_exec_stage2(
                         carrick_observability::probes::HvpatchExecStage2::new(
                             carrick_observability::probes::HvpatchExecStage2Phase::UnmapBegin,
@@ -1077,6 +1132,9 @@ impl HvfVmState {
                     }
                 },
                 |extent| {
+                    if extent.pre_mapped {
+                        return Ok(());
+                    }
                     crate::probes::hvpatch_exec_stage2(
                         carrick_observability::probes::HvpatchExecStage2::new(
                             carrick_observability::probes::HvpatchExecStage2Phase::MapBegin,
@@ -1133,8 +1191,12 @@ impl HvfVmState {
                 }
                 return Err(error);
             }
-            for (_, lease) in &mut prepared_exec_regions {
-                lease.mark_mapped();
+            for (_, lease, handle) in &mut prepared_exec_regions {
+                if handle.is_some() {
+                    lease.mark_pre_mapped();
+                } else {
+                    lease.mark_mapped();
+                }
             }
             if let Some((Some(retired), _)) = inventory_reservations.as_mut() {
                 let authority = self.cow_authority.as_ref().cloned().ok_or_else(|| {
@@ -1404,13 +1466,18 @@ impl HvfVmState {
         // host owners only after predecessor retirement can no longer roll
         // back. Mature VMM still maps through the historical helper here.
         if self.persistent_vm_lifecycle {
-            for (mut region, lease) in prepared_exec_regions.drain(..) {
-                publish_exec_region_host_owner_in(
-                    &custody,
-                    &mut region,
-                    lease,
-                    Some(replacement_mm_root_slot),
-                )
+            for (mut region, lease, handle) in prepared_exec_regions.drain(..) {
+                match handle {
+                    Some(handle) => {
+                        publish_pooled_exec_root_owner_in(&custody, &mut region, lease, handle)
+                    }
+                    None => publish_exec_region_host_owner_in(
+                        &custody,
+                        &mut region,
+                        lease,
+                        Some(replacement_mm_root_slot),
+                    ),
+                }
                 .unwrap_or_else(|error| {
                     carrick_fatal!(
                         "hvpatch::frame_inventory",
