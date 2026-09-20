@@ -1,8 +1,8 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 
-use carrick_conformance_contract::{CapabilityClass, ContractId};
+use carrick_conformance_contract::{CapabilityClass, ContractId, ExecutionLayer};
 use carrick_investigation::{
     Investigation, InvestigationId, SelectedFailure, Stage, default_dir, scan_results,
 };
@@ -14,6 +14,9 @@ fn print_usage() {
   investigate new --from-results <results.jsonl> [--suite <suite>]
   investigate prioritize --from-results <results.jsonl>
   investigate classify --id <id> --contract <contract-id> [--requires-guest <reason> | --vm-free <cap>]
+  investigate reduce --id <id> --layer <layer> --mechanism <text>
+  investigate diagnose --id <id> --evidence <text> [--fixture-active]
+  investigate review --id <id> --package <path>
   investigate status [--id <id>]
   investigate park --id <id> --reason <reason> [--resumption <condition>]
   investigate resume --id <id>
@@ -44,6 +47,9 @@ fn run(args: &[String]) -> Result<(), String> {
         "new" => handle_new(&args[1..]),
         "prioritize" => handle_prioritize(&args[1..]),
         "classify" => handle_classify(&args[1..]),
+        "reduce" => handle_reduce(&args[1..]),
+        "diagnose" => handle_diagnose(&args[1..]),
+        "review" => handle_review(&args[1..]),
         "status" => handle_status(&args[1..]),
         "park" => handle_park(&args[1..]),
         "resume" => handle_resume(&args[1..]),
@@ -372,5 +378,147 @@ fn handle_classify(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("cannot save investigation: {e}"))?;
 
     println!("investigation {} classified at {}", id_str, path.display());
+    Ok(())
+}
+
+fn handle_reduce(args: &[String]) -> Result<(), String> {
+    let mut id_arg = None;
+    let mut layer_arg = None;
+    let mut mechanisms = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--id" if i + 1 < args.len() => {
+                id_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--layer" if i + 1 < args.len() => {
+                layer_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--mechanism" if i + 1 < args.len() => {
+                mechanisms.push(args[i + 1].clone());
+                i += 2;
+            }
+            other => return Err(format!("unexpected argument to 'reduce': {other}")),
+        }
+    }
+
+    let id_str = id_arg.ok_or_else(|| "missing --id".to_string())?;
+    let layer_str = layer_arg.ok_or_else(|| "missing --layer".to_string())?;
+    let layer: ExecutionLayer = serde_json::from_value(serde_json::Value::String(layer_str))
+        .map_err(|e| format!("invalid execution layer: {e}"))?;
+
+    if mechanisms.is_empty() {
+        return Err("at least one --mechanism is required".to_string());
+    }
+
+    let path = default_dir().join(format!("{id_str}.jsonl"));
+    let mut inv = Investigation::load_from_file(&path)
+        .map_err(|e| format!("cannot load investigation {}: {e}", path.display()))?;
+
+    inv.transition(Stage::Reducing {
+        layer,
+        preserved_mechanisms: mechanisms,
+    })
+    .map_err(|e| format!("cannot reduce investigation: {e}"))?;
+
+    inv.save_to_file(&path)
+        .map_err(|e| format!("cannot save investigation: {e}"))?;
+
+    println!("investigation {} reducing at {}", id_str, path.display());
+    Ok(())
+}
+
+fn handle_diagnose(args: &[String]) -> Result<(), String> {
+    let mut id_arg = None;
+    let mut evidence = Vec::new();
+    let mut fixture_active = true;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--id" if i + 1 < args.len() => {
+                id_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--evidence" if i + 1 < args.len() => {
+                evidence.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--fixture-inactive" => {
+                fixture_active = false;
+                i += 1;
+            }
+            "--fixture-active" => {
+                fixture_active = true;
+                i += 1;
+            }
+            other => return Err(format!("unexpected argument to 'diagnose': {other}")),
+        }
+    }
+
+    let id_str = id_arg.ok_or_else(|| "missing --id".to_string())?;
+    if evidence.is_empty() {
+        return Err("at least one --evidence is required".to_string());
+    }
+
+    let path = default_dir().join(format!("{id_str}.jsonl"));
+    let mut inv = Investigation::load_from_file(&path)
+        .map_err(|e| format!("cannot load investigation {}: {e}", path.display()))?;
+
+    inv.transition(Stage::Diagnosing {
+        red_evidence: evidence,
+        fixture_active,
+    })
+    .map_err(|e| format!("cannot diagnose investigation: {e}"))?;
+
+    inv.save_to_file(&path)
+        .map_err(|e| format!("cannot save investigation: {e}"))?;
+
+    println!("investigation {} diagnosing at {}", id_str, path.display());
+    Ok(())
+}
+
+fn handle_review(args: &[String]) -> Result<(), String> {
+    let mut id_arg = None;
+    let mut package_arg = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--id" if i + 1 < args.len() => {
+                id_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--package" if i + 1 < args.len() => {
+                package_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => return Err(format!("unexpected argument to 'review': {other}")),
+        }
+    }
+
+    let id_str = id_arg.ok_or_else(|| "missing --id".to_string())?;
+    let package_path = package_arg.ok_or_else(|| "missing --package".to_string())?;
+
+    let path = default_dir().join(format!("{id_str}.jsonl"));
+    let mut inv = Investigation::load_from_file(&path)
+        .map_err(|e| format!("cannot load investigation {}: {e}", path.display()))?;
+
+    inv.transition(Stage::ReviewReady {
+        review_package_path: PathBuf::from(package_path),
+    })
+    .map_err(|e| format!("cannot mark investigation review-ready: {e}"))?;
+
+    inv.save_to_file(&path)
+        .map_err(|e| format!("cannot save investigation: {e}"))?;
+
+    println!(
+        "investigation {} review-ready at {}",
+        id_str,
+        path.display()
+    );
     Ok(())
 }
