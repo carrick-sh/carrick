@@ -57,10 +57,14 @@ pub(super) struct HandoffSlot {
 pub struct HostWaitToken<'a> {
     queue: Arc<RunQueueInner>,
     executors: Arc<ExecutorDirectory>,
+    preemption: Arc<Mutex<PreemptionState>>,
+    preemption_condvar: Arc<Condvar>,
     registration: ExecutorRegistration,
     binding: ExecutorBinding,
     slot: ExecutorId,
     cpu: GuestCpuId,
+    process: SchedProcessId,
+    preserved_reasons: PreemptionReasons,
     active: bool,
     lease: PhantomData<&'a ThreadExecutionLease>,
     // The retained backend/vCPU belongs to the entering host thread.
@@ -137,6 +141,53 @@ impl HostWaitToken<'_> {
                     });
                 self.queue.changed.notify_all();
                 drop(state);
+
+                let thread_id = SchedThreadId::new(self.binding.thread.serial.raw());
+                let dispatch_ctx = DispatchContext {
+                    thread: thread_id,
+                    process: self.process,
+                    cpu: self.cpu,
+                    load: self.queue.cpu_load(self.cpu),
+                };
+                let budget = self.queue.policy.on_dispatch(&dispatch_ctx);
+                let mut reasons_to_restore = self.preserved_reasons;
+                reasons_to_restore.insert(PreemptionReasons::HOST_WAIT_RETURN);
+                let (_ticket, sequence) = {
+                    let mut preemption = self.preemption.lock();
+                    let (ticket, seq) = preemption.register_residency(
+                        self.binding,
+                        self.cpu,
+                        budget,
+                        self.binding.thread,
+                        self.binding.generation,
+                    );
+                    if !reasons_to_restore.is_empty() {
+                        preemption.add_preemption_reason(self.registration.id, reasons_to_restore);
+                    }
+                    (ticket, seq)
+                };
+                crate::event_ring::rec_sched_dispatch(
+                    self.binding.thread.serial.raw() as i32,
+                    self.registration.id.raw(),
+                    self.cpu.as_usize(),
+                );
+                crate::event_ring::rec_sched_budget(
+                    self.registration.id.raw(),
+                    budget.quantum().as_millis() as u32,
+                    self.binding.generation.raw(),
+                );
+                self.queue.policy.on_event(&SchedulingEvent {
+                    sequence,
+                    thread: thread_id,
+                    process: self.process,
+                    cpu: Some(self.cpu),
+                    kind: SchedulingEventKind::Dispatch,
+                });
+                recompute_demand_state(&self.queue, &self.preemption, &self.preemption_condvar);
+                if !reasons_to_restore.is_empty() {
+                    self.executors.deliver_kick_to(self.registration.id);
+                    self.preemption_condvar.notify_all();
+                }
                 return;
             }
             let owner = slot.owner.as_ref().map(|owner| owner.id);
@@ -282,13 +333,36 @@ impl Scheduler {
         drop(state);
         let guest_cpu = &self.queue.inner.cpus[cpu.as_usize()];
         guest_cpu.nudge();
+        let process = SchedProcessId::new(thread.task_key().serial.raw());
+        let (preserved_reasons, sequence) = {
+            let mut preemption = self.preemption.lock();
+            let old = preemption.finalize_residency(registration.id);
+            let reasons = old
+                .map(|r| r.reasons.difference(PreemptionReasons::FAIRNESS))
+                .unwrap_or_default();
+            let seq = preemption.next_sequence();
+            (reasons, seq)
+        };
+        let thread_id = SchedThreadId::new(binding.thread.serial.raw());
+        self.queue.inner.policy.on_event(&SchedulingEvent {
+            sequence,
+            thread: thread_id,
+            process,
+            cpu: Some(cpu),
+            kind: SchedulingEventKind::Stop(SchedulingStopReason::HostWait),
+        });
+        self.recompute_demand();
         Ok(HostWaitToken {
             queue: Arc::clone(&self.queue.inner),
             executors: Arc::clone(&self.executors),
+            preemption: Arc::clone(&self.preemption),
+            preemption_condvar: Arc::clone(&self.preemption_condvar),
             registration: registration.clone(),
             binding,
             slot: id,
             cpu,
+            process,
+            preserved_reasons,
             active: true,
             lease: PhantomData,
             owner_thread: PhantomData,

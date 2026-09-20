@@ -21,10 +21,10 @@ pub use dto::{
     DebugAltstack, DebugClass, DebugCredentialsRow, DebugExecutorBindingRow,
     DebugExecutorReceiptRow, DebugExecutorReceiptSummary, DebugExecutorRow,
     DebugFileDescriptionRow, DebugFileSlotRow, DebugFileTableRow, DebugFrameRow, DebugFsContextRow,
-    DebugMappingRow, DebugMmRow, DebugProcessGroupRow, DebugRunQueueRow, DebugSchedulerRow,
-    DebugSessionRow, DebugSighandRow, DebugTaskRow, DebugTaskSharedRow, DebugTaskSignalRow,
-    DebugThreadResourcesRow, DebugThreadRow, DebugThreadSignalRow, DebugVmaRow, DebugZombieRow,
-    KERNEL_DEBUG_REQUEST_SCHEMA, KERNEL_DEBUG_RESPONSE_SCHEMA, KernelDebugAction,
+    DebugMappingRow, DebugMmRow, DebugProcessGroupRow, DebugResidencyRow, DebugRunQueueRow,
+    DebugSchedulerRow, DebugSessionRow, DebugSighandRow, DebugTaskRow, DebugTaskSharedRow,
+    DebugTaskSignalRow, DebugThreadResourcesRow, DebugThreadRow, DebugThreadSignalRow, DebugVmaRow,
+    DebugZombieRow, KERNEL_DEBUG_REQUEST_SCHEMA, KERNEL_DEBUG_RESPONSE_SCHEMA, KernelDebugAction,
     KernelDebugAuxProvider, KernelDebugDtoError, KernelDebugRequest, KernelDebugSnapshot,
     KernelDebugTable, UnknownTable,
 };
@@ -417,6 +417,7 @@ mod tests {
                     control_epoch: 0,
                     need_resched: false,
                     snapshot_count: 0,
+                    residencies: None,
                 })
                 .into_iter()
                 .collect()

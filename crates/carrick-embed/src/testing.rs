@@ -985,6 +985,17 @@ pub enum SchedulingDecision {
         cpu: carrick_hal::GuestCpuId,
         stolen: Option<(carrick_hal::GuestCpuId, carrick_hal::SchedThreadId)>,
     },
+    Dispatch {
+        context: carrick_hal::DispatchContext,
+        budget: carrick_hal::RunBudget,
+    },
+    Contention {
+        context: carrick_hal::ContentionContext,
+        action: carrick_hal::PreemptionAction,
+    },
+    Event {
+        event: carrick_hal::SchedulingEvent,
+    },
 }
 
 /// Records an inner policy's decision sequence, then replays it.
@@ -1150,18 +1161,66 @@ impl carrick_hal::SchedulingPolicy for RecordReplay {
     }
 
     fn on_dispatch(&self, context: &carrick_hal::DispatchContext) -> carrick_hal::RunBudget {
-        self.inner.on_dispatch(context)
+        if let Some(SchedulingDecision::Dispatch {
+            context: recorded_context,
+            budget,
+        }) = self.next_recorded()
+        {
+            if recorded_context.thread == context.thread
+                && recorded_context.process == context.process
+                && recorded_context.cpu == context.cpu
+            {
+                return budget;
+            }
+            self.diverged();
+        }
+        let budget = self.inner.on_dispatch(context);
+        self.record(SchedulingDecision::Dispatch {
+            context: *context,
+            budget,
+        });
+        budget
     }
 
     fn on_contention(
         &self,
         context: &carrick_hal::ContentionContext,
     ) -> carrick_hal::PreemptionAction {
-        self.inner.on_contention(context)
+        if let Some(SchedulingDecision::Contention {
+            context: recorded_context,
+            action,
+        }) = self.next_recorded()
+        {
+            if recorded_context.running.thread == context.running.thread
+                && recorded_context.running.process == context.running.process
+                && recorded_context.running.cpu == context.running.cpu
+                && recorded_context.eligible_queued == context.eligible_queued
+            {
+                return action;
+            }
+            self.diverged();
+        }
+        let action = self.inner.on_contention(context);
+        self.record(SchedulingDecision::Contention {
+            context: *context,
+            action,
+        });
+        action
     }
 
     fn on_event(&self, event: &carrick_hal::SchedulingEvent) {
+        if let Some(SchedulingDecision::Event {
+            event: recorded_event,
+        }) = self.next_recorded()
+        {
+            if recorded_event == *event {
+                self.inner.on_event(event);
+                return;
+            }
+            self.diverged();
+        }
         self.inner.on_event(event);
+        self.record(SchedulingDecision::Event { event: *event });
     }
 }
 
@@ -1174,6 +1233,7 @@ mod scheduling_policy_tests {
         SchedulingPolicy, TaskPlacement,
     };
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn placement<'a>(task: u64, last: Option<u32>, cpus: &'a [CpuLoad]) -> TaskPlacement<'a> {
         TaskPlacement {
@@ -1337,5 +1397,105 @@ mod scheduling_policy_tests {
         };
         assert_eq!(replay.select_cpu(&pinned), GuestCpuId::new(0));
         assert_eq!(replay.divergences(), 1);
+    }
+
+    #[test]
+    fn a_recording_replays_dispatch_contention_and_event() {
+        let inner = Arc::new(AdversarialPolicy::new(4, 77));
+        let recorder = RecordReplay::recording(inner);
+
+        let dispatch_ctx = carrick_hal::DispatchContext {
+            thread: SchedThreadId::new(10),
+            process: SchedProcessId::new(10),
+            cpu: GuestCpuId::new(1),
+            load: CpuLoad::default(),
+        };
+        let budget = recorder.on_dispatch(&dispatch_ctx);
+
+        let contention_ctx = carrick_hal::ContentionContext {
+            running: dispatch_ctx,
+            residency_elapsed: Duration::from_millis(3),
+            eligible_queued: 2,
+        };
+        let action = recorder.on_contention(&contention_ctx);
+
+        let event = carrick_hal::SchedulingEvent {
+            sequence: 1,
+            thread: SchedThreadId::new(10),
+            process: SchedProcessId::new(10),
+            cpu: Some(GuestCpuId::new(1)),
+            kind: carrick_hal::SchedulingEventKind::Dispatch,
+        };
+        recorder.on_event(&event);
+
+        let decisions = recorder.recorded();
+        assert_eq!(decisions.len(), 3);
+
+        // Replay with fallback policy
+        let fallback = Arc::new(GuestCpuPolicy::new(4));
+        let replay = RecordReplay::replaying(fallback, decisions);
+
+        let replayed_budget = replay.on_dispatch(&dispatch_ctx);
+        assert_eq!(replayed_budget, budget);
+
+        // Different residency_elapsed still matches because thread/process/cpu/backlog match
+        let replay_contention_ctx = carrick_hal::ContentionContext {
+            running: dispatch_ctx,
+            residency_elapsed: Duration::from_millis(5),
+            eligible_queued: 2,
+        };
+        let replayed_action = replay.on_contention(&replay_contention_ctx);
+        assert_eq!(replayed_action, action);
+
+        replay.on_event(&event);
+        assert_eq!(replay.divergences(), 0);
+    }
+
+    #[test]
+    fn a_stale_dispatch_or_contention_diverges_instead_of_lying() {
+        let dispatch_ctx = carrick_hal::DispatchContext {
+            thread: SchedThreadId::new(10),
+            process: SchedProcessId::new(10),
+            cpu: GuestCpuId::new(1),
+            load: CpuLoad::default(),
+        };
+        let decisions = vec![
+            SchedulingDecision::Dispatch {
+                context: dispatch_ctx,
+                budget: carrick_hal::RunBudget::default(),
+            },
+            SchedulingDecision::Contention {
+                context: carrick_hal::ContentionContext {
+                    running: dispatch_ctx,
+                    residency_elapsed: Duration::from_millis(1),
+                    eligible_queued: 1,
+                },
+                action: carrick_hal::PreemptionAction::Preempt,
+            },
+        ];
+
+        let fallback = Arc::new(GuestCpuPolicy::new(4));
+        let replay = RecordReplay::replaying(fallback, decisions);
+
+        // Dispatch for different thread diverges
+        let different_dispatch = carrick_hal::DispatchContext {
+            thread: SchedThreadId::new(99),
+            process: SchedProcessId::new(10),
+            cpu: GuestCpuId::new(1),
+            load: CpuLoad::default(),
+        };
+        let _ = replay.on_dispatch(&different_dispatch);
+        assert_eq!(replay.divergences(), 1);
+
+        // Contention with different backlog diverges
+        let different_contention = carrick_hal::ContentionContext {
+            running: dispatch_ctx,
+            residency_elapsed: Duration::from_millis(1),
+            eligible_queued: 5,
+        };
+        let action = replay.on_contention(&different_contention);
+        // Default policy returns KeepBudget, not Preempt
+        assert_eq!(action, carrick_hal::PreemptionAction::KeepBudget);
+        assert_eq!(replay.divergences(), 2);
     }
 }

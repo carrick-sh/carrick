@@ -543,6 +543,24 @@ pub struct DebugSchedulerRow {
     pub control_epoch: u64,
     pub need_resched: bool,
     pub snapshot_count: u64,
+    /// None means unavailable (including snapshots where preemption lock was contended),
+    /// not an empty residency population.
+    #[serde(default)]
+    pub residencies: Option<Vec<DebugResidencyRow>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugResidencyRow {
+    pub executor: u32,
+    pub thread: DebugThreadKey,
+    pub generation: u64,
+    pub cpu: usize,
+    pub ticket: u64,
+    pub budget_ns: u64,
+    pub reasons: u32,
+    pub deadline_remaining_ns: Option<u64>,
+    pub ticket_claimed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

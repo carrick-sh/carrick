@@ -240,6 +240,14 @@ pub const SIGNAL_PC: u8 = 62;
 /// Successful caught-signal frame injection. `a` is guest TID, `b` is Linux
 /// signal, and `c` is the final restart decision.
 pub const SIGNAL_INJECT: u8 = 63;
+/// Task dispatched to executor. `a` is guest TID, `b` is executor id, `c` is CPU index.
+pub const SCHED_DISPATCH: u8 = 64;
+/// Preemption request delivered to executor. `a` is guest TID, `b` is executor id, `c` is PreemptionReasons bits.
+pub const SCHED_PREEMPT: u8 = 65;
+/// Quantum budget assigned at dispatch. `a` is executor id, `b` is budget quantum in ms, `c` is execution generation.
+pub const SCHED_BUDGET: u8 = 66;
+/// Deadline scheduled for executor under contention. `a` is executor id, `b` is deadline delta in ms, `c` is demand ticket.
+pub const SCHED_DEADLINE: u8 = 67;
 
 const HVPWAIT_ID_MASK: u32 = 0x00ff_ffff;
 
@@ -542,6 +550,36 @@ pub fn rec_hvpatch_settle_object(address: usize, step: i32) {
 }
 
 #[inline]
+pub fn rec_sched_dispatch(tid: i32, executor: u32, cpu: usize) {
+    rec(SCHED_DISPATCH, tid, executor as i32, cpu as i32);
+}
+
+#[inline]
+pub fn rec_sched_preempt(tid: i32, executor: u32, reasons: u32) {
+    rec(SCHED_PREEMPT, tid, executor as i32, reasons as i32);
+}
+
+#[inline]
+pub fn rec_sched_budget(executor: u32, budget_ms: u32, generation: u64) {
+    rec(
+        SCHED_BUDGET,
+        executor as i32,
+        budget_ms as i32,
+        generation.min(i32::MAX as u64) as i32,
+    );
+}
+
+#[inline]
+pub fn rec_sched_deadline(executor: u32, deadline_ms: u32, ticket: u64) {
+    rec(
+        SCHED_DEADLINE,
+        executor as i32,
+        deadline_ms as i32,
+        ticket.min(i32::MAX as u64) as i32,
+    );
+}
+
+#[inline]
 pub fn rec_hvpatch_blocked_continuation(
     pid: i32,
     tid: i32,
@@ -611,7 +649,7 @@ pub enum RingReadError {
 }
 
 const fn known_kind(kind: u8) -> bool {
-    kind >= BIND && kind <= SIGNAL_INJECT
+    kind >= BIND && kind <= SCHED_DEADLINE
 }
 
 fn read_slot_after(
@@ -1098,6 +1136,10 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
             (a as u32 as u64) | ((b as u32 as u64) << 32)
         ),
         SIGNAL_INJECT => format!("SIGNAL_INJECT tid={a} signal={b} restart={}", c != 0),
+        SCHED_DISPATCH => format!("SCHED_DISPATCH tid={a} executor={b} cpu={c}"),
+        SCHED_PREEMPT => format!("SCHED_PREEMPT tid={a} executor={b} reasons={:#x}", c as u32),
+        SCHED_BUDGET => format!("SCHED_BUDGET executor={a} budget_ms={b} generation={c}"),
+        SCHED_DEADLINE => format!("SCHED_DEADLINE executor={a} deadline_ms={b} ticket={c}"),
         _ => String::new(),
     }
 }
@@ -1765,5 +1807,34 @@ mod tests {
             decode(HVPBLOCK, 98, 4, (19_i32 << 24) | 65),
             "HVPBLOCK pid=98 tid=4 native_nr=65 family=semop"
         );
+        assert_eq!(
+            decode(SCHED_DISPATCH, 42, 3, 1),
+            "SCHED_DISPATCH tid=42 executor=3 cpu=1"
+        );
+        assert_eq!(
+            decode(SCHED_PREEMPT, 42, 3, 0x13),
+            "SCHED_PREEMPT tid=42 executor=3 reasons=0x13"
+        );
+        assert_eq!(
+            decode(SCHED_BUDGET, 3, 4, 100),
+            "SCHED_BUDGET executor=3 budget_ms=4 generation=100"
+        );
+        assert_eq!(
+            decode(SCHED_DEADLINE, 3, 4, 1),
+            "SCHED_DEADLINE executor=3 deadline_ms=4 ticket=1"
+        );
+    }
+
+    #[test]
+    fn event_ring_records_preemption_lifecycle_events() {
+        rec_sched_dispatch(101, 5, 2);
+        rec_sched_budget(5, 4, 12);
+        rec_sched_deadline(5, 3, 42);
+        rec_sched_preempt(101, 5, 0x01);
+
+        assert!(contains_event(SCHED_DISPATCH, 101, 5, 2));
+        assert!(contains_event(SCHED_BUDGET, 5, 4, 12));
+        assert!(contains_event(SCHED_DEADLINE, 5, 3, 42));
+        assert!(contains_event(SCHED_PREEMPT, 101, 5, 0x01));
     }
 }
