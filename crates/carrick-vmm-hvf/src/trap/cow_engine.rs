@@ -5292,6 +5292,8 @@ impl HvfTaskState {
                 TWO_MIB,
             )?;
             self.mappings.retain(|m| m.ipa != base);
+            self.mm_access
+                .release_structural_owner_at(base, TWO_MIB as usize);
         }
         Ok(())
     }

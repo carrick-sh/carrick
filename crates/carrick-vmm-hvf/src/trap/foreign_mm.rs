@@ -461,6 +461,20 @@ impl MmAccessState {
         *self.cow_runtime.write() = Some(binding);
     }
 
+    /// Drop this mm's retained authority over a retired structural extent and,
+    /// when it was served by the carrier's root-slot pool, hand the slot back.
+    /// The runtime's stage-1 slot allocator reissues a retired extension arena
+    /// immediately, so the pool must not still consider it in use.
+    pub(crate) fn release_structural_owner_at(&self, physical_ipa: u64, physical_size: usize) {
+        let removed = self
+            .structural_owners
+            .write()
+            .remove(&(physical_ipa, physical_size));
+        if let Some(owner) = removed {
+            owner.release_pooled_root_slot();
+        }
+    }
+
     pub(crate) fn install_structural_owner(&self, owner: std::sync::Arc<StructuralBackingOwner>) {
         let key = (owner.physical_ipa, owner.physical_size);
         self.structural_owners.write().insert(key, owner);
@@ -580,6 +594,10 @@ impl MmAccessState {
                 "stage-1 root structural record remained nonterminal: {snapshot:?}"
             )));
         }
+        // The record is terminal: the runtime may reissue this root slot the
+        // moment it holds the proof below, so a pooled slot goes back to the
+        // pool here rather than at the last `Arc` drop of the retained mapping.
+        authority.owner.release_pooled_root_slot();
 
         let authority = slot.take().unwrap_or_else(|| {
             carrick_fatal!(

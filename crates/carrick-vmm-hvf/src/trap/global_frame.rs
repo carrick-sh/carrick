@@ -1569,6 +1569,14 @@ impl StructuralBackingOwner {
         }
     }
 
+    /// Return a pooled root slot to the pool once this owner's stage-2 record
+    /// is terminal. No-op for owned backings and idempotent for pooled ones.
+    pub(crate) fn release_pooled_root_slot(&self) {
+        if let GlobalFrameBacking::PooledRoot(ref handle) = self.retained.mapping.backing {
+            handle.release_slot();
+        }
+    }
+
     pub(crate) fn ptr(&self) -> *mut u8 {
         self.retained.mapping.backing.as_ptr()
     }

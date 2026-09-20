@@ -453,6 +453,7 @@ impl PreMappedRootSlotPool {
             host_ptr: slot.host_ptr,
             len: TWO_MIB,
             populated_prefix: AtomicUsize::new(0),
+            released: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -477,6 +478,7 @@ impl PreMappedRootSlotPool {
                     host_ptr: slot.host_ptr,
                     len: TWO_MIB,
                     populated_prefix: AtomicUsize::new(0),
+                    released: std::sync::atomic::AtomicBool::new(false),
                 });
             }
         }
@@ -529,6 +531,9 @@ pub(crate) struct PooledRootSlotHandle {
     host_ptr: *mut u8,
     len: usize,
     populated_prefix: AtomicUsize,
+    /// Set once the slot has been handed back, either explicitly at the
+    /// owner's retirement proof or by `Drop`; the second path is a no-op.
+    released: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -559,6 +564,21 @@ impl PooledRootSlotHandle {
     pub(crate) fn record_populated_prefix(&self, prefix: usize) {
         self.populated_prefix.fetch_max(prefix, Ordering::Relaxed);
     }
+
+    /// Hand the slot back to the pool now. The runtime reuses a stage-1 root
+    /// slot as soon as the VMM proves its stage-2 record terminal, which can
+    /// precede the last `Arc` holder of this handle; releasing at the proof
+    /// keeps the pool's `in_use` in step with the runtime allocator, so the
+    /// next owner of the slot always finds it free and never maps the
+    /// pre-mapped IPA on its own. Idempotent.
+    pub(crate) fn release_slot(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            self.pool.recycle(
+                self.slot_index,
+                self.populated_prefix.load(Ordering::Relaxed),
+            );
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -577,10 +597,7 @@ impl carrick_mem::page_table::HostArenaResolver for &PooledRootSlotHandle {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for PooledRootSlotHandle {
     fn drop(&mut self) {
-        self.pool.recycle(
-            self.slot_index,
-            self.populated_prefix.load(Ordering::Relaxed),
-        );
+        self.release_slot();
     }
 }
 

@@ -1017,12 +1017,14 @@ impl HvfVmState {
                             prepared_exec_regions.push((region, lease, Some(handle)));
                         }
                         None => {
-                            let region = prepare_exec_region_raw_in_sized(
-                                &custody,
-                                mapping,
-                                lease.length(),
-                            )?;
-                            prepared_exec_regions.push((region, lease, None));
+                            // The pool pre-maps this IPA; an owned mapping
+                            // here can only collide with it. The slot is
+                            // released at its previous owner's retirement
+                            // proof, before the runtime reissues it.
+                            return Err(TrapError::Hypervisor(format!(
+                                "HVPatch exec root slot IPA 0x{:x} is still held by the root-slot pool",
+                                mapping.ipa_start
+                            )));
                         }
                     }
                 } else {

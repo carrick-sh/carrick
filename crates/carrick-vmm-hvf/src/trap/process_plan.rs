@@ -972,6 +972,15 @@ impl HvfTaskState {
                 if let Some(pool) = carrier_foreign_mm_transport.custody.root_slot_pool() {
                     if let Some(handle) = pool.allocate_slot_at(physical_ipa) {
                         ProcessMappingHost::PooledRootSlot { handle }
+                    } else if pool.contains_ipa(physical_ipa) {
+                        // The pool pre-maps this IPA; an owned mapping here
+                        // can only collide with it. The slot is released at
+                        // its previous owner's retirement proof, before the
+                        // runtime reissues it, so this names a lifecycle bug
+                        // rather than a transient to fall back from.
+                        return Err(TrapError::Hypervisor(format!(
+                            "HVPatch child root slot IPA 0x{physical_ipa:x} is still held by the root-slot pool"
+                        )));
                     } else {
                         let owned = crate::host_mapping::OwnedHostMapping::map_shared_anon(
                             physical_size,
