@@ -5851,18 +5851,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/inotify.rs:1507 in `scan_dir_entries`, `std::fs::read_dir` accesses only the resolved watched directory beneath the hostfs root used by `scan_dir_entries`.",
+    "rationale": "At crates/carrick-kernel/src/inotify.rs:1549 in `scan_dir_entries`, `std::fs::read_dir` accesses only the resolved watched directory beneath the hostfs root used by `scan_dir_entries`.",
     "review_id": "HA-000261",
     "source": {
-      "byte_end": 61733,
-      "byte_start": 61716,
+      "byte_end": 63934,
+      "byte_start": 63917,
       "column": 18,
       "column_end": 35,
       "column_start": 18,
       "file": "crates/carrick-kernel/src/inotify.rs",
-      "line": 1507,
-      "line_end": 1507,
-      "line_start": 1507
+      "line": 1549,
+      "line_end": 1549,
+      "line_start": 1549
     }
   },
   {
