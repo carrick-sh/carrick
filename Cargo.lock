@@ -374,6 +374,7 @@ name = "carrick-conformance"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "carrick-coordinator",
  "clap",
  "libc",
  "regex",
@@ -387,8 +388,10 @@ dependencies = [
 name = "carrick-conformance-contract"
 version = "0.1.0"
 dependencies = [
+ "carrick-abi",
  "carrick-observability",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "toml",
@@ -410,6 +413,17 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "carrick-coordinator"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -543,6 +557,19 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "carrick-investigation"
+version = "0.1.0"
+dependencies = [
+ "carrick-conformance-contract",
+ "carrick-coordinator",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

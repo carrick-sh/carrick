@@ -242,8 +242,157 @@ pub struct SurfaceRegistry {
     pub surfaces: Vec<SurfaceAssignment>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ClaimId(String);
+
+impl ClaimId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
+        let value = value.into();
+        let valid = !value.is_empty()
+            && value.split('.').all(|segment| {
+                !segment.is_empty()
+                    && segment.split('-').all(|part| {
+                        !part.is_empty()
+                            && part
+                                .bytes()
+                                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                    })
+            });
+        if !valid {
+            return Err(ModelError::InvalidClaimId(value));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ClaimId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClaimId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "class", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CapabilityClass {
+    VmFreeExisting {
+        capability: String,
+    },
+    VmFreeExtension {
+        capability: String,
+        rationale: String,
+    },
+    RequiresGuest {
+        rationale: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum CoverageState {
+    Declared,
+    Bound {
+        layer: ExecutionLayer,
+    },
+    Evidenced {
+        layer: ExecutionLayer,
+        revision: String,
+    },
+    ViolationDemonstrated {
+        layer: ExecutionLayer,
+        known_bad_revision: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for CoverageState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
+        enum CoverageStateWire {
+            Declared,
+            Bound {
+                layer: ExecutionLayer,
+            },
+            Evidenced {
+                layer: ExecutionLayer,
+                revision: String,
+            },
+            ViolationDemonstrated {
+                layer: ExecutionLayer,
+                known_bad_revision: String,
+            },
+        }
+
+        let wire = CoverageStateWire::deserialize(deserializer)?;
+        match wire {
+            CoverageStateWire::Declared => Ok(CoverageState::Declared),
+            CoverageStateWire::Bound { layer } => Ok(CoverageState::Bound { layer }),
+            CoverageStateWire::Evidenced { layer, revision } => {
+                if revision.trim().is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "revision cannot be empty or whitespace",
+                    ));
+                }
+                Ok(CoverageState::Evidenced { layer, revision })
+            }
+            CoverageStateWire::ViolationDemonstrated {
+                layer,
+                known_bad_revision,
+            } => {
+                if known_bad_revision.trim().is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "known_bad_revision cannot be empty or whitespace",
+                    ));
+                }
+                Ok(CoverageState::ViolationDemonstrated {
+                    layer,
+                    known_bad_revision,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Claim {
+    pub id: ClaimId,
+    pub contract: ContractId,
+    pub description: String,
+    pub linux_authority: Vec<String>,
+    #[serde(default)]
+    pub fixture_requirements: Vec<String>,
+    #[serde(default)]
+    pub related_contracts: Vec<ContractId>,
+    #[serde(default)]
+    pub related_ecosystem_rows: Vec<String>,
+    pub capability: CapabilityClass,
+    pub coverage: CoverageState,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ModelError {
     #[error("invalid contract id {0:?}")]
     InvalidContractId(String),
+    #[error("invalid claim id {0:?}")]
+    InvalidClaimId(String),
+    #[error("invalid claim {id}: {reason}")]
+    InvalidClaim { id: ClaimId, reason: String },
 }

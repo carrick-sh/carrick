@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use carrick_conformance_contract::ContractRegistry;
+use carrick_conformance_contract::{ContractRegistry, SyscallInventory};
 
 fn parse_args() -> Result<PathBuf, String> {
     let mut args = env::args().skip(1);
@@ -79,10 +79,37 @@ fn run(root: &Path) -> Result<(), String> {
         }
     }
 
+    // Verify inventory matches live generation
+    let inventory = SyscallInventory::generate(&registry);
+    let serialized = serde_json::to_string_pretty(&inventory)
+        .map_err(|e| format!("cannot serialize inventory: {e}"))?;
+    let inventory_path = root.join("conformance-contracts").join("inventory.json");
+    if !inventory_path.exists() {
+        return Err(format!(
+            "missing inventory file {} (run `cargo run -p carrick-conformance-contract --bin generate-inventory` to generate it)",
+            inventory_path.display()
+        ));
+    }
+    let existing = std::fs::read_to_string(&inventory_path).map_err(|e| {
+        format!(
+            "cannot read inventory file {}: {e}",
+            inventory_path.display()
+        )
+    })?;
+    if existing.trim() != serialized.trim() {
+        return Err(format!(
+            "inventory drift detected at {} (run `cargo run -p carrick-conformance-contract --bin generate-inventory` to refresh)",
+            inventory_path.display()
+        ));
+    }
+
     println!(
-        "conformance contracts checked: {} contracts, {} surfaces",
+        "conformance contracts checked: {} contracts, {} claims, {} surfaces (inventory: {} syscalls, {} with claims)",
         registry.contracts().len(),
-        registry.surfaces().len()
+        registry.claims().len(),
+        registry.surfaces().len(),
+        inventory.summary.total_entries,
+        inventory.summary.with_claims
     );
     Ok(())
 }

@@ -1,0 +1,23 @@
+[package]
+name = "carrick-investigation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "investigate"
+path = "src/bin/investigate.rs"
+
+[dependencies]
+chrono = { workspace = true, features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+carrick-conformance-contract = { path = "../carrick-conformance-contract" }
+carrick-coordinator = { path = "../carrick-coordinator" }
+
+[dev-dependencies]
+tempfile.workspace = true

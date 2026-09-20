@@ -1,0 +1,19 @@
+[[claims]]
+id = "kernel.inotify.watch.host-registration-bound"
+contract = "kernel.inotify.watch"
+description = "Inotify watch addition and removal bounds host backend calls to exactly two operations"
+linux_authority = ["man 2 inotify_init1", "man 2 inotify_add_watch", "man 2 inotify_rm_watch"]
+fixture_requirements = ["probe:inotifymatrix"]
+related_contracts = ["kernel.inotify.readiness"]
+capability = { class = "requires-guest", rationale = "Requires host kqueue/multiplexer vnode registration" }
+coverage = { status = "evidenced", layer = "embed-structural", revision = "HEAD" }
+
+[[claims]]
+id = "kernel.inotify.readiness.depth-independent"
+contract = "kernel.inotify.readiness"
+description = "Inotify queue readiness is non-emptiness check with zero queue visits regardless of depth"
+linux_authority = ["man 2 inotify_init1", "man 2 inotify_add_watch", "man 2 read"]
+fixture_requirements = ["probe:inotifyqueue"]
+related_contracts = ["kernel.inotify.watch"]
+capability = { class = "requires-guest", rationale = "Requires live event delivery and queue readiness check" }
+coverage = { status = "evidenced", layer = "embed-structural", revision = "HEAD" }

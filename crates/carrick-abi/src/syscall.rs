@@ -22,9 +22,9 @@
 //! a handler but stays `Deferred`/`Unimplemented` here will under-report
 //! coverage, and the reverse over-reports it.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SupportLevel {
     BringUp,
@@ -32,7 +32,7 @@ pub enum SupportLevel {
     Deferred,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyscallHandler {
     Credentials,
@@ -47,7 +47,7 @@ pub enum SyscallHandler {
     Unimplemented,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Authority {
     /// 100% guest kernel state: MUST NEVER make host process/identity/signal calls.

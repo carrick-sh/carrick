@@ -1,0 +1,4440 @@
+{
+  "summary": {
+    "total_entries": 338,
+    "bring_up": 246,
+    "deferred": 90,
+    "planned": 2,
+    "with_claims": 13,
+    "without_claims": 325,
+    "with_evidence": 13,
+    "with_violation_evidence": 1
+  },
+  "entries": [
+    {
+      "number": 0,
+      "name": "io_setup",
+      "group": "io",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 1,
+      "name": "io_destroy",
+      "group": "io",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 2,
+      "name": "io_submit",
+      "group": "io",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 3,
+      "name": "io_cancel",
+      "group": "io",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 4,
+      "name": "io_getevents",
+      "group": "io",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 5,
+      "name": "setxattr",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 6,
+      "name": "lsetxattr",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 7,
+      "name": "fsetxattr",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 8,
+      "name": "getxattr",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 9,
+      "name": "lgetxattr",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 10,
+      "name": "fgetxattr",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 11,
+      "name": "listxattr",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 12,
+      "name": "llistxattr",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 13,
+      "name": "flistxattr",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 14,
+      "name": "removexattr",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "compat_note": "xattr removal is reported as unsupported for bring-up compatibility",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 15,
+      "name": "lremovexattr",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "compat_note": "xattr removal is reported as unsupported for bring-up compatibility",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 16,
+      "name": "fremovexattr",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "compat_note": "xattr removal is reported as unsupported for bring-up compatibility",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 17,
+      "name": "getcwd",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 18,
+      "name": "lookup_dcookie",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 19,
+      "name": "eventfd2",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 20,
+      "name": "epoll_create1",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 21,
+      "name": "epoll_ctl",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 22,
+      "name": "epoll_pwait",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 23,
+      "name": "dup",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 24,
+      "name": "dup3",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 25,
+      "name": "fcntl",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 26,
+      "name": "inotify_init1",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [
+        "kernel.inotify.readiness",
+        "kernel.inotify.watch"
+      ],
+      "claims": [
+        "kernel.inotify.readiness.depth-independent",
+        "kernel.inotify.watch.host-registration-bound"
+      ]
+    },
+    {
+      "number": 27,
+      "name": "inotify_add_watch",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [
+        "kernel.inotify.readiness",
+        "kernel.inotify.watch"
+      ],
+      "claims": [
+        "kernel.inotify.readiness.depth-independent",
+        "kernel.inotify.watch.host-registration-bound"
+      ]
+    },
+    {
+      "number": 28,
+      "name": "inotify_rm_watch",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [
+        "kernel.inotify.watch"
+      ],
+      "claims": [
+        "kernel.inotify.watch.host-registration-bound"
+      ]
+    },
+    {
+      "number": 29,
+      "name": "ioctl",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 30,
+      "name": "ioprio_set",
+      "group": "sched",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 31,
+      "name": "ioprio_get",
+      "group": "sched",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 32,
+      "name": "flock",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 33,
+      "name": "mknodat",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 34,
+      "name": "mkdirat",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 35,
+      "name": "unlinkat",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 36,
+      "name": "symlinkat",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 37,
+      "name": "linkat",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 38,
+      "name": "renameat",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 39,
+      "name": "umount2",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 40,
+      "name": "mount",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 41,
+      "name": "pivot_root",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 42,
+      "name": "nfsservctl",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 43,
+      "name": "statfs",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 44,
+      "name": "fstatfs",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 45,
+      "name": "truncate",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 46,
+      "name": "ftruncate",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 47,
+      "name": "fallocate",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 48,
+      "name": "faccessat",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 49,
+      "name": "chdir",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 50,
+      "name": "fchdir",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 51,
+      "name": "chroot",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 52,
+      "name": "fchmod",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 53,
+      "name": "fchmodat",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 54,
+      "name": "fchownat",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 55,
+      "name": "fchown",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 56,
+      "name": "openat",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 57,
+      "name": "close",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 58,
+      "name": "vhangup",
+      "group": "tty",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 59,
+      "name": "pipe2",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 60,
+      "name": "quotactl",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 61,
+      "name": "getdents64",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 62,
+      "name": "lseek",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 63,
+      "name": "read",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [
+        "kernel.inotify.readiness",
+        "kernel.scheduler.host-wait-handoff"
+      ],
+      "claims": [
+        "kernel.inotify.readiness.depth-independent",
+        "kernel.scheduler.host-wait-handoff.zero-migration"
+      ]
+    },
+    {
+      "number": 64,
+      "name": "write",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [
+        "kernel.scheduler.host-wait-handoff"
+      ],
+      "claims": [
+        "kernel.scheduler.host-wait-handoff.zero-migration"
+      ]
+    },
+    {
+      "number": 65,
+      "name": "readv",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 66,
+      "name": "writev",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 67,
+      "name": "pread64",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [
+        "kernel.scheduler.host-wait-handoff"
+      ],
+      "claims": [
+        "kernel.scheduler.host-wait-handoff.zero-migration"
+      ]
+    },
+    {
+      "number": 68,
+      "name": "pwrite64",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [
+        "kernel.scheduler.host-wait-handoff"
+      ],
+      "claims": [
+        "kernel.scheduler.host-wait-handoff.zero-migration"
+      ]
+    },
+    {
+      "number": 69,
+      "name": "preadv",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 70,
+      "name": "pwritev",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 71,
+      "name": "sendfile",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 72,
+      "name": "pselect6",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 73,
+      "name": "ppoll",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 74,
+      "name": "signalfd4",
+      "group": "signal",
+      "support": "bring_up",
+      "handler": "signal",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 75,
+      "name": "vmsplice",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 76,
+      "name": "splice",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 77,
+      "name": "tee",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 78,
+      "name": "readlinkat",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 79,
+      "name": "newfstatat",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 80,
+      "name": "fstat",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 81,
+      "name": "sync",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 82,
+      "name": "fsync",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [
+        "kernel.scheduler.host-wait-handoff"
+      ],
+      "claims": [
+        "kernel.scheduler.host-wait-handoff.zero-migration"
+      ]
+    },
+    {
+      "number": 83,
+      "name": "fdatasync",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [
+        "kernel.scheduler.host-wait-handoff"
+      ],
+      "claims": [
+        "kernel.scheduler.host-wait-handoff.zero-migration"
+      ]
+    },
+    {
+      "number": 84,
+      "name": "sync_file_range",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 85,
+      "name": "timerfd_create",
+      "group": "time",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 86,
+      "name": "timerfd_settime",
+      "group": "time",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 87,
+      "name": "timerfd_gettime",
+      "group": "time",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 88,
+      "name": "utimensat",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 89,
+      "name": "acct",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 90,
+      "name": "capget",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 91,
+      "name": "capset",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 92,
+      "name": "personality",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 93,
+      "name": "exit",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "lifecycle",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 94,
+      "name": "exit_group",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "lifecycle",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 95,
+      "name": "waitid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 96,
+      "name": "set_tid_address",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "thread_local",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 97,
+      "name": "unshare",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 98,
+      "name": "futex",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "thread_local",
+      "authority": "guest",
+      "contracts": [
+        "kernel.futex.contention",
+        "kernel.futex.requeue"
+      ],
+      "claims": [
+        "kernel.futex.contention.wake-cardinality",
+        "kernel.futex.requeue.batch-move"
+      ]
+    },
+    {
+      "number": 99,
+      "name": "set_robust_list",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "thread_local",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 100,
+      "name": "get_robust_list",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 101,
+      "name": "nanosleep",
+      "group": "time",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 102,
+      "name": "getitimer",
+      "group": "time",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 103,
+      "name": "setitimer",
+      "group": "time",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 104,
+      "name": "kexec_load",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 105,
+      "name": "init_module",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 106,
+      "name": "delete_module",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 107,
+      "name": "timer_create",
+      "group": "time",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 108,
+      "name": "timer_gettime",
+      "group": "time",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 109,
+      "name": "timer_getoverrun",
+      "group": "time",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 110,
+      "name": "timer_settime",
+      "group": "time",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 111,
+      "name": "timer_delete",
+      "group": "time",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 112,
+      "name": "clock_settime",
+      "group": "time",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 113,
+      "name": "clock_gettime",
+      "group": "time",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 114,
+      "name": "clock_getres",
+      "group": "time",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 115,
+      "name": "clock_nanosleep",
+      "group": "time",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 116,
+      "name": "syslog",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 117,
+      "name": "ptrace",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 118,
+      "name": "sched_setparam",
+      "group": "sched",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 119,
+      "name": "sched_setscheduler",
+      "group": "sched",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 120,
+      "name": "sched_getscheduler",
+      "group": "sched",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 121,
+      "name": "sched_getparam",
+      "group": "sched",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 122,
+      "name": "sched_setaffinity",
+      "group": "sched",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 123,
+      "name": "sched_getaffinity",
+      "group": "sched",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 124,
+      "name": "sched_yield",
+      "group": "sched",
+      "support": "bring_up",
+      "handler": "thread_local",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 125,
+      "name": "sched_get_priority_max",
+      "group": "sched",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 126,
+      "name": "sched_get_priority_min",
+      "group": "sched",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 127,
+      "name": "sched_rr_get_interval",
+      "group": "sched",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 128,
+      "name": "restart_syscall",
+      "group": "signal",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 129,
+      "name": "kill",
+      "group": "signal",
+      "support": "bring_up",
+      "handler": "signal",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 130,
+      "name": "tkill",
+      "group": "signal",
+      "support": "bring_up",
+      "handler": "signal",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 131,
+      "name": "tgkill",
+      "group": "signal",
+      "support": "bring_up",
+      "handler": "signal",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 132,
+      "name": "sigaltstack",
+      "group": "signal",
+      "support": "bring_up",
+      "handler": "signal",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 133,
+      "name": "rt_sigsuspend",
+      "group": "signal",
+      "support": "bring_up",
+      "handler": "signal",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 134,
+      "name": "rt_sigaction",
+      "group": "signal",
+      "support": "bring_up",
+      "handler": "signal",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 135,
+      "name": "rt_sigprocmask",
+      "group": "signal",
+      "support": "bring_up",
+      "handler": "signal",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 136,
+      "name": "rt_sigpending",
+      "group": "signal",
+      "support": "bring_up",
+      "handler": "signal",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 137,
+      "name": "rt_sigtimedwait",
+      "group": "signal",
+      "support": "bring_up",
+      "handler": "signal",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 138,
+      "name": "rt_sigqueueinfo",
+      "group": "signal",
+      "support": "bring_up",
+      "handler": "signal",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 139,
+      "name": "rt_sigreturn",
+      "group": "signal",
+      "support": "bring_up",
+      "handler": "signal",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 140,
+      "name": "setpriority",
+      "group": "sched",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 141,
+      "name": "getpriority",
+      "group": "sched",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 142,
+      "name": "reboot",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 143,
+      "name": "setregid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 144,
+      "name": "setgid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 145,
+      "name": "setreuid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 146,
+      "name": "setuid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 147,
+      "name": "setresuid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 148,
+      "name": "getresuid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 149,
+      "name": "setresgid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 150,
+      "name": "getresgid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 151,
+      "name": "setfsuid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 152,
+      "name": "setfsgid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 153,
+      "name": "times",
+      "group": "time",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 154,
+      "name": "setpgid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 155,
+      "name": "getpgid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 156,
+      "name": "getsid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 157,
+      "name": "setsid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 158,
+      "name": "getgroups",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 159,
+      "name": "setgroups",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 160,
+      "name": "uname",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 161,
+      "name": "sethostname",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 162,
+      "name": "setdomainname",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 163,
+      "name": "getrlimit",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 164,
+      "name": "setrlimit",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 165,
+      "name": "getrusage",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 166,
+      "name": "umask",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 167,
+      "name": "prctl",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 168,
+      "name": "getcpu",
+      "group": "sched",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 169,
+      "name": "gettimeofday",
+      "group": "time",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 170,
+      "name": "settimeofday",
+      "group": "time",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 171,
+      "name": "adjtimex",
+      "group": "time",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 172,
+      "name": "getpid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 173,
+      "name": "getppid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 174,
+      "name": "getuid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 175,
+      "name": "geteuid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 176,
+      "name": "getgid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 177,
+      "name": "getegid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "credentials",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 178,
+      "name": "gettid",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "thread_local",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 179,
+      "name": "sysinfo",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 180,
+      "name": "mq_open",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 181,
+      "name": "mq_unlink",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 182,
+      "name": "mq_timedsend",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 183,
+      "name": "mq_timedreceive",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 184,
+      "name": "mq_notify",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 185,
+      "name": "mq_getsetattr",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 186,
+      "name": "msgget",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 187,
+      "name": "msgctl",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 188,
+      "name": "msgrcv",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 189,
+      "name": "msgsnd",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 190,
+      "name": "semget",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 191,
+      "name": "semctl",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 192,
+      "name": "semtimedop",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 193,
+      "name": "semop",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 194,
+      "name": "shmget",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 195,
+      "name": "shmctl",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 196,
+      "name": "shmat",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 197,
+      "name": "shmdt",
+      "group": "ipc",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 198,
+      "name": "socket",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 199,
+      "name": "socketpair",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 200,
+      "name": "bind",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 201,
+      "name": "listen",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 202,
+      "name": "accept",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 203,
+      "name": "connect",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 204,
+      "name": "getsockname",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 205,
+      "name": "getpeername",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 206,
+      "name": "sendto",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 207,
+      "name": "recvfrom",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 208,
+      "name": "setsockopt",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 209,
+      "name": "getsockopt",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 210,
+      "name": "shutdown",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 211,
+      "name": "sendmsg",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 212,
+      "name": "recvmsg",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 213,
+      "name": "readahead",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 214,
+      "name": "brk",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 215,
+      "name": "munmap",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 216,
+      "name": "mremap",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 217,
+      "name": "add_key",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 218,
+      "name": "request_key",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 219,
+      "name": "keyctl",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 220,
+      "name": "clone",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "lifecycle",
+      "authority": "guest",
+      "contracts": [
+        "kernel.fork.filetable",
+        "kernel.fork.mappings",
+        "kernel.fork.stage1-image"
+      ],
+      "claims": [
+        "kernel.fork.filetable.copy-scaling",
+        "kernel.fork.mappings.deferred-unpopulated",
+        "kernel.fork.stage1-image.image-pool-bound"
+      ]
+    },
+    {
+      "number": 221,
+      "name": "execve",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "lifecycle",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 222,
+      "name": "mmap",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [
+        "kernel.fork.mappings"
+      ],
+      "claims": [
+        "kernel.fork.mappings.deferred-unpopulated"
+      ]
+    },
+    {
+      "number": 223,
+      "name": "fadvise64",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 224,
+      "name": "swapon",
+      "group": "mm",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 225,
+      "name": "swapoff",
+      "group": "mm",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 226,
+      "name": "mprotect",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 227,
+      "name": "msync",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 228,
+      "name": "mlock",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 229,
+      "name": "munlock",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 230,
+      "name": "mlockall",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 231,
+      "name": "munlockall",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 232,
+      "name": "mincore",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 233,
+      "name": "madvise",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 234,
+      "name": "remap_file_pages",
+      "group": "mm",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 235,
+      "name": "mbind",
+      "group": "mm",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 236,
+      "name": "get_mempolicy",
+      "group": "mm",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 237,
+      "name": "set_mempolicy",
+      "group": "mm",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 238,
+      "name": "migrate_pages",
+      "group": "mm",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 239,
+      "name": "move_pages",
+      "group": "mm",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 240,
+      "name": "rt_tgsigqueueinfo",
+      "group": "signal",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 241,
+      "name": "perf_event_open",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 242,
+      "name": "accept4",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 243,
+      "name": "recvmmsg",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 260,
+      "name": "wait4",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "lifecycle",
+      "authority": "guest",
+      "contracts": [
+        "kernel.fork.stage1-image"
+      ],
+      "claims": [
+        "kernel.fork.stage1-image.image-pool-bound"
+      ]
+    },
+    {
+      "number": 261,
+      "name": "prlimit64",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 262,
+      "name": "fanotify_init",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 263,
+      "name": "fanotify_mark",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 264,
+      "name": "name_to_handle_at",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 265,
+      "name": "open_by_handle_at",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 266,
+      "name": "clock_adjtime",
+      "group": "time",
+      "support": "bring_up",
+      "handler": "time",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 267,
+      "name": "syncfs",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 268,
+      "name": "setns",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 269,
+      "name": "sendmmsg",
+      "group": "net",
+      "support": "bring_up",
+      "handler": "network",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 270,
+      "name": "process_vm_readv",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 271,
+      "name": "process_vm_writev",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 272,
+      "name": "kcmp",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 273,
+      "name": "finit_module",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 274,
+      "name": "sched_setattr",
+      "group": "sched",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 275,
+      "name": "sched_getattr",
+      "group": "sched",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 276,
+      "name": "renameat2",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 277,
+      "name": "seccomp",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 278,
+      "name": "getrandom",
+      "group": "random",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 279,
+      "name": "memfd_create",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 280,
+      "name": "bpf",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 281,
+      "name": "execveat",
+      "group": "process",
+      "support": "planned",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "compat_note": "execveat remains planned and currently routes to unimplemented ENOSYS",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "planned syscall without registered claims"
+      ]
+    },
+    {
+      "number": 282,
+      "name": "userfaultfd",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "compat_note": "container policy only: EPERM without CAP_SYS_PTRACE (Docker-default caps), ENOSYS with it — no userfaultfd emulation",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 283,
+      "name": "membarrier",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 284,
+      "name": "mlock2",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 285,
+      "name": "copy_file_range",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 286,
+      "name": "preadv2",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 287,
+      "name": "pwritev2",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 288,
+      "name": "pkey_mprotect",
+      "group": "mm",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 289,
+      "name": "pkey_alloc",
+      "group": "mm",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 290,
+      "name": "pkey_free",
+      "group": "mm",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 291,
+      "name": "statx",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 292,
+      "name": "io_pgetevents",
+      "group": "io",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 293,
+      "name": "rseq",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 294,
+      "name": "kexec_file_load",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 403,
+      "name": "clock_gettime64",
+      "group": "time",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 404,
+      "name": "clock_settime64",
+      "group": "time",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 405,
+      "name": "clock_adjtime64",
+      "group": "time",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 406,
+      "name": "clock_getres_time64",
+      "group": "time",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 407,
+      "name": "clock_nanosleep_time64",
+      "group": "time",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 408,
+      "name": "timer_gettime64",
+      "group": "time",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 409,
+      "name": "timer_settime64",
+      "group": "time",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 410,
+      "name": "timerfd_gettime64",
+      "group": "time",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 411,
+      "name": "timerfd_settime64",
+      "group": "time",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 412,
+      "name": "utimensat_time64",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 413,
+      "name": "pselect6_time64",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 414,
+      "name": "ppoll_time64",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 416,
+      "name": "io_pgetevents_time64",
+      "group": "io",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 417,
+      "name": "recvmmsg_time64",
+      "group": "net",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 418,
+      "name": "mq_timedsend_time64",
+      "group": "ipc",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 419,
+      "name": "mq_timedreceive_time64",
+      "group": "ipc",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 420,
+      "name": "semtimedop_time64",
+      "group": "ipc",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 421,
+      "name": "rt_sigtimedwait_time64",
+      "group": "signal",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 422,
+      "name": "futex_time64",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 423,
+      "name": "sched_rr_get_interval_time64",
+      "group": "sched",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 424,
+      "name": "pidfd_send_signal",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 425,
+      "name": "io_uring_setup",
+      "group": "io",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 426,
+      "name": "io_uring_enter",
+      "group": "io",
+      "support": "bring_up",
+      "handler": "memory",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 427,
+      "name": "io_uring_register",
+      "group": "io",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 428,
+      "name": "open_tree",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 429,
+      "name": "move_mount",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 430,
+      "name": "fsopen",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 431,
+      "name": "fsconfig",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 432,
+      "name": "fsmount",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 433,
+      "name": "fspick",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 434,
+      "name": "pidfd_open",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 435,
+      "name": "clone3",
+      "group": "process",
+      "support": "planned",
+      "handler": "lifecycle",
+      "authority": "guest",
+      "compat_note": "clone3 is partially handled for the clone/fork modes Carrick supports",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "planned syscall without registered claims"
+      ]
+    },
+    {
+      "number": 436,
+      "name": "close_range",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 437,
+      "name": "openat2",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 438,
+      "name": "pidfd_getfd",
+      "group": "process",
+      "support": "bring_up",
+      "handler": "process",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 439,
+      "name": "faccessat2",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 440,
+      "name": "process_madvise",
+      "group": "mm",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 441,
+      "name": "epoll_pwait2",
+      "group": "net",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 442,
+      "name": "mount_setattr",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 443,
+      "name": "quotactl_fd",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 444,
+      "name": "landlock_create_ruleset",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 445,
+      "name": "landlock_add_rule",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 446,
+      "name": "landlock_restrict_self",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 447,
+      "name": "memfd_secret",
+      "group": "mm",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "hybrid",
+      "compat_note": "guest-visible ABI (fd, MAP_SHARED-only mmap, EINVAL file I/O, /proc mem hiding); host direct-map removal and mlock accounting are not modeled",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 448,
+      "name": "process_mrelease",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 449,
+      "name": "futex_waitv",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 450,
+      "name": "set_mempolicy_home_node",
+      "group": "mm",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 451,
+      "name": "cachestat",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 452,
+      "name": "fchmodat2",
+      "group": "fs",
+      "support": "bring_up",
+      "handler": "filesystem",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "emulated in bring-up without explicit contract claim"
+      ]
+    },
+    {
+      "number": 453,
+      "name": "map_shadow_stack",
+      "group": "mm",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 454,
+      "name": "futex_wake",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 455,
+      "name": "futex_wait",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 456,
+      "name": "futex_requeue",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 457,
+      "name": "statmount",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 458,
+      "name": "listmount",
+      "group": "fs",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "host",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 459,
+      "name": "lsm_get_self_attr",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 460,
+      "name": "lsm_set_self_attr",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 461,
+      "name": "lsm_list_modules",
+      "group": "process",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "guest",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    },
+    {
+      "number": 462,
+      "name": "mseal",
+      "group": "mm",
+      "support": "deferred",
+      "handler": "unimplemented",
+      "authority": "hybrid",
+      "contracts": [],
+      "claims": [],
+      "uncovered_behaviors": [
+        "deferred refusal behavior unverified by contract"
+      ]
+    }
+  ]
+}

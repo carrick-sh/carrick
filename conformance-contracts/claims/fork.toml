@@ -1,0 +1,29 @@
+[[claims]]
+id = "kernel.fork.filetable.copy-scaling"
+contract = "kernel.fork.filetable"
+description = "Fork file table copy scaling is proportional to fd count"
+linux_authority = ["man 2 clone", "man 2 fork"]
+fixture_requirements = ["probe:forkfiletable"]
+related_contracts = ["kernel.fork.mappings"]
+capability = { class = "vm-free-existing", capability = "carrick-kernel-example::fork_filetable_contract" }
+coverage = { status = "evidenced", layer = "vm-free", revision = "HEAD" }
+
+[[claims]]
+id = "kernel.fork.mappings.deferred-unpopulated"
+contract = "kernel.fork.mappings"
+description = "Unpopulated deferred anonymous mappings do not allocate backing across fork"
+linux_authority = ["man 2 clone", "man 2 fork", "man 2 mmap"]
+fixture_requirements = ["probe:forksnapshot"]
+related_contracts = ["kernel.fork.filetable", "kernel.fork.stage1-image"]
+capability = { class = "vm-free-existing", capability = "carrick-kernel-example::fork_mappings_contract" }
+coverage = { status = "evidenced", layer = "vm-free", revision = "HEAD" }
+
+[[claims]]
+id = "kernel.fork.stage1-image.image-pool-bound"
+contract = "kernel.fork.stage1-image"
+description = "Stage-1 page table image allocation is bounded by concurrency through stage1 image pool"
+linux_authority = ["man 2 clone", "man 2 fork", "man 2 wait4"]
+fixture_requirements = ["probe:forkserial"]
+related_contracts = ["kernel.fork.mappings"]
+capability = { class = "requires-guest", rationale = "Stage-1 page table projection requires VMM memory virtualization" }
+coverage = { status = "evidenced", layer = "embed-structural", revision = "HEAD" }

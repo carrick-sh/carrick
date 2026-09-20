@@ -89,7 +89,14 @@ KIND_ORDER = {
 }
 EXPECTED_FIELDS = {"path", "line", "column", "kind", "detail", "enclosing_item"}
 
-NON_PRODUCT_CRATES = frozenset({"carrick-conformance", "carrick-test-support"})
+NON_PRODUCT_CRATES = frozenset(
+    {
+        "carrick-conformance",
+        "carrick-coordinator",
+        "carrick-investigation",
+        "carrick-test-support",
+    }
+)
 
 
 def _is_product_source(path: PurePosixPath) -> bool:
