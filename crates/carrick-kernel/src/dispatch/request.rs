@@ -210,6 +210,13 @@ pub struct SyscallCtx<'a, M: CurrentMmMemory> {
     pub(crate) mm_executor: Option<&'a mut MmExecutorParticipation>,
 }
 
+impl<M: CurrentMmMemory> SyscallCtx<'_, M> {
+    #[inline]
+    pub fn can_host_wait(&self) -> bool {
+        self.host_wait.is_some() && self.execution_lease.is_some() && self.mm_executor.is_some()
+    }
+}
+
 /// Context available only after the outer run loop has established structural
 /// page-table mutation authority for this exact syscall and MM.
 pub struct MutationSyscallCtx<'a, 'mutation, 'authority, M: CurrentMmMemory> {

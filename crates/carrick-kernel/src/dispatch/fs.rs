@@ -427,7 +427,7 @@ impl<'a> FsView<'a> {
         &self,
         cx: &'ctx mut super::SyscallCtx<'_, M>,
     ) -> Option<FsHostWaitContext<'a, 'ctx>> {
-        if cx.host_wait.is_none() {
+        if !cx.can_host_wait() {
             None
         } else {
             Some(FsHostWaitContext::new(self.cross, cx))
@@ -441,7 +441,7 @@ impl<'a> FsView<'a> {
         cx: &mut super::SyscallCtx<'_, M>,
         operation: impl FnOnce() -> T,
     ) -> Result<T, super::DispatchError> {
-        if cx.host_wait.is_none() {
+        if !cx.can_host_wait() {
             return Ok(operation());
         }
         let mut operation = Some(operation);

@@ -1418,6 +1418,10 @@ impl<M: carrick_guest_mem::CurrentMmMemory> MmExecutorReleaser for super::Syscal
         dispatcher: &SyscallDispatcher,
         op: &mut dyn FnMut(),
     ) -> Result<(), super::outcome::DispatchError> {
+        if !self.can_host_wait() {
+            op();
+            return Ok(());
+        }
         let context = self
             .host_wait
             .ok_or(super::outcome::DispatchError::MmExecutorExecutionLeaseUnavailable)?;

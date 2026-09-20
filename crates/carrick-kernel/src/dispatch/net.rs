@@ -262,9 +262,9 @@ pub(super) fn host_socket_is_connected(host_fd: i32) -> bool {
     rc == 0
 }
 pub(super) mod epoll_ops;
-pub(in crate::dispatch) use epoll_ops::WriteRearm;
 #[cfg(test)]
 use epoll_ops::epoll_kqueue_for_wake_test;
+pub(in crate::dispatch) use epoll_ops::{IoRearm, WriteRearm};
 pub(super) mod lifecycle;
 pub(super) use lifecycle::{host_stream_socket_is_connected, host_stream_socket_rdhup};
 pub(super) mod netlink;

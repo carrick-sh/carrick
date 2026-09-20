@@ -715,6 +715,12 @@ impl<'a> FsView<'a> {
             // process's stdin is — file, pipe, or terminal).
             if fd.0 == 0 && !this.fd_table_contains(0) {
                 crate::dispatch::net::set_host_nonblocking(0);
+                if host_wait_ref.is_some() {
+                    super::resources::stage_io_rearm(
+                        cx.kernel,
+                        super::net::IoRearm::read(None),
+                    )?;
+                }
                 return read_host_pipe(
                     memory,
                     address,
@@ -736,6 +742,12 @@ impl<'a> FsView<'a> {
             else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
+            if host_wait_ref.is_some() {
+                super::resources::stage_io_rearm(
+                    cx.kernel,
+                    super::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
+                )?;
+            }
             let Some(mut open) = open_file.description.write() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
@@ -1188,6 +1200,12 @@ impl<'a> FsView<'a> {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
+            if host_wait_ref.is_some() {
+                super::resources::stage_io_rearm(
+                    cx.kernel,
+                    super::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
+                )?;
+            }
             let nonblocking = this.io_is_nonblocking(fd.0, 0);
             let Some(mut open) = open_file.description.write() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -1509,6 +1527,12 @@ impl<'a> FsView<'a> {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
+            if host_wait_ref.is_some() {
+                super::resources::stage_io_rearm(
+                    cx.kernel,
+                    super::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
+                )?;
+            }
             let Some(open) = open_file.description.read() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
@@ -1671,6 +1695,12 @@ impl<'a> FsView<'a> {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
+            if host_wait_ref.is_some() {
+                super::resources::stage_io_rearm(
+                    cx.kernel,
+                    super::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
+                )?;
+            }
             let Some(open) = open_file.description.read() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
@@ -1849,14 +1879,18 @@ impl<'a> FsView<'a> {
                     }
                 }
             };
-            let host_wait_runner = this.host_wait_runner_for_ctx(cx);
-            let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
             if is_stdio_fd(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
             }
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
+            if cx.can_host_wait() {
+                super::resources::stage_io_rearm(
+                    cx.kernel,
+                    super::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
+                )?;
+            }
             let Some(open) = open_file.description.read() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
@@ -1906,6 +1940,8 @@ impl<'a> FsView<'a> {
                 else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
+                let host_wait_runner = this.host_wait_runner_for_ctx(cx);
+                let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
                 let outcome = write_host_pipe_owned_at(
                     bytes,
                     offset,
@@ -2122,6 +2158,12 @@ impl<'a> FsView<'a> {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
+            if cx.can_host_wait() {
+                super::resources::stage_io_rearm(
+                    cx.kernel,
+                    super::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
+                )?;
+            }
             let Some(open) = open_file.description.read() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
@@ -2498,6 +2540,12 @@ impl<'a> FsView<'a> {
             // confirmed there's no open description do we fall back to the
             // dispatcher's built-in stdout/stderr buffers.
             if let Some(open_file) = this.open_file(fd) {
+                if cx.can_host_wait() {
+                    super::resources::stage_io_rearm(
+                        cx.kernel,
+                        super::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
+                    )?;
+                }
                 let Some(io_lease) = open_file.description.retain_fd_lease() else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
@@ -3095,6 +3143,12 @@ impl<'a> FsView<'a> {
             }
 
             let host_target = if let Some(open_file) = this.open_file(fd) {
+                if cx.can_host_wait() {
+                    super::resources::stage_io_rearm(
+                        cx.kernel,
+                        super::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
+                    )?;
+                }
                 let open = open_file.description.read();
                 match open.as_deref() {
                     Some(OpenDescription::HostPipe {
