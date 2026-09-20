@@ -124,6 +124,18 @@ pub fn validate_closure_reports(selected: &[Suite], reports: &[SuiteReport]) -> 
         );
     }
 
+    let confirmed: Vec<&str> = reports
+        .iter()
+        .filter(|report| report.confirmation.is_some())
+        .map(|report| report.name.as_str())
+        .collect();
+    if !confirmed.is_empty() {
+        anyhow::bail!(
+            "closure rejects serial confirmation evidence: {}",
+            confirmed.join(", ")
+        );
+    }
+
     let incomplete: Vec<String> = reports
         .iter()
         .filter(|report| report.verdict != Verdict::Match)
@@ -335,6 +347,25 @@ mod tests {
         reports.push(report_named("unexpected", Verdict::Match));
         let error = validate_closure_reports(&selected, &reports).unwrap_err();
         assert!(error.to_string().contains("unexpected: unexpected"));
+    }
+
+    #[test]
+    fn closure_rejects_match_obtained_by_serial_confirmation() {
+        let selected = full_inventory();
+        let mut reports = matching_reports(&selected);
+        reports[0].confirmation = Some(crate::verdict::SerialConfirmation {
+            reason: crate::verdict::ConfirmReason::BudgetKill,
+            load_ms: 7_257,
+            load_budget_ms: 7_000,
+            load_timeout_kind: Some(crate::engine::TimeoutKind::Blocked),
+            serial_ms: Some(1_700),
+            serial_timed_out: false,
+            skipped: None,
+        });
+        let error = validate_closure_reports(&selected, &reports)
+            .expect_err("a recovered MATCH must not erase the original budget failure");
+        assert!(error.to_string().contains("suite-0"));
+        assert!(error.to_string().contains("serial confirmation"));
     }
 
     #[test]

@@ -771,7 +771,9 @@ fn run() -> anyhow::Result<ExitCode> {
     let mut carrick_outs = carrick_outs;
     let mut confirmations: std::collections::BTreeMap<usize, SerialConfirmation> =
         std::collections::BTreeMap::new();
-    {
+    // Closure preserves the first observation at the declared concurrency.
+    // Serial recovery is diagnostic evidence, never proof of parity.
+    if !args.closure {
         let mut load_facts: std::collections::BTreeMap<
             usize,
             (ConfirmReason, u64, u64, Option<engine::TimeoutKind>),
