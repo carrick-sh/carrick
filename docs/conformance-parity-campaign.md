@@ -266,3 +266,27 @@ After the build, compare at least two baseline observations using the same
 23-row smoke harness and unchanged concurrency, with serial confirmation
 explicitly disabled; preserve every initial budget failure and exact artifact
 identity. No guest workload should overlap this build.
+
+## Loaded Go diagnostic capture (2026-09-20)
+
+`target/investigations/parity-20260920/loaded-go-kernel/` captured a
+successful loaded Go run (2711 ms); the subsequent `loaded-go-kernel-b/`
+run hit its unchanged 7000 ms budget (7252 ms observed). No reachable
+kernel debug socket was found at its sampled times. That absence alone
+does not establish a startup failure.
+
+`loaded-go-lldb/` contains a coherent kernel snapshot, all-thread
+backtraces, event ring and modified-memory core for `conf-66325-c10`,
+carrier PID 66529. This carrier had run guest work: the ring recorded
+80125 events, including repeated dispatch/preemption. Executor 8 was
+in `PersistentCarrierMappings::audit` collecting carrier mappings;
+executor 4 was yielding in `run_executor_loop`. These are sampled
+locations, not a proven causal diagnosis. The attach perturbed the run,
+which ended as a regression with missing run metadata; it is not timing
+or acceptance evidence. The original cleanup script rejected that empty
+ID. Follow-up cleanup covered the explicit captured ID and all 22 other
+ledger IDs, with exit zero; see `cleanup-completed.log`.
+
+Parity remains open. Diagnose the dispatch/preemption and mapping-audit
+behavior before changing runtime code; do not infer closure from a
+successful neighboring run or from the debugger capture.
