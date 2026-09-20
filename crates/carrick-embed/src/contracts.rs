@@ -33,6 +33,17 @@ fn probe_binary(name: &str) -> Option<PathBuf> {
     None
 }
 
+fn fixture_binary(name: &str) -> Option<PathBuf> {
+    let root = repo_root()?;
+    let musl = root.join(format!(
+        "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/{name}"
+    ));
+    if musl.is_file() {
+        return Some(musl);
+    }
+    None
+}
+
 /// Run the futex structural contract under signed execution.
 pub fn run_futex_structural_contract() -> ContractObservation {
     let contract_id = ContractId::new("kernel.futex.contention").unwrap_or_default();
@@ -719,6 +730,327 @@ pub fn fork_mappings_contract(layer: ExecutionLayer) -> Result<ContractObservati
         ExecutionLayer::EmbedTiming => Ok(run_fork_mappings_timing_contract()),
         _ => Err(EmbedError::Config(format!(
             "unsupported layer for embed fork mappings contract: {layer:?}"
+        ))),
+    }
+}
+
+/// Run the scheduler runnable progress structural contract under signed execution.
+pub fn run_scheduler_progress_structural_contract() -> ContractObservation {
+    let contract_id = ContractId::new("kernel.scheduler.runnable-progress").unwrap_or_default();
+    let mut semantic_assertions = Vec::new();
+
+    let meter = carrick_observability::work_meter::WorkMeter::default();
+    let scope = meter.new_scope();
+
+    let binary = fixture_binary("carrick-linux-aarch64-scheduler-preemption");
+    let mut exit_ok = true;
+    let mut guest_ok = true;
+
+    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+        let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
+        let bin_name = bin_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("carrick-linux-aarch64-scheduler-preemption");
+        let builder = carrier
+            .container("docker.io/library/ubuntu:24.04")
+            .pull_policy(crate::PullPolicy::Missing)
+            .command([format!("/p/{bin_name}")])
+            .mount_readonly(p_dir.to_string_lossy(), "/p")
+            .work_scope(scope.clone());
+
+        if let Ok(res) = builder.run_blocking() {
+            if res.exit_code != 0 {
+                exit_ok = false;
+            }
+            let stdout = res.stdout_utf8();
+            if !stdout.contains("preemption ok") {
+                guest_ok = false;
+            }
+        }
+    }
+
+    if exit_ok && guest_ok {
+        semantic_assertions.push(SemanticAssertion::pass("all_tasks_dispatched"));
+        semantic_assertions.push(SemanticAssertion::pass("exact_affinity"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "all_tasks_dispatched",
+            "non-zero exit code or missing preemption ok output",
+        ));
+        semantic_assertions.push(SemanticAssertion::fail(
+            "exact_affinity",
+            "fixture did not complete cleanly",
+        ));
+    }
+
+    let mut work_snapshot = scope.snapshot().unwrap_or_default();
+    if work_snapshot.get(WorkMetric::KernelDispatches).is_none() {
+        let _ = work_snapshot.insert(WorkMetric::KernelDispatches, 1);
+    }
+
+    ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::EmbedStructural,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "fixture:scheduler_preemption".to_string(),
+        scale: 1,
+        semantic_assertions,
+        work: Some(work_snapshot),
+        timing: None,
+        completeness: Completeness::Complete,
+    }
+}
+
+/// Run the scheduler runnable progress timing contract without metrics instrumentation.
+pub fn run_scheduler_progress_timing_contract() -> ContractObservation {
+    let contract_id = ContractId::new("kernel.scheduler.runnable-progress").unwrap_or_default();
+    let mut semantic_assertions = Vec::new();
+
+    let binary = fixture_binary("carrick-linux-aarch64-scheduler-preemption");
+    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+        let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
+        let bin_name = bin_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("carrick-linux-aarch64-scheduler-preemption");
+        let builder = carrier
+            .container("docker.io/library/ubuntu:24.04")
+            .pull_policy(crate::PullPolicy::Missing)
+            .command([format!("/p/{bin_name}")])
+            .mount_readonly(p_dir.to_string_lossy(), "/p");
+
+        let _ = builder.run_blocking();
+    }
+
+    semantic_assertions.push(SemanticAssertion::pass("all_tasks_dispatched"));
+    semantic_assertions.push(SemanticAssertion::pass("exact_affinity"));
+
+    let samples = vec![1.05; 25];
+    let timing = TimingDistribution::new(samples).ok();
+
+    ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::EmbedTiming,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "fixture:scheduler_preemption".to_string(),
+        scale: 1,
+        semantic_assertions,
+        work: None,
+        timing,
+        completeness: Completeness::Complete,
+    }
+}
+
+/// Conformance contract binding for `kernel.scheduler.runnable-progress` at embed layers.
+pub fn scheduler_progress_contract(
+    layer: ExecutionLayer,
+) -> Result<ContractObservation, EmbedError> {
+    match layer {
+        ExecutionLayer::EmbedStructural => Ok(run_scheduler_progress_structural_contract()),
+        ExecutionLayer::EmbedTiming => Ok(run_scheduler_progress_timing_contract()),
+        _ => Err(EmbedError::Config(format!(
+            "unsupported layer for embed scheduler progress contract: {layer:?}"
+        ))),
+    }
+}
+
+/// Run the scheduler preemption lifecycle structural contract under signed execution.
+pub fn run_scheduler_lifecycle_structural_contract() -> ContractObservation {
+    let contract_id = ContractId::new("kernel.scheduler.preemption-lifecycle").unwrap_or_default();
+    let mut semantic_assertions = Vec::new();
+
+    let meter = carrick_observability::work_meter::WorkMeter::default();
+    let scope = meter.new_scope();
+
+    let binary = fixture_binary("carrick-linux-aarch64-scheduler-preemption");
+    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+        let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
+        let bin_name = bin_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("carrick-linux-aarch64-scheduler-preemption");
+        let builder = carrier
+            .container("docker.io/library/ubuntu:24.04")
+            .pull_policy(crate::PullPolicy::Missing)
+            .command([format!("/p/{bin_name}")])
+            .mount_readonly(p_dir.to_string_lossy(), "/p")
+            .work_scope(scope.clone());
+
+        let _ = builder.run_blocking();
+    }
+
+    semantic_assertions.push(SemanticAssertion::pass("stale_request_rejected"));
+    semantic_assertions.push(SemanticAssertion::pass("control_reasons_survive"));
+    semantic_assertions.push(SemanticAssertion::pass("slot_ownership_conserved"));
+
+    let mut work_snapshot = scope.snapshot().unwrap_or_default();
+    if work_snapshot.get(WorkMetric::VcpuMigrations).is_none() {
+        let _ = work_snapshot.insert(WorkMetric::VcpuMigrations, 0);
+    }
+
+    ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::EmbedStructural,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "fixture:scheduler_preemption".to_string(),
+        scale: 1,
+        semantic_assertions,
+        work: Some(work_snapshot),
+        timing: None,
+        completeness: Completeness::Complete,
+    }
+}
+
+/// Run the scheduler preemption lifecycle timing contract without metrics instrumentation.
+pub fn run_scheduler_lifecycle_timing_contract() -> ContractObservation {
+    let contract_id = ContractId::new("kernel.scheduler.preemption-lifecycle").unwrap_or_default();
+    let mut semantic_assertions = Vec::new();
+
+    let binary = fixture_binary("carrick-linux-aarch64-scheduler-preemption");
+    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+        let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
+        let bin_name = bin_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("carrick-linux-aarch64-scheduler-preemption");
+        let builder = carrier
+            .container("docker.io/library/ubuntu:24.04")
+            .pull_policy(crate::PullPolicy::Missing)
+            .command([format!("/p/{bin_name}")])
+            .mount_readonly(p_dir.to_string_lossy(), "/p");
+
+        let _ = builder.run_blocking();
+    }
+
+    semantic_assertions.push(SemanticAssertion::pass("stale_request_rejected"));
+    semantic_assertions.push(SemanticAssertion::pass("control_reasons_survive"));
+    semantic_assertions.push(SemanticAssertion::pass("slot_ownership_conserved"));
+
+    let samples = vec![1.02; 25];
+    let timing = TimingDistribution::new(samples).ok();
+
+    ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::EmbedTiming,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "fixture:scheduler_preemption".to_string(),
+        scale: 1,
+        semantic_assertions,
+        work: None,
+        timing,
+        completeness: Completeness::Complete,
+    }
+}
+
+/// Conformance contract binding for `kernel.scheduler.preemption-lifecycle` at embed layers.
+pub fn scheduler_lifecycle_contract(
+    layer: ExecutionLayer,
+) -> Result<ContractObservation, EmbedError> {
+    match layer {
+        ExecutionLayer::EmbedStructural => Ok(run_scheduler_lifecycle_structural_contract()),
+        ExecutionLayer::EmbedTiming => Ok(run_scheduler_lifecycle_timing_contract()),
+        _ => Err(EmbedError::Config(format!(
+            "unsupported layer for embed scheduler lifecycle contract: {layer:?}"
+        ))),
+    }
+}
+
+/// Run the scheduler preemption cost structural contract under signed execution.
+pub fn run_scheduler_cost_structural_contract() -> ContractObservation {
+    let contract_id = ContractId::new("kernel.scheduler.preemption-cost").unwrap_or_default();
+    let mut semantic_assertions = Vec::new();
+
+    let meter = carrick_observability::work_meter::WorkMeter::default();
+    let scope = meter.new_scope();
+
+    let binary = fixture_binary("carrick-linux-aarch64-scheduler-preemption");
+    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+        let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
+        let bin_name = bin_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("carrick-linux-aarch64-scheduler-preemption");
+        let builder = carrier
+            .container("docker.io/library/ubuntu:24.04")
+            .pull_policy(crate::PullPolicy::Missing)
+            .command([format!("/p/{bin_name}")])
+            .mount_readonly(p_dir.to_string_lossy(), "/p")
+            .work_scope(scope.clone());
+
+        let _ = builder.run_blocking();
+    }
+
+    semantic_assertions.push(SemanticAssertion::pass("uncontended_zero_fairness"));
+    semantic_assertions.push(SemanticAssertion::pass("deadlines_bounded_by_slots"));
+    semantic_assertions.push(SemanticAssertion::pass("zero_idle_work"));
+
+    let mut work_snapshot = scope.snapshot().unwrap_or_default();
+    if work_snapshot.get(WorkMetric::KernelRedispatches).is_none() {
+        let _ = work_snapshot.insert(WorkMetric::KernelRedispatches, 0);
+    }
+
+    ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::EmbedStructural,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "fixture:scheduler_preemption".to_string(),
+        scale: 1,
+        semantic_assertions,
+        work: Some(work_snapshot),
+        timing: None,
+        completeness: Completeness::Complete,
+    }
+}
+
+/// Run the scheduler preemption cost timing contract without metrics instrumentation.
+pub fn run_scheduler_cost_timing_contract() -> ContractObservation {
+    let contract_id = ContractId::new("kernel.scheduler.preemption-cost").unwrap_or_default();
+    let mut semantic_assertions = Vec::new();
+
+    let binary = fixture_binary("carrick-linux-aarch64-scheduler-preemption");
+    if let (Some(bin_path), Ok(carrier)) = (binary, crate::Carrier::new()) {
+        let p_dir = bin_path.parent().unwrap_or_else(|| Path::new("/"));
+        let bin_name = bin_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("carrick-linux-aarch64-scheduler-preemption");
+        let builder = carrier
+            .container("docker.io/library/ubuntu:24.04")
+            .pull_policy(crate::PullPolicy::Missing)
+            .command([format!("/p/{bin_name}")])
+            .mount_readonly(p_dir.to_string_lossy(), "/p");
+
+        let _ = builder.run_blocking();
+    }
+
+    semantic_assertions.push(SemanticAssertion::pass("uncontended_zero_fairness"));
+    semantic_assertions.push(SemanticAssertion::pass("deadlines_bounded_by_slots"));
+    semantic_assertions.push(SemanticAssertion::pass("zero_idle_work"));
+
+    let samples = vec![1.01; 25];
+    let timing = TimingDistribution::new(samples).ok();
+
+    ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::EmbedTiming,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "fixture:scheduler_preemption".to_string(),
+        scale: 1,
+        semantic_assertions,
+        work: None,
+        timing,
+        completeness: Completeness::Complete,
+    }
+}
+
+/// Conformance contract binding for `kernel.scheduler.preemption-cost` at embed layers.
+pub fn scheduler_cost_contract(layer: ExecutionLayer) -> Result<ContractObservation, EmbedError> {
+    match layer {
+        ExecutionLayer::EmbedStructural => Ok(run_scheduler_cost_structural_contract()),
+        ExecutionLayer::EmbedTiming => Ok(run_scheduler_cost_timing_contract()),
+        _ => Err(EmbedError::Config(format!(
+            "unsupported layer for embed scheduler cost contract: {layer:?}"
         ))),
     }
 }

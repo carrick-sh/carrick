@@ -1,0 +1,28 @@
+schema_version = 1
+id = "kernel.scheduler.preemption-lifecycle"
+title = "Preemption lifecycle and stale-request protection"
+guest_surfaces = ["scheduler:preemption", "scheduler:host_wait", "scheduler:lifecycle"]
+semantic_authority = [
+  "man 7 sched",
+  "man 2 sigaction",
+]
+fixture = "fixture:scheduler_preemption"
+scale_points = [1, 2, 4, 8]
+rationale = "A stale request never affects a successor; control reasons survive fairness cancellation; handoff preserves slot ownership."
+
+[bindings]
+vm_free = "carrick-kernel-example::scheduler_lifecycle_contract"
+embed = "carrick-embed::scheduler_lifecycle_contract"
+docker = "fixture:scheduler_preemption"
+ecosystem = ["go:runtime", "cpython:threading"]
+
+[[structural_budgets]]
+kind = "exact"
+metric = "vcpu_migrations"
+value = 0
+rationale = "Preemption lifecycle transitions preserve CPU affinity and do not perform spurious vCPU migrations."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20

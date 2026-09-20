@@ -1,0 +1,30 @@
+schema_version = 1
+id = "kernel.scheduler.runnable-progress"
+title = "Runnable scheduler preemption progress"
+guest_surfaces = ["scheduler:preemption", "scheduler:rotation"]
+semantic_authority = [
+  "man 7 sched",
+  "man 2 sched_yield",
+  "man 2 sched_setaffinity",
+]
+fixture = "fixture:scheduler_preemption"
+scale_points = [1, 8, 32, 128]
+rationale = "Eligible syscall-free tasks rotate under a finite execution budget; affinity and thread identity remain exact."
+
+[bindings]
+vm_free = "carrick-kernel-example::scheduler_progress_contract"
+embed = "carrick-embed::scheduler_progress_contract"
+docker = "fixture:scheduler_preemption"
+ecosystem = ["go:runtime", "cpython:threading"]
+
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_dispatches"
+base = 0
+per_unit = 1
+rationale = "Each runnable task receives at least one dispatch in a rotation round."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20
