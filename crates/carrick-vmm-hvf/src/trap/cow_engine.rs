@@ -80,6 +80,33 @@ impl HvfVmState {
             None
         };
         let mut matched_dynamic_aliases = 0usize;
+        let page_armed_ranges: Vec<(u64, u64)> = self
+            .cow_armed
+            .lock()
+            .ranges
+            .iter()
+            .filter(|r| r.granule == carrick_aarch64::vmm::CowGranule::Page)
+            .map(|r| (r.va, r.va.saturating_add(r.len as u64)))
+            .collect();
+        let inventory = self.frame_inventory.lock();
+        let is_page_granular = |start: u64, end: u64, physical_ipa: u64| -> bool {
+            if page_armed_ranges
+                .iter()
+                .any(|&(p_start, p_end)| p_start < end && start < p_end)
+            {
+                return true;
+            }
+            inventory
+                .extents
+                .iter()
+                .find(|(key, _)| {
+                    key.0 <= physical_ipa && physical_ipa < key.0.saturating_add(key.1)
+                })
+                .map(|(_, extent)| {
+                    matches!(extent.backing, InventoryBackingIdentity::PrivateFileView(_))
+                })
+                .unwrap_or(false)
+        };
         let mut ranges: Vec<_> = self
             .mappings
             .iter()
@@ -103,15 +130,24 @@ impl HvfVmState {
                     )
                     && is_current
             })
-            .map(|mapping| carrick_aarch64::vmm::ForkCowRange {
-                va: mapping.start,
-                len: semantic_extent_size(mapping.start, mapping.end),
-                executable: u64::from(mapping.perms) & 4 != 0,
-                kernel_only: is_kernel_only_stage1_range(
+            .map(|mapping| {
+                let len = semantic_extent_size(mapping.start, mapping.end);
+                let granule = if is_page_granular(
                     mapping.start,
-                    semantic_extent_size(mapping.start, mapping.end),
-                ),
-                granule: carrick_aarch64::vmm::CowGranule::Compound,
+                    mapping.start.saturating_add(len as u64),
+                    mapping.physical_ipa,
+                ) {
+                    carrick_aarch64::vmm::CowGranule::Page
+                } else {
+                    carrick_aarch64::vmm::CowGranule::Compound
+                };
+                carrick_aarch64::vmm::ForkCowRange {
+                    va: mapping.start,
+                    len,
+                    executable: u64::from(mapping.perms) & 4 != 0,
+                    kernel_only: is_kernel_only_stage1_range(mapping.start, len),
+                    granule,
+                }
             })
             .collect();
         let all_aliases_covered = matched_dynamic_aliases == alias_index.len();
@@ -139,15 +175,27 @@ impl HvfVmState {
                     mapping.sharing == GuestMappingSharing::Private
                         && !is_kernel_only_stage1_range(mapping.start, mapping.size)
                 })
-                .map(|mapping| carrick_aarch64::vmm::ForkCowRange {
-                    va: mapping.start,
-                    len: mapping.size,
-                    executable: mapping.perms & 4 != 0,
-                    kernel_only: is_kernel_only_stage1_range(mapping.start, mapping.size),
-                    granule: carrick_aarch64::vmm::CowGranule::Compound,
+                .map(|mapping| {
+                    let granule = if is_page_granular(
+                        mapping.start,
+                        mapping.start.saturating_add(mapping.size as u64),
+                        mapping.ipa,
+                    ) {
+                        carrick_aarch64::vmm::CowGranule::Page
+                    } else {
+                        carrick_aarch64::vmm::CowGranule::Compound
+                    };
+                    carrick_aarch64::vmm::ForkCowRange {
+                        va: mapping.start,
+                        len: mapping.size,
+                        executable: mapping.perms & 4 != 0,
+                        kernel_only: is_kernel_only_stage1_range(mapping.start, mapping.size),
+                        granule,
+                    }
                 }),
             );
         }
+        drop(inventory);
         let mut seen_for_source = if has_shadowed {
             Some(ProcessAliasSet::with_capacity_and_hasher(
                 self.mappings.len(),
