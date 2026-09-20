@@ -3,17 +3,20 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use carrick_abi::LinuxCloneFlags;
 use carrick_hal::NullHostSignalBridge;
 use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 use carrick_hal::{
-    BudgetError, CpuQueueView, GuestCpuId, RunBudget, SchedProcessId, SchedThreadId,
-    SchedulingPolicy, TaskPlacement, ThreadId,
+    BudgetError, CpuAffinity, CpuQueueView, DispatchContext, GuestCpuId, GuestCpuPolicy, RunBudget,
+    SchedProcessId, SchedThreadId, SchedulingPolicy, TaskPlacement, ThreadId,
 };
 use carrick_kernel::kernel::objects::MigratableTaskState;
 use carrick_kernel::kernel::scheduler::PreemptionReasons;
+use carrick_kernel::kernel::scheduler::preemption::{
+    DeliveryOutcome, DemandTicket, ManualClock, MonotonicClock, PreemptionRequest, PreemptionWork,
+};
 use carrick_kernel::kernel::{
     ClonePlan, ExecutorBinding, ExecutorKick, ExecutorKickToken, Kernel, KernelContext, Scheduler,
 };
@@ -94,6 +97,50 @@ fn bootstrap_kernel(pid: i32) -> (Arc<Kernel>, KernelContext, Arc<AsidAllocator>
     .expect("boot root");
     let kernel = Arc::clone(root.kernel());
     (kernel, root, asids)
+}
+
+fn bootstrap_kernel_with_policy_and_clock(
+    pid: i32,
+    policy: Arc<dyn SchedulingPolicy>,
+    clock: Arc<dyn MonotonicClock>,
+) -> (
+    Arc<Kernel>,
+    KernelContext,
+    Arc<Scheduler>,
+    Arc<AsidAllocator>,
+) {
+    let asids = Arc::new(AsidAllocator::new());
+    let space = AddressSpace::allocate(&asids).expect("allocate space");
+    let (_process, root) = ExampleProcess::boot_root(
+        pid,
+        "scheduler preemption test",
+        Arc::new(NullHostSignalBridge::default()),
+        space,
+    )
+    .expect("boot root");
+    let kernel = Arc::clone(root.kernel());
+    let scheduler = Arc::new(Scheduler::new_with_policy_and_clock(
+        Arc::clone(&kernel),
+        policy,
+        clock,
+    ));
+    (kernel, root, scheduler, asids)
+}
+
+fn bootstrap_kernel_with_clock(
+    pid: i32,
+    clock: Arc<dyn MonotonicClock>,
+) -> (
+    Arc<Kernel>,
+    KernelContext,
+    Arc<Scheduler>,
+    Arc<AsidAllocator>,
+) {
+    bootstrap_kernel_with_policy_and_clock(
+        pid,
+        Arc::new(GuestCpuPolicy::new(carrick_hal::MAX_GUEST_CPUS)),
+        clock,
+    )
 }
 
 fn create_sibling_thread(
@@ -711,4 +758,572 @@ fn uncontended_syscall_steps_retain_residency() {
     assert!(!kick.kicked.load(Ordering::Acquire));
 
     scheduler.settle_runnable(running).unwrap();
+}
+
+/// Test 10: Timeline: A starts at 0; B queues at 1 ms -> One request due at 4 ms.
+#[test]
+fn timeline_a_starts_0_b_queues_1ms_due_at_4ms() {
+    let t0 = Instant::now();
+    let clock = Arc::new(ManualClock::new(t0));
+    let (kernel, ctx_a, scheduler, _asids) = bootstrap_kernel_with_clock(70_001, clock.clone());
+    clock.attach_condvar(scheduler.preemption_condvar());
+    publish_task(&ctx_a, 1001);
+    let ctx_b = create_sibling_thread(&kernel, &ctx_a, 70_002);
+    publish_task(&ctx_b, 1002);
+
+    let kick_a = Arc::new(TestKick::default());
+    let exec_a = scheduler
+        .register_executor_bound(kick_a, Some(GuestCpuId::new(0)), false)
+        .unwrap();
+
+    scheduler.make_runnable(ctx_a.thread().key()).unwrap();
+    let running_a = scheduler.take(&exec_a).unwrap();
+    assert_eq!(
+        scheduler.live_deadline_count(),
+        0,
+        "uncontended residency has no deadline"
+    );
+
+    clock.advance(Duration::from_millis(1));
+    scheduler.make_runnable(ctx_b.thread().key()).unwrap();
+
+    assert!(scheduler.has_deadline(exec_a.id()));
+    assert_eq!(
+        scheduler.deadline_for(exec_a.id()),
+        Some(t0 + Duration::from_millis(4))
+    );
+    assert_eq!(scheduler.live_deadline_count(), 1);
+
+    clock.advance(Duration::from_millis(2)); // t = 3 ms
+    assert!(
+        scheduler.poll_due_preemption_requests().is_empty(),
+        "deadline at 4 ms must not be due at 3 ms"
+    );
+
+    clock.advance(Duration::from_millis(1)); // t = 4 ms
+    let due = scheduler.poll_due_preemption_requests();
+    assert_eq!(due.len(), 1, "exactly one request due at 4 ms");
+    assert_eq!(due[0].binding.executor(), exec_a.id());
+    assert!(due[0].reasons.contains(PreemptionReasons::FAIRNESS));
+
+    scheduler.settle_runnable(running_a).unwrap();
+}
+
+/// Test 11: Timeline: A starts at 0; B queues at 20 ms -> A immediately eligible for one request.
+#[test]
+fn timeline_a_starts_0_b_queues_20ms_immediately_eligible() {
+    let t0 = Instant::now();
+    let clock = Arc::new(ManualClock::new(t0));
+    let (kernel, ctx_a, scheduler, _asids) = bootstrap_kernel_with_clock(71_001, clock.clone());
+    publish_task(&ctx_a, 1101);
+    let ctx_b = create_sibling_thread(&kernel, &ctx_a, 71_002);
+    publish_task(&ctx_b, 1102);
+
+    let kick_a = Arc::new(TestKick::default());
+    let exec_a = scheduler
+        .register_executor_bound(kick_a, Some(GuestCpuId::new(0)), false)
+        .unwrap();
+
+    scheduler.make_runnable(ctx_a.thread().key()).unwrap();
+    let running_a = scheduler.take(&exec_a).unwrap();
+
+    clock.advance(Duration::from_millis(20));
+    assert!(
+        scheduler.poll_due_preemption_requests().is_empty(),
+        "no requests before contention"
+    );
+
+    scheduler.make_runnable(ctx_b.thread().key()).unwrap();
+    let due = scheduler.poll_due_preemption_requests();
+    assert_eq!(
+        due.len(),
+        1,
+        "A is immediately eligible for one preemption request"
+    );
+    assert_eq!(due[0].binding.executor(), exec_a.id());
+    assert!(due[0].reasons.contains(PreemptionReasons::FAIRNESS));
+
+    assert!(
+        scheduler.poll_due_preemption_requests().is_empty(),
+        "one due claim produces at most one delivery"
+    );
+
+    scheduler.settle_runnable(running_a).unwrap();
+}
+
+/// Test 12: Timeline: More wakes at 2 and 3 ms do not extend original 4 ms deadline.
+#[test]
+fn timeline_more_wakes_do_not_extend_deadline() {
+    let t0 = Instant::now();
+    let clock = Arc::new(ManualClock::new(t0));
+    let (kernel, ctx_a, scheduler, _asids) = bootstrap_kernel_with_clock(72_001, clock.clone());
+    publish_task(&ctx_a, 1201);
+    let ctx_b = create_sibling_thread(&kernel, &ctx_a, 72_002);
+    publish_task(&ctx_b, 1202);
+    let ctx_c = create_sibling_thread(&kernel, &ctx_a, 72_003);
+    publish_task(&ctx_c, 1203);
+    let ctx_d = create_sibling_thread(&kernel, &ctx_a, 72_004);
+    publish_task(&ctx_d, 1204);
+
+    let kick_a = Arc::new(TestKick::default());
+    let exec_a = scheduler
+        .register_executor_bound(kick_a, Some(GuestCpuId::new(0)), false)
+        .unwrap();
+
+    scheduler.make_runnable(ctx_a.thread().key()).unwrap();
+    let running_a = scheduler.take(&exec_a).unwrap();
+
+    clock.advance(Duration::from_millis(1));
+    scheduler.make_runnable(ctx_b.thread().key()).unwrap();
+    assert_eq!(
+        scheduler.deadline_for(exec_a.id()),
+        Some(t0 + Duration::from_millis(4))
+    );
+
+    clock.advance(Duration::from_millis(1)); // t = 2 ms
+    scheduler.make_runnable(ctx_c.thread().key()).unwrap();
+    assert_eq!(
+        scheduler.deadline_for(exec_a.id()),
+        Some(t0 + Duration::from_millis(4)),
+        "wake at 2 ms must not extend deadline"
+    );
+
+    clock.advance(Duration::from_millis(1)); // t = 3 ms
+    scheduler.make_runnable(ctx_d.thread().key()).unwrap();
+    assert_eq!(
+        scheduler.deadline_for(exec_a.id()),
+        Some(t0 + Duration::from_millis(4)),
+        "wake at 3 ms must not extend deadline"
+    );
+    assert!(scheduler.poll_due_preemption_requests().is_empty());
+
+    clock.advance(Duration::from_millis(1)); // t = 4 ms
+    let due = scheduler.poll_due_preemption_requests();
+    assert_eq!(
+        due.len(),
+        1,
+        "exactly one request due at original 4 ms deadline"
+    );
+
+    scheduler.settle_runnable(running_a).unwrap();
+}
+
+/// Test 13: Timeline: B claimed by idle executor before expiry cancels unclaimed deadline.
+#[test]
+fn timeline_b_claimed_by_idle_executor_cancels_unclaimed_deadline() {
+    let t0 = Instant::now();
+    let clock = Arc::new(ManualClock::new(t0));
+    let (kernel, ctx_a, scheduler, _asids) = bootstrap_kernel_with_clock(73_001, clock.clone());
+    publish_task(&ctx_a, 1301);
+    let ctx_b = create_sibling_thread(&kernel, &ctx_a, 73_002);
+    publish_task(&ctx_b, 1302);
+
+    let kick_a = Arc::new(TestKick::default());
+    let kick_b = Arc::new(TestKick::default());
+    let exec_a = scheduler
+        .register_executor_bound(kick_a, Some(GuestCpuId::new(0)), false)
+        .unwrap();
+    let exec_b = scheduler
+        .register_executor_bound(kick_b, Some(GuestCpuId::new(0)), false)
+        .unwrap();
+
+    scheduler.make_runnable(ctx_a.thread().key()).unwrap();
+    let running_a = scheduler.take(&exec_a).unwrap();
+
+    clock.advance(Duration::from_millis(1));
+    scheduler.make_runnable(ctx_b.thread().key()).unwrap();
+    assert!(scheduler.has_deadline(exec_a.id()));
+    assert_eq!(scheduler.live_deadline_count(), 1);
+
+    clock.advance(Duration::from_millis(1)); // t = 2 ms
+    let running_b = scheduler.take(&exec_b).unwrap(); // B claimed by idle executor
+    assert!(
+        !scheduler.has_deadline(exec_a.id()),
+        "claiming demand must eagerly cancel unclaimed deadline on A"
+    );
+    assert_eq!(scheduler.live_deadline_count(), 0);
+
+    clock.advance(Duration::from_millis(2)); // t = 4 ms
+    assert!(
+        scheduler.poll_due_preemption_requests().is_empty(),
+        "no request should fire after deadline was cancelled"
+    );
+
+    scheduler.settle_runnable(running_a).unwrap();
+    scheduler.settle_runnable(running_b).unwrap();
+}
+
+/// Test 14: Timeline: B only allows CPU 0; CPU 1 is busy -> never kick CPU 1 for B.
+#[test]
+fn timeline_affinity_constrained_contender_never_kicks_ineligible_cpu() {
+    let t0 = Instant::now();
+    let clock = Arc::new(ManualClock::new(t0));
+    let (kernel, ctx_a, scheduler, _asids) = bootstrap_kernel_with_clock(74_001, clock.clone());
+    publish_task(&ctx_a, 1401);
+    let ctx_b = create_sibling_thread(&kernel, &ctx_a, 74_002);
+    publish_task(&ctx_b, 1402);
+
+    let kick_1 = Arc::new(TestKick::default());
+    let exec_1 = scheduler
+        .register_executor_bound(kick_1.clone(), Some(GuestCpuId::new(1)), false)
+        .unwrap();
+
+    scheduler.make_runnable(ctx_a.thread().key()).unwrap();
+    let running_a = scheduler.take(&exec_1).unwrap();
+
+    // B only allows CPU 0
+    ctx_b
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+
+    clock.advance(Duration::from_millis(1));
+    scheduler.make_runnable(ctx_b.thread().key()).unwrap();
+
+    assert!(
+        !scheduler.has_deadline(exec_1.id()),
+        "ineligible CPU 1 must not receive a deadline for CPU 0 demand"
+    );
+
+    clock.advance(Duration::from_millis(10));
+    assert!(
+        scheduler.poll_due_preemption_requests().is_empty(),
+        "ineligible CPU 1 must never be queued for preemption"
+    );
+    assert!(!kick_1.kicked.load(Ordering::SeqCst));
+
+    scheduler.settle_runnable(running_a).unwrap();
+}
+
+/// Test 15: Timeline: One contender, several busy executors on CPU 0 -> selects one oldest eligible residency.
+#[test]
+fn timeline_one_contender_several_busy_executors_selects_oldest() {
+    let t0 = Instant::now();
+    let clock = Arc::new(ManualClock::new(t0));
+    let (kernel, ctx_a1, scheduler, _asids) = bootstrap_kernel_with_clock(75_001, clock.clone());
+    publish_task(&ctx_a1, 1501);
+    let ctx_a2 = create_sibling_thread(&kernel, &ctx_a1, 75_002);
+    publish_task(&ctx_a2, 1502);
+    let ctx_b = create_sibling_thread(&kernel, &ctx_a1, 75_003);
+    publish_task(&ctx_b, 1503);
+
+    let kick_1 = Arc::new(TestKick::default());
+    let kick_2 = Arc::new(TestKick::default());
+    let exec_1 = scheduler
+        .register_executor_bound(kick_1, Some(GuestCpuId::new(0)), false)
+        .unwrap();
+    let exec_2 = scheduler
+        .register_executor_bound(kick_2, Some(GuestCpuId::new(0)), false)
+        .unwrap();
+
+    scheduler.make_runnable(ctx_a1.thread().key()).unwrap();
+    let running_1 = scheduler.take(&exec_1).unwrap(); // starts at t = 0 ms
+
+    clock.advance(Duration::from_millis(1)); // t = 1 ms
+    scheduler.make_runnable(ctx_a2.thread().key()).unwrap();
+    let running_2 = scheduler.take(&exec_2).unwrap(); // starts at t = 1 ms
+
+    clock.advance(Duration::from_millis(1)); // t = 2 ms
+    scheduler.make_runnable(ctx_b.thread().key()).unwrap(); // 1 contender queues
+
+    assert!(
+        scheduler.has_deadline(exec_1.id()),
+        "oldest residency must be selected for single contender"
+    );
+    assert!(
+        !scheduler.has_deadline(exec_2.id()),
+        "newer residency must NOT receive deadline when demand is 1"
+    );
+    assert_eq!(scheduler.live_deadline_count(), 1);
+
+    scheduler.settle_runnable(running_1).unwrap();
+    scheduler.settle_runnable(running_2).unwrap();
+}
+
+/// Test 16: Timeline: Demand disappears after delivery claim -> at most one extra exit of the same binding.
+#[test]
+fn timeline_demand_disappears_after_delivery_claim_at_most_one_extra_exit() {
+    let t0 = Instant::now();
+    let clock = Arc::new(ManualClock::new(t0));
+    let (kernel, ctx_a, scheduler, _asids) = bootstrap_kernel_with_clock(76_001, clock.clone());
+    publish_task(&ctx_a, 1601);
+    let ctx_b = create_sibling_thread(&kernel, &ctx_a, 76_002);
+    publish_task(&ctx_b, 1602);
+
+    let kick_a = Arc::new(TestKick::default());
+    let exec_a = scheduler
+        .register_executor_bound(kick_a.clone(), Some(GuestCpuId::new(0)), false)
+        .unwrap();
+
+    scheduler.make_runnable(ctx_a.thread().key()).unwrap();
+    let running_a = scheduler.take(&exec_a).unwrap();
+
+    clock.advance(Duration::from_millis(1));
+    scheduler.make_runnable(ctx_b.thread().key()).unwrap();
+
+    clock.advance(Duration::from_millis(3)); // t = 4 ms
+    let delivered = scheduler.request_preemption();
+    assert_eq!(delivered, 1);
+    assert_eq!(kick_a.tokens.lock().len(), 1);
+
+    // Subsequent poll/request should be 0 because demand was claimed:
+    assert!(scheduler.poll_due_preemption_requests().is_empty());
+    assert_eq!(
+        scheduler.request_preemption(),
+        0,
+        "demand claimed once must not deliver multiple times"
+    );
+
+    scheduler.settle_runnable(running_a).unwrap();
+}
+
+/// Test 17: Timeline: Deadline fires after exec/unbind -> no successor receives that request.
+#[test]
+fn timeline_deadline_fires_after_exec_unbind_no_successor() {
+    let t0 = Instant::now();
+    let clock = Arc::new(ManualClock::new(t0));
+    let (kernel, ctx_a, scheduler, _asids) = bootstrap_kernel_with_clock(77_001, clock.clone());
+    publish_task(&ctx_a, 1701);
+    let ctx_b = create_sibling_thread(&kernel, &ctx_a, 77_002);
+    publish_task(&ctx_b, 1702);
+
+    let kick_a = Arc::new(TestKick::default());
+    let exec_a = scheduler
+        .register_executor_bound(kick_a.clone(), Some(GuestCpuId::new(0)), false)
+        .unwrap();
+
+    scheduler.make_runnable(ctx_a.thread().key()).unwrap();
+    let running_a = scheduler.take(&exec_a).unwrap();
+    let old_binding = running_a.binding();
+
+    clock.advance(Duration::from_millis(1));
+    scheduler.make_runnable(ctx_b.thread().key()).unwrap();
+    assert!(scheduler.has_deadline(exec_a.id()));
+
+    // At 2 ms, task unbinds / execs:
+    clock.advance(Duration::from_millis(1)); // t = 2 ms
+    scheduler.settle_exited(running_a).unwrap();
+    kick_a.unbind(old_binding);
+
+    // At 4 ms, deadline fires:
+    clock.advance(Duration::from_millis(2)); // t = 4 ms
+    let stale_req = PreemptionRequest {
+        binding: old_binding,
+        ticket: DemandTicket(0),
+        reasons: PreemptionReasons::FAIRNESS,
+        cpu: GuestCpuId::new(0),
+    };
+    let outcome = scheduler.deliver_preemption(stale_req);
+    assert_eq!(outcome, DeliveryOutcome::Stale);
+    assert!(
+        kick_a.tokens.lock().is_empty(),
+        "unbound/successor executor must not receive kick for stale binding"
+    );
+}
+
+/// Test 18: Cost assertions: live deadline entries <= live execution slots; parked noncompetitors add zero fairness work; FIFO rotation.
+#[test]
+fn cost_assertions_and_fifo_rotation() {
+    for slots in [1, 2, 4] {
+        for n in [1, 8, 32, 128] {
+            let clock = Arc::new(ManualClock::new(Instant::now()));
+            let policy = Arc::new(GuestCpuPolicy::new(1));
+            let (kernel, root, scheduler, _asids) = bootstrap_kernel_with_policy_and_clock(
+                78_000 + (slots * 1000 + n) as i32,
+                policy,
+                clock.clone(),
+            );
+            clock.attach_condvar(scheduler.preemption_condvar());
+            publish_task(&root, 18_000);
+
+            let mut executors = Vec::new();
+            for _ in 0..slots {
+                let kick = Arc::new(TestKick::default());
+                let exec = scheduler
+                    .register_executor_bound(kick, Some(GuestCpuId::new(0)), false)
+                    .unwrap();
+                executors.push(exec);
+            }
+
+            let mut threads = vec![root.thread().key()];
+            for i in 1..n {
+                let sibling = create_sibling_thread(
+                    &kernel,
+                    &root,
+                    78_000 + (slots * 1000 + n) as i32 + i as i32,
+                );
+                publish_task(&sibling, 18_000 + i as u64);
+                threads.push(sibling.thread().key());
+            }
+
+            for key in &threads {
+                scheduler.make_runnable(*key).unwrap();
+            }
+
+            // Invariant 1: live deadline entries <= live execution slots
+            assert!(
+                scheduler.live_deadline_count() <= slots,
+                "deadlines {} must not exceed live execution slots {}",
+                scheduler.live_deadline_count(),
+                slots
+            );
+
+            // Run a rotation:
+            let mut running_threads = Vec::new();
+            for exec in &executors {
+                if scheduler.queued_len() > 0
+                    && let Ok(runnable) = scheduler.take(exec)
+                {
+                    running_threads.push(runnable);
+                }
+            }
+
+            assert!(
+                scheduler.live_deadline_count() <= slots,
+                "deadlines {} must not exceed slots {} after take",
+                scheduler.live_deadline_count(),
+                slots
+            );
+
+            // Advance clock by quantum to trigger preemption eligibility:
+            clock.advance(Duration::from_millis(4));
+
+            let due = scheduler.poll_due_preemption_requests();
+            assert!(
+                due.len() <= slots,
+                "due requests {} cannot exceed live execution slots {}",
+                due.len(),
+                slots
+            );
+
+            // Settle all running threads
+            for r in running_threads {
+                scheduler.settle_runnable(r).unwrap();
+            }
+
+            // Drain queue without blocking
+            while scheduler.queued_len() > 0 {
+                let r = scheduler.take(&executors[0]).unwrap();
+                scheduler.settle_exited(r).unwrap();
+            }
+
+            // Invariant 2: when queue is drained, parked noncompetitors add zero fairness work
+            assert_eq!(
+                scheduler.live_deadline_count(),
+                0,
+                "drained queue must have 0 live deadlines"
+            );
+            assert!(
+                scheduler.poll_due_preemption_requests().is_empty(),
+                "drained queue must have 0 due requests"
+            );
+        }
+    }
+}
+
+/// Test 19: Custom quantum policy: policy returning 10 ms quantum sets 10 ms deadline, not 4 ms.
+#[test]
+fn custom_quantum_policy_sets_10ms_deadline() {
+    #[derive(Debug)]
+    struct CustomQuantumPolicy {
+        base: GuestCpuPolicy,
+    }
+
+    impl SchedulingPolicy for CustomQuantumPolicy {
+        fn cpu_count(&self) -> usize {
+            self.base.cpu_count()
+        }
+
+        fn select_cpu(&self, placement: &TaskPlacement<'_>) -> GuestCpuId {
+            self.base.select_cpu(placement)
+        }
+
+        fn on_dispatch(&self, _ctx: &DispatchContext) -> RunBudget {
+            RunBudget::new(Duration::from_millis(10)).unwrap()
+        }
+    }
+
+    let t0 = Instant::now();
+    let clock = Arc::new(ManualClock::new(t0));
+    let policy = Arc::new(CustomQuantumPolicy {
+        base: GuestCpuPolicy::new(carrick_hal::MAX_GUEST_CPUS),
+    });
+    let (kernel, ctx_a, scheduler, _asids) =
+        bootstrap_kernel_with_policy_and_clock(79_001, policy, clock.clone());
+    publish_task(&ctx_a, 1901);
+    let ctx_b = create_sibling_thread(&kernel, &ctx_a, 79_002);
+    publish_task(&ctx_b, 1902);
+
+    let kick_a = Arc::new(TestKick::default());
+    let exec_a = scheduler
+        .register_executor_bound(kick_a, Some(GuestCpuId::new(0)), false)
+        .unwrap();
+
+    scheduler.make_runnable(ctx_a.thread().key()).unwrap();
+    let running_a = scheduler.take(&exec_a).unwrap();
+
+    clock.advance(Duration::from_millis(1));
+    scheduler.make_runnable(ctx_b.thread().key()).unwrap();
+
+    assert_eq!(
+        scheduler.deadline_for(exec_a.id()),
+        Some(t0 + Duration::from_millis(10)),
+        "custom policy must schedule 10 ms deadline"
+    );
+
+    clock.advance(Duration::from_millis(8)); // t = 9 ms
+    assert!(scheduler.poll_due_preemption_requests().is_empty());
+
+    clock.advance(Duration::from_millis(1)); // t = 10 ms
+    let due = scheduler.poll_due_preemption_requests();
+    assert_eq!(due.len(), 1, "request due at 10 ms");
+
+    scheduler.settle_runnable(running_a).unwrap();
+}
+
+/// Test 20: Threaded driver: wait_preemption_work wakes on manual clock advance without wall-clock sleep.
+#[test]
+fn threaded_driver_wait_preemption_work_wakes_on_manual_clock_advance() {
+    let t0 = Instant::now();
+    let clock = Arc::new(ManualClock::new(t0));
+    let (kernel, ctx_a, scheduler, _asids) = bootstrap_kernel_with_clock(80_001, clock.clone());
+    clock.attach_condvar(scheduler.preemption_condvar());
+    publish_task(&ctx_a, 2001);
+    let ctx_b = create_sibling_thread(&kernel, &ctx_a, 80_002);
+    publish_task(&ctx_b, 2002);
+
+    let kick_a = Arc::new(TestKick::default());
+    let exec_a = scheduler
+        .register_executor_bound(kick_a, Some(GuestCpuId::new(0)), false)
+        .unwrap();
+
+    scheduler.make_runnable(ctx_a.thread().key()).unwrap();
+    let running_a = scheduler.take(&exec_a).unwrap();
+
+    clock.advance(Duration::from_millis(1));
+    scheduler.make_runnable(ctx_b.thread().key()).unwrap();
+
+    // Spawn driver thread waiting on wait_preemption_work
+    let sched_clone = Arc::clone(&scheduler);
+    let (tx, rx) = mpsc::channel();
+    let driver_handle = thread::spawn(move || {
+        let work = sched_clone.wait_preemption_work();
+        tx.send(work).unwrap();
+    });
+
+    // Advance clock to 4 ms. This notifies the condvar via attach_condvar and wakes the driver thread!
+    clock.advance(Duration::from_millis(3));
+
+    let work = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("driver thread must wake up on clock advance");
+    match work {
+        PreemptionWork::Due(requests) => {
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].binding.executor(), exec_a.id());
+        }
+        PreemptionWork::Shutdown => panic!("expected Due, got Shutdown"),
+    }
+
+    driver_handle.join().unwrap();
+    scheduler.settle_runnable(running_a).unwrap();
 }

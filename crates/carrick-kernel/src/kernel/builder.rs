@@ -15,7 +15,7 @@ pub struct KernelBuilder {
     observed_pid: i32,
     diagnostic_name: String,
     policy: Option<Arc<dyn SchedulingPolicy>>,
-    clock: Option<Box<dyn MonotonicClock>>,
+    clock: Option<Arc<dyn MonotonicClock>>,
     host_signal: Option<Arc<dyn HostSignalBridge>>,
 }
 
@@ -51,7 +51,7 @@ impl KernelBuilder {
         self
     }
 
-    pub fn with_clock(mut self, clock: Box<dyn MonotonicClock>) -> Self {
+    pub fn with_clock(mut self, clock: Arc<dyn MonotonicClock>) -> Self {
         self.clock = Some(clock);
         self
     }
@@ -75,12 +75,37 @@ impl KernelBuilder {
         let policy = self
             .policy
             .unwrap_or_else(|| Arc::new(GuestCpuPolicy::new(carrick_hal::MAX_GUEST_CPUS)));
-        let clock = self.clock.unwrap_or_else(|| Box::new(HostMonotonicClock));
+        let clock = self.clock.unwrap_or_else(|| Arc::new(HostMonotonicClock));
         let scheduler = Arc::new(Scheduler::new_with_policy_and_clock(
             Arc::clone(&kernel),
             policy,
             clock,
         ));
         Ok((kernel, context, scheduler))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::scheduler::preemption::ManualClock;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn kernel_builder_with_clock_and_policy() {
+        let t0 = Instant::now();
+        let clock = Arc::new(ManualClock::new(t0));
+        let policy = Arc::new(GuestCpuPolicy::new(4));
+        let (_kernel, context, scheduler) = KernelBuilder::new()
+            .with_pid(42)
+            .with_diagnostic_name("test-kernel-builder")
+            .with_policy(policy)
+            .with_clock(clock.clone())
+            .build()
+            .expect("build kernel");
+
+        assert_eq!(context.thread().key().tid.raw(), 42);
+        assert_eq!(scheduler.cpu_count(), 4);
+        clock.advance(Duration::from_millis(10));
     }
 }

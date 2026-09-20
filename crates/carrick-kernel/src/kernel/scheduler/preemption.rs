@@ -60,34 +60,47 @@ impl MonotonicClock for HostMonotonicClock {
 #[derive(Debug)]
 pub struct ManualClock {
     now: parking_lot::Mutex<Instant>,
-    notify: Arc<parking_lot::Condvar>,
+    notify: parking_lot::Mutex<Vec<Arc<parking_lot::Condvar>>>,
 }
 
 impl ManualClock {
     pub fn new(start: Instant) -> Self {
         Self {
             now: parking_lot::Mutex::new(start),
-            notify: Arc::new(parking_lot::Condvar::new()),
+            notify: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
     pub fn with_condvar(start: Instant, notify: Arc<parking_lot::Condvar>) -> Self {
         Self {
             now: parking_lot::Mutex::new(start),
-            notify,
+            notify: parking_lot::Mutex::new(vec![notify]),
         }
+    }
+
+    pub fn attach_condvar(&self, notify: Arc<parking_lot::Condvar>) {
+        self.notify.lock().push(notify);
     }
 
     pub fn advance(&self, duration: Duration) {
         let mut now = self.now.lock();
         *now += duration;
-        self.notify.notify_all();
+        let condvars = self.notify.lock().clone();
+        for cv in condvars {
+            cv.notify_all();
+        }
     }
 }
 
 impl MonotonicClock for ManualClock {
     fn now(&self) -> Instant {
         *self.now.lock()
+    }
+}
+
+impl<T: ?Sized + MonotonicClock> MonotonicClock for Arc<T> {
+    fn now(&self) -> Instant {
+        (**self).now()
     }
 }
 
@@ -102,6 +115,7 @@ pub struct BindingResidency {
     pub cpu: GuestCpuId,
     pub thread: ThreadKey,
     pub generation: ExecutionGeneration,
+    pub ticket_claimed: bool,
 }
 
 /// Immutable snapshot of an executor's residency for diagnostics.
@@ -122,6 +136,7 @@ pub struct PreemptionRequest {
     pub binding: ExecutorBinding,
     pub ticket: DemandTicket,
     pub reasons: PreemptionReasons,
+    pub cpu: GuestCpuId,
 }
 
 /// An entry in the ordered deadline set.
@@ -131,6 +146,7 @@ pub struct DeadlineEntry {
     pub ticket: DemandTicket,
     pub deadline: Instant,
     pub reasons: PreemptionReasons,
+    pub cpu: GuestCpuId,
 }
 
 /// Outcome from waiting on preemption work.
@@ -152,10 +168,11 @@ pub enum DeliveryOutcome {
 /// Internal preemption state owned by the [`crate::kernel::Scheduler`].
 pub struct PreemptionState {
     pub(crate) residencies: BTreeMap<ExecutorId, BindingResidency>,
-    pub(crate) deadlines: BTreeMap<Instant, Vec<DeadlineEntry>>,
+    pub(crate) deadlines: BTreeMap<(Instant, ExecutorId), DeadlineEntry>,
+    pub(crate) executor_deadlines: BTreeMap<ExecutorId, Instant>,
     pub(crate) demand_counter: u64,
     pub(crate) event_sequence: Arc<AtomicU64>,
-    pub(crate) clock: Box<dyn MonotonicClock>,
+    pub(crate) clock: Arc<dyn MonotonicClock>,
     pub(crate) shutdown: bool,
 }
 
@@ -176,10 +193,11 @@ impl fmt::Debug for PreemptionState {
 }
 
 impl PreemptionState {
-    pub fn new(clock: Box<dyn MonotonicClock>, event_sequence: Arc<AtomicU64>) -> Self {
+    pub fn new(clock: Arc<dyn MonotonicClock>, event_sequence: Arc<AtomicU64>) -> Self {
         Self {
             residencies: BTreeMap::new(),
             deadlines: BTreeMap::new(),
+            executor_deadlines: BTreeMap::new(),
             demand_counter: 0,
             event_sequence,
             clock,
@@ -216,21 +234,15 @@ impl PreemptionState {
             cpu,
             thread,
             generation,
+            ticket_claimed: false,
         };
         self.residencies.insert(binding.executor(), residency);
         (ticket, sequence)
     }
 
     pub fn finalize_residency(&mut self, executor: ExecutorId) -> Option<BindingResidency> {
-        let removed = self.residencies.remove(&executor);
-        if removed.is_some() {
-            // Remove any deadlines for this executor
-            for entries in self.deadlines.values_mut() {
-                entries.retain(|e| e.binding.executor() != executor);
-            }
-            self.deadlines.retain(|_, entries| !entries.is_empty());
-        }
-        removed
+        self.cancel_deadline(executor);
+        self.residencies.remove(&executor)
     }
 
     pub fn binding_residency(&self, executor: ExecutorId) -> Option<BindingResidencySnapshot> {
@@ -253,7 +265,10 @@ impl PreemptionState {
         reasons: PreemptionReasons,
     ) -> bool {
         if let Some(residency) = self.residencies.get_mut(&executor) {
-            residency.reasons.insert(reasons);
+            if !residency.reasons.contains(reasons) {
+                residency.reasons.insert(reasons);
+                residency.ticket_claimed = false;
+            }
             true
         } else {
             false
@@ -278,7 +293,14 @@ impl PreemptionState {
             if residency.binding != *binding {
                 return false;
             }
-            if !residency.reasons.is_empty() {
+            if !residency
+                .reasons
+                .difference(PreemptionReasons::FAIRNESS)
+                .is_empty()
+            {
+                return true;
+            }
+            if residency.reasons.contains(PreemptionReasons::FAIRNESS) && queue_len > 0 {
                 return true;
             }
             if queue_len > 0 {
@@ -318,48 +340,87 @@ impl PreemptionState {
         reasons: PreemptionReasons,
     ) {
         if let Some(residency) = self.residencies.get(&executor) {
+            if let Some(old_deadline) = self.executor_deadlines.remove(&executor) {
+                self.deadlines.remove(&(old_deadline, executor));
+            }
             let entry = DeadlineEntry {
                 binding: residency.binding,
                 ticket: residency.ticket,
                 deadline,
                 reasons,
+                cpu: residency.cpu,
             };
-            self.deadlines.entry(deadline).or_default().push(entry);
+            self.executor_deadlines.insert(executor, deadline);
+            self.deadlines.insert((deadline, executor), entry);
         }
+    }
+
+    pub fn cancel_deadline(&mut self, executor: ExecutorId) -> bool {
+        if let Some(old_deadline) = self.executor_deadlines.remove(&executor) {
+            self.deadlines.remove(&(old_deadline, executor)).is_some()
+        } else {
+            false
+        }
+    }
+
+    pub fn has_deadline(&self, executor: ExecutorId) -> bool {
+        self.executor_deadlines.contains_key(&executor)
+    }
+
+    pub fn deadline_for(&self, executor: ExecutorId) -> Option<Instant> {
+        self.executor_deadlines.get(&executor).copied()
+    }
+
+    pub fn earliest_deadline(&self) -> Option<Instant> {
+        self.deadlines.first_key_value().map(|((inst, _), _)| *inst)
+    }
+
+    pub fn live_deadline_count(&self) -> usize {
+        self.deadlines.len()
     }
 
     pub fn poll_due_requests(&mut self) -> Vec<PreemptionRequest> {
         let now = self.clock.now();
-        let mut due_times = Vec::new();
-        for &time in self.deadlines.keys() {
-            if time <= now {
-                due_times.push(time);
+        let mut due_executors = Vec::new();
+
+        while let Some((&(deadline, executor), _)) = self.deadlines.first_key_value() {
+            if deadline <= now {
+                self.deadlines.remove(&(deadline, executor));
+                self.executor_deadlines.remove(&executor);
+                due_executors.push((executor, PreemptionReasons::FAIRNESS));
             } else {
                 break;
             }
         }
 
         let mut requests = Vec::new();
-        for time in due_times {
-            if let Some(entries) = self.deadlines.remove(&time) {
-                for entry in entries {
-                    if let Some(residency) = self.residencies.get_mut(&entry.binding.executor()) {
-                        if residency.ticket == entry.ticket && residency.binding == entry.binding {
-                            residency.reasons.insert(entry.reasons);
-                            requests.push(PreemptionRequest {
-                                binding: entry.binding,
-                                ticket: entry.ticket,
-                                reasons: residency.reasons,
-                            });
-                        }
-                    }
+        for (executor, reasons) in due_executors {
+            if let Some(residency) = self.residencies.get_mut(&executor) {
+                residency.reasons.insert(reasons);
+                if !residency.ticket_claimed {
+                    residency.ticket_claimed = true;
+                    requests.push(PreemptionRequest {
+                        binding: residency.binding,
+                        ticket: residency.ticket,
+                        reasons: residency.reasons,
+                        cpu: residency.cpu,
+                    });
                 }
             }
         }
-        requests
-    }
 
-    pub fn earliest_deadline(&self) -> Option<Instant> {
-        self.deadlines.keys().next().copied()
+        for residency in self.residencies.values_mut() {
+            if !residency.reasons.is_empty() && !residency.ticket_claimed {
+                residency.ticket_claimed = true;
+                requests.push(PreemptionRequest {
+                    binding: residency.binding,
+                    ticket: residency.ticket,
+                    reasons: residency.reasons,
+                    cpu: residency.cpu,
+                });
+            }
+        }
+
+        requests
     }
 }
