@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use carrick_fatal::carrick_fatal;
 use parking_lot::{Condvar, Mutex};
@@ -626,19 +627,6 @@ impl ExecutorDirectory {
             .any(|kick| kick.current_binding().is_some())
     }
 
-    fn running_executors(&self) -> Vec<(ExecutorId, GuestCpuId)> {
-        let state = self.state.lock();
-        state
-            .entries
-            .iter()
-            .filter_map(|(&id, entry)| {
-                let _binding = entry.kick.current_binding()?;
-                let cpu = entry.placement.lock().cpu?;
-                Some((id, cpu))
-            })
-            .collect()
-    }
-
     fn deliver(&self, token: ExecutorKickToken) -> bool {
         let kick = self
             .state
@@ -674,6 +662,11 @@ pub struct QueueRow {
     pub(crate) key: QueueKey,
     pub(crate) thread: Arc<Thread>,
     pub(crate) closing_authorized: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct QueuedDemand {
+    pub affinity: carrick_hal::CpuAffinity,
 }
 
 /// One guest CPU's local run queue and parking bookkeeping, behind that CPU's
@@ -1671,6 +1664,19 @@ impl RunQueueInner {
         self.mark_unpublished(key);
         Ok(())
     }
+
+    pub(crate) fn snapshot_queued_demands(&self) -> Vec<QueuedDemand> {
+        let mut demands = Vec::new();
+        for cpu in &self.cpus {
+            let local = cpu.state.lock();
+            for row in &local.rows {
+                demands.push(QueuedDemand {
+                    affinity: row.thread.affinity(),
+                });
+            }
+        }
+        demands
+    }
 }
 
 #[derive(Debug)]
@@ -2645,6 +2651,10 @@ impl RunQueue {
         self.inner.cpu_load(cpu)
     }
 
+    fn snapshot_queued_demands(&self) -> Vec<QueuedDemand> {
+        self.inner.snapshot_queued_demands()
+    }
+
     /// Executors parked right now, across every CPU plus the spare pool,
     /// counted from a state guard the CALLER already holds.
     ///
@@ -2794,6 +2804,10 @@ impl RunnableThread {
 
     pub const fn executor_epoch(&self) -> u64 {
         self.binding.executor_epoch
+    }
+
+    pub const fn binding(&self) -> ExecutorBinding {
+        self.binding
     }
 
     pub fn lease(&self) -> &ThreadExecutionLease {
@@ -2951,19 +2965,28 @@ impl std::fmt::Debug for Scheduler {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ResidencyCandidate {
+    executor: ExecutorId,
+    cpu: GuestCpuId,
+    start: Instant,
+    thread: SchedThreadId,
+    process: SchedProcessId,
+}
+
 impl Scheduler {
     pub fn new(kernel: Arc<Kernel>) -> Self {
         Self::new_with_policy(kernel, Arc::new(GuestCpuPolicy::new(guest_cpu_count())))
     }
 
     pub fn new_with_policy(kernel: Arc<Kernel>, policy: Arc<dyn SchedulingPolicy>) -> Self {
-        Self::new_with_policy_and_clock(kernel, policy, Box::new(HostMonotonicClock))
+        Self::new_with_policy_and_clock(kernel, policy, Arc::new(HostMonotonicClock))
     }
 
     pub fn new_with_policy_and_clock(
         kernel: Arc<Kernel>,
         policy: Arc<dyn SchedulingPolicy>,
-        clock: Box<dyn MonotonicClock>,
+        clock: Arc<dyn MonotonicClock>,
     ) -> Self {
         let event_sequence = Arc::new(AtomicU64::new(1));
         let preemption_condvar = Arc::new(Condvar::new());
@@ -3680,86 +3703,184 @@ impl Scheduler {
 
     /// Only a claimable row is work an executor can be sent looking for.
     fn after_insertion(&self, outcome: EnqueueOutcome) {
-        if outcome == EnqueueOutcome::Claimable && self.executors.has_running() {
-            self.handle_contention();
+        if outcome == EnqueueOutcome::Claimable {
+            self.recompute_demand();
         }
     }
 
-    fn handle_contention(&self) {
-        let queue_len = self.queue.len();
-        if queue_len == 0 {
+    pub fn preemption_condvar(&self) -> Arc<Condvar> {
+        Arc::clone(&self.preemption_condvar)
+    }
+
+    pub fn live_deadline_count(&self) -> usize {
+        self.preemption.lock().live_deadline_count()
+    }
+
+    pub fn has_deadline(&self, executor: ExecutorId) -> bool {
+        self.preemption.lock().has_deadline(executor)
+    }
+
+    pub fn deadline_for(&self, executor: ExecutorId) -> Option<Instant> {
+        self.preemption.lock().deadline_for(executor)
+    }
+
+    pub fn earliest_deadline(&self) -> Option<Instant> {
+        self.preemption.lock().earliest_deadline()
+    }
+
+    pub fn poll_due_preemption_requests(
+        &self,
+    ) -> Vec<crate::kernel::scheduler::preemption::PreemptionRequest> {
+        self.preemption.lock().poll_due_requests()
+    }
+
+    pub fn recompute_demand(&self) {
+        let demands = self.queue.snapshot_queued_demands();
+        let candidates = {
+            let preemption = self.preemption.lock();
+            preemption
+                .residencies
+                .iter()
+                .map(|(exec_id, res)| ResidencyCandidate {
+                    executor: *exec_id,
+                    cpu: res.cpu,
+                    start: res.start,
+                    thread: SchedThreadId::new(res.thread.serial.raw()),
+                    process: SchedProcessId::new(res.binding.thread.serial.raw()),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if candidates.is_empty() {
             return;
         }
-        let running_executors = self.executors.running_executors();
-        let mut preemption = self.preemption.lock();
-        let mut notify_driver = false;
-        let now = preemption.clock.now();
-        let mut deadlines_to_schedule = Vec::new();
-        for (executor_id, bound_cpu) in running_executors {
-            if let Some(residency) = preemption.residencies.get_mut(&executor_id) {
-                let elapsed = now.saturating_duration_since(residency.start);
-                let load = self.queue.load_of(bound_cpu);
+
+        // Sort candidates by residency start (oldest residency first)
+        let mut sorted_candidates = candidates.clone();
+        sorted_candidates.sort_by_key(|c| c.start);
+
+        let mut matched_executors = std::collections::HashSet::new();
+        let mut candidate_backlog: std::collections::HashMap<ExecutorId, usize> =
+            std::collections::HashMap::new();
+
+        for demand in &demands {
+            if let Some(candidate) = sorted_candidates.iter().find(|c| {
+                !matched_executors.contains(&c.executor) && demand.affinity.is_allowed(c.cpu)
+            }) {
+                matched_executors.insert(candidate.executor);
+                *candidate_backlog.entry(candidate.executor).or_insert(0) += 1;
+            } else if let Some(candidate) = sorted_candidates
+                .iter()
+                .find(|c| demand.affinity.is_allowed(c.cpu))
+            {
+                *candidate_backlog.entry(candidate.executor).or_insert(0) += 1;
+            }
+        }
+
+        // Call policy.on_contention outside of locks
+        let now = {
+            let preemption = self.preemption.lock();
+            preemption.clock.now()
+        };
+
+        let mut actions = Vec::new();
+        for candidate in &candidates {
+            if matched_executors.contains(&candidate.executor) {
+                let eligible_queued = *candidate_backlog.get(&candidate.executor).unwrap_or(&1);
+                let elapsed = now.saturating_duration_since(candidate.start);
+                let load = self.queue.load_of(candidate.cpu);
                 let dispatch_ctx = DispatchContext {
-                    thread: SchedThreadId::new(residency.thread.serial.raw()),
-                    process: SchedProcessId::new(residency.binding.thread.serial.raw()),
-                    cpu: bound_cpu,
+                    thread: candidate.thread,
+                    process: candidate.process,
+                    cpu: candidate.cpu,
                     load,
                 };
                 let contention_ctx = ContentionContext {
                     running: dispatch_ctx,
                     residency_elapsed: elapsed,
-                    eligible_queued: queue_len,
+                    eligible_queued,
                 };
                 let action = self.queue.inner.policy.on_contention(&contention_ctx);
-                match action {
-                    PreemptionAction::KeepBudget => {
-                        if elapsed >= residency.budget.quantum() {
-                            residency.reasons.insert(PreemptionReasons::FAIRNESS);
-                            notify_driver = true;
-                        } else {
-                            let deadline = residency.start + residency.budget.quantum();
-                            let entry = DeadlineEntry {
-                                binding: residency.binding,
-                                ticket: residency.ticket,
-                                deadline,
-                                reasons: PreemptionReasons::FAIRNESS,
-                            };
-                            deadlines_to_schedule.push(entry);
-                            notify_driver = true;
+                actions.push((candidate.executor, Some(action)));
+            } else {
+                actions.push((candidate.executor, None));
+            }
+        }
+
+        // Apply under preemption lock
+        let mut preemption = self.preemption.lock();
+        let mut notify = false;
+        let now = preemption.clock.now();
+
+        for (executor, maybe_action) in actions {
+            match maybe_action {
+                None => {
+                    // No demand for this executor: cancel unclaimed deadline
+                    if preemption.cancel_deadline(executor) {
+                        notify = true;
+                    }
+                    if let Some(res) = preemption.residencies.get_mut(&executor) {
+                        if !res.ticket_claimed {
+                            res.reasons.remove(PreemptionReasons::FAIRNESS);
                         }
                     }
-                    PreemptionAction::ShortenTo(duration) => {
-                        let effective = duration.min(residency.budget.quantum());
-                        if elapsed >= effective {
-                            residency.reasons.insert(PreemptionReasons::FAIRNESS);
-                            notify_driver = true;
-                        } else {
-                            let deadline = residency.start + effective;
-                            let entry = DeadlineEntry {
-                                binding: residency.binding,
-                                ticket: residency.ticket,
-                                deadline,
-                                reasons: PreemptionReasons::FAIRNESS,
-                            };
-                            deadlines_to_schedule.push(entry);
-                            notify_driver = true;
+                }
+                Some(action) => {
+                    if let Some(res) = preemption.residencies.get_mut(&executor) {
+                        let elapsed = now.saturating_duration_since(res.start);
+                        let quantum = res.budget.quantum();
+                        match action {
+                            PreemptionAction::KeepBudget => {
+                                if elapsed >= quantum {
+                                    res.reasons.insert(PreemptionReasons::FAIRNESS);
+                                    let _ = preemption.cancel_deadline(executor);
+                                    notify = true;
+                                } else {
+                                    let deadline = res.start + quantum;
+                                    if !preemption.has_deadline(executor) {
+                                        preemption.schedule_deadline(
+                                            executor,
+                                            deadline,
+                                            PreemptionReasons::FAIRNESS,
+                                        );
+                                        notify = true;
+                                    }
+                                }
+                            }
+                            PreemptionAction::ShortenTo(duration) => {
+                                let effective = duration.min(quantum);
+                                if elapsed >= effective {
+                                    res.reasons.insert(PreemptionReasons::FAIRNESS);
+                                    let _ = preemption.cancel_deadline(executor);
+                                    notify = true;
+                                } else {
+                                    let deadline = res.start + effective;
+                                    let should_schedule = match preemption.deadline_for(executor) {
+                                        Some(existing) => deadline < existing,
+                                        None => true,
+                                    };
+                                    if should_schedule {
+                                        preemption.schedule_deadline(
+                                            executor,
+                                            deadline,
+                                            PreemptionReasons::FAIRNESS,
+                                        );
+                                        notify = true;
+                                    }
+                                }
+                            }
+                            PreemptionAction::Preempt => {
+                                res.reasons.insert(PreemptionReasons::FAIRNESS);
+                                let _ = preemption.cancel_deadline(executor);
+                                notify = true;
+                            }
                         }
-                    }
-                    PreemptionAction::Preempt => {
-                        residency.reasons.insert(PreemptionReasons::FAIRNESS);
-                        notify_driver = true;
                     }
                 }
             }
         }
-        for entry in deadlines_to_schedule {
-            preemption
-                .deadlines
-                .entry(entry.deadline)
-                .or_default()
-                .push(entry);
-        }
-        if notify_driver {
+
+        if notify {
             self.preemption_condvar.notify_all();
         }
     }
@@ -3794,7 +3915,7 @@ impl Scheduler {
             load,
         };
         let budget = self.queue.inner.policy.on_dispatch(&dispatch_ctx);
-        let (ticket, sequence) = self.preemption.lock().register_residency(
+        let (_ticket, sequence) = self.preemption.lock().register_residency(
             binding,
             bound_cpu,
             budget,
@@ -3808,27 +3929,7 @@ impl Scheduler {
             cpu: Some(bound_cpu),
             kind: SchedulingEventKind::Dispatch,
         });
-        if self.queue.len() > 0 {
-            let mut preemption = self.preemption.lock();
-            let deadline = preemption.clock.now() + budget.quantum();
-            let entry = DeadlineEntry {
-                binding,
-                ticket,
-                deadline,
-                reasons: PreemptionReasons::FAIRNESS,
-            };
-            preemption
-                .deadlines
-                .entry(deadline)
-                .or_default()
-                .push(entry);
-            self.preemption_condvar.notify_all();
-        } else {
-            let mut preemption = self.preemption.lock();
-            for res in preemption.residencies.values_mut() {
-                res.reasons.remove(PreemptionReasons::FAIRNESS);
-            }
-        }
+        self.recompute_demand();
         Ok(RunnableThread {
             thread: row.thread,
             key: row.key,
@@ -3929,6 +4030,7 @@ impl Scheduler {
             cpu: Some(bound_cpu),
             kind: SchedulingEventKind::Stop(stop_reason),
         });
+        self.recompute_demand();
         drop(_transition);
         if observed == GenerationTransitionOutcome::Recorded {
             self.apply_settlement_action(
@@ -4011,6 +4113,7 @@ impl Scheduler {
             cpu: Some(bound_cpu),
             kind: SchedulingEventKind::Stop(SchedulingStopReason::HostWait),
         });
+        self.recompute_demand();
         drop(_transition);
         #[cfg(test)]
         if let Some((at_clear, release)) = self.continuation_settlement_barriers.lock().clone() {
@@ -4266,6 +4369,7 @@ impl Scheduler {
             cpu: Some(bound_cpu),
             kind: SchedulingEventKind::Stop(stop_reason),
         });
+        self.recompute_demand();
         drop(_transition);
         self.snapshot_count.fetch_add(1, Ordering::Relaxed);
         let target_cpu = running.thread.last_cpu();
@@ -4333,6 +4437,7 @@ impl Scheduler {
             cpu: Some(bound_cpu),
             kind: SchedulingEventKind::Stop(SchedulingStopReason::Exited),
         });
+        self.recompute_demand();
         crate::event_ring::rec_hvpatch_settle_step(settle_tid, settle_generation, 3);
         drop(_transition);
         running.finish_claim();
@@ -4396,6 +4501,7 @@ impl Scheduler {
             cpu: Some(bound_cpu),
             kind: SchedulingEventKind::Stop(SchedulingStopReason::Exec),
         });
+        self.recompute_demand();
         crate::event_ring::rec_hvpatch_settle_step(settle_tid, settle_generation, 3);
         drop(_transition);
         running.finish_claim();
@@ -4595,26 +4701,11 @@ impl Scheduler {
     /// current executor directory and every delivery revalidates the complete
     /// binding, so an epoch successor cannot consume a late preemption.
     pub fn request_preemption(&self) -> usize {
-        if !self.need_resched() {
-            return 0;
-        }
-        let mut count = 0;
         let requests = {
             let mut preemption = self.preemption.lock();
-            let mut due = preemption.poll_due_requests();
-            let queue_len = self.queue.len();
-            for res in preemption.residencies.values_mut() {
-                if !res.reasons.is_empty() || queue_len > 0 {
-                    res.reasons.insert(PreemptionReasons::FAIRNESS);
-                    due.push(PreemptionRequest {
-                        binding: res.binding,
-                        ticket: res.ticket,
-                        reasons: res.reasons,
-                    });
-                }
-            }
-            due
+            preemption.poll_due_requests()
         };
+        let mut count = 0;
         for req in requests {
             if self.deliver_preemption(req) == DeliveryOutcome::Delivered {
                 count += 1;
@@ -4629,6 +4720,15 @@ impl Scheduler {
         if let Some(entry) = state.entries.get(&req.binding.executor()) {
             if let Some(current) = entry.kick.current_binding() {
                 if current == req.binding {
+                    let preemption = self.preemption.lock();
+                    if let Some(res) = preemption.residencies.get(&req.binding.executor()) {
+                        if res.ticket != req.ticket || res.binding != req.binding {
+                            return DeliveryOutcome::Stale;
+                        }
+                    } else {
+                        return DeliveryOutcome::Stale;
+                    }
+                    drop(preemption);
                     if entry.kick.deliver_exact(req.binding.token()) {
                         return DeliveryOutcome::Delivered;
                     } else {
