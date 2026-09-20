@@ -292,8 +292,8 @@ fn handle_prioritize(args: &[String]) -> Result<(), String> {
     }
 
     println!(
-        "{:<4} {:<24} {:<32} {:<20} {}",
-        "#", "SEVERITY", "SUITE", "TEST ID", "DETAILS"
+        "{:<4} {:<24} {:<32} {:<20} DETAILS",
+        "#", "SEVERITY", "SUITE", "TEST ID"
     );
     println!("{}", "-".repeat(105));
     for (idx, c) in candidates.iter().enumerate() {
