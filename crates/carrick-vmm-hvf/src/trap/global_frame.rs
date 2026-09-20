@@ -1306,6 +1306,39 @@ pub(crate) fn publish_exec_region_host_owner_in(
     Ok(owner_generation)
 }
 
+/// Publish an exec'd image's stage-1 root table that lives in a pre-mapped
+/// root-slot pool slot: the structural record authenticates on the pool's
+/// mapping and custody skips the backend unmap at retirement, after which the
+/// handle's drop returns the slot to the pool.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn publish_pooled_exec_root_owner_in(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    region: &mut HvfMappedRegion,
+    lease: GlobalFrameStage2Lease,
+    handle: crate::frame_pool::PooledRootSlotHandle,
+) -> Result<u64, TrapError> {
+    let key = lease.key();
+    if !lease.mapped || lease.backend_map_installed {
+        return Err(TrapError::Hypervisor(format!(
+            "pooled exec root lease ({:#x}, {:#x}) is not pre-mapped",
+            key.0, key.1
+        )));
+    }
+    let epoch = next_structural_epoch()?;
+    let owner = StructuralBackingOwner::new_pooled_root_in(
+        custody,
+        handle,
+        lease,
+        u64::from(region.perms),
+        epoch,
+        key.0,
+        usize::try_from(key.1).map_err(|_| TrapError::MappingTooLarge(key.1))?,
+    )?;
+    region.structural_owner = Some(owner);
+    region.owner_generation = epoch.raw();
+    Ok(epoch.raw())
+}
+
 /// Cached `CARRICK_FORK_DEBUG_IPA` / `CARRICK_FORK_DEBUG_VA` (parsed once).
 /// `std::env::var` serializes on std's process-wide environment lock; calling
 /// Monotonic source for [`StructuralEpoch`]. Never reset, monotonically increasing.

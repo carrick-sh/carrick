@@ -5,9 +5,10 @@
 
 use carrick_conformance_contract::{ContractRegistry, ExecutionLayer, evaluate};
 use carrick_embed::{
-    run_fork_stage1_image_structural_contract, run_fork_stage1_image_structural_contract_with,
-    run_fork_stage1_image_timing_contract, run_futex_requeue_structural_contract,
-    run_futex_requeue_timing_contract, run_futex_structural_contract, run_futex_timing_contract,
+    run_fork_stage1_image_structural_contract, run_fork_stage1_image_structural_contract_via_shell,
+    run_fork_stage1_image_structural_contract_with, run_fork_stage1_image_timing_contract,
+    run_futex_requeue_structural_contract, run_futex_requeue_timing_contract,
+    run_futex_structural_contract, run_futex_timing_contract,
 };
 use carrick_observability::work_meter::WorkMetric;
 
@@ -153,4 +154,34 @@ fn fork_stage1_image_structural_contract_dirty_parent() {
     }
     evaluate(contract, &observations)
         .expect("fork stage-1 image structural contract evaluation (dirty parent)");
+}
+
+/// Same contract with the forking parent exec'd by `/bin/sh -c`: the root
+/// slot the parent forks from came through exec, so this is the launch shape
+/// of every harness LTP row. Before the pool was created at VM creation and
+/// exec drew its root table from it, this shape paid a 2 MiB host mapping
+/// per fork (`host_mapping_allocations` 2n, `HV_ERROR` at the lazy pre-map).
+#[test]
+fn fork_stage1_image_structural_contract_via_shell() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry
+        .require("kernel.fork.stage1-image")
+        .expect("contract");
+    let observations = [1u64, 8, 32, 128]
+        .into_iter()
+        .map(run_fork_stage1_image_structural_contract_via_shell)
+        .collect::<Vec<_>>();
+    for obs in &observations {
+        eprintln!(
+            "fork.stage1-image(shell) scale={} task_admissions={:?} page_table_image_allocations={:?} host_mapping_allocations={:?} fork_projection_rows_visited={:?} completeness={:?}",
+            obs.scale,
+            obs.work_value(WorkMetric::TaskAdmissions),
+            obs.work_value(WorkMetric::PageTableImageAllocations),
+            obs.work_value(WorkMetric::HostMappingAllocations),
+            obs.work_value(WorkMetric::ForkProjectionRowsVisited),
+            obs.completeness
+        );
+    }
+    evaluate(contract, &observations)
+        .expect("fork stage-1 image structural contract evaluation (exec'd parent)");
 }

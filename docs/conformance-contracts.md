@@ -212,11 +212,13 @@ creates 16k children this way, and allocating a fresh image per fork produced
 - Status (2026-09-20): structural bindings green at 1/8/32/128. The timing
   binding is red: 205 µs per serial fork under the signed carrier versus
   88 µs under Docker (2.33x against the 2.0x policy), and `ltp-fork14` sits at
-  3.8x (6.2 s versus 1.6 s; it was 15.4x). Named remaining levers, in order:
-  the pre-mapped root-slot pool is created lazily at the first fork and
-  collides with an exec'd process's slot (`HV_ERROR` at the 128 MiB pre-map),
-  so every exec'd forker still pays a 2 MiB host `mmap` per fork; the
-  executor boundary audit issues about five `pthread_sigmask` and four
-  `thread_selfusage` host calls per fork; and the parent's post-fork COW
-  splits cost about 15% of carrier CPU. The timing gate stays red until the
-  ratio meets policy; it is not widened.
+  3.7x (6.0 s versus 1.6 s; it was 15.4x), `ltp-epoll-ltp` (the same serial
+  fork shape: 12,468 clone/exit/wait rounds) at 3.5x from 11.5x, and
+  `ltp-fork09` at 1.6x from 3.2x. The root-slot pool is now created at VM
+  creation and an exec'd image's root table is drawn from it too, so the
+  `sh -c` launch shape every harness LTP row uses no longer pays a 2 MiB host
+  `mmap` per fork (the `via_shell` structural binding proves it). Named
+  remaining levers: the executor boundary audit issues about five
+  `pthread_sigmask` and four `thread_selfusage` host calls per fork, and the
+  parent's post-fork COW splits cost about 15% of carrier CPU. The timing
+  gate stays red until the ratio meets policy; it is not widened.

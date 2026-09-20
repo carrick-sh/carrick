@@ -531,8 +531,19 @@ pub(crate) fn prepare_exec_region_raw_in(
     custody: &CarrierVmCustody,
     mapping: &GuestMapping,
 ) -> Result<HvfMappedRegion, TrapError> {
-    let requested_size = usize::try_from(mapping.mapped_size)
-        .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?;
+    prepare_exec_region_raw_in_sized(custody, mapping, mapping.mapped_size)
+}
+
+/// [`prepare_exec_region_raw_in`] with an explicit physical extent, for a
+/// stage-1 root table whose lease names its whole root slot but whose pool
+/// slot was unavailable.
+pub(crate) fn prepare_exec_region_raw_in_sized(
+    custody: &CarrierVmCustody,
+    mapping: &GuestMapping,
+    physical_size: u64,
+) -> Result<HvfMappedRegion, TrapError> {
+    let requested_size =
+        usize::try_from(physical_size).map_err(|_| TrapError::MappingTooLarge(physical_size))?;
     let backing_started = std::time::Instant::now();
     let (host, size, host_mapping) = map_exclusive_region(mapping, requested_size)?;
     let elapsed_ns = backing_started
@@ -599,6 +610,7 @@ pub(crate) fn prepare_exec_region_raw(
 pub(crate) fn exec_stage2_install(
     mapping: &GuestMapping,
     region: &HvfMappedRegion,
+    pre_mapped: bool,
 ) -> ExecStage2Install {
     ExecStage2Install {
         ipa: mapping.ipa_start,
@@ -606,7 +618,84 @@ pub(crate) fn exec_stage2_install(
         host: region.host_addr,
         perms: u64::from(region.perms),
         replay_registered: false,
+        pre_mapped,
     }
+}
+
+/// Prepare the exec'd image's stage-1 root table inside a pre-mapped
+/// root-slot pool slot. The slot is already stage-2 mapped by the pool's own
+/// lease, so the exec transaction installs nothing for it and the region's
+/// physical extent is the whole slot (`kernel.fork.stage1-image`).
+pub(crate) fn prepare_pooled_exec_root_region_in(
+    custody: &CarrierVmCustody,
+    mapping: &GuestMapping,
+    handle: &crate::frame_pool::PooledRootSlotHandle,
+) -> Result<HvfMappedRegion, TrapError> {
+    let size = usize::try_from(mapping.mapped_size)
+        .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?;
+    if mapping.private_file_backing.is_some() || mapping.shared || size > handle.len() {
+        return Err(TrapError::Hypervisor(format!(
+            "pooled exec root table at IPA 0x{:x} is not a private anonymous image within its slot",
+            mapping.ipa_start
+        )));
+    }
+    let end =
+        mapping
+            .guest_start
+            .checked_add(mapping.mapped_size)
+            .ok_or(TrapError::MappingOverflow {
+                guest_start: mapping.guest_start,
+                mapped_size: mapping.mapped_size,
+            })?;
+    let host = handle.as_mut_ptr();
+    // The pool zeroes a recycled slot up to its recorded populated prefix,
+    // so only the image payload is written here; the rest reads as zero.
+    if !mapping.image.is_empty() {
+        let off = usize::try_from(mapping.offset_in_mapping)
+            .map_err(|_| TrapError::MappingTooLarge(mapping.offset_in_mapping))?;
+        if off.saturating_add(mapping.image.len()) > handle.len() {
+            return Err(TrapError::Hypervisor(format!(
+                "pooled exec root table payload escapes its slot at IPA 0x{:x}",
+                mapping.ipa_start
+            )));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                mapping.image.as_ptr(),
+                host.add(off),
+                mapping.image.len(),
+            );
+        }
+    }
+    handle.record_populated_prefix(
+        usize::try_from(mapping.offset_in_mapping)
+            .unwrap_or(0)
+            .saturating_add(mapping.image.len()),
+    );
+    Ok(HvfMappedRegion {
+        start: mapping.guest_start,
+        ipa: mapping.ipa_start,
+        physical_ipa: mapping.ipa_start,
+        end,
+        host_addr: host,
+        size,
+        physical_size: handle.len(),
+        perms: hvf_perms(mapping.perms),
+        memory: None,
+        host_mapping: None,
+        structural_owner: None,
+        stage2_lease: None,
+        is_dynamic_alias: false,
+        sharing: GuestMappingSharing::Private,
+        guest_writable: mapping.perms.write,
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        owner_generation: global_frame_host_owner_generation_in(
+            custody,
+            mapping.ipa_start,
+            handle.len() as u64,
+        ),
+    })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
