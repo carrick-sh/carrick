@@ -568,6 +568,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
 ]
@@ -639,6 +640,7 @@ dependencies = [
  "carrick-vfs",
  "libc",
  "parking_lot",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

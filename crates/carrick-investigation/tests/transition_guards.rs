@@ -90,3 +90,56 @@ fn parking_and_resumption_restores_prior_stage() {
     inv.resume().unwrap();
     assert_eq!(inv.stage, before_park);
 }
+
+#[test]
+fn vm_free_classification_cannot_skip_to_guest() {
+    let from = Stage::Classified {
+        contract: ContractId::new("kernel.inotify.readiness").unwrap(),
+        capability: CapabilityClass::VmFreeExisting {
+            capability: "inotify_readiness_contract".into(),
+        },
+    };
+    assert!(
+        Stage::validate_transition(
+            &from,
+            &Stage::Reducing {
+                layer: ExecutionLayer::EmbedStructural,
+                preserved_mechanisms: vec!["queue depth".into()],
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn prose_is_not_executed_red_evidence() {
+    assert!(
+        Stage::validate_transition(
+            &Stage::Reducing {
+                layer: ExecutionLayer::VmFree,
+                preserved_mechanisms: vec!["queue depth".into()],
+            },
+            &Stage::Diagnosing {
+                red_evidence: vec!["rev_bad: SemanticMismatch".into()],
+                fixture_active: true,
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn review_requires_readable_validated_package() {
+    assert!(
+        Stage::validate_transition(
+            &Stage::Diagnosing {
+                red_evidence: vec!["fabricated".into()],
+                fixture_active: true,
+            },
+            &Stage::ReviewReady {
+                review_package_path: "/nonexistent/review.json".into(),
+            }
+        )
+        .is_err()
+    );
+}

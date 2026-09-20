@@ -1,0 +1,9 @@
+[[claims]]
+id = "kernel.fs.write-seek.no-offset-query"
+contract = "kernel.fs.write-seek"
+description = "Repeated regular-file write/rewind at offset zero does not query the host offset to prepare write"
+linux_authority = ["man 2 write", "man 2 lseek"]
+fixture_requirements = ["script:write-seek-host-file"]
+related_ecosystem_rows = ["ltp:inotify09"]
+capability = { class = "vm-free-existing", capability = "ScriptedBackend with HostFsBackend" }
+coverage = { status = "bound", layer = "vm-free" }

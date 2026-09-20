@@ -1,5 +1,6 @@
 //! Durable investigation engine for contract-driven conformance investigations.
 
+pub mod evidence;
 mod experiment;
 mod intake;
 mod persistence;

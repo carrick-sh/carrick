@@ -1,0 +1,18 @@
+schema_version = 1
+id = "kernel.fs.write-seek"
+title = "Regular-file overwrite needs no preparatory host offset query"
+guest_surfaces = ["syscall:write", "syscall:lseek"]
+semantic_authority = ["man 2 write", "man 2 lseek"]
+fixture = "script:write-seek-host-file"
+scale_points = [1, 8, 32, 128]
+rationale = "For a newly created non-append regular file repeatedly overwritten at offset zero, with unlimited RLIMIT_FSIZE and no sparse extents, the host write owns offset advancement. A preparatory host SEEK_CUR query contributes no required semantic information. This is the isolated write/rewind mechanism of inotify09 thread B, not a claim about its full timing or concurrency."
+[bindings]
+vm_free = "carrick-kernel-example::write-seek-observation"
+ecosystem = ["ltp:inotify09"]
+unresolved = { embed_structural = "Open: signed write/seek binding required before production correction acceptance", docker = "Open: same-fixture Linux observation required; man pages supply initial semantic authority" }
+[[structural_budgets]]
+kind = "affine"
+metric = "host_write_position_queries"
+base = 0
+per_unit = 0
+rationale = "The fixture overwrites at offset zero with no append, finite file limit, or sparse extent bookkeeping; host write advances the offset without an extra SEEK_CUR. Other write shapes retain their own requirements."

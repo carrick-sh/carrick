@@ -31,6 +31,8 @@ pub enum WorkMetric {
     VfsBackendOperations,
     DirectoryEntriesVisited,
     HostBackendCalls,
+    /// Host SEEK_CUR queries used to prepare a scalar regular-file write.
+    HostWritePositionQueries,
     PageTableEdits,
     PageTableInvalidations,
     /// Fresh host-heap allocations of a stage-1 page-table software image
@@ -59,7 +61,7 @@ pub enum WorkMetric {
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 27;
+    pub const COUNT: usize = 28;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -75,6 +77,7 @@ impl WorkMetric {
         Self::VfsBackendOperations,
         Self::DirectoryEntriesVisited,
         Self::HostBackendCalls,
+        Self::HostWritePositionQueries,
         Self::PageTableEdits,
         Self::PageTableInvalidations,
         Self::PageTableImageAllocations,

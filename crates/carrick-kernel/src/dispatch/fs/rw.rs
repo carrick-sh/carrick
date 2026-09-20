@@ -2835,6 +2835,13 @@ impl<'a> FsView<'a> {
                             if is_append {
                                 unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
                             }
+                            #[cfg(feature = "conformance-metrics")]
+                            if let Some(scope) = cx.kernel.kernel().work_scope() {
+                                let _ = scope.add(
+                                    carrick_observability::work_meter::WorkMetric::HostWritePositionQueries,
+                                    1,
+                                );
+                            }
                             let pos = unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) };
                             let write_offset = (pos >= 0).then_some(pos as u64);
                             let cur_pos = (!is_append).then_some(write_offset).flatten();
@@ -2852,6 +2859,13 @@ impl<'a> FsView<'a> {
                             // (post-append reposition) before applying the
                             // guest's RLIMIT_FSIZE cap.
                             if this.fsize_soft_limit().is_some() {
+                                    #[cfg(feature = "conformance-metrics")]
+                                if let Some(scope) = cx.kernel.kernel().work_scope() {
+                                    let _ = scope.add(
+                                        carrick_observability::work_meter::WorkMetric::HostWritePositionQueries,
+                                        1,
+                                    );
+                                }
                                 let pos = unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) };
                                 if pos >= 0 {
                                     match this.fsize_write_len(cx, pos as u64, bytes.len()) {

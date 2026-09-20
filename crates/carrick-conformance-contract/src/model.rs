@@ -190,6 +190,9 @@ enum BudgetKind {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LayerBindings {
+    /// Explicit open binding work. Never authorizes execution or acceptance.
+    #[serde(default)]
+    pub unresolved: std::collections::BTreeMap<String, String>,
     pub vm_free: Option<String>,
     pub embed: Option<String>,
     pub docker: Option<String>,

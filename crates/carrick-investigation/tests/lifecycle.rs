@@ -1,6 +1,6 @@
 use carrick_conformance_contract::{CapabilityClass, ContractId, ExecutionLayer};
 use carrick_investigation::{Investigation, InvestigationId, SelectedFailure, Stage};
-use std::path::PathBuf;
+
 use tempfile::tempdir;
 
 #[test]
@@ -32,17 +32,9 @@ fn investigation_full_lifecycle_and_jsonl_persistence() {
     })
     .unwrap();
 
-    inv.transition(Stage::Diagnosing {
-        red_evidence: vec!["rev_bad_123: SemanticMismatch".to_string()],
-        fixture_active: true,
-    })
-    .unwrap();
-
-    let review_pkg = PathBuf::from("target/reviews/inv-full-01.md");
-    inv.transition(Stage::ReviewReady {
-        review_package_path: review_pkg.clone(),
-    })
-    .unwrap();
+    inv.park("budget exhausted".into(), "next campaign".into())
+        .unwrap();
+    inv.resume().unwrap();
 
     // Persist to JSONL
     inv.save_to_file(&file_path).unwrap();

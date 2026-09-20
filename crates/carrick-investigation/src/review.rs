@@ -30,6 +30,37 @@ pub struct ReviewPackage {
 }
 
 impl ReviewPackage {
+    pub fn validate(&self) -> Result<(), crate::InvestigationError> {
+        let lists = [
+            &self.linux_authority,
+            &self.diagnosis.causal_evidence,
+            &self.proposed_correction.target_components,
+            &self.affected_invariants,
+            &self.validation_plan,
+        ];
+        if lists
+            .iter()
+            .any(|items| items.is_empty() || items.iter().any(|v| v.trim().is_empty()))
+            || [
+                &self.diagnosis.root_cause,
+                &self.proposed_correction.summary,
+                &self.proposed_correction.semantic_neutrality_assessment,
+            ]
+            .iter()
+            .any(|v| v.trim().is_empty())
+            || self.hypotheses_considered.is_empty()
+            || !self
+                .hypotheses_considered
+                .iter()
+                .any(|h| h.tested && h.outcome.as_ref().is_some_and(|s| !s.trim().is_empty()))
+        {
+            return Err(crate::InvestigationError::InvalidEvidence(
+                "incomplete review package".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn render_markdown(&self) -> String {
         let mut md = String::new();
         md.push_str("# Conformance Investigation Review Package\n\n");
