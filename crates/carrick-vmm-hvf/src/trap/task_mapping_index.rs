@@ -491,6 +491,14 @@ impl TaskMappingIndex {
     /// population by every fork ever done (`kernel.fork.stage1-image`,
     /// `fork_projection_rows_visited`). Returns the drained rows so the caller
     /// retires their registry aliases.
+    ///
+    /// Supersession is proven by the exact VA extent plus a strictly newer
+    /// owner generation, never by containment. A coarse per-vCPU host-owner row
+    /// can cover a finer row without being newer than it, and retiring the
+    /// finer row's alias then drops the CURRENT incarnation from a fork's
+    /// source mappings: the fork plan finds only the stale row, cannot
+    /// authenticate an overlay owner for the live translation, and refuses the
+    /// fork ("has no authenticated inherited inventory extent").
     pub(crate) fn drain_superseded_shadow_rows(&mut self) -> Vec<HvfMappedRegion> {
         let mut drained = Vec::new();
         let mut index = 0;
@@ -500,15 +508,16 @@ impl TaskMappingIndex {
                 && row.structural_owner.is_none()
                 && row.host_mapping.is_none()
                 && row.stage2_lease.is_none()
+                && row.owner_generation != 0
                 && self
                     .live
                     .range(..=GuestVa(row.start))
                     .next_back()
                     .is_some_and(|(_, live)| {
-                        live.start <= row.start
-                            && live.end >= row.end
-                            && (live.physical_ipa, live.owner_generation)
-                                != (row.physical_ipa, row.owner_generation)
+                        live.start == row.start
+                            && live.end == row.end
+                            && live.physical_ipa != row.physical_ipa
+                            && live.owner_generation > row.owner_generation
                     });
             if superseded {
                 note_task_mapping_row_visited();

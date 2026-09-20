@@ -15,7 +15,11 @@ impl HvfVmState {
         // Retire the rows (and their registry aliases) that earlier COW splits
         // superseded, so the projection below scans this process's mappings,
         // never its fork history.
-        let superseded = self.mappings.drain_superseded_shadow_rows();
+        let superseded = if fork_shadow_prune_enabled() {
+            self.mappings.drain_superseded_shadow_rows()
+        } else {
+            Vec::new()
+        };
         if !superseded.is_empty() {
             let keys: std::collections::HashSet<ProcessAliasKey> = superseded
                 .iter()
@@ -1626,6 +1630,21 @@ impl HvfVmState {
         });
         Ok(Some(span_end))
     }
+}
+
+/// Whether a fork retires the parent's superseded dynamic-alias shadow rows
+/// before projecting its COW ranges. On by default; `CARRICK_FORK_SHADOW_PRUNE=0`
+/// restores the pre-prune behaviour so a projection-population regression can
+/// be bisected against one signed binary.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fork_shadow_prune_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("CARRICK_FORK_SHADOW_PRUNE").as_deref(),
+            Ok("0")
+        )
+    })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
