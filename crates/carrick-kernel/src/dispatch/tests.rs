@@ -1918,17 +1918,28 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         (h, epfd, writer, event_addr)
     }
 
-    fn set_write_latch(epoll: &OpenFile, writer: i32) {
+    fn set_epoll_latch(epoll: &OpenFile, target: i32, ready: u32, read_avail: u64) {
         let mut open = epoll.description.write().unwrap();
         let OpenDescription::Epoll { interest, .. } = &mut *open else { panic!("epoll") };
-        interest.get_mut(&writer).unwrap().last_ready = LINUX_EPOLLOUT;
+        let slot = interest.get_mut(&target).unwrap();
+        slot.last_ready = ready;
+        slot.last_read_avail = read_avail;
+    }
+
+    fn set_write_latch(epoll: &OpenFile, writer: i32) {
+        set_epoll_latch(epoll, writer, LINUX_EPOLLOUT, 0);
+    }
+
+    fn staged_slot_state(epoll: &OpenFile, target: i32) -> (u32, u64, bool, u64, u32, u64) {
+        let open = epoll.description.read().unwrap();
+        let OpenDescription::Epoll { interest, .. } = &*open else { panic!("epoll") };
+        let slot = interest.get(&target).unwrap();
+        (slot.last_ready, slot.io_gen, slot.write_backpressured, slot.last_read_avail, slot.event.events, slot.event.data)
     }
 
     fn staged_write_state(epoll: &OpenFile, writer: i32) -> (u32, u64, bool, u32, u64) {
-        let open = epoll.description.read().unwrap();
-        let OpenDescription::Epoll { interest, .. } = &*open else { panic!("epoll") };
-        let slot = interest.get(&writer).unwrap();
-        (slot.last_ready, slot.io_gen, slot.write_backpressured, slot.event.events, slot.event.data)
+        let (ready, io_gen, backpressured, _, events, data) = staged_slot_state(epoll, writer);
+        (ready, io_gen, backpressured, events, data)
     }
 
     #[test]
@@ -1956,23 +1967,8 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         event[8..].copy_from_slice(&19u64.to_le_bytes());
         let event_addr = h.put_bytes(&event);
         assert_eq!(returned(h.call(21, [epfd, LINUX_EPOLL_CTL_ADD, reader as u64, event_addr, 0, 0])), 0);
-        set_read_latch(&h.dispatcher.open_file(epfd as i32).unwrap(), reader);
+        set_epoll_latch(&h.dispatcher.open_file(epfd as i32).unwrap(), reader, LINUX_EPOLLIN, 4);
         (h, epfd, reader, event_addr)
-    }
-
-    fn set_read_latch(epoll: &OpenFile, reader: i32) {
-        let mut open = epoll.description.write().unwrap();
-        let OpenDescription::Epoll { interest, .. } = &mut *open else { panic!("epoll") };
-        let slot = interest.get_mut(&reader).unwrap();
-        slot.last_ready = LINUX_EPOLLIN;
-        slot.last_read_avail = 4;
-    }
-
-    fn staged_read_state(epoll: &OpenFile, reader: i32) -> (u32, u64, u64, u32, u64) {
-        let open = epoll.description.read().unwrap();
-        let OpenDescription::Epoll { interest, .. } = &*open else { panic!("epoll") };
-        let slot = interest.get(&reader).unwrap();
-        (slot.last_ready, slot.io_gen, slot.last_read_avail, slot.event.events, slot.event.data)
     }
 
     #[test]
@@ -1985,7 +1981,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             resources::finish_files_for_host_wait(&context).unwrap();
             receipt.complete(&DispatchOutcome::Returned { value: 4 });
         });
-        assert_eq!(staged_read_state(&epoll, reader), (0, 1, 0, LINUX_EPOLLIN | LINUX_EPOLLET, 19));
+        assert_eq!(staged_slot_state(&epoll, reader), (0, 1, false, 0, LINUX_EPOLLIN | LINUX_EPOLLET, 19));
     }
 
     #[test]
