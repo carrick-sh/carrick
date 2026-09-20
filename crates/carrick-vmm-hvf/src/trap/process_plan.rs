@@ -353,6 +353,7 @@ pub(crate) fn fork_mapping_requires_base_translation(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfTaskState {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_process_plan(
         &self,
         request: carrick_hal::ProcessForkRequest,
@@ -1124,7 +1125,7 @@ impl HvfTaskState {
                 size: mapping.size,
                 physical_ipa,
                 physical_host_addr,
-                physical_size: physical_size,
+                physical_size,
                 inventory_backing,
                 perms: mapping.perms,
                 is_dynamic_alias: mapping.is_dynamic_alias,
