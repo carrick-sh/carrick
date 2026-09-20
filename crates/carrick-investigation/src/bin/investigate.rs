@@ -2,8 +2,9 @@ use std::env;
 use std::path::Path;
 use std::process;
 
+use carrick_conformance_contract::{CapabilityClass, ContractId};
 use carrick_investigation::{
-    Investigation, InvestigationId, SelectedFailure, default_dir, scan_results,
+    Investigation, InvestigationId, SelectedFailure, Stage, default_dir, scan_results,
 };
 
 fn print_usage() {
@@ -11,6 +12,8 @@ fn print_usage() {
         "Usage:
   investigate new --id <id> --suite <suite> [--test-id <test>] [--run-id <run>] [--details <text>]
   investigate new --from-results <results.jsonl> [--suite <suite>]
+  investigate prioritize --from-results <results.jsonl>
+  investigate classify --id <id> --contract <contract-id> [--requires-guest <reason> | --vm-free <cap>]
   investigate status [--id <id>]
   investigate park --id <id> --reason <reason> [--resumption <condition>]
   investigate resume --id <id>
@@ -39,6 +42,8 @@ fn run(args: &[String]) -> Result<(), String> {
     let command = &args[0];
     match command.as_str() {
         "new" => handle_new(&args[1..]),
+        "prioritize" => handle_prioritize(&args[1..]),
+        "classify" => handle_classify(&args[1..]),
         "status" => handle_status(&args[1..]),
         "park" => handle_park(&args[1..]),
         "resume" => handle_resume(&args[1..]),
@@ -260,5 +265,112 @@ fn handle_resume(args: &[String]) -> Result<(), String> {
         id_str,
         inv.stage.name()
     );
+    Ok(())
+}
+
+fn handle_prioritize(args: &[String]) -> Result<(), String> {
+    let mut from_results_arg = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--from-results" if i + 1 < args.len() => {
+                from_results_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => return Err(format!("unexpected argument to 'prioritize': {other}")),
+        }
+    }
+
+    let results_file =
+        from_results_arg.ok_or_else(|| "missing --from-results <results.jsonl>".to_string())?;
+    let candidates = scan_results(Path::new(&results_file))
+        .map_err(|e| format!("cannot scan results from {results_file}: {e}"))?;
+
+    if candidates.is_empty() {
+        println!("No failure candidates found in {results_file}. Conformance clean!");
+        return Ok(());
+    }
+
+    println!(
+        "{:<4} {:<24} {:<32} {:<20} {}",
+        "#", "SEVERITY", "SUITE", "TEST ID", "DETAILS"
+    );
+    println!("{}", "-".repeat(105));
+    for (idx, c) in candidates.iter().enumerate() {
+        let sev_str = serde_json::to_string(&c.severity)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string();
+        println!(
+            "{:<4} {:<24} {:<32} {:<20} {}",
+            idx + 1,
+            sev_str,
+            c.failure.suite,
+            c.failure.test_id,
+            c.failure.details
+        );
+    }
+    println!("\nTotal prioritized candidates: {}", candidates.len());
+    Ok(())
+}
+
+fn handle_classify(args: &[String]) -> Result<(), String> {
+    let mut id_arg = None;
+    let mut contract_arg = None;
+    let mut guest_rationale = None;
+    let mut vm_free_cap = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--id" if i + 1 < args.len() => {
+                id_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--contract" if i + 1 < args.len() => {
+                contract_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--requires-guest" if i + 1 < args.len() => {
+                guest_rationale = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--vm-free" if i + 1 < args.len() => {
+                vm_free_cap = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => return Err(format!("unexpected argument to 'classify': {other}")),
+        }
+    }
+
+    let id_str = id_arg.ok_or_else(|| "missing --id".to_string())?;
+    let contract_str = contract_arg.ok_or_else(|| "missing --contract".to_string())?;
+    let contract_id =
+        ContractId::new(&contract_str).map_err(|e| format!("invalid contract id: {e}"))?;
+
+    let capability = if let Some(rat) = guest_rationale {
+        CapabilityClass::RequiresGuest { rationale: rat }
+    } else if let Some(cap) = vm_free_cap {
+        CapabilityClass::VmFreeExisting { capability: cap }
+    } else {
+        CapabilityClass::RequiresGuest {
+            rationale: "default guest classification".to_string(),
+        }
+    };
+
+    let path = default_dir().join(format!("{id_str}.jsonl"));
+    let mut inv = Investigation::load_from_file(&path)
+        .map_err(|e| format!("cannot load investigation {}: {e}", path.display()))?;
+
+    inv.transition(Stage::Classified {
+        contract: contract_id,
+        capability,
+    })
+    .map_err(|e| format!("cannot classify investigation: {e}"))?;
+
+    inv.save_to_file(&path)
+        .map_err(|e| format!("cannot save investigation: {e}"))?;
+
+    println!("investigation {} classified at {}", id_str, path.display());
     Ok(())
 }
