@@ -1781,24 +1781,46 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let length = bytes.len();
         let mut copied = 0usize;
         while copied < length {
-            let (va, ipa, chunk_len) = self.syscall_buffer_chunk(address, copied, length)?;
-            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::PrivilegedInternal)?;
-            self.vm.translated_write_unchecked(
-                va,
-                ipa.raw(),
-                &bytes[copied..copied + chunk_len],
-            )?;
+            let report_fault = |phase, error: MemoryError| {
+                carrick_observability::probes::guest_internal_write_fault(
+                    address,
+                    length as u64,
+                    phase,
+                    &error.to_string(),
+                );
+                error
+            };
+            let (va, ipa, chunk_len) = self
+                .syscall_buffer_chunk(address, copied, length)
+                .map_err(|error| report_fault(0, error))?;
+            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::PrivilegedInternal)
+                .map_err(|error| report_fault(1, error))?;
+            self.vm
+                .translated_write_unchecked(va, ipa.raw(), &bytes[copied..copied + chunk_len])
+                .map_err(|error| report_fault(2, error))?;
             copied += chunk_len;
         }
         Ok(())
     }
 
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
-        self.vm.guest_range_is_writable(address, length)
-            && self
-                .vm
-                .protections()
-                .is_none_or(|p| !p.range_write_denied(address, length))
+        if !self.vm.guest_range_is_writable(address, length) {
+            return false;
+        }
+        if self
+            .vm
+            .protections()
+            .is_some_and(|p| p.range_write_denied(address, length))
+        {
+            carrick_observability::probes::guest_internal_write_fault(
+                address,
+                length as u64,
+                5,
+                "guest write protection denies range",
+            );
+            return false;
+        }
+        true
     }
 
     fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {

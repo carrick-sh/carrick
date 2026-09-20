@@ -4,7 +4,7 @@
  * WHAT: records Go's exact tgkill(2) request, Linux signal delivery, AArch64
  * sigframe inject/restore, guest exit/exit_group requests, typed Carrick
  * thread-loop terminal reasons, persistent-executor task switches, and
- * terminal guest-fault register tuples needed to
+ * failed internal guest-memory writes and terminal guest-fault register tuples needed to
  * decide whether SIGURG async preemption is lost before kernel publication,
  * between publication and delivery, during rt_sigreturn, or after the restored
  * guest context resumes.  The host pid/tid, source/target Linux pid/tid,
@@ -34,6 +34,13 @@
  *   this consumer deliberately reads only args 0..4; x30 and SP are reliable.
  * - vcpu-fault-regs: ESR, ELR, FAR, instruction, Rn, X[Rn].
  * - vcpu-fault-gprs: x0..x5 for the immediately preceding vcpu-fault-regs.
+ *
+ * Extension (2026-09-20): guest-internal-write-fault reports base VA,
+ * total length, phase (0 translation, 1 backing/COW, 2 copy, 3 no-access,
+ * 4 backend validation, 5 write protection, 6 missing mapping, 7 permission), and error text.
+ * Four-argument ABI qualified live by setid-error-only/trace-5.raw on
+ * 2026-09-20: phase 4, VA 0x600108bc60, length 5024.
+ * This error-only probe preserves the reason before force_sigsegv lowering.
  *
  * PERTURBATION: potentially HIGH on process/thread-heavy Go workloads.  The
  * exact gcimporter reducer emitted more than 1,000 terminal receipts and timed
@@ -163,4 +170,13 @@ proc:::exit
 /pid == $target/
 {
     exit(0);
+}
+
+// Error-only: retain the backend reason that signal-frame setup otherwise
+// lowers to a guest SIGSEGV. Join to delivery by host pid/tid and timestamp.
+carrick*:::guest-internal-write-fault
+/(pid == $target || progenyof($target))/
+{
+    printf("HVPATCHGOSIG1|internal_write_fault|ts=%llu|host_pid=%d|host_tid=%d|address=0x%llx|length=%llu|phase=%u|error=%s\n",
+        timestamp, pid, tid, (uint64_t)arg0, (uint64_t)arg1, (uint32_t)arg2, copyinstr(arg3));
 }

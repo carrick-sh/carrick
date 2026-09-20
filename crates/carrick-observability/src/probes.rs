@@ -5570,6 +5570,12 @@ mod real {
         /// frame was written at, `handler` the guest handler entry. Lets a trace
         /// see exactly what state is captured for later restore.
         fn signal__inject(_: i32, _: u64, _: u64, _: u64) {}
+        /// Failed internal guest-memory write: base VA, total bytes, phase
+        /// (0 translation, 1 backing/COW, 2 copy, 3 no-access,
+        /// 4 backend validation, 5 write protection, 6 missing mapping,
+        /// 7 mapping permission), and the original error or refusal context.
+        /// Emitted before signal-frame callers lower the error to SIGSEGV.
+        fn guest__internal__write__fault(_: u64, _: u64, _: u32, _: &str) {}
         /// Fires inside rt_sigreturn/restore. `saved_pc` is the PC about to be
         /// restored into ELR_EL1, `sp` the SP_EL0 the frame was read from,
         /// `magic` the frame magic read back. A corrupted `saved_pc` or `magic`
@@ -7451,6 +7457,10 @@ mod real {
         carrick_usdt::signal__inject!(|| (signum, saved_pc, new_sp, handler));
     }
 
+    pub fn guest_internal_write_fault(address: u64, length: u64, phase: u32, error: &str) {
+        carrick_usdt::guest__internal__write__fault!(|| (address, length, phase, error));
+    }
+
     pub fn signal_restore(saved_pc: u64, sp: u64, magic: u64) {
         carrick_usdt::signal__restore!(|| (saved_pc, sp, magic));
     }
@@ -8468,6 +8478,7 @@ mod stub {
     stub!(fork_footprint_class(class_id: i32, region_count: u64, scan_bytes: u64, resident_bytes: u64, flags: u64));
     stub!(fork_post(pid: i32, pc: u64, elr: u64));
     stub!(signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64));
+    stub!(guest_internal_write_fault(address: u64, length: u64, phase: u32, error: &str));
     stub!(signal_restore(saved_pc: u64, sp: u64, magic: u64));
     stub!(kick_in_kernel(pc: u64, el: u32));
     stub!(vcpu_kick(vcpu: u64, valid: i32, rc: i32));
