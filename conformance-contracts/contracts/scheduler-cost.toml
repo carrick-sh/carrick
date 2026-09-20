@@ -1,0 +1,27 @@
+schema_version = 1
+id = "kernel.scheduler.preemption-cost"
+title = "Preemption cost and scalability"
+guest_surfaces = ["scheduler:preemption", "scheduler:demand"]
+semantic_authority = [
+  "man 7 sched",
+]
+fixture = "fixture:scheduler_preemption"
+scale_points = [1, 8, 32, 128]
+rationale = "No idle periodic work or uncontended fairness exits; deadlines and notifications scale with active demand, not parked population."
+
+[bindings]
+vm_free = "carrick-kernel-example::scheduler_cost_contract"
+embed = "carrick-embed::scheduler_cost_contract"
+docker = "fixture:scheduler_preemption"
+ecosystem = ["go:runtime"]
+
+[[structural_budgets]]
+kind = "upper-bound"
+metric = "kernel_redispatches"
+maximum = 0
+rationale = "Uncontended execution incurs zero fairness redispatches or spurious preemptions."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20

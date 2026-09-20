@@ -76,3 +76,8 @@ path = "src/signal_basic.rs"
 [[bin]]
 name = "carrick-linux-aarch64-signal-default"
 path = "src/signal_default.rs"
+
+[[bin]]
+name = "carrick-linux-aarch64-scheduler-preemption"
+path = "src/scheduler_preemption.rs"
+

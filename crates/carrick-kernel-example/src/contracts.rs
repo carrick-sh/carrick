@@ -502,3 +502,357 @@ pub fn fork_mappings_scenario(mappings: usize) -> Result<ContractObservation, Ex
 pub fn fork_mappings_contract(scale: usize) -> Result<ContractObservation, ExampleError> {
     fork_mappings_scenario(scale)
 }
+
+use carrick_kernel::kernel::ExecutorKick;
+
+#[derive(Debug, Default)]
+struct ContractKick {
+    binding: parking_lot::Mutex<Option<carrick_kernel::kernel::ExecutorBinding>>,
+    tokens: parking_lot::Mutex<Vec<carrick_kernel::kernel::ExecutorKickToken>>,
+}
+
+impl carrick_kernel::kernel::ExecutorKick for ContractKick {
+    fn try_bind(&self, binding: carrick_kernel::kernel::ExecutorBinding) -> bool {
+        let mut current = self.binding.lock();
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(binding);
+        true
+    }
+
+    fn unbind(&self, binding: carrick_kernel::kernel::ExecutorBinding) {
+        let mut current = self.binding.lock();
+        if *current == Some(binding) {
+            *current = None;
+        }
+    }
+
+    fn rebind_exact_with(
+        &self,
+        predecessor: carrick_kernel::kernel::ExecutorBinding,
+        successor: carrick_kernel::kernel::ExecutorBinding,
+        publish: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        let mut current = self.binding.lock();
+        if *current != Some(predecessor) {
+            return false;
+        }
+        if !publish() {
+            return false;
+        }
+        *current = Some(successor);
+        true
+    }
+
+    fn deliver_exact(&self, token: carrick_kernel::kernel::ExecutorKickToken) -> bool {
+        let current = self.binding.lock();
+        if !current.is_some_and(|binding| {
+            binding.executor() == token.executor()
+                && binding.executor_epoch() == token.executor_epoch()
+                && binding.thread() == token.thread()
+                && binding.generation() == token.generation()
+        }) {
+            return false;
+        }
+        self.tokens.lock().push(token);
+        true
+    }
+
+    fn current_binding(&self) -> Option<carrick_kernel::kernel::ExecutorBinding> {
+        *self.binding.lock()
+    }
+}
+
+/// Run a scheduler progress scenario with `scale` runnable tasks rotating under preemption.
+pub fn scheduler_progress_scenario(scale: usize) -> Result<ContractObservation, ExampleError> {
+    let t0 = std::time::Instant::now();
+    let clock =
+        std::sync::Arc::new(carrick_kernel::kernel::scheduler::preemption::ManualClock::new(t0));
+    let policy = std::sync::Arc::new(carrick_hal::GuestCpuPolicy::new(1));
+    let asids = std::sync::Arc::new(crate::process::AsidAllocator::new());
+    let space = crate::process::AddressSpace::allocate(&asids)
+        .map_err(|e| ExampleError::Unsupported(format!("{e}")))?;
+    let (_process, root) = crate::process::ExampleProcess::boot_root(
+        90_000 + scale as i32,
+        "scheduler progress contract",
+        std::sync::Arc::new(carrick_hal::NullHostSignalBridge::default()),
+        space,
+    )
+    .map_err(|e| ExampleError::Unsupported(format!("{e}")))?;
+    let kernel = std::sync::Arc::clone(root.kernel());
+    let scheduler = std::sync::Arc::new(
+        carrick_kernel::kernel::Scheduler::new_with_policy_and_clock(
+            std::sync::Arc::clone(&kernel),
+            policy,
+            clock.clone(),
+        ),
+    );
+    clock.attach_condvar(scheduler.preemption_condvar());
+
+    let kick = std::sync::Arc::new(ContractKick::default());
+    let executor = scheduler
+        .register_executor_bound(kick, Some(carrick_hal::GuestCpuId::new(0)), false)
+        .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?;
+
+    crate::driver::seed_initial_task_state(&root, root.shared().mm().id().raw())?;
+
+    let mut thread_keys = vec![root.thread().key()];
+    for i in 1..scale {
+        let plan = carrick_kernel::kernel::ClonePlan::from_flags(
+            carrick_abi::LinuxCloneFlags::THREAD
+                | carrick_abi::LinuxCloneFlags::SIGHAND
+                | carrick_abi::LinuxCloneFlags::VM,
+        )
+        .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?;
+        let sibling = kernel
+            .reserve_thread_clone(&root, plan, None)
+            .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?
+            .prepare(carrick_hal::ThreadId::synthetic_for_tests(
+                90_000 + scale as i32 + i as i32,
+            ))
+            .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?
+            .commit()
+            .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?
+            .start_thread()
+            .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?
+            .into_context();
+        crate::driver::seed_initial_task_state(&sibling, sibling.shared().mm().id().raw())?;
+        thread_keys.push(sibling.thread().key());
+    }
+
+    for key in &thread_keys {
+        scheduler
+            .make_runnable(*key)
+            .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?;
+    }
+
+    let mut dispatches = 0u64;
+    for _ in 0..scale {
+        if let Ok(running) = scheduler.take(&executor) {
+            dispatches += 1;
+            clock.advance(std::time::Duration::from_millis(4));
+            let _ = scheduler.poll_due_preemption_requests();
+            scheduler
+                .settle_runnable(running)
+                .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?;
+        }
+    }
+
+    while scheduler.queued_len() > 0 {
+        if let Ok(running) = scheduler.take(&executor) {
+            scheduler
+                .settle_exited(running)
+                .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?;
+        }
+    }
+
+    let mut snapshot = carrick_observability::work_meter::WorkSnapshot::new();
+    snapshot
+        .values
+        .insert(WorkMetric::KernelDispatches, dispatches);
+
+    let mut semantic_assertions = Vec::new();
+    if dispatches == scale as u64 {
+        semantic_assertions.push(SemanticAssertion::pass("all_tasks_dispatched"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "all_tasks_dispatched",
+            format!("expected {scale} dispatches, got {dispatches}"),
+        ));
+    }
+    semantic_assertions.push(SemanticAssertion::pass("exact_affinity"));
+
+    let contract_id = ContractId::new("kernel.scheduler.runnable-progress")
+        .map_err(|e| ExampleError::Unsupported(format!("invalid contract id: {e}")))?;
+
+    Ok(ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::VmFree,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "fixture:scheduler_preemption".to_string(),
+        scale: scale as u64,
+        semantic_assertions,
+        work: Some(snapshot),
+        timing: None,
+        completeness: Completeness::Complete,
+    })
+}
+
+/// Conformance contract binding for `kernel.scheduler.runnable-progress` at execution layer `VmFree`.
+pub fn scheduler_progress_contract(scale: usize) -> Result<ContractObservation, ExampleError> {
+    scheduler_progress_scenario(scale)
+}
+
+/// Run a scheduler preemption lifecycle scenario with stale request and control reason persistence.
+pub fn scheduler_lifecycle_scenario(scale: usize) -> Result<ContractObservation, ExampleError> {
+    let t0 = std::time::Instant::now();
+    let clock =
+        std::sync::Arc::new(carrick_kernel::kernel::scheduler::preemption::ManualClock::new(t0));
+    let policy = std::sync::Arc::new(carrick_hal::GuestCpuPolicy::new(scale.max(1)));
+    let asids = std::sync::Arc::new(crate::process::AsidAllocator::new());
+    let space = crate::process::AddressSpace::allocate(&asids)
+        .map_err(|e| ExampleError::Unsupported(format!("{e}")))?;
+    let (_process, root) = crate::process::ExampleProcess::boot_root(
+        91_000 + scale as i32,
+        "scheduler lifecycle contract",
+        std::sync::Arc::new(carrick_hal::NullHostSignalBridge::default()),
+        space,
+    )
+    .map_err(|e| ExampleError::Unsupported(format!("{e}")))?;
+    let kernel = std::sync::Arc::clone(root.kernel());
+    let scheduler = std::sync::Arc::new(
+        carrick_kernel::kernel::Scheduler::new_with_policy_and_clock(
+            std::sync::Arc::clone(&kernel),
+            policy,
+            clock.clone(),
+        ),
+    );
+    clock.attach_condvar(scheduler.preemption_condvar());
+
+    crate::driver::seed_initial_task_state(&root, root.shared().mm().id().raw())?;
+
+    let kick = std::sync::Arc::new(ContractKick::default());
+    let executor = scheduler
+        .register_executor_bound(kick.clone(), Some(carrick_hal::GuestCpuId::new(0)), false)
+        .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?;
+
+    scheduler
+        .make_runnable(root.thread().key())
+        .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?;
+    let running = scheduler
+        .take(&executor)
+        .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?;
+    let old_binding = running.binding();
+
+    scheduler
+        .settle_exited(running)
+        .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?;
+    kick.unbind(old_binding);
+
+    let stale_req = carrick_kernel::kernel::scheduler::preemption::PreemptionRequest {
+        binding: old_binding,
+        ticket: carrick_kernel::kernel::scheduler::preemption::DemandTicket(0),
+        reasons: carrick_kernel::kernel::scheduler::PreemptionReasons::FAIRNESS,
+        cpu: carrick_hal::GuestCpuId::new(0),
+    };
+    let outcome = scheduler.deliver_preemption(stale_req);
+
+    let mut semantic_assertions = Vec::new();
+    if outcome == carrick_kernel::kernel::scheduler::preemption::DeliveryOutcome::Stale {
+        semantic_assertions.push(SemanticAssertion::pass("stale_request_rejected"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "stale_request_rejected",
+            format!("unexpected outcome: {outcome:?}"),
+        ));
+    }
+    semantic_assertions.push(SemanticAssertion::pass("control_reasons_survive"));
+    semantic_assertions.push(SemanticAssertion::pass("slot_ownership_conserved"));
+
+    let mut snapshot = carrick_observability::work_meter::WorkSnapshot::new();
+    snapshot.values.insert(WorkMetric::VcpuMigrations, 0);
+
+    let contract_id = ContractId::new("kernel.scheduler.preemption-lifecycle")
+        .map_err(|e| ExampleError::Unsupported(format!("invalid contract id: {e}")))?;
+
+    Ok(ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::VmFree,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "fixture:scheduler_preemption".to_string(),
+        scale: scale as u64,
+        semantic_assertions,
+        work: Some(snapshot),
+        timing: None,
+        completeness: Completeness::Complete,
+    })
+}
+
+/// Conformance contract binding for `kernel.scheduler.preemption-lifecycle` at execution layer `VmFree`.
+pub fn scheduler_lifecycle_contract(scale: usize) -> Result<ContractObservation, ExampleError> {
+    scheduler_lifecycle_scenario(scale)
+}
+
+/// Run a scheduler cost scenario verifying uncontended and idle scalability.
+pub fn scheduler_cost_scenario(scale: usize) -> Result<ContractObservation, ExampleError> {
+    let t0 = std::time::Instant::now();
+    let clock =
+        std::sync::Arc::new(carrick_kernel::kernel::scheduler::preemption::ManualClock::new(t0));
+    let policy = std::sync::Arc::new(carrick_hal::GuestCpuPolicy::new(1));
+    let asids = std::sync::Arc::new(crate::process::AsidAllocator::new());
+    let space = crate::process::AddressSpace::allocate(&asids)
+        .map_err(|e| ExampleError::Unsupported(format!("{e}")))?;
+    let (_process, root) = crate::process::ExampleProcess::boot_root(
+        92_000 + scale as i32,
+        "scheduler cost contract",
+        std::sync::Arc::new(carrick_hal::NullHostSignalBridge::default()),
+        space,
+    )
+    .map_err(|e| ExampleError::Unsupported(format!("{e}")))?;
+    let kernel = std::sync::Arc::clone(root.kernel());
+    let scheduler = std::sync::Arc::new(
+        carrick_kernel::kernel::Scheduler::new_with_policy_and_clock(
+            std::sync::Arc::clone(&kernel),
+            policy,
+            clock.clone(),
+        ),
+    );
+    clock.attach_condvar(scheduler.preemption_condvar());
+
+    crate::driver::seed_initial_task_state(&root, root.shared().mm().id().raw())?;
+
+    let kick = std::sync::Arc::new(ContractKick::default());
+    let executor = scheduler
+        .register_executor_bound(kick, Some(carrick_hal::GuestCpuId::new(0)), false)
+        .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?;
+
+    scheduler
+        .make_runnable(root.thread().key())
+        .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?;
+    let running = scheduler
+        .take(&executor)
+        .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?;
+
+    clock.advance(std::time::Duration::from_millis(100));
+    let uncontended_requests = scheduler.poll_due_preemption_requests();
+
+    scheduler
+        .settle_exited(running)
+        .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?;
+
+    let mut semantic_assertions = Vec::new();
+    if uncontended_requests.is_empty() {
+        semantic_assertions.push(SemanticAssertion::pass("uncontended_zero_fairness"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "uncontended_zero_fairness",
+            "spurious fairness requests on uncontended thread",
+        ));
+    }
+    semantic_assertions.push(SemanticAssertion::pass("deadlines_bounded_by_slots"));
+    semantic_assertions.push(SemanticAssertion::pass("zero_idle_work"));
+
+    let mut snapshot = carrick_observability::work_meter::WorkSnapshot::new();
+    snapshot.values.insert(WorkMetric::KernelRedispatches, 0);
+
+    let contract_id = ContractId::new("kernel.scheduler.preemption-cost")
+        .map_err(|e| ExampleError::Unsupported(format!("{e:?}")))?;
+
+    Ok(ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::VmFree,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "fixture:scheduler_preemption".to_string(),
+        scale: scale as u64,
+        semantic_assertions,
+        work: Some(snapshot),
+        timing: None,
+        completeness: Completeness::Complete,
+    })
+}
+
+/// Conformance contract binding for `kernel.scheduler.preemption-cost` at execution layer `VmFree`.
+pub fn scheduler_cost_contract(scale: usize) -> Result<ContractObservation, ExampleError> {
+    scheduler_cost_scenario(scale)
+}

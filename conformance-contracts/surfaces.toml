@@ -90,11 +90,32 @@ contracts = ["kernel.inotify.watch"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/scheduler/host_wait.rs"
-contracts = ["kernel.scheduler.host-wait-handoff"]
+contracts = ["kernel.scheduler.host-wait-handoff", "kernel.scheduler.preemption-lifecycle"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/scheduler.rs"
-contracts = ["kernel.scheduler.host-wait-handoff"]
+contracts = [
+  "kernel.scheduler.host-wait-handoff",
+  "kernel.scheduler.runnable-progress",
+  "kernel.scheduler.preemption-lifecycle",
+  "kernel.scheduler.preemption-cost",
+]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/scheduler/preemption.rs"
+contracts = [
+  "kernel.scheduler.runnable-progress",
+  "kernel.scheduler.preemption-lifecycle",
+  "kernel.scheduler.preemption-cost",
+]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/scheduler_preemption.rs"
+contracts = [
+  "kernel.scheduler.runnable-progress",
+  "kernel.scheduler.preemption-lifecycle",
+  "kernel.scheduler.preemption-cost",
+]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/host_io.rs"
@@ -127,3 +148,20 @@ contracts = ["kernel.scheduler.host-wait-handoff"]
 [[surfaces]]
 path = "crates/carrick-embed/tests/host_wait_policy.rs"
 contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/scheduler_preemption.rs"
+contracts = [
+  "kernel.scheduler.runnable-progress",
+  "kernel.scheduler.preemption-lifecycle",
+  "kernel.scheduler.preemption-cost",
+]
+
+[[surfaces]]
+path = "fixtures/linux-aarch64-hello/src/scheduler_preemption.rs"
+contracts = [
+  "kernel.scheduler.runnable-progress",
+  "kernel.scheduler.preemption-lifecycle",
+  "kernel.scheduler.preemption-cost",
+]
+

@@ -95,6 +95,10 @@ pub use contracts::{
     run_fork_mappings_timing_contract, run_futex_requeue_structural_contract,
     run_futex_requeue_timing_contract, run_futex_structural_contract, run_futex_timing_contract,
     run_inotify_watch_structural_contract, run_inotify_watch_timing_contract,
+    run_scheduler_cost_structural_contract, run_scheduler_cost_timing_contract,
+    run_scheduler_lifecycle_structural_contract, run_scheduler_lifecycle_timing_contract,
+    run_scheduler_progress_structural_contract, run_scheduler_progress_timing_contract,
+    scheduler_cost_contract, scheduler_lifecycle_contract, scheduler_progress_contract,
 };
 pub use error::{BuildError, EmbedError};
 pub use prepared::PreparedContainer;

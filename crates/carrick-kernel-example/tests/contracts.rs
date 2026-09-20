@@ -6,6 +6,7 @@ use carrick_conformance_contract::{ContractRegistry, evaluate};
 use carrick_kernel_example::contracts::{
     fork_filetable_contract, fork_mappings_contract, futex_contention_contract,
     futex_requeue_contract, futex_requeue_scenario, inotify_watch_contract,
+    scheduler_cost_contract, scheduler_lifecycle_contract, scheduler_progress_contract,
 };
 use carrick_observability::work_meter::WorkMetric;
 
@@ -229,4 +230,43 @@ fn fork_mappings_structural_red_control() {
         }
         other => panic!("expected WorkBudgetExceeded, got: {other:?}"),
     }
+}
+
+#[test]
+fn scheduler_progress_contract_is_semantically_exact_and_linear() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry
+        .require("kernel.scheduler.runnable-progress")
+        .expect("contract");
+    let observations = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| scheduler_progress_contract(scale).expect("observation"))
+        .collect::<Vec<_>>();
+    evaluate(contract, &observations).expect("scheduler progress conformance");
+}
+
+#[test]
+fn scheduler_lifecycle_contract_is_semantically_exact_and_constant() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry
+        .require("kernel.scheduler.preemption-lifecycle")
+        .expect("contract");
+    let observations = [1, 2, 4, 8]
+        .into_iter()
+        .map(|scale| scheduler_lifecycle_contract(scale).expect("observation"))
+        .collect::<Vec<_>>();
+    evaluate(contract, &observations).expect("scheduler lifecycle conformance");
+}
+
+#[test]
+fn scheduler_cost_contract_is_semantically_exact_and_constant() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry
+        .require("kernel.scheduler.preemption-cost")
+        .expect("contract");
+    let observations = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| scheduler_cost_contract(scale).expect("observation"))
+        .collect::<Vec<_>>();
+    evaluate(contract, &observations).expect("scheduler cost conformance");
 }
