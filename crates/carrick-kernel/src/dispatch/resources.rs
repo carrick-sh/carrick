@@ -12,7 +12,7 @@ use carrick_fatal::carrick_fatal;
 pub(super) struct CapturedResources {
     file_lease: Option<crate::kernel::objects::FileTableFunctionalLease>,
     files_finished: bool,
-    write_rearm: Option<super::net::WriteRearm>,
+    io_rearm: Option<super::net::IoRearm>,
     credentials: Arc<crate::kernel::Credentials>,
     fs_context: Arc<crate::kernel::FsContext>,
     files: Arc<crate::kernel::FileTable>,
@@ -32,7 +32,7 @@ impl CapturedResources {
         Self {
             file_lease: None,
             files_finished: false,
-            write_rearm: None,
+            io_rearm: None,
             credentials: context.resources().credentials(),
             fs_context: context.resources().fs_context(),
             files: context.resources().files(),
@@ -232,9 +232,9 @@ fn with_resource_scope<R>(
 }
 
 /// Capture from the handler's selected endpoint, never from a second fd lookup.
-pub(super) fn stage_write_rearm(
+pub(super) fn stage_io_rearm(
     context: &crate::kernel::KernelContext,
-    rearm: super::net::WriteRearm,
+    rearm: super::net::IoRearm,
 ) -> Result<(), super::DispatchError> {
     if !ACTIVE_CONTEXT.with(|active| std::ptr::eq(active.get(), context)) {
         return Err(super::DispatchError::HostWaitResourceScope);
@@ -244,21 +244,39 @@ pub(super) fn stage_write_rearm(
         let resources = stack
             .last_mut()
             .ok_or(super::DispatchError::HostWaitResourceScope)?;
-        if resources.files_finished || resources.write_rearm.is_some() {
+        if resources.files_finished {
             return Err(super::DispatchError::HostWaitResourceScope);
         }
-        resources.write_rearm = Some(rearm);
+        if resources.io_rearm.is_none() {
+            resources.io_rearm = Some(rearm);
+        }
         Ok(())
     })
 }
 
+pub(super) fn stage_write_rearm(
+    context: &crate::kernel::KernelContext,
+    rearm: super::net::WriteRearm,
+) -> Result<(), super::DispatchError> {
+    stage_io_rearm(context, rearm)
+}
+
 /// Consume only owned completion state; no file-table use is reacquired.
-pub(super) fn take_write_rearm() -> Option<super::net::WriteRearm> {
+pub(super) fn take_io_rearm() -> Option<super::net::IoRearm> {
     CAPTURED_RESOURCES.with(|stack| {
         stack
             .borrow_mut()
             .last_mut()
-            .and_then(|scope| scope.write_rearm.take())
+            .and_then(|scope| scope.io_rearm.take())
+    })
+}
+
+pub(super) fn files_finished() -> bool {
+    CAPTURED_RESOURCES.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .is_some_and(|scope| scope.files_finished)
     })
 }
 

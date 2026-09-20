@@ -25,7 +25,7 @@ use crate::dispatch::{
 };
 
 mod write_rearm;
-pub(in crate::dispatch) use write_rearm::WriteRearm;
+pub(in crate::dispatch) use write_rearm::{IoRearm, WriteRearm};
 
 const EPOLL_REBIND_REASON_IO_REARM: u32 = 1;
 const EPOLL_REBIND_REASON_CLOSE_DETACH: u32 = 2;
@@ -77,7 +77,7 @@ fn epoll_wait_sample_needs_host_rebind(
     clear_write_backpressure || write_edge_delivered || terminal_edge_delivered
 }
 
-fn epoll_io_progress_needs_host_rebind(
+pub(super) fn epoll_io_progress_needs_host_rebind(
     before_ready: u32,
     after_ready: u32,
     before_read_avail: u64,

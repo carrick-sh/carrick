@@ -1944,6 +1944,50 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         assert_eq!(staged_write_state(&epoll, writer), (0, 1, false, LINUX_EPOLLOUT | LINUX_EPOLLET, 17));
     }
 
+    fn staged_read_fixture() -> (Harness, u64, i32, u64) {
+        let mut h = Harness::new();
+        let epfd = returned(h.call(20, [0; 6])) as u64;
+        let pair_addr = h.reserve(8);
+        assert_eq!(returned(h.call(199, [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK, 0, pair_addr, 0, 0])), 0);
+        let pair = h.memory.read_bytes(pair_addr, 8).unwrap();
+        let reader = i32::from_le_bytes(pair[..4].try_into().unwrap());
+        let mut event = [0u8; 16];
+        event[..4].copy_from_slice(&(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes());
+        event[8..].copy_from_slice(&19u64.to_le_bytes());
+        let event_addr = h.put_bytes(&event);
+        assert_eq!(returned(h.call(21, [epfd, LINUX_EPOLL_CTL_ADD, reader as u64, event_addr, 0, 0])), 0);
+        set_read_latch(&h.dispatcher.open_file(epfd as i32).unwrap(), reader);
+        (h, epfd, reader, event_addr)
+    }
+
+    fn set_read_latch(epoll: &OpenFile, reader: i32) {
+        let mut open = epoll.description.write().unwrap();
+        let OpenDescription::Epoll { interest, .. } = &mut *open else { panic!("epoll") };
+        let slot = interest.get_mut(&reader).unwrap();
+        slot.last_ready = LINUX_EPOLLIN;
+        slot.last_read_avail = 4;
+    }
+
+    fn staged_read_state(epoll: &OpenFile, reader: i32) -> (u32, u64, u64, u32, u64) {
+        let open = epoll.description.read().unwrap();
+        let OpenDescription::Epoll { interest, .. } = &*open else { panic!("epoll") };
+        let slot = interest.get(&reader).unwrap();
+        (slot.last_ready, slot.io_gen, slot.last_read_avail, slot.event.events, slot.event.data)
+    }
+
+    #[test]
+    fn staged_read_rearm_consumes_no_file_table_authority() {
+        let (h, epfd, reader, _) = staged_read_fixture();
+        let epoll = h.dispatcher.open_file(epfd as i32).unwrap();
+        let context = h.dispatcher.capture_one_task_context().unwrap();
+        resources::with_captured_resources(&context, || {
+            let receipt = net::IoRearm::read(h.dispatcher.open_file(reader).map(|file| file.description));
+            resources::finish_files_for_host_wait(&context).unwrap();
+            receipt.complete(&DispatchOutcome::Returned { value: 4 });
+        });
+        assert_eq!(staged_read_state(&epoll, reader), (0, 1, 0, LINUX_EPOLLIN | LINUX_EPOLLET, 19));
+    }
+
     #[test]
     fn staged_write_rearm_distinguishes_error_eagain_and_progress() {
         let (h, epfd, writer, _) = staged_write_fixture();

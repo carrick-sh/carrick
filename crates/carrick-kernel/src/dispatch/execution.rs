@@ -436,9 +436,9 @@ impl SyscallDispatcher {
         // assertion is delivered (the Linux-lane lost-edge wedge — see
         // `epoll_rearm_after_io`). Outcome matters: an EAGAIN write did not
         // consume writable capacity and must not synthesize another OUT edge.
-        if let Some(rearm) = resources::take_write_rearm() {
+        if let Some(rearm) = resources::take_io_rearm() {
             rearm.complete(&outcome);
-        } else {
+        } else if !resources::files_finished() {
             resources::with_captured_resources(kernel, || {
                 self.epoll_rearm_after_io(&request, &outcome);
             });
