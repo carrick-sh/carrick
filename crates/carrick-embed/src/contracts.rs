@@ -652,10 +652,18 @@ pub fn run_inotify_readiness_structural_contract() -> ContractObservation {
                 Ok(_) => {}
                 // A probe that never ran measured nothing. Saying so is the
                 // contract's IncompleteMeasurement, not a zero-visit pass.
-                Err(_) => completeness = Completeness::Incomplete,
+                Err(error) => {
+                    completeness = Completeness::Incomplete {
+                        reasons: vec![format!("probe run failed: {error}")],
+                    }
+                }
             }
         }
-        _ => completeness = Completeness::Incomplete,
+        _ => {
+            completeness = Completeness::Incomplete {
+                reasons: vec!["no probe directory available".to_string()],
+            }
+        }
     }
 
     if exit_ok {

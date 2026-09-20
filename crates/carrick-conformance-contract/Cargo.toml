@@ -9,8 +9,10 @@ workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+carrick-abi = { path = "../carrick-abi" }
 carrick-observability = { path = "../carrick-observability", features = ["conformance-metrics"] }
 
 [dev-dependencies]

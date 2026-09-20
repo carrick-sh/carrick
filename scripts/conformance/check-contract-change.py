@@ -14,6 +14,8 @@ NON_GUEST_CRATES = {
     "crates/carrick-conformance-contract",
     "crates/carrick-conformance",
     "crates/carrick-conformance-next",
+    "crates/carrick-coordinator",
+    "crates/carrick-investigation",
     "crates/carrick-test-support",
     "crates/carrick-observability",
 }

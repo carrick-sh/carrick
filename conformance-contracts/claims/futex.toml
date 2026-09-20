@@ -1,0 +1,20 @@
+[[claims]]
+id = "kernel.futex.contention.wake-cardinality"
+contract = "kernel.futex.contention"
+description = "Wake cardinality must match woken waiters exactly and queue visits must be proportional to affected waiters"
+linux_authority = ["man 2 futex"]
+fixture_requirements = ["probe:futexpingpong"]
+related_contracts = ["kernel.futex.requeue"]
+related_ecosystem_rows = ["go:sync", "cpython:concurrent_futures"]
+capability = { class = "vm-free-existing", capability = "carrick-kernel-example::futex_contention_contract" }
+coverage = { status = "violation-demonstrated", layer = "vm-free", known_bad_revision = "2026-09-18-futex-leak" }
+
+[[claims]]
+id = "kernel.futex.requeue.batch-move"
+contract = "kernel.futex.requeue"
+description = "Futex CMP_REQUEUE moves waiters between futex words in single batch"
+linux_authority = ["man 2 futex"]
+fixture_requirements = ["probe:futexrequeue"]
+related_contracts = ["kernel.futex.contention"]
+capability = { class = "vm-free-existing", capability = "carrick-kernel-example::futex_requeue_contract" }
+coverage = { status = "evidenced", layer = "vm-free", revision = "HEAD" }

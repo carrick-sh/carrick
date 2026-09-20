@@ -1,0 +1,39 @@
+[[claims]]
+id = "kernel.scheduler.host-wait-handoff.zero-migration"
+contract = "kernel.scheduler.host-wait-handoff"
+description = "Host wait handoff preserves logical vCPU binding with zero vCPU migrations"
+linux_authority = ["man 2 read", "man 2 write", "man 2 pread64", "man 2 pwrite64"]
+fixture_requirements = ["scheduler_handoff"]
+related_contracts = ["kernel.scheduler.preemption-lifecycle"]
+capability = { class = "vm-free-existing", capability = "carrick-kernel-example::scheduler_handoff" }
+coverage = { status = "evidenced", layer = "vm-free", revision = "HEAD" }
+
+[[claims]]
+id = "kernel.scheduler.preemption-lifecycle.stale-request-protection"
+contract = "kernel.scheduler.preemption-lifecycle"
+description = "Preemption lifecycle and stale-request protection incurs zero vCPU migrations"
+linux_authority = ["carrick-architecture-invariants:scheduler-lifecycle"]
+fixture_requirements = ["fixture:scheduler_preemption"]
+related_contracts = ["kernel.scheduler.runnable-progress", "kernel.scheduler.preemption-cost"]
+capability = { class = "vm-free-existing", capability = "carrick-kernel-example::scheduler_preemption" }
+coverage = { status = "evidenced", layer = "vm-free", revision = "HEAD" }
+
+[[claims]]
+id = "kernel.scheduler.runnable-progress.linear-progress"
+contract = "kernel.scheduler.runnable-progress"
+description = "Runnable scheduler preemption makes linear progress with dispatch count proportional to scale"
+linux_authority = ["carrick-architecture-invariants:scheduler-progress"]
+fixture_requirements = ["fixture:scheduler_preemption"]
+related_contracts = ["kernel.scheduler.preemption-lifecycle", "kernel.scheduler.preemption-cost"]
+capability = { class = "vm-free-existing", capability = "carrick-kernel-example::scheduler_preemption" }
+coverage = { status = "evidenced", layer = "vm-free", revision = "HEAD" }
+
+[[claims]]
+id = "kernel.scheduler.preemption-cost.uncontended-zero-redispatch"
+contract = "kernel.scheduler.preemption-cost"
+description = "Uncontended execution incurs zero fairness redispatches"
+linux_authority = ["carrick-architecture-invariants:scheduler-cost"]
+fixture_requirements = ["fixture:scheduler_preemption"]
+related_contracts = ["kernel.scheduler.runnable-progress", "kernel.scheduler.preemption-lifecycle"]
+capability = { class = "vm-free-existing", capability = "carrick-kernel-example::scheduler_preemption" }
+coverage = { status = "evidenced", layer = "vm-free", revision = "HEAD" }

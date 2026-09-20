@@ -514,6 +514,18 @@ matrix:
 check-matrix:
     cargo run -p carrick-conformance -- --check-matrix
 
+# Generate fresh syscall inventory from carrick-abi.
+inventory *ARGS:
+    cargo run -p carrick-conformance-contract --bin generate-inventory -- {{ARGS}}
+
+# Drift gate: conformance-contracts/inventory.json must equal a fresh generation.
+check-inventory:
+    cargo run -p carrick-conformance-contract --bin generate-inventory -- --check
+
+# Contract-driven conformance investigation CLI.
+investigate *ARGS:
+    cargo run -p carrick-investigation --bin investigate -- {{ARGS}}
+
 # Layering gate: carrick-vfs / carrick-kernel never depend upward; no VMM
 # depends on the kernel
 # (docs/superpowers/plans/2026-09-13-extract-carrick-vfs-and-carrick-kernel.md);

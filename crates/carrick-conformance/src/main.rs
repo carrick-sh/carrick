@@ -660,6 +660,25 @@ fn run() -> anyhow::Result<ExitCode> {
     let fail_fast_stop = AtomicBool::new(false);
     let phase1_gating = AtomicUsize::new(0);
 
+    let coordinator =
+        carrick_coordinator::Coordinator::new(carrick_coordinator::Coordinator::default_dir()).ok();
+    let host_name = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
+    let phase1_lease = coordinator.as_ref().and_then(|c| {
+        let owner = carrick_coordinator::LeaseOwner {
+            host: host_name.clone(),
+            pid: std::process::id(),
+            run_id: format!("conf-{pid}"),
+            investigation_id: None,
+        };
+        match c.try_acquire(carrick_coordinator::ResourceClass::SignedGuestRun, owner) {
+            Ok(lease) => lease,
+            Err(e) => {
+                eprintln!("coordinator: note: failed to acquire SignedGuestRun lease: {e}");
+                None
+            }
+        }
+    });
+
     // ---- Phase 1: ALL carrick (weight-aware; never overlapping docker). ----
     eprintln!(
         "phase 1/4: {n} carrick runs (workers={workers}, cpython-workers={cpython_workers}, fast-timeout={}s; cached slow rows get 2x oracle + 2s; hard-cap={:?})",
@@ -875,6 +894,8 @@ fn run() -> anyhow::Result<ExitCode> {
         }
     }
 
+    drop(phase1_lease);
+
     // ---- Phase 2: docker — but ONLY for suites whose oracle is not already
     // cached. The docker oracle for a deterministic suite is stable, so it needs
     // to run once, ever; a cached suite contributes its committed result and
@@ -891,6 +912,25 @@ fn run() -> anyhow::Result<ExitCode> {
             ""
         },
     );
+    let phase2_lease = if !need_docker.is_empty() {
+        coordinator.as_ref().and_then(|c| {
+            let owner = carrick_coordinator::LeaseOwner {
+                host: host_name.clone(),
+                pid: std::process::id(),
+                run_id: format!("conf-{pid}-docker"),
+                investigation_id: None,
+            };
+            match c.try_acquire(carrick_coordinator::ResourceClass::DockerPhase, owner) {
+                Ok(lease) => lease,
+                Err(e) => {
+                    eprintln!("coordinator: note: failed to acquire DockerPhase lease: {e}");
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
     let fresh_outs = fan_out_scheduled(&need_docker, &selected, workers, &lanes, |i| {
         let s = &selected[i];
         let run_id = format!("conf-{pid}-d{i:02}");
@@ -898,6 +938,7 @@ fn run() -> anyhow::Result<ExitCode> {
         eprintln!("  [docker]  {}", s.name);
         out
     });
+    drop(phase2_lease);
 
     // Parse fresh docker runs, fold comparable ones into the cache, key them back
     // by suite index for phase 3.

@@ -3,13 +3,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    Budget, ConformanceContract, ContractId, ExecutionLayer, ModelError, SurfaceAssignment,
-    SurfaceRegistry,
+    Budget, Claim, ClaimId, ConformanceContract, ContractId, ExecutionLayer, ModelError,
+    SurfaceAssignment, SurfaceRegistry,
 };
 
 #[derive(Clone, Debug)]
 pub struct ContractRegistry {
     contracts: BTreeMap<ContractId, ConformanceContract>,
+    claims: BTreeMap<ClaimId, Claim>,
     surfaces: Vec<SurfaceAssignment>,
 }
 
@@ -35,6 +36,28 @@ impl ContractRegistry {
             }
         }
 
+        let claims_root = registry_root.join("claims");
+        let mut claims = BTreeMap::new();
+        if claims_root.exists() {
+            let mut claim_paths = read_contract_paths(&claims_root)?;
+            claim_paths.sort();
+            for path in claim_paths {
+                let text = read_to_string(&path)?;
+                let file: ClaimsFile =
+                    toml::from_str(&text).map_err(|source| RegistryError::Toml {
+                        path: path.clone(),
+                        source,
+                    })?;
+                for claim in file.into_claims() {
+                    validate_claim(&claim, &contracts)?;
+                    let id = claim.id.clone();
+                    if claims.insert(id.clone(), claim).is_some() {
+                        return Err(RegistryError::DuplicateClaim(id));
+                    }
+                }
+            }
+        }
+
         let surfaces_path = registry_root.join("surfaces.toml");
         let surfaces_text = read_to_string(&surfaces_path)?;
         let surface_registry: SurfaceRegistry =
@@ -55,6 +78,7 @@ impl ContractRegistry {
 
         Ok(Self {
             contracts,
+            claims,
             surfaces: surface_registry.surfaces,
         })
     }
@@ -70,6 +94,19 @@ impl ContractRegistry {
 
     pub fn contracts(&self) -> impl ExactSizeIterator<Item = &ConformanceContract> {
         self.contracts.values()
+    }
+
+    pub fn get_claim(&self, id: &ClaimId) -> Option<&Claim> {
+        self.claims.get(id)
+    }
+
+    pub fn require_claim(&self, id: &str) -> Result<&Claim, RegistryError> {
+        let id = ClaimId::new(id)?;
+        self.get_claim(&id).ok_or(RegistryError::UnknownClaim(id))
+    }
+
+    pub fn claims(&self) -> impl ExactSizeIterator<Item = &Claim> {
+        self.claims.values()
     }
 
     pub fn surfaces(&self) -> &[SurfaceAssignment] {
@@ -159,6 +196,52 @@ fn validate_contract(contract: &ConformanceContract) -> Result<(), RegistryError
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ClaimsFile {
+    Multiple { claims: Vec<Claim> },
+    BareList(Vec<Claim>),
+    Single(Box<Claim>),
+}
+
+impl ClaimsFile {
+    fn into_claims(self) -> Vec<Claim> {
+        match self {
+            ClaimsFile::Multiple { claims } => claims,
+            ClaimsFile::BareList(claims) => claims,
+            ClaimsFile::Single(claim) => vec![*claim],
+        }
+    }
+}
+
+fn validate_claim(
+    claim: &Claim,
+    contracts: &BTreeMap<ContractId, ConformanceContract>,
+) -> Result<(), RegistryError> {
+    if claim.description.trim().is_empty() {
+        return Err(RegistryError::MissingClaimDescription(claim.id.clone()));
+    }
+    if claim.linux_authority.is_empty() || claim.linux_authority.iter().any(|a| a.trim().is_empty())
+    {
+        return Err(RegistryError::MissingClaimAuthority(claim.id.clone()));
+    }
+    if !contracts.contains_key(&claim.contract) {
+        return Err(RegistryError::UnknownClaimContract {
+            claim: claim.id.clone(),
+            contract: claim.contract.clone(),
+        });
+    }
+    for related in &claim.related_contracts {
+        if !contracts.contains_key(related) {
+            return Err(RegistryError::UnknownClaimContract {
+                claim: claim.id.clone(),
+                contract: related.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
     #[error("cannot read contract registry path {path}: {source}")]
@@ -175,6 +258,8 @@ pub enum RegistryError {
     UnexpectedContractFile(PathBuf),
     #[error("duplicate contract id {0}")]
     Duplicate(ContractId),
+    #[error("duplicate claim id {0}")]
+    DuplicateClaim(ClaimId),
     #[error("contract {id} has no rationale for budget {index}")]
     MissingBudgetRationale { id: ContractId, index: usize },
     #[error("contract {id} scaling budget requires at least three scale points")]
@@ -184,10 +269,21 @@ pub enum RegistryError {
         surface: String,
         contract: ContractId,
     },
+    #[error("claim {claim} references unknown contract family {contract}")]
+    UnknownClaimContract {
+        claim: ClaimId,
+        contract: ContractId,
+    },
+    #[error("claim {0} has no description")]
+    MissingClaimDescription(ClaimId),
+    #[error("claim {0} has empty semantic authority")]
+    MissingClaimAuthority(ClaimId),
     #[error("invalid contract id: {0}")]
     InvalidContractId(#[from] ModelError),
     #[error("unknown contract id {0}")]
     UnknownContract(ContractId),
+    #[error("unknown claim id {0}")]
+    UnknownClaim(ClaimId),
     #[error("contract {0} has no semantic authority")]
     MissingSemanticAuthority(ContractId),
     #[error("contract {0} has no contract rationale")]
