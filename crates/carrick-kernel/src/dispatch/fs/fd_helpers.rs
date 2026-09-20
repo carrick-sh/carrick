@@ -523,25 +523,13 @@ impl<'a> FsView<'a> {
         let Some(path) = self.lookup_recorded_fd_open_path(fd) else {
             return;
         };
-        // The self watch (on the file itself) always fires — an unlinked-but-open
-        // file still generates events for a watch ON it. For the parent-directory
-        // (child) watch, IN_EXCL_UNLINK suppresses events once the child name is
-        // gone from the directory; signal that by checking whether the child path
-        // still resolves (inotify12 #2: write to an unlinked-but-open fd).
-        //
-        // `path_exists` is a resolve+stat (the cap-std containment walk). It is
-        // ONLY consumed by the child (parent-dir) watch, so compute it lazily:
-        // when no watch exists on the parent dir — e.g. a watch on the file
-        // ITSELF, as in the inotify09 write-beating loop — skip it entirely. This
-        // is the difference between a ~38µs and a ~few-µs write on a watched file.
-        let child_unlinked =
-            self.fs.inotify_registry.parent_watch_exists_for(&path) && !self.path_exists(&path);
-        // Parent-directory (child) event precedes the object's own (self) event,
-        // matching Linux fsnotify ordering (inotify10).
+        // Deliver to parent-directory (child) watch (if active) and object's own
+        // (self) watch under a single registry read lock. The resolve+stat check
+        // for IN_EXCL_UNLINK is evaluated lazily only when a parent watch with
+        // IN_EXCL_UNLINK is actually present.
         self.fs
             .inotify_registry
-            .notify_child_excl(&path, mask, is_dir, child_unlinked);
-        self.fs.inotify_registry.notify_self(&path, mask, is_dir);
+            .notify_fd_event(&path, mask, is_dir, || !self.path_exists(&path));
     }
 
     /// Emit `IN_CLOSE_WRITE` (fd was writable) or `IN_CLOSE_NOWRITE` (read-only)
