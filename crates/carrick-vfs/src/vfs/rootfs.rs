@@ -1304,6 +1304,15 @@ impl RootFsVfs {
         self.overlay.watch_fds(path)
     }
 
+    /// Whether Carrick's dispatch hooks observe every guest mutation of this
+    /// namespace. The writable overlay and immutable lower are private kernel
+    /// graph state: guest tasks cannot bypass the dispatcher to mutate either.
+    /// This lets inotify use a virtual watch here while bind mounts, whose host
+    /// paths may change externally, continue to require native vnode watches.
+    pub const fn dispatch_events_complete(&self) -> bool {
+        true
+    }
+
     /// Layered rename with optional `RENAME_NOREPLACE` semantics.
     /// Walks the overlay-then-rootfs view to find the source,
     /// materialises the destination in the overlay (copying bytes

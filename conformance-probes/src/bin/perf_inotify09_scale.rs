@@ -137,6 +137,19 @@ fn report_phase(phase: &str, scale: usize, samples: Vec<Option<u64>>, freq: u64)
     complete
 }
 
+fn contract_scale() -> Result<Option<usize>, ()> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.is_empty() {
+        return Ok(None);
+    }
+    if args.len() != 2 || args[0] != "contract-scale" {
+        return Err(());
+    }
+    let scale = args[1].parse::<usize>().map_err(|_| ())?;
+    [1, 8, 32, 128].contains(&scale).then_some(scale).ok_or(())
+        .map(Some)
+}
+
 fn concurrent_sample(ifd: i32, fd: i32, path: &CString, scale: usize) -> Option<u64> {
     let barrier = Arc::new(Barrier::new(3));
     let ok = Arc::new(AtomicBool::new(true));
@@ -176,6 +189,13 @@ fn concurrent_sample(ifd: i32, fd: i32, path: &CString, scale: usize) -> Option<
 
 fn main() {
     unsafe { arm_alarm_ms(90_000) };
+    let contract_scale = match contract_scale() {
+        Ok(scale) => scale,
+        Err(()) => {
+            eprintln!("usage: perf_inotify09_scale [contract-scale <1|8|32|128>]");
+            std::process::exit(2);
+        }
+    };
     let freq = frequency();
     if freq == 0 {
         std::process::exit(2);
@@ -199,6 +219,28 @@ fn main() {
     }
 
     let mut complete = true;
+    if let Some(scale) = contract_scale {
+        let mut completed = 0usize;
+        for _ in 0..scale {
+            let wd = raw_inotify_add_watch(ifd, &path, IN_MODIFY);
+            if wd < 0 || !write_seek_cycle(fd) || raw_inotify_rm_watch(ifd, wd) != 0 {
+                complete = false;
+                break;
+            }
+            completed += 1;
+        }
+        complete &= unsafe { libc::close(ifd) } == 0;
+        complete &= unsafe { libc::close(fd) } == 0;
+        complete &= unsafe { libc::unlink(path.as_ptr()) } == 0;
+        println!("contract_scale={scale}");
+        println!("completed_iterations={completed}");
+        println!("probe_complete={}", u8::from(complete));
+        unsafe { disarm_alarm() };
+        if !complete {
+            std::process::exit(1);
+        }
+        return;
+    }
     for scale in SCALES {
         complete &= report_phase(
             "watch_churn",

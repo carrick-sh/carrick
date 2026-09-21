@@ -299,6 +299,16 @@ impl<'a> FsView<'a> {
                     }
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
+            } else if this.fs.rootfs_vfs.dispatch_events_complete() {
+                // The private rootfs is mutated only through this shared kernel
+                // graph. Its fork-coherent registry therefore observes every
+                // guest change without opening and registering a host vnode.
+                // Bind mounts take the branch above and retain native watches
+                // because an external host process can mutate their namespace.
+                if !this.path_exists(&path) {
+                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOENT));
+                }
+                state.add_virtual_watch(mask)
             } else {
                 match this.fs.rootfs_vfs.watch_fds(&path) {
                     Ok(watch_fds) => match state.add_watch_fds(watch_fds, mask) {

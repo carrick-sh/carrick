@@ -361,7 +361,8 @@ pub fn fork_filetable_contract(scale: usize) -> Result<ContractObservation, Exam
 
 /// Run an inotify directory watch scenario with the specified number of directory entries.
 ///
-/// Uses `HostFsBackend` to exercise real vnode watch registration and deregistration.
+/// Uses a private `HostFsBackend` rootfs to prove dispatch-authoritative watch
+/// registration and removal perform no native vnode operations.
 pub fn inotify_watch_scenario(entries: usize) -> Result<ContractObservation, ExampleError> {
     let scratch = tempfile::TempDir::new()
         .map_err(|e| ExampleError::Script(format!("failed to create tempdir: {e}")))?;

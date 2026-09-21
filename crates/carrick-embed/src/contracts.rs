@@ -1,6 +1,8 @@
 //! Conformance contract bindings for carrick-embed.
 
+mod inotify_hotpath;
 mod write_seek;
+pub use inotify_hotpath::inotify_hotpath_structural_contract;
 pub use write_seek::write_seek_structural_contract;
 
 use std::path::{Path, PathBuf};
@@ -553,10 +555,7 @@ pub fn run_inotify_watch_structural_contract() -> ContractObservation {
         ));
     }
 
-    let mut work_snapshot = scope.snapshot().unwrap_or_default();
-    if work_snapshot.get(WorkMetric::HostBackendCalls).is_none() {
-        let _ = work_snapshot.insert(WorkMetric::HostBackendCalls, 2);
-    }
+    let work_snapshot = scope.snapshot().unwrap_or_default();
 
     ContractObservation {
         contract_id,

@@ -98,6 +98,10 @@ pub enum Budget {
 pub struct StructuralBudget {
     #[serde(flatten)]
     pub budget: Budget,
+    /// Instrumented evidence layers to which this budget applies. An omitted
+    /// list preserves the historical behavior: enforce in both structural
+    /// layers.
+    pub layers: Vec<ExecutionLayer>,
     pub rationale: Option<String>,
 }
 
@@ -142,6 +146,9 @@ impl<'de> Deserialize<'de> for StructuralBudget {
         };
         Ok(Self {
             budget,
+            layers: wire
+                .layers
+                .unwrap_or_else(|| vec![ExecutionLayer::VmFree, ExecutionLayer::EmbedStructural]),
             rationale: wire.rationale,
         })
     }
@@ -175,6 +182,8 @@ struct StructuralBudgetWire {
     maximum: Option<u64>,
     base: Option<u64>,
     per_unit: Option<u64>,
+    #[serde(default)]
+    layers: Option<Vec<ExecutionLayer>>,
     #[serde(default)]
     rationale: Option<String>,
 }
