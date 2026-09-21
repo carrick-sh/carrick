@@ -373,6 +373,9 @@ impl RootFsVfs {
 
     /// Invalidate dentry/inode cache entry for an open host fd.
     pub fn invalidate_host_fd(&self, raw_fd: i32) {
+        if !self.dentry_cache.has_cached_inodes() {
+            return;
+        }
         if let Some(inode) = Self::host_fd_inode_identity(raw_fd) {
             self.dentry_cache.inode_changed("", Some(inode));
         }

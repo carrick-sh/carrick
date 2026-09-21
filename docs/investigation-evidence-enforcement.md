@@ -64,13 +64,15 @@ acceptance or the full workload's runtime ratio.
 
 ## Review boundary
 
-A proposed offset-query optimization must account for shared open-description
-state, dup/fork aliases, append changes, seek beyond EOF, subsequent truncation,
-finite RLIMIT_FSIZE and sparse extents. A boolean meaning 'never sought past EOF'
-is not by itself proof that the current offset cannot exceed a subsequently
-truncated length. Require semantic regressions for these transitions before
-accepting the production correction. This investigation leaves that correction
-unimplemented and preserves the pre-existing runtime work.
+The offset-query optimization accounts for shared open-description state,
+dup/fork aliases, append changes, seek beyond EOF, subsequent truncation,
+finite RLIMIT_FSIZE and sparse extents. The shared host-fd owner records a
+conservative `offset_may_be_nonzero` fact: sequential I/O sets it and a
+successful absolute seek to zero clears it. The write fast path is available
+only when that fact is false, the file-size limit is unlimited and sparse
+tracking has never been activated. Append and every state requiring the
+position keep the host query. This avoids treating 'never sought past EOF' as
+proof after a later truncation.
 
 ## Verification scope
 
@@ -81,10 +83,10 @@ producer fixture and reject changed source, altered output, inactive fixtures,
 and green observations. These tooling fixtures are explicitly not the pilot.
 The real pilot runs the kernel's write and lseek operations and reads actual bytes.
 
-Pre-existing `sought_past_eof` fields/methods remain unused and produce warnings.
-An existing temporary-borrow error in `with_recorded_fd_open_path` was corrected
-by retaining the captured table while its path guard lives. This compile-only
-repair remains alongside the user's existing uncommitted method.
+Focused regressions cover a finite file-size limit, sparse extent preservation,
+truncate/write/seek transitions, shared offset state and repeated host writes
+refreshing cached size. Kernel clippy with conformance metrics and warnings
+denied also passes.
 
 The strict `check-contracts` registration check now passes with real embed and
 Docker bindings. The zero-query structural budget is unchanged. A binding-presence
@@ -144,3 +146,25 @@ passed. Inventory/strategy checks, formatting, and focused tooling clippy passed
 Embed clippy with warnings denied remains blocked by the pre-existing unused
 `sought_past_eof` field and methods; no warning suppression was added. Independent
 static review of the binding changes found no blocking issues.
+
+## Corrected signed checkpoint (2026-09-20)
+
+The strict signed budget was rerun after the production correction against the
+same digest-pinned ARM64 image and the same scales. Scales 1, 8, 32 and 128 each
+observed zero preparatory host position queries and passed the maximum-zero
+budget. The unentitled negative control passed and scoped cleanup found zero
+remaining guests. This is the red-to-green result for the isolated structural
+contract; the full inotify workload's runtime ratio and broader promotion gates
+remain unqualified.
+
+The corrected checkpoint used source HEAD
+`dad786c8be97b98430ef13b6f5d876300132ceaf` plus working-tree source identity
+`4dbe8cf88d8a78fa7c475ccea54bbca4dbac7e53b267d2d90506a4fb0887b0ba`.
+The signed test executable had SHA-256
+`e3d52e4293803cc5aaeea0198bd8c5e5af1801ba9b4c8f700dc6276335d86090`, CDHash
+`1f1a92f9834a8f78929a09942173f2288e92fb48` and LC_UUID
+`835C14FC-0411-3671-A579-8CAC4511899F`; its hypervisor entitlement and DOF
+section were present. The signer receipt is preserved at
+`target/investigations/parity-20260920/write-seek-green/signed-artifacts.jsonl`
+with SHA-256
+`c8b594136802465577bf216b13effdf2eda4ce08c389976c20e29986a751c97c`.

@@ -1550,6 +1550,14 @@ struct HostFdOwner {
     /// per-process close (`OwnedFd` drops via `libc::close`) — never anything fancier.
     fd: OwnedFd,
     private_file_source: carrick_guest_mem::PrivateFileSource,
+    /// Conservative offset state for regular files. Freshly opened host files
+    /// start at zero. Any operation that can advance the shared open-file
+    /// position marks this true; a successful seek back to zero clears it.
+    ///
+    /// This lets the regular write path skip a SEEK_CUR/fstat pair when a
+    /// write cannot create a hole. The state lives with the host-fd owner so
+    /// dup/fork aliases of one Carrick description observe the same value.
+    offset_may_be_nonzero: std::sync::atomic::AtomicBool,
 }
 
 /// The OWNED, Arc-refcounted handle to a host kernel fd. The single owner of a
@@ -1580,11 +1588,36 @@ impl HostFdRef {
         Self(Arc::new(HostFdOwner {
             fd,
             private_file_source,
+            offset_may_be_nonzero: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
     pub(super) fn private_file_source(&self) -> carrick_guest_mem::PrivateFileSource {
         self.0.private_file_source
+    }
+
+    #[inline]
+    pub(super) fn offset_may_be_nonzero(&self) -> bool {
+        self.0
+            .offset_may_be_nonzero
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record an absolute host-file position returned by lseek(2).
+    #[inline]
+    pub(super) fn record_absolute_offset(&self, offset: i64) {
+        self.0
+            .offset_may_be_nonzero
+            .store(offset != 0, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Conservatively record that a sequential operation may leave the shared
+    /// host-file position beyond a later truncation boundary.
+    #[inline]
+    pub(super) fn record_sequential_io(&self) {
+        self.0
+            .offset_may_be_nonzero
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// The raw fd number for a host `libc` call (borrowed — the caller must
@@ -3463,6 +3496,24 @@ mod tests {
 
     const SYS_READ: u64 = 63;
     const SYS_FTRUNCATE: u64 = 46;
+
+    #[test]
+    fn host_file_offset_proof_is_shared_and_only_zero_is_safe() {
+        use std::os::fd::IntoRawFd;
+
+        let host_fd = HostFdRef::new(tempfile::tempfile().unwrap().into_raw_fd());
+        let alias = host_fd.clone();
+        assert!(!host_fd.offset_may_be_nonzero());
+
+        alias.record_sequential_io();
+        assert!(host_fd.offset_may_be_nonzero());
+
+        host_fd.record_absolute_offset(0);
+        assert!(!alias.offset_may_be_nonzero());
+
+        alias.record_absolute_offset(1);
+        assert!(host_fd.offset_may_be_nonzero());
+    }
 
     #[test]
     fn mapped_file_reference_survives_last_fd_and_releases_last_fragment() {

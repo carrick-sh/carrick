@@ -911,6 +911,7 @@ impl<'a> FsView<'a> {
                         else {
                             return DispatchOutcome::errno(LINUX_EBADF);
                         };
+                        host_fd.record_sequential_io();
                         return write_host_pipe(
                             bytes,
                             HostPipeWriteTarget::new(
@@ -1614,8 +1615,11 @@ impl<'a> FsView<'a> {
                         OpenDescription::HostFile { host_fd, .. } => {
                             // SAFETY: host_fd is a live regular-file fd owned by
                             // this guest fd; lseek to an absolute position is benign.
-                            unsafe {
-                                libc::lseek(host_fd.raw(), offset as libc::off_t, libc::SEEK_SET);
+                            let positioned = unsafe {
+                                libc::lseek(host_fd.raw(), offset as libc::off_t, libc::SEEK_SET)
+                            };
+                            if positioned >= 0 {
+                                host_fd.record_absolute_offset(positioned);
                             }
                         }
                         _ => {}
