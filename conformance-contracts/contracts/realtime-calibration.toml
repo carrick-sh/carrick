@@ -1,0 +1,15 @@
+schema_version = 1
+id = "kernel.time.realtime-calibration"
+title = "Existing and newly executed address spaces share the syscall realtime base"
+guest_surfaces = ["syscall:clock_gettime", "syscall:gettimeofday", "syscall:execve", "vdso:clock_gettime"]
+semantic_authority = ["man 2 clock_gettime", "Linux Test Project clock_gettime04 (LTP 20260529)"]
+fixture = "ltp:clock_gettime04-with-sibling-exec"
+scale_points = [1, 8, 32, 128]
+structural_budgets = []
+rationale = "Without an explicit clock adjustment, sequential vDSO/syscall realtime reads must not move backwards when a sibling exec calibrates a new vvar page. Every page and syscall reader uses one immutable host-carrier calibration; guest clock adjustments remain independent container deltas. Publication performs exactly one atomic compare-exchange per stamp, with no retries, per-mm scans, or updates to existing pages. The VM-free regression checks coherence at each scale; it does not execute guest clocks or report a work-meter observation. The signed binding runs ten LTP comparisons alongside the declared number of sibling execs. No runtime-ratio acceptance is claimed by this semantic contract."
+
+[bindings]
+vm_free = "carrick-mem::vdso::tests::realtime_calibration_is_shared_by_existing_and_new_address_spaces"
+embed = "carrick-embed::realtime_calibration::realtime_calibration_survives_sibling_exec"
+docker = "ltp:clock_gettime04-with-sibling-exec"
+ecosystem = ["ltp:clock_gettime04"]

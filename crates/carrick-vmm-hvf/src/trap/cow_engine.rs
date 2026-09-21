@@ -4289,12 +4289,10 @@ impl HvfVmState {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        let realtime_off = unix_ns.wrapping_sub(mono_ns);
-        // Publish the SAME offset to the shared store so the trapping
-        // clock_gettime(CLOCK_REALTIME) syscall computes uptime + realtime_off
-        // identically to the vDSO fast path (which adds VVAR_OFF_REALTIME_OFF_NS
-        // to the guest CNTVCT) — keeping the two paths coherent (clock_gettime04).
-        crate::vdso::set_realtime_off_ns(realtime_off);
+        // All address spaces in this carrier use one immutable calibration.
+        // Replacing the syscall base on exec would strand older vvar pages on
+        // a different base, allowing successive fast/slow reads to go backwards.
+        let realtime_off = crate::vdso::set_realtime_off_ns(unix_ns.wrapping_sub(mono_ns));
 
         let base = crate::vdso::LINUX_VVAR_BASE;
         let _ = self.write_guest_bytes(
