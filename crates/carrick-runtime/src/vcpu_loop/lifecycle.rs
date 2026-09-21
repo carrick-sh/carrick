@@ -708,6 +708,13 @@ pub(crate) fn bootstrap_hvpatch_process_child_identity_with(
             id.pid,
             u32::from(dispatcher.identity_fast_path_enabled()),
         )
+        .and_then(|()| {
+            carrick_kernel::kernel::identity_page::stamp_clock_gate(
+                memory,
+                base,
+                carrick_kernel::kernel::identity_page::clock_gate_word(dispatcher, kernel_context),
+            )
+        })
     };
     res.map_err(|error| {
         RuntimeError::Trap(TrapError::Hypervisor(format!(

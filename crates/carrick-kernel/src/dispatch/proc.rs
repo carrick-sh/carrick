@@ -942,11 +942,12 @@ impl<'a> ProcView<'a> {
         {
             return DispatchOutcome::errno(LINUX_EACCES);
         }
+        // Close in-guest syscall admission before the filter becomes visible.
+        // A call already admitted before this store also entered before the
+        // filter publication, matching Linux's syscall-entry evaluation point.
+        self.disable_syscall_fast_paths(memory);
         match self.seccomp.install(prog) {
-            Ok(()) => {
-                self.disable_identity_syscall_shim(memory);
-                DispatchOutcome::Returned { value: 0 }
-            }
+            Ok(()) => DispatchOutcome::Returned { value: 0 },
             Err(crate::seccomp::SeccompInstallError::InvalidProgram) => {
                 DispatchOutcome::errno(LINUX_EINVAL)
             }
@@ -956,8 +957,13 @@ impl<'a> ProcView<'a> {
         }
     }
 
-    fn disable_identity_syscall_shim<M: CurrentMmMemory>(&self, memory: &mut M) {
+    fn disable_syscall_fast_paths<M: CurrentMmMemory>(&self, memory: &mut M) {
         if crate::syscall_shim_enabled() {
+            let _ = crate::kernel::identity_page::stamp_clock_gate(
+                memory,
+                crate::memory::LINUX_IDENTITY_PAGE_BASE,
+                0,
+            );
             let _ = memory.write_bytes(
                 crate::memory::LINUX_IDENTITY_PAGE_BASE + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
                 &0u32.to_le_bytes(),
@@ -966,8 +972,8 @@ impl<'a> ProcView<'a> {
     }
 
     fn install_seccomp_strict<M: CurrentMmMemory>(&self, memory: &mut M) -> DispatchOutcome {
+        self.disable_syscall_fast_paths(memory);
         self.seccomp.install_strict();
-        self.disable_identity_syscall_shim(memory);
         DispatchOutcome::Returned { value: 0 }
     }
 
