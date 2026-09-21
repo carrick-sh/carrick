@@ -185,11 +185,14 @@ pub(super) fn install(bytes: &mut [u8], dispatch: usize) -> ClockHandlerLayout {
     c.emit(enc_ldr_wt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_FLAGS));
     c.emit(enc_cmp_w16_imm(0));
     let completion_kicked = c.branch();
-    // Exact per-owner accounting is an enablement prerequisite. Do not reuse
-    // the identity page's non-atomic shared counter: a late kick can normalize
-    // this operation into host dispatch after any chosen completion point and
-    // would double-charge it. Admission remains closed until a per-owner ledger
-    // can be folded exactly once.
+    // Count successful fast completions with one LSE atomic add. Identity calls
+    // predate concurrent HVPatch execution and still use ldr/add/str; clocks are
+    // hot on multiple vCPUs, so sharing that sequence would lose increments.
+    // This builder is selected only by the arm64 HVF lane, where FEAT_LSE is a
+    // qualified host prerequisite. x16/x17 are restored below.
+    c.imm(16, LINUX_IDENTITY_PAGE_BASE + IDENTITY_OFF_SHIM_SYSCALLS);
+    c.emit(0xD280_0031); // mov x17, #1
+    c.emit(0xF8F1_021F); // ldaddal x17, xzr, [x16]
     c.restore_frame();
     c.restore_regs(true);
     c.emit(AARCH64_ERET_OPCODE);
@@ -313,6 +316,11 @@ pub(super) mod tests {
                         0xD5184010 => self.spsr = self.regs[16],
                         0xD5185210 => self.esr = self.regs[16],
                         0xEB11021F => self.equal = self.regs[16] == self.regs[17],
+                        0xF8F1021F => {
+                            let address = self.regs[16];
+                            let next = self.read(address).wrapping_add(self.regs[17]);
+                            self.mem.insert(address, next);
+                        }
                         _ => panic!("unsupported opcode {op:08x} at {pc:x}"),
                     }
                 }
@@ -406,8 +414,8 @@ pub(super) mod tests {
         assert_eq!(m.read(SP + 32), 0);
         assert_eq!(
             m.read(LINUX_IDENTITY_PAGE_BASE + IDENTITY_OFF_SHIM_SYSCALLS),
-            0,
-            "clock accounting stays dormant until exact per-owner folding exists"
+            1,
+            "successful clock completion must be counted atomically"
         );
     }
     #[test]
