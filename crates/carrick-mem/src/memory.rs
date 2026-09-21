@@ -80,6 +80,15 @@
 //! stage-1 tables ([`is_rosetta_va`] / [`is_high_va`]). This is the only place a
 //! guest VA differs from its IPA.
 
+mod el1_clock;
+
+/// Dedicated EL0 clock transport page. Admission remains disabled until runtime
+/// clock policy, asynchronous exit handling, and mapping protection are wired.
+pub const LINUX_EL0_CLOCK_STUB_BASE: u64 = el1_clock::STUB_BASE;
+pub const LINUX_EL0_CLOCK_STUB_SIZE: u64 = el1_clock::STUB_SIZE;
+/// Reserved identity-page word; zero means no EL1 clock admission.
+pub const IDENTITY_OFF_CLOCK_GATE: u64 = el1_clock::CLOCK_GATE_OFFSET;
+
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -1639,6 +1648,51 @@ impl AddressSpace {
         identity_fast_path: bool,
     ) -> Result<Self, AddressSpaceError> {
         self.with_el1_vectors_from_bytes(el1_vectors_bytes_mailbox_fd_ceiling(identity_fast_path))
+    }
+
+    /// Construct the mailbox-vector image with the dormant raw-clock transport.
+    /// Callers must keep [`IDENTITY_OFF_CLOCK_GATE`] zero until MM-owned policy,
+    /// asynchronous-exit normalization, accounting, and mapping protection are
+    /// installed. The ordinary production builders above deliberately omit the
+    /// stub until those prerequisites are complete.
+    pub fn with_el1_vectors_mailbox_clock(
+        self,
+        identity_fast_path: bool,
+        fd_ceiling: bool,
+    ) -> Result<Self, AddressSpaceError> {
+        self.with_mailbox_vectors(
+            el1_vectors_bytes_mailbox_clock(identity_fast_path, fd_ceiling),
+            identity_fast_path,
+        )
+    }
+
+    fn with_mailbox_vectors(
+        self,
+        bytes: Vec<u8>,
+        clock_stub: bool,
+    ) -> Result<Self, AddressSpaceError> {
+        let mut image = self.with_el1_vectors_from_bytes(bytes)?;
+        if clock_stub {
+            // RX in both the host mapping and generated stage-1 permissions.
+            // Runtime must additionally reserve this range against guest MM
+            // mutation before enabling the currently zero clock-domain gate.
+            let region = el1_clock::region();
+            if let Some(existing) = image
+                .regions
+                .iter()
+                .find(|r| r.start < region.end && region.start < r.end)
+            {
+                return Err(AddressSpaceError::OverlappingRegion {
+                    start: region.start,
+                    end: region.end,
+                    other_start: existing.start,
+                    other_end: existing.end,
+                });
+            }
+            image.regions.push(region);
+            image.regions.sort_by_key(|r| r.start);
+        }
+        Ok(image)
     }
 
     fn with_el1_vectors_from_bytes(self, bytes: Vec<u8>) -> Result<Self, AddressSpaceError> {
@@ -4064,6 +4118,21 @@ pub fn el1_vectors_bytes_mailbox_fd_ceiling(identity_fast_path: bool) -> Vec<u8>
     el1_vectors_bytes_mailbox_inner(identity_fast_path, true)
 }
 
+/// Build mailbox vectors containing the dormant raw-clock transport.
+/// Production must not select this image until the clock admission contract is
+/// fully installed; its separate per-MM gate starts closed.
+pub fn el1_vectors_bytes_mailbox_clock(identity_fast_path: bool, fd_ceiling: bool) -> Vec<u8> {
+    let mut bytes = el1_vectors_bytes_mailbox_inner(identity_fast_path, fd_ceiling);
+    if identity_fast_path {
+        let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
+        const ESR_GUARD_LEN: usize = 6 * 4;
+        let mailbox_entry =
+            dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 1 + usize::from(fd_ceiling)) * 8;
+        el1_clock::install(&mut bytes, mailbox_entry);
+    }
+    bytes
+}
+
 fn linux_runtime_regions() -> Result<Vec<MemoryRegion>, AddressSpaceError> {
     Ok(vec![
         MemoryRegion {
@@ -6106,7 +6175,10 @@ mod el1_shim_tests {
             let mailbox_capture = if let Some(mailbox_handler) =
                 decode_b(rd_u32(bytes, fallback_target), fallback_target)
             {
-                mailbox_handler + 24
+                if mailbox_handler != MAILBOX_HANDLER_OFFSET {
+                    el1_clock::tests::assert_fstat_host_fallback(bytes, mailbox_handler);
+                }
+                MAILBOX_HANDLER_OFFSET + 24
             } else {
                 fallback_target
             };
@@ -6457,6 +6529,25 @@ mod el1_shim_tests {
             sysreg_seen,
             vec![GETTID_NR],
             "gettid must be serviced via a CONTEXTIDR_EL1 read"
+        );
+    }
+
+    #[test]
+    fn mailbox_shim_routes_raw_clock_gettime_only_when_fast_paths_are_enabled() {
+        let enabled = el1_vectors_bytes_mailbox_clock(true, false);
+        assert!(
+            enabled
+                .chunks_exact(4)
+                .any(|word| decode_cmp_x8(rd_u32(word, 0)) == Some(113)),
+            "raw clock_gettime must have an EL1 dispatch arm before the host mailbox"
+        );
+
+        let disabled = el1_vectors_bytes_mailbox(false);
+        assert!(
+            !disabled
+                .chunks_exact(4)
+                .any(|word| decode_cmp_x8(rd_u32(word, 0)) == Some(113)),
+            "policy-visible runs must keep raw clock_gettime on the host dispatch path"
         );
     }
 
