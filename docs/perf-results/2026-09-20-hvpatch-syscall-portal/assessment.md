@@ -483,3 +483,22 @@ at `ff25eef96`,
 `7c88ac4f90d74db502844f61cfad936d358e092c9300deba1883ac54ec20515d`,
 and the pinned LTP image. This is a signed instrumented test artifact, distinct
 from the release CLI timing artifact; it is not full probe-gate acceptance.
+
+### Repair of sustained service join state
+
+The USDT-only control reproduced missing join state with no host syscall
+clauses. Moving syscall-number selection from predicate to action did not fix
+it (252,147 selected begins despite 909,322 hot begin events). Retaining the
+thread-local identity and using nonzero inactive state `2`, rather than
+zero-clearing every field on every service, then tracked 912,664 selected begins
+with zero nesting, mismatches, or DTrace errors. This isolates the script's
+state lifecycle as the failure mechanism; it does not establish a runtime
+ownership bug. Receipt: `inotify-join-retained-state.trace`.
+
+Applying the same correction to the full host-call join also passed its
+existing checks (`inotify-join-fixed.trace`). Host counts now attribute one
+Darwin lseek per guest lseek and one Darwin write per guest write, with only
+one fstat in the write population. This is a bounded, highly instrumented
+capture, not a runtime-ratio result. Complete per-host-call timing and explicit
+boundary-censored window accounting remain to be added before calling it the
+requested comprehensive timed attribution report.

@@ -1,0 +1,63 @@
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315501|raw_pid=3|raw_tid=3|raw_asid=4|raw_nr=64|active=1|stored_pid=3|stored_tid=3|stored_asid=4|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315501|raw_pid=3|raw_tid=3|raw_asid=4|raw_nr=64|active=1|stored_pid=3|stored_tid=3|stored_asid=4|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315500|raw_pid=6|raw_tid=6|raw_asid=8|raw_nr=64|active=1|stored_pid=6|stored_tid=6|stored_asid=8|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315500|raw_pid=6|raw_tid=6|raw_asid=8|raw_nr=27|active=1|stored_pid=6|stored_tid=6|stored_asid=8|stored_nr=27
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315500|raw_pid=6|raw_tid=6|raw_asid=8|raw_nr=28|active=1|stored_pid=6|stored_tid=6|stored_asid=8|stored_nr=28
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315500|raw_pid=6|raw_tid=6|raw_asid=8|raw_nr=27|active=1|stored_pid=6|stored_tid=6|stored_asid=8|stored_nr=27
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315500|raw_pid=6|raw_tid=6|raw_asid=8|raw_nr=28|active=1|stored_pid=6|stored_tid=6|stored_asid=8|stored_nr=28
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315501|raw_pid=3|raw_tid=3|raw_asid=4|raw_nr=64|active=1|stored_pid=3|stored_tid=3|stored_asid=4|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315501|raw_pid=3|raw_tid=3|raw_asid=4|raw_nr=64|active=1|stored_pid=3|stored_tid=3|stored_asid=4|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315501|raw_pid=3|raw_tid=3|raw_asid=4|raw_nr=64|active=1|stored_pid=3|stored_tid=3|stored_asid=4|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315497|raw_pid=5|raw_tid=5|raw_asid=7|raw_nr=64|active=1|stored_pid=5|stored_tid=5|stored_asid=7|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315501|raw_pid=3|raw_tid=3|raw_asid=4|raw_nr=64|active=1|stored_pid=3|stored_tid=3|stored_asid=4|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315501|raw_pid=6|raw_tid=7|raw_asid=8|raw_nr=64|active=1|stored_pid=6|stored_tid=7|stored_asid=8|stored_nr=64
+INOTIFYHOT1|stack|nr=64|host=fstat64
+
+              0x192af643c
+              0x102c2b124
+              0x102c2fcb8
+              0x102df20a8
+              0x102ca2154
+              0x102ca270c
+              0x102df8804
+              0x102ca34f4
+              0x102cd40f0
+              0x102cd204c
+              0x102d091d0
+              0x102cff010
+              0x102d000d0
+              0x102cfd334
+              0x102d7a098
+              0x102d304e4
+              0x102d2eb84
+              0x102d5e470
+              0x102e1d0c0
+              0x103933f28
+              0x192b2cd00
+              0x192b27cec
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315501|raw_pid=6|raw_tid=7|raw_asid=8|raw_nr=62|active=1|stored_pid=6|stored_tid=7|stored_asid=8|stored_nr=62
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315501|raw_pid=6|raw_tid=7|raw_asid=8|raw_nr=64|active=1|stored_pid=6|stored_tid=7|stored_asid=8|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18034|host_tid=315501|raw_pid=6|raw_tid=7|raw_asid=8|raw_nr=62|active=1|stored_pid=6|stored_tid=7|stored_asid=8|stored_nr=62
+INOTIFYHOT1|bound_s=10|selected=906399|nested=0|mismatch=0|errors=0|complete=1
+INOTIFYHOT1|nr=28|services=226659
+INOTIFYHOT1|nr=27|services=226660
+INOTIFYHOT1|nr=62|services=226660
+INOTIFYHOT1|nr=64|services=226683
+INOTIFYHOT1|nr=28|duration_ns=243096854
+INOTIFYHOT1|nr=27|duration_ns=563157244
+INOTIFYHOT1|nr=62|duration_ns=839789176
+INOTIFYHOT1|nr=64|duration_ns=2279145910
+INOTIFYHOT1|nr=27|host=listxattr|count=1
+INOTIFYHOT1|nr=28|host=kevent|count=1
+INOTIFYHOT1|nr=28|host=psynch_cvclrprepost|count=1
+INOTIFYHOT1|nr=64|host=fstat64|count=1
+INOTIFYHOT1|nr=64|host=psynch_mutexwait|count=1
+INOTIFYHOT1|nr=27|host=fstatat64|count=2
+INOTIFYHOT1|nr=28|host=psynch_cvsignal|count=2
+INOTIFYHOT1|nr=28|host=psynch_cvwait|count=4
+INOTIFYHOT1|nr=64|host=close|count=20
+INOTIFYHOT1|nr=64|host=fcntl|count=20
+INOTIFYHOT1|nr=64|host=psynch_cvwait|count=22
+INOTIFYHOT1|nr=64|host=psynch_cvsignal|count=118
+INOTIFYHOT1|nr=62|host=lseek|count=226660
+INOTIFYHOT1|nr=64|host=write|count=226682
