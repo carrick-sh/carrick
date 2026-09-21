@@ -2,7 +2,10 @@
 //! protects this mapping and normalizes asynchronous exits in the EL0 stub.
 use super::*;
 
-pub const STUB_BASE: u64 = LINUX_SIGRETURN_TRAMPOLINE_BASE + LINUX_SIGRETURN_TRAMPOLINE_SIZE;
+// Carrick-owned user ABI slot immediately above the vDSO. Static ELF images
+// commonly occupy 0x30_0000_0000, so the old placement after the sigreturn
+// trampoline collided with real probe text before the guest could start.
+pub const STUB_BASE: u64 = crate::vdso::LINUX_VDSO_BASE + 0x1_0000;
 pub const STUB_SIZE: u64 = 0x4000;
 /// Reserved per-MM word. Zero-filled identity pages deliberately disable this.
 /// TODO(runtime): publish only for unscaled/unfrozen hardware-counter clocks,
