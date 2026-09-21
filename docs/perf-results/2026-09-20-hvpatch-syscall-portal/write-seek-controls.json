@@ -1,0 +1,170 @@
+{
+  "image": "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+  "sha256": {
+    "conformance-probes/target/aarch64-apple-darwin/release/perf_inotify09_scale": "24192e9a291fe60319ce79213f97963a8af594632d9d10427674afad1a741cdf",
+    "conformance-probes/target/aarch64-unknown-linux-musl/release/perf_inotify09_scale": "6e5f2df97429d7f8688febf7332dd2ea6c5ca7ba297c3708c643d1b1e00e58e7",
+    "target/release/carrick": "a05fb6c4c3dfb6329ff4195f29d86109a8a82e99d1cfda848f450b2bb768d424",
+    "conformance-probes/src/bin/perf_inotify09_scale.rs": "22793c4fed9a8a217c236df7785f9edb297c9af00304b591ebcc662f3fa53ba3"
+  },
+  "runs": [
+    {
+      "name": "macos",
+      "argv": [
+        "/Volumes/CaseSensitive/carrick/conformance-probes/target/aarch64-apple-darwin/release/perf_inotify09_scale",
+        "write-seek-only"
+      ],
+      "returncode": 0,
+      "elapsed_s": 1.8816575830023794,
+      "rows": [
+        {
+          "phase": "write_seek",
+          "scale": "1",
+          "samples": "21",
+          "p50_ns_per_iter": "1434",
+          "complete": "1"
+        },
+        {
+          "phase": "write_seek",
+          "scale": "32",
+          "samples": "21",
+          "p50_ns_per_iter": "1276",
+          "complete": "1"
+        },
+        {
+          "phase": "write_seek",
+          "scale": "1024",
+          "samples": "21",
+          "p50_ns_per_iter": "1226",
+          "complete": "1"
+        },
+        {
+          "phase": "write_seek",
+          "scale": "8192",
+          "samples": "21",
+          "p50_ns_per_iter": "1172",
+          "complete": "1"
+        },
+        {
+          "phase": "write_seek",
+          "scale": "65536",
+          "samples": "21",
+          "p50_ns_per_iter": "1193",
+          "complete": "1"
+        }
+      ]
+    },
+    {
+      "name": "carrick",
+      "argv": [
+        "/Volumes/CaseSensitive/carrick/target/release/carrick",
+        "run",
+        "--max-traps",
+        "18446744073709551615",
+        "--fs",
+        "host",
+        "-v",
+        "/Volumes/CaseSensitive/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/perf_inotify09_scale:/probe:ro",
+        "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+        "/bin/sh",
+        "-c",
+        "/probe write-seek-only"
+      ],
+      "returncode": 0,
+      "elapsed_s": 8.501164208999398,
+      "rows": [
+        {
+          "phase": "write_seek",
+          "scale": "1",
+          "samples": "21",
+          "p50_ns_per_iter": "6291",
+          "complete": "1"
+        },
+        {
+          "phase": "write_seek",
+          "scale": "32",
+          "samples": "21",
+          "p50_ns_per_iter": "5169",
+          "complete": "1"
+        },
+        {
+          "phase": "write_seek",
+          "scale": "1024",
+          "samples": "21",
+          "p50_ns_per_iter": "5578",
+          "complete": "1"
+        },
+        {
+          "phase": "write_seek",
+          "scale": "8192",
+          "samples": "21",
+          "p50_ns_per_iter": "5351",
+          "complete": "1"
+        },
+        {
+          "phase": "write_seek",
+          "scale": "65536",
+          "samples": "21",
+          "p50_ns_per_iter": "5326",
+          "complete": "1"
+        }
+      ]
+    },
+    {
+      "name": "docker",
+      "argv": [
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        "/Volumes/CaseSensitive/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/perf_inotify09_scale:/probe:ro",
+        "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+        "/bin/sh",
+        "-c",
+        "/probe write-seek-only"
+      ],
+      "returncode": 0,
+      "elapsed_s": 0.8970327919996635,
+      "rows": [
+        {
+          "phase": "write_seek",
+          "scale": "1",
+          "samples": "21",
+          "p50_ns_per_iter": "500",
+          "complete": "1"
+        },
+        {
+          "phase": "write_seek",
+          "scale": "32",
+          "samples": "21",
+          "p50_ns_per_iter": "503",
+          "complete": "1"
+        },
+        {
+          "phase": "write_seek",
+          "scale": "1024",
+          "samples": "21",
+          "p50_ns_per_iter": "559",
+          "complete": "1"
+        },
+        {
+          "phase": "write_seek",
+          "scale": "8192",
+          "samples": "21",
+          "p50_ns_per_iter": "512",
+          "complete": "1"
+        },
+        {
+          "phase": "write_seek",
+          "scale": "65536",
+          "samples": "21",
+          "p50_ns_per_iter": "449",
+          "complete": "1"
+        }
+      ]
+    }
+  ],
+  "native_mode_negative_control": {
+    "exit_code": 2,
+    "stderr": "native host control requires write-seek-only; notification modes require Linux\n"
+  }
+}

@@ -639,3 +639,47 @@ LC_UUID `4E80856F-613E-3B8E-97BF-DC6FFAD483AD`.
 The build source is e11b87dbf plus this commit's production diff. The previous
 public probe-gate receipt belongs to the pre-fix artifact and cannot promote
 this one. Full signed promotion and <=2x Docker remain open.
+
+
+### Native macOS control and fresh public probe gate
+
+The lazy-service artifact completed `just --no-deps conformance-probes` (exit 0):
+three generic shards, dedicated signed scenarios, negative entitlement controls,
+CLI contract and 33 retained ARM64 cases per libc passed. Both run-scoped cleanup
+counts were zero; CLI SHA-256 stayed unchanged. Signed manifests and the gate
+receipt are `lazy-service-{generic,dedicated}-signed-artifacts.jsonl` and
+`lazy-service-probes.json`. GNU retained results remain report-only in this
+public recipe; strict closure is not claimed. Only the performance probe source
+changed during the gate; no runtime or conformance-probe code was changed or
+relinked. No smoke/full promotion follows while the pathology remains open.
+
+Added `write-seek-only` to the existing clean-room scaling probe. It shares the
+same write/rewind function, payload, counter, scales and 21-sample median code,
+but does not invoke Linux notification syscalls. The same final source compiled
+for native macOS and static-musl Linux. After the gate finished, native macOS,
+Carrick and Docker ran serially; every row completed all 21 samples and every
+process returned zero with `probe_complete=1`. The Linux executable is identical
+between Carrick and Docker. `write-seek-controls.json` records executable/source
+hashes and exact commands; matching raw streams are retained here.
+
+| Scale 65,536, ns per write/rewind iteration | p50 |
+| --- | ---: |
+| Native macOS | 1,193 |
+| Carrick | 5,326 |
+| Native ARM64 Docker | 449 |
+
+Carrick/Linux is 11.86x; Carrick/native-macOS is 4.46x. Native macOS/Linux is
+already 2.66x for this direct host-call sequence. This is a platform control,
+not Linux semantic authority and not a hardware lower-bound claim. It shows
+that eliminating measured Carrick overhead alone would still miss 2x in this
+sample. The next architectural investigation must examine reducing host
+write/seek work as well as dispatch crossings (for example, separating native
+pwrite-at-zero cost from write-plus-seek before considering offset authority).
+Do not turn this into a host-platform excuse or relax the Linux target. No
+full-inotify speedup or final parity is established by the component comparison.
+
+The retained control above uses the final guarded probe: on non-Linux hosts,
+notification modes fail with exit 2 before executing any Linux syscall number.
+That negative control passed. An initial pre-guard comparison measured
+1,201/5,421/446 ns for macOS/Carrick/Linux; it was superseded by rebuilding and
+rerunning the final source, not used to recover a failed semantic observation.

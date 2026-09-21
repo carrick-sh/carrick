@@ -7,7 +7,8 @@
 //! `write(64)` + `lseek(SEEK_SET)`. This probe measures those components alone,
 //! then measures their serial composition and concurrent composition at growing
 //! iteration counts. Output is consumed as performance evidence and is not
-//! line-diffed as conformance output.
+//! line-diffed as conformance output. `write-seek-only` runs the identical
+//! file component without Linux notification calls, including on native macOS.
 
 use conformance_probes::{arm_alarm_ms, disarm_alarm};
 use std::ffi::CString;
@@ -139,14 +140,17 @@ fn report_phase(phase: &str, scale: usize, samples: Vec<Option<u64>>, freq: u64)
 
 fn contract_scale() -> Result<Option<usize>, ()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.is_empty() {
+    if args.is_empty() || args.as_slice() == ["write-seek-only"] {
         return Ok(None);
     }
     if args.len() != 2 || args[0] != "contract-scale" {
         return Err(());
     }
     let scale = args[1].parse::<usize>().map_err(|_| ())?;
-    [1, 8, 32, 128].contains(&scale).then_some(scale).ok_or(())
+    [1, 8, 32, 128]
+        .contains(&scale)
+        .then_some(scale)
+        .ok_or(())
         .map(Some)
 }
 
@@ -188,11 +192,19 @@ fn concurrent_sample(ifd: i32, fd: i32, path: &CString, scale: usize) -> Option<
 }
 
 fn main() {
+    let write_seek_only = std::env::args().skip(1).eq(["write-seek-only"]);
+    #[cfg(not(target_os = "linux"))]
+    if !write_seek_only {
+        eprintln!("native host control requires write-seek-only; notification modes require Linux");
+        std::process::exit(2);
+    }
     unsafe { arm_alarm_ms(90_000) };
     let contract_scale = match contract_scale() {
         Ok(scale) => scale,
         Err(()) => {
-            eprintln!("usage: perf_inotify09_scale [contract-scale <1|8|32|128>]");
+            eprintln!(
+                "usage: perf_inotify09_scale [write-seek-only | contract-scale <1|8|32|128>]"
+            );
             std::process::exit(2);
         }
     };
@@ -213,6 +225,30 @@ fn main() {
             0o600,
         )
     };
+    if write_seek_only {
+        if fd < 0 {
+            std::process::exit(2);
+        }
+        let mut complete = true;
+        for scale in SCALES {
+            complete &= report_phase(
+                "write_seek",
+                scale,
+                (0..SAMPLES)
+                    .map(|_| measure(scale, || write_seek_cycle(fd)))
+                    .collect(),
+                freq,
+            );
+        }
+        complete &= unsafe { libc::close(fd) } == 0;
+        complete &= unsafe { libc::unlink(path.as_ptr()) } == 0;
+        println!("probe_complete={}", u8::from(complete));
+        unsafe { disarm_alarm() };
+        if !complete {
+            std::process::exit(1);
+        }
+        return;
+    }
     let ifd = raw_inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if fd < 0 || ifd < 0 {
         std::process::exit(2);
