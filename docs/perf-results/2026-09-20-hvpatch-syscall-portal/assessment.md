@@ -123,3 +123,16 @@ diagnose the instrument before relying on its joins. Both bounded runs left
 no live Carrick guests. Next: repair/replace that join or use independent
 host-call counts before deciding whether host metadata work or exit overhead
 is the next production target.
+
+An independent whole-tree Darwin census (`inotify-host-census.trace`) then
+passed the required-exit check, with zero errors at its ten-second bound.
+It recorded 373,257 host seeks, 373,323 writes, 746,614 `fstat64` calls and
+746,900 `fstatat64` calls. Startup is included, so these are approximate
+per-cycle counts, not a service-window join: about two of each metadata query
+per write/seek cycle. This establishes metadata amplification as a concrete
+candidate before a new offset-authority architecture. The current write path
+calls `invalidate_dentry_host_fd` after each positive write, which resolves
+the stable inode identity with a fresh `fstat`. Any optimization must retain
+invalidation after every mutation, including after a cache refill and across
+descriptor aliases; the prior idea of invalidating only once per open cannot
+establish that invariant.
