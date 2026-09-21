@@ -142,6 +142,24 @@ fn print_summary(prefix: &str, summary: TimingSummary) {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.as_slice() == ["host-dispatch"] {
+        const CALLS: usize = 10_000_000;
+        let mut unexpected = 0usize;
+        for _ in 0..CALLS {
+            let result = unsafe { libc::syscall(libc::SYS_lseek, -1i32, 0i64, libc::SEEK_SET) };
+            unexpected += usize::from(result != -1);
+        }
+        assert_eq!(unexpected, 0);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        println!("host_dispatch_calls={CALLS}");
+        println!("unexpected={unexpected}");
+        return;
+    }
+    assert!(args.is_empty(), "usage: perf_trap_floor [host-dispatch]");
     // Raw getpid by syscall number, arch-correct (aarch64 __NR_getpid=172,
     // x86_64=39): `libc::SYS_getpid` resolves per target. carrick answers from
     // cached creds; with the identity shim enabled this does not reach the host.

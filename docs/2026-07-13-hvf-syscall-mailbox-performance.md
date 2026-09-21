@@ -6,6 +6,15 @@
 
 ## Decision
 
+**2026-09-20 measurement correction:** The historical trap-floor row below
+times raw identity syscalls, which can complete in EL1 without host dispatch.
+Its equal timings therefore do not establish equal host-transport cost. The
+historical receipt is retained, but that row cannot qualify or reject the
+current mailbox transport. The campaign now selects batched invalid-fd `lseek`
+to exercise host dispatch; fresh artifact-qualified measurements and correctness
+gates are required before changing the default. See the
+[current investigation](perf-results/2026-09-20-hvpatch-syscall-portal/assessment.md).
+
 The shared mailbox removes the intended Hypervisor.framework register traffic,
 but it did not clear the frozen boundary-promotion threshold. The authoritative
 trap-floor comparison was exactly `1.000` with a seeded 95% interval of
