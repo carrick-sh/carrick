@@ -1,0 +1,79 @@
+# Adaptive syscall portal assessment
+
+## Decision
+
+The executor-local helper portal is rejected as the next `inotify09`
+optimization. It remains useful design evidence, but its production integration
+was reverted by `a5bb139b4` after the signed A/B showed both worse steady-state
+cost and an unsafe cancellation race. Portal policy was never enabled by
+default.
+
+Carrick's acceptance target remains unchanged: Linux semantics plus no more
+than 2.0 times native-arm64 Docker on the same workload.
+
+## Artifact
+
+- source revision: `e71105fef`
+- binary SHA-256: `f96cd3f9db8f214cea65a7c05936b1b38a8c073bec1e894720bd37e34306f9c1`
+- CDHash: `d2b379be9c8aa5c9886b3c3822793a14da647eec`
+- LC_UUID: `B91802AF-CC14-3268-9BCC-820853EB948F`
+- entitlement: `com.apple.security.hypervisor = true`
+- USDT section: `__DATA,__dof_carrick` present
+- probe: `perf_inotify09_scale`, clean-room `Apache-2.0 OR MIT`, SHA-256
+  `6c2d5cbcaefa380345c6794b5953a416107b81e2457a10fc389530e80e165ba8`
+- image: `localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b`
+
+Carrick and Docker ran serially. Scoped run identities were
+`portal-decomp-off` and `portal-decomp-adaptive`; no Carrick process remained
+after the adaptive failure.
+
+These are diagnostic rejection measurements, not acceptance receipts. The
+commands used the local image tag (the digest above was inspected), and the
+probe executable was hashed but not freshly rebuilt and source-attested for
+this comparison. Process CPU and deterministic work counters were not captured.
+The results justify rejecting this implementation; they do not qualify the
+remaining implementation or close any promotion gate.
+
+## Scale 65,536 result
+
+Nanoseconds per iteration are p50 over 21 samples.
+
+| Phase | Carrick portal off | Docker | Off / Docker |
+| --- | ---: | ---: | ---: |
+| watch churn | 4,459 | 969 | 4.60x |
+| write + seek | 5,699 | 458 | 12.44x |
+| persistent-watch write + seek | 5,734 | 566 | 10.13x |
+| serial full body | 12,876 | 1,546 | 8.33x |
+| concurrent components | 8,665 | 1,139 | 7.61x |
+
+The portal-off arm completed every phase. The adaptive arm did not reach the
+65,536 point. At scale 8,192 its completed phases were already slower than the
+same artifact with the portal off:
+
+| Phase | Portal off | Adaptive | Adaptive / off |
+| --- | ---: | ---: | ---: |
+| watch churn | 4,450 | 9,589 | 2.15x |
+| write + seek | 5,622 | 11,268 | 2.00x |
+| persistent-watch write + seek | 5,681 | 11,501 | 2.02x |
+| serial full body | 12,943 | 15,939 | 1.23x |
+
+The adaptive run then failed at mailbox sequence 77,140. EL1 reached HVC with
+state `Disabled` and no ordinary request publication. The helper's activity
+expiry had raced the guest's non-atomic `Armed -> RequestReady` transition.
+Both sides can overwrite the shared state because EL1 uses a load followed by
+an unconditional release store. State checks, a longer timeout, or a different
+denylist cannot make that ownership transfer atomic.
+
+The exact signed LTP run also remained red: `conf-67654-s00` reached the 40 s
+declared budget versus the cached 10.344 s Docker result, a 3.89x lower bound.
+
+## Consequence
+
+The next performance work targets the same-vCPU owner path. The decomposition
+names regular-file `write + lseek` as the largest measured phase gap. A useful
+replacement must remove an HVC without a cross-core request/response handoff.
+The next candidate to evaluate is Carrick-owned open-file-description offset
+authority with positional host I/O and a typed, generation-authenticated EL1
+capability for the narrow regular-file seek operation. It must cover dup/fork
+sharing, concurrent access, append, sparse files, signals, and stale capability
+rejection before production admission.
