@@ -1,0 +1,25 @@
+{
+  "command": "RUSTC_WRAPPER= CARRICK_RUN_ID=post-sparse-live-oracle just --no-deps conformance-probes",
+  "exit_code": 0,
+  "log": "target/perf/inotify-sustained/post-sparse-live-oracle.log",
+  "log_sha256": "c25efe0305da2bc7228485f0dd31da31ef1eab9bd401c3985d98d43130f38638",
+  "generic_shards_passed": 3,
+  "retained_arm64_passes": {
+    "musl": 33,
+    "gnu": 33
+  },
+  "retained_gnu_gating": false,
+  "cli_sha256": "5ac057b96842305f771b7a2b5835dc33c95a4124cafa77b87710e98149916778",
+  "cli_cdhash": "f073d32e82a0352662651dbfcb279e5520afd3cd",
+  "cli_uuid": "E6533A16-C092-345C-BE5B-70454838EBB2",
+  "hypervisor_entitlement": true,
+  "dof_present": true,
+  "cleanup_remaining": {
+    "post-sparse-live-oracle": 0,
+    "post-sparse-live-oracle-cli": 0
+  },
+  "strict_closure_gate_completed": false,
+  "smoke_completed": false,
+  "full_completed": false,
+  "performance_parity": false
+}
