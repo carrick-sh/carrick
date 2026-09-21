@@ -269,7 +269,12 @@ impl<'a> FsView<'a> {
             }
             let path = this.resolve_at_path(LINUX_AT_FDCWD, &path)?;
             let mask = mask as u32;
-            if let Some((wd, old_mask)) = this.fs.inotify_registry.watch_descriptor_and_mask(&path, &state) {
+            let current_gen = carrick_vfs::fs_resolve_cache::current_generation();
+            let (existing, is_known_rootfs) = this
+                .fs
+                .inotify_registry
+                .lookup_watch_and_rootfs(&path, &state, current_gen);
+            if let Some((wd, old_mask)) = existing {
                 let add = mask & carrick_abi::LINUX_IN_MASK_ADD != 0;
                 let req = mask & !carrick_abi::LINUX_IN_MASK_ADD;
                 let effective = if add { old_mask | req } else { req };
@@ -289,10 +294,14 @@ impl<'a> FsView<'a> {
             // virtual dispatch-only one when the backend declines) is recorded
             // in the dispatch registry so the fs handlers can synthesize the
             // precise same-process events the coarse kqueue NOTE_* set misses.
-            let (wd, is_virtual) = if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
+            let (wd, is_virtual, is_rootfs) = if is_known_rootfs
+                && this.fs.rootfs_vfs.dispatch_events_complete()
+            {
+                (state.add_virtual_watch(mask), true, true)
+            } else if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
                 match m.vfs.watch_fds(&m.full_path) {
                     Ok(watch_fds) => match state.add_watch_fds(watch_fds, mask) {
-                        Ok(wd) => (wd, false),
+                        Ok(wd) => (wd, false, false),
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     },
                     // Backend can't hand back a host vnode: fall back to a
@@ -301,7 +310,7 @@ impl<'a> FsView<'a> {
                         if !this.path_exists(&path) {
                             return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOENT));
                         }
-                        (state.add_virtual_watch(mask), true)
+                        (state.add_virtual_watch(mask), true, false)
                     }
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
@@ -314,11 +323,11 @@ impl<'a> FsView<'a> {
                 if !this.rootfs_path_exists(&path) {
                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOENT));
                 }
-                (state.add_virtual_watch(mask), true)
+                (state.add_virtual_watch(mask), true, true)
             } else {
                 match this.fs.rootfs_vfs.watch_fds(&path) {
                     Ok(watch_fds) => match state.add_watch_fds(watch_fds, mask) {
-                        Ok(wd) => (wd, false),
+                        Ok(wd) => (wd, false, false),
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     },
                     Err(errno) if errno == LINUX_ENOSYS => {
@@ -331,12 +340,12 @@ impl<'a> FsView<'a> {
                         {
                             Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::HostFile { host_fd, .. }) => {
                                 match state.add_watch(host_fd, mask) {
-                                    Ok(wd) => (wd, false),
+                                    Ok(wd) => (wd, false, false),
                                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                                 }
                             }
                             // No host vnode (in-memory overlay): dispatch-only.
-                            Ok(_) => (state.add_virtual_watch(mask), true),
+                            Ok(_) => (state.add_virtual_watch(mask), true, false),
                             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                         }
                     }
@@ -350,9 +359,15 @@ impl<'a> FsView<'a> {
             if !is_virtual {
                 state.mark_dispatch_authoritative();
             }
-            this.fs
-                .inotify_registry
-                .register(&path, &state, wd, mask);
+            if is_rootfs && is_virtual {
+                this.fs
+                    .inotify_registry
+                    .register_virtual_rootfs(&path, &state, wd, mask, current_gen);
+            } else {
+                this.fs
+                    .inotify_registry
+                    .register(&path, &state, wd, mask);
+            }
             Ok(DispatchOutcome::returned_i32(wd))
         }
 

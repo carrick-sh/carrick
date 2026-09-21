@@ -1374,11 +1374,13 @@ impl WatchPaths {
 struct RegistryInner {
     by_path: HashMap<std::sync::Arc<str>, Vec<RegisteredWatch>>,
     by_wd: HashMap<(usize, i32), WatchPaths>,
+    known_rootfs_paths: HashMap<std::sync::Arc<str>, u64>,
 }
 
 impl RegistryInner {
     /// Remove a path without discarding other aliases of its watch descriptors.
     fn remove_path(&mut self, path: &str) -> Option<Vec<RegisteredWatch>> {
+        self.known_rootfs_paths.remove(path);
         let watches = self.by_path.remove(path)?;
         for watch in &watches {
             let key = (std::sync::Arc::as_ptr(&watch.state) as usize, watch.wd);
@@ -1454,6 +1456,34 @@ impl InotifyRegistry {
         })
     }
 
+    /// Check if `path` has an existing watch under `state`, and/or is a known
+    /// verified private-rootfs path at `current_gen`.
+    pub(crate) fn lookup_watch_and_rootfs(
+        &self,
+        path: &str,
+        state: &std::sync::Arc<InotifyState>,
+        current_gen: u64,
+    ) -> (Option<(i32, u32)>, bool) {
+        let key = normalize_watch_path(path);
+        let inner = self.inner.read();
+        let existing = if self.is_empty() {
+            None
+        } else {
+            inner.by_path.get(key).and_then(|watches| {
+                watches
+                    .iter()
+                    .find(|watch| std::sync::Arc::ptr_eq(&watch.state, state))
+                    .map(|watch| (watch.wd, watch.mask))
+            })
+        };
+        let is_rootfs = inner
+            .known_rootfs_paths
+            .get(key)
+            .map(|&g| g == current_gen)
+            .unwrap_or(false);
+        (existing, is_rootfs)
+    }
+
     /// Record that `path` is now watched under `wd` of `state` with `mask`.
     /// Called from `inotify_add_watch` after the per-instance watch is added.
     pub(crate) fn register(
@@ -1462,6 +1492,30 @@ impl InotifyRegistry {
         state: &std::sync::Arc<InotifyState>,
         wd: i32,
         mask: u32,
+    ) {
+        self.register_inner(path, state, wd, mask, None);
+    }
+
+    /// Record that `path` is now watched under `wd` of `state` with `mask` on private rootfs,
+    /// caching its existence at `generation`.
+    pub(crate) fn register_virtual_rootfs(
+        &self,
+        path: &str,
+        state: &std::sync::Arc<InotifyState>,
+        wd: i32,
+        mask: u32,
+        generation: u64,
+    ) {
+        self.register_inner(path, state, wd, mask, Some(generation));
+    }
+
+    fn register_inner(
+        &self,
+        path: &str,
+        state: &std::sync::Arc<InotifyState>,
+        wd: i32,
+        mask: u32,
+        rootfs_gen: Option<u64>,
     ) {
         let key = normalize_watch_path(path);
         let mut inner = self.inner.write();
@@ -1501,12 +1555,18 @@ impl InotifyRegistry {
             std::collections::hash_map::Entry::Occupied(mut occ) => {
                 let paths = occ.get_mut();
                 if !paths.contains(key) {
-                    paths.push(path_key);
+                    paths.push(std::sync::Arc::clone(&path_key));
                 }
             }
             std::collections::hash_map::Entry::Vacant(vac) => {
-                vac.insert(WatchPaths::One(path_key));
+                vac.insert(WatchPaths::One(std::sync::Arc::clone(&path_key)));
             }
+        }
+        if let Some(generation) = rootfs_gen {
+            if inner.known_rootfs_paths.len() > 1024 {
+                inner.known_rootfs_paths.clear();
+            }
+            inner.known_rootfs_paths.insert(path_key, generation);
         }
     }
 
