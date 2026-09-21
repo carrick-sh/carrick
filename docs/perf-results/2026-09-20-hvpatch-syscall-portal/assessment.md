@@ -554,3 +554,30 @@ the clocks, instrumentation and populations differ. Uninstrumented end-to-end
 runs remain the ratio gate. No new full-inotify09 speedup or conformance parity
 is claimed. Next: account for VM transitions, profile the dominant service
 regions, then implement one contract-backed change and remeasure untraced.
+
+
+### Whole-workload attribution check (2026-09-21)
+
+On the unchanged release artifact (SHA-256
+`5ac057b96842305f771b7a2b5835dc33c95a4124cafa77b87710e98149916778`),
+`inotify-user-ranking.trace` sampled the harness-configured syscall path using
+the existing carrier CPU script. Its emitted image base is `0x10291c000`.
+The largest retained stack (14,221 samples across printed slices) passes through
+`applevisor::Vcpu::run`; this includes guest execution/spinning and must not be
+classified as pure transition overhead. The script truncates each slice to its
+60 largest stacks, so retained counts are not a complete population or precise
+whole-run share. This corroborates the earlier opaque guest/HVF bucket rather
+than adding evidence for a particular runtime fix.
+
+`inotify-whole-cpu.trace` completed its diagnostic receipt with no DTrace errors:
+4,796 samples, 359 user and 4,437 kernel. Two unresolved kernel PCs account for
+2,388 and 1,894 samples. The installed KDKs are 27.0 while the running kernel is
+27.2.0 (`xnu-13432.40.144.0.1~53`); assigning those PCs names from the installed
+KDK would be unsupported. Both guests were deliberately bounded at 12 seconds;
+neither trace is an LTP pass. Scoped process inspection found no remaining
+`carrick run`/`carrick trace` processes before resuming the public probe gate.
+
+Next attribution work must isolate host-dispatch transition cost with the
+existing finite `perf_trap_floor host-dispatch` reduction and qualified probes,
+not equate time under Vcpu::run with host overhead. Meanwhile the restored live
+Docker oracle permits closing the previously skipped signed gate observations.
