@@ -77,3 +77,28 @@ authority with positional host I/O and a typed, generation-authenticated EL1
 capability for the narrow regular-file seek operation. It must cover dup/fork
 sharing, concurrent access, append, sparse files, signals, and stale capability
 rejection before production admission.
+
+## Post-revert verification
+
+The production source at `a5bb139b4` was rebuilt with `RUSTC_WRAPPER= just
+build`; only the assessment documentation changed in `e2c6353fd` during that
+build. All 24 VM-free `carrick-kernel-example` contract tests passed.
+
+- binary SHA-256: `7177143f6341f9784631d269ecf05f3eaa4ea44e48650f1f984350797c188e27`
+- CDHash: `1c4825fc9064a92bcbd39fa75673fb49795ef962`
+- LC_UUID: `D90ED10E-2976-39E9-9400-316A5E04F133`
+- hypervisor entitlement and `__DATA,__dof_carrick`: present
+- ledger: `target/conformance/portal-revert-inotify09.jsonl`
+- declared-budget run: `conf-74312-s00`, timeout at 40.316 s
+
+Both raw streams were inspected. The stderr transcript reported progress to
+35,890 loops, with thread A's body averaging 3,939 ns and thread B's 9,545 ns.
+Those are LTP's internal sampling observations, not an uninstrumented complete
+runtime or proof of deadlock. The harness classified the timeout `[blocked]`,
+but the transcript establishes ongoing progress during the run. The oracle
+was cached; no new Docker acceptance run was performed. Binary SHA-256 was
+unchanged afterward, and a process inventory found no remaining Carrick guest.
+
+The signed probe, smoke, and full promotion gates remain open. The next
+attribution must include the fuzzy-sync waiting/clock cost as well as the
+write/seek body before selecting a replacement architecture.
