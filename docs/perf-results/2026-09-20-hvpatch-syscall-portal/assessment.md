@@ -240,3 +240,28 @@ Retained local artifacts:
 
 The guest timeout produced the expected interrupted LTP diagnostic, including
 TBROK; profile success certifies only the complete CPU sample population.
+
+### Harness configuration correction and fresh oracle
+
+The harness dry-run showed `--max-traps 18446744073709551615`, whereas the
+diagnostic captures above used `--max-traps 0`. Zero is not the harness's
+disabled limit and can introduce watchdog clock reads. The metadata census
+observations remain counts of those diagnostic configurations; do not use
+their throughput or the earlier CPU ranking as exact harness measurements.
+
+The CPU profile was repeated with the harness's exact trap limit. It returned
+zero with 5,813 samples, 963 stacks and exact closure. Using its live image
+base `0x100e00000`, 4,019 samples (69.1%) contain `Vcpu::run`; `write_host_file`
+is the first Carrick frame in 316 samples (5.4%). This supersedes the earlier
+ranking without changing the broad finding. No Carrick guests remained.
+Raw and symbolized results are `target/perf/inotify-sustained/harness-carrier.trace`
+and `harness-symbols.json`.
+
+Before that Carrick phase, a fresh native `linux/arm64` Docker run of the same
+digest-pinned image and `/bin/sh -c /opt/ltp/testcases/bin/inotify09` passed
+1/1 with zero broken/skipped cases in 5.75 s wall time, measured around
+`docker run --rm` (including container startup). This is faster than the cached
+10.344 s baseline, so the remaining gap is not explained by a slow current
+oracle. An initial attempt to use `time` inside the image failed before LTP
+because that command is absent; the reported run used host `/usr/bin/time`.
+This diagnostic did not rewrite the committed oracle cache.
