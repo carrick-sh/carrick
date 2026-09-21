@@ -507,7 +507,9 @@ requested comprehensive timed attribution report.
 
 `inotify-timed-host-join.trace` adds host entry/return wall and vtimestamp CPU
 timing, service CPU timing, begin/completion/clear counts, and boundary-open
-counts. All service and host populations reconciled exactly in this capture;
+counts. Per-syscall service and host populations reconciled in this capture, but the
+global scalar selected counter later proved inconsistent (722,435 versus
+722,625 summed begins). This capture fails the new strict report validator;
 every open-window count was zero, with no host/service mismatches or DTrace
 errors. This is diagnostic instrumented timing, not a performance gate.
 
@@ -519,3 +521,36 @@ wall-minus-CPU must not be called pure scheduler delay. These proportions
 identify both native write cost and non-host-call service work as remaining
 contributors. VM entry/return outside the service window is still unmeasured,
 and this capture does not justify claiming a complete syscall round-trip split.
+
+
+### Drained accounting and native Linux comparison (2026-09-21)
+
+Replaced the concurrently incremented scalar selected counter with a DTrace
+count aggregation. Admit service windows for eight seconds and allow two
+seconds to drain; reject any remaining open windows. The first aggregate-only
+capture was correctly rejected with one open write at the ten-second cutoff.
+A subsequent drained capture reconciled 574,075 services and all host-call
+windows, with no join errors. `inotify-accounting-drained.trace` and its JSON
+report preserve the evidence. The first drain invocation mistyped the image
+digest and failed before guest execution; the corrected invocation succeeded.
+
+Within these instrumented service windows, non-host-syscall CPU totals rank
+add-watch (309 ms), write (263 ms), remove-watch (100 ms), seek (97 ms).
+Write additionally spends 215 ms in host calls. This points to watch installation
+and write service work for the next focused profile; it still excludes VM
+transitions and cannot establish the full round-trip overhead ranking.
+
+Docker was stopped; launching Docker restored the native aarch64 oracle.
+Qualified bpftrace 0.20.2 and captured the same pinned LTP image using the new
+`scripts/bpftrace/inotify-service-time.bt`. The full Linux test passed with
+3,000,000 calls each to add-watch, remove-watch and seek, and 3,000,034 writes.
+Entries equal returns, all open counts and bad joins are zero, and no timeout
+or lost-event diagnostic appeared. Mean instrumented elapsed syscall times:
+add-watch 675 ns, remove-watch 607 ns, seek 274 ns, write 608 ns.
+Raw output and stderr: `inotify-linux-service-time.{out,err}`.
+
+These Linux elapsed measurements cannot be subtracted from Darwin CPU times:
+the clocks, instrumentation and populations differ. Uninstrumented end-to-end
+runs remain the ratio gate. No new full-inotify09 speedup or conformance parity
+is claimed. Next: account for VM transitions, profile the dominant service
+regions, then implement one contract-backed change and remeasure untraced.

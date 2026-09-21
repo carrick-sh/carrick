@@ -1,5 +1,7 @@
 #!/usr/sbin/dtrace -qs
 /*
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
  * hvpatch-inotify09-hotpath.d — attribute the four LTP inotify09 services.
  *
  * WHAT IT MEASURES
@@ -7,7 +9,8 @@
  * For Linux inotify_add_watch (27), inotify_rm_watch (28), lseek (62), and
  * write (64), counts completed Carrick service windows, sums their reported
  * duration, and counts Darwin syscalls issued inside each window. The capture
- * is bounded at ten seconds because inotify09 intentionally sustains the loop.
+ * admits windows for eight seconds, then drains for two seconds before exit.
+ * Any windows still open at the bound invalidate the timing report.
  *
  * PROVIDER ABI QUALIFICATION
  * --------------------------
@@ -42,6 +45,7 @@
 #pragma D option dynvarsize=16m
 
 inline int BOUND_SECONDS = 10;
+inline int ADMISSION_SECONDS = 8;
 
 dtrace:::BEGIN
 {
@@ -64,7 +68,7 @@ dtrace:::BEGIN
 }
 
 carrick*:::hvpatch-syscall-service-begin
-/(pid == $target || progenyof($target)) &&
+/seconds < ADMISSION_SECONDS && (pid == $target || progenyof($target)) &&
  ((uint64_t)arg3 == 27 || (uint64_t)arg3 == 28 ||
   (uint64_t)arg3 == 62 || (uint64_t)arg3 == 64)/
 {
@@ -77,7 +81,8 @@ carrick*:::hvpatch-syscall-service-begin
     self->service_cpu_start = vtimestamp;
     @service_begins[self->nr] = count();
     @open_services[self->nr] = sum(1);
-    selected++;
+    selected = 1;
+    @selected_total = count();
     if (begin_diagnostics < 16) {
         printf("INOTIFYHOT1|begin_state|host_pid=%d|host_tid=%d|raw_pid=%d|raw_tid=%d|raw_asid=%u|raw_nr=%llu|active=%d|stored_pid=%d|stored_tid=%d|stored_asid=%u|stored_nr=%llu\n",
             pid, tid, (int32_t)arg0, (int32_t)arg1, (uint32_t)arg2,
@@ -128,7 +133,7 @@ syscall::lseek:entry
 
 carrick*:::hvpatch-syscall-service,
 carrick*:::hvpatch-syscall-service-clear
-/(pid == $target || progenyof($target)) &&
+/(seconds < ADMISSION_SECONDS || self->active == 1) && (pid == $target || progenyof($target)) &&
  ((uint64_t)arg3 == 27 || (uint64_t)arg3 == 28 ||
   (uint64_t)arg3 == 62 || (uint64_t)arg3 == 64) &&
  (self->active != 1 || self->guest_pid != (int32_t)arg0 ||
@@ -143,7 +148,7 @@ carrick*:::hvpatch-syscall-service-clear
 }
 
 carrick*:::hvpatch-syscall-service
-/(pid == $target || progenyof($target)) &&
+/(seconds < ADMISSION_SECONDS || self->active == 1) && (pid == $target || progenyof($target)) &&
  ((uint64_t)arg3 == 27 || (uint64_t)arg3 == 28 ||
   (uint64_t)arg3 == 62 || (uint64_t)arg3 == 64)/
 {
@@ -160,7 +165,7 @@ carrick*:::hvpatch-syscall-service
 }
 
 carrick*:::hvpatch-syscall-service-clear
-/(pid == $target || progenyof($target)) &&
+/(seconds < ADMISSION_SECONDS || self->active == 1) && (pid == $target || progenyof($target)) &&
  ((uint64_t)arg3 == 27 || (uint64_t)arg3 == 28 ||
   (uint64_t)arg3 == 62 || (uint64_t)arg3 == 64)/
 {
@@ -193,8 +198,9 @@ dtrace:::END
 {
     this->complete = errors == 0 && selected > 0 && !nested && !mismatch && !host_mismatch;
     printf("INOTIFYHOT1|host_mismatch=%d|boundary_censored=1\n", host_mismatch);
-    printf("INOTIFYHOT1|bound_s=%d|selected=%d|nested=%d|mismatch=%d|errors=%d|complete=%d\n",
+    printf("INOTIFYHOT1|bound_s=%d|saw_selected=%d|nested=%d|mismatch=%d|errors=%d|complete=%d\n",
         BOUND_SECONDS, selected, nested, mismatch, errors, this->complete);
+    printa("INOTIFYHOT1|selected_total=%@d\n", @selected_total);
     printa("INOTIFYHOT1|nr=%llu|services=%@d\n", @service_count);
     printa("INOTIFYHOT1|nr=%llu|duration_ns=%@d\n", @service_duration_ns);
     printa("INOTIFYHOT1|nr=%llu|host=%s|count=%@d\n", @host_syscalls);

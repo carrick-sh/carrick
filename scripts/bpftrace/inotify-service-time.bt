@@ -1,0 +1,65 @@
+/* SPDX-License-Identifier: Apache-2.0 OR MIT
+ * Native ARM64 Linux inotify09 syscall latency, including off-CPU time.
+ * Run inside the privileged Docker oracle with tracefs mounted:
+ * bpftrace inotify-service-time.bt -c '/bin/sh -c /opt/ltp/testcases/bin/inotify09'
+ * Qualification: bpftrace 0.20.2, Linux aarch64. Syscall numbers are ARM64.
+ * Track TIDs, including descendants; do not scope by comm or delete the
+ * entire process when a worker thread exits. -c starts after probes attach.
+ * Perturbs syscall paths. These are diagnostic elapsed times, NOT CPU times
+ * and must not be subtracted from Darwin vtimestamp service measurements.
+ * Require matching entries/returns, zero open counts and no lost events.
+ */
+BEGIN
+{
+    @tracked[cpid] = 1;
+    printf("INOTIFYLINUX1|ready|root=%d\n", cpid);
+}
+
+tracepoint:sched:sched_process_fork
+/@tracked[args->parent_pid]/
+{
+    @tracked[args->child_pid] = 1;
+}
+
+tracepoint:raw_syscalls:sys_enter
+/@tracked[tid] && (args->id == 27 || args->id == 28 || args->id == 62 || args->id == 64)/
+{
+    if (@start[tid]) { @bad_join = count(); }
+    @start[tid] = nsecs;
+    @number[tid] = args->id;
+    @entries[args->id] = count();
+    @open[args->id] = sum(1);
+}
+
+tracepoint:raw_syscalls:sys_exit
+/@tracked[tid] && @start[tid]/
+{
+    if (@number[tid] != args->id) { @bad_join = count(); }
+    @returns[args->id] = count();
+    @wall_ns[args->id] = sum(nsecs - @start[tid]);
+    @latency_ns[args->id] = hist(nsecs - @start[tid]);
+    @open[args->id] = sum(-1);
+    delete(@start[tid]);
+    delete(@number[tid]);
+}
+
+tracepoint:sched:sched_process_exit
+/@tracked[tid]/
+{
+    if (@start[tid]) { @bad_join = count(); }
+    delete(@tracked[tid]);
+}
+
+interval:s:30
+{
+    printf("INOTIFYLINUX1|timeout=1\n");
+    exit();
+}
+
+END
+{
+    printf("INOTIFYLINUX1|end=1\n");
+    clear(@tracked);
+    clear(@start);
+    clear(@number);
+}
