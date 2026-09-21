@@ -851,7 +851,6 @@ pub(crate) type PlatformFutexFactory =
     Arc<dyn Fn(Arc<FutexTable>) -> Arc<dyn PlatformFutex> + Send + Sync>;
 
 pub(crate) mod binding;
-pub mod portal;
 
 pub(crate) use binding::{
     ExecutionLeaseCell, HvpatchBlockInput, HvpatchContinuationInput, HvpatchLogicalJobInput,
@@ -3209,7 +3208,6 @@ pub(crate) mod tests {
             pending_terminal_retirement: None,
             pending_terminal_inventory: None,
             external_exec,
-            portal_quantum_epoch: 0,
         }
     }
 
