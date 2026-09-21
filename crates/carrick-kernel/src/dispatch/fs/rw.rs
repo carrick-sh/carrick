@@ -336,32 +336,50 @@ impl<'a> FsView<'a> {
         } else {
             bytes
         };
-        let Some(wait_authority) = self
-            .captured_slot_authority(fd)
-            .map(WaitFdAuthority::logical)
-        else {
-            return Ok(DispatchOutcome::errno(LINUX_EBADF));
-        };
         let raw_fd = host_fd.raw();
         host_fd.record_sequential_io();
-        let host_wait_runner = self.host_wait_runner_for_ctx(cx);
-        let host_wait_ref = host_wait_runner
-            .as_ref()
-            .map(|runner| runner as &dyn HostWaitRunner);
-        let mut target = HostPipeWriteTarget::new(
-            raw_fd,
-            Some(host_fd.clone()),
-            nonblocking,
-            HostWriteKind::RegularFile,
-            tid,
-            wait_authority,
-            self.cross.host_signal(),
-        )
-        .with_host_wait(host_wait_ref);
-        if seek_authority_active {
-            target = target.with_offset(current_seek_offset);
-        }
-        let out = write_host_pipe(bytes, target)?;
+        let out = if seek_authority_active {
+            let written = unsafe {
+                libc::pwrite(
+                    raw_fd,
+                    bytes.as_ptr() as *const libc::c_void,
+                    bytes.len(),
+                    current_seek_offset as libc::off_t,
+                )
+            };
+            if written >= 0 {
+                DispatchOutcome::Returned {
+                    value: written as i64,
+                }
+            } else {
+                let host = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                DispatchOutcome::errno(crate::host_to_linux_errno(host))
+            }
+        } else {
+            let Some(wait_authority) = self
+                .captured_slot_authority(fd)
+                .map(WaitFdAuthority::logical)
+            else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let host_wait_runner = self.host_wait_runner_for_ctx(cx);
+            let host_wait_ref = host_wait_runner
+                .as_ref()
+                .map(|runner| runner as &dyn HostWaitRunner);
+            let target = HostPipeWriteTarget::new(
+                raw_fd,
+                Some(host_fd.clone()),
+                nonblocking,
+                HostWriteKind::RegularFile,
+                tid,
+                wait_authority,
+                self.cross.host_signal(),
+            )
+            .with_host_wait(host_wait_ref);
+            write_host_pipe(bytes, target)?
+        };
         if let DispatchOutcome::Returned { value } = out
             && value > 0
         {
