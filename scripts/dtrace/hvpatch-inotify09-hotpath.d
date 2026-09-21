@@ -44,6 +44,7 @@ dtrace:::BEGIN
     mismatch = 0;
     stack_samples = 0;
     join_diagnostics = 0;
+    begin_diagnostics = 0;
     self->active = (int32_t)0;
     self->nr = (uint64_t)0;
     self->guest_pid = (int32_t)0;
@@ -63,6 +64,13 @@ carrick*:::hvpatch-syscall-service-begin
     self->asid = (uint32_t)arg2;
     self->nr = (uint64_t)arg3;
     selected++;
+    if (begin_diagnostics < 16) {
+        printf("INOTIFYHOT1|begin_state|host_pid=%d|host_tid=%d|raw_pid=%d|raw_tid=%d|raw_asid=%u|raw_nr=%llu|active=%d|stored_pid=%d|stored_tid=%d|stored_asid=%u|stored_nr=%llu\n",
+            pid, tid, (int32_t)arg0, (int32_t)arg1, (uint32_t)arg2,
+            (uint64_t)arg3, self->active, self->guest_pid, self->guest_tid,
+            self->asid, self->nr);
+        begin_diagnostics++;
+    }
 }
 
 syscall:::entry
