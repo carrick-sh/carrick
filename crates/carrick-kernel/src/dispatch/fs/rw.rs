@@ -251,6 +251,103 @@ impl<'a> FsView<'a> {
         Ok(len.min((limit - offset) as usize))
     }
 
+    fn write_host_file<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        fd: i32,
+        tid: crate::thread::ThreadId,
+        mut bytes: Vec<u8>,
+        open_file: &OpenFile,
+        host_fd: HostFdRef,
+        writable: bool,
+        nonblocking: bool,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if !writable {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        }
+        let is_append =
+            LinuxOpenFlags::from_bits_truncate(open_file.description.common().status_flags())
+                .contains(LinuxOpenFlags::APPEND);
+        let file_limit = self.fsize_soft_limit();
+        let sparse_tracking = self.fs.has_host_sparse_extents();
+        let offset_may_be_nonzero = host_fd.offset_may_be_nonzero();
+        let pos = if is_append {
+            unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) }
+        } else if offset_may_be_nonzero || file_limit.is_some() || sparse_tracking {
+            #[cfg(feature = "conformance-metrics")]
+            if let Some(scope) = cx.kernel.kernel().work_scope() {
+                let _ = scope.add(
+                    carrick_observability::work_meter::WorkMetric::HostWritePositionQueries,
+                    1,
+                );
+            }
+            unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) }
+        } else {
+            0
+        };
+        let write_offset = (pos >= 0).then_some(pos as u64);
+        let old_len = if !is_append && offset_may_be_nonzero && pos > 0 {
+            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+            if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0
+                && (pos as u64) > st.st_size as u64
+            {
+                Some((st.st_size as u64, pos as u64))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if file_limit.is_some() && pos >= 0 {
+            match self.fsize_write_len(cx, pos as u64, bytes.len()) {
+                Ok(len) => bytes.truncate(len),
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            }
+        }
+        let Some(wait_authority) = self
+            .captured_slot_authority(fd)
+            .map(WaitFdAuthority::logical)
+        else {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        };
+        let raw_fd = host_fd.raw();
+        host_fd.record_sequential_io();
+        let host_wait_runner = self.host_wait_runner_for_ctx(cx);
+        let host_wait_ref = host_wait_runner
+            .as_ref()
+            .map(|runner| runner as &dyn HostWaitRunner);
+        let out = write_host_pipe_owned(
+            bytes,
+            HostPipeWriteTarget::new(
+                raw_fd,
+                Some(host_fd),
+                nonblocking,
+                HostWriteKind::RegularFile,
+                tid,
+                wait_authority,
+                self.cross.host_signal(),
+            )
+            .with_host_wait(host_wait_ref),
+        )?;
+        if let DispatchOutcome::Returned { value } = out
+            && value > 0
+        {
+            self.invalidate_dentry_host_fd(raw_fd);
+            let punch_result = if let Some((old_len, pos)) = old_len {
+                punch_unwritten_host_blocks(raw_fd, old_len, pos)
+            } else {
+                Ok(())
+            };
+            if let Some(write_offset) = write_offset {
+                self.fs
+                    .record_host_sparse_write(raw_fd, write_offset, value as usize);
+            }
+            self.notify_host_file_write_result(cx.kernel, open_file, &out);
+            punch_result?;
+        }
+        Ok(out)
+    }
+
     fn lseek_host_file(&self, host_fd: &HostFdRef, offset: i64, whence: u64) -> DispatchOutcome {
         if (whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE) && offset >= 0 {
             if let Some(next) = self.fs.seek_host_sparse_extents(
@@ -2541,6 +2638,29 @@ impl<'a> FsView<'a> {
                 let Some(io_lease) = open_file.description.retain_fd_lease() else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
+                let host_file = {
+                    let Some(open) = open_file.description.read() else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    match &*open {
+                        OpenDescription::HostFile {
+                            host_fd, writable, ..
+                        } => Some((host_fd.clone(), *writable)),
+                        _ => None,
+                    }
+                };
+                if let Some((host_fd, writable)) = host_file {
+                    return this.write_host_file(
+                        cx,
+                        fd,
+                        tid,
+                        bytes,
+                        &open_file,
+                        host_fd,
+                        writable,
+                        nonblocking,
+                    );
+                }
                 // Take an inner scope so the borrow on the description ends
                 // before we touch this.fs.rootfs_vfs.overlay (writable File path below).
                 enum FileWriteback {
@@ -2811,119 +2931,8 @@ impl<'a> FsView<'a> {
                             drop(open);
                             return Ok(socket.sendto(cx.memory, &bytes, 0, 0, 0));
                         }
-                        OpenDescription::HostFile {
-                            host_fd, writable, ..
-                        } => {
-                            if !*writable {
-                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                            }
-                            let is_append = LinuxOpenFlags::from_bits_truncate(
-                                open_file.description.common().status_flags(),
-                            )
-                            .contains(LinuxOpenFlags::APPEND);
-                            // O_APPEND: seek to EOF before writing so `>>` and
-                            // log appends don't overwrite from offset 0. (The
-                            // host fd isn't opened O_APPEND, so we emulate the
-                            // seek-then-write; single-writer, which covers the
-                            // shell/dpkg append cases.)
-                            let file_limit = this.fsize_soft_limit();
-                            let sparse_tracking = this.fs.has_host_sparse_extents();
-                            let offset_may_be_nonzero = host_fd.offset_may_be_nonzero();
-                            let pos = if is_append {
-                                unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) }
-                            } else if offset_may_be_nonzero
-                                || file_limit.is_some()
-                                || sparse_tracking
-                            {
-                                #[cfg(feature = "conformance-metrics")]
-                                if let Some(scope) = cx.kernel.kernel().work_scope() {
-                                    let _ = scope.add(
-                                        carrick_observability::work_meter::WorkMetric::HostWritePositionQueries,
-                                        1,
-                                    );
-                                }
-                                unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) }
-                            } else {
-                                0
-                            };
-                            let write_offset = (pos >= 0).then_some(pos as u64);
-                            let old_len = if !is_append && offset_may_be_nonzero && pos > 0 {
-                                let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                                if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0
-                                    && (pos as u64) > st.st_size as u64
-                                {
-                                    Some((st.st_size as u64, pos as u64))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-                            // The offset lives in the host kernel; read it back
-                            // (post-append reposition) before applying the
-                            // guest's RLIMIT_FSIZE cap.
-                            if file_limit.is_some() {
-                                if pos >= 0 {
-                                    match this.fsize_write_len(cx, pos as u64, bytes.len()) {
-                                        Ok(len) => bytes.truncate(len),
-                                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                                    }
-                                }
-                            }
-                            // libc::write to the real fd: advances the
-                            // kernel offset and is visible across fork.
-                            let Some(wait_authority) = this
-                                .captured_slot_authority(fd)
-                                .map(WaitFdAuthority::logical)
-                            else {
-                                drop(open);
-                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                            };
-                            let raw_fd = host_fd.raw();
-                            let host_fd_owner = host_fd.clone();
-                            // The write may advance the shared host-file offset.
-                            // Mark it before releasing description authority so
-                            // another alias cannot observe a stale zero proof.
-                            host_fd_owner.record_sequential_io();
-                            drop(open);
-                            let host_wait_runner = this.host_wait_runner_for_ctx(cx);
-                            let host_wait_ref =
-                                host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
-                            let out = write_host_pipe_owned(
-                                bytes,
-                                HostPipeWriteTarget::new(
-                                    raw_fd,
-                                    Some(host_fd_owner.clone()),
-                                    nonblocking,
-                                    HostWriteKind::RegularFile,
-                                    tid,
-                                    wait_authority,
-                                    this.cross.host_signal(),
-                                )
-                                .with_host_wait(host_wait_ref),
-                            )?;
-                            if let DispatchOutcome::Returned { value } = out && value > 0 {
-                                // Publish metadata before waking a watch consumer.
-                                // A stat between writes can repopulate this cache.
-                                this.invalidate_dentry_host_fd(raw_fd);
-                                let punch_result = if let Some((old_len, pos)) = old_len {
-                                    punch_unwritten_host_blocks(raw_fd, old_len, pos)
-                                } else {
-                                    Ok(())
-                                };
-                                if let Some(write_offset) = write_offset {
-                                    this.fs.record_host_sparse_write(
-                                        raw_fd,
-                                        write_offset,
-                                        value as usize,
-                                    );
-                                }
-                                // The host write already changed bytes even if
-                                // subsequent sparse maintenance failed.
-                                this.notify_host_file_write_result(cx.kernel, &open_file, &out);
-                                punch_result?;
-                            }
-                            return Ok(out);
+                        OpenDescription::HostFile { .. } => {
+                            unreachable!("host files are handled under shared description authority")
                         }
                         OpenDescription::InMemoryFile {
                             path,

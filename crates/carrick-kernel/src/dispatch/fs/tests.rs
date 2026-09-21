@@ -54,6 +54,69 @@ fn host_file_lseek_does_not_publish_description_mutation() {
 }
 
 #[test]
+fn host_file_write_does_not_publish_description_mutation() {
+    use std::io::{Read, Seek};
+    use std::os::fd::IntoRawFd;
+
+    let host_file = tempfile::tempfile().unwrap();
+    let verify = host_file.try_clone().unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    let fd = dispatcher
+        .install_fd_at_or_above(
+            3,
+            OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::HostFile {
+                    host_fd: HostFdRef::new(host_file.into_raw_fd()),
+                    metadata: RootFsMetadata {
+                        path: "/write-revision".into(),
+                        kind: RootFsEntryKind::File,
+                        mode: 0o600,
+                        size: 0,
+                    },
+                    base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                    writable: true,
+                })),
+                LINUX_O_RDWR,
+                0,
+            ),
+        )
+        .unwrap();
+    let open_file = dispatcher.open_file(fd).unwrap();
+    let before_lease = open_file.description.revision_for_test();
+    let lease = open_file.description.retain_fd_lease().unwrap();
+    drop(lease);
+    let after_lease = open_file.description.revision_for_test();
+    let lease_publications = after_lease - before_lease;
+    assert_eq!(lease_publications, 2, "retain and release publish fd_refs");
+    let before = after_lease;
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let expected = [0x5au8; 64];
+    let mut memory = LinearMemory::new(0x4000, expected.to_vec());
+    let result = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                64,
+                SyscallArgs::from([fd as u64, 0x4000, expected.len() as u64, 0, 0, 0]),
+            ),
+            &mut memory,
+            &CompatReporter::default(),
+        )
+        .unwrap();
+    assert_eq!(result, DispatchOutcome::Returned { value: 64 });
+    assert_eq!(
+        open_file.description.revision_for_test() - before,
+        lease_publications,
+        "host write may publish its fd-lease lifecycle, but no Carrick description mutation"
+    );
+    let mut verify = verify;
+    verify.rewind().unwrap();
+    let mut actual = [0u8; 64];
+    verify.read_exact(&mut actual).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn host_flush_injection_is_the_real_dispatch_operation() {
     use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
     use std::sync::atomic::{AtomicUsize, Ordering};
