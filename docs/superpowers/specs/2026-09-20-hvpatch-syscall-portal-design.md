@@ -2,18 +2,21 @@
 
 ## Outcome
 
-Carrick will service a narrow class of nonblocking HVPatch syscalls without one
-Hypervisor.framework exit per call. EL0 still enters Carrick's EL1 vector and
-all Linux semantics remain in the Rust kernel graph. An executor-local host
-helper consumes a typed request from the existing syscall mailbox while the
-vCPU waits in EL1, publishes a typed response, and lets EL1 return directly to
-EL0. Any ambiguity forces the existing HVC path.
+The executor-local helper described here was implemented experimentally and
+rejected after signed workload qualification. The helper made every completed
+steady-state `inotify09` reduction phase slower and then exposed a non-atomic
+`Armed -> RequestReady` versus cancellation ownership race. Production wiring
+was reverted in `a5bb139b4`; portal selection never defaulted on. The typed
+mailbox protocol and contract remain as design groundwork, not a shipped
+performance claim.
 
-The initial success criterion is mechanical: eligible calls reduce HVC exits
+The success criterion was mechanical: eligible calls reduce HVC exits
 with identical return values, signal behavior, observer behavior, and kernel
 work. The workload criterion is progress toward the `ltp-inotify09` maximum
 2.0 Docker ratio without permanent helper CPU consumption. This design does
-not claim that the first scalar allowlist alone will close that ratio.
+not claim that the first scalar allowlist alone will close that ratio. The
+signed rejection evidence is recorded in
+[`docs/perf-results/2026-09-20-hvpatch-syscall-portal/assessment.md`](../../perf-results/2026-09-20-hvpatch-syscall-portal/assessment.md).
 
 ## Evidence and choice
 
