@@ -111,6 +111,14 @@ impl EventMultiplexer for KqueueMultiplexer {
         if vnodes.is_empty() {
             return Ok(());
         }
+        if vnodes.len() == 1 {
+            let (fd, token, mask) = vnodes[0];
+            let note = mask.to_note();
+            let ev = [Kevent::vnode(fd, note).with_udata_u64(token)];
+            self.kq.apply(&ev).map_err(OsError::from_raw)?;
+            self.registered.entry(fd).or_default().vnode = true;
+            return Ok(());
+        }
         let kevents: Vec<Kevent> = vnodes
             .iter()
             .map(|&(fd, token, mask)| {
@@ -175,6 +183,34 @@ impl EventMultiplexer for KqueueMultiplexer {
 
     fn deregister_vnodes(&mut self, fds: &[RawFd]) -> Result<(), OsError> {
         if fds.is_empty() {
+            return Ok(());
+        }
+        if fds.len() == 1 {
+            let fd = fds[0];
+            if let Some(entry) = self.registered.remove(&fd) {
+                if !entry.read && !entry.write && !entry.oob && entry.vnode {
+                    let ev = [Kevent::vnode_delete(fd)];
+                    let _ = self.kq.apply(&ev);
+                    return Ok(());
+                }
+                let mut deletes = Vec::with_capacity(4);
+                if entry.read {
+                    deletes.push(Kevent::read(fd, libc::EV_DELETE));
+                }
+                if entry.write {
+                    deletes.push(Kevent::write(fd, libc::EV_DELETE));
+                }
+                #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
+                if entry.oob {
+                    deletes.push(Kevent::oob(fd, libc::EV_DELETE));
+                }
+                if entry.vnode {
+                    deletes.push(Kevent::vnode_delete(fd));
+                }
+                if !deletes.is_empty() {
+                    let _ = self.kq.apply(&deletes);
+                }
+            }
             return Ok(());
         }
         let mut deletes = Vec::with_capacity(fds.len());

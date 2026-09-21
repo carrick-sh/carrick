@@ -545,41 +545,52 @@ impl InotifyBackend for VnodeDiffInotify {
         if watch_fds.is_empty() {
             return Err(LINUX_EINVAL);
         }
-        let host_fds: Vec<RawFd> = watch_fds.iter().map(|watch_fd| watch_fd.host_fd).collect();
+        let single_fd = if watch_fds.len() == 1 {
+            Some(watch_fds[0].host_fd)
+        } else {
+            None
+        };
 
         // Register each watched vnode for the requested `NOTE_*` set in a single batch.
         // The token is the host fd so `read_records` can map a fired event back to its wd.
         let registered = {
             let events = linux_mask_to_vnode_events(mask);
             let mut mux = self.mux.lock();
-            let vnodes: Vec<(RawFd, u64, VnodeEvents)> =
-                host_fds.iter().map(|&fd| (fd, fd as u64, events)).collect();
             if let Some(scope) = work_scope {
                 let _ = scope.add(
                     carrick_observability::work_meter::WorkMetric::HostBackendCalls,
                     1,
                 );
             }
-            mux.register_vnodes(&vnodes).map_err(|_| ())
+            if let Some(fd) = single_fd {
+                mux.register_vnodes(&[(fd, fd as u64, events)])
+                    .map_err(|_| ())
+            } else {
+                let vnodes: Vec<(RawFd, u64, VnodeEvents)> = watch_fds
+                    .iter()
+                    .map(|watch_fd| (watch_fd.host_fd, watch_fd.host_fd as u64, events))
+                    .collect();
+                mux.register_vnodes(&vnodes).map_err(|_| ())
+            }
         };
         if registered.is_err() {
             // Registration failed: we own the fds, so don't leak them.
-            for host_fd in host_fds {
-                unsafe { libc::close(host_fd) };
+            for watch_fd in &watch_fds {
+                unsafe { libc::close(watch_fd.host_fd) };
             }
             return Err(LINUX_ENOSPC);
         }
         let mut inner = inner.lock();
-        if watch_fds.len() == 1
+        if let Some(fd) = single_fd
             && watch_fds[0].name.is_none()
-            && let Some(existing) = inner.wd_by_fd.get(&watch_fds[0].host_fd).cloned()
+            && let Some(existing) = inner.wd_by_fd.get(&fd).cloned()
         {
             let wd = existing.wd;
             if let Some(w) = inner.watches.get_mut(&wd) {
                 w.mask = mask;
             }
             // The caller's duplicate fd is redundant; drop it.
-            unsafe { libc::close(watch_fds[0].host_fd) };
+            unsafe { libc::close(fd) };
             return Ok(wd);
         }
         let wd = inner.next_wd;
@@ -600,6 +611,11 @@ impl InotifyBackend for VnodeDiffInotify {
                 },
             );
         }
+        let host_fds = if let Some(fd) = single_fd {
+            vec![fd]
+        } else {
+            watch_fds.iter().map(|watch_fd| watch_fd.host_fd).collect()
+        };
         inner.watches.insert(wd, Watch { host_fds, mask });
         Ok(wd)
     }
@@ -619,15 +635,21 @@ impl InotifyBackend for VnodeDiffInotify {
             .ok_or(LINUX_EINVAL)?;
         let events = linux_mask_to_vnode_events(mask);
         let mut mux = self.mux.lock();
-        let vnodes: Vec<(RawFd, u64, VnodeEvents)> =
-            host_fds.iter().map(|&fd| (fd, fd as u64, events)).collect();
         if let Some(scope) = work_scope {
             let _ = scope.add(
                 carrick_observability::work_meter::WorkMetric::HostBackendCalls,
                 1,
             );
         }
-        mux.register_vnodes(&vnodes).map_err(|_| LINUX_ENOSPC)?;
+        if host_fds.len() == 1 {
+            let fd = host_fds[0];
+            mux.register_vnodes(&[(fd, fd as u64, events)])
+                .map_err(|_| LINUX_ENOSPC)?;
+        } else {
+            let vnodes: Vec<(RawFd, u64, VnodeEvents)> =
+                host_fds.iter().map(|&fd| (fd, fd as u64, events)).collect();
+            mux.register_vnodes(&vnodes).map_err(|_| LINUX_ENOSPC)?;
+        }
         drop(mux);
         let mut inner = inner.lock();
         let watch = inner.watches.get_mut(&wd).ok_or(LINUX_EINVAL)?;
