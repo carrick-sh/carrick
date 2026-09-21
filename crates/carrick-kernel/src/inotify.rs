@@ -1154,7 +1154,7 @@ struct RegisteredWatch {
 #[derive(Default)]
 struct RegistryInner {
     by_path: HashMap<String, Vec<RegisteredWatch>>,
-    by_wd: HashMap<(usize, i32), HashSet<String>>,
+    by_wd: HashMap<(usize, i32), Vec<String>>,
 }
 
 impl RegistryInner {
@@ -1164,7 +1164,7 @@ impl RegistryInner {
         for watch in &watches {
             let key = (std::sync::Arc::as_ptr(&watch.state) as usize, watch.wd);
             if let Some(paths) = self.by_wd.get_mut(&key) {
-                paths.remove(path);
+                paths.retain(|p| p != path);
                 if paths.is_empty() {
                     self.by_wd.remove(&key);
                 }
@@ -1242,11 +1242,10 @@ impl InotifyRegistry {
             });
         }
         let ptr = std::sync::Arc::as_ptr(state) as usize;
-        inner
-            .by_wd
-            .entry((ptr, wd))
-            .or_default()
-            .insert(key.to_owned());
+        let paths = inner.by_wd.entry((ptr, wd)).or_default();
+        if !paths.iter().any(|p| p == key) {
+            paths.push(key.to_owned());
+        }
     }
 
     /// Drop every registry entry for `wd` of `state` (an `inotify_rm_watch`, or
@@ -1306,11 +1305,10 @@ impl InotifyRegistry {
             inner.remove_path(to_key);
             for w in &watches {
                 let ptr = std::sync::Arc::as_ptr(&w.state) as usize;
-                inner
-                    .by_wd
-                    .entry((ptr, w.wd))
-                    .or_default()
-                    .insert(to_key.to_owned());
+                let paths = inner.by_wd.entry((ptr, w.wd)).or_default();
+                if !paths.iter().any(|p| p == to_key) {
+                    paths.push(to_key.to_owned());
+                }
             }
             inner.by_path.insert(to_key.to_owned(), watches);
         }
