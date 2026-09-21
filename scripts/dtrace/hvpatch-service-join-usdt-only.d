@@ -62,11 +62,11 @@ carrick*:::hvpatch-syscall-service-begin
 { @all_begin_numbers[(uint64_t)arg3] = count(); }
 
 carrick*:::hvpatch-syscall-service-begin
-/(pid == $target || progenyof($target)) &&
- ((uint64_t)arg3 == 27 || (uint64_t)arg3 == 28 ||
-  (uint64_t)arg3 == 62 || (uint64_t)arg3 == 64)/
+/pid == $target || progenyof($target)/
 {
-    nested = nested || self->active;
+    if ((uint64_t)arg3 == 27 || (uint64_t)arg3 == 28 ||
+        (uint64_t)arg3 == 62 || (uint64_t)arg3 == 64) {
+    nested = nested || self->active == 1;
     self->active = 1;
     self->guest_pid = (int32_t)arg0;
     self->guest_tid = (int32_t)arg1;
@@ -81,13 +81,14 @@ carrick*:::hvpatch-syscall-service-begin
         begin_diagnostics++;
     }
 }
+}
 
 carrick*:::hvpatch-syscall-service,
 carrick*:::hvpatch-syscall-service-clear
 /(pid == $target || progenyof($target)) &&
  ((uint64_t)arg3 == 27 || (uint64_t)arg3 == 28 ||
   (uint64_t)arg3 == 62 || (uint64_t)arg3 == 64) &&
- (!self->active || self->guest_pid != (int32_t)arg0 ||
+ (self->active != 1 || self->guest_pid != (int32_t)arg0 ||
   self->guest_tid != (int32_t)arg1 || self->asid != (uint32_t)arg2 ||
   self->nr != (uint64_t)arg3) && join_diagnostics < 16/
 {
@@ -103,7 +104,7 @@ carrick*:::hvpatch-syscall-service
  ((uint64_t)arg3 == 27 || (uint64_t)arg3 == 28 ||
   (uint64_t)arg3 == 62 || (uint64_t)arg3 == 64)/
 {
-    this->matches = self->active &&
+    this->matches = self->active == 1 &&
         self->guest_pid == (int32_t)arg0 &&
         self->guest_tid == (int32_t)arg1 &&
         self->asid == (uint32_t)arg2 &&
@@ -118,13 +119,11 @@ carrick*:::hvpatch-syscall-service-clear
  ((uint64_t)arg3 == 27 || (uint64_t)arg3 == 28 ||
   (uint64_t)arg3 == 62 || (uint64_t)arg3 == 64)/
 {
-    this->matches = self->active && self->nr == (uint64_t)arg3;
+    this->matches = self->active == 1 && self->nr == (uint64_t)arg3;
     mismatch = mismatch || !this->matches;
-    self->active = 0;
-    self->guest_pid = 0;
-    self->guest_tid = 0;
-    self->asid = 0;
-    self->nr = 0;
+    /* DTrace zero assignment frees dynamic storage. Retain the identity and
+     * a nonzero inactive sentinel to avoid per-service allocation churn. */
+    self->active = 2;
 }
 
 dtrace:::ERROR

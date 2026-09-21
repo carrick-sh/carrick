@@ -57,7 +57,7 @@ carrick*:::hvpatch-syscall-service-begin
  ((uint64_t)arg3 == 27 || (uint64_t)arg3 == 28 ||
   (uint64_t)arg3 == 62 || (uint64_t)arg3 == 64)/
 {
-    nested = nested || self->active;
+    nested = nested || self->active == 1;
     self->active = 1;
     self->guest_pid = (int32_t)arg0;
     self->guest_tid = (int32_t)arg1;
@@ -74,13 +74,13 @@ carrick*:::hvpatch-syscall-service-begin
 }
 
 syscall:::entry
-/(pid == $target || progenyof($target)) && self->active/
+/(pid == $target || progenyof($target)) && self->active == 1/
 {
     @host_syscalls[self->nr, probefunc] = count();
 }
 
 syscall::fstat64:entry
-/(pid == $target || progenyof($target)) && self->active && stack_samples < 8/
+/(pid == $target || progenyof($target)) && self->active == 1 && stack_samples < 8/
 {
     printf("INOTIFYHOT1|stack|nr=%llu|host=fstat64\n", self->nr);
     ustack(24);
@@ -88,7 +88,7 @@ syscall::fstat64:entry
 }
 
 syscall::lseek:entry
-/(pid == $target || progenyof($target)) && self->nr == 64 && stack_samples < 8/
+/(pid == $target || progenyof($target)) && self->active == 1 && self->nr == 64 && stack_samples < 8/
 {
     printf("INOTIFYHOT1|stack|nr=64|host=lseek\n");
     ustack(24);
@@ -100,7 +100,7 @@ carrick*:::hvpatch-syscall-service-clear
 /(pid == $target || progenyof($target)) &&
  ((uint64_t)arg3 == 27 || (uint64_t)arg3 == 28 ||
   (uint64_t)arg3 == 62 || (uint64_t)arg3 == 64) &&
- (!self->active || self->guest_pid != (int32_t)arg0 ||
+ (self->active != 1 || self->guest_pid != (int32_t)arg0 ||
   self->guest_tid != (int32_t)arg1 || self->asid != (uint32_t)arg2 ||
   self->nr != (uint64_t)arg3) && join_diagnostics < 16/
 {
@@ -116,7 +116,7 @@ carrick*:::hvpatch-syscall-service
  ((uint64_t)arg3 == 27 || (uint64_t)arg3 == 28 ||
   (uint64_t)arg3 == 62 || (uint64_t)arg3 == 64)/
 {
-    this->matches = self->active &&
+    this->matches = self->active == 1 &&
         self->guest_pid == (int32_t)arg0 &&
         self->guest_tid == (int32_t)arg1 &&
         self->asid == (uint32_t)arg2 &&
@@ -131,13 +131,11 @@ carrick*:::hvpatch-syscall-service-clear
  ((uint64_t)arg3 == 27 || (uint64_t)arg3 == 28 ||
   (uint64_t)arg3 == 62 || (uint64_t)arg3 == 64)/
 {
-    this->matches = self->active && self->nr == (uint64_t)arg3;
+    this->matches = self->active == 1 && self->nr == (uint64_t)arg3;
     mismatch = mismatch || !this->matches;
-    self->active = 0;
-    self->guest_pid = 0;
-    self->guest_tid = 0;
-    self->asid = 0;
-    self->nr = 0;
+    /* Keep allocated thread-local state; zero-clearing every event caused
+     * lost join state in sustained captures. Two means inactive. */
+    self->active = 2;
 }
 
 dtrace:::ERROR
