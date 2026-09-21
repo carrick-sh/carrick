@@ -252,10 +252,10 @@ impl<'a> FsView<'a> {
         }
 
         fn inotify_add_watch(this, cx, fd: Fd, pathname: GuestPtr, mask: u64) {
-            if !this.fd_is_valid(fd.0) {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            }
             let Some(state) = this.inotify_state(fd.0) else {
+                if !this.fd_is_valid(fd.0) {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             if state.work_scope().is_none()
@@ -343,19 +343,21 @@ impl<'a> FsView<'a> {
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
             };
-            this.fs.inotify_registry.register(&path, &state, wd, mask);
             // The dispatch registry now owns same-process event generation for
             // this instance; suppress the kqueue backend's duplicate synthesis
             // (it stays a poll_fd readiness source only).
             state.mark_dispatch_authoritative();
+            this.fs
+                .inotify_registry
+                .register(&path, &state, wd, mask);
             Ok(DispatchOutcome::returned_i32(wd))
         }
 
         fn inotify_rm_watch(this, cx, fd: Fd, wd: u64) {
-            if !this.fd_is_valid(fd.0) {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            }
             let Some(state) = this.inotify_state(fd.0) else {
+                if !this.fd_is_valid(fd.0) {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             if state.work_scope().is_none()
@@ -368,9 +370,6 @@ impl<'a> FsView<'a> {
             // the same `watches` table with no host fds, so it finds them too).
             // Drop the dispatch-registry entry to match.
             let result = state.rm_watch(wd);
-            if result.is_ok() {
-                state.enqueue(wd, carrick_abi::LINUX_IN_IGNORED, 0, None);
-            }
             this.fs.inotify_registry.unregister(&state, wd);
             Ok(match result {
                 Ok(()) => DispatchOutcome::Returned { value: 0 },

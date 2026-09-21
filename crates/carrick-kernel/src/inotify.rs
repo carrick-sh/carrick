@@ -994,6 +994,12 @@ impl InotifyState {
         for host_fd in watch.host_fds {
             unsafe { libc::close(host_fd) };
         }
+        if !inner.overflowed {
+            let record = encode_event_raw(wd, carrick_abi::LINUX_IN_IGNORED, 0, None);
+            if inner.push_record(record) {
+                self.backend.wake();
+            }
+        }
         Ok(())
     }
 
@@ -1220,12 +1226,18 @@ impl RegistryInner {
 pub struct InotifyRegistry {
     /// Registry inner state: path-indexed watches and reverse (instance, wd) index.
     inner: std::sync::Arc<parking_lot::RwLock<RegistryInner>>,
+    /// Fast atomic count of active registered watches to allow lock-free `is_empty()`.
+    watch_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Debug for InotifyRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InotifyRegistry")
             .field("watched_paths", &self.inner.read().by_path.len())
+            .field(
+                "watch_count",
+                &self.watch_count.load(std::sync::atomic::Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -1248,6 +1260,9 @@ impl InotifyRegistry {
         path: &str,
         state: &std::sync::Arc<InotifyState>,
     ) -> Option<(i32, u32)> {
+        if self.is_empty() {
+            return None;
+        }
         let key = normalize_watch_path(path);
         self.inner.read().by_path.get(key).and_then(|watches| {
             watches
@@ -1285,6 +1300,8 @@ impl InotifyRegistry {
                 wd,
                 mask,
             });
+            self.watch_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let ptr = std::sync::Arc::as_ptr(state) as usize;
         let paths = inner.by_wd.entry((ptr, wd)).or_default();
@@ -1303,7 +1320,13 @@ impl InotifyRegistry {
         if let Some(paths) = inner.by_wd.remove(&(ptr, wd)) {
             for path in paths {
                 if let Some(watches) = inner.by_path.get_mut(&path) {
+                    let prev_len = watches.len();
                     watches.retain(|w| !(w.wd == wd && std::sync::Arc::ptr_eq(&w.state, state)));
+                    let removed = prev_len - watches.len();
+                    if removed > 0 {
+                        self.watch_count
+                            .fetch_sub(removed, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if watches.is_empty() {
                         inner.by_path.remove(&path);
                     }
@@ -1318,10 +1341,17 @@ impl InotifyRegistry {
         let mut inner = self.inner.write();
         let ptr = std::sync::Arc::as_ptr(state) as usize;
         inner.by_wd.retain(|&(p, _), _| p != ptr);
+        let mut removed = 0;
         inner.by_path.retain(|_, watches| {
+            let prev_len = watches.len();
             watches.retain(|w| !std::sync::Arc::ptr_eq(&w.state, state));
+            removed += prev_len - watches.len();
             !watches.is_empty()
         });
+        if removed > 0 {
+            self.watch_count
+                .fetch_sub(removed, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Drop every watch registered on exactly `path` (the watched object was
@@ -1331,7 +1361,13 @@ impl InotifyRegistry {
     pub(crate) fn unregister_path(&self, path: &str) {
         let key = normalize_watch_path(path);
         let mut inner = self.inner.write();
-        inner.remove_path(key);
+        if let Some(watches) = inner.remove_path(key) {
+            let removed = watches.len();
+            if removed > 0 {
+                self.watch_count
+                    .fetch_sub(removed, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     /// Move a watch from `from` to `to` (a `rename(2)` of a watched object):
@@ -1347,7 +1383,13 @@ impl InotifyRegistry {
         }
         let mut inner = self.inner.write();
         if let Some(watches) = inner.remove_path(from_key) {
-            inner.remove_path(to_key);
+            if let Some(to_watches) = inner.remove_path(to_key) {
+                let removed = to_watches.len();
+                if removed > 0 {
+                    self.watch_count
+                        .fetch_sub(removed, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             for w in &watches {
                 let ptr = std::sync::Arc::as_ptr(&w.state) as usize;
                 let paths = inner.by_wd.entry((ptr, w.wd)).or_default();
@@ -1361,8 +1403,9 @@ impl InotifyRegistry {
 
     /// True iff nothing is currently watched (the hot-path fast exit: the fs
     /// handlers skip all event work when no inotify watch exists).
+    #[inline]
     pub(crate) fn is_empty(&self) -> bool {
-        self.inner.read().by_path.is_empty()
+        self.watch_count.load(std::sync::atomic::Ordering::Relaxed) == 0
     }
 
     /// Emit a *self* event on `path` (the watched object itself changed):
