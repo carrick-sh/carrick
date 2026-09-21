@@ -1,5 +1,5 @@
 pub const AARCH64_SYSCALL_MAILBOX_MAGIC: u64 = 0x4341_5252_4d42_4f58;
-pub const AARCH64_SYSCALL_MAILBOX_VERSION: u32 = 2;
+pub const AARCH64_SYSCALL_MAILBOX_VERSION: u32 = 3;
 pub const AARCH64_SYSCALL_MAILBOX_SIZE: u64 = 0x100;
 pub const AARCH64_SYSCALL_MAILBOX_SLOTS: usize = 256;
 pub use carrick_mem::memory::Aarch64SyscallMailbox;
@@ -17,7 +17,7 @@ const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, response_acti
 const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, flags) == 44);
 const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, native_nr) == 48);
 const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, args) == 56);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, x8) == 104);
+const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, portal_quantum_epoch) == 104);
 const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, resume_pc) == 112);
 const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, spsr) == 120);
 const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, fp) == 128);
@@ -29,7 +29,10 @@ const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, resume_x16) =
 const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, resume_x17) == 176);
 const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x16) == 216);
 const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x17) == 224);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, reserved) == 232);
+const _: () =
+    assert!(core::mem::offset_of!(Aarch64SyscallMailbox, portal_executor_generation) == 232);
+const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, portal_task_serial) == 240);
+const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, portal_mm_generation) == 248);
 // The guest vector lives in `carrick-mem` (below this protocol crate in the
 // dependency graph), so it owns the instruction-immediate constants. Tie every
 // offset it emits back to this wire struct at compile time to prevent drift.
@@ -66,8 +69,8 @@ const _: () = assert!(
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_ARGS as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, x8)
-        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_X8 as usize
+    core::mem::offset_of!(Aarch64SyscallMailbox, portal_quantum_epoch)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_PORTAL_QUANTUM_EPOCH as usize
 );
 const _: () = assert!(
     core::mem::offset_of!(Aarch64SyscallMailbox, resume_pc)
@@ -104,6 +107,18 @@ const _: () = assert!(
 const _: () = assert!(
     core::mem::offset_of!(Aarch64SyscallMailbox, resume_x17)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17 as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, portal_executor_generation)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_PORTAL_EXECUTOR_GENERATION as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, portal_task_serial)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_PORTAL_TASK_SERIAL as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, portal_mm_generation)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_PORTAL_MM_GENERATION as usize
 );
 
 /// Set only while the vCPU is stopped and its owned mailbox is stable.
@@ -151,6 +166,7 @@ impl MailboxTrapKind {
 pub enum MailboxResponseAction {
     NormalReturn = 1,
     RegistersPrepared = 2,
+    NormalReturnAndArmPortal = 3,
 }
 
 impl MailboxResponseAction {
@@ -194,6 +210,7 @@ impl TryFrom<u32> for MailboxResponseAction {
         match value {
             1 => Ok(Self::NormalReturn),
             2 => Ok(Self::RegistersPrepared),
+            3 => Ok(Self::NormalReturnAndArmPortal),
             unknown => Err(UnknownMailboxValue(unknown)),
         }
     }
@@ -272,6 +289,68 @@ pub const fn next_nonzero_generation(current: u64) -> u64 {
     if next == 0 { 1 } else { next }
 }
 
+/// Exact executor/task/MM identity published for an armed portal session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct PortalSessionWire {
+    pub executor_generation: u64,
+    pub task_serial: u64,
+    pub mm_generation: u64,
+    pub quantum_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PortalState {
+    Disabled = 0,
+    RequestReady = 1,
+    ResponseReady = 2,
+    Armed = 4,
+    HostBoundary = 5,
+    Cancelling = 6,
+}
+
+impl PortalState {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Disabled, Self::Armed)
+                | (Self::Armed, Self::RequestReady)
+                | (Self::RequestReady, Self::ResponseReady | Self::HostBoundary)
+                | (Self::ResponseReady | Self::HostBoundary, Self::Armed)
+                | (
+                    Self::Armed | Self::RequestReady | Self::ResponseReady,
+                    Self::Cancelling
+                )
+                | (Self::Cancelling, Self::Disabled)
+        )
+    }
+}
+
+impl TryFrom<u32> for PortalState {
+    type Error = UnknownMailboxValue;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Disabled),
+            1 => Ok(Self::RequestReady),
+            2 => Ok(Self::ResponseReady),
+            4 => Ok(Self::Armed),
+            5 => Ok(Self::HostBoundary),
+            6 => Ok(Self::Cancelling),
+            unknown => Err(UnknownMailboxValue(unknown)),
+        }
+    }
+}
+
+pub const fn portal_scalar_eligible(native_nr: u64) -> bool {
+    matches!(native_nr, 62 | 28)
+}
+
 const _: () = assert!(
     core::mem::offset_of!(Aarch64SyscallMailbox, clock_x9)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X9 as usize
@@ -290,6 +369,12 @@ const _: () = assert!(
 );
 const _: () = assert!(
     MailboxState::ClockActive.raw() == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_CLOCK_ACTIVE
+);
+const _: () =
+    assert!(PortalState::Armed.raw() == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_PORTAL_ARMED);
+const _: () = assert!(
+    PortalState::HostBoundary.raw()
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_PORTAL_HOST_BOUNDARY
 );
 
 #[cfg(test)]
@@ -314,7 +399,10 @@ mod tests {
         assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, flags), 44);
         assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, native_nr), 48);
         assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, args), 56);
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, x8), 104);
+        assert_eq!(
+            core::mem::offset_of!(Aarch64SyscallMailbox, portal_quantum_epoch),
+            104
+        );
         assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, resume_pc), 112);
         assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, spsr), 120);
         assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, fp), 128);
@@ -341,7 +429,18 @@ mod tests {
             core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x17),
             224
         );
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, reserved), 232);
+        assert_eq!(
+            core::mem::offset_of!(Aarch64SyscallMailbox, portal_executor_generation),
+            232
+        );
+        assert_eq!(
+            core::mem::offset_of!(Aarch64SyscallMailbox, portal_task_serial),
+            240
+        );
+        assert_eq!(
+            core::mem::offset_of!(Aarch64SyscallMailbox, portal_mm_generation),
+            248
+        );
     }
 
     #[test]
@@ -352,13 +451,14 @@ mod tests {
         assert_eq!(MailboxTrapKind::Syscall.raw(), 1);
         assert_eq!(MailboxResponseAction::NormalReturn.raw(), 1);
         assert_eq!(MailboxResponseAction::RegistersPrepared.raw(), 2);
+        assert_eq!(MailboxResponseAction::NormalReturnAndArmPortal.raw(), 3);
 
         assert_eq!(MailboxState::try_from(3), Ok(MailboxState::ClockActive));
         assert_eq!(MailboxState::try_from(4), Err(UnknownMailboxValue(4)));
         assert_eq!(MailboxTrapKind::try_from(2), Err(UnknownMailboxValue(2)));
         assert_eq!(
-            MailboxResponseAction::try_from(3),
-            Err(UnknownMailboxValue(3))
+            MailboxResponseAction::try_from(4),
+            Err(UnknownMailboxValue(4))
         );
     }
 
@@ -439,5 +539,47 @@ mod tests {
         assert_eq!(next_nonzero_generation(0), 1);
         assert_eq!(next_nonzero_generation(41), 42);
         assert_eq!(next_nonzero_generation(u64::MAX), 1);
+    }
+
+    #[test]
+    fn portal_wire_layout_and_transitions_are_closed() {
+        assert_eq!(core::mem::size_of::<PortalSessionWire>(), 32);
+        assert_eq!(PortalState::try_from(0), Ok(PortalState::Disabled));
+        assert_eq!(PortalState::try_from(4), Ok(PortalState::Armed));
+        assert_eq!(PortalState::try_from(5), Ok(PortalState::HostBoundary));
+        assert_eq!(PortalState::try_from(6), Ok(PortalState::Cancelling));
+        assert_eq!(PortalState::try_from(3), Err(UnknownMailboxValue(3)));
+        assert_eq!(PortalState::try_from(7), Err(UnknownMailboxValue(7)));
+
+        assert!(PortalState::Disabled.can_transition_to(PortalState::Armed));
+        assert!(PortalState::Armed.can_transition_to(PortalState::RequestReady));
+        assert!(PortalState::RequestReady.can_transition_to(PortalState::ResponseReady));
+        assert!(PortalState::ResponseReady.can_transition_to(PortalState::Armed));
+        assert!(PortalState::RequestReady.can_transition_to(PortalState::HostBoundary));
+        assert!(PortalState::HostBoundary.can_transition_to(PortalState::Armed));
+        for state in [
+            PortalState::Armed,
+            PortalState::RequestReady,
+            PortalState::ResponseReady,
+        ] {
+            assert!(state.can_transition_to(PortalState::Cancelling));
+        }
+        assert!(PortalState::Cancelling.can_transition_to(PortalState::Disabled));
+        assert!(!PortalState::Disabled.can_transition_to(PortalState::ResponseReady));
+        assert!(!PortalState::Armed.can_transition_to(PortalState::Disabled));
+    }
+
+    #[test]
+    fn portal_scalar_allowlist_is_exact() {
+        assert_eq!(carrick_abi::syscall::nr::LSEEK.raw(), 62);
+        assert_eq!(carrick_abi::syscall::nr::INOTIFY_RM_WATCH.raw(), 28);
+        assert!(portal_scalar_eligible(62));
+        assert!(portal_scalar_eligible(28));
+        for native_nr in [0, 1, 27, 29, 63, 64, 124, 293] {
+            assert!(
+                !portal_scalar_eligible(native_nr),
+                "unexpected syscall {native_nr}"
+            );
+        }
     }
 }

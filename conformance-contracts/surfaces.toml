@@ -5,6 +5,18 @@ path = "crates/carrick-observability/src/work_meter.rs"
 contracts = ["hvpatch.syscall.portal"]
 
 [[surfaces]]
+path = "crates/carrick-mem/src/memory.rs"
+contracts = ["hvpatch.syscall.portal"]
+
+[[surfaces]]
+path = "crates/carrick-aarch64/src/mailbox.rs"
+contracts = ["hvpatch.syscall.portal"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/syscall_mailbox.rs"
+contracts = ["hvpatch.syscall.portal"]
+
+[[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/futex.rs"
 contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
 

@@ -30,7 +30,7 @@ fn binding() -> (
         flags: 0,
         native_nr: 0,
         args: [0; 6],
-        x8: 0,
+        portal_quantum_epoch: 0,
         resume_pc: 0,
         spsr: 0,
         fp: 0,
@@ -46,7 +46,9 @@ fn binding() -> (
         clock_x12: 0,
         clock_tmp_x16: 0,
         clock_tmp_x17: 0,
-        reserved: [0; 24],
+        portal_executor_generation: 0,
+        portal_task_serial: 0,
+        portal_mm_generation: 0,
     });
     let pointer = NonNull::from(mailbox.as_mut());
     let binding = unsafe { MailboxBinding::new(lease, pointer, HvfSyscallTransport::Mailbox) };
