@@ -211,3 +211,32 @@ Both streams were inspected; the final emitted sampling report named loop
 the hypervisor entitlement was verified, and no guest remained. Reduced
 metadata work has therefore not yet established a complete-workload runtime
 gain; the next attribution must explain the sustained workload cost.
+
+## Sustained carrier CPU ranking
+
+On the same namespace-only artifact, the built-in
+`hvpatch-carrier-cpu-low-rate` profile sampled the real LTP workload under a
+guest `timeout 30s` diagnostic wrapper. This deliberately does not supply an
+LTP verdict or runtime acceptance. The corrected invocation returned zero and
+validated 5,813 samples, 939 distinct stacks, exact population closure, zero
+errors, root exit and no profile deadline expiry. Scoped cleanup was empty.
+An initial invocation incorrectly requested unsupported `--summary-jsonl`;
+it was not accepted, and the corrected capture replaced it as evidence.
+
+Symbolication used the live image-base receipt `0x100970000` and the exact
+signed artifact. 3,951/5,813 samples (68.0%) contain `applevisor::Vcpu::run`:
+this is an opaque guest/HVF/trampoline bucket, not measured host-dispatch CPU.
+The first Carrick frame was `write_host_file` in 319 samples (5.5%). Other
+smaller groups included time reads, HVF register access, dispatcher and executor
+work. This does not support attributing the whole remaining gap to metadata.
+Separating guest spin from transition cost is the next performance question;
+the guest spin may itself depend on service latency, so the 68% is not an
+independent Amdahl bound.
+
+Retained local artifacts:
+
+- `target/perf/inotify-sustained/carrier.trace` (complete validated raw capture)
+- `target/perf/inotify-sustained/symbols.json` (offline symbols and ranking)
+
+The guest timeout produced the expected interrupted LTP diagnostic, including
+TBROK; profile success certifies only the complete CPU sample population.
