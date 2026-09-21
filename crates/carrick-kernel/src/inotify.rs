@@ -633,6 +633,12 @@ impl InotifyBackend for VnodeDiffInotify {
             .get(&wd)
             .map(|watch| watch.host_fds.clone())
             .ok_or(LINUX_EINVAL)?;
+        if host_fds.is_empty() {
+            let mut inner = inner.lock();
+            let watch = inner.watches.get_mut(&wd).ok_or(LINUX_EINVAL)?;
+            watch.mask = mask;
+            return Ok(());
+        }
         let events = linux_mask_to_vnode_events(mask);
         let mut mux = self.mux.lock();
         if let Some(scope) = work_scope {
@@ -935,6 +941,9 @@ impl InotifyState {
         let add = requested & carrick_abi::LINUX_IN_MASK_ADD != 0;
         let requested = requested & !carrick_abi::LINUX_IN_MASK_ADD;
         let effective = if add { current | requested } else { requested };
+        if effective == current {
+            return Ok(effective);
+        }
         let scope = self.work_scope();
         self.backend
             .update_watch(wd, effective, &self.inner, scope.as_ref())?;
@@ -1223,17 +1232,28 @@ impl std::fmt::Debug for InotifyRegistry {
 
 impl InotifyRegistry {
     /// Existing wd for this exact path and inotify instance, if any.
+    #[allow(dead_code)]
     pub(crate) fn watch_descriptor(
         &self,
         path: &str,
         state: &std::sync::Arc<InotifyState>,
     ) -> Option<i32> {
+        self.watch_descriptor_and_mask(path, state)
+            .map(|(wd, _)| wd)
+    }
+
+    /// Existing (wd, mask) for this exact path and inotify instance, if any.
+    pub(crate) fn watch_descriptor_and_mask(
+        &self,
+        path: &str,
+        state: &std::sync::Arc<InotifyState>,
+    ) -> Option<(i32, u32)> {
         let key = normalize_watch_path(path);
         self.inner.read().by_path.get(key).and_then(|watches| {
             watches
                 .iter()
                 .find(|watch| std::sync::Arc::ptr_eq(&watch.state, state))
-                .map(|watch| watch.wd)
+                .map(|watch| (watch.wd, watch.mask))
         })
     }
 

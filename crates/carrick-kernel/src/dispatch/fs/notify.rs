@@ -269,7 +269,13 @@ impl<'a> FsView<'a> {
             }
             let path = this.resolve_at_path(LINUX_AT_FDCWD, &path)?;
             let mask = mask as u32;
-            if let Some(wd) = this.fs.inotify_registry.watch_descriptor(&path, &state) {
+            if let Some((wd, old_mask)) = this.fs.inotify_registry.watch_descriptor_and_mask(&path, &state) {
+                let add = mask & carrick_abi::LINUX_IN_MASK_ADD != 0;
+                let req = mask & !carrick_abi::LINUX_IN_MASK_ADD;
+                let effective = if add { old_mask | req } else { req };
+                if effective == old_mask {
+                    return Ok(DispatchOutcome::returned_i32(wd));
+                }
                 let effective = state.update_watch(wd, mask)?;
                 this.fs
                     .inotify_registry
