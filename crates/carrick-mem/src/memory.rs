@@ -88,6 +88,39 @@ pub const LINUX_EL0_CLOCK_STUB_BASE: u64 = el1_clock::STUB_BASE;
 pub const LINUX_EL0_CLOCK_STUB_SIZE: u64 = el1_clock::STUB_SIZE;
 /// Reserved identity-page word; zero means no EL1 clock admission.
 pub const IDENTITY_OFF_CLOCK_GATE: u64 = el1_clock::CLOCK_GATE_OFFSET;
+/// Generated handler phases used to normalize a stopped clock transport.
+#[derive(Debug, Clone, Copy)]
+pub struct ClockHandlerLayout {
+    pub start: u64,
+    pub completion: u64,
+    pub end: u64,
+}
+
+pub fn clock_handler_layout() -> &'static ClockHandlerLayout {
+    static LAYOUT: std::sync::OnceLock<ClockHandlerLayout> = std::sync::OnceLock::new();
+    LAYOUT.get_or_init(|| {
+        let mut bytes = vec![0; LINUX_EL1_VECTORS_SIZE as usize];
+        el1_clock::install(&mut bytes, 0)
+    })
+}
+
+pub fn is_carrick_el1_clock_handler_va(va: u64) -> bool {
+    let layout = clock_handler_layout();
+    (layout.start..layout.end).contains(&va)
+}
+
+/// Mailbox clock transaction wire values, tied to the typed protocol upstream.
+pub const AARCH64_SYSCALL_MAILBOX_CLOCK_ACTIVE: u32 = 3;
+pub const CLOCK_FORCE_HOST_BOUNDARY: u32 = 1;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X9: u64 = 184;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X10: u64 = 192;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X11: u64 = 200;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X12: u64 = 208;
+/// Includes the completion instruction so interrupted transport state is never
+/// mistaken for ordinary guest code.
+pub fn is_carrick_el0_clock_stub_va(va: u64) -> bool {
+    (LINUX_EL0_CLOCK_STUB_BASE..LINUX_EL0_CLOCK_STUB_BASE + LINUX_EL0_CLOCK_STUB_SIZE).contains(&va)
+}
 
 use std::fs;
 use std::io::Read;
