@@ -786,7 +786,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs",
-      "line": 631,
+      "line": 628,
       "categories": [
         "description_guard"
       ],
@@ -797,7 +797,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs",
-      "line": 667,
+      "line": 664,
       "categories": [
         "description_guard"
       ],
@@ -808,7 +808,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs",
-      "line": 759,
+      "line": 756,
       "categories": [
         "description_guard"
       ],
@@ -819,7 +819,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs",
-      "line": 794,
+      "line": 791,
       "categories": [
         "description_guard"
       ],
@@ -830,7 +830,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs",
-      "line": 850,
+      "line": 847,
       "categories": [
         "description_guard"
       ],
@@ -841,7 +841,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs",
-      "line": 862,
+      "line": 859,
       "categories": [
         "description_guard"
       ],
@@ -852,7 +852,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs",
-      "line": 880,
+      "line": 877,
       "categories": [
         "description_guard"
       ],
@@ -863,7 +863,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs",
-      "line": 899,
+      "line": 896,
       "categories": [
         "description_guard"
       ],
@@ -874,7 +874,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs",
-      "line": 920,
+      "line": 917,
       "categories": [
         "description_guard"
       ],
@@ -885,7 +885,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs",
-      "line": 939,
+      "line": 936,
       "categories": [
         "description_guard"
       ],
