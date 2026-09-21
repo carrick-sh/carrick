@@ -450,6 +450,11 @@ pub const LSEEK_NR: u16 = 62;
 pub const IDENTITY_OFF_SEEK_GATE: u64 = 0x14;
 pub const IDENTITY_OFF_SEEK_FD: u64 = 0x18;
 pub const IDENTITY_OFF_SEEK_OFFSET: u64 = 0x20;
+pub const IDENTITY_OFF_WRITE_LEASE_GATE: u64 = 0x28;
+pub const IDENTITY_OFF_WRITE_LEASE_HOST_FD: u64 = 0x2C;
+pub const IDENTITY_OFF_WRITE_LEASE_OFFSET: u64 = 0x30;
+pub const IDENTITY_OFF_WRITE_LEASE_GUEST_FD: u64 = 0x38;
+pub const IDENTITY_OFF_WRITE_LEASE_DIRTY: u64 = 0x3C;
 // The identity page must stay inside the kernel hole's first 2 MiB block so it
 // inherits the kernel-only (AP=00) block mapping from `stage1_identity_page_tables`.
 const _: () = assert!(

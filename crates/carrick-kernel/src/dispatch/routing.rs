@@ -166,6 +166,7 @@ impl SyscallDispatcher {
         &self,
         mut ctx: SyscallCtx<'_, M>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        self.drain_write_lease_dirty(&mut ctx);
         let handler = resolve_handler(ctx.request.number.raw())?;
         let canonical_nr = ctx.request.number.raw();
         let outcome = resources::with_captured_resources(ctx.kernel, || handler(self, &mut ctx));
@@ -222,8 +223,25 @@ impl SyscallDispatcher {
     /// two can never drift. Uses `LinearMemory` as the concrete memory type —
     /// the claimed set is independent of `M`.
     pub(crate) fn dispatch_normalized_known(number: u64) -> bool {
-        resolve_handler::<LinearMemory>(number).is_some()
-            || resolve_mutation_handler::<LinearMemory>(number).is_some()
+        static KNOWN_SYSCALL_BITMAP: std::sync::LazyLock<[u64; 8]> =
+            std::sync::LazyLock::new(|| {
+                let mut bitmap = [0u64; 8];
+                for nr in 0..512 {
+                    if resolve_handler::<LinearMemory>(nr).is_some()
+                        || resolve_mutation_handler::<LinearMemory>(nr).is_some()
+                    {
+                        bitmap[(nr / 64) as usize] |= 1 << (nr % 64);
+                    }
+                }
+                bitmap
+            });
+
+        if number < 512 {
+            (KNOWN_SYSCALL_BITMAP[(number / 64) as usize] & (1 << (number % 64))) != 0
+        } else {
+            resolve_handler::<LinearMemory>(number).is_some()
+                || resolve_mutation_handler::<LinearMemory>(number).is_some()
+        }
     }
 
     /// Characterization seam for the per-module routing refactor (Task A1).
