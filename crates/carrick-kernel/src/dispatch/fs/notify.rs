@@ -258,7 +258,7 @@ impl<'a> FsView<'a> {
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
-            if state.work_scope().is_none()
+            if !state.has_work_scope()
                 && let Some(scope) = cx.kernel.kernel().work_scope()
             {
                 state.set_work_scope(scope);
@@ -363,7 +363,7 @@ impl<'a> FsView<'a> {
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
-            if state.work_scope().is_none()
+            if !state.has_work_scope()
                 && let Some(scope) = cx.kernel.kernel().work_scope()
             {
                 state.set_work_scope(scope);
