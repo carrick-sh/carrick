@@ -2941,8 +2941,18 @@ impl FsContext {
         self.state.read().cwd.clone()
     }
 
+    pub fn with_cwd<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        let state = self.state.read();
+        f(&state.cwd)
+    }
+
     pub fn chroot_root(&self) -> Option<String> {
         self.state.read().chroot_root.clone()
+    }
+
+    pub fn with_chroot_root<R>(&self, f: impl FnOnce(Option<&str>) -> R) -> R {
+        let state = self.state.read();
+        f(state.chroot_root.as_deref())
     }
 
     pub fn set_cwd(&self, cwd: String) {

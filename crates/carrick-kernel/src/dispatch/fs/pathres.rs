@@ -386,7 +386,7 @@ impl<'a> FsView<'a> {
         }
         let mut inline_buf = [0u8; 512];
         let lookup_key: Option<LookupKey<'_>> = if std::path::Path::new(path).is_absolute() {
-            match fs_context.chroot_root().as_deref() {
+            fs_context.with_chroot_root(|root| match root {
                 Some(root) if root != "/" => {
                     let total = root.len() + 1 + path.len();
                     if total <= 512 {
@@ -400,19 +400,20 @@ impl<'a> FsView<'a> {
                     }
                 }
                 _ => Some(LookupKey::Borrowed(path)),
-            }
+            })
         } else if is_atfdcwd {
-            let cwd = fs_context.cwd();
-            let total = cwd.len() + 1 + path.len();
-            if total <= 512 {
-                inline_buf[..cwd.len()].copy_from_slice(cwd.as_bytes());
-                inline_buf[cwd.len()] = 0;
-                inline_buf[cwd.len() + 1..total].copy_from_slice(path.as_bytes());
-                let s = std::str::from_utf8(&inline_buf[..total]).unwrap_or("");
-                Some(LookupKey::Borrowed(s))
-            } else {
-                Some(LookupKey::Owned(format!("{cwd}\u{0}{path}")))
-            }
+            fs_context.with_cwd(|cwd| {
+                let total = cwd.len() + 1 + path.len();
+                if total <= 512 {
+                    inline_buf[..cwd.len()].copy_from_slice(cwd.as_bytes());
+                    inline_buf[cwd.len()] = 0;
+                    inline_buf[cwd.len() + 1..total].copy_from_slice(path.as_bytes());
+                    let s = std::str::from_utf8(&inline_buf[..total]).unwrap_or("");
+                    Some(LookupKey::Borrowed(s))
+                } else {
+                    Some(LookupKey::Owned(format!("{cwd}\u{0}{path}")))
+                }
+            })
         } else {
             None
         };

@@ -474,20 +474,31 @@ fn read_guest_c_string_bytes_bounded(
     const CHUNK: usize = 256;
     let mut bytes = Vec::new();
     let mut offset = 0usize;
+    let mut stack_chunk = [0u8; CHUNK];
     while offset < max_bytes_including_nul {
-        let address = address.checked_add(offset as u64).ok_or(too_long)?;
+        let current_address = address.checked_add(offset as u64).ok_or(too_long)?;
         let to_read = CHUNK.min(max_bytes_including_nul - offset);
-        let chunk = match memory.read_bytes(address, to_read) {
-            Ok(chunk) => chunk,
-            Err(_) if to_read > 1 => memory.read_bytes(address, 1).map_err(|_| LINUX_EFAULT)?,
-            Err(_) => return Err(LINUX_EFAULT),
+        let read_len = if memory
+            .read_into(current_address, &mut stack_chunk[..to_read])
+            .is_ok()
+        {
+            to_read
+        } else if to_read > 1
+            && memory
+                .read_into(current_address, &mut stack_chunk[..1])
+                .is_ok()
+        {
+            1
+        } else {
+            return Err(LINUX_EFAULT);
         };
-        if let Some(nul) = chunk.iter().position(|&byte| byte == 0) {
-            bytes.extend_from_slice(&chunk[..nul]);
+        let slice = &stack_chunk[..read_len];
+        if let Some(nul) = slice.iter().position(|&byte| byte == 0) {
+            bytes.extend_from_slice(&slice[..nul]);
             return Ok(bytes);
         }
-        offset += chunk.len();
-        bytes.extend_from_slice(&chunk);
+        offset += read_len;
+        bytes.extend_from_slice(slice);
     }
     Err(too_long)
 }
