@@ -157,7 +157,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/fs/open.rs::FsView::open_at_path_string::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/fs/open.rs",
-      "line": 161,
+      "line": 170,
       "item": "FsView::open_at_path_string",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -166,7 +166,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/fs/open.rs::FsView::try_vfs_open::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/fs/open.rs",
-      "line": 1377,
+      "line": 1386,
       "item": "FsView::try_vfs_open",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -238,7 +238,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/mem/mmap.rs::MemView::mmap::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 585,
+      "line": 607,
       "item": "MemView::mmap",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -346,7 +346,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::personality::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1351,
+      "line": 1357,
       "item": "ProcView::personality",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -355,7 +355,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1403,
+      "line": 1409,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -364,7 +364,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#2",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1416,
+      "line": 1422,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -373,7 +373,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#3",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1424,
+      "line": 1430,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -382,7 +382,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#4",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1428,
+      "line": 1434,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -391,7 +391,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#5",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1440,
+      "line": 1446,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -400,7 +400,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#6",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1450,
+      "line": 1456,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -409,7 +409,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#7",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1454,
+      "line": 1460,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -418,7 +418,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#8",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1507,
+      "line": 1513,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -427,7 +427,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#9",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1515,
+      "line": 1521,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -436,7 +436,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#10",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1523,
+      "line": 1529,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -445,7 +445,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#11",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1527,
+      "line": 1533,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -454,7 +454,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#12",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1532,
+      "line": 1538,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -463,7 +463,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#13",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1543,
+      "line": 1549,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -472,7 +472,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#14",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1554,
+      "line": 1560,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -481,7 +481,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#15",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1560,
+      "line": 1566,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -490,7 +490,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#16",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1564,
+      "line": 1570,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -499,7 +499,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::uname::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 2471,
+      "line": 2477,
       "item": "ProcView::uname",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -508,7 +508,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::ptrace::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 2501,
+      "line": 2507,
       "item": "ProcView::ptrace",
       "category": "proc",
       "expression": ".proc.lock()",
