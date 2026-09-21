@@ -1,0 +1,10 @@
+[[claims]]
+id = "hvpatch.syscall.portal.scalar-boundary"
+contract = "hvpatch.syscall.portal"
+description = "Eligible regular-file lseek and inotify watch removal preserve Linux scalar results while reducing repeated HVF syscall exits"
+linux_authority = ["man 2 lseek", "man 2 inotify_rm_watch"]
+fixture_requirements = ["probe:hvpatch_portal_scalar"]
+related_contracts = ["kernel.fs.write-seek", "kernel.inotify.mark-race-hotpath"]
+related_ecosystem_rows = ["ltp:inotify09"]
+capability = { class = "requires-guest", rationale = "Portal transport and exit reduction require the HVF HVPatch execution path; deterministic state transitions remain testable VM-free." }
+coverage = { status = "declared" }

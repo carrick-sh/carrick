@@ -41,31 +41,19 @@ fn run(root: &Path) -> Result<(), String> {
 
     // Check each contract's bindings
     for contract in registry.contracts() {
-        let vm_free = contract
-            .bindings
-            .vm_free
-            .as_deref()
-            .ok_or_else(|| format!("{}: missing vm_free binding", contract.id))?;
-        let _embed = contract
-            .bindings
-            .embed
-            .as_deref()
-            .ok_or_else(|| format!("{}: missing embed binding", contract.id))?;
-        let _docker = contract
-            .bindings
-            .docker
-            .as_deref()
-            .ok_or_else(|| format!("{}: missing docker binding", contract.id))?;
-
-        // Check that the vm_free binding crate exists
-        let crate_name = vm_free.split("::").next().unwrap_or(vm_free);
-        let crate_path = root.join("crates").join(crate_name);
-        if !crate_path.exists() {
-            return Err(format!(
-                "{}: missing vm_free target crate {}",
-                contract.id,
-                crate_path.display()
-            ));
+        // Registry validation already requires every absent binding to carry a
+        // non-empty unresolved reason. Once a VM-free binding is concrete,
+        // additionally prove that its target crate exists.
+        if let Some(vm_free) = contract.bindings.vm_free.as_deref() {
+            let crate_name = vm_free.split("::").next().unwrap_or(vm_free);
+            let crate_path = root.join("crates").join(crate_name);
+            if !crate_path.exists() {
+                return Err(format!(
+                    "{}: missing vm_free target crate {}",
+                    contract.id,
+                    crate_path.display()
+                ));
+            }
         }
     }
 
