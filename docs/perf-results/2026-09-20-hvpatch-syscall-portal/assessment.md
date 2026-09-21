@@ -465,3 +465,10 @@ Full output: `scale-sparse-cache-carrick.out`. Against the fresh pre-fix Docker
 measurement of 471 ns, write/seek remains 12.13x. This closes the demonstrated
 repeated identity-query defect, not the runtime-ratio failure, full inotify09,
 or signed probe/smoke/full acceptance.
+
+Full LTP follow-up on this same signed artifact, `conf-20563-s00`, timed out
+at 40.256 seconds against the unchanged 40-second declared budget. The harness
+classified it `FAIL TIMEOUT [blocked]`; both raw streams were inspected. The
+earlier adaptive 23-second cutoff was diagnostic only. No retries were enabled,
+and the cached Linux oracle remains 1/1. The sparse-write optimization therefore
+has measured component impact but does not close the original workload.
