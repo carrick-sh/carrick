@@ -717,7 +717,12 @@ impl FsState {
         }
     }
 
-    pub(in crate::dispatch) fn record_host_sparse_write(&self, fd: i32, offset: u64, len: usize) {
+    pub(in crate::dispatch) fn record_host_sparse_write(
+        &self,
+        fd: &HostFdRef,
+        offset: u64,
+        len: usize,
+    ) {
         if !self.has_host_sparse_extents() {
             return;
         }
@@ -725,8 +730,14 @@ impl FsState {
         if extents.is_empty() {
             return;
         }
-        let Some(identity) = host_file_identity(fd) else {
+        // The owned descriptor pins dev/ino across aliasing and unlink. Cache
+        // only that immutable identity; extent contents remain live below.
+        let Some(identity) = fd.inode_identity() else {
             return;
+        };
+        let identity = HostFileIdentity {
+            device: identity.dev,
+            inode: identity.ino,
         };
         if let Some(extents) = extents.get_mut(&identity) {
             extents.record_write(offset, len as u64);
@@ -753,6 +764,49 @@ impl FsState {
         extents
             .get(&identity)
             .map(|extents| extents.seek(offset, data))
+    }
+}
+
+#[cfg(test)]
+mod sparse_identity_tests {
+    use super::*;
+    use std::os::fd::IntoRawFd;
+
+    #[test]
+    fn sparse_writes_follow_owned_inode_across_path_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sparse");
+        let owner = HostFdRef::new(std::fs::File::create(&path).unwrap().into_raw_fd());
+        let alias = owner.clone();
+        let fs = FsState::new_with_host_resolver(None);
+        fs.reset_host_sparse_extents(owner.raw(), 16384);
+        fs.record_host_sparse_write(&owner, 4096, 64);
+        std::fs::remove_file(&path).unwrap();
+        let replacement = HostFdRef::new(std::fs::File::create(&path).unwrap().into_raw_fd());
+        fs.reset_host_sparse_extents(replacement.raw(), 16384);
+        fs.record_host_sparse_write(&alias, 8192, 64);
+        fs.record_host_sparse_write(&replacement, 12288, 64);
+        assert_eq!(
+            fs.seek_host_sparse_extents(owner.raw(), 0, true),
+            Some(Some(4096))
+        );
+        assert_eq!(
+            fs.seek_host_sparse_extents(alias.raw(), 8192, true),
+            Some(Some(8192))
+        );
+        assert_eq!(
+            fs.seek_host_sparse_extents(replacement.raw(), 0, true),
+            Some(Some(12288))
+        );
+        fs.truncate_host_sparse_extents(owner.raw(), 4096);
+        assert_eq!(
+            fs.seek_host_sparse_extents(alias.raw(), 0, true),
+            Some(None)
+        );
+        assert_eq!(
+            fs.seek_host_sparse_extents(replacement.raw(), 0, true),
+            Some(Some(12288))
+        );
     }
 }
 

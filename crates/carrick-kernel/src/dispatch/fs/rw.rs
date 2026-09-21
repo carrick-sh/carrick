@@ -343,7 +343,7 @@ impl<'a> FsView<'a> {
             };
             if let Some(write_offset) = write_offset {
                 self.fs
-                    .record_host_sparse_write(raw_fd, write_offset, value as usize);
+                    .record_host_sparse_write(&host_fd, write_offset, value as usize);
             }
             self.notify_host_file_write_result(cx.kernel, open_file, &out);
             punch_result?;
@@ -2048,7 +2048,7 @@ impl<'a> FsView<'a> {
                     offset,
                     HostPipeWriteTarget::new(
                         raw_fd,
-                        Some(host_fd_owner),
+                        Some(host_fd_owner.clone()),
                         false,
                         HostWriteKind::RegularFile,
                         tid,
@@ -2074,7 +2074,7 @@ impl<'a> FsView<'a> {
                         offset as u64
                     };
                     this.fs
-                        .record_host_sparse_write(raw_fd, write_offset, value as usize);
+                        .record_host_sparse_write(&host_fd_owner, write_offset, value as usize);
                 }
                 return Ok(outcome);
             }
