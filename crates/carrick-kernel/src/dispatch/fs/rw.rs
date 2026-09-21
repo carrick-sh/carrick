@@ -251,6 +251,53 @@ impl<'a> FsView<'a> {
         Ok(len.min((limit - offset) as usize))
     }
 
+    fn lseek_host_file(&self, host_fd: &HostFdRef, offset: i64, whence: u64) -> DispatchOutcome {
+        if (whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE) && offset >= 0 {
+            if let Some(next) = self.fs.seek_host_sparse_extents(
+                host_fd.raw(),
+                offset as u64,
+                whence == LINUX_SEEK_DATA,
+            ) {
+                return match next {
+                    Some(next) => {
+                        let positioned = unsafe {
+                            libc::lseek(host_fd.raw(), next as libc::off_t, libc::SEEK_SET)
+                        };
+                        match positioned.host_syscall_errno() {
+                            Ok(positioned) => {
+                                host_fd.record_absolute_offset(positioned);
+                                DispatchOutcome::returned_offset_or_errno(positioned)
+                            }
+                            Err(errno) => DispatchOutcome::errno(errno),
+                        }
+                    }
+                    None => DispatchOutcome::errno(LINUX_ENXIO),
+                };
+            }
+        }
+        let host_whence = match whence {
+            LINUX_SEEK_SET => libc::SEEK_SET,
+            LINUX_SEEK_CUR => libc::SEEK_CUR,
+            LINUX_SEEK_END => libc::SEEK_END,
+            // macOS swaps Linux's SEEK_DATA and SEEK_HOLE numbers.
+            LINUX_SEEK_DATA => 4,
+            LINUX_SEEK_HOLE => 3,
+            _ => return DispatchOutcome::errno(LINUX_EINVAL),
+        };
+        if (whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE) && offset < 0 {
+            return DispatchOutcome::errno(LINUX_ENXIO);
+        }
+        match (unsafe { libc::lseek(host_fd.raw(), offset as libc::off_t, host_whence) })
+            .host_syscall_errno()
+        {
+            Ok(positioned) => {
+                host_fd.record_absolute_offset(positioned);
+                DispatchOutcome::returned_offset_or_errno(positioned)
+            }
+            Err(errno) => DispatchOutcome::errno(errno),
+        }
+    }
+
     define_syscall! {
 
         fn lseek(this, cx, fd: Fd, offset: u64, whence: u64) {
@@ -269,72 +316,22 @@ impl<'a> FsView<'a> {
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
+            let Some(open) = open_file.description.read() else {
+                if is_stdio_fd(fd.0) && !this.stdio_is_closed(fd.0) {
+                    return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
+                }
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            if let OpenDescription::HostFile { host_fd, .. } = &*open {
+                return Ok(this.lseek_host_file(host_fd, offset, whence));
+            }
+            drop(open);
             let Some(mut open) = open_file.description.write() else {
                 if is_stdio_fd(fd.0) && !this.stdio_is_closed(fd.0) {
                     return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-
-            // HostFile: the kernel owns the offset — delegate straight to
-            // libc::lseek on the real fd.
-            if let OpenDescription::HostFile { host_fd, .. } = &*open {
-                if (whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE) && offset >= 0 {
-                    if let Some(next) = this.fs.seek_host_sparse_extents(
-                        host_fd.raw(),
-                        offset as u64,
-                        whence == LINUX_SEEK_DATA,
-                    ) {
-                        return Ok(match next {
-                            Some(next) => {
-                                let positioned = unsafe {
-                                    libc::lseek(
-                                        host_fd.raw(),
-                                        next as libc::off_t,
-                                        libc::SEEK_SET,
-                                    )
-                                };
-                                match positioned.host_syscall_errno() {
-                                    Ok(positioned) => {
-                                        host_fd.record_absolute_offset(positioned);
-                                        DispatchOutcome::returned_offset_or_errno(positioned)
-                                    }
-                                    Err(errno) => DispatchOutcome::errno(errno),
-                                }
-                            }
-                            None => DispatchOutcome::errno(LINUX_ENXIO),
-                        });
-                    }
-                }
-                let host_whence = match whence {
-                    LINUX_SEEK_SET => libc::SEEK_SET,
-                    LINUX_SEEK_CUR => libc::SEEK_CUR,
-                    LINUX_SEEK_END => libc::SEEK_END,
-                    // SEEK_DATA/SEEK_HOLE: macOS supports them but SWAPS the
-                    // numbers (Linux DATA=3/HOLE=4, macOS DATA=4/HOLE=3), so
-                    // translate for sparse-file hole queries (test_fs_holes).
-                    LINUX_SEEK_DATA => 4, // LINUX_SEEK_DATA -> macOS SEEK_DATA
-                    LINUX_SEEK_HOLE => 3, // LINUX_SEEK_HOLE -> macOS SEEK_HOLE
-                    _ => {
-                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                    }
-                };
-                // Linux answers ENXIO for a negative SEEK_DATA/SEEK_HOLE offset
-                // (oracle `seekholemap`); macOS would say EINVAL, so decide here.
-                if (whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE) && offset < 0 {
-                    return Ok(DispatchOutcome::errno(LINUX_ENXIO));
-                }
-                let r = match (unsafe {
-                    libc::lseek(host_fd.raw(), offset as libc::off_t, host_whence)
-                })
-                .host_syscall_errno()
-                {
-                    Ok(r) => r,
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                };
-                host_fd.record_absolute_offset(r);
-                return Ok(DispatchOutcome::returned_offset_or_errno(r));
-            }
 
             // A CHARACTER device (/dev/null, /dev/zero, /dev/full, /dev/random,
             // /dev/urandom) is backed by a host fd but lands here as a HostPipe
