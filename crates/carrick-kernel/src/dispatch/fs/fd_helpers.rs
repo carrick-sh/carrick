@@ -494,6 +494,9 @@ impl<'a> FsView<'a> {
                 .ok()
                 .map(|md| md.kind == carrick_vfs::EntryKind::Directory);
         }
+        if let Ok(is_dir) = self.fs.rootfs_vfs.dentry_is_dir(path) {
+            return Some(is_dir);
+        }
         self.fs
             .rootfs_vfs
             .lookup(path)

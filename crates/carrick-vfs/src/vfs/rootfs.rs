@@ -274,6 +274,17 @@ impl RootFsVfs {
             .stat(path, follow, &*self.overlay, self.rootfs.as_ref())
     }
 
+    /// Resolve existence and directory kind without refreshing inode attributes.
+    /// Follows the final symlink using the same namespace resolver as stat.
+    pub fn dentry_is_dir(&self, path: &str) -> Result<bool, LinuxErrno> {
+        if !self.overlay.serves_dentry_cache() {
+            return Err(LINUX_ENOSYS);
+        }
+        self.dentry_cache
+            .lookup_path(path, true, &*self.overlay, self.rootfs.as_ref())
+            .map(|resolved| resolved.dentry.kind == RootFsEntryKind::Directory)
+    }
+
     /// Read link target for `path` via the dentry cache.
     pub fn dentry_readlink(&self, path: &str) -> Result<String, LinuxErrno> {
         if !self.overlay.serves_dentry_cache() {
@@ -2656,6 +2667,36 @@ mod tests {
                 Vec::<String>::new()
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dentry_kind_does_not_refill_invalidated_metadata() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        std::fs::write(scratch.path().join("file"), b"x").unwrap();
+        std::os::unix::fs::symlink("file", scratch.path().join("link")).unwrap();
+        let mut vfs = RootFsVfs::new();
+        vfs.set_overlay(Box::new(HostFsBackend::from_path(scratch.path()).unwrap()));
+        let resolved = vfs
+            .dentry_cache
+            .lookup_path("/file", true, &*vfs.overlay, None)
+            .unwrap();
+        let inode = InodeIdentity::new(resolved.dentry.dev, resolved.dentry.ino);
+        vfs.dentry_stat("/file", true).unwrap();
+        vfs.notify_inode_changed("", Some(inode));
+        assert!(!vfs.dentry_is_dir("/link").unwrap());
+        assert!(
+            vfs.dentry_cache
+                .get_inode_record(inode.dev, inode.ino)
+                .is_none(),
+            "existence/type resolution must not refresh mutable inode attributes"
+        );
+        assert!(vfs.dentry_is_dir("/").unwrap());
+        assert_eq!(vfs.dentry_is_dir("/missing"), Err(LINUX_ENOENT));
+        vfs.unlink("/file").unwrap();
+        assert_eq!(vfs.dentry_is_dir("/link"), Err(LINUX_ENOENT));
+        vfs.mkdir("/file", 0o755).unwrap();
+        assert!(vfs.dentry_is_dir("/link").unwrap());
     }
 
     #[cfg(target_os = "macos")]
