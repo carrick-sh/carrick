@@ -257,7 +257,7 @@ impl<'a> FsView<'a> {
         cx: &mut SyscallCtx<'_, M>,
         fd: i32,
         tid: crate::thread::ThreadId,
-        mut bytes: Vec<u8>,
+        bytes: &[u8],
         open_file: &OpenFile,
         host_fd: HostFdRef,
         writable: bool,
@@ -275,17 +275,24 @@ impl<'a> FsView<'a> {
         let mut current_seek_offset = 0i64;
         if !is_append && crate::syscall_shim_enabled() {
             let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
-            if let (Ok(gate_b), Ok(fd_b), Ok(off_b)) = (
-                cx.memory
-                    .read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_GATE, 4),
-                cx.memory
-                    .read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_FD, 4),
-                cx.memory
-                    .read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_OFFSET, 8),
-            ) {
-                let gate = u32::from_le_bytes(gate_b.as_slice().try_into().unwrap_or([0; 4]));
-                let s_fd = i32::from_le_bytes(fd_b.as_slice().try_into().unwrap_or([u8::MAX; 4]));
-                let off = i64::from_le_bytes(off_b.as_slice().try_into().unwrap_or([0; 8]));
+            let mut seek_buf = [0u8; 20];
+            if cx
+                .memory
+                .read_into(base + crate::memory::IDENTITY_OFF_SEEK_GATE, &mut seek_buf)
+                .is_ok()
+            {
+                let gate = u32::from_le_bytes([seek_buf[0], seek_buf[1], seek_buf[2], seek_buf[3]]);
+                let s_fd = i32::from_le_bytes([seek_buf[4], seek_buf[5], seek_buf[6], seek_buf[7]]);
+                let off = i64::from_le_bytes([
+                    seek_buf[12],
+                    seek_buf[13],
+                    seek_buf[14],
+                    seek_buf[15],
+                    seek_buf[16],
+                    seek_buf[17],
+                    seek_buf[18],
+                    seek_buf[19],
+                ]);
                 if gate == 1 && s_fd == fd && off >= 0 {
                     seek_authority_active = true;
                     current_seek_offset = off;
@@ -321,12 +328,14 @@ impl<'a> FsView<'a> {
         } else {
             None
         };
-        if file_limit.is_some() && pos >= 0 {
+        let bytes = if file_limit.is_some() && pos >= 0 {
             match self.fsize_write_len(cx, pos as u64, bytes.len()) {
-                Ok(len) => bytes.truncate(len),
+                Ok(len) => &bytes[..len.min(bytes.len())],
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             }
-        }
+        } else {
+            bytes
+        };
         let Some(wait_authority) = self
             .captured_slot_authority(fd)
             .map(WaitFdAuthority::logical)
@@ -352,7 +361,7 @@ impl<'a> FsView<'a> {
         if seek_authority_active {
             target = target.with_offset(current_seek_offset);
         }
-        let out = write_host_pipe_owned(bytes, target)?;
+        let out = write_host_pipe(bytes, target)?;
         if let DispatchOutcome::Returned { value } = out
             && value > 0
         {
@@ -2692,16 +2701,24 @@ impl<'a> FsView<'a> {
             let length =
                 usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
             let tid = Self::ctx_tid(cx);
-            // A zero-length write never accesses the buffer (write(fd, NULL, 0)
-            // returns 0, not EFAULT) — only read guest memory when count > 0.
-            let mut bytes = if length == 0 {
-                Vec::new()
+
+            const STACK_WRITE_LIMIT: usize = 4096;
+            let mut stack_buf = [0u8; STACK_WRITE_LIMIT];
+            let heap_buf;
+            let bytes: &[u8] = if length == 0 {
+                &[]
+            } else if length <= STACK_WRITE_LIMIT {
+                match (*cx.memory).read_into(address, &mut stack_buf[..length]) {
+                    Ok(()) => &stack_buf[..length],
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                }
             } else {
                 match (*cx.memory).read_bytes(address, length) {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    Ok(v) => {
+                        heap_buf = v;
+                        &heap_buf
                     }
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                 }
             };
 
@@ -2786,11 +2803,11 @@ impl<'a> FsView<'a> {
                             }
                         }
                         OpenDescription::VirtualConsole { console, .. } => {
-                            console.write(&bytes);
+                            console.write(bytes);
                             return Ok(DispatchOutcome::returned_len_or_errno(bytes.len()));
                         }
                         OpenDescription::EventFd { state, .. } => {
-                            return Ok(write_eventfd(this, &bytes, state));
+                            return Ok(write_eventfd(this, bytes, state));
                         }
                         OpenDescription::PipeWriter { pipe, .. } => {
                             let pipe = Arc::clone(pipe);
@@ -2803,7 +2820,7 @@ impl<'a> FsView<'a> {
                                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
                             };
                             let outcome = write_pipe(
-                                &bytes,
+                                bytes,
                                 &pipe,
                                 flags,
                                 PipeWriteOperation {
@@ -2852,7 +2869,7 @@ impl<'a> FsView<'a> {
                                     drop(open);
                                     drop(io_lease);
                                     drop(open_file);
-                                    return this.write_owned_stdio_sink(cx, stream, bytes, Some(rearm_target));
+                                    return this.write_owned_stdio_sink(cx, stream, bytes.to_vec(), Some(rearm_target));
                                 }
                             }
                             // pty ends and O_RDWR FIFOs are bidirectional; only
@@ -2874,12 +2891,12 @@ impl<'a> FsView<'a> {
                                 let forwarded = crate::kernel::tty::process_master_write(
                                     crate::kernel::tty::TtyKey::Pty(*index),
                                     host_fd.raw(),
-                                    &bytes,
+                                    bytes,
                                 );
                                 let consumed = orig_len - forwarded.len();
-                                (forwarded, consumed)
+                                (std::borrow::Cow::Owned(forwarded), consumed)
                             } else {
-                                (bytes, 0)
+                                (std::borrow::Cow::Borrowed(bytes), 0)
                             };
                             let out = if bytes_to_write.is_empty() && consumed_count > 0 {
                                 DispatchOutcome::returned_len_or_errno(consumed_count)
@@ -2894,8 +2911,8 @@ impl<'a> FsView<'a> {
                                 let host_wait_runner = this.host_wait_runner_for_ctx(cx);
                                 let host_wait_ref =
                                     host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
-                                let res = write_host_pipe_owned(
-                                    bytes_to_write,
+                                let res = write_host_pipe(
+                                    bytes_to_write.as_ref(),
                                     HostPipeWriteTarget::new(
                                         host_fd.raw(),
                                         Some(host_fd.clone()),
@@ -2971,7 +2988,7 @@ impl<'a> FsView<'a> {
                             let host_wait_runner = this.host_wait_runner_for_ctx(cx);
                             let host_wait_ref =
                                 host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
-                            let out = write_host_pipe_owned(
+                            let out = write_host_pipe(
                                 bytes,
                                 HostPipeWriteTarget::new(
                                     host_fd.raw(),
@@ -2998,7 +3015,7 @@ impl<'a> FsView<'a> {
                         OpenDescription::InMemorySocket { socket, .. } => {
                             let socket = Arc::clone(socket);
                             drop(open);
-                            match socket.send_stream(&bytes, Vec::new()) {
+                            match socket.send_stream(bytes, Vec::new()) {
                                 Ok(written) => {
                                     this.notify_inmem_epoll();
                                     return Ok(DispatchOutcome::returned_len_or_errno(
@@ -3022,7 +3039,7 @@ impl<'a> FsView<'a> {
                         OpenDescription::Packet { socket, .. } => {
                             let socket = Arc::clone(socket);
                             drop(open);
-                            return Ok(socket.sendto(cx.memory, &bytes, 0, 0, 0));
+                            return Ok(socket.sendto(cx.memory, bytes, 0, 0, 0));
                         }
                         OpenDescription::HostFile { .. } => {
                             unreachable!("host files are handled under shared description authority")
@@ -3047,10 +3064,10 @@ impl<'a> FsView<'a> {
                             } else {
                                 *offset
                             };
-                            match this.fsize_write_len(cx, write_offset as u64, bytes.len()) {
-                                Ok(len) => bytes.truncate(len),
+                            let bytes = match this.fsize_write_len(cx, write_offset as u64, bytes.len()) {
+                                Ok(len) => &bytes[..len.min(bytes.len())],
                                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                            }
+                            };
                             let end = match write_offset.checked_add(bytes.len()) {
                                 Some(e) => e,
                                 None => return Ok(DispatchOutcome::errno(LINUX_EFBIG)),
@@ -3059,7 +3076,7 @@ impl<'a> FsView<'a> {
                                 return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                             }
                             let mut data = contents.write();
-                            if data.write_range(write_offset, &bytes).is_err() {
+                            if data.write_range(write_offset, bytes).is_err() {
                                 return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                             }
                             *offset = end;
@@ -3092,16 +3109,15 @@ impl<'a> FsView<'a> {
                             ) {
                                 return Ok(DispatchOutcome::errno(errno));
                             }
-                            match this.fsize_write_len(cx, *offset as u64, bytes.len()) {
-                                Ok(len) => bytes.truncate(len),
+                            let bytes = match this.fsize_write_len(cx, *offset as u64, bytes.len()) {
+                                Ok(len) => &bytes[..len.min(bytes.len())],
                                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                            }
+                            };
                             let write_offset = *offset;
-                            let written = match write_into_file_contents(contents, offset, &bytes) {
+                            let written = match write_into_file_contents(contents, offset, bytes) {
                                 Ok(n) => n,
                                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                             };
-                            bytes.truncate(written);
                             let new_len = match contents.len() {
                                 Ok(l) => l as usize,
                                 Err(errno) if written == 0 => {
@@ -3115,7 +3131,7 @@ impl<'a> FsView<'a> {
                                 FileWriteback::Range {
                                     path: path.clone(),
                                     offset: write_offset,
-                                    bytes,
+                                    bytes: bytes[..written.min(bytes.len())].to_vec(),
                                     final_size: new_len,
                                 }
                             });
@@ -3135,7 +3151,7 @@ impl<'a> FsView<'a> {
                             let task = cx.kernel.task();
                             let privileged = task.caps().is_map_write_privileged();
                             let result = task.with_user_ns(|ns| {
-                                crate::vfs::proc::write_userns_map(ns, privileged, path, &bytes)
+                                crate::vfs::proc::write_userns_map(ns, privileged, path, bytes)
                             });
                             let outcome = match result {
                                 Ok(n) => DispatchOutcome::returned_len_or_errno(n),
@@ -3163,7 +3179,7 @@ impl<'a> FsView<'a> {
                             // to "the current one" — LTP writes the library
                             // process's file from the test child.
                             let parsed =
-                                crate::vfs::proc::parse_tunable_write(path, &bytes);
+                                crate::vfs::proc::parse_tunable_write(path, bytes);
                             let outcome = match parsed {
                                 Err(errno) => DispatchOutcome::errno(errno),
                                 Ok(crate::vfs::proc::TunableWrite::Ignored) => {
@@ -3238,7 +3254,7 @@ impl<'a> FsView<'a> {
             // never buffered when the sink is live: busybox ash writes its
             // post-Enter newline to fd 2 via write(2), and buffering it left
             // the newline stuck until exit.
-            this.write_owned_stdio_sink(cx, fd, bytes, None)
+            this.write_owned_stdio_sink(cx, fd, bytes.to_vec(), None)
 
         }
 
