@@ -1,0 +1,164 @@
+{
+  "schema": 1,
+  "measurement": "instrumented_service_windows",
+  "vm_transition_time_measured": false,
+  "boundary_open_windows": 0,
+  "services": [
+    {
+      "syscall": "write",
+      "number": 64,
+      "calls": 128176,
+      "service_wall_ns": 2188169440,
+      "service_cpu_ns": 438223992,
+      "host_cpu_ns": 195981112,
+      "non_host_call_cpu_ns": 242242880,
+      "hosts": [
+        {
+          "name": "write",
+          "count": 128175,
+          "returns": 128175,
+          "wall_ns": 616910537,
+          "cpu_ns": 195705186,
+          "open_hosts": 0
+        },
+        {
+          "name": "psynch_cvsignal",
+          "count": 93,
+          "returns": 93,
+          "wall_ns": 1896128,
+          "cpu_ns": 151466,
+          "open_hosts": 0
+        },
+        {
+          "name": "psynch_cvwait",
+          "count": 21,
+          "returns": 21,
+          "wall_ns": 5467832,
+          "cpu_ns": 69252,
+          "open_hosts": 0
+        },
+        {
+          "name": "psynch_mutexdrop",
+          "count": 32,
+          "returns": 32,
+          "wall_ns": 156250,
+          "cpu_ns": 37418,
+          "open_hosts": 0
+        },
+        {
+          "name": "fcntl",
+          "count": 20,
+          "returns": 20,
+          "wall_ns": 59665,
+          "cpu_ns": 11625,
+          "open_hosts": 0
+        },
+        {
+          "name": "close",
+          "count": 20,
+          "returns": 20,
+          "wall_ns": 46832,
+          "cpu_ns": 5874,
+          "open_hosts": 0
+        },
+        {
+          "name": "fstat64",
+          "count": 1,
+          "returns": 1,
+          "wall_ns": 4000,
+          "cpu_ns": 291,
+          "open_hosts": 0
+        }
+      ]
+    },
+    {
+      "syscall": "inotify_add_watch",
+      "number": 27,
+      "calls": 128154,
+      "service_wall_ns": 1350602442,
+      "service_cpu_ns": 302530074,
+      "host_cpu_ns": 8375,
+      "non_host_call_cpu_ns": 302521699,
+      "hosts": [
+        {
+          "name": "listxattr",
+          "count": 1,
+          "returns": 1,
+          "wall_ns": 8792,
+          "cpu_ns": 5875,
+          "open_hosts": 0
+        },
+        {
+          "name": "fstatat64",
+          "count": 2,
+          "returns": 2,
+          "wall_ns": 8500,
+          "cpu_ns": 2500,
+          "open_hosts": 0
+        }
+      ]
+    },
+    {
+      "syscall": "lseek",
+      "number": 62,
+      "calls": 128153,
+      "service_wall_ns": 760015239,
+      "service_cpu_ns": 112524342,
+      "host_cpu_ns": 24472140,
+      "non_host_call_cpu_ns": 88052202,
+      "hosts": [
+        {
+          "name": "lseek",
+          "count": 128153,
+          "returns": 128153,
+          "wall_ns": 328631871,
+          "cpu_ns": 24469599,
+          "open_hosts": 0
+        },
+        {
+          "name": "psynch_cvwait",
+          "count": 1,
+          "returns": 1,
+          "wall_ns": 234084,
+          "cpu_ns": 2541,
+          "open_hosts": 0
+        }
+      ]
+    },
+    {
+      "syscall": "inotify_rm_watch",
+      "number": 28,
+      "calls": 128153,
+      "service_wall_ns": 746232408,
+      "service_cpu_ns": 93358103,
+      "host_cpu_ns": 26458,
+      "non_host_call_cpu_ns": 93331645,
+      "hosts": [
+        {
+          "name": "psynch_cvwait",
+          "count": 4,
+          "returns": 4,
+          "wall_ns": 706126,
+          "cpu_ns": 22042,
+          "open_hosts": 0
+        },
+        {
+          "name": "psynch_cvsignal",
+          "count": 4,
+          "returns": 4,
+          "wall_ns": 23000,
+          "cpu_ns": 4124,
+          "open_hosts": 0
+        },
+        {
+          "name": "kevent",
+          "count": 1,
+          "returns": 1,
+          "wall_ns": 2583,
+          "cpu_ns": 292,
+          "open_hosts": 0
+        }
+      ]
+    }
+  ]
+}

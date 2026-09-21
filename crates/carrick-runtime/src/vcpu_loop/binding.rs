@@ -4761,19 +4761,23 @@ pub(crate) struct HvpatchSyscallServiceGuard {
 
 impl HvpatchSyscallServiceGuard {
     pub(crate) fn begin(
-        pid: i32,
+        identity: impl FnOnce() -> Option<(i32, u32)>,
         tid: i32,
-        asid: u32,
         number: u64,
         args: [u64; 6],
     ) -> Option<Self> {
-        // The wrapper materializes the clock only inside the USDT enabled
-        // closure. With no consumer this returns `None`, preserving the probe
-        // surface's predicted-not-taken-branch cost contract.
-        let event =
-            carrick_observability::probes::HvpatchSyscallService::new(pid, tid, asid, number, 0)
-                .ok()?;
-        let started = crate::probes::hvpatch_syscall_service_begin(event, args)?;
+        // Neither task/MM identity resolution nor the clock is paid for
+        // without a consumer of the begin probe.
+        let (event, started) = crate::probes::hvpatch_syscall_service_begin_with(
+            || {
+                let (pid, asid) = identity()?;
+                carrick_observability::probes::HvpatchSyscallService::new(pid, tid, asid, number, 0)
+                    .ok()
+            },
+            args,
+        )?;
+        let pid = event.pid();
+        let asid = event.asid();
         Some(Self {
             pid,
             tid,

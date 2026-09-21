@@ -3072,6 +3072,24 @@ mod hvpatch_guest_probe_abi {
     }
 
     #[test]
+    fn disabled_syscall_service_does_not_resolve_identity() {
+        let resolutions = std::cell::Cell::new(0);
+        let result = super::hvpatch_syscall_service_begin_with(
+            || {
+                resolutions.set(resolutions.get() + 1);
+                HvpatchSyscallService::new(41, 43, 7, 62, 0).ok()
+            },
+            [0; 6],
+        );
+        assert!(result.is_none());
+        assert_eq!(
+            resolutions.get(),
+            0,
+            "disabled tracing must not resolve task/MM identity"
+        );
+    }
+
+    #[test]
     fn syscall_service_provider_and_stub_keep_guest_task_identity_typed() {
         let completion =
             HvpatchSyscallService::new(41, 43, 7, 56, 12_345).expect("valid task identity");
@@ -6561,6 +6579,34 @@ mod real {
         ));
     }
 
+    /// Resolve service identity only when the begin probe is enabled.
+    pub fn hvpatch_syscall_service_begin_with(
+        resolve: impl FnOnce() -> Option<super::HvpatchSyscallService>,
+        args: [u64; 6],
+    ) -> Option<(super::HvpatchSyscallService, std::time::Instant)> {
+        let mut started = None;
+        // The macro evaluates its argument expression only after the USDT
+        // enabled check. Keep fallible identity resolution inside that gate;
+        // an absent identity must not emit a synthetic zero-valued begin.
+        carrick_usdt::hvpatch__syscall__service__begin!(match resolve() {
+            Some(event) => {
+                started = Some((event, std::time::Instant::now()));
+                move || (event.pid(), event.tid(), event.asid(), event.number())
+            }
+            None => return None,
+        });
+        if let Some((event, _)) = started {
+            carrick_usdt::hvpatch__syscall__args!(|| (
+                event.number(),
+                args[0],
+                args[1],
+                args[2],
+                args[3]
+            ));
+        }
+        started
+    }
+
     #[inline(never)]
     pub fn hvpatch_syscall_service_begin(
         event: super::HvpatchSyscallService,
@@ -8419,6 +8465,13 @@ mod stub {
     stub!(hvpatch_global_frame_stage2(event: super::HvpatchGlobalFrameStage2));
     stub!(hvpatch_global_frame_owner_miss(ipa: u64, length: u64, host_addr: u64, owner_host_addr: u64));
     stub!(hvpatch_guest_address_space(event: super::HvpatchGuestAddressSpace));
+    pub fn hvpatch_syscall_service_begin_with(
+        _resolve: impl FnOnce() -> Option<super::HvpatchSyscallService>,
+        _args: [u64; 6],
+    ) -> Option<(super::HvpatchSyscallService, std::time::Instant)> {
+        None
+    }
+
     stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService, args: [u64; 6]) -> Option<std::time::Instant> => None);
     stub!(hvpatch_syscall_service(event: super::HvpatchSyscallService));
     stub!(hvpatch_syscall_service_clear(event: super::HvpatchSyscallService));
