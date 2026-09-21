@@ -356,3 +356,39 @@ The reusable transport campaign command was separately corrected from retired
 green on `hvpatch`. Historical native-versus-VMM comparators remain untouched.
 The full transport campaign still requires freshly built probe artifacts and
 all end-to-end rows before a default change can be considered.
+
+### Full current HVPatch transport campaign: promotion rejected
+
+`hvpatch-mailbox-full.jsonl` records the eight-workload campaign at
+`2f56d817b4e52823ed1813f4947d583bdfda8e7c`: ten warmup and thirty measured
+ABBA blocks per workload, sixty samples per mode, zero cooldown as in the
+historical campaign. All eight static-PIE probes were freshly built with the
+repository's `rust:alpine` / `cc -static-pie` recipe. A local rust-lld build
+attempt rejected the compiler-driver `-static-pie` flag before any execution;
+none of those failed outputs were measured. The report includes each executable
+hash and validates unchanged probe and Carrick hashes after measurement.
+Dirty source status reflects the three unrelated untracked plan files.
+
+| Workload | Mailbox / legacy | 95% interval | Frozen verdict |
+| --- | ---: | --- | --- |
+| host-dispatch floor | 0.8974 | 0.8925–0.9016 | Pass |
+| stdio burst | 1.0050 | 0.9466–1.0405 | Fail |
+| writev burst | 0.9778 | 0.9667–0.9882 | Pass |
+| pipe ping-pong | 1.0141 | 0.9994–1.0234 | Fail |
+| epoll pipe loop | 0.9892 | 0.9876–0.9935 | Pass |
+| compute | 1.0017 | 0.9991–1.0036 | Pass |
+| fork | 0.9951 | 0.9917–0.9983 | Pass |
+| fork/exec | 0.9980 | 0.9927–1.0039 | Pass |
+
+The report-producing test exited zero after 544.75 seconds, which means the
+report completed, **not** that promotion passed. Stdio requires upper <1.00;
+pipe ping-pong requires upper <=1.02. Both failed. The runtime default stays
+legacy, and no retry or threshold relaxation closes these failures. Scoped
+guest cleanup was verified; Carrick SHA-256 remains
+`166143994b2502b38687b63deda3106da1e1d720e2c8d21d4faf576ae35f6086`.
+
+The boundary improvement is real but insufficient evidence of broad benefit.
+Return to the existing inotify scaling decomposition to rank the residual
+watch/write/concurrent costs against fresh Docker before expanding transport
+work. `inotify09`, the <=2x requirement, and all signed promotion gates remain
+open.
