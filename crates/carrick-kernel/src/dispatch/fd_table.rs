@@ -1742,6 +1742,13 @@ impl OpenFile {
             .concrete_backing::<super::ioring::IoUringBacking>()
             .is_some()
     }
+
+    pub(in crate::dispatch) fn is_pty(&self) -> bool {
+        let Some(open) = self.description.read() else {
+            return false;
+        };
+        matches!(&*open, OpenDescription::HostPipe { pty: Some(_), .. })
+    }
 }
 
 pub(super) fn kernel_file_description(

@@ -262,6 +262,7 @@ impl<'a> FsView<'a> {
         host_fd: HostFdRef,
         writable: bool,
         nonblocking: bool,
+        slot_authority: Option<crate::kernel::objects::FileSlotAuthority>,
     ) -> Result<DispatchOutcome, DispatchError> {
         if !writable {
             return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -338,8 +339,8 @@ impl<'a> FsView<'a> {
         };
         let raw_fd = host_fd.raw();
         host_fd.record_sequential_io();
-        let Some(wait_authority) = self
-            .captured_slot_authority(fd)
+        let Some(wait_authority) = slot_authority
+            .or_else(|| self.captured_slot_authority(fd))
             .map(WaitFdAuthority::logical)
         else {
             return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -2701,7 +2702,10 @@ impl<'a> FsView<'a> {
         fn write(this, cx, fd: Fd, buf: GuestPtr, count: u64) {
 
             let fd = fd.0;
-            let open_file = this.open_file(fd);
+            let (open_file, slot_authority) = match this.open_file_with_authority(fd) {
+                Some((of, auth)) => (Some(of), Some(auth)),
+                None => (this.open_file(fd), None),
+            };
             if let Some(ref of) = open_file {
                 let common = of.description.common();
                 // An O_PATH descriptor is not open for I/O (open13 → EBADF).
@@ -2716,7 +2720,9 @@ impl<'a> FsView<'a> {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
             }
-            if this.fd_is_controlling_tty(cx.kernel, fd)
+            let is_potential_tty = is_stdio_fd(fd) || open_file.as_ref().is_some_and(|of| of.is_pty());
+            if is_potential_tty
+                && this.fd_is_controlling_tty(cx.kernel, fd)
                 && cx.kernel.kernel().tty_caller_is_background(cx.kernel)
             {
                 let host_fd_opt = match this.pty_info(fd) {
@@ -2817,6 +2823,7 @@ impl<'a> FsView<'a> {
                         host_fd,
                         writable,
                         nonblocking,
+                        slot_authority,
                     );
                 }
                 // Take an inner scope so the borrow on the description ends

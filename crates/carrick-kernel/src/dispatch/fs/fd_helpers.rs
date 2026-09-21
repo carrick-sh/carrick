@@ -408,6 +408,15 @@ impl<'a> FsView<'a> {
             .cloned()
     }
 
+    pub(in crate::dispatch) fn open_file_with_authority(
+        &self,
+        fd: i32,
+    ) -> Option<(OpenFile, crate::kernel::objects::FileSlotAuthority)> {
+        let number = crate::kernel::FileSlotNumber::for_open_fd(fd).ok()?;
+        self.captured_file_table()
+            .capture_open_slot_authority(number)
+    }
+
     pub(in crate::dispatch) fn fd_table_contains(&self, fd: i32) -> bool {
         self.captured_file_table()
             .read_open_files()
