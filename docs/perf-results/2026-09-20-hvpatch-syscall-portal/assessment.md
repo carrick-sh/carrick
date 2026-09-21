@@ -178,3 +178,36 @@ refreshes mutable inode metadata after a write invalidates it. The existing
 `DentryCache::lookup_path` can resolve existence/kind without that refresh.
 Before substituting it, cover symlink following, missing paths, unlink/recreate,
 and directory-kind behavior; retain full metadata refresh for actual stat calls.
+
+## Namespace-only watch lookup candidate
+
+`RootFsVfs::dentry_is_dir` uses the existing symlink-following namespace
+resolver without refreshing inode attributes. Inotify's rootfs kind query uses
+that answer when available and preserves its prior lookup fallback otherwise.
+The regression failed against the full-stat implementation because it refilled
+invalidated inode metadata, then passed with namespace-only lookup. It also
+checks a followed symlink, root directory, missing path, dangling symlink after
+unlink, and a replacement directory. All 24 VM-free contracts and five inotify
+semantic tests passed.
+
+The required-exit census passed with zero errors: 425,986 host seeks, 426,052
+writes, 426,093 `fstat64`, and just 398 `fstatat64` calls including startup.
+Thus the two per-loop path metadata queries disappeared. Instrumented
+throughput is not a timing acceptance claim. Raw: `inotify-kind-cache.trace`.
+
+Artifact based on `489cd1fb9` plus the namespace-only lookup diff:
+
+- SHA-256: `166143994b2502b38687b63deda3106da1e1d720e2c8d21d4faf576ae35f6086`
+- CDHash: `c6c7b7a034ae925f054dba8d8d08f93780b04342`
+- LC_UUID: `09BD6C70-38FB-3B17-88C6-B77DE04BFE4E`
+- built through `just build`; `__dof_carrick` present
+
+Signed promotion and <=2x end-to-end acceptance remain open.
+
+The same artifact still timed out at 40.275 s in the uninstrumented declared
+budget run `conf-79640-s00` (`target/conformance/kind-cache-inotify09.jsonl`).
+Both streams were inspected; the final emitted sampling report named loop
+10,413, A=3,799 ns and B=8,876 ns. The oracle was cached. SHA-256 was unchanged,
+the hypervisor entitlement was verified, and no guest remained. Reduced
+metadata work has therefore not yet established a complete-workload runtime
+gain; the next attribution must explain the sustained workload cost.
