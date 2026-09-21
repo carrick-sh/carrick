@@ -949,6 +949,10 @@ where
         let guest_child_pid = reservation.visible_child_id();
         let child_pid = child_id.raw();
         let parent_task = parent_context.task().key();
+        let _ = carrick_kernel::kernel::identity_page::revoke_seek_authority_and_write_lease(
+            memory,
+            crate::memory::LINUX_IDENTITY_PAGE_BASE,
+        );
         let prepared_mm = if shares_mm {
             // A shared-MM child joins the parent's owner set, which an exec on
             // ANY task sharing that generation freezes for its duration (the
