@@ -433,6 +433,7 @@ pub(crate) struct ProductionHvpatchLoopJob<E: ThreadedEngine> {
         carrick_kernel::kernel::MmId,
     )>,
     pub(super) external_exec: Option<carrick_kernel::kernel::control::ExecWork>,
+    pub(super) portal_quantum_epoch: u64,
 }
 
 pub(crate) trait ProductionHvpatchLoopPoll: Send {
@@ -475,6 +476,89 @@ impl<E: ThreadedEngine + 'static> ProductionHvpatchLoopJob<E>
 where
     E::SiblingSpec: 'static,
 {
+    fn arm_syscall_portal(
+        &mut self,
+        engine: &E,
+        control: &executor::HvpatchQuantumControl<'_, '_>,
+    ) -> Result<(), RuntimeError> {
+        let Some(helper) = control.portal_helper else {
+            return Ok(());
+        };
+        if !helper.is_parked() {
+            return Ok(());
+        }
+        let Some(endpoint) = engine.portal_endpoint() else {
+            return Ok(());
+        };
+        let context = self
+            .state
+            .service_kernel_context
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Configuration("syscall portal lacks exact Kernel context".to_owned())
+            })?
+            .retain_exact();
+        let (_, execution_generation) = control
+            .current_submission_key()
+            .map_err(RuntimeError::Trap)?;
+        self.portal_quantum_epoch = self.portal_quantum_epoch.saturating_add(1).max(1);
+        let identity = portal::PortalSessionIdentity {
+            mailbox_generation: 0,
+            executor_generation: execution_generation.raw(),
+            task_serial: context.task().key().serial.raw(),
+            mm_generation: context.shared().mm().id().raw(),
+            quantum_epoch: self.portal_quantum_epoch,
+        };
+        let kernel = Arc::clone(&self.kernel);
+        let dispatch_context = context.retain_exact();
+        let registry = Arc::clone(&self.state.registry);
+        let futex = Arc::clone(&self.state.futex);
+        let this_tid = self.state.this_tid;
+        let conditions_kernel = Arc::clone(&self.kernel);
+        let conditions_kicker = Arc::clone(&self.state.kicker);
+        let conditions_tid = self.state.this_tid;
+        let work_scope = self.kernel.dispatcher.work_scope();
+        helper
+            .arm(
+                endpoint,
+                identity,
+                Arc::new(move |request| {
+                    let mut memory = carrick_kernel::dispatch::LinearMemory::new(0, Vec::new());
+                    let syscall = SyscallRequest::new(
+                        request.native_nr,
+                        crate::compat::SyscallArgs(request.args),
+                    );
+                    let work_scope = kernel.dispatcher.work_scope();
+                    let thread = ThreadCtx::new(this_tid, &registry, &futex);
+                    let thread = work_scope
+                        .as_ref()
+                        .map_or(thread, |scope| thread.with_work_scope(scope));
+                    dispatch_with_panic_backstop(request.native_nr, this_tid, || {
+                        kernel.dispatcher.dispatch_threaded(
+                            &dispatch_context,
+                            syscall,
+                            &mut memory,
+                            &kernel.reporter,
+                            thread,
+                        )
+                    })
+                    .map_err(|error| error.to_string())
+                }),
+                Arc::new(move || portal::PortalServiceConditions {
+                    signal_debt: conditions_kicker
+                        .kernel_wake_debt_for(conditions_tid)
+                        .is_some(),
+                    incompatible_interceptor: !conditions_kernel
+                        .dispatcher
+                        .portal_direct_compatible(),
+                }),
+                Arc::new(carrick_aarch64::mailbox::portal_scalar_eligible),
+                work_scope,
+            )
+            .map_err(RuntimeError::Configuration)?;
+        Ok(())
+    }
+
     fn external_exec_failure(&mut self, engine: &mut E, code: i32) -> executor::ExecutorExit {
         let context = self
             .state
@@ -3894,6 +3978,7 @@ where
         if let Some(thread) = self.state.kernel_thread.as_ref() {
             thread.begin_guest_run();
         }
+        self.arm_syscall_portal(engine, control)?;
         let next = engine.next_syscall();
         if let Some(thread) = self.state.kernel_thread.as_ref() {
             thread.charge_user_ns(engine.take_guest_run_receipt_ns());
@@ -4183,7 +4268,36 @@ where
             }
             Err(error) => return Err(RuntimeError::Trap(error).into()),
         };
+        if let Some(scope) = self.kernel.dispatcher.work_scope() {
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::HvfSyscallExits,
+                1,
+            );
+        }
         self.state.trace_syscall(self.traps, frame);
+        if let Some(helper) = control.portal_helper
+            && let Some(completion) = helper.take_boundary(frame.native_number.raw(), frame.args)
+        {
+            match completion {
+                portal::PortalCompletion::HostBoundary {
+                    outcome: Some(outcome),
+                    ..
+                } => return self.service_outcome(engine, control, frame, outcome),
+                portal::PortalCompletion::DispatchFailed(error) => {
+                    return Err(RuntimeError::Configuration(format!(
+                        "syscall portal dispatch failed after accepting request: {error}"
+                    ))
+                    .into());
+                }
+                portal::PortalCompletion::HostBoundary { outcome: None, .. } => {}
+                portal::PortalCompletion::Returned(_) | portal::PortalCompletion::StaleRejected => {
+                    return Err(RuntimeError::Configuration(
+                        "syscall portal published an impossible owner boundary".to_owned(),
+                    )
+                    .into());
+                }
+            }
+        }
         let outcome = self.state.service_threaded_syscall(
             &self.kernel,
             engine,
@@ -5023,6 +5137,7 @@ where
         pending_terminal_retirement: None,
         pending_terminal_inventory: None,
         external_exec: None,
+        portal_quantum_epoch: 0,
     };
     let job = HvpatchLoopJob::production(production, injected_lease);
     let quantum = Arc::new(continuation::HvpatchTaskQuantum::new(
@@ -6014,6 +6129,7 @@ mod tests {
             pending_terminal_retirement: None,
             pending_terminal_inventory: None,
             external_exec: None,
+            portal_quantum_epoch: 0,
         };
         let root_quantum = Arc::new(continuation::HvpatchTaskQuantum::new(
             Box::new(HvpatchLoopJob::production(

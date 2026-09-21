@@ -3119,6 +3119,7 @@ pub(crate) mod tests {
             pending_terminal_retirement: None,
             pending_terminal_inventory: None,
             external_exec: None,
+            portal_quantum_epoch: 0,
         };
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut parent_submission = executor::ExecutorSubmissionContext {
@@ -3390,6 +3391,7 @@ pub(crate) mod tests {
                 pending_terminal_retirement: None,
                 pending_terminal_inventory: None,
                 external_exec: None,
+                portal_quantum_epoch: 0,
             };
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
@@ -3634,6 +3636,7 @@ pub(crate) mod tests {
                 pending_terminal_retirement: None,
                 pending_terminal_inventory: None,
                 external_exec: None,
+                portal_quantum_epoch: 0,
             };
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
@@ -3883,6 +3886,7 @@ pub(crate) mod tests {
             pending_terminal_retirement: None,
             pending_terminal_inventory: None,
             external_exec: None,
+            portal_quantum_epoch: 0,
         };
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut submission = executor::ExecutorSubmissionContext {

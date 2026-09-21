@@ -1267,6 +1267,7 @@ pub(crate) mod tests {
                 pending_terminal_retirement: None,
                 pending_terminal_inventory: None,
                 external_exec: None,
+                portal_quantum_epoch: 0,
             };
             let mut memory = Memory::default();
             memory.0.insert(0x1000, 11_i32.to_le_bytes().to_vec());

@@ -179,6 +179,18 @@ struct ForkCloneObservedArgs<'a> {
 }
 
 impl SyscallDispatcher {
+    /// Whether a syscall may run on the portal helper. Container policy and
+    /// seccomp remain compatible because the helper uses the ordinary
+    /// dispatcher preflight; trusted argument interceptors and user callbacks
+    /// retain the executor-owner thread they were installed for.
+    pub fn portal_direct_compatible(&self) -> bool {
+        self.interceptors.is_none()
+            && self
+                .observers
+                .as_ref()
+                .is_none_or(|chain| !chain.has_user_observers())
+    }
+
     /// The bridge-less test/reference-model constructor: the Null bridges of
     /// [`CarrierBridges::null`]. Product carriers construct with
     /// [`Self::with_bridges`]; this one does not exist in a product build.
