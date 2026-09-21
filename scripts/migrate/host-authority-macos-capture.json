@@ -4401,15 +4401,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 74517,
-        "byte_start": 74500,
+        "byte_end": 78933,
+        "byte_start": 78916,
         "column": 18,
         "column_end": 35,
         "column_start": 18,
         "file": "crates/carrick-kernel/src/inotify.rs",
-        "line": 1831,
-        "line_end": 1831,
-        "line_start": 1831
+        "line": 1978,
+        "line_end": 1978,
+        "line_start": 1978
       }
     },
     {
@@ -11607,9 +11607,9 @@
       }
     }
   ],
-  "rows_sha256": "1a9801d10605aefa1eb9aa77ef132815e79ce7b1a78de54684e92b36e322903f",
+  "rows_sha256": "01e89fee4c579be5e259dd34238e69ba048753da630db81e43db3768518c6b8e",
   "schema": 1,
-  "source_head": "76e2d59245898131655a996bec65b7714ab2fb83",
+  "source_head": "47866c662774d58ebb4f32aec5471caee89843f2",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
