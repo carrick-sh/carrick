@@ -392,3 +392,32 @@ Return to the existing inotify scaling decomposition to rank the residual
 watch/write/concurrent costs against fresh Docker before expanding transport
 work. `inotify09`, the <=2x requirement, and all signed promotion gates remain
 open.
+
+### Fresh inotify component scaling after transport rejection
+
+At `763a75bb7`, rebuilt the existing clean-room `perf_inotify09_scale` probe
+and ran it first under the unchanged signed Carrick artifact, then under native
+ARM64 Docker, both with the pinned LTP image above and `/bin/sh -c` invocation.
+Carrick used the harness's unlimited trap count and host filesystem. Both runs
+exited zero, all 25 phase/scale rows reported 21 complete samples, and both
+reported `probe_complete=1`. Raw streams had no stderr diagnostics. Probe source
+SHA-256 is `dfc7bf01aa7aa4ba31447842144521eb014c425bc6eebf1da03da299b7fb9be3`;
+ELF SHA-256 is `87dd1362c7696d1c15289cf134729fb73a12c4fb3fed7ef7d5cd7ea00b9460a7`.
+Carrick SHA-256 remained unchanged. Full outputs are retained as
+`scale-current-carrick.out` and `scale-current-docker.out`.
+
+| Phase, scale 65,536 | Carrick ns/iteration | Docker ns/iteration | Ratio |
+| --- | ---: | ---: | ---: |
+| watch churn | 4660 | 998 | 4.67 |
+| write/seek | 6145 | 471 | 13.05 |
+| persistent-watch write/seek | 6217 | 587 | 10.59 |
+| serial composition | 11931 | 1581 | 7.55 |
+| concurrent components | 8641 | 1138 | 7.59 |
+
+Costs are approximately flat per iteration at the larger scales. These results
+identify ordinary write/seek as a pathological component independently of
+watch churn or LTP fuzzy synchronization. They do not prove which internal
+function owns the remaining cost. The next attribution target is write/seek,
+including residual metadata queries and its dispatch cost; adding a persistent
+watch changes Carrick's large-scale result by only 72 ns/iteration. No runtime
+budget or acceptance gate is relaxed.
