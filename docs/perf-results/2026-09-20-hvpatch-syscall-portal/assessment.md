@@ -421,3 +421,21 @@ function owns the remaining cost. The next attribution target is write/seek,
 including residual metadata queries and its dispatch cost; adding a persistent
 watch changes Carrick's large-scale result by only 72 ns/iteration. No runtime
 budget or acceptance gate is relaxed.
+
+### Residual metadata attribution
+
+`hvpatch-write-metadata-stacks.d` captured 553,136 Darwin fstat events with
+zero DTrace errors and its ten-second bound reached. Of those, 552,982 shared
+the write hot-path stack. The raw capture is `write-metadata-stacks.trace`.
+This trace perturbs execution and supplies no timing evidence.
+
+Offline symbolization inferred image base `0x1008f4000` from the final Rust
+thread-start frame and cross-checked the write dispatcher frames. LLDB
+disassembly of the unchanged binary places stack return address `0x100cc7190`
+at unslid `0x1003d3190`, immediately after the call to
+`FsState::record_host_sparse_write` at `0x1003d318c`. This identifies sparse
+extent bookkeeping as the dominant residual fstat caller, rather than the
+already-cached dentry invalidation path. That function still calls
+`host_file_identity(fd)` on every tracked write. The next correction can reuse
+the live owned descriptor's immutable inode identity while preserving mutable
+extent updates, aliasing, and unlink/replacement semantics.
