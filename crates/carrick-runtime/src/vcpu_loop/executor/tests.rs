@@ -355,6 +355,8 @@ struct FakeFactory {
     panic_initial_audit_call: Arc<AtomicUsize>,
     initial_audit_gate: Arc<parking_lot::Mutex<Option<Arc<Barrier>>>>,
     fail_invalidation_generation: Arc<AtomicU64>,
+    invalidation_gate: Arc<parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    invalidation_resume: Arc<parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
     fail_hardware_kick: Arc<AtomicBool>,
     drift_hardware_on_load: Arc<AtomicBool>,
     hardware_vcpu_offset: Arc<AtomicU64>,
@@ -1111,6 +1113,12 @@ impl PersistentExecutor for FakeExecutor {
         }
         self.factory
             .record(BackendEventKind::Invalidate, self.id, None);
+        if let Some(gate) = self.factory.invalidation_gate.lock().take() {
+            let _ = gate.send(());
+        }
+        if let Some(resume) = self.factory.invalidation_resume.lock().take() {
+            let _ = resume.recv_timeout(Duration::from_secs(5));
+        }
         Ok(())
     }
 
@@ -3072,6 +3080,114 @@ fn host_wait_lends_the_only_cpu_through_the_executor_submission_interface() {
     shutdown.expect("clean shutdown after handoff");
     assert_eq!(waiting.progress.load(Ordering::SeqCst), 1);
     assert_eq!(replacement.progress.load(Ordering::SeqCst), 1);
+}
+
+/// kernel.scheduler.host-wait-handoff: a saved replacement must return its
+/// borrowed P before detached MM retirement, which can wait for the original
+/// executor's owner-thread ASID acknowledgement. An invalidation gate makes that dependency
+/// deterministic without leaving the red test deadlocked.
+#[test]
+fn saved_replacement_returns_host_wait_slot_before_terminal_retirement() {
+    let (process, replacement_context) = crate::hvpatch::process_context_for_tests(15_110);
+    let kernel = Arc::clone(replacement_context.kernel());
+    let waiting_context = sibling(&kernel, &replacement_context, 25_110);
+    let scheduler = Arc::new(Scheduler::new_with_policy(
+        kernel,
+        Arc::new(GuestCpuPolicy::new(1)),
+    ));
+    let factory = Arc::new(FakeFactory::default());
+    let waiting = FakeBinding::new(311, [Step::HostWait]);
+    let replacement = FakeBinding::new(312, [Step::Exit]);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (settled_tx, settled_rx) = std::sync::mpsc::channel();
+    *waiting.host_wait_entered.lock() = Some(entered_tx);
+    *waiting.host_wait_release.lock() = Some(release_rx);
+    waiting.notify_on_terminal_settlement(settled_tx);
+    let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+    *factory.invalidation_gate.lock() = Some(cleanup_tx);
+    *factory.invalidation_resume.lock() = Some(finish_rx);
+    factory.install(&waiting_context, Arc::clone(&waiting));
+    factory.install(&replacement_context, Arc::clone(&replacement));
+    let waiting_generation = publish(&waiting_context, 311);
+    let replacement_generation = publish(&replacement_context, 312);
+    let pool = ExecutorPool::start(
+        ExecutorPoolConfig {
+            bound_workers: 1,
+            spare_executors: 1,
+            vcpu_ceiling: 3,
+            reserve: 1,
+        },
+        Arc::clone(&scheduler),
+        Arc::clone(&factory),
+        Arc::clone(&factory),
+        ExecutorBoundaryAudit::production(),
+    )
+    .expect("one CPU with one spare");
+    process
+        .stage1_mm_lease()
+        .unwrap()
+        .begin_asid_load(pool.executor_ids()[1])
+        .unwrap()
+        .mark_resident()
+        .unwrap();
+    let tid = ThreadId::from_guest_supplied_tid(replacement_context.thread().key().tid.raw());
+    *replacement.pending_address_space_retirement.lock() = Some(
+        process
+            .begin_address_space_retirement(0, tid, None)
+            .expect("pending retirement"),
+    );
+    let waiting_authority = enqueue_root(&scheduler, &waiting_context, waiting_generation);
+    let entered = entered_rx.recv_timeout(Duration::from_secs(2));
+    let replacement_authority =
+        enqueue_root(&scheduler, &replacement_context, replacement_generation);
+    let at_cleanup = cleanup_rx.recv_timeout(Duration::from_secs(2));
+    release_tx.send(()).expect("finish external host operation");
+    let resumed_before_cleanup = settled_rx.recv_timeout(Duration::from_secs(2));
+    // Always release the artificial retirement dependency before asserting red.
+    let _ = finish_tx.send(());
+    drop(waiting_authority);
+    drop(replacement_authority);
+    let shutdown = pool.shutdown();
+    entered.expect("original executor must lend its CPU");
+    at_cleanup.expect("replacement must save and reach owner-thread ASID invalidation");
+    shutdown.expect("both exact execution claims settle and workers join");
+    resumed_before_cleanup.expect("saved replacement held borrowed P across terminal retirement");
+    let census = scheduler.host_wait_census().expect("host-wait census");
+    assert_eq!(census.entered, 1);
+    assert_eq!(census.resumed, 1);
+    assert!(census.slots.is_empty());
+}
+
+#[test]
+fn saved_host_wait_slot_release_rejects_live_and_foreign_execution_claims() {
+    let (kernel, context) = bootstrap(15_111);
+    let scheduler = Scheduler::new(Arc::clone(&kernel));
+    let (other_kernel, _) = bootstrap(15_112);
+    let foreign = Scheduler::new(other_kernel);
+    let registration = scheduler
+        .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
+        .unwrap();
+    publish(&context, 313);
+    scheduler.make_runnable(context.thread().key()).unwrap();
+    let running = scheduler.take(&registration).unwrap();
+    assert!(
+        scheduler
+            .release_saved_host_wait_slot(&running, None)
+            .is_err()
+    );
+    scheduler.begin_switch_out(&running).unwrap();
+    assert!(
+        foreign
+            .release_saved_host_wait_slot(&running, None)
+            .is_err()
+    );
+    scheduler
+        .release_saved_host_wait_slot(&running, None)
+        .unwrap();
+    scheduler.settle_exited(running).unwrap();
+    scheduler.unregister_executor(&registration).unwrap();
 }
 
 #[test]

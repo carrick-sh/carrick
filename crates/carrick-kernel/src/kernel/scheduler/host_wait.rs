@@ -253,6 +253,59 @@ impl Scheduler {
         })
     }
 
+    /// Return a borrowed CPU after the runtime has saved/detached the task and
+    /// audited the idle backend boundary. Keep the exact execution binding and
+    /// claim until settlement: ASID retirement may still need this owner thread.
+    ///
+    /// In particular, retirement must not retain the CPU needed by a returning
+    /// host waiter that owes this executor an owner-thread invalidation ack.
+    pub fn release_saved_host_wait_slot(
+        &self,
+        running: &RunnableThread,
+        consumed: Option<&super::super::objects::ExecConsumedPredecessorAuthority>,
+    ) -> Result<(), SchedulerError> {
+        let _transition = self.generation_transition.lock();
+        let queue = running.queue.upgrade().ok_or(RunQueueError::Closed)?;
+        if !Arc::ptr_eq(&queue, &self.queue.inner)
+            || self.executors.binding_for_thread(running.thread_key()) != Some(running.binding)
+        {
+            return Err(RunQueueError::AuthorityMismatch.into());
+        }
+        if let Some(consumed) = consumed {
+            if consumed.thread_key() != running.thread_key()
+                || consumed.generation() != running.generation()
+                || consumed.executor() != running.executor()
+                || consumed.executor_epoch() != running.executor_epoch()
+                || !matches!(running.thread.execution_state(), ThreadExecutionState::Exited {
+                    generation
+                } if running.generation().next() == Some(generation))
+            {
+                return Err(RunQueueError::AuthorityMismatch.into());
+            }
+        } else {
+            let lease = running
+                .lease
+                .as_ref()
+                .ok_or(RunQueueError::AuthorityMismatch)?;
+            running.thread.authenticate_task_state_authority(lease)?;
+            if !matches!(running.thread.execution_state(), ThreadExecutionState::SwitchingOut {
+                generation, executor, executor_epoch, ..
+            } if generation == running.generation()
+                && executor == running.executor()
+                && executor_epoch == running.executor_epoch())
+            {
+                return Err(RunQueueError::AuthorityMismatch.into());
+            }
+        }
+        if self.queue.inner.release_handoff(running.executor(), false) {
+            self.preemption
+                .lock()
+                .finalize_residency(running.executor());
+            self.recompute_demand();
+        }
+        Ok(())
+    }
+
     /// Relinquish this executor's CPU while retaining its exact task lease.
     pub fn begin_host_wait<'a>(
         &self,
