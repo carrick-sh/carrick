@@ -2331,6 +2331,12 @@ impl DentryCache {
         self.inodes.read().get(&(dev, ino)).copied()
     }
 
+    /// Whether any inode record is currently cached.
+    pub fn has_cached_inodes(&self) -> bool {
+        self.check_fork();
+        !self.inodes.read().is_empty()
+    }
+
     /// Insert or update inode record for `(dev, ino)`.
     pub fn insert_inode_record(&self, dev: u64, ino: u64, record: InodeRecord) {
         self.check_fork();

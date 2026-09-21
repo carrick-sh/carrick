@@ -296,6 +296,7 @@ impl<'a> FsView<'a> {
                                 };
                                 match positioned.host_syscall_errno() {
                                     Ok(positioned) => {
+                                        host_fd.record_absolute_offset(positioned);
                                         DispatchOutcome::returned_offset_or_errno(positioned)
                                     }
                                     Err(errno) => DispatchOutcome::errno(errno),
@@ -331,6 +332,7 @@ impl<'a> FsView<'a> {
                     Ok(r) => r,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 };
+                host_fd.record_absolute_offset(r);
                 return Ok(DispatchOutcome::returned_offset_or_errno(r));
             }
 
@@ -1154,6 +1156,7 @@ impl<'a> FsView<'a> {
                 OpenDescription::HostFile { host_fd, .. } => {
                     let host_fd_raw = host_fd.raw();
                     let host_fd_owner = host_fd.clone();
+                    host_fd_owner.record_sequential_io();
                     drop(open);
                     return read_host_pipe(
                         memory,
@@ -1225,6 +1228,7 @@ impl<'a> FsView<'a> {
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
                 let hfd = host_fd.raw();
                 let owner = Some(host_fd.clone());
+                host_fd.record_sequential_io();
                 if host_wait_ref.is_none() {
                     if let Some(targets) = prepare_readv_targets(memory, &iovecs)? {
                         if targets.host_iovecs.is_empty() {
@@ -2306,6 +2310,9 @@ impl<'a> FsView<'a> {
                     }
                 };
                 let at_current = write_at_current || is_append;
+                if at_current {
+                    host_fd_owner.record_sequential_io();
+                }
                 let old_len = if !at_current {
                     let mut st: libc::stat = unsafe { core::mem::zeroed() };
                     if unsafe { libc::fstat(hfd, &mut st) } == 0 {
@@ -2822,23 +2829,33 @@ impl<'a> FsView<'a> {
                             // host fd isn't opened O_APPEND, so we emulate the
                             // seek-then-write; single-writer, which covers the
                             // shell/dpkg append cases.)
-                            if is_append {
-                                unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
-                            }
-                            #[cfg(feature = "conformance-metrics")]
-                            if let Some(scope) = cx.kernel.kernel().work_scope() {
-                                let _ = scope.add(
-                                    carrick_observability::work_meter::WorkMetric::HostWritePositionQueries,
-                                    1,
-                                );
-                            }
-                            let pos = unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) };
+                            let file_limit = this.fsize_soft_limit();
+                            let sparse_tracking = this.fs.has_host_sparse_extents();
+                            let offset_may_be_nonzero = host_fd.offset_may_be_nonzero();
+                            let pos = if is_append {
+                                unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) }
+                            } else if offset_may_be_nonzero
+                                || file_limit.is_some()
+                                || sparse_tracking
+                            {
+                                #[cfg(feature = "conformance-metrics")]
+                                if let Some(scope) = cx.kernel.kernel().work_scope() {
+                                    let _ = scope.add(
+                                        carrick_observability::work_meter::WorkMetric::HostWritePositionQueries,
+                                        1,
+                                    );
+                                }
+                                unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) }
+                            } else {
+                                0
+                            };
                             let write_offset = (pos >= 0).then_some(pos as u64);
-                            let cur_pos = (!is_append).then_some(write_offset).flatten();
-                            let old_len = if let Some(pos) = cur_pos {
+                            let old_len = if !is_append && offset_may_be_nonzero && pos > 0 {
                                 let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                                if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0 && pos > st.st_size as u64 {
-                                    Some((st.st_size as u64, pos))
+                                if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0
+                                    && (pos as u64) > st.st_size as u64
+                                {
+                                    Some((st.st_size as u64, pos as u64))
                                 } else {
                                     None
                                 }
@@ -2848,15 +2865,7 @@ impl<'a> FsView<'a> {
                             // The offset lives in the host kernel; read it back
                             // (post-append reposition) before applying the
                             // guest's RLIMIT_FSIZE cap.
-                            if this.fsize_soft_limit().is_some() {
-                                    #[cfg(feature = "conformance-metrics")]
-                                if let Some(scope) = cx.kernel.kernel().work_scope() {
-                                    let _ = scope.add(
-                                        carrick_observability::work_meter::WorkMetric::HostWritePositionQueries,
-                                        1,
-                                    );
-                                }
-                                let pos = unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) };
+                            if file_limit.is_some() {
                                 if pos >= 0 {
                                     match this.fsize_write_len(cx, pos as u64, bytes.len()) {
                                         Ok(len) => bytes.truncate(len),
@@ -2875,6 +2884,10 @@ impl<'a> FsView<'a> {
                             };
                             let raw_fd = host_fd.raw();
                             let host_fd_owner = host_fd.clone();
+                            // The write may advance the shared host-file offset.
+                            // Mark it before releasing description authority so
+                            // another alias cannot observe a stale zero proof.
+                            host_fd_owner.record_sequential_io();
                             drop(open);
                             let host_wait_runner = this.host_wait_runner_for_ctx(cx);
                             let host_wait_ref =
@@ -3294,6 +3307,11 @@ impl<'a> FsView<'a> {
                 let host_wait_runner = this.host_wait_runner_for_ctx(cx);
                 let host_wait_ref =
                     host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
+                if let Some(owner) = target.host_fd_owner.as_ref()
+                    && target.write_kind == HostWriteKind::RegularFile
+                {
+                    owner.record_sequential_io();
+                }
                 let outcome = write_host_pipe_owned(
                     bytes,
                     HostPipeWriteTarget::new(
@@ -3603,6 +3621,7 @@ impl<'a> FsView<'a> {
                                     };
                                 let raw_fd = host_fd.raw();
                                 let host_fd_owner = host_fd.clone();
+                                host_fd_owner.record_sequential_io();
                                 let host_wait_runner = this.host_wait_runner_for_ctx(cx);
                                 let host_wait_ref =
                                     host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);

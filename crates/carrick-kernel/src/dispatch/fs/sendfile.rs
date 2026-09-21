@@ -18,6 +18,18 @@ fn darwin_copyfile_fast_path_disabled() -> bool {
 }
 
 impl<'a> FsView<'a> {
+    fn record_host_file_absolute_offset(&self, fd: i32, offset: i64) {
+        let Some(open_file) = self.open_file(fd) else {
+            return;
+        };
+        let Some(open) = open_file.description.read() else {
+            return;
+        };
+        if let OpenDescription::HostFile { host_fd, .. } = &*open {
+            host_fd.record_absolute_offset(offset);
+        }
+    }
+
     /// copy_file_range(2): like sendfile but file-to-file with independent
     /// in/out offset pointers. coreutils `cat`/`cp` and apt/dpkg use it for
     /// efficient copies; it was unimplemented and the panic-on-unknown guard
@@ -83,6 +95,10 @@ impl<'a> FsView<'a> {
                     || !set_host_fd_offset(HostFd(output.host_fd), copied)
                 {
                     return Ok(None);
+                }
+                if let Ok(positioned) = i64::try_from(copied) {
+                    self.record_host_file_absolute_offset(in_fd, positioned);
+                    self.record_host_file_absolute_offset(out_fd, positioned);
                 }
                 Ok(Some(DispatchOutcome::Returned {
                     value: i64::try_from(copied)
@@ -400,7 +416,12 @@ impl<'a> FsView<'a> {
                         // macOS sendfile takes an explicit `offset` and does NOT
                         // advance the file's kernel offset; do it so a follow-up
                         // read/sendfile (no explicit offset) continues correctly.
-                        unsafe { libc::lseek(file_fd.get(), new_off as libc::off_t, libc::SEEK_SET) };
+                        let positioned = unsafe {
+                            libc::lseek(file_fd.get(), new_off as libc::off_t, libc::SEEK_SET)
+                        };
+                        if positioned >= 0 {
+                            this.record_host_file_absolute_offset(in_fd.0, positioned);
+                        }
                     } else if memory
                         .write_bytes(offset_address, &(new_off as u64).to_ne_bytes())
                         .is_err()
@@ -510,8 +531,11 @@ impl<'a> FsView<'a> {
                         OpenDescription::HostFile { host_fd, .. } => {
                             // SAFETY: host_fd is a live regular-file fd owned by
                             // this guest fd; lseek to an absolute position is benign.
-                            unsafe {
-                                libc::lseek(host_fd.raw(), offset as libc::off_t, libc::SEEK_SET);
+                            let positioned = unsafe {
+                                libc::lseek(host_fd.raw(), offset as libc::off_t, libc::SEEK_SET)
+                            };
+                            if positioned >= 0 {
+                                host_fd.record_absolute_offset(positioned);
                             }
                         }
                         _ => {}
@@ -655,9 +679,12 @@ impl<'a> FsView<'a> {
                         | OpenDescription::SyntheticFile { offset, .. }
                         | OpenDescription::ProcExecutable { offset, .. } => *offset = new_in,
                         OpenDescription::HostFile { host_fd, .. } => {
-                            unsafe {
+                            let positioned = unsafe {
                                 libc::lseek(host_fd.raw(), new_in as libc::off_t, libc::SEEK_SET)
                             };
+                            if positioned >= 0 {
+                                host_fd.record_absolute_offset(positioned);
+                            }
                         }
                         _ => {}
                     }

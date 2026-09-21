@@ -201,6 +201,7 @@ pub(in crate::dispatch) struct FsState {
     /// object identity so dup/open/fork aliases observe one layout.
     host_sparse_extents:
         std::sync::Arc<parking_lot::Mutex<HashMap<HostFileIdentity, HostSparseExtents>>>,
+    has_sparse_extents: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -659,6 +660,7 @@ impl FsState {
             hvpatch_exec_cache: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             classic_record_locks: std::sync::Arc::new(super::LogicalRecordLocks::default()),
             host_sparse_extents: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            has_sparse_extents: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -677,11 +679,20 @@ impl FsState {
             hvpatch_exec_cache: std::sync::Arc::clone(&self.hvpatch_exec_cache),
             classic_record_locks: std::sync::Arc::clone(&self.classic_record_locks),
             host_sparse_extents: std::sync::Arc::clone(&self.host_sparse_extents),
+            has_sparse_extents: std::sync::Arc::clone(&self.has_sparse_extents),
         }
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn has_host_sparse_extents(&self) -> bool {
+        self.has_sparse_extents
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(in crate::dispatch) fn reset_host_sparse_extents(&self, fd: i32, len: u64) {
         if let Some(identity) = host_file_identity(fd) {
+            self.has_sparse_extents
+                .store(true, std::sync::atomic::Ordering::Release);
             self.host_sparse_extents
                 .lock()
                 .insert(identity, HostSparseExtents::empty(len));
@@ -694,6 +705,8 @@ impl FsState {
         };
         let mut files = self.host_sparse_extents.lock();
         if len == 0 {
+            self.has_sparse_extents
+                .store(true, std::sync::atomic::Ordering::Release);
             files.insert(identity, HostSparseExtents::empty(0));
         } else if let Some(extents) = files.get_mut(&identity) {
             extents.truncate(len);
@@ -701,10 +714,17 @@ impl FsState {
     }
 
     pub(in crate::dispatch) fn record_host_sparse_write(&self, fd: i32, offset: u64, len: usize) {
+        if !self.has_host_sparse_extents() {
+            return;
+        }
+        let mut extents = self.host_sparse_extents.lock();
+        if extents.is_empty() {
+            return;
+        }
         let Some(identity) = host_file_identity(fd) else {
             return;
         };
-        if let Some(extents) = self.host_sparse_extents.lock().get_mut(&identity) {
+        if let Some(extents) = extents.get_mut(&identity) {
             extents.record_write(offset, len as u64);
         }
     }
@@ -718,9 +738,15 @@ impl FsState {
         offset: u64,
         data: bool,
     ) -> Option<Option<u64>> {
+        if !self.has_host_sparse_extents() {
+            return None;
+        }
+        let extents = self.host_sparse_extents.lock();
+        if extents.is_empty() {
+            return None;
+        }
         let identity = host_file_identity(fd)?;
-        self.host_sparse_extents
-            .lock()
+        extents
             .get(&identity)
             .map(|extents| extents.seek(offset, data))
     }
