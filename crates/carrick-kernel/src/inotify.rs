@@ -1226,7 +1226,10 @@ impl InotifyRegistry {
     ) {
         let key = normalize_watch_path(path);
         let mut inner = self.inner.write();
-        let entry = inner.by_path.entry(key.to_owned()).or_default();
+        let entry = match inner.by_path.get_mut(key) {
+            Some(entry) => entry,
+            None => inner.by_path.entry(key.to_owned()).or_default(),
+        };
         // Re-adding the same (instance, wd) updates the mask in place (inotify
         // returns the same wd for a re-add and replaces the mask).
         if let Some(existing) = entry
