@@ -1520,11 +1520,9 @@ where
         }
         let request = syscall.request;
         let _syscall_guard = kernel.hvpatch_process.as_ref().and_then(|proc| {
-            let (pid, asid) = proc.syscall_trace_identity()?;
             HvpatchSyscallServiceGuard::begin(
-                pid,
+                || proc.syscall_trace_identity(),
                 self.linux_tid.raw(),
-                asid,
                 request.number.raw(),
                 request.args.0,
             )

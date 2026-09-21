@@ -603,3 +603,39 @@ This closes the prior public-gate missing-oracle observation. It does not
 close strict probe closure, the frozen 2,127-suite full gate, or <=2x performance.
 The demonstrated inotify performance violation remains a correctness blocker;
 no smoke/full promotion or parity claim follows from this probe pass.
+
+
+### Disabled service tracing identity cost
+
+The ordinary dispatch path resolved task identity and retained/read-locked the
+MM binding before the USDT enabled check, despite the guard's documented
+predicted-not-taken cost contract. The new lazy producer resolves identity and
+materializes the clock inside the enabled macro expression. A missing identity
+returns without emitting a fabricated begin; the scalar provider ABI and
+begin/args/completion/clear ordering are unchanged. Applicable guest contracts
+remain `kernel.fs.write-seek` and `kernel.inotify.mark-race-hotpath`; the added
+host regression asserts exactly zero identity resolutions with no consumer.
+
+Red evidence: `disabled_syscall_service_does_not_resolve_identity` failed with
+one resolution instead of zero using the eager producer. The initial sandboxed
+compile could not generate DTrace headers and was not semantic red evidence.
+After the lazy change, that test and all 83 observability tests passed. All 24
+VM-free kernel-example contracts passed. The signed enabled trace reconciled
+512,636 service windows with no open windows or join errors; see
+`lazy-service-traced.trace` and `.json`.
+
+Uninstrumented finite dispatch comparison: two warmup and twenty measured ABBA
+blocks, forty samples per artifact, four exposed CPUs, unchanged probe and
+binary hashes. Median block after/before ratio is 0.989704, percentile-bootstrap
+95% interval [0.982084, 0.992882] (10,000 resamples; seed 5634344305327363654).
+Raw observations: `lazy-service-abba.jsonl`. This is only about a 1% improvement;
+it is a bounded disabled-instrumentation fix, not resolution of the pathological
+ratio or evidence that metadata/tracing explains the remaining gap.
+
+New signed CLI SHA-256:
+`a05fb6c4c3dfb6329ff4195f29d86109a8a82e99d1cfda848f450b2bb768d424`;
+CDHash `2a51964d55bf3a0e86c6a9b8c56d9eba839bf757`;
+LC_UUID `4E80856F-613E-3B8E-97BF-DC6FFAD483AD`.
+The build source is e11b87dbf plus this commit's production diff. The previous
+public probe-gate receipt belongs to the pre-fix artifact and cannot promote
+this one. Full signed promotion and <=2x Docker remain open.
