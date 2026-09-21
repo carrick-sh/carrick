@@ -1,0 +1,26 @@
+phase=watch_churn scale=1 samples=21 p50_ns_per_iter=5000 complete=1
+phase=write_seek scale=1 samples=21 p50_ns_per_iter=6416 complete=1
+phase=persistent_watch_write_seek scale=1 samples=21 p50_ns_per_iter=6500 complete=1
+phase=serial_full scale=1 samples=21 p50_ns_per_iter=12458 complete=1
+phase=concurrent_components scale=1 samples=21 p50_ns_per_iter=168083 complete=1
+phase=watch_churn scale=32 samples=21 p50_ns_per_iter=4442 complete=1
+phase=write_seek scale=32 samples=21 p50_ns_per_iter=5587 complete=1
+phase=persistent_watch_write_seek scale=32 samples=21 p50_ns_per_iter=5446 complete=1
+phase=serial_full scale=32 samples=21 p50_ns_per_iter=11691 complete=1
+phase=concurrent_components scale=32 samples=21 p50_ns_per_iter=14730 complete=1
+phase=watch_churn scale=1024 samples=21 p50_ns_per_iter=4712 complete=1
+phase=write_seek scale=1024 samples=21 p50_ns_per_iter=5735 complete=1
+phase=persistent_watch_write_seek scale=1024 samples=21 p50_ns_per_iter=5898 complete=1
+phase=serial_full scale=1024 samples=21 p50_ns_per_iter=11561 complete=1
+phase=concurrent_components scale=1024 samples=21 p50_ns_per_iter=8761 complete=1
+phase=watch_churn scale=8192 samples=21 p50_ns_per_iter=4723 complete=1
+phase=write_seek scale=8192 samples=21 p50_ns_per_iter=5748 complete=1
+phase=persistent_watch_write_seek scale=8192 samples=21 p50_ns_per_iter=5866 complete=1
+phase=serial_full scale=8192 samples=21 p50_ns_per_iter=11556 complete=1
+phase=concurrent_components scale=8192 samples=21 p50_ns_per_iter=8495 complete=1
+phase=watch_churn scale=65536 samples=21 p50_ns_per_iter=4666 complete=1
+phase=write_seek scale=65536 samples=21 p50_ns_per_iter=5713 complete=1
+phase=persistent_watch_write_seek scale=65536 samples=21 p50_ns_per_iter=5792 complete=1
+phase=serial_full scale=65536 samples=21 p50_ns_per_iter=11501 complete=1
+phase=concurrent_components scale=65536 samples=21 p50_ns_per_iter=8467 complete=1
+probe_complete=1
