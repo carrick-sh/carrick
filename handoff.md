@@ -1,5 +1,10 @@
 # Carrick exact conformance closure handoff
 
+> **2026-09-21 handoff:** Read [handoff-inotify09-2026-09-21.md](handoff-inotify09-2026-09-21.md)
+> first for the current artifact, passed public probe gate, native-host cost
+> comparison and remaining blockers. The user requested a handoff; the goal is
+> paused and incomplete. The older checkpoint below retains historical scope.
+
 **Updated:** 2026-08-27 (session 21 — three probe families integrated; clean stopping checkpoint)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
