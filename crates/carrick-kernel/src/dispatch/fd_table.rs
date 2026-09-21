@@ -1558,6 +1558,9 @@ struct HostFdOwner {
     /// write cannot create a hole. The state lives with the host-fd owner so
     /// dup/fork aliases of one Carrick description observe the same value.
     offset_may_be_nonzero: std::sync::atomic::AtomicBool,
+    /// Device/inode identity cannot change while this owned descriptor lives.
+    /// Mutable attributes must still be invalidated after every mutation.
+    inode_identity: std::sync::OnceLock<carrick_vfs::vfs::InodeIdentity>,
 }
 
 /// The OWNED, Arc-refcounted handle to a host kernel fd. The single owner of a
@@ -1589,11 +1592,28 @@ impl HostFdRef {
             fd,
             private_file_source,
             offset_may_be_nonzero: std::sync::atomic::AtomicBool::new(false),
+            inode_identity: std::sync::OnceLock::new(),
         }))
     }
 
     pub(super) fn private_file_source(&self) -> carrick_guest_mem::PrivateFileSource {
         self.0.private_file_source
+    }
+
+    pub(super) fn inode_identity(&self) -> Option<carrick_vfs::vfs::InodeIdentity> {
+        if let Some(identity) = self.0.inode_identity.get() {
+            return Some(*identity);
+        }
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(self.raw(), stat.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let stat = unsafe { stat.assume_init() };
+        let identity = carrick_vfs::vfs::InodeIdentity::new(stat.st_dev as u64, stat.st_ino);
+        // Concurrent first readers may both query the same live descriptor.
+        // They publish the same identity; failures are never cached.
+        let _ = self.0.inode_identity.set(identity);
+        Some(identity)
     }
 
     #[inline]
@@ -3496,6 +3516,22 @@ mod tests {
 
     const SYS_READ: u64 = 63;
     const SYS_FTRUNCATE: u64 = 46;
+
+    #[test]
+    fn owned_inode_identity_survives_path_replacement_and_aliasing() {
+        use std::os::fd::IntoRawFd;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity");
+        let file = std::fs::File::create(&path).unwrap();
+        let owner = HostFdRef::new(file.into_raw_fd());
+        let alias = owner.clone();
+        let identity = owner.inode_identity().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let replacement = HostFdRef::new(std::fs::File::create(&path).unwrap().into_raw_fd());
+        assert_ne!(replacement.inode_identity().unwrap(), identity);
+        drop(owner);
+        assert_eq!(alias.inode_identity().unwrap(), identity);
+    }
 
     #[test]
     fn host_file_offset_proof_is_shared_and_only_zero_is_safe() {

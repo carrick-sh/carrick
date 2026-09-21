@@ -319,7 +319,7 @@ impl<'a> FsView<'a> {
             bytes,
             HostPipeWriteTarget::new(
                 raw_fd,
-                Some(host_fd),
+                Some(host_fd.clone()),
                 nonblocking,
                 HostWriteKind::RegularFile,
                 tid,
@@ -331,7 +331,11 @@ impl<'a> FsView<'a> {
         if let DispatchOutcome::Returned { value } = out
             && value > 0
         {
-            self.invalidate_dentry_host_fd(raw_fd);
+            if self.fs.rootfs_vfs.dentry_cache.has_cached_inodes()
+                && let Some(identity) = host_fd.inode_identity()
+            {
+                self.fs.rootfs_vfs.notify_inode_changed("", Some(identity));
+            }
             let punch_result = if let Some((old_len, pos)) = old_len {
                 punch_unwritten_host_blocks(raw_fd, old_len, pos)
             } else {
