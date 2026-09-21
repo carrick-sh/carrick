@@ -44,7 +44,9 @@ fn binding() -> (
         clock_x10: 0,
         clock_x11: 0,
         clock_x12: 0,
-        reserved: [0; 40],
+        clock_tmp_x16: 0,
+        clock_tmp_x17: 0,
+        reserved: [0; 24],
     });
     let pointer = NonNull::from(mailbox.as_mut());
     let binding = unsafe { MailboxBinding::new(lease, pointer, HvfSyscallTransport::Mailbox) };

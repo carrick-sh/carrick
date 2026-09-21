@@ -320,12 +320,13 @@ impl MailboxBinding {
                 if esr >> 26 != 0x15 {
                     return Ok(None);
                 }
-                for (r, after, off) in [(16, 4, 0usize), (17, 8, 8usize)] {
+                for (r, after) in [(16, 4), (17, 8)] {
                     if pc >= layout.start + after {
-                        let ptr = core::ptr::addr_of!((*mailbox).reserved)
-                            .cast::<u8>()
-                            .add(off)
-                            .cast::<u64>();
+                        let ptr = if r == 16 {
+                            core::ptr::addr_of!((*mailbox).clock_tmp_x16)
+                        } else {
+                            core::ptr::addr_of!((*mailbox).clock_tmp_x17)
+                        };
                         registers.push((r, core::ptr::read_volatile(ptr)));
                     }
                 }
@@ -1006,7 +1007,9 @@ mod tests {
             clock_x10: 0,
             clock_x11: 0,
             clock_x12: 0,
-            reserved: [0; 40],
+            clock_tmp_x16: 0,
+            clock_tmp_x17: 0,
+            reserved: [0; 24],
         });
         let pointer = NonNull::from(mailbox.as_mut());
         let binding = unsafe { MailboxBinding::new(lease, pointer, HvfSyscallTransport::Mailbox) };
@@ -1016,8 +1019,8 @@ mod tests {
     #[test]
     fn kick_normalization_recovers_pre_active_scratch_registers() {
         let (mut binding, mut mailbox) = binding();
-        mailbox.reserved[0..8].copy_from_slice(&0x1616_u64.to_le_bytes());
-        mailbox.reserved[8..16].copy_from_slice(&0x1717_u64.to_le_bytes());
+        mailbox.clock_tmp_x16 = 0x1616;
+        mailbox.clock_tmp_x17 = 0x1717;
         let layout = carrick_mem::memory::clock_handler_layout();
         let restart = binding
             .clock_kick_restart(layout.start + 8, 0x4004, 0xA0000000, 0x15 << 26)
@@ -1257,7 +1260,9 @@ mod tests {
             clock_x10: 0,
             clock_x11: 0,
             clock_x12: 0,
-            reserved: [0; 40],
+            clock_tmp_x16: 0,
+            clock_tmp_x17: 0,
+            reserved: [0; 24],
         });
         let rebuilt_pointer = NonNull::from(rebuilt_mailbox.as_mut());
 
@@ -1305,6 +1310,8 @@ mod tests {
             clock_x10: old_mailbox.clock_x10,
             clock_x11: old_mailbox.clock_x11,
             clock_x12: old_mailbox.clock_x12,
+            clock_tmp_x16: old_mailbox.clock_tmp_x16,
+            clock_tmp_x17: old_mailbox.clock_tmp_x17,
             reserved: old_mailbox.reserved,
         });
         publish_valid_request(&binding, &mut cow_replacement);
@@ -1385,7 +1392,9 @@ mod tests {
             clock_x10: 0,
             clock_x11: 0,
             clock_x12: 0,
-            reserved: [0; 40],
+            clock_tmp_x16: 0,
+            clock_tmp_x17: 0,
+            reserved: [0; 24],
         });
         let old_pointer = NonNull::from(old_mailbox.as_mut());
         let mut binding =
@@ -1435,7 +1444,9 @@ mod tests {
             clock_x10: 0,
             clock_x11: 0,
             clock_x12: 0,
-            reserved: [0; 40],
+            clock_tmp_x16: 0,
+            clock_tmp_x17: 0,
+            reserved: [0; 24],
         });
         let resumed_pointer = NonNull::from(resumed_mailbox.as_mut());
         unsafe {
@@ -1618,7 +1629,9 @@ mod tests {
             clock_x10: 0,
             clock_x11: 0,
             clock_x12: 0,
-            reserved: [0; 40],
+            clock_tmp_x16: 0,
+            clock_tmp_x17: 0,
+            reserved: [0; 24],
         });
         let pointer = NonNull::from(mailbox.as_mut());
         let mut binding =

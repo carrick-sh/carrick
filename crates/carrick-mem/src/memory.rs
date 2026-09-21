@@ -82,6 +82,50 @@
 
 mod el1_clock;
 
+/// Host/EL1 wire layout for one AArch64 syscall mailbox slot.
+///
+/// This type lives beside the code which emits mailbox loads and stores so
+/// every instruction displacement can be derived from a named field. Higher
+/// architecture and VMM layers re-export and operate on this same type.
+#[repr(C, align(64))]
+pub struct Aarch64SyscallMailbox {
+    pub magic: u64,
+    pub version: u32,
+    pub size: u32,
+    pub generation: u64,
+    pub sequence: u64,
+    pub state: std::sync::atomic::AtomicU32,
+    pub trap_kind: u32,
+    pub response_action: u32,
+    pub flags: u32,
+    pub native_nr: u64,
+    pub args: [u64; 6],
+    pub x8: u64,
+    pub resume_pc: u64,
+    pub spsr: u64,
+    pub fp: u64,
+    pub lr: u64,
+    pub sp: u64,
+    pub esr: u64,
+    pub return_value: u64,
+    pub resume_x16: u64,
+    pub resume_x17: u64,
+    pub clock_x9: u64,
+    pub clock_x10: u64,
+    pub clock_x11: u64,
+    pub clock_x12: u64,
+    pub clock_tmp_x16: u64,
+    pub clock_tmp_x17: u64,
+    pub reserved: [u8; 24],
+}
+
+const _: () = assert!(core::mem::size_of::<Aarch64SyscallMailbox>() == 256);
+const _: () = assert!(core::mem::align_of::<Aarch64SyscallMailbox>() == 64);
+
+const fn mailbox_offset(offset: usize) -> u64 {
+    offset as u64
+}
+
 /// Dedicated EL0 clock transport page. Admission remains disabled until runtime
 /// clock policy, asynchronous exit handling, and mapping protection are wired.
 pub const LINUX_EL0_CLOCK_STUB_BASE: u64 = el1_clock::STUB_BASE;
@@ -112,10 +156,14 @@ pub fn is_carrick_el1_clock_handler_va(va: u64) -> bool {
 /// Mailbox clock transaction wire values, tied to the typed protocol upstream.
 pub const AARCH64_SYSCALL_MAILBOX_CLOCK_ACTIVE: u32 = 3;
 pub const CLOCK_FORCE_HOST_BOUNDARY: u32 = 1;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X9: u64 = 184;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X10: u64 = 192;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X11: u64 = 200;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X12: u64 = 208;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X9: u64 =
+    mailbox_offset(core::mem::offset_of!(Aarch64SyscallMailbox, clock_x9));
+pub const AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X10: u64 =
+    mailbox_offset(core::mem::offset_of!(Aarch64SyscallMailbox, clock_x10));
+pub const AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X11: u64 =
+    mailbox_offset(core::mem::offset_of!(Aarch64SyscallMailbox, clock_x11));
+pub const AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X12: u64 =
+    mailbox_offset(core::mem::offset_of!(Aarch64SyscallMailbox, clock_x12));
 /// Includes the completion instruction so interrupted transport state is never
 /// mistaken for ordinary guest code.
 pub fn is_carrick_el0_clock_stub_va(va: u64) -> bool {
@@ -248,25 +296,31 @@ pub const LINUX_IDENTITY_PAGE_BASE: u64 = LINUX_EL1_MAINT_BASE + LINUX_EL1_MAINT
 pub const LINUX_IDENTITY_PAGE_SIZE: u64 = 0x4000;
 pub const LINUX_SYSCALL_MAILBOX_BASE: u64 = LINUX_IDENTITY_PAGE_BASE + LINUX_IDENTITY_PAGE_SIZE;
 pub const LINUX_SYSCALL_MAILBOX_ARENA_SIZE: u64 = 0x1_0000;
-pub const LINUX_SYSCALL_MAILBOX_SLOT_SIZE: u64 = 0x100;
+pub const LINUX_SYSCALL_MAILBOX_SLOT_SIZE: u64 =
+    core::mem::size_of::<Aarch64SyscallMailbox>() as u64;
 pub const LINUX_SYSCALL_MAILBOX_SLOTS: usize = 256;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_SEQUENCE: u64 = 24;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_STATE: u64 = 32;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_TRAP_KIND: u64 = 36;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION: u64 = 40;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_FLAGS: u64 = 44;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_NATIVE_NR: u64 = 48;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_ARGS: u64 = 56;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_X8: u64 = 104;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_RESUME_PC: u64 = 112;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_SPSR: u64 = 120;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_FP: u64 = 128;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_LR: u64 = 136;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_SP: u64 = 144;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_ESR: u64 = 152;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE: u64 = 160;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16: u64 = 168;
-pub const AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17: u64 = 176;
+macro_rules! mailbox_offset_const {
+    ($name:ident, $field:ident) => {
+        pub const $name: u64 = mailbox_offset(core::mem::offset_of!(Aarch64SyscallMailbox, $field));
+    };
+}
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_SEQUENCE, sequence);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_STATE, state);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_TRAP_KIND, trap_kind);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION, response_action);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_FLAGS, flags);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_NATIVE_NR, native_nr);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_ARGS, args);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_X8, x8);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_RESUME_PC, resume_pc);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_SPSR, spsr);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_FP, fp);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_LR, lr);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_SP, sp);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_ESR, esr);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE, return_value);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16, resume_x16);
+mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17, resume_x17);
 const _: () = assert!(LINUX_SYSCALL_MAILBOX_BASE.is_multiple_of(0x4000));
 const _: () = assert!(
     LINUX_SYSCALL_MAILBOX_SLOT_SIZE * LINUX_SYSCALL_MAILBOX_SLOTS as u64
@@ -3417,6 +3471,11 @@ fn enc_movk_xn(reg: u32, imm16: u16, hw: u32) -> u32 {
 fn enc_movk_x0(imm16: u16, hw: u32) -> u32 {
     enc_movk_xn(0, imm16, hw)
 }
+// `ldaddal xs, xt, [xn]`: atomically add xs with acquire-release ordering and
+// return the previous value in xt. Register 31 discards that previous value.
+fn enc_ldaddal_x(rs: u32, rt: u32, rn: u32) -> u32 {
+    0xF8E0_0000 | ((rs & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
 fn enc_ldr_wt_xn(rt: u32, rn: u32, off: u64) -> u32 {
     0xB940_0000 | (((off as u32 / 4) & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F)
 }
@@ -5935,22 +5994,22 @@ mod syscall_mailbox_tests {
             .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
             .collect();
         for (register, offset) in [
-            (0, 56),
-            (1, 64),
-            (2, 72),
-            (3, 80),
-            (4, 88),
-            (5, 96),
-            (8, 48),
-            (8, 104),
-            (29, 128),
-            (30, 136),
+            (0, AARCH64_SYSCALL_MAILBOX_OFF_ARGS),
+            (1, AARCH64_SYSCALL_MAILBOX_OFF_ARGS + 8),
+            (2, AARCH64_SYSCALL_MAILBOX_OFF_ARGS + 16),
+            (3, AARCH64_SYSCALL_MAILBOX_OFF_ARGS + 24),
+            (4, AARCH64_SYSCALL_MAILBOX_OFF_ARGS + 32),
+            (5, AARCH64_SYSCALL_MAILBOX_OFF_ARGS + 40),
+            (8, AARCH64_SYSCALL_MAILBOX_OFF_NATIVE_NR),
+            (8, AARCH64_SYSCALL_MAILBOX_OFF_X8),
+            (29, AARCH64_SYSCALL_MAILBOX_OFF_FP),
+            (30, AARCH64_SYSCALL_MAILBOX_OFF_LR),
         ] {
             assert!(
                 words
                     .iter()
                     .copied()
-                    .any(|word| decode_str_x_sp(word) == Some((register, offset))),
+                    .any(|word| decode_str_x_sp(word) == Some((register, offset as usize))),
                 "missing store x{register} -> mailbox+{offset}"
             );
         }
