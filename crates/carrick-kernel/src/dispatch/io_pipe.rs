@@ -348,6 +348,16 @@ static AR_MAGIC_WRITES: std::sync::LazyLock<parking_lot::Mutex<HashMap<i32, (usi
     std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 static AR_MAGIC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Stream writes may wait for a guest peer to drain or close the endpoint, so
+/// they must lend their executor while the host call runs. A regular-file
+/// write has no guest-driven readiness dependency: running it inline matches a
+/// native host thread and avoids a scheduler/MM handoff around every scalar
+/// write. Slow storage can occupy this executor, but cannot deadlock on guest
+/// progress; other persistent executors remain runnable.
+fn write_requires_host_wait(write_kind: HostWriteKind) -> bool {
+    write_kind != HostWriteKind::RegularFile
+}
+
 fn note_ar_magic_write(host_fd: i32, length: usize) {
     let seq = AR_MAGIC_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     AR_MAGIC_WRITES.lock().insert(host_fd, (length, seq));
@@ -634,7 +644,7 @@ fn write_host_pipe_payload(
                 }
             };
             let mut n = 0isize;
-            if let Some(hw) = host_wait {
+            if let Some(hw) = host_wait.filter(|_| write_requires_host_wait(write_kind)) {
                 hw.run_with_host_wait(&mut || {
                     n = write_fn();
                 })?;
@@ -748,6 +758,19 @@ fn write_host_pipe_payload(
             ));
         }
         return Ok(DispatchOutcome::returned_isize_or_errno(n));
+    }
+}
+
+#[cfg(test)]
+mod host_wait_policy_tests {
+    use super::*;
+
+    #[test]
+    fn regular_file_writes_stay_inline_while_waitable_streams_release_the_executor() {
+        assert!(!write_requires_host_wait(HostWriteKind::RegularFile));
+        assert!(write_requires_host_wait(HostWriteKind::PipeLike));
+        assert!(write_requires_host_wait(HostWriteKind::SocketLike));
+        assert!(write_requires_host_wait(HostWriteKind::Other));
     }
 }
 
