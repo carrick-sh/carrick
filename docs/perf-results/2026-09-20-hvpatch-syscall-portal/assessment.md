@@ -102,3 +102,24 @@ unchanged afterward, and a process inventory found no remaining Carrick guest.
 The signed probe, smoke, and full promotion gates remain open. The next
 attribution must include the fuzzy-sync waiting/clock cost as well as the
 write/seek body before selecting a replacement architecture.
+
+## Post-revert live syscall attribution
+
+On the same signed binary, `inotify-census-revert` ran the digest-pinned LTP
+image with `/bin/sh -c /opt/ltp/testcases/bin/inotify09`, `--fs host`, and
+`--max-traps 0`. The bounded ten-second service census completed with zero
+DTrace errors and a successful required-exit receipt. Counts were 409,310
+watch additions, 409,310 removals, 409,309 seeks, 409,333 writes, and just one
+host-serviced clock call. This supports the EL1 raw-clock path being active
+in the real workload; repeating clock fast-path implementation is not the
+next action. See `inotify-census-revert.trace`. Instrumented timing is not
+performance acceptance evidence.
+
+The subsequent `inotify-hotpath-revert` capture was correctly rejected by
+`--require-script-exit`: its service join reported `mismatch=1`, `complete=0`.
+Its aggregate host-call ratios and durations are not admissible attribution.
+The raw rejected capture is preserved in `inotify-hotpath-rejected.trace` to
+diagnose the instrument before relying on its joins. Both bounded runs left
+no live Carrick guests. Next: repair/replace that join or use independent
+host-call counts before deciding whether host metadata work or exit overhead
+is the next production target.
