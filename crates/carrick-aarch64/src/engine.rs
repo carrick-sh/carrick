@@ -716,43 +716,45 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
     fn try_fast_write(&mut self, frame: &Aarch64SyscallFrame) -> Option<usize> {
         let base = carrick_mem::memory::LINUX_IDENTITY_PAGE_BASE;
-        let mut lease_buf = [0u8; 24];
-        if self
-            .read_into_raw(
-                base + carrick_mem::memory::IDENTITY_OFF_WRITE_LEASE_GATE,
-                &mut lease_buf,
-            )
-            .is_err()
-        {
-            return None;
-        }
-        let gate = u32::from_le_bytes(lease_buf[0..4].try_into().ok()?);
-        if gate != 1 {
-            return None;
-        }
-        let host_fd = i32::from_le_bytes(lease_buf[4..8].try_into().ok()?);
-        let guest_fd = i32::from_le_bytes(lease_buf[16..20].try_into().ok()?);
-        if guest_fd != frame.x0 as i32 || host_fd < 0 {
-            return None;
-        }
-
-        // Verify seek authority is also active for this exact guest fd.
-        let mut seek_buf = [0u8; 20];
+        // The seek authority and write lease fields form a contiguous 44-byte span:
+        // 0x14: SEEK_GATE (4 bytes)
+        // 0x18: SEEK_FD (4 bytes)
+        // 0x1C: padding (4 bytes)
+        // 0x20: SEEK_OFFSET (8 bytes)
+        // 0x28: WRITE_LEASE_GATE (4 bytes)
+        // 0x2C: WRITE_LEASE_HOST_FD (4 bytes)
+        // 0x30: WRITE_LEASE_OFFSET (8 bytes)
+        // 0x38: WRITE_LEASE_GUEST_FD (4 bytes)
+        // 0x3C: WRITE_LEASE_DIRTY (4 bytes)
+        let mut chunk = [0u8; 44];
         if self
             .read_into_raw(
                 base + carrick_mem::memory::IDENTITY_OFF_SEEK_GATE,
-                &mut seek_buf,
+                &mut chunk,
             )
             .is_err()
         {
             return None;
         }
-        let seek_gate = u32::from_le_bytes(seek_buf[0..4].try_into().ok()?);
-        let seek_fd = i32::from_le_bytes(seek_buf[4..8].try_into().ok()?);
-        let cur_seek_off = i64::from_le_bytes(seek_buf[12..20].try_into().ok()?);
-        if seek_gate != 1 || seek_fd != guest_fd || cur_seek_off < 0 {
+
+        let seek_gate = u32::from_le_bytes(chunk[0..4].try_into().ok()?);
+        let seek_fd = i32::from_le_bytes(chunk[4..8].try_into().ok()?);
+        let cur_seek_off = i64::from_le_bytes(chunk[12..20].try_into().ok()?);
+        let write_gate = u32::from_le_bytes(chunk[20..24].try_into().ok()?);
+        let host_fd = i32::from_le_bytes(chunk[24..28].try_into().ok()?);
+        let write_guest_fd = i32::from_le_bytes(chunk[36..40].try_into().ok()?);
+
+        let guest_fd = frame.x0 as i32;
+        if seek_gate != 1
+            || write_gate != 1
+            || seek_fd != guest_fd
+            || write_guest_fd != guest_fd
+            || host_fd < 0
+            || cur_seek_off < 0
+        {
             return None;
         }
+
         let offset = cur_seek_off as u64;
         let buf_gva = frame.x1;
         let count = frame.x2 as usize;
@@ -787,21 +789,19 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         if written < 0 {
             return None;
         }
+
         let new_offset = offset.saturating_add(written as u64);
-        unsafe {
-            libc::lseek(host_fd, new_offset as libc::off_t, libc::SEEK_SET);
-        }
-        let _ = self.write_bytes(
-            base + carrick_mem::memory::IDENTITY_OFF_WRITE_LEASE_OFFSET,
-            &new_offset.to_le_bytes(),
-        );
         let _ = self.write_bytes(
             base + carrick_mem::memory::IDENTITY_OFF_SEEK_OFFSET,
             &(new_offset as i64).to_le_bytes(),
         );
+        let mut lease_update = [0u8; 16];
+        lease_update[0..8].copy_from_slice(&new_offset.to_le_bytes());
+        lease_update[8..12].copy_from_slice(&chunk[36..40]); // preserve guest_fd
+        lease_update[12..16].copy_from_slice(&1_u32.to_le_bytes()); // dirty = 1
         let _ = self.write_bytes(
-            base + carrick_mem::memory::IDENTITY_OFF_WRITE_LEASE_DIRTY,
-            &1_u32.to_le_bytes(),
+            base + carrick_mem::memory::IDENTITY_OFF_WRITE_LEASE_OFFSET,
+            &lease_update,
         );
         Some(written as usize)
     }
