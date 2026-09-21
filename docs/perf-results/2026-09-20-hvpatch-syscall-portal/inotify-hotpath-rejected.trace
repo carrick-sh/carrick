@@ -1,0 +1,220 @@
+INOTIFYHOT1|stack|nr=64|host=fstat64
+
+              0x18d2d343c
+              0x10329af8c
+              0x10329fa84
+              0x10341502c
+              0x103311eb4
+              0x103312464
+              0x10341b788
+              0x10331324c
+              0x103343e48
+              0x103341da4
+              0x103378f28
+              0x10336ed68
+              0x10336fe28
+              0x10336d08c
+              0x1033e9cf8
+              0x1033a023c
+              0x10339e8dc
+              0x1033df0fc
+              0x1034b3218
+              0x103fa3f68
+              0x18d309d00
+              0x18d304cec
+INOTIFYHOT1|stack|nr=64|host=fstat64
+
+              0x18d2d343c
+              0x10329affc
+              0x10329fa84
+              0x10341502c
+              0x103311eb4
+              0x103312464
+              0x10341b788
+              0x10331324c
+              0x103343e48
+              0x103341da4
+              0x103378f28
+              0x10336ed68
+              0x10336fe28
+              0x10336d08c
+              0x1033e9cf8
+              0x1033a023c
+              0x10339e8dc
+              0x1033df0fc
+              0x1034b3218
+              0x103fa3f68
+              0x18d309d00
+              0x18d304cec
+INOTIFYHOT1|stack|nr=64|host=fstat64
+
+              0x18d2d343c
+              0x10329af8c
+              0x10329fa84
+              0x10341502c
+              0x103311eb4
+              0x103312464
+              0x10341b788
+              0x10331324c
+              0x103343e48
+              0x103341da4
+              0x103378f28
+              0x10336ed68
+              0x10336fe28
+              0x10336d08c
+              0x1033e9cf8
+              0x1033a023c
+              0x10339e8dc
+              0x1033df0fc
+              0x1034b3218
+              0x103fa3f68
+              0x18d309d00
+              0x18d304cec
+INOTIFYHOT1|stack|nr=64|host=fstat64
+
+              0x18d2d343c
+              0x10329affc
+              0x10329fa84
+              0x10341502c
+              0x103311eb4
+              0x103312464
+              0x10341b788
+              0x10331324c
+              0x103343e48
+              0x103341da4
+              0x103378f28
+              0x10336ed68
+              0x10336fe28
+              0x10336d08c
+              0x1033e9cf8
+              0x1033a023c
+              0x10339e8dc
+              0x1033df0fc
+              0x1034b3218
+              0x103fa3f68
+              0x18d309d00
+              0x18d304cec
+INOTIFYHOT1|stack|nr=64|host=fstat64
+
+              0x18d2d343c
+              0x10329af8c
+              0x10329fa84
+              0x10341502c
+              0x103311eb4
+              0x103312464
+              0x10341b788
+              0x10331324c
+              0x103343e48
+              0x103341da4
+              0x103378f28
+              0x10336ed68
+              0x10336fe28
+              0x10336d08c
+              0x1033e9cf8
+              0x1033a023c
+              0x10339e8dc
+              0x1033df0fc
+              0x1034b3218
+              0x103fa3f68
+              0x18d309d00
+              0x18d304cec
+INOTIFYHOT1|stack|nr=64|host=fstat64
+
+              0x18d2d343c
+              0x10329affc
+              0x10329fa84
+              0x10341502c
+              0x103311eb4
+              0x103312464
+              0x10341b788
+              0x10331324c
+              0x103343e48
+              0x103341da4
+              0x103378f28
+              0x10336ed68
+              0x10336fe28
+              0x10336d08c
+              0x1033e9cf8
+              0x1033a023c
+              0x10339e8dc
+              0x1033df0fc
+              0x1034b3218
+              0x103fa3f68
+              0x18d309d00
+              0x18d304cec
+INOTIFYHOT1|stack|nr=64|host=fstat64
+
+              0x18d2d343c
+              0x10329af8c
+              0x10329fa84
+              0x10341502c
+              0x103311eb4
+              0x103312464
+              0x10341b788
+              0x10331324c
+              0x103343e48
+              0x103341da4
+              0x103378f28
+              0x10336ed68
+              0x10336fe28
+              0x10336d08c
+              0x1033e9cf8
+              0x1033a023c
+              0x10339e8dc
+              0x1033df0fc
+              0x1034b3218
+              0x103fa3f68
+              0x18d309d00
+              0x18d304cec
+INOTIFYHOT1|stack|nr=64|host=fstat64
+
+              0x18d2d343c
+              0x10329affc
+              0x10329fa84
+              0x10341502c
+              0x103311eb4
+              0x103312464
+              0x10341b788
+              0x10331324c
+              0x103343e48
+              0x103341da4
+              0x103378f28
+              0x10336ed68
+              0x10336fe28
+              0x10336d08c
+              0x1033e9cf8
+              0x1033a023c
+              0x10339e8dc
+              0x1033df0fc
+              0x1034b3218
+              0x103fa3f68
+              0x18d309d00
+              0x18d304cec
+INOTIFYHOT1|bound_s=10|selected=251979|nested=0|mismatch=1|errors=0|complete=0
+INOTIFYHOT1|nr=27|services=218205
+INOTIFYHOT1|nr=28|services=218205
+INOTIFYHOT1|nr=62|services=218205
+INOTIFYHOT1|nr=64|services=218228
+INOTIFYHOT1|nr=28|duration_ns=177728278
+INOTIFYHOT1|nr=62|duration_ns=327623329
+INOTIFYHOT1|nr=27|duration_ns=1453954059
+INOTIFYHOT1|nr=64|duration_ns=1626592945
+INOTIFYHOT1|nr=27|host=listxattr|count=1
+INOTIFYHOT1|nr=28|host=kevent|count=1
+INOTIFYHOT1|nr=28|host=psynch_mutexdrop|count=1
+INOTIFYHOT1|nr=64|host=psynch_cvclrprepost|count=1
+INOTIFYHOT1|nr=64|host=psynch_mutexdrop|count=1
+INOTIFYHOT1|nr=64|host=psynch_mutexwait|count=1
+INOTIFYHOT1|nr=0|host=fstatat64|count=2
+INOTIFYHOT1|nr=0|host=write|count=2
+INOTIFYHOT1|nr=28|host=psynch_cvsignal|count=2
+INOTIFYHOT1|nr=0|host=lseek|count=3
+INOTIFYHOT1|nr=0|host=fstat64|count=4
+INOTIFYHOT1|nr=64|host=psynch_cvwait|count=17
+INOTIFYHOT1|nr=64|host=close|count=20
+INOTIFYHOT1|nr=64|host=fcntl|count=20
+INOTIFYHOT1|nr=64|host=psynch_cvsignal|count=108
+INOTIFYHOT1|nr=62|host=lseek|count=63024
+INOTIFYHOT1|nr=64|host=write|count=63047
+INOTIFYHOT1|nr=27|host=fstatat64|count=126049
+INOTIFYHOT1|nr=64|host=fstat64|count=126050
