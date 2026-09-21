@@ -3726,7 +3726,7 @@ fn write_fstat_ceiling_dispatcher(
     // The lower-EL synchronous vector also sees faults and sysreg traps.  x8
     // can contain a stale syscall number in those frames, so establish SVC64
     // before considering fstat just as the identity shim does.
-    let fallthrough = dispatch + 32;
+    let fallthrough = dispatch + 40;
     put(bytes, dispatch, AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
     put(bytes, dispatch + 4, AARCH64_MRS_ESR_EL1_X16_OPCODE);
     put(bytes, dispatch + 8, AARCH64_LSR_X16_X16_26_OPCODE);
@@ -3742,6 +3742,12 @@ fn write_fstat_ceiling_dispatcher(
         bytes,
         dispatch + 28,
         enc_beq((dispatch + 28) as u64, handler as u64),
+    );
+    put(bytes, dispatch + 32, enc_cmp_x8_imm(57));
+    put(
+        bytes,
+        dispatch + 36,
+        enc_beq((dispatch + 36) as u64, handler as u64),
     );
     put(bytes, fallthrough, AARCH64_HVC_SYSCALL_OPCODE);
     put(bytes, fallthrough + 4, AARCH64_ERET_OPCODE);
@@ -3802,8 +3808,9 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
     let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
     let mut cursor = dispatch;
     const ESR_GUARD_LEN: usize = 6 * 4;
+    let ceiling_syscalls = if fd_ceiling { 2 } else { 0 };
     let fallthrough =
-        dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 2 + usize::from(fd_ceiling)) * 8;
+        dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 2 + ceiling_syscalls) * 8;
     put(&mut bytes, cursor, AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
     put(&mut bytes, cursor + 4, AARCH64_MRS_ESR_EL1_X16_OPCODE);
     put(&mut bytes, cursor + 8, AARCH64_LSR_X16_X16_26_OPCODE);
@@ -3885,11 +3892,18 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
 
     let fstat_handler = lseek_handler + LSEEK_HANDLER_LEN;
     if fd_ceiling {
-        // fstat(80) is argument-bearing, so it has its own guard that preserves
-        // x0..x5 on every host-dispatch fallback.  Unlike the identity entries it
-        // is eligible only when the carrier-global descriptor-ceiling gate is
+        // fstat(80) and close(57) are argument-bearing, so they have their own guard that preserves
+        // x0..x5 on every host-dispatch fallback.  Unlike the identity entries they
+        // are eligible only when the carrier-global descriptor-ceiling gate is
         // explicitly enabled.
         put(&mut bytes, cursor, enc_cmp_x8_imm(80));
+        put(
+            &mut bytes,
+            cursor + 4,
+            enc_beq((cursor + 4) as u64, fstat_handler as u64),
+        );
+        cursor += 8;
+        put(&mut bytes, cursor, enc_cmp_x8_imm(57));
         put(
             &mut bytes,
             cursor + 4,
@@ -4085,7 +4099,8 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
     let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
     let mailbox_entry = if identity_fast_path {
         const ESR_GUARD_LEN: usize = 6 * 4;
-        dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 2 + usize::from(fd_ceiling)) * 8
+        let ceiling_syscalls = if fd_ceiling { 2 } else { 0 };
+        dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 2 + ceiling_syscalls) * 8
     } else {
         dispatch
     };
@@ -4109,7 +4124,7 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
     let non_svc_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
 
-    // A mailbox image with no identity shim still needs the independent fstat
+    // A mailbox image with no identity shim still needs the independent fstat/close
     // ceiling guard.  Put its handler in unused vector-page tail space and
     // branch its fallback directly into the normal mailbox capture below;
     // this retains the configured transport for every ineligible call.
@@ -4121,6 +4136,13 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
             &mut bytes,
             &mut cursor,
             enc_beq(branch_pc as u64, handler as u64),
+        );
+        emit(&mut bytes, &mut cursor, enc_cmp_x8_imm(57));
+        let branch_pc2 = cursor;
+        emit(
+            &mut bytes,
+            &mut cursor,
+            enc_beq(branch_pc2 as u64, handler as u64),
         );
     }
     let mailbox_capture = cursor;
@@ -4553,8 +4575,9 @@ pub fn el1_vectors_bytes_mailbox_clock(identity_fast_path: bool, fd_ceiling: boo
     if identity_fast_path {
         let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
         const ESR_GUARD_LEN: usize = 6 * 4;
+        let ceiling_syscalls = if fd_ceiling { 2 } else { 0 };
         let mailbox_entry =
-            dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 2 + usize::from(fd_ceiling)) * 8;
+            dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 2 + ceiling_syscalls) * 8;
         el1_clock::install(&mut bytes, mailbox_entry);
     }
     bytes
@@ -6725,6 +6748,12 @@ mod el1_shim_tests {
                     .any(|word| { decode_cmp_x8(rd_u32(word, 0)) == Some(80) }),
                 "fstat(80) must reach the carrier ceiling guard before host dispatch"
             );
+            assert!(
+                bytes
+                    .chunks_exact(4)
+                    .any(|word| { decode_cmp_x8(rd_u32(word, 0)) == Some(57) }),
+                "close(57) must reach the carrier ceiling guard before host dispatch"
+            );
         }
         for bytes in [
             el1_vectors_bytes(),
@@ -6737,6 +6766,12 @@ mod el1_shim_tests {
                     .chunks_exact(4)
                     .any(|word| { decode_cmp_x8(rd_u32(word, 0)) == Some(80) }),
                 "universal vector helpers must not dereference an absent carrier control page"
+            );
+            assert!(
+                !bytes
+                    .chunks_exact(4)
+                    .any(|word| { decode_cmp_x8(rd_u32(word, 0)) == Some(57) }),
+                "universal vector helpers must not emit close ceiling without control page"
             );
         }
     }
