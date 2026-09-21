@@ -300,6 +300,9 @@ impl<'a> MemView<'a> {
         let mem = mem_authority_6.lock();
         for &(low, current, _end) in &mem.growdown_ranges {
             if page >= low && page < current {
+                if super::overlaps_el0_clock_stub(page, current - page) {
+                    return None;
+                }
                 let obstacle = mem
                     .dynamic_maps
                     .iter()

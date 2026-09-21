@@ -140,10 +140,8 @@ impl MmapRequest {
 /// EEXIST collision result. Lengths are page-rounded by the syscall boundary.
 /// No VMA lookup or backend work is needed: the reserved ABI span is fixed.
 fn overlaps_clock_stub(address: u64, length: u64) -> Result<bool, LinuxErrno> {
-    let end = address.checked_add(length).ok_or(LINUX_ENOMEM)?;
-    let base = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE;
-    let limit = base + carrick_mem::memory::LINUX_EL0_CLOCK_STUB_SIZE;
-    Ok(length != 0 && address < limit && base < end)
+    address.checked_add(length).ok_or(LINUX_ENOMEM)?;
+    Ok(super::overlaps_el0_clock_stub(address, length))
 }
 
 impl<'a> MemView<'a> {

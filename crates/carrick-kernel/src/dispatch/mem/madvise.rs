@@ -659,6 +659,9 @@ impl<'a> MemView<'a> {
             let Some(end) = align_up_u64(raw_end, page_size) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
+            if super::overlaps_el0_clock_stub(address.0, end - address.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
             let meta = this.madvise_range_meta(address.0, end);
             if meta.covered.is_empty() {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));

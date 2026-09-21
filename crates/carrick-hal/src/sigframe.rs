@@ -219,9 +219,10 @@ pub fn build_sigframe<E: RegAccess + CurrentMmMemory>(
     // (LTP sigaltstack01 deliberately exercises that).
     let frame_bytes = frame.as_bytes();
     let new_sp = signal_frame_stack_pointer(frame.saved_sp, p.altstack, frame_bytes.len())?;
-    if p.altstack.is_some() && !engine.guest_range_is_writable(new_sp, frame_bytes.len()) {
-        // Unwritable alt stack: Linux force_sigsegv -> terminate the
-        // thread-group by SIGSEGV, not a fatal carrick error.
+    if !engine.guest_range_is_writable(new_sp, frame_bytes.len()) {
+        // Any unwritable signal stack is Linux force_sigsegv territory. This
+        // check also prevents the unchecked frame write below from modifying
+        // runtime-owned executable mappings when a guest forges SP_EL0.
         return Err(TrapError::SignalDeliveryFault);
     }
 
