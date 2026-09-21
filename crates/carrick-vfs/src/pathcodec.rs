@@ -57,6 +57,11 @@ fn is_escape_scalar(c: char) -> bool {
 ///
 /// Round-trips: `decode_to_bytes(&encode_bytes(b)) == b` for every `&[u8]`.
 pub fn encode_bytes(bytes: &[u8]) -> String {
+    if bytes.is_ascii() {
+        // SAFETY: is_ascii() ensures valid ASCII (and thus UTF-8), and all bytes
+        // are < 128, which is strictly below ESCAPE_WINDOW_START (0xEE00).
+        return unsafe { std::str::from_utf8_unchecked(bytes) }.to_owned();
+    }
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0usize;
     while i < bytes.len() {
