@@ -24,6 +24,14 @@
  * ratios, and rankings are citable; elapsed time and absolute service latency
  * from this capture are diagnostic. A nested or mismatched service join makes
  * the receipt incomplete and invalidates its host-syscall attribution.
+ * Host entry/return pairs report elapsed timestamp and on-CPU vtimestamp
+ * deltas. Service CPU uses the same vtimestamp clock. Wall time includes
+ * tracing perturbation; do not label wall-minus-CPU as pure scheduler delay.
+ * The ten-second boundary may censor windows: reconcile begins, completions,
+ * clears and open_services, and host counts, returns and open_hosts before
+ * comparing populations. complete=1 validates joins, not zero censoring.
+ * EL1-only syscalls and VM entry/return outside these service windows are not
+ * measured by this script.
  * Join failures emit up to sixteen identity-bearing diagnostics before the
  * existing completeness check rejects the capture; never interpret their
  * aggregate timings as an accepted ranking.
@@ -42,6 +50,7 @@ dtrace:::BEGIN
     errors = 0;
     nested = 0;
     mismatch = 0;
+    host_mismatch = 0;
     stack_samples = 0;
     join_diagnostics = 0;
     begin_diagnostics = 0;
@@ -50,6 +59,8 @@ dtrace:::BEGIN
     self->guest_pid = (int32_t)0;
     self->guest_tid = (int32_t)0;
     self->asid = (uint32_t)0;
+    self->host_active = (int32_t)0;
+    self->host_name = "";
 }
 
 carrick*:::hvpatch-syscall-service-begin
@@ -63,6 +74,9 @@ carrick*:::hvpatch-syscall-service-begin
     self->guest_tid = (int32_t)arg1;
     self->asid = (uint32_t)arg2;
     self->nr = (uint64_t)arg3;
+    self->service_cpu_start = vtimestamp;
+    @service_begins[self->nr] = count();
+    @open_services[self->nr] = sum(1);
     selected++;
     if (begin_diagnostics < 16) {
         printf("INOTIFYHOT1|begin_state|host_pid=%d|host_tid=%d|raw_pid=%d|raw_tid=%d|raw_asid=%u|raw_nr=%llu|active=%d|stored_pid=%d|stored_tid=%d|stored_asid=%u|stored_nr=%llu\n",
@@ -76,7 +90,24 @@ carrick*:::hvpatch-syscall-service-begin
 syscall:::entry
 /(pid == $target || progenyof($target)) && self->active == 1/
 {
+    host_mismatch = host_mismatch || self->host_active == 1;
+    self->host_active = 1;
+    self->host_name = probefunc;
+    self->host_start = timestamp;
+    self->host_cpu_start = vtimestamp;
     @host_syscalls[self->nr, probefunc] = count();
+    @open_hosts[self->nr, probefunc] = sum(1);
+}
+
+syscall:::return
+/(pid == $target || progenyof($target)) && self->host_active == 1/
+{
+    host_mismatch = host_mismatch || self->active != 1 || self->host_name != probefunc;
+    @host_returns[self->nr, probefunc] = count();
+    @host_wall_ns[self->nr, probefunc] = sum(timestamp - self->host_start);
+    @host_cpu_ns[self->nr, probefunc] = sum(vtimestamp - self->host_cpu_start);
+    @open_hosts[self->nr, probefunc] = sum(-1);
+    self->host_active = 2;
 }
 
 syscall::fstat64:entry
@@ -122,8 +153,10 @@ carrick*:::hvpatch-syscall-service
         self->asid == (uint32_t)arg2 &&
         self->nr == (uint64_t)arg3;
     mismatch = mismatch || !this->matches;
+    host_mismatch = host_mismatch || self->host_active == 1;
     @service_count[(uint64_t)arg3] = count();
     @service_duration_ns[(uint64_t)arg3] = sum((uint64_t)arg4);
+    @service_cpu_ns[(uint64_t)arg3] = sum(vtimestamp - self->service_cpu_start);
 }
 
 carrick*:::hvpatch-syscall-service-clear
@@ -136,6 +169,8 @@ carrick*:::hvpatch-syscall-service-clear
     /* Keep allocated thread-local state; zero-clearing every event caused
      * lost join state in sustained captures. Two means inactive. */
     self->active = 2;
+    @service_clears[(uint64_t)arg3] = count();
+    @open_services[(uint64_t)arg3] = sum(-1);
 }
 
 dtrace:::ERROR
@@ -151,15 +186,24 @@ profile:::tick-1s
 profile:::tick-1s
 /seconds >= BOUND_SECONDS/
 {
-    exit(errors == 0 && selected > 0 && !nested && !mismatch ? 0 : 2);
+    exit(errors == 0 && selected > 0 && !nested && !mismatch && !host_mismatch ? 0 : 2);
 }
 
 dtrace:::END
 {
-    this->complete = errors == 0 && selected > 0 && !nested && !mismatch;
+    this->complete = errors == 0 && selected > 0 && !nested && !mismatch && !host_mismatch;
+    printf("INOTIFYHOT1|host_mismatch=%d|boundary_censored=1\n", host_mismatch);
     printf("INOTIFYHOT1|bound_s=%d|selected=%d|nested=%d|mismatch=%d|errors=%d|complete=%d\n",
         BOUND_SECONDS, selected, nested, mismatch, errors, this->complete);
     printa("INOTIFYHOT1|nr=%llu|services=%@d\n", @service_count);
     printa("INOTIFYHOT1|nr=%llu|duration_ns=%@d\n", @service_duration_ns);
     printa("INOTIFYHOT1|nr=%llu|host=%s|count=%@d\n", @host_syscalls);
+    printa("INOTIFYHOT1|nr=%llu|begins=%@d\n", @service_begins);
+    printa("INOTIFYHOT1|nr=%llu|clears=%@d\n", @service_clears);
+    printa("INOTIFYHOT1|nr=%llu|open_services=%@d\n", @open_services);
+    printa("INOTIFYHOT1|nr=%llu|service_cpu_ns=%@d\n", @service_cpu_ns);
+    printa("INOTIFYHOT1|nr=%llu|host=%s|returns=%@d\n", @host_returns);
+    printa("INOTIFYHOT1|nr=%llu|host=%s|wall_ns=%@d\n", @host_wall_ns);
+    printa("INOTIFYHOT1|nr=%llu|host=%s|cpu_ns=%@d\n", @host_cpu_ns);
+    printa("INOTIFYHOT1|nr=%llu|host=%s|open_hosts=%@d\n", @open_hosts);
 }

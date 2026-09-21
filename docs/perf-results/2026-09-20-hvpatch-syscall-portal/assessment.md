@@ -502,3 +502,20 @@ one fstat in the write population. This is a bounded, highly instrumented
 capture, not a runtime-ratio result. Complete per-host-call timing and explicit
 boundary-censored window accounting remain to be added before calling it the
 requested comprehensive timed attribution report.
+
+### First reconciled service and host-call timing
+
+`inotify-timed-host-join.trace` adds host entry/return wall and vtimestamp CPU
+timing, service CPU timing, begin/completion/clear counts, and boundary-open
+counts. All service and host populations reconciled exactly in this capture;
+every open-window count was zero, with no host/service mismatches or DTrace
+errors. This is diagnostic instrumented timing, not a performance gate.
+
+Write service CPU totaled 612,090,352 ns across 180,674 calls; host write CPU
+was 268,485,769 ns (about 44%). Seek service CPU totaled 156,388,964 ns across
+180,650 calls; host lseek CPU was 34,174,029 ns (about 22%). Service wall times
+were much larger, demonstrating substantial tracing/scheduling perturbation;
+wall-minus-CPU must not be called pure scheduler delay. These proportions
+identify both native write cost and non-host-call service work as remaining
+contributors. VM entry/return outside the service window is still unmeasured,
+and this capture does not justify claiming a complete syscall round-trip split.
