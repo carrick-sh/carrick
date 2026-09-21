@@ -1,0 +1,126 @@
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318782|raw_pid=3|raw_tid=3|raw_asid=4|raw_nr=64|active=1|stored_pid=3|stored_tid=3|stored_asid=4|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318782|raw_pid=3|raw_tid=3|raw_asid=4|raw_nr=64|active=1|stored_pid=3|stored_tid=3|stored_asid=4|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318782|raw_pid=3|raw_tid=3|raw_asid=4|raw_nr=64|active=1|stored_pid=3|stored_tid=3|stored_asid=4|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318782|raw_pid=3|raw_tid=3|raw_asid=4|raw_nr=64|active=1|stored_pid=3|stored_tid=3|stored_asid=4|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318783|raw_pid=3|raw_tid=3|raw_asid=4|raw_nr=64|active=1|stored_pid=3|stored_tid=3|stored_asid=4|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318786|raw_pid=6|raw_tid=6|raw_asid=8|raw_nr=27|active=1|stored_pid=6|stored_tid=6|stored_asid=8|stored_nr=27
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318786|raw_pid=6|raw_tid=6|raw_asid=8|raw_nr=28|active=1|stored_pid=6|stored_tid=6|stored_asid=8|stored_nr=28
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318786|raw_pid=6|raw_tid=6|raw_asid=8|raw_nr=27|active=1|stored_pid=6|stored_tid=6|stored_asid=8|stored_nr=27
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318786|raw_pid=6|raw_tid=6|raw_asid=8|raw_nr=28|active=1|stored_pid=6|stored_tid=6|stored_asid=8|stored_nr=28
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318778|raw_pid=5|raw_tid=5|raw_asid=7|raw_nr=64|active=1|stored_pid=5|stored_tid=5|stored_asid=7|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318786|raw_pid=6|raw_tid=6|raw_asid=8|raw_nr=64|active=1|stored_pid=6|stored_tid=6|stored_asid=8|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318779|raw_pid=6|raw_tid=7|raw_asid=8|raw_nr=64|active=1|stored_pid=6|stored_tid=7|stored_asid=8|stored_nr=64
+INOTIFYHOT1|stack|nr=64|host=fstat64
+
+              0x192af643c
+              0x10056f124
+              0x100573cb8
+              0x1007360a8
+              0x1005e6154
+              0x1005e670c
+              0x10073c804
+              0x1005e74f4
+              0x1006180f0
+              0x10061604c
+              0x10064d1d0
+              0x100643010
+              0x1006440d0
+              0x100641334
+              0x1006be098
+              0x1006744e4
+              0x100672b84
+              0x1006a2470
+              0x1007610c0
+              0x101277f28
+              0x192b2cd00
+              0x192b27cec
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318779|raw_pid=6|raw_tid=7|raw_asid=8|raw_nr=62|active=1|stored_pid=6|stored_tid=7|stored_asid=8|stored_nr=62
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318779|raw_pid=6|raw_tid=7|raw_asid=8|raw_nr=64|active=1|stored_pid=6|stored_tid=7|stored_asid=8|stored_nr=64
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318779|raw_pid=6|raw_tid=7|raw_asid=8|raw_nr=62|active=1|stored_pid=6|stored_tid=7|stored_asid=8|stored_nr=62
+INOTIFYHOT1|begin_state|host_pid=18850|host_tid=318782|raw_pid=3|raw_tid=3|raw_asid=4|raw_nr=64|active=1|stored_pid=3|stored_tid=3|stored_asid=4|stored_nr=64
+INOTIFYHOT1|host_mismatch=0|boundary_censored=1
+INOTIFYHOT1|bound_s=10|selected=722435|nested=0|mismatch=0|errors=0|complete=1
+INOTIFYHOT1|nr=28|services=180650
+INOTIFYHOT1|nr=62|services=180650
+INOTIFYHOT1|nr=27|services=180651
+INOTIFYHOT1|nr=64|services=180674
+INOTIFYHOT1|nr=28|duration_ns=871168685
+INOTIFYHOT1|nr=62|duration_ns=974435889
+INOTIFYHOT1|nr=27|duration_ns=1657449265
+INOTIFYHOT1|nr=64|duration_ns=2701086748
+INOTIFYHOT1|nr=27|host=listxattr|count=1
+INOTIFYHOT1|nr=28|host=kevent|count=1
+INOTIFYHOT1|nr=64|host=fstat64|count=1
+INOTIFYHOT1|nr=64|host=psynch_mutexwait|count=1
+INOTIFYHOT1|nr=27|host=fstatat64|count=2
+INOTIFYHOT1|nr=64|host=close|count=20
+INOTIFYHOT1|nr=64|host=fcntl|count=20
+INOTIFYHOT1|nr=64|host=psynch_cvwait|count=20
+INOTIFYHOT1|nr=64|host=psynch_mutexdrop|count=27
+INOTIFYHOT1|nr=64|host=psynch_cvsignal|count=89
+INOTIFYHOT1|nr=62|host=lseek|count=180650
+INOTIFYHOT1|nr=64|host=write|count=180673
+INOTIFYHOT1|nr=28|begins=180650
+INOTIFYHOT1|nr=62|begins=180650
+INOTIFYHOT1|nr=27|begins=180651
+INOTIFYHOT1|nr=64|begins=180674
+INOTIFYHOT1|nr=28|clears=180650
+INOTIFYHOT1|nr=62|clears=180650
+INOTIFYHOT1|nr=27|clears=180651
+INOTIFYHOT1|nr=64|clears=180674
+INOTIFYHOT1|nr=27|open_services=0
+INOTIFYHOT1|nr=28|open_services=0
+INOTIFYHOT1|nr=62|open_services=0
+INOTIFYHOT1|nr=64|open_services=0
+INOTIFYHOT1|nr=28|service_cpu_ns=129425930
+INOTIFYHOT1|nr=62|service_cpu_ns=156388964
+INOTIFYHOT1|nr=27|service_cpu_ns=402666262
+INOTIFYHOT1|nr=64|service_cpu_ns=612090352
+INOTIFYHOT1|nr=27|host=listxattr|returns=1
+INOTIFYHOT1|nr=28|host=kevent|returns=1
+INOTIFYHOT1|nr=64|host=fstat64|returns=1
+INOTIFYHOT1|nr=64|host=psynch_mutexwait|returns=1
+INOTIFYHOT1|nr=27|host=fstatat64|returns=2
+INOTIFYHOT1|nr=64|host=close|returns=20
+INOTIFYHOT1|nr=64|host=fcntl|returns=20
+INOTIFYHOT1|nr=64|host=psynch_cvwait|returns=20
+INOTIFYHOT1|nr=64|host=psynch_mutexdrop|returns=27
+INOTIFYHOT1|nr=64|host=psynch_cvsignal|returns=89
+INOTIFYHOT1|nr=62|host=lseek|returns=180650
+INOTIFYHOT1|nr=64|host=write|returns=180673
+INOTIFYHOT1|nr=28|host=kevent|wall_ns=2791
+INOTIFYHOT1|nr=64|host=psynch_mutexwait|wall_ns=4625
+INOTIFYHOT1|nr=64|host=fstat64|wall_ns=5083
+INOTIFYHOT1|nr=27|host=listxattr|wall_ns=7458
+INOTIFYHOT1|nr=27|host=fstatat64|wall_ns=8625
+INOTIFYHOT1|nr=64|host=fcntl|wall_ns=57208
+INOTIFYHOT1|nr=64|host=psynch_mutexdrop|wall_ns=137916
+INOTIFYHOT1|nr=64|host=close|wall_ns=246000
+INOTIFYHOT1|nr=64|host=psynch_cvsignal|wall_ns=1256961
+INOTIFYHOT1|nr=64|host=psynch_cvwait|wall_ns=3048790
+INOTIFYHOT1|nr=62|host=lseek|wall_ns=421308070
+INOTIFYHOT1|nr=64|host=write|wall_ns=799350425
+INOTIFYHOT1|nr=28|host=kevent|cpu_ns=334
+INOTIFYHOT1|nr=64|host=fstat64|cpu_ns=458
+INOTIFYHOT1|nr=64|host=psynch_mutexwait|cpu_ns=833
+INOTIFYHOT1|nr=27|host=fstatat64|cpu_ns=3167
+INOTIFYHOT1|nr=27|host=listxattr|cpu_ns=4708
+INOTIFYHOT1|nr=64|host=close|cpu_ns=5206
+INOTIFYHOT1|nr=64|host=fcntl|cpu_ns=9330
+INOTIFYHOT1|nr=64|host=psynch_mutexdrop|cpu_ns=37292
+INOTIFYHOT1|nr=64|host=psynch_cvwait|cpu_ns=55417
+INOTIFYHOT1|nr=64|host=psynch_cvsignal|cpu_ns=136218
+INOTIFYHOT1|nr=62|host=lseek|cpu_ns=34174029
+INOTIFYHOT1|nr=64|host=write|cpu_ns=268485769
+INOTIFYHOT1|nr=27|host=fstatat64|open_hosts=0
+INOTIFYHOT1|nr=27|host=listxattr|open_hosts=0
+INOTIFYHOT1|nr=28|host=kevent|open_hosts=0
+INOTIFYHOT1|nr=62|host=lseek|open_hosts=0
+INOTIFYHOT1|nr=64|host=close|open_hosts=0
+INOTIFYHOT1|nr=64|host=fcntl|open_hosts=0
+INOTIFYHOT1|nr=64|host=fstat64|open_hosts=0
+INOTIFYHOT1|nr=64|host=psynch_cvsignal|open_hosts=0
+INOTIFYHOT1|nr=64|host=psynch_cvwait|open_hosts=0
+INOTIFYHOT1|nr=64|host=psynch_mutexdrop|open_hosts=0
+INOTIFYHOT1|nr=64|host=psynch_mutexwait|open_hosts=0
+INOTIFYHOT1|nr=64|host=write|open_hosts=0
