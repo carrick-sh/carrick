@@ -156,6 +156,7 @@ const SYS_KCMP: u64 = 272;
 pub(crate) const IDENTITY_FAST_PATH_SYSCALLS: &[u64] = &[172, 173, 174, 175, 176, 177, 178];
 /// Argument-bearing calls that may be answered by the carrier ceiling guard.
 const FD_CEILING_FAST_PATH_SYSCALLS: &[u64] = &[80];
+const RAW_CLOCK_FAST_PATH_SYSCALLS: &[u64] = &[113];
 
 /// A launch-time syscall-deny table (canonical syscall number -> errno),
 /// consulted at the dispatch-entry seam before any handler. See the module
@@ -320,6 +321,7 @@ impl crate::observe::SyscallObserver for ContainerPolicy {
     fn wants_fast_path_visibility(&self) -> crate::observe::FastPathVisibility {
         if self.denies_any(IDENTITY_FAST_PATH_SYSCALLS)
             || self.denies_any(FD_CEILING_FAST_PATH_SYSCALLS)
+            || self.denies_any(RAW_CLOCK_FAST_PATH_SYSCALLS)
         {
             crate::observe::FastPathVisibility::Required
         } else {
@@ -376,6 +378,17 @@ mod tests {
             policy.wants_fast_path_visibility(),
             crate::observe::FastPathVisibility::Required,
             "fstat denial must remain observable above the descriptor ceiling"
+        );
+    }
+
+    #[test]
+    fn denying_clock_gettime_requires_fast_path_visibility() {
+        use crate::observe::SyscallObserver;
+        let policy = ContainerPolicy::from_entries(vec![(113, LINUX_EPERM)]);
+        assert_eq!(
+            policy.wants_fast_path_visibility(),
+            crate::observe::FastPathVisibility::Required,
+            "raw clock_gettime denial must close the EL1 clock path"
         );
     }
 

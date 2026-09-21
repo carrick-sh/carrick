@@ -53,7 +53,54 @@ pub fn stamp_identity_page_at<M: CurrentMmMemory>(
     // dispatcher answers correctly. A later stamp re-opens it once the
     // identity is real.
     let shim_enabled = identity_gate_word(dispatcher.identity_fast_path_enabled(), id.pid);
-    stamp_identity_values(memory, base, id.pid, shim_enabled)
+    let clock_enabled = clock_gate_word(dispatcher, kernel_context);
+    // Close both independent gates before changing any protected-page state.
+    stamp_clock_gate(memory, base, 0)?;
+    stamp_identity_values(memory, base, id.pid, shim_enabled)?;
+    stamp_clock_gate(memory, base, clock_enabled)
+}
+
+/// The raw CLOCK_MONOTONIC path is valid only for the live system clock and
+/// only when no policy, observer, interceptor, resource budget, or diagnostic
+/// mode requires dispatcher visibility.
+pub fn clock_gate_word(
+    dispatcher: &SyscallDispatcher,
+    kernel_context: &crate::kernel::KernelContext,
+) -> u32 {
+    clock_gate_word_for(
+        crate::syscall_shim_enabled() && dispatcher.identity_fast_path_enabled(),
+        kernel_context.container().clock().is_controlled(),
+        kernel_context.container().budget().is_some(),
+        crate::vdso_policy::raw_clock_fast_path_allowed_for_debug(),
+    )
+}
+
+const fn clock_gate_word_for(
+    dispatch_invisible: bool,
+    controlled_clock: bool,
+    has_resource_budget: bool,
+    debug_allows: bool,
+) -> u32 {
+    if dispatch_invisible && !controlled_clock && !has_resource_budget && debug_allows {
+        1
+    } else {
+        0
+    }
+}
+
+/// Publish the separate raw-clock admission word. Callers close it before a
+/// policy transition and use this helper to retain the release ordering paired
+/// with the vector's acquire load.
+pub fn stamp_clock_gate<M: CurrentMmMemory>(
+    memory: &mut M,
+    base: u64,
+    enabled: u32,
+) -> Result<(), carrick_guest_mem::MemoryError> {
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    memory.write_bytes(
+        base + crate::memory::IDENTITY_OFF_CLOCK_GATE,
+        &enabled.to_le_bytes(),
+    )
 }
 
 /// The value to publish in the identity page's shim gate.
@@ -159,6 +206,19 @@ mod tests {
             0,
             "a caller that disabled the fast path still wins"
         );
+    }
+
+    #[test]
+    fn raw_clock_gate_requires_every_semantic_and_visibility_precondition() {
+        assert_eq!(clock_gate_word_for(true, false, false, true), 1);
+        for closed in [
+            clock_gate_word_for(false, false, false, true),
+            clock_gate_word_for(true, true, false, true),
+            clock_gate_word_for(true, false, true, true),
+            clock_gate_word_for(true, false, false, false),
+        ] {
+            assert_eq!(closed, 0);
+        }
     }
 
     #[test]

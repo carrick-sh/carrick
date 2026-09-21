@@ -30,6 +30,16 @@ fn vdso_debug_mode() -> VdsoDebugMode {
     )
 }
 
+/// Whether raw clock syscalls may use an in-guest fast path under the current
+/// diagnostic mode. Modes that intentionally route clocks or every fast path
+/// through the dispatcher must close the EL1 clock gate too.
+pub(crate) fn raw_clock_fast_path_allowed_for_debug() -> bool {
+    matches!(
+        vdso_debug_mode(),
+        VdsoDebugMode::Full | VdsoDebugMode::NoGetrandom
+    )
+}
+
 fn vdso_debug_mode_from_env(disable: Option<&str>, mode: Option<&str>) -> VdsoDebugMode {
     if debug_env_flag_enabled(disable) {
         return VdsoDebugMode::Disabled;
