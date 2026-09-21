@@ -212,7 +212,22 @@ pub fn run_carrick_backend(
     drain_checked_with_deadline(child, repo_root, &run_id)
 }
 
-/// Run the same direct-ELF VMM command under one internal syscall transport.
+fn hvf_transport_args(probe: &Path, guest_args: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        "run-elf".to_owned(),
+        "--raw".to_owned(),
+        "--exec-backend".to_owned(),
+        "hvpatch".to_owned(),
+        probe.to_string_lossy().into_owned(),
+    ];
+    if !guest_args.is_empty() {
+        args.push("--".to_owned());
+    }
+    args.extend(guest_args.iter().map(|arg| (*arg).to_owned()));
+    args
+}
+
+/// Run the same direct-ELF HVPatch command under one internal syscall transport.
 /// The executable, argv, CPU exposure, and guest artifact remain identical;
 /// only the private transport-selection environment variable changes.
 pub fn run_carrick_hvf_transport(
@@ -225,7 +240,7 @@ pub fn run_carrick_hvf_transport(
     let run_id = std::env::var("CARRICK_HVF_MAILBOX_RUN_ID").unwrap_or_else(|_| perf_run_id());
     let mut command = Command::new(bin);
     command
-        .args(backend_args(CarrickBackend::Hvf, probe, guest_args))
+        .args(hvf_transport_args(probe, guest_args))
         .env("CARRICK_RUN_ID", &run_id)
         .env("CARRICK_EXPOSED_CPUS", CPU_PIN.to_string())
         .env("CARRICK_HVF_SYSCALL_TRANSPORT", transport.env_value());
@@ -409,6 +424,23 @@ mod tests {
     #[test]
     fn injected_probe_snippet_exports_normalized_nproc() {
         assert!(PROBE_SNIPPET.contains("export BENCH_NPROC=4;"));
+    }
+
+    #[test]
+    fn transport_campaign_uses_current_hvpatch_lane() {
+        let args = hvf_transport_args(Path::new("/probe"), &["argument"]);
+        assert_eq!(
+            args,
+            [
+                "run-elf",
+                "--raw",
+                "--exec-backend",
+                "hvpatch",
+                "/probe",
+                "--",
+                "argument"
+            ]
+        );
     }
 
     #[test]
