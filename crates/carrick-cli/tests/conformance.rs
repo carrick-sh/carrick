@@ -2924,7 +2924,7 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// costs and write-completion notifications, bringing the inventory to 542 sources: 514
 /// conformance sources (491 generic, 23 dedicated), 27 performance sources,
 /// and one helper. Both libc lanes gate 1028 rows.
-const PROBE_SOURCE_COUNT: usize = 542;
+const PROBE_SOURCE_COUNT: usize = 543;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
