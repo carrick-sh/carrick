@@ -99,6 +99,22 @@ pub fn write(fd: impl Into<Operand>, data: &[u8]) -> Syscall {
     )
 }
 
+/// `lseek(2)`.
+pub fn lseek(fd: impl Into<Operand>, offset: i64, whence: u64) -> Syscall {
+    call(
+        "lseek",
+        nr::LSEEK,
+        [
+            fd.into(),
+            offset.into(),
+            whence.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
 /// `close(2)`.
 pub fn close(fd: impl Into<Operand>) -> Syscall {
     call(

@@ -1571,6 +1571,14 @@
     "excluded": false,
     "runner": "generic"
   },
+  "perf_inotify09_scale": {
+    "class": "performance",
+    "contract_ids": [
+      "kernel.inotify.mark-race-hotpath"
+    ],
+    "excluded": false,
+    "runner": "generic"
+  },
   "perf_large_meta": {
     "class": "performance",
     "excluded": false,

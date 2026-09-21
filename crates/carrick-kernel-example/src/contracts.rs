@@ -2,7 +2,7 @@
 
 use carrick_abi::{
     LINUX_AT_FDCWD, LINUX_IN_CREATE, LINUX_IN_DELETE, LINUX_IN_MODIFY, LINUX_O_CREAT,
-    LINUX_O_NONBLOCK, LINUX_O_WRONLY,
+    LINUX_O_NONBLOCK, LINUX_O_RDWR, LINUX_O_WRONLY, LINUX_SEEK_SET,
 };
 use carrick_conformance_contract::{
     Completeness, ContractId, ContractObservation, ExecutionLayer, SemanticAssertion,
@@ -554,6 +554,111 @@ pub fn inotify_readiness_scenario(events: usize) -> Result<ContractObservation, 
 /// Conformance contract binding for `kernel.inotify.readiness` at execution layer `VmFree`.
 pub fn inotify_readiness_contract(scale: usize) -> Result<ContractObservation, ExampleError> {
     inotify_readiness_scenario(scale)
+}
+
+/// Run the serial four-syscall body of LTP `inotify09` for `iterations`.
+///
+/// The upstream test executes add-watch/remove-watch on one thread and
+/// write/rewind on another. This VM-free fixture deliberately serializes those
+/// operations so it can assign an exact structural slope to the kernel and VFS
+/// work before the signed timing probe adds concurrency.
+pub fn inotify_hotpath_scenario(iterations: usize) -> Result<ContractObservation, ExampleError> {
+    assert!(iterations >= 1, "iterations must be at least 1");
+    let scratch = tempfile::TempDir::new()
+        .map_err(|e| ExampleError::Script(format!("failed to create tempdir: {e}")))?;
+    let host_backend = HostFsBackend::new_in(scratch.path())
+        .map_err(|e| ExampleError::Script(format!("failed to create host fs backend: {e}")))?;
+
+    let mut script = vec![
+        Step::Sys(
+            sys::openat(
+                LINUX_AT_FDCWD,
+                "/inotify09-stress",
+                (LINUX_O_CREAT | LINUX_O_RDWR) as i32,
+                0o600,
+            )
+            .save(0),
+        ),
+        Step::Sys(sys::inotify_init1(LINUX_O_NONBLOCK as i32).save(1)),
+    ];
+    for _ in 0..iterations {
+        script.extend([
+            Step::Sys(
+                sys::inotify_add_watch(slot(1), "/inotify09-stress", LINUX_IN_MODIFY).save(2),
+            ),
+            Step::Sys(sys::write(slot(0), &[0x5a; 64]).ret(64)),
+            Step::Sys(sys::lseek(slot(0), 0, LINUX_SEEK_SET).ret(0)),
+            Step::Sys(sys::inotify_rm_watch(slot(1), slot(2)).ret(0)),
+        ]);
+    }
+    script.extend([
+        Step::Sys(sys::ioctl_fionread_labeled("queued_bytes", slot(1)).ret(0)),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ]);
+
+    let report = ScriptedBackend::new()
+        .with_fs_backend(Box::new(host_backend))
+        .run_root(script)?;
+    let mut snapshot = report.work_snapshot().clone();
+
+    #[cfg(any(test, debug_assertions))]
+    if std::env::var("CARRICK_CONTRACT_FAULT").as_deref() == Ok("amplified-inotify09-hotpath") {
+        *snapshot
+            .values
+            .entry(WorkMetric::HostBackendCalls)
+            .or_insert(0) += iterations as u64;
+    }
+
+    let queued_bytes = report
+        .outputs()
+        .iter()
+        .find(|output| output.label == "queued_bytes")
+        .and_then(|output| output.bytes.get(..4))
+        .map(|bytes| i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .unwrap_or(-1);
+    let minimum_queued_bytes = i32::try_from(iterations)
+        .unwrap_or(i32::MAX)
+        .saturating_mul(carrick_abi::LINUX_INOTIFY_EVENT_HEADER_SIZE as i32);
+
+    let mut semantic_assertions = Vec::new();
+    if report.exit_code() == 0 {
+        semantic_assertions.push(SemanticAssertion::pass("clean_task_retirement"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "clean_task_retirement",
+            format!("exit code was {}", report.exit_code()),
+        ));
+    }
+    if queued_bytes >= minimum_queued_bytes {
+        semantic_assertions.push(SemanticAssertion::pass("undrained_events_preserved"));
+    } else {
+        semantic_assertions.push(SemanticAssertion::fail(
+            "undrained_events_preserved",
+            format!(
+                "FIONREAD reported {queued_bytes} bytes after {iterations} iterations; expected at least {minimum_queued_bytes}"
+            ),
+        ));
+    }
+
+    let contract_id = ContractId::new("kernel.inotify.mark-race-hotpath")
+        .map_err(|e| ExampleError::Unsupported(format!("invalid contract id: {e}")))?;
+    Ok(ContractObservation {
+        contract_id,
+        layer: ExecutionLayer::VmFree,
+        implementation_revision: env!("CARGO_PKG_VERSION").to_string(),
+        fixture_identity: "probe:perf_inotify09_scale".to_string(),
+        scale: iterations as u64,
+        semantic_assertions,
+        work: Some(snapshot),
+        timing: None,
+        completeness: Completeness::Complete,
+    })
+}
+
+pub fn inotify_hotpath_contract(scale: usize) -> Result<ContractObservation, ExampleError> {
+    inotify_hotpath_scenario(scale)
 }
 
 /// Run a fork memory mappings scenario with `mappings` anonymous unpopulated mappings in the parent.

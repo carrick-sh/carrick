@@ -269,11 +269,10 @@ impl<'a> FsView<'a> {
             LinuxOpenFlags::from_bits_truncate(open_file.description.common().status_flags())
                 .contains(LinuxOpenFlags::APPEND);
         let file_limit = self.fsize_soft_limit();
-        let sparse_tracking = self.fs.has_host_sparse_extents();
         let offset_may_be_nonzero = host_fd.offset_may_be_nonzero();
         let pos = if is_append {
             unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) }
-        } else if offset_may_be_nonzero || file_limit.is_some() || sparse_tracking {
+        } else if offset_may_be_nonzero || file_limit.is_some() {
             #[cfg(feature = "conformance-metrics")]
             if let Some(scope) = cx.kernel.kernel().work_scope() {
                 let _ = scope.add(

@@ -27,3 +27,13 @@ fixture_requirements = ["probe:inotifywrite", "probe:inotifymatrix"]
 related_contracts = ["kernel.fs.write-seek"]
 capability = { class = "vm-free-existing", capability = "carrick-kernel-example::inotify_watch_contract and semantics::inotify_watch" }
 coverage = { status = "bound", layer = "vm-free" }
+
+[[claims]]
+id = "kernel.inotify.mark-race-hotpath.linear-work"
+contract = "kernel.inotify.mark-race-hotpath"
+description = "The four-syscall inotify09 body has exact dispatch and backend-call slopes with no queue scan, continuation park, or preparatory write offset query"
+linux_authority = ["man 2 inotify_add_watch", "man 2 inotify_rm_watch", "man 2 write", "man 2 lseek", "ltp:inotify09.c"]
+fixture_requirements = ["probe:perf_inotify09_scale"]
+related_contracts = ["kernel.inotify.watch", "kernel.inotify.readiness", "kernel.fs.write-seek"]
+capability = { class = "vm-free-existing", capability = "carrick-kernel-example::inotify_hotpath_contract with HostFsBackend" }
+coverage = { status = "bound", layer = "vm-free" }

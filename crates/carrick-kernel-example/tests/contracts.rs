@@ -6,8 +6,8 @@ use carrick_conformance_contract::{ContractRegistry, evaluate};
 use carrick_kernel_example::contracts::{
     fork_filetable_contract, fork_mappings_contract, fork_stage1_image_contract,
     futex_contention_contract, futex_requeue_contract, futex_requeue_scenario,
-    inotify_readiness_contract, inotify_watch_contract, scheduler_cost_contract,
-    scheduler_lifecycle_contract, scheduler_progress_contract,
+    inotify_hotpath_contract, inotify_readiness_contract, inotify_watch_contract,
+    scheduler_cost_contract, scheduler_lifecycle_contract, scheduler_progress_contract,
 };
 use carrick_observability::work_meter::WorkMetric;
 
@@ -258,6 +258,41 @@ fn inotify_readiness_structural_red_control() {
         } => {
             assert_eq!(scale, 1, "smallest affected scale must be 1");
             assert_eq!(metric, WorkMetric::InotifyQueueVisits);
+        }
+        other => panic!("expected ScalingViolation, got: {other:?}"),
+    }
+}
+
+#[test]
+fn inotify09_hotpath_is_semantically_exact_and_linear() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry
+        .require("kernel.inotify.mark-race-hotpath")
+        .expect("contract");
+    let observations = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| inotify_hotpath_contract(scale).expect("observation"))
+        .collect::<Vec<_>>();
+    evaluate(contract, &observations).expect("semantic and structural conformance");
+}
+
+#[test]
+fn inotify09_hotpath_structural_red_control() {
+    if std::env::var("CARRICK_CONTRACT_FAULT").as_deref() != Ok("amplified-inotify09-hotpath") {
+        return;
+    }
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let contract = registry
+        .require("kernel.inotify.mark-race-hotpath")
+        .expect("contract");
+    let observations = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| inotify_hotpath_contract(scale).expect("observation"))
+        .collect::<Vec<_>>();
+    let err = evaluate(contract, &observations).expect_err("fault must violate work slope");
+    match err {
+        carrick_conformance_contract::EvaluationError::ScalingViolation { metric, .. } => {
+            assert_eq!(metric, WorkMetric::HostBackendCalls);
         }
         other => panic!("expected ScalingViolation, got: {other:?}"),
     }
