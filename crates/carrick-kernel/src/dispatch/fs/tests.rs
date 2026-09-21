@@ -6,6 +6,54 @@ use crate::dispatch::dispatcher::FsCrossSubsystem;
 use std::sync::Arc;
 
 #[test]
+fn host_file_lseek_does_not_publish_description_mutation() {
+    use std::os::fd::IntoRawFd;
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let fd = dispatcher
+        .install_fd_at_or_above(
+            3,
+            OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::HostFile {
+                    host_fd: HostFdRef::new(tempfile::tempfile().unwrap().into_raw_fd()),
+                    metadata: RootFsMetadata {
+                        path: "/lseek-revision".into(),
+                        kind: RootFsEntryKind::File,
+                        mode: 0o600,
+                        size: 0,
+                    },
+                    base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                    writable: true,
+                })),
+                LINUX_O_RDWR,
+                0,
+            ),
+        )
+        .unwrap();
+    let open_file = dispatcher.open_file(fd).unwrap();
+    let before = open_file.description.revision_for_test();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 64]);
+    let result = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                62,
+                SyscallArgs::from([fd as u64, 0, LINUX_SEEK_SET as u64, 0, 0, 0]),
+            ),
+            &mut memory,
+            &CompatReporter::default(),
+        )
+        .unwrap();
+    assert_eq!(result, DispatchOutcome::Returned { value: 0 });
+    assert_eq!(
+        open_file.description.revision_for_test(),
+        before,
+        "a host-owned offset change must not publish a Carrick description mutation"
+    );
+}
+
+#[test]
 fn host_flush_injection_is_the_real_dispatch_operation() {
     use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
     use std::sync::atomic::{AtomicUsize, Ordering};
