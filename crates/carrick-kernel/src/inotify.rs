@@ -1150,13 +1150,10 @@ struct RegisteredWatch {
 /// Linux event a coarse kqueue `NOTE_*` can't (`IN_OPEN`/`IN_ACCESS`/per-write
 /// `IN_MODIFY`/`IN_CLOSE_*`, and transient `IN_CREATE`+`IN_DELETE` pairs).
 ///
-/// This complements, and does not replace, the per-instance kqueue/native-
-/// inotify backend: cross-process changes (a forked guest child mutating a
-/// watched directory) are NOT visible here — the child is a separate host
-/// process with its own copy of this in-memory table — so those still flow
-/// through the fork-coherent kqueue path. The registry covers the same-process
-/// operations the kqueue is too coarse for.
-#[derive(Default, Clone)]
+/// This is the payload shared by [`InotifyRegistry`] clones. The native backend
+/// still covers host mutations that do not pass through Carrick's dispatch
+/// hooks; this index supplies the precise events for mutations that do.
+#[derive(Default)]
 struct RegistryInner {
     by_path: HashMap<String, Vec<RegisteredWatch>>,
     by_wd: HashMap<(usize, i32), HashSet<String>>,
@@ -1185,24 +1182,15 @@ impl RegistryInner {
 /// Linux event a coarse kqueue `NOTE_*` can't (`IN_OPEN`/`IN_ACCESS`/per-write
 /// `IN_MODIFY`/`IN_CLOSE_*`, and transient `IN_CREATE`+`IN_DELETE` pairs).
 ///
-/// This complements, and does not replace, the per-instance kqueue/native-
-/// inotify backend: cross-process changes (a forked guest child mutating a
-/// watched directory) are NOT visible here — the child is a separate host
-/// process with its own copy of this in-memory table — so those still flow
-/// through the fork-coherent kqueue path. The registry covers the same-process
-/// operations the kqueue is too coarse for.
-#[derive(Default)]
+/// The unified kernel shares this table across guest fork. An inotify instance
+/// is an inherited open file description: watches added or removed through one
+/// dispatcher must immediately affect sibling dispatchers that inherited it.
+/// The native backend remains necessary for mutations outside Carrick's kernel
+/// graph, including externally modified bind mounts.
+#[derive(Default, Clone)]
 pub struct InotifyRegistry {
     /// Registry inner state: path-indexed watches and reverse (instance, wd) index.
-    inner: parking_lot::RwLock<RegistryInner>,
-}
-
-impl Clone for InotifyRegistry {
-    fn clone(&self) -> Self {
-        Self {
-            inner: parking_lot::RwLock::new(self.inner.read().clone()),
-        }
-    }
+    inner: std::sync::Arc<parking_lot::RwLock<RegistryInner>>,
 }
 
 impl std::fmt::Debug for InotifyRegistry {
@@ -2145,6 +2133,30 @@ mod registry_tests {
         reg.register("/w", &state, wd2, carrick_abi::LINUX_IN_MODIFY);
         reg.notify_self("/w", carrick_abi::LINUX_IN_ATTRIB, true); // not requested
         assert!(state.read_records(4096).expect("read").is_empty());
+    }
+
+    #[test]
+    fn registry_clone_observes_later_watch_and_removal_updates() {
+        let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
+        let parent = InotifyRegistry::default();
+        let child = parent.clone();
+
+        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+        parent.register("/shared", &state, wd, carrick_abi::LINUX_IN_MODIFY);
+        child.notify_self("/shared", carrick_abi::LINUX_IN_MODIFY, false);
+        assert!(
+            !state
+                .read_records(4096)
+                .expect("read child event")
+                .is_empty(),
+            "a forked dispatcher must see watches added through the shared inotify instance"
+        );
+
+        child.unregister(&state, wd);
+        assert!(
+            parent.is_empty(),
+            "removing a shared inotify watch through either dispatcher must update both registries"
+        );
     }
 
     #[test]
