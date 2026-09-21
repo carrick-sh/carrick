@@ -2687,6 +2687,9 @@ impl<'a> ProcView<'a> {
                         if !addr.0.is_multiple_of(8) || ptrace_text_data_addr_is_invalid(addr) {
                             return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
                         }
+                        if super::mem::overlaps_el0_clock_stub(addr.0, 8) {
+                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
+                        }
                         let staged_data = data.to_le_bytes();
                         let remote_va = carrick_guest_mem::GuestVa(addr.0);
                         let mutation_tid = cx.tid();

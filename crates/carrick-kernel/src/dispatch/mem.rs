@@ -65,6 +65,38 @@ pub(crate) use self::fault::*;
 pub(crate) use madvise::MadviseCoveredSegment;
 pub mod backing;
 pub(crate) use self::backing::*;
+
+/// True when a non-empty guest range touches the runtime-owned raw-clock
+/// transport. The span is fixed in every HVPatch MM, so syscall paths which
+/// intentionally bypass ordinary VMA write permissions must consult this too.
+pub(crate) fn overlaps_el0_clock_stub(address: u64, length: u64) -> bool {
+    if length == 0 {
+        return false;
+    }
+    let end = address.checked_add(length).unwrap_or(u64::MAX);
+    let base = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE;
+    let limit = base + carrick_mem::memory::LINUX_EL0_CLOCK_STUB_SIZE;
+    address < limit && base < end
+}
+
+#[cfg(test)]
+mod clock_stub_range_tests {
+    use super::overlaps_el0_clock_stub;
+    use carrick_mem::memory::{
+        LINUX_EL0_CLOCK_STUB_BASE as BASE, LINUX_EL0_CLOCK_STUB_SIZE as SIZE,
+    };
+
+    #[test]
+    fn overlap_guard_covers_edges_and_overflow() {
+        assert!(!overlaps_el0_clock_stub(BASE, 0));
+        assert!(!overlaps_el0_clock_stub(BASE - 8, 8));
+        assert!(overlaps_el0_clock_stub(BASE - 8, 9));
+        assert!(overlaps_el0_clock_stub(BASE, SIZE));
+        assert!(overlaps_el0_clock_stub(BASE + SIZE - 1, 1));
+        assert!(!overlaps_el0_clock_stub(BASE + SIZE, 1));
+        assert!(!overlaps_el0_clock_stub(u64::MAX - 7, 16));
+    }
+}
 // The carrier's boot path installs the private file backings before the
 // first guest instruction, so this one item is `pub` where the rest of the
 // backing glob stays crate-internal.

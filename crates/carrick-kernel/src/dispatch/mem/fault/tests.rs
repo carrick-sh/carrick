@@ -4,6 +4,31 @@ use crate::linux_abi::{LINUX_PAGE_SIZE, LINUX_PROT_READ};
 use crate::memory::LINUX_MMAP_BASE;
 
 #[test]
+fn growdown_cannot_claim_raw_clock_transport() {
+    let dispatcher = SyscallDispatcher::new();
+    let page = dispatcher.linux_page_size();
+    let stub_base = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE;
+    let stub_limit = stub_base + carrick_mem::memory::LINUX_EL0_CLOCK_STUB_SIZE;
+
+    dispatcher.record_growdown_mapping(stub_limit, page * 4);
+    assert!(
+        dispatcher
+            .with_mmap_growdown_fault_plan_for_test(stub_base, |plan| drop(plan))
+            .is_none(),
+        "grow-down expansion must not mint writable stage-1 permissions over the clock stub"
+    );
+
+    let ordinary_start = stub_limit + page * 512;
+    dispatcher.record_growdown_mapping(ordinary_start, page * 4);
+    assert!(
+        dispatcher
+            .with_mmap_growdown_fault_plan_for_test(ordinary_start - page, |plan| drop(plan))
+            .is_some(),
+        "adjacent ordinary grow-down behavior must remain available"
+    );
+}
+
+#[test]
 fn growdown_metadata_is_trimmed_with_mapping_teardown() {
     let dispatcher = SyscallDispatcher::new();
     let page = dispatcher.linux_page_size();
