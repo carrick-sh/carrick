@@ -472,3 +472,14 @@ classified it `FAIL TIMEOUT [blocked]`; both raw streams were inspected. The
 earlier adaptive 23-second cutoff was diagnostic only. No retries were enabled,
 and the cached Linux oracle remains 1/1. The sparse-write optimization therefore
 has measured component impact but does not close the original workload.
+
+The signed `write_seek_contract_budget` binding subsequently passed at scales
+1, 8, 32, 128, with zero preparatory host position queries at every scale.
+The unsigned entitlement negative control passed and both scoped cleanup
+counts were zero. Receipt: `sparse-cache-write-seek-signed.jsonl`. The first
+attempt failed before guest execution because `CARRICK_OBSERVATION_SOURCE`
+was omitted; the qualified invocation supplied SHA-256 of `git archive HEAD`
+at `ff25eef96`,
+`7c88ac4f90d74db502844f61cfad936d358e092c9300deba1883ac54ec20515d`,
+and the pinned LTP image. This is a signed instrumented test artifact, distinct
+from the release CLI timing artifact; it is not full probe-gate acceptance.
