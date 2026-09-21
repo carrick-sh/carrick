@@ -1,0 +1,6 @@
+phase=write_seek scale=1 samples=21 p50_ns_per_iter=500 complete=1
+phase=write_seek scale=32 samples=21 p50_ns_per_iter=503 complete=1
+phase=write_seek scale=1024 samples=21 p50_ns_per_iter=559 complete=1
+phase=write_seek scale=8192 samples=21 p50_ns_per_iter=512 complete=1
+phase=write_seek scale=65536 samples=21 p50_ns_per_iter=449 complete=1
+probe_complete=1

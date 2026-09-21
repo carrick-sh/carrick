@@ -1,0 +1,21 @@
+{
+  "source_head": "4d8f0ac7e",
+  "command": "RUSTC_WRAPPER= CARRICK_RUN_ID=lazy-service-probes just --no-deps conformance-probes",
+  "exit_code": 0,
+  "retained_arm64_passes": {
+    "musl": 33,
+    "gnu": 33
+  },
+  "retained_gnu_gating": false,
+  "log": "target/perf/inotify-sustained/lazy-service-probes.log",
+  "log_sha256": "45387392d4ee76cba56c3813ab48a285e107ae9d242233314e2f11d4bbcc6efd",
+  "cli_sha256": "a05fb6c4c3dfb6329ff4195f29d86109a8a82e99d1cfda848f450b2bb768d424",
+  "cleanup_remaining": {
+    "lazy-service-probes": 0,
+    "lazy-service-probes-cli": 0
+  },
+  "strict_closure_complete": false,
+  "smoke_complete": false,
+  "full_complete": false,
+  "performance_parity": false
+}
