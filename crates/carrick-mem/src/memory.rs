@@ -100,7 +100,9 @@ pub struct Aarch64SyscallMailbox {
     pub flags: u32,
     pub native_nr: u64,
     pub args: [u64; 6],
-    pub x8: u64,
+    /// Portal quantum identity. Ordinary mailbox requests recover x8 from
+    /// `native_nr`, which is the exact SVC-entry x8 value.
+    pub portal_quantum_epoch: u64,
     pub resume_pc: u64,
     pub spsr: u64,
     pub fp: u64,
@@ -116,7 +118,9 @@ pub struct Aarch64SyscallMailbox {
     pub clock_x12: u64,
     pub clock_tmp_x16: u64,
     pub clock_tmp_x17: u64,
-    pub reserved: [u8; 24],
+    pub portal_executor_generation: u64,
+    pub portal_task_serial: u64,
+    pub portal_mm_generation: u64,
 }
 
 const _: () = assert!(core::mem::size_of::<Aarch64SyscallMailbox>() == 256);
@@ -155,6 +159,8 @@ pub fn is_carrick_el1_clock_handler_va(va: u64) -> bool {
 
 /// Mailbox clock transaction wire values, tied to the typed protocol upstream.
 pub const AARCH64_SYSCALL_MAILBOX_CLOCK_ACTIVE: u32 = 3;
+pub const AARCH64_SYSCALL_MAILBOX_PORTAL_ARMED: u32 = 4;
+pub const AARCH64_SYSCALL_MAILBOX_PORTAL_HOST_BOUNDARY: u32 = 5;
 pub const CLOCK_FORCE_HOST_BOUNDARY: u32 = 1;
 pub const AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X9: u64 =
     mailbox_offset(core::mem::offset_of!(Aarch64SyscallMailbox, clock_x9));
@@ -311,7 +317,10 @@ mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION, response_acti
 mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_FLAGS, flags);
 mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_NATIVE_NR, native_nr);
 mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_ARGS, args);
-mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_X8, x8);
+mailbox_offset_const!(
+    AARCH64_SYSCALL_MAILBOX_OFF_PORTAL_QUANTUM_EPOCH,
+    portal_quantum_epoch
+);
 mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_RESUME_PC, resume_pc);
 mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_SPSR, spsr);
 mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_FP, fp);
@@ -321,6 +330,18 @@ mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_ESR, esr);
 mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE, return_value);
 mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16, resume_x16);
 mailbox_offset_const!(AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17, resume_x17);
+mailbox_offset_const!(
+    AARCH64_SYSCALL_MAILBOX_OFF_PORTAL_EXECUTOR_GENERATION,
+    portal_executor_generation
+);
+mailbox_offset_const!(
+    AARCH64_SYSCALL_MAILBOX_OFF_PORTAL_TASK_SERIAL,
+    portal_task_serial
+);
+mailbox_offset_const!(
+    AARCH64_SYSCALL_MAILBOX_OFF_PORTAL_MM_GENERATION,
+    portal_mm_generation
+);
 const _: () = assert!(LINUX_SYSCALL_MAILBOX_BASE.is_multiple_of(0x4000));
 const _: () = assert!(
     LINUX_SYSCALL_MAILBOX_SLOT_SIZE * LINUX_SYSCALL_MAILBOX_SLOTS as u64
@@ -4007,11 +4028,6 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
     emit(
         &mut bytes,
         &mut cursor,
-        enc_str_xt_sp(8, AARCH64_SYSCALL_MAILBOX_OFF_X8),
-    );
-    emit(
-        &mut bytes,
-        &mut cursor,
         enc_str_xt_sp(8, AARCH64_SYSCALL_MAILBOX_OFF_NATIVE_NR),
     );
     emit(
@@ -4070,11 +4086,114 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
         &mut cursor,
         enc_str_wt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION),
     );
+
+    // Portal admission is deliberately exact: only the initial scalar
+    // allowlist, an armed state, and a clear host-boundary latch may avoid HVC.
+    emit(&mut bytes, &mut cursor, enc_cmp_x8_imm(62));
+    let portal_lseek_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+    emit(&mut bytes, &mut cursor, enc_cmp_x8_imm(28));
+    let ordinary_ineligible_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+    let portal_candidate = cursor;
     emit(
         &mut bytes,
         &mut cursor,
-        enc_str_wt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_FLAGS),
+        enc_ldr_wt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_FLAGS),
     );
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(0));
+    let ordinary_forced_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_add_xd_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_STATE as u16),
+    );
+    emit(&mut bytes, &mut cursor, AARCH64_LDAR_W16_X17_OPCODE);
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_cmp_w16_imm(AARCH64_SYSCALL_MAILBOX_PORTAL_ARMED as u16),
+    );
+    let ordinary_disarmed_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+
+    // Publish an eligible portal request and wait only while the exact request
+    // remains owned by the helper. Every uncertain state falls back to HVC.
+    emit(&mut bytes, &mut cursor, enc_movz_w16(1));
+    emit(&mut bytes, &mut cursor, AARCH64_STLR_W16_X17_OPCODE);
+    let portal_wait = cursor;
+    emit(&mut bytes, &mut cursor, AARCH64_LDAR_W16_X17_OPCODE);
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(2));
+    let portal_response_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_cmp_w16_imm(AARCH64_SYSCALL_MAILBOX_PORTAL_HOST_BOUNDARY as u16),
+    );
+    let portal_host_boundary_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(1));
+    let portal_uncertain_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_wt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_FLAGS),
+    );
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(0));
+    let portal_wait_forced_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+    let portal_wait_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+
+    let portal_response = cursor;
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_wt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_FLAGS),
+    );
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(0));
+    let portal_response_forced_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_wt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION),
+    );
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(1));
+    let portal_action_invalid_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(0, AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE),
+    );
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_add_xd_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_STATE as u16),
+    );
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_movz_w16(AARCH64_SYSCALL_MAILBOX_PORTAL_ARMED as u16),
+    );
+    emit(&mut bytes, &mut cursor, AARCH64_STLR_W16_X17_OPCODE);
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16),
+    );
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17),
+    );
+    emit(&mut bytes, &mut cursor, AARCH64_ERET_OPCODE);
+
+    let ordinary_publish = cursor;
     emit(
         &mut bytes,
         &mut cursor,
@@ -4082,6 +4201,7 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
     );
     emit(&mut bytes, &mut cursor, enc_movz_w16(1));
     emit(&mut bytes, &mut cursor, AARCH64_STLR_W16_X17_OPCODE);
+    let portal_hvc = cursor;
     // The request used x16/x17 as publication scratch. Put the guest's original
     // values back into the live register file before trapping so a normal mailbox
     // response can preserve them without any host register API calls. Exceptional
@@ -4129,6 +4249,9 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
     emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(2));
     let prepared_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(3));
+    let arm_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
     let invalid_action_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
 
@@ -4141,8 +4264,18 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
     let normal_finalize_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
 
+    let armed_normal_return = cursor;
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(0, AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE),
+    );
+    let armed_finalize_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+
     let finalize = cursor;
     emit(&mut bytes, &mut cursor, enc_movz_w16(0));
+    let publish_final_state = cursor;
     emit(&mut bytes, &mut cursor, AARCH64_STLR_W16_X17_OPCODE);
     emit(
         &mut bytes,
@@ -4155,6 +4288,15 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
         enc_ldr_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17),
     );
     emit(&mut bytes, &mut cursor, AARCH64_ERET_OPCODE);
+
+    let finalize_armed = cursor;
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_movz_w16(AARCH64_SYSCALL_MAILBOX_PORTAL_ARMED as u16),
+    );
+    let finalize_armed_publish_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
 
     let legacy_hvc = cursor;
     emit(&mut bytes, &mut cursor, AARCH64_HVC_SYSCALL_OPCODE);
@@ -4174,6 +4316,61 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
     }
     put(
         &mut bytes,
+        portal_lseek_branch,
+        enc_beq(portal_lseek_branch as u64, portal_candidate as u64),
+    );
+    put(
+        &mut bytes,
+        ordinary_ineligible_branch,
+        enc_bne(ordinary_ineligible_branch as u64, ordinary_publish as u64),
+    );
+    put(
+        &mut bytes,
+        ordinary_forced_branch,
+        enc_bne(ordinary_forced_branch as u64, ordinary_publish as u64),
+    );
+    put(
+        &mut bytes,
+        ordinary_disarmed_branch,
+        enc_bne(ordinary_disarmed_branch as u64, ordinary_publish as u64),
+    );
+    put(
+        &mut bytes,
+        portal_response_branch,
+        enc_beq(portal_response_branch as u64, portal_response as u64),
+    );
+    put(
+        &mut bytes,
+        portal_host_boundary_branch,
+        enc_beq(portal_host_boundary_branch as u64, portal_hvc as u64),
+    );
+    put(
+        &mut bytes,
+        portal_uncertain_branch,
+        enc_bne(portal_uncertain_branch as u64, portal_hvc as u64),
+    );
+    put(
+        &mut bytes,
+        portal_wait_forced_branch,
+        enc_bne(portal_wait_forced_branch as u64, portal_hvc as u64),
+    );
+    put(
+        &mut bytes,
+        portal_wait_branch,
+        enc_b(portal_wait_branch as u64, portal_wait as u64),
+    );
+    put(
+        &mut bytes,
+        portal_response_forced_branch,
+        enc_bne(portal_response_forced_branch as u64, portal_hvc as u64),
+    );
+    put(
+        &mut bytes,
+        portal_action_invalid_branch,
+        enc_bne(portal_action_invalid_branch as u64, portal_hvc as u64),
+    );
+    put(
+        &mut bytes,
         invalid_state_branch,
         enc_bne(invalid_state_branch as u64, invalid_state as u64),
     );
@@ -4189,6 +4386,11 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
     );
     put(
         &mut bytes,
+        arm_branch,
+        enc_beq(arm_branch as u64, armed_normal_return as u64),
+    );
+    put(
+        &mut bytes,
         invalid_action_branch,
         enc_b(invalid_action_branch as u64, invalid_action as u64),
     );
@@ -4196,6 +4398,19 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
         &mut bytes,
         normal_finalize_branch,
         enc_b(normal_finalize_branch as u64, finalize as u64),
+    );
+    put(
+        &mut bytes,
+        armed_finalize_branch,
+        enc_b(armed_finalize_branch as u64, finalize_armed as u64),
+    );
+    put(
+        &mut bytes,
+        finalize_armed_publish_branch,
+        enc_b(
+            finalize_armed_publish_branch as u64,
+            publish_final_state as u64,
+        ),
     );
 
     debug_assert!(cursor <= MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE);
@@ -6001,7 +6216,6 @@ mod syscall_mailbox_tests {
             (4, AARCH64_SYSCALL_MAILBOX_OFF_ARGS + 32),
             (5, AARCH64_SYSCALL_MAILBOX_OFF_ARGS + 40),
             (8, AARCH64_SYSCALL_MAILBOX_OFF_NATIVE_NR),
-            (8, AARCH64_SYSCALL_MAILBOX_OFF_X8),
             (29, AARCH64_SYSCALL_MAILBOX_OFF_FP),
             (30, AARCH64_SYSCALL_MAILBOX_OFF_LR),
         ] {
@@ -6083,6 +6297,39 @@ mod syscall_mailbox_tests {
                 >= 2,
             "invalid state and response action must each fail loud"
         );
+    }
+
+    #[test]
+    fn disabled_portal_routes_eligible_syscall_to_existing_hvc() {
+        let bytes = el1_vectors_bytes_mailbox(false);
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
+            .collect();
+        let compare = words
+            .iter()
+            .position(|word| *word == enc_cmp_x8_imm(62))
+            .expect("lseek portal eligibility compare");
+        assert_eq!(words[compare + 2], enc_cmp_x8_imm(28));
+        assert_eq!(
+            words[compare + 9],
+            enc_cmp_w16_imm(AARCH64_SYSCALL_MAILBOX_PORTAL_ARMED as u16)
+        );
+
+        let branch_index = compare + 10;
+        let instruction = words[branch_index];
+        assert_eq!(instruction & 0xff00_001f, 0x5400_0001, "expected b.ne");
+        let imm19 = ((instruction >> 5) & 0x7ffff) as i32;
+        let signed = (imm19 << 13) >> 13;
+        let target = usize::try_from(branch_index as i64 + i64::from(signed))
+            .expect("forward ordinary-HVC target");
+        assert_eq!(
+            words[target],
+            enc_add_xd_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_STATE as u16)
+        );
+        assert_eq!(words[target + 1], enc_movz_w16(1));
+        assert_eq!(words[target + 2], AARCH64_STLR_W16_X17_OPCODE);
+        assert_eq!(words[target + 5], AARCH64_HVC_SYSCALL_OPCODE);
     }
 
     #[test]

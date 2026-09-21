@@ -7,7 +7,7 @@ use carrick_fatal::carrick_fatal;
 use carrick_aarch64::mailbox::{
     AARCH64_SYSCALL_MAILBOX_MAGIC, AARCH64_SYSCALL_MAILBOX_SIZE, AARCH64_SYSCALL_MAILBOX_VERSION,
     Aarch64SyscallMailbox, MailboxProtocolError, MailboxRequestMetadata, MailboxResponseAction,
-    MailboxState, validate_request_metadata,
+    MailboxState, PortalSessionWire, PortalState, validate_request_metadata,
 };
 use carrick_guest_mem::Aarch64SyscallFrame;
 use carrick_hal::threaded::Aarch64SyscallContinuationV1;
@@ -179,6 +179,29 @@ pub enum MailboxConsumeError {
     NotParked,
     #[error("AArch64 syscall mailbox binding has no live slot")]
     NoLiveSlot,
+    #[error("stale portal session: expected {expected:?}, got {actual:?}")]
+    StalePortalSession {
+        expected: PortalSessionWire,
+        actual: PortalSessionWire,
+    },
+    #[error("stale portal sequence: expected {expected}, got {actual}")]
+    StalePortalSequence { expected: u64, actual: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortalSnapshot {
+    pub mailbox_generation: u64,
+    pub sequence: u64,
+    pub state: PortalState,
+    pub session: PortalSessionWire,
+    pub native_nr: u64,
+    pub args: [u64; 6],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortalResponse {
+    Returned(i64),
+    HostBoundary,
 }
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -225,6 +248,243 @@ pub struct ClockKickRestart {
 }
 
 impl MailboxBinding {
+    fn require_live_generation(&self, expected_generation: u64) -> Result<(), MailboxConsumeError> {
+        if self.lease.is_none() {
+            return Err(MailboxConsumeError::NoLiveSlot);
+        }
+        let actual = self.generation;
+        if expected_generation != actual {
+            return Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::StaleGeneration {
+                    expected: actual,
+                    actual: expected_generation,
+                },
+            ));
+        }
+        // SAFETY: the live binding owns the complete slot for this generation.
+        let wire_generation = unsafe {
+            core::ptr::read_volatile(core::ptr::addr_of!((*self.host.as_ptr()).generation))
+        };
+        if wire_generation != actual {
+            return Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::StaleGeneration {
+                    expected: actual,
+                    actual: wire_generation,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn write_portal_session(&self, session: PortalSessionWire) {
+        // SAFETY: callers hold host ownership of a disabled or response-ready
+        // slot and publish the state only after these identity words.
+        unsafe {
+            let mailbox = self.host.as_ptr();
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).portal_executor_generation),
+                session.executor_generation,
+            );
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).portal_task_serial),
+                session.task_serial,
+            );
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).portal_mm_generation),
+                session.mm_generation,
+            );
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).portal_quantum_epoch),
+                session.quantum_epoch,
+            );
+        }
+    }
+
+    fn read_portal_session(&self) -> PortalSessionWire {
+        // SAFETY: an acquire state load precedes every caller and the binding
+        // owns this complete slot.
+        unsafe {
+            let mailbox = self.host.as_ptr();
+            PortalSessionWire {
+                executor_generation: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*mailbox).portal_executor_generation
+                )),
+                task_serial: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*mailbox).portal_task_serial
+                )),
+                mm_generation: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*mailbox).portal_mm_generation
+                )),
+                quantum_epoch: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*mailbox).portal_quantum_epoch
+                )),
+            }
+        }
+    }
+
+    pub fn arm_portal(
+        &mut self,
+        expected_generation: u64,
+        session: PortalSessionWire,
+    ) -> Result<(), MailboxConsumeError> {
+        self.require_live_generation(expected_generation)?;
+        let state = self.state().load(Ordering::Acquire);
+        match PortalState::try_from(state) {
+            Ok(PortalState::Disabled) => {
+                self.write_portal_session(session);
+                self.state()
+                    .store(PortalState::Armed.raw(), Ordering::Release);
+                Ok(())
+            }
+            Ok(PortalState::ResponseReady) => {
+                // SAFETY: the acquire observes the complete host response.
+                let action = unsafe {
+                    core::ptr::read_volatile(core::ptr::addr_of!(
+                        (*self.host.as_ptr()).response_action
+                    ))
+                };
+                if action != MailboxResponseAction::NormalReturn.raw() {
+                    return Err(MailboxConsumeError::Protocol(
+                        MailboxProtocolError::UnknownResponseAction(action),
+                    ));
+                }
+                self.write_portal_session(session);
+                // SAFETY: ResponseReady gives the stopped owner exclusive
+                // authority over the response payload before vCPU resume.
+                unsafe {
+                    self.write_volatile(
+                        core::ptr::addr_of_mut!((*self.host.as_ptr()).response_action),
+                        MailboxResponseAction::NormalReturnAndArmPortal.raw(),
+                    );
+                }
+                Ok(())
+            }
+            _ => Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::UnexpectedState {
+                    expected: MailboxState::Idle,
+                    actual: state,
+                },
+            )),
+        }
+    }
+
+    pub fn cancel_portal(
+        &mut self,
+        expected_generation: u64,
+        next_quantum_epoch: u64,
+    ) -> Result<(), MailboxConsumeError> {
+        self.require_live_generation(expected_generation)?;
+        let state = self.state().load(Ordering::Acquire);
+        let portal_state = PortalState::try_from(state).map_err(|unknown| {
+            MailboxConsumeError::Protocol(MailboxProtocolError::UnexpectedState {
+                expected: MailboxState::Idle,
+                actual: unknown.0,
+            })
+        })?;
+        if !matches!(
+            portal_state,
+            PortalState::Armed | PortalState::RequestReady | PortalState::ResponseReady
+        ) {
+            return Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::UnexpectedState {
+                    expected: MailboxState::Idle,
+                    actual: state,
+                },
+            ));
+        }
+        self.state()
+            .store(PortalState::Cancelling.raw(), Ordering::Release);
+        // SAFETY: cancellation owns the session identity after the helper has
+        // been joined by the runtime owner.
+        unsafe {
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*self.host.as_ptr()).portal_quantum_epoch),
+                next_quantum_epoch,
+            );
+        }
+        self.state()
+            .store(PortalState::Disabled.raw(), Ordering::Release);
+        Ok(())
+    }
+
+    pub fn portal_snapshot(
+        &self,
+        expected_generation: u64,
+    ) -> Result<PortalSnapshot, MailboxConsumeError> {
+        self.require_live_generation(expected_generation)?;
+        let state = self.state().load(Ordering::Acquire);
+        let state = PortalState::try_from(state).map_err(|unknown| {
+            MailboxConsumeError::Protocol(MailboxProtocolError::UnexpectedState {
+                expected: MailboxState::RequestReady,
+                actual: unknown.0,
+            })
+        })?;
+        // SAFETY: the acquire state load observes the guest publication.
+        unsafe {
+            let mailbox = self.host.as_ptr();
+            Ok(PortalSnapshot {
+                mailbox_generation: expected_generation,
+                sequence: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
+                state,
+                session: self.read_portal_session(),
+                native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
+                args: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).args)),
+            })
+        }
+    }
+
+    pub fn publish_portal_response(
+        &self,
+        expected_generation: u64,
+        expected_sequence: u64,
+        expected_session: PortalSessionWire,
+        response: PortalResponse,
+    ) -> Result<(), MailboxConsumeError> {
+        let snapshot = self.portal_snapshot(expected_generation)?;
+        if snapshot.state != PortalState::RequestReady {
+            return Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::UnexpectedState {
+                    expected: MailboxState::RequestReady,
+                    actual: snapshot.state.raw(),
+                },
+            ));
+        }
+        if snapshot.sequence != expected_sequence {
+            return Err(MailboxConsumeError::StalePortalSequence {
+                expected: expected_sequence,
+                actual: snapshot.sequence,
+            });
+        }
+        if snapshot.session != expected_session {
+            return Err(MailboxConsumeError::StalePortalSession {
+                expected: expected_session,
+                actual: snapshot.session,
+            });
+        }
+        match response {
+            PortalResponse::Returned(value) => {
+                // SAFETY: validated RequestReady transfers response ownership
+                // to this exact helper session.
+                unsafe {
+                    self.write_volatile(
+                        core::ptr::addr_of_mut!((*self.host.as_ptr()).return_value),
+                        value as u64,
+                    );
+                    self.write_volatile(
+                        core::ptr::addr_of_mut!((*self.host.as_ptr()).response_action),
+                        MailboxResponseAction::NormalReturn.raw(),
+                    );
+                }
+                self.state()
+                    .store(PortalState::ResponseReady.raw(), Ordering::Release);
+            }
+            PortalResponse::HostBoundary => self
+                .state()
+                .store(PortalState::HostBoundary.raw(), Ordering::Release),
+        }
+        Ok(())
+    }
+
     /// The owning vCPU must be stopped throughout this operation.
     pub fn force_clock_host_boundary(&mut self) -> Result<(), MailboxConsumeError> {
         if self.lease.is_none() {
@@ -283,7 +543,7 @@ impl MailboxBinding {
                 registers.extend([
                     (
                         8,
-                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).x8)),
+                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
                     ),
                     (
                         9,
@@ -459,7 +719,7 @@ impl MailboxBinding {
                 flags: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).flags)),
                 native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
                 args: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).args)),
-                x8: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).x8)),
+                x8: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
                 resume_pc: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_pc)),
                 spsr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).spsr)),
                 fp: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).fp)),
@@ -498,7 +758,6 @@ impl MailboxBinding {
                 parked.native_nr,
             );
             self.write_volatile(core::ptr::addr_of_mut!((*mailbox).args), parked.args);
-            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).x8), parked.x8);
             self.write_volatile(
                 core::ptr::addr_of_mut!((*mailbox).resume_pc),
                 parked.resume_pc,
@@ -747,7 +1006,7 @@ impl MailboxBinding {
                     x3: args[3],
                     x4: args[4],
                     x5: args[5],
-                    x8: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).x8)),
+                    x8: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
                 },
                 native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
                 resume_pc: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_pc)),
@@ -879,7 +1138,10 @@ impl MailboxBinding {
             ));
         }
         match MailboxResponseAction::try_from(action) {
-            Ok(MailboxResponseAction::NormalReturn) => Ok(Some(value as i64)),
+            Ok(
+                MailboxResponseAction::NormalReturn
+                | MailboxResponseAction::NormalReturnAndArmPortal,
+            ) => Ok(Some(value as i64)),
             Ok(MailboxResponseAction::RegistersPrepared) => Ok(None),
             Err(unknown) => Err(MailboxConsumeError::Protocol(
                 MailboxProtocolError::UnknownResponseAction(unknown.0),
@@ -993,7 +1255,7 @@ mod tests {
             flags: 0,
             native_nr: 0,
             args: [0; 6],
-            x8: 0,
+            portal_quantum_epoch: 0,
             resume_pc: 0,
             spsr: 0,
             fp: 0,
@@ -1009,11 +1271,131 @@ mod tests {
             clock_x12: 0,
             clock_tmp_x16: 0,
             clock_tmp_x17: 0,
-            reserved: [0; 24],
+            portal_executor_generation: 0,
+            portal_task_serial: 0,
+            portal_mm_generation: 0,
         });
         let pointer = NonNull::from(mailbox.as_mut());
         let binding = unsafe { MailboxBinding::new(lease, pointer, HvfSyscallTransport::Mailbox) };
         (binding, mailbox)
+    }
+
+    fn portal_session() -> PortalSessionWire {
+        PortalSessionWire {
+            executor_generation: 11,
+            task_serial: 22,
+            mm_generation: 33,
+            quantum_epoch: 44,
+        }
+    }
+
+    #[test]
+    fn portal_binding_rejects_stale_identity_and_sequence() {
+        let (mut binding, mut mailbox) = binding();
+        let generation = binding.generation();
+        let session = portal_session();
+        binding.arm_portal(generation, session).expect("arm");
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            PortalState::Armed.raw()
+        );
+
+        mailbox.sequence = 7;
+        mailbox.native_nr = 62;
+        mailbox.args = [9, 0, 0, 0, 0, 0];
+        mailbox
+            .state
+            .store(PortalState::RequestReady.raw(), Ordering::Release);
+        let snapshot = binding.portal_snapshot(generation).expect("snapshot");
+        assert_eq!(snapshot.session, session);
+        assert_eq!((snapshot.sequence, snapshot.native_nr), (7, 62));
+
+        for stale in [
+            PortalSessionWire {
+                executor_generation: session.executor_generation + 1,
+                ..session
+            },
+            PortalSessionWire {
+                task_serial: session.task_serial + 1,
+                ..session
+            },
+            PortalSessionWire {
+                mm_generation: session.mm_generation + 1,
+                ..session
+            },
+            PortalSessionWire {
+                quantum_epoch: session.quantum_epoch + 1,
+                ..session
+            },
+        ] {
+            assert!(matches!(
+                binding.publish_portal_response(
+                    generation,
+                    snapshot.sequence,
+                    stale,
+                    PortalResponse::Returned(9)
+                ),
+                Err(MailboxConsumeError::StalePortalSession { .. })
+            ));
+        }
+        assert!(matches!(
+            binding.publish_portal_response(
+                generation,
+                snapshot.sequence + 1,
+                session,
+                PortalResponse::Returned(9)
+            ),
+            Err(MailboxConsumeError::StalePortalSequence { .. })
+        ));
+        binding
+            .publish_portal_response(
+                generation,
+                snapshot.sequence,
+                session,
+                PortalResponse::Returned(9),
+            )
+            .expect("response");
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            PortalState::ResponseReady.raw()
+        );
+        assert_eq!(mailbox.return_value, 9);
+
+        assert!(matches!(
+            binding.portal_snapshot(generation + 1),
+            Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::StaleGeneration { .. }
+            ))
+        ));
+        binding
+            .cancel_portal(generation, session.quantum_epoch + 1)
+            .expect("cancel");
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            PortalState::Disabled.raw()
+        );
+        assert_eq!(mailbox.portal_quantum_epoch, session.quantum_epoch + 1);
+    }
+
+    #[test]
+    fn ordinary_response_can_arm_the_next_portal_request() {
+        let (mut binding, mut mailbox) = binding();
+        let generation = binding.generation();
+        publish_valid_request(&binding, &mut mailbox);
+        binding.take_request().expect("take").expect("request");
+        binding.publish_normal_return(17).expect("response");
+        binding
+            .arm_portal(generation, portal_session())
+            .expect("arm response");
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            PortalState::ResponseReady.raw()
+        );
+        assert_eq!(
+            mailbox.response_action,
+            MailboxResponseAction::NormalReturnAndArmPortal.raw()
+        );
+        assert_eq!(binding.pending_normal_return().expect("pending"), Some(17));
     }
 
     #[test]
@@ -1051,7 +1433,7 @@ mod tests {
             mailbox.resume_pc = 0x8004;
             mailbox.spsr = 0x60000000;
             mailbox.args = [1, 2, 3, 4, 5, 6];
-            mailbox.x8 = 113;
+            mailbox.native_nr = 113;
             mailbox.clock_x9 = 9;
             mailbox.clock_x10 = 10;
             mailbox.clock_x11 = 11;
@@ -1131,7 +1513,6 @@ mod tests {
         mailbox.trap_kind = MailboxTrapKind::Syscall.raw();
         mailbox.native_nr = 64;
         mailbox.args = [10, 11, 12, 13, 14, 15];
-        mailbox.x8 = 64;
         mailbox.resume_pc = 0x1234;
         mailbox.spsr = 0x3c0;
         mailbox.fp = 0x29;
@@ -1222,7 +1603,7 @@ mod tests {
         assert_ne!(binding.generation(), before);
         assert_eq!(mailbox.generation, binding.generation());
         assert_eq!(mailbox.sequence, 1);
-        assert_eq!(mailbox.x8, 64);
+        assert_eq!(mailbox.native_nr, 64);
         assert_eq!(
             mailbox.state.load(Ordering::Acquire),
             MailboxState::RequestReady.raw()
@@ -1246,7 +1627,7 @@ mod tests {
             flags: 0,
             native_nr: 0,
             args: [0; 6],
-            x8: 0,
+            portal_quantum_epoch: 0,
             resume_pc: 0,
             spsr: 0,
             fp: 0,
@@ -1262,7 +1643,9 @@ mod tests {
             clock_x12: 0,
             clock_tmp_x16: 0,
             clock_tmp_x17: 0,
-            reserved: [0; 24],
+            portal_executor_generation: 0,
+            portal_task_serial: 0,
+            portal_mm_generation: 0,
         });
         let rebuilt_pointer = NonNull::from(rebuilt_mailbox.as_mut());
 
@@ -1277,7 +1660,7 @@ mod tests {
         assert_eq!(rebuilt_mailbox.trap_kind, MailboxTrapKind::Syscall.raw());
         assert_eq!(rebuilt_mailbox.native_nr, 64);
         assert_eq!(rebuilt_mailbox.args, [10, 11, 12, 13, 14, 15]);
-        assert_eq!(rebuilt_mailbox.x8, 64);
+        assert_eq!(rebuilt_mailbox.native_nr, 64);
         assert_eq!(rebuilt_mailbox.resume_pc, 0x1234);
     }
 
@@ -1296,7 +1679,7 @@ mod tests {
             flags: old_mailbox.flags,
             native_nr: old_mailbox.native_nr,
             args: old_mailbox.args,
-            x8: old_mailbox.x8,
+            portal_quantum_epoch: old_mailbox.portal_quantum_epoch,
             resume_pc: old_mailbox.resume_pc,
             spsr: old_mailbox.spsr,
             fp: old_mailbox.fp,
@@ -1312,7 +1695,9 @@ mod tests {
             clock_x12: old_mailbox.clock_x12,
             clock_tmp_x16: old_mailbox.clock_tmp_x16,
             clock_tmp_x17: old_mailbox.clock_tmp_x17,
-            reserved: old_mailbox.reserved,
+            portal_executor_generation: old_mailbox.portal_executor_generation,
+            portal_task_serial: old_mailbox.portal_task_serial,
+            portal_mm_generation: old_mailbox.portal_mm_generation,
         });
         publish_valid_request(&binding, &mut cow_replacement);
         let generation = binding.generation();
@@ -1378,7 +1763,7 @@ mod tests {
             flags: 0,
             native_nr: 0,
             args: [0; 6],
-            x8: 0,
+            portal_quantum_epoch: 0,
             resume_pc: 0,
             spsr: 0,
             fp: 0,
@@ -1394,7 +1779,9 @@ mod tests {
             clock_x12: 0,
             clock_tmp_x16: 0,
             clock_tmp_x17: 0,
-            reserved: [0; 24],
+            portal_executor_generation: 0,
+            portal_task_serial: 0,
+            portal_mm_generation: 0,
         });
         let old_pointer = NonNull::from(old_mailbox.as_mut());
         let mut binding =
@@ -1430,7 +1817,7 @@ mod tests {
             flags: 0,
             native_nr: 0,
             args: [0; 6],
-            x8: 0,
+            portal_quantum_epoch: 0,
             resume_pc: 0,
             spsr: 0,
             fp: 0,
@@ -1446,7 +1833,9 @@ mod tests {
             clock_x12: 0,
             clock_tmp_x16: 0,
             clock_tmp_x17: 0,
-            reserved: [0; 24],
+            portal_executor_generation: 0,
+            portal_task_serial: 0,
+            portal_mm_generation: 0,
         });
         let resumed_pointer = NonNull::from(resumed_mailbox.as_mut());
         unsafe {
@@ -1615,7 +2004,7 @@ mod tests {
             flags: 0,
             native_nr: 0,
             args: [0; 6],
-            x8: 0,
+            portal_quantum_epoch: 0,
             resume_pc: 0,
             spsr: 0,
             fp: 0,
@@ -1631,7 +2020,9 @@ mod tests {
             clock_x12: 0,
             clock_tmp_x16: 0,
             clock_tmp_x17: 0,
-            reserved: [0; 24],
+            portal_executor_generation: 0,
+            portal_task_serial: 0,
+            portal_mm_generation: 0,
         });
         let pointer = NonNull::from(mailbox.as_mut());
         let mut binding =
