@@ -1,6 +1,6 @@
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use carrick_fatal::carrick_fatal;
 
@@ -11,6 +11,7 @@ use carrick_aarch64::mailbox::{
 };
 use carrick_guest_mem::Aarch64SyscallFrame;
 use carrick_hal::threaded::Aarch64SyscallContinuationV1;
+use carrick_hal::{PortalEndpoint, PortalPoll, PortalTransport, PortalWireRequest};
 
 pub use carrick_mem::memory::{
     LINUX_SYSCALL_MAILBOX_ARENA_SIZE, LINUX_SYSCALL_MAILBOX_BASE,
@@ -204,6 +205,265 @@ pub enum PortalResponse {
     HostBoundary,
 }
 
+#[derive(Debug)]
+struct SharedPortalMailbox {
+    host: AtomicPtr<Aarch64SyscallMailbox>,
+    generation: AtomicU64,
+    live: AtomicBool,
+}
+
+impl SharedPortalMailbox {
+    fn new(host: NonNull<Aarch64SyscallMailbox>) -> Self {
+        Self {
+            host: AtomicPtr::new(host.as_ptr()),
+            generation: AtomicU64::new(0),
+            live: AtomicBool::new(false),
+        }
+    }
+
+    fn bind(&self, host: NonNull<Aarch64SyscallMailbox>, generation: u64) {
+        self.live.store(false, Ordering::Release);
+        self.host.store(host.as_ptr(), Ordering::Release);
+        self.generation.store(generation, Ordering::Release);
+        self.live.store(true, Ordering::Release);
+    }
+
+    fn unbind(&self) {
+        self.live.store(false, Ordering::Release);
+    }
+
+    fn current(&self) -> Result<(*mut Aarch64SyscallMailbox, u64), carrick_hal::TrapError> {
+        if !self.live.load(Ordering::Acquire) {
+            return Err(carrick_hal::TrapError::Hypervisor(
+                "syscall portal has no live mailbox binding".to_owned(),
+            ));
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        let host = self.host.load(Ordering::Acquire);
+        if host.is_null() || generation == 0 {
+            return Err(carrick_hal::TrapError::Hypervisor(
+                "syscall portal published an incomplete mailbox binding".to_owned(),
+            ));
+        }
+        // SAFETY: a live publication names a complete process-lifetime arena
+        // slot. Its binding generation is checked again from the wire before
+        // any payload is accepted or response is published.
+        let wire_generation =
+            unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*host).generation)) };
+        if wire_generation != generation {
+            return Err(carrick_hal::TrapError::Hypervisor(format!(
+                "stale syscall portal mailbox generation: endpoint={generation} wire={wire_generation}"
+            )));
+        }
+        Ok((host, generation))
+    }
+
+    fn state(host: *mut Aarch64SyscallMailbox) -> &'static std::sync::atomic::AtomicU32 {
+        // SAFETY: mailbox slots are process-lifetime mappings and `state` is an
+        // aligned AtomicU32 in the typed wire structure.
+        unsafe { &(*host).state }
+    }
+
+    fn session(host: *mut Aarch64SyscallMailbox) -> carrick_hal::PortalSessionWire {
+        // SAFETY: callers acquired a portal state before reading the payload.
+        unsafe {
+            carrick_hal::PortalSessionWire {
+                executor_generation: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*host).portal_executor_generation
+                )),
+                task_serial: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*host).portal_task_serial
+                )),
+                mm_generation: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*host).portal_mm_generation
+                )),
+                quantum_epoch: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*host).portal_quantum_epoch
+                )),
+            }
+        }
+    }
+
+    fn validate_request(
+        &self,
+        request: PortalWireRequest,
+    ) -> Result<*mut Aarch64SyscallMailbox, carrick_hal::TrapError> {
+        let (host, generation) = self.current()?;
+        if generation != request.mailbox_generation
+            || Self::state(host).load(Ordering::Acquire) != PortalState::RequestReady.raw()
+        {
+            return Err(carrick_hal::TrapError::Hypervisor(
+                "stale syscall portal response owner".to_owned(),
+            ));
+        }
+        // SAFETY: RequestReady acquire owns a complete guest publication.
+        let sequence = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*host).sequence)) };
+        if sequence != request.sequence || Self::session(host) != request.session {
+            return Err(carrick_hal::TrapError::Hypervisor(
+                "stale syscall portal request identity".to_owned(),
+            ));
+        }
+        Ok(host)
+    }
+}
+
+impl PortalTransport for SharedPortalMailbox {
+    fn generation(&self) -> Option<u64> {
+        self.live
+            .load(Ordering::Acquire)
+            .then(|| self.generation.load(Ordering::Acquire))
+            .filter(|generation| *generation != 0)
+    }
+
+    fn arm(&self, session: carrick_hal::PortalSessionWire) -> Result<u64, carrick_hal::TrapError> {
+        let (host, generation) = self.current()?;
+        let state = Self::state(host).load(Ordering::Acquire);
+        if state != PortalState::Disabled.raw() && state != MailboxState::ResponseReady.raw() {
+            return Err(carrick_hal::TrapError::Hypervisor(format!(
+                "syscall portal arm requires Disabled or ResponseReady, got {state}"
+            )));
+        }
+        // SAFETY: Disabled gives the stopped runtime owner payload authority;
+        // the release state publication follows every identity word.
+        unsafe {
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*host).portal_executor_generation),
+                session.executor_generation,
+            );
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*host).portal_task_serial),
+                session.task_serial,
+            );
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*host).portal_mm_generation),
+                session.mm_generation,
+            );
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*host).portal_quantum_epoch),
+                session.quantum_epoch,
+            );
+        }
+        if state == MailboxState::ResponseReady.raw() {
+            // SAFETY: the stopped host owner controls the response action. EL1
+            // consumes this response and establishes Armed with one release.
+            let action =
+                unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*host).response_action)) };
+            if action != MailboxResponseAction::NormalReturn.raw() {
+                return Err(carrick_hal::TrapError::Hypervisor(format!(
+                    "syscall portal cannot arm response action {action}"
+                )));
+            }
+            unsafe {
+                core::ptr::write_volatile(
+                    core::ptr::addr_of_mut!((*host).response_action),
+                    MailboxResponseAction::NormalReturnAndArmPortal.raw(),
+                );
+            }
+        } else {
+            Self::state(host).store(PortalState::Armed.raw(), Ordering::Release);
+        }
+        Ok(generation)
+    }
+
+    fn cancel(&self, next_quantum_epoch: u64) -> Result<(), carrick_hal::TrapError> {
+        let (host, _) = self.current()?;
+        let state = Self::state(host).load(Ordering::Acquire);
+        let portal_state = PortalState::try_from(state).map_err(|unknown| {
+            carrick_hal::TrapError::Hypervisor(format!(
+                "unknown syscall portal state {}",
+                unknown.0
+            ))
+        })?;
+        if !matches!(
+            portal_state,
+            PortalState::Armed | PortalState::RequestReady | PortalState::ResponseReady
+        ) {
+            return Err(carrick_hal::TrapError::Hypervisor(format!(
+                "syscall portal cancel rejected state {state}"
+            )));
+        }
+        Self::state(host).store(PortalState::Cancelling.raw(), Ordering::Release);
+        // SAFETY: Cancelling transfers the session word to the runtime owner.
+        unsafe {
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*host).portal_quantum_epoch),
+                next_quantum_epoch,
+            );
+        }
+        Self::state(host).store(PortalState::Disabled.raw(), Ordering::Release);
+        Ok(())
+    }
+
+    fn poll(&self) -> Result<PortalPoll, carrick_hal::TrapError> {
+        let (host, mailbox_generation) = self.current()?;
+        let state = Self::state(host).load(Ordering::Acquire);
+        if state == MailboxState::RequestReady.raw() {
+            return Ok(PortalPoll::HostBoundary);
+        }
+        if state == MailboxState::ResponseReady.raw() {
+            return Ok(PortalPoll::Idle);
+        }
+        match PortalState::try_from(state) {
+            Ok(PortalState::Armed | PortalState::ResponseReady) => Ok(PortalPoll::Idle),
+            Ok(PortalState::HostBoundary) => Ok(PortalPoll::HostBoundary),
+            Ok(PortalState::Cancelling) => Ok(PortalPoll::Cancelling),
+            Ok(PortalState::Disabled) => Ok(PortalPoll::Disabled),
+            Ok(PortalState::RequestReady) => {
+                // A forced host-boundary flag means EL1 must not complete this
+                // request through the portal even if the flag arrived just
+                // after its admission check.
+                let flags = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*host).flags)) };
+                if flags != 0 {
+                    return Ok(PortalPoll::HostBoundary);
+                }
+                // SAFETY: the RequestReady acquire observes the complete guest
+                // request before these typed field reads.
+                let request = unsafe {
+                    PortalWireRequest {
+                        mailbox_generation,
+                        sequence: core::ptr::read_volatile(core::ptr::addr_of!((*host).sequence)),
+                        session: Self::session(host),
+                        native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*host).native_nr)),
+                        args: core::ptr::read_volatile(core::ptr::addr_of!((*host).args)),
+                    }
+                };
+                Ok(PortalPoll::Request(request))
+            }
+            Err(unknown) => Err(carrick_hal::TrapError::Hypervisor(format!(
+                "unknown syscall portal state {}",
+                unknown.0
+            ))),
+        }
+    }
+
+    fn publish_returned(
+        &self,
+        request: PortalWireRequest,
+        value: i64,
+    ) -> Result<(), carrick_hal::TrapError> {
+        let host = self.validate_request(request)?;
+        // SAFETY: validated RequestReady ownership is exact to this request.
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*host).return_value), value as u64);
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*host).response_action),
+                MailboxResponseAction::NormalReturn.raw(),
+            );
+        }
+        Self::state(host).store(PortalState::ResponseReady.raw(), Ordering::Release);
+        Ok(())
+    }
+
+    fn publish_host_boundary(
+        &self,
+        request: PortalWireRequest,
+    ) -> Result<(), carrick_hal::TrapError> {
+        let host = self.validate_request(request)?;
+        Self::state(host).store(PortalState::HostBoundary.raw(), Ordering::Release);
+        Ok(())
+    }
+}
+
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn fresh_generation() -> u64 {
@@ -222,6 +482,7 @@ pub struct MailboxBinding {
     generation: u64,
     last_sequence: u64,
     transport: HvfSyscallTransport,
+    portal: Arc<SharedPortalMailbox>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +499,12 @@ pub struct MailboxDiagnostics {
 // binding has one logical vCPU owner and moves only with that vCPU to its owning
 // host thread; guest/host ownership is synchronized by the mailbox state word.
 unsafe impl Send for MailboxBinding {}
+
+impl Drop for MailboxBinding {
+    fn drop(&mut self) {
+        self.portal.unbind();
+    }
+}
 
 /// Original EL0 syscall state to replay after a kick in dormant clock code.
 #[derive(Debug)]
@@ -336,7 +603,7 @@ impl MailboxBinding {
                     .store(PortalState::Armed.raw(), Ordering::Release);
                 Ok(())
             }
-            Ok(PortalState::ResponseReady) => {
+            Err(_) if state == MailboxState::ResponseReady.raw() => {
                 // SAFETY: the acquire observes the complete host response.
                 let action = unsafe {
                     core::ptr::read_volatile(core::ptr::addr_of!(
@@ -641,6 +908,7 @@ impl MailboxBinding {
             generation: 0,
             last_sequence: 0,
             transport,
+            portal: Arc::new(SharedPortalMailbox::new(host)),
         };
         // SAFETY: upheld by this constructor's caller.
         unsafe { binding.rebind(host, false) };
@@ -661,6 +929,10 @@ impl MailboxBinding {
 
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub fn portal_endpoint(&self) -> PortalEndpoint {
+        PortalEndpoint::new(self.portal.clone())
     }
 
     pub const fn transport(&self) -> HvfSyscallTransport {
@@ -864,6 +1136,7 @@ impl MailboxBinding {
             })
         })?;
         drop(self.lease.take());
+        self.portal.unbind();
         self.last_sequence = 0;
         Ok(())
     }
@@ -885,6 +1158,7 @@ impl MailboxBinding {
             ));
         }
         drop(self.lease.take());
+        self.portal.unbind();
         self.last_sequence = 0;
         Ok(())
     }
@@ -964,6 +1238,7 @@ impl MailboxBinding {
             self.state()
                 .store(MailboxState::Idle.raw(), Ordering::Release);
         }
+        self.portal.bind(self.host, self.generation);
     }
 
     /// Follow a stage-1 COW relocation of this slot without modifying the
@@ -976,6 +1251,7 @@ impl MailboxBinding {
     /// rebind, or drop.
     pub unsafe fn relocate_after_cow(&mut self, host: NonNull<Aarch64SyscallMailbox>) {
         self.host = host;
+        self.portal.bind(self.host, self.generation);
     }
 
     pub fn take_request(&mut self) -> Result<Option<MailboxRequest>, MailboxConsumeError> {
@@ -986,6 +1262,7 @@ impl MailboxBinding {
 
         // SAFETY: acquire ownership above makes the guest-published payload
         // visible, and all fields stay inside this binding's mapped slot.
+        let portal_host_boundary = state == PortalState::HostBoundary.raw();
         let (metadata, request) = unsafe {
             let mailbox = self.host.as_ptr();
             let metadata = MailboxRequestMetadata {
@@ -994,7 +1271,11 @@ impl MailboxBinding {
                 size: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).size)),
                 generation: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).generation)),
                 sequence: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
-                state,
+                state: if portal_host_boundary {
+                    MailboxState::RequestReady.raw()
+                } else {
+                    state
+                },
                 trap_kind: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).trap_kind)),
             };
             let args = core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).args));
@@ -1021,6 +1302,13 @@ impl MailboxBinding {
         validate_request_metadata(metadata, self.generation, self.last_sequence)
             .map_err(MailboxConsumeError::Protocol)?;
         self.last_sequence = metadata.sequence;
+        if portal_host_boundary {
+            // The helper has completed its publication and will not touch the
+            // mailbox again. Restore the ordinary host-owned state so all
+            // existing response and continuation paths remain authoritative.
+            self.state()
+                .store(MailboxState::RequestReady.raw(), Ordering::Release);
+        }
         // Reaching validated host dispatch satisfies the latched boundary.
         unsafe {
             let flags = core::ptr::read_volatile(core::ptr::addr_of!((*self.host.as_ptr()).flags));
@@ -1389,7 +1677,7 @@ mod tests {
             .expect("arm response");
         assert_eq!(
             mailbox.state.load(Ordering::Acquire),
-            PortalState::ResponseReady.raw()
+            MailboxState::ResponseReady.raw()
         );
         assert_eq!(
             mailbox.response_action,
@@ -1886,6 +2174,31 @@ mod tests {
                 carrick_aarch64::mailbox::MailboxProtocolError::NonIncreasingSequence { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn portal_host_boundary_is_consumed_once_by_ordinary_owner() {
+        let (mut binding, mut mailbox) = binding();
+        publish_valid_request(&binding, &mut mailbox);
+        mailbox
+            .state
+            .store(PortalState::HostBoundary.raw(), Ordering::Release);
+
+        let request = binding
+            .take_request()
+            .expect("valid portal boundary")
+            .expect("request");
+        assert_eq!(request.frame.x8, 64);
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            MailboxState::RequestReady.raw()
+        );
+        binding.publish_normal_return(17).expect("owner response");
+        assert_eq!(mailbox.return_value, 17);
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            MailboxState::ResponseReady.raw()
+        );
     }
 
     #[test]

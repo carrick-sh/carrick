@@ -342,6 +342,7 @@ pub(crate) struct HvpatchQuantumControl<'a, 'lease> {
     pub(crate) executor_id: Option<ExecutorId>,
     pub(crate) binding: Option<&'a Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>>,
     pub(crate) cow_invalidation_observer: Option<&'a crate::hvpatch::CowInvalidationObserver>,
+    pub(crate) portal_helper: Option<&'a crate::vcpu_loop::portal::PortalHelper>,
 }
 
 impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
@@ -370,6 +371,7 @@ impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
             executor_id: None,
             binding: None,
             cow_invalidation_observer: None,
+            portal_helper: None,
         }
     }
     pub(crate) fn need_resched(&self) -> bool {

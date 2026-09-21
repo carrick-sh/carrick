@@ -2872,6 +2872,10 @@ fn seed_sibling_snapshot(
 }
 
 impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
+    fn portal_endpoint(&self) -> Option<carrick_hal::PortalEndpoint> {
+        self.vm.portal_endpoint(&self.vcpu)
+    }
+
     fn fd_ceiling_publisher(&self) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
         self.vm.fd_ceiling_publisher()
     }

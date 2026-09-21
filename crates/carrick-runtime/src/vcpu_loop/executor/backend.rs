@@ -50,6 +50,7 @@ struct HvpatchResidentTaskRecord {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct HvpatchPersistentExecutor {
     executor_id: ExecutorId,
+    portal_helper: crate::vcpu_loop::portal::PortalHelper,
     lifecycle: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vmm>,
     vcpu: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vcpu>,
     current: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine>,
@@ -384,10 +385,18 @@ impl PersistentExecutorFactory for HvpatchPersistentExecutorFactory {
     type Executor = HvpatchPersistentExecutor;
     fn create(&self, executor: ExecutorId) -> Result<Self::Executor, TrapError> {
         let (lifecycle, vcpu) = self.authority.create_executor_parts()?;
+        let portal_policy = crate::vcpu_loop::portal::PortalPolicy::from_environment()
+            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+        let portal_helper = crate::vcpu_loop::portal::PortalHelper::new(
+            portal_policy,
+            crate::vcpu_loop::portal::PortalActivityBudget::default(),
+        )
+        .map_err(TrapError::Hypervisor)?;
         let raw_vcpu_id = carrick_vmm_hvf::hvf_aarch64_engine::persistent_vcpu_identity(&vcpu);
         let owner_thread_port = current_owner_thread_port();
         Ok(HvpatchPersistentExecutor {
             executor_id: executor,
+            portal_helper,
             lifecycle: Some(lifecycle),
             vcpu: Some(vcpu),
             current: None,
@@ -740,6 +749,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                     }),
             ),
             cow_invalidation_observer: self.cow_invalidation_observer.as_ref(),
+            portal_helper: Some(&self.portal_helper),
         };
         let engine = self
             .current
@@ -799,6 +809,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         &mut self,
         mut lease: ThreadExecutionLease,
     ) -> Result<SavedRunnable, ExecutorSaveError> {
+        if let Err(error) = self.portal_helper.cancel_and_wait(u64::MAX) {
+            return Err(ExecutorSaveError::new(TrapError::Hypervisor(error), lease));
+        }
         let Some(engine) = self.current.as_mut() else {
             return Err(ExecutorSaveError::new(
                 TrapError::Hypervisor("HVPatch save without loaded engine".into()),
@@ -924,6 +937,11 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 "dirty HVPatch executor boundary".into(),
             ));
         }
+        if !self.portal_helper.is_parked() {
+            return Err(TrapError::Hypervisor(
+                "active syscall portal helper at executor boundary".into(),
+            ));
+        }
         let vcpu = self.vcpu.as_ref().unwrap_or_else(|| {
             carrick_fatal!(
                 "vcpu_loop::executor_lease",
@@ -952,6 +970,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
     }
 
     fn detach_loaded_task(&mut self) -> Result<(), TrapError> {
+        self.portal_helper
+            .cancel_and_wait(u64::MAX)
+            .map_err(TrapError::Hypervisor)?;
         if let Some(mut engine) = self.current.take() {
             let _ = engine.restore_persistent_executor_invariants();
             let (backend, vcpu) = if let Some(task_only) = self.loaded_task_only.take() {
@@ -992,6 +1013,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
     }
 
     fn destroy(mut self) -> Result<(), TrapError> {
+        self.portal_helper
+            .cancel_and_wait(u64::MAX)
+            .map_err(TrapError::Hypervisor)?;
         if let Some(mut engine) = self.current.take() {
             let _ = catch_unwind(AssertUnwindSafe(|| {
                 engine.snapshot_task_state_from_live_executor()

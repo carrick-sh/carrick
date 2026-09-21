@@ -1298,6 +1298,11 @@ impl GuestVmBackend for HvfAarch64Vmm {
 }
 
 impl Aarch64Vmm for HvfAarch64Vmm {
+    fn portal_endpoint(&self, vcpu: &Self::Vcpu) -> Option<carrick_hal::PortalEndpoint> {
+        (vcpu.mailbox.transport() == HvfSyscallTransport::Mailbox)
+            .then(|| vcpu.mailbox.portal_endpoint())
+    }
+
     fn fd_ceiling_publisher(&self) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
         self.state.fd_ceiling_publisher()
     }

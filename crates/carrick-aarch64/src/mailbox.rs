@@ -303,11 +303,11 @@ pub struct PortalSessionWire {
 #[repr(u32)]
 pub enum PortalState {
     Disabled = 0,
-    RequestReady = 1,
-    ResponseReady = 2,
     Armed = 4,
     HostBoundary = 5,
     Cancelling = 6,
+    RequestReady = 7,
+    ResponseReady = 8,
 }
 
 impl PortalState {
@@ -337,11 +337,11 @@ impl TryFrom<u32> for PortalState {
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Disabled),
-            1 => Ok(Self::RequestReady),
-            2 => Ok(Self::ResponseReady),
             4 => Ok(Self::Armed),
             5 => Ok(Self::HostBoundary),
             6 => Ok(Self::Cancelling),
+            7 => Ok(Self::RequestReady),
+            8 => Ok(Self::ResponseReady),
             unknown => Err(UnknownMailboxValue(unknown)),
         }
     }
@@ -375,6 +375,14 @@ const _: () =
 const _: () = assert!(
     PortalState::HostBoundary.raw()
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_PORTAL_HOST_BOUNDARY
+);
+const _: () = assert!(
+    PortalState::RequestReady.raw()
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_PORTAL_REQUEST_READY
+);
+const _: () = assert!(
+    PortalState::ResponseReady.raw()
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_PORTAL_RESPONSE_READY
 );
 
 #[cfg(test)]
@@ -548,8 +556,11 @@ mod tests {
         assert_eq!(PortalState::try_from(4), Ok(PortalState::Armed));
         assert_eq!(PortalState::try_from(5), Ok(PortalState::HostBoundary));
         assert_eq!(PortalState::try_from(6), Ok(PortalState::Cancelling));
+        assert_eq!(PortalState::try_from(7), Ok(PortalState::RequestReady));
+        assert_eq!(PortalState::try_from(8), Ok(PortalState::ResponseReady));
+        assert_eq!(PortalState::try_from(1), Err(UnknownMailboxValue(1)));
+        assert_eq!(PortalState::try_from(2), Err(UnknownMailboxValue(2)));
         assert_eq!(PortalState::try_from(3), Err(UnknownMailboxValue(3)));
-        assert_eq!(PortalState::try_from(7), Err(UnknownMailboxValue(7)));
 
         assert!(PortalState::Disabled.can_transition_to(PortalState::Armed));
         assert!(PortalState::Armed.can_transition_to(PortalState::RequestReady));
