@@ -53,13 +53,9 @@ impl<'a> FsView<'a> {
         if self.fs.inotify_registry.is_empty() && self.fs.fanotify_registry.is_empty() {
             return;
         }
-        let Some(open) = open_file.description.read() else {
-            return;
-        };
-        let OpenDescription::HostFile { .. } = &*open else {
-            return;
-        };
-        self.notify_file_write_result(context, open.open_path(), outcome);
+        if let Some(open_path) = open_file.host_file_open_path() {
+            self.notify_file_write_result(context, Some(&open_path), outcome);
+        }
     }
 
     pub(crate) fn drain_write_lease_dirty<M: CurrentMmMemory>(

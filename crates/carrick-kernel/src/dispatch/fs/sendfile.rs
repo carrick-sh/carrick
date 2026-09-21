@@ -19,14 +19,8 @@ fn darwin_copyfile_fast_path_disabled() -> bool {
 
 impl<'a> FsView<'a> {
     fn record_host_file_absolute_offset(&self, fd: i32, offset: i64) {
-        let Some(open_file) = self.open_file(fd) else {
-            return;
-        };
-        let Some(open) = open_file.description.read() else {
-            return;
-        };
-        if let OpenDescription::HostFile { host_fd, .. } = &*open {
-            host_fd.record_absolute_offset(offset);
+        if let Some(open_file) = self.open_file(fd) {
+            open_file.record_host_file_absolute_offset(offset);
         }
     }
 

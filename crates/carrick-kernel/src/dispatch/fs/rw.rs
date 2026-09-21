@@ -461,13 +461,7 @@ impl<'a> FsView<'a> {
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let Some(open) = open_file.description.read() else {
-                if is_stdio_fd(fd.0) && !this.stdio_is_closed(fd.0) {
-                    return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
-                }
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
-            if let OpenDescription::HostFile { host_fd, .. } = &*open {
+            if let Some((host_fd, writable)) = open_file.host_file_info() {
                 let mut seek_authority_active = false;
                 if crate::syscall_shim_enabled() {
                     let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
@@ -485,7 +479,7 @@ impl<'a> FsView<'a> {
                         }
                     }
                 }
-                let outcome = this.lseek_host_file(host_fd, offset, whence);
+                let outcome = this.lseek_host_file(&host_fd, offset, whence);
                 if seek_authority_active {
                     let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
                     if let DispatchOutcome::Returned { value } = outcome {
@@ -507,42 +501,36 @@ impl<'a> FsView<'a> {
                     && whence as i32 == libc::SEEK_SET
                     && matches!(outcome, DispatchOutcome::Returned { value: 0 })
                 {
-                    if let OpenDescription::HostFile {
-                        writable, host_fd, ..
-                    } = &*open
-                    {
-                        let is_append = LinuxOpenFlags::from_bits_truncate(
-                            open_file.description.common().status_flags(),
-                        )
-                        .contains(LinuxOpenFlags::APPEND);
-                        if *writable && !is_append {
-                            let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
-                            let _ = crate::kernel::identity_page::stamp_seek_authority(
+                    let is_append = LinuxOpenFlags::from_bits_truncate(
+                        open_file.description.common().status_flags(),
+                    )
+                    .contains(LinuxOpenFlags::APPEND);
+                    if writable && !is_append {
+                        let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+                        let _ = crate::kernel::identity_page::stamp_seek_authority(
+                            &mut *cx.memory,
+                            base,
+                            fd.0,
+                            0,
+                            true,
+                        );
+                        let rlim_fsize = this
+                            .effective_resource_limit(carrick_abi::LINUX_RLIMIT_FSIZE)
+                            .rlim_cur;
+                        if rlim_fsize == carrick_abi::LINUX_RLIM_INFINITY {
+                            let _ = crate::kernel::identity_page::stamp_write_lease(
                                 &mut *cx.memory,
                                 base,
                                 fd.0,
+                                host_fd.raw(),
                                 0,
                                 true,
                             );
-                            let rlim_fsize = this
-                                .effective_resource_limit(carrick_abi::LINUX_RLIMIT_FSIZE)
-                                .rlim_cur;
-                            if rlim_fsize == carrick_abi::LINUX_RLIM_INFINITY {
-                                let _ = crate::kernel::identity_page::stamp_write_lease(
-                                    &mut *cx.memory,
-                                    base,
-                                    fd.0,
-                                    host_fd.raw(),
-                                    0,
-                                    true,
-                                );
-                            }
                         }
                     }
                 }
                 return Ok(outcome);
             }
-            drop(open);
             let Some(mut open) = open_file.description.write() else {
                 if is_stdio_fd(fd.0) && !this.stdio_is_closed(fd.0) {
                     return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
@@ -2720,7 +2708,7 @@ impl<'a> FsView<'a> {
                 if LinuxOpenFlags::from_bits_truncate(common.status_flags()).contains(LinuxOpenFlags::PATH) {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
-                if of.description.concrete_backing::<super::ioring::IoUringBacking>().is_some() {
+                if of.is_io_uring_backing() {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 // memfd_secret: no file write method → EINVAL (memfdsecret probe).
@@ -2819,18 +2807,7 @@ impl<'a> FsView<'a> {
                 let Some(io_lease) = open_file.description.retain_fd_lease() else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
-                let host_file = {
-                    let Some(open) = open_file.description.read() else {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    };
-                    match &*open {
-                        OpenDescription::HostFile {
-                            host_fd, writable, ..
-                        } => Some((host_fd.clone(), *writable)),
-                        _ => None,
-                    }
-                };
-                if let Some((host_fd, writable)) = host_file {
+                if let Some((host_fd, writable)) = open_file.host_file_info() {
                     return this.write_host_file(
                         cx,
                         fd,

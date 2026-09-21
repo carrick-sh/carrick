@@ -1709,6 +1709,41 @@ pub(in crate::dispatch) enum InMemoryPipeEndpoint {
 
 pub type OpenFile = crate::kernel::FileSlot;
 
+impl OpenFile {
+    pub(in crate::dispatch) fn host_file_info(&self) -> Option<(HostFdRef, bool)> {
+        let open = self.description.read()?;
+        match &*open {
+            OpenDescription::HostFile {
+                host_fd, writable, ..
+            } => Some((host_fd.clone(), *writable)),
+            _ => None,
+        }
+    }
+
+    pub(in crate::dispatch) fn host_file_open_path(&self) -> Option<String> {
+        let open = self.description.read()?;
+        match &*open {
+            OpenDescription::HostFile { .. } => open.open_path().map(|p| p.to_string()),
+            _ => None,
+        }
+    }
+
+    pub(in crate::dispatch) fn record_host_file_absolute_offset(&self, offset: i64) {
+        let Some(open) = self.description.read() else {
+            return;
+        };
+        if let OpenDescription::HostFile { host_fd, .. } = &*open {
+            host_fd.record_absolute_offset(offset);
+        }
+    }
+
+    pub(in crate::dispatch) fn is_io_uring_backing(&self) -> bool {
+        self.description
+            .concrete_backing::<super::ioring::IoUringBacking>()
+            .is_some()
+    }
+}
+
 pub(super) fn kernel_file_description(
     description: OpenDescriptionRef,
     status_flags: u64,
