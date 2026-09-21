@@ -107,6 +107,10 @@ fn write_seek_cycle(fd: i32) -> bool {
     }
 }
 
+fn pwrite_cycle(fd: i32) -> bool {
+    unsafe { libc::pwrite(fd, PAYLOAD.as_ptr().cast(), PAYLOAD.len(), 0) == PAYLOAD.len() as isize }
+}
+
 fn measure(scale: usize, mut operation: impl FnMut() -> bool) -> Option<u64> {
     let start = counter();
     for _ in 0..scale {
@@ -140,7 +144,10 @@ fn report_phase(phase: &str, scale: usize, samples: Vec<Option<u64>>, freq: u64)
 
 fn contract_scale() -> Result<Option<usize>, ()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.is_empty() || args.as_slice() == ["write-seek-only"] {
+    if args.is_empty()
+        || args.as_slice() == ["write-seek-only"]
+        || args.as_slice() == ["pwrite-only"]
+    {
         return Ok(None);
     }
     if args.len() != 2 || args[0] != "contract-scale" {
@@ -193,9 +200,12 @@ fn concurrent_sample(ifd: i32, fd: i32, path: &CString, scale: usize) -> Option<
 
 fn main() {
     let write_seek_only = std::env::args().skip(1).eq(["write-seek-only"]);
+    let pwrite_only = std::env::args().skip(1).eq(["pwrite-only"]);
     #[cfg(not(target_os = "linux"))]
-    if !write_seek_only {
-        eprintln!("native host control requires write-seek-only; notification modes require Linux");
+    if !write_seek_only && !pwrite_only {
+        eprintln!(
+            "native host control requires write-seek-only or pwrite-only; notification modes require Linux"
+        );
         std::process::exit(2);
     }
     unsafe { arm_alarm_ms(90_000) };
@@ -203,7 +213,7 @@ fn main() {
         Ok(scale) => scale,
         Err(()) => {
             eprintln!(
-                "usage: perf_inotify09_scale [write-seek-only | contract-scale <1|8|32|128>]"
+                "usage: perf_inotify09_scale [write-seek-only | pwrite-only | contract-scale <1|8|32|128>]"
             );
             std::process::exit(2);
         }
@@ -236,6 +246,30 @@ fn main() {
                 scale,
                 (0..SAMPLES)
                     .map(|_| measure(scale, || write_seek_cycle(fd)))
+                    .collect(),
+                freq,
+            );
+        }
+        complete &= unsafe { libc::close(fd) } == 0;
+        complete &= unsafe { libc::unlink(path.as_ptr()) } == 0;
+        println!("probe_complete={}", u8::from(complete));
+        unsafe { disarm_alarm() };
+        if !complete {
+            std::process::exit(1);
+        }
+        return;
+    }
+    if pwrite_only {
+        if fd < 0 {
+            std::process::exit(2);
+        }
+        let mut complete = true;
+        for scale in SCALES {
+            complete &= report_phase(
+                "pwrite",
+                scale,
+                (0..SAMPLES)
+                    .map(|_| measure(scale, || pwrite_cycle(fd)))
                     .collect(),
                 freq,
             );

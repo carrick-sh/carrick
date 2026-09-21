@@ -300,6 +300,23 @@ impl<'a> FsView<'a> {
             // removal to THIS registration. detach takes only a read lock, so it
             // does not deadlock with the separate write below.
             this.detach_fd_from_epolls(fd.0);
+            if crate::syscall_shim_enabled() {
+                let fd_addr = crate::memory::LINUX_IDENTITY_PAGE_BASE
+                    + crate::memory::IDENTITY_OFF_SEEK_FD;
+                if let Ok(bytes) = cx.memory.read_bytes(fd_addr, 4) {
+                    let current_seek_fd =
+                        i32::from_le_bytes(bytes.as_slice().try_into().unwrap_or([u8::MAX; 4]));
+                    if current_seek_fd == fd.0 {
+                        let _ = crate::kernel::identity_page::stamp_seek_authority(
+                            &mut *cx.memory,
+                            crate::memory::LINUX_IDENTITY_PAGE_BASE,
+                            -1,
+                            0,
+                            false,
+                        );
+                    }
+                }
+            }
             let files = this.captured_file_table();
             let removed = files.write_open_files().remove(&fd.0);
             Ok(
@@ -346,8 +363,8 @@ impl<'a> FsView<'a> {
             if first > last {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            let cloexec_only = flags.contains(carrick_abi::LinuxCloseRangeFlags::CLOEXEC);
             let close_selected = || {
-                let cloexec_only = flags.contains(carrick_abi::LinuxCloseRangeFlags::CLOEXEC);
                 // Drain matching fds out of the table so we don't iterate a
                 // gigantic [first, last] (callers commonly pass last=u32::MAX).
                 let fds: Vec<i32> = this
@@ -401,36 +418,59 @@ impl<'a> FsView<'a> {
                 Ok(DispatchOutcome::Returned { value: 0 })
             };
 
-            if !flags.contains(carrick_abi::LinuxCloseRangeFlags::UNSHARE) {
-                return close_selected();
-            }
-            let unshared: crate::kernel::CloseRangeUnshare = match cx
-                .kernel
-                .kernel()
-                .unshare_file_table_for_close_range(cx.kernel)
-            {
-                Ok(unshared) => unshared,
-                Err(
-                    crate::kernel::KernelOperationError::StaleContext
-                    | crate::kernel::KernelOperationError::ParentExited
-                    | crate::kernel::KernelOperationError::UnknownThread(_),
-                ) => return Ok(DispatchOutcome::errno(LINUX_EINTR)),
-                Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
-                    return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
-                }
-                Err(error) => {
-                    tracing::error!(%error, "close_range unshare publication failed");
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                }
+            let outcome = if !flags.contains(carrick_abi::LinuxCloseRangeFlags::UNSHARE) {
+                close_selected()
+            } else {
+                let unshared: crate::kernel::CloseRangeUnshare = match cx
+                    .kernel
+                    .kernel()
+                    .unshare_file_table_for_close_range(cx.kernel)
+                {
+                    Ok(unshared) => unshared,
+                    Err(
+                        crate::kernel::KernelOperationError::StaleContext
+                        | crate::kernel::KernelOperationError::ParentExited
+                        | crate::kernel::KernelOperationError::UnknownThread(_),
+                    ) => return Ok(DispatchOutcome::errno(LINUX_EINTR)),
+                    Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
+                        return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "close_range unshare publication failed");
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    }
+                };
+                let successor = unshared.context().resources().files();
+                this.close_draining_file_table(
+                    cx.kernel.kernel(),
+                    unshared.old_file_table(),
+                    Some(cx.kernel.task().key()),
+                    Some(&successor),
+                );
+                this.with_kernel_resources(unshared.context(), close_selected)
             };
-            let successor = unshared.context().resources().files();
-            this.close_draining_file_table(
-                cx.kernel.kernel(),
-                unshared.old_file_table(),
-                Some(cx.kernel.task().key()),
-                Some(&successor),
-            );
-            this.with_kernel_resources(unshared.context(), close_selected)
+
+            if !cloexec_only && crate::syscall_shim_enabled() {
+                let fd_addr = crate::memory::LINUX_IDENTITY_PAGE_BASE
+                    + crate::memory::IDENTITY_OFF_SEEK_FD;
+                if let Ok(bytes) = cx.memory.read_bytes(fd_addr, 4) {
+                    let current_seek_fd =
+                        i32::from_le_bytes(bytes.as_slice().try_into().unwrap_or([u8::MAX; 4]));
+                    if current_seek_fd >= 0
+                        && (current_seek_fd as u64) >= first
+                        && (current_seek_fd as u64) <= last
+                    {
+                        let _ = crate::kernel::identity_page::stamp_seek_authority(
+                            &mut *cx.memory,
+                            crate::memory::LINUX_IDENTITY_PAGE_BASE,
+                            -1,
+                            0,
+                            false,
+                        );
+                    }
+                }
+            }
+            outcome
 
         }
 

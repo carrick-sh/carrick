@@ -73,7 +73,7 @@ pub(crate) fn overlaps_el0_clock_stub(address: u64, length: u64) -> bool {
     if length == 0 {
         return false;
     }
-    let end = address.checked_add(length).unwrap_or(u64::MAX);
+    let end = address.saturating_add(length);
     let base = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE;
     let limit = base + carrick_mem::memory::LINUX_EL0_CLOCK_STUB_SIZE;
     address < limit && base < end
