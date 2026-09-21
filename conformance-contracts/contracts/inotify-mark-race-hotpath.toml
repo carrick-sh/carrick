@@ -1,0 +1,68 @@
+schema_version = 1
+id = "kernel.inotify.mark-race-hotpath"
+title = "Inotify mark-race hot path scales with guest operations"
+guest_surfaces = [
+  "syscall:inotify_add_watch",
+  "syscall:inotify_rm_watch",
+  "syscall:write",
+  "syscall:lseek",
+  "kernel:inotify",
+]
+semantic_authority = [
+  "man 2 inotify_add_watch",
+  "man 2 inotify_rm_watch",
+  "man 2 write",
+  "man 2 lseek",
+  "ltp:inotify09.c",
+]
+fixture = "probe:perf_inotify09_scale"
+scale_points = [1, 8, 32, 128]
+rationale = "The serial fixture isolates the exact four-syscall body of LTP inotify09. It binds structural work before the signed performance probe adds the upstream two-thread race."
+
+[bindings]
+vm_free = "carrick-kernel-example::inotify_hotpath_contract"
+docker = "probe:perf_inotify09_scale"
+ecosystem = ["ltp:inotify09"]
+
+[bindings.unresolved]
+embed_structural = "The signed decomposition probe reports phase timing; a fail-closed work-meter parser is still required before it can supply structural evidence."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_dispatches"
+base = 6
+per_unit = 4
+rationale = "Setup, FIONREAD, cleanup, and exit cost six dispatches; each iteration issues exactly add-watch, write, lseek, and remove-watch."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "host_backend_calls"
+base = 0
+per_unit = 2
+rationale = "Each iteration performs one vnode registration batch and one deregistration batch."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "host_write_position_queries"
+base = 0
+per_unit = 0
+rationale = "The overwrite/rewind shape needs no preparatory SEEK_CUR query before write."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "inotify_queue_visits"
+base = 0
+per_unit = 0
+rationale = "Leaving the event queue undrained must not cause any queue scan."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "continuation_parks"
+base = 0
+per_unit = 0
+rationale = "All four operations are nonblocking in this fixture."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20
