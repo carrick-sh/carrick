@@ -13,25 +13,25 @@ pub const STUB_SIZE: u64 = 0x4000;
 pub const CLOCK_GATE_OFFSET: u64 = 16;
 const ACTIVE: u16 = AARCH64_SYSCALL_MAILBOX_CLOCK_ACTIVE as u16;
 const ENTRY: usize = 0xC00;
-const TMP16: u64 = 216;
-const TMP17: u64 = 224;
+const TMP16: u64 = mailbox_offset(core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x16));
+const TMP17: u64 = mailbox_offset(core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x17));
 const MARKER: u16 = 0xC10C;
 const _: () = assert!(TMP17 + 8 <= LINUX_SYSCALL_MAILBOX_SLOT_SIZE);
 const _: () = assert!(STUB_BASE.is_multiple_of(0x4000));
 const SAVED: [(u32, u64); 13] = [
-    (0, 56),
-    (1, 64),
-    (2, 72),
-    (3, 80),
-    (4, 88),
-    (5, 96),
-    (8, 104),
+    (0, AARCH64_SYSCALL_MAILBOX_OFF_ARGS),
+    (1, AARCH64_SYSCALL_MAILBOX_OFF_ARGS + 8),
+    (2, AARCH64_SYSCALL_MAILBOX_OFF_ARGS + 16),
+    (3, AARCH64_SYSCALL_MAILBOX_OFF_ARGS + 24),
+    (4, AARCH64_SYSCALL_MAILBOX_OFF_ARGS + 32),
+    (5, AARCH64_SYSCALL_MAILBOX_OFF_ARGS + 40),
+    (8, AARCH64_SYSCALL_MAILBOX_OFF_X8),
     (9, AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X9),
     (10, AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X10),
     (11, AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X11),
     (12, AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X12),
-    (16, 168),
-    (17, 176),
+    (16, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16),
+    (17, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17),
 ];
 // EL0 stores retain ordinary stage-1/stage-2 permission and COW behavior.
 const STUB: [u32; 12] = [
@@ -97,7 +97,11 @@ impl Code<'_> {
         self.bytes[p..p + 4].copy_from_slice(&op.to_le_bytes());
     }
     fn restore_frame(&mut self) {
-        for (offset, msr) in [(112, 0xD518_4030), (120, 0xD518_4010), (152, 0xD518_5210)] {
+        for (offset, msr) in [
+            (AARCH64_SYSCALL_MAILBOX_OFF_RESUME_PC, 0xD518_4030),
+            (AARCH64_SYSCALL_MAILBOX_OFF_SPSR, 0xD518_4010),
+            (AARCH64_SYSCALL_MAILBOX_OFF_ESR, 0xD518_5210),
+        ] {
             self.emit(enc_ldr_xt_sp(16, offset));
             self.emit(msr);
         }
@@ -153,9 +157,18 @@ pub(super) fn install(bytes: &mut [u8], dispatch: usize) -> ClockHandlerLayout {
         c.emit(enc_str_xt_sp(r, off));
     }
     for (mrs, off) in [
-        (AARCH64_MRS_ELR_EL1_X16_OPCODE, 112),
-        (AARCH64_MRS_SPSR_EL1_X16_OPCODE, 120),
-        (AARCH64_MRS_ESR_EL1_X16_OPCODE, 152),
+        (
+            AARCH64_MRS_ELR_EL1_X16_OPCODE,
+            AARCH64_SYSCALL_MAILBOX_OFF_RESUME_PC,
+        ),
+        (
+            AARCH64_MRS_SPSR_EL1_X16_OPCODE,
+            AARCH64_SYSCALL_MAILBOX_OFF_SPSR,
+        ),
+        (
+            AARCH64_MRS_ESR_EL1_X16_OPCODE,
+            AARCH64_SYSCALL_MAILBOX_OFF_ESR,
+        ),
     ] {
         c.emit(mrs);
         c.emit(enc_str_xt_sp(16, off));
@@ -164,7 +177,7 @@ pub(super) fn install(bytes: &mut [u8], dispatch: usize) -> ClockHandlerLayout {
     c.emit(enc_str_wt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_STATE));
     c.imm(16, STUB_BASE);
     c.emit(0xD518_4030); // msr elr_el1, x16
-    c.emit(enc_ldr_xt_sp(16, 168));
+    c.emit(enc_ldr_xt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16));
     c.emit(AARCH64_ERET_OPCODE);
 
     let ordinary = c.pc;
@@ -194,8 +207,8 @@ pub(super) fn install(bytes: &mut [u8], dispatch: usize) -> ClockHandlerLayout {
     // This builder is selected only by the arm64 HVF lane, where FEAT_LSE is a
     // qualified host prerequisite. x16/x17 are restored below.
     c.imm(16, LINUX_IDENTITY_PAGE_BASE + IDENTITY_OFF_SHIM_SYSCALLS);
-    c.emit(0xD280_0031); // mov x17, #1
-    c.emit(0xF8F1_021F); // ldaddal x17, xzr, [x16]
+    c.emit(enc_movz_xn(17, 1, 0));
+    c.emit(enc_ldaddal_x(17, 31, 16));
     c.restore_frame();
     c.restore_regs(true);
     c.emit(AARCH64_ERET_OPCODE);
@@ -319,7 +332,7 @@ pub(super) mod tests {
                         0xD5184010 => self.spsr = self.regs[16],
                         0xD5185210 => self.esr = self.regs[16],
                         0xEB11021F => self.equal = self.regs[16] == self.regs[17],
-                        0xF8F1021F => {
+                        op if op == enc_ldaddal_x(17, 31, 16) => {
                             let address = self.regs[16];
                             let next = self.read(address).wrapping_add(self.regs[17]);
                             self.mem.insert(address, next);
@@ -402,7 +415,7 @@ pub(super) mod tests {
         let original = (m.regs, m.elr, m.spsr, m.esr);
         assert_eq!(m.run(), "eret");
         assert_eq!(m.elr, STUB_BASE);
-        assert_eq!(m.read(SP + 32), 3);
+        assert_eq!(m.read(SP + AARCH64_SYSCALL_MAILBOX_OFF_STATE), 3);
         for (r, _) in SAVED {
             m.regs[r as usize] = 0xDEAD;
         }
@@ -414,7 +427,7 @@ pub(super) mod tests {
         expected[0] = 0;
         assert_eq!(m.regs, expected);
         assert_eq!((m.elr, m.spsr, m.esr), (original.1, original.2, original.3));
-        assert_eq!(m.read(SP + 32), 0);
+        assert_eq!(m.read(SP + AARCH64_SYSCALL_MAILBOX_OFF_STATE), 0);
         assert_eq!(
             m.read(LINUX_IDENTITY_PAGE_BASE + IDENTITY_OFF_SHIM_SYSCALLS),
             1,
@@ -441,7 +454,7 @@ pub(super) mod tests {
             m.exception(pc, esr);
             assert_eq!(m.run(), "host");
             assert_eq!((m.regs, m.elr, m.spsr, m.esr), original);
-            assert_eq!(m.read(SP + 32), 0);
+            assert_eq!(m.read(SP + AARCH64_SYSCALL_MAILBOX_OFF_STATE), 0);
             assert_eq!(
                 m.read(LINUX_IDENTITY_PAGE_BASE + IDENTITY_OFF_SHIM_SYSCALLS),
                 0
