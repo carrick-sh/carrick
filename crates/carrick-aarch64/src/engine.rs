@@ -2470,8 +2470,15 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                     // the syscall return. Only a kick taken in genuine guest EL0 code
                     // is reported (`Ok(None)`).
                     let pc = self.vcpu.get_reg(Reg::Pc)?;
-                    if carrick_mem::memory::is_carrick_el1_vector_va(pc) {
-                        continue;
+                    let in_vector = carrick_mem::memory::is_carrick_el1_vector_va(pc);
+                    if in_vector || carrick_mem::memory::is_carrick_el0_clock_stub_va(pc) {
+                        // Clock completion may have already passed its flag
+                        // check. Normalize to the original SVC so replay must
+                        // cross host dispatch before delivering the kick.
+                        let normalized = self.vcpu.force_clock_host_boundary()?;
+                        if in_vector || normalized {
+                            continue;
+                        }
                     }
                     return Ok(None);
                 }

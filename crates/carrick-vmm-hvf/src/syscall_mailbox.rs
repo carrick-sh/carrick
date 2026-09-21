@@ -216,7 +216,131 @@ pub struct MailboxDiagnostics {
 // host thread; guest/host ownership is synchronized by the mailbox state word.
 unsafe impl Send for MailboxBinding {}
 
+/// Original EL0 syscall state to replay after a kick in dormant clock code.
+#[derive(Debug)]
+pub struct ClockKickRestart {
+    pub pc: u64,
+    pub pstate: u64,
+    pub registers: Vec<(u32, u64)>,
+}
+
 impl MailboxBinding {
+    /// The owning vCPU must be stopped throughout this operation.
+    pub fn force_clock_host_boundary(&mut self) -> Result<(), MailboxConsumeError> {
+        if self.lease.is_none() {
+            return Err(MailboxConsumeError::NoLiveSlot);
+        }
+        let mailbox = self.host.as_ptr();
+        // SAFETY: an unreleased binding owns this complete slot; stopped vCPU
+        // excludes concurrent guest stores, and other executors cannot use it.
+        unsafe {
+            let generation = core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).generation));
+            if generation != self.generation {
+                return Err(MailboxConsumeError::Protocol(
+                    MailboxProtocolError::StaleGeneration {
+                        expected: self.generation,
+                        actual: generation,
+                    },
+                ));
+            }
+            let flags = core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).flags));
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).flags),
+                flags | carrick_aarch64::mailbox::CLOCK_FORCE_HOST_BOUNDARY,
+            );
+        }
+        Ok(())
+    }
+
+    /// Normalize every instruction boundary, including the completion tail
+    /// after ClockActive was cleared. Merely setting a flag there is too late.
+    pub fn clock_kick_restart(
+        &mut self,
+        pc: u64,
+        elr: u64,
+        spsr: u64,
+        esr: u64,
+    ) -> Result<Option<ClockKickRestart>, MailboxConsumeError> {
+        self.force_clock_host_boundary()?;
+        let layout = carrick_mem::memory::clock_handler_layout();
+        let in_handler = (layout.start..layout.end).contains(&pc);
+        let in_stub = carrick_mem::memory::is_carrick_el0_clock_stub_va(pc);
+        if !in_handler && !in_stub {
+            return Ok(None);
+        }
+        let mailbox = self.host.as_ptr();
+        // SAFETY: same stopped-vCPU/exclusive-slot contract as the latch above.
+        unsafe {
+            let active = self.state().load(Ordering::Acquire) == MailboxState::ClockActive.raw();
+            if in_stub && !active {
+                return Ok(None);
+            }
+            let saved = active || pc >= layout.completion;
+            let mut registers = Vec::new();
+            let (resume_pc, pstate) = if saved {
+                let args = core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).args));
+                registers.extend(args.into_iter().enumerate().map(|(i, v)| (i as u32, v)));
+                registers.extend([
+                    (
+                        8,
+                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).x8)),
+                    ),
+                    (
+                        9,
+                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).clock_x9)),
+                    ),
+                    (
+                        10,
+                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).clock_x10)),
+                    ),
+                    (
+                        11,
+                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).clock_x11)),
+                    ),
+                    (
+                        12,
+                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).clock_x12)),
+                    ),
+                    (
+                        16,
+                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_x16)),
+                    ),
+                    (
+                        17,
+                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_x17)),
+                    ),
+                ]);
+                (
+                    core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_pc)),
+                    core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).spsr)),
+                )
+            } else {
+                // A kicked ordinary data-abort dispatch must continue its
+                // fault path; its ELR is not a post-SVC return address.
+                if esr >> 26 != 0x15 {
+                    return Ok(None);
+                }
+                for (r, after, off) in [(16, 4, 0usize), (17, 8, 8usize)] {
+                    if pc >= layout.start + after {
+                        let ptr = core::ptr::addr_of!((*mailbox).reserved)
+                            .cast::<u8>()
+                            .add(off)
+                            .cast::<u64>();
+                        registers.push((r, core::ptr::read_volatile(ptr)));
+                    }
+                }
+                (elr, spsr)
+            };
+            self.state()
+                .store(MailboxState::Idle.raw(), Ordering::Release);
+            Ok(Some(ClockKickRestart {
+                pc: resume_pc.wrapping_sub(4),
+                pstate,
+                registers,
+            }))
+        }
+    }
+
     pub(crate) fn is_released_for_executor_boundary(&self) -> bool {
         self.lease.is_none()
     }
@@ -570,6 +694,7 @@ impl MailboxBinding {
             );
             if preserved.is_none() {
                 self.write_volatile(core::ptr::addr_of_mut!((*self.host.as_ptr()).sequence), 0);
+                self.write_volatile(core::ptr::addr_of_mut!((*self.host.as_ptr()).flags), 0);
             }
         }
         if let Some(parked) = preserved {
@@ -636,6 +761,14 @@ impl MailboxBinding {
         validate_request_metadata(metadata, self.generation, self.last_sequence)
             .map_err(MailboxConsumeError::Protocol)?;
         self.last_sequence = metadata.sequence;
+        // Reaching validated host dispatch satisfies the latched boundary.
+        unsafe {
+            let flags = core::ptr::read_volatile(core::ptr::addr_of!((*self.host.as_ptr()).flags));
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*self.host.as_ptr()).flags),
+                flags & !carrick_aarch64::mailbox::CLOCK_FORCE_HOST_BOUNDARY,
+            );
+        }
         Ok(Some(request))
     }
 
@@ -687,7 +820,9 @@ impl MailboxBinding {
         let state = self.state().load(Ordering::Acquire);
         match MailboxState::try_from(state) {
             Ok(MailboxState::ResponseReady) => {}
-            Ok(MailboxState::Idle | MailboxState::RequestReady) => return Ok(None),
+            Ok(MailboxState::Idle | MailboxState::RequestReady | MailboxState::ClockActive) => {
+                return Ok(None);
+            }
             Err(unknown) => {
                 return Err(MailboxConsumeError::Protocol(
                     MailboxProtocolError::UnexpectedState {
@@ -787,6 +922,12 @@ impl MailboxBinding {
                 Ok(())
             }
             Ok(MailboxState::Idle) => Ok(()),
+            Ok(MailboxState::ClockActive) => Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::UnexpectedState {
+                    expected: MailboxState::RequestReady,
+                    actual: MailboxState::ClockActive.raw(),
+                },
+            )),
             Err(unknown) => Err(MailboxConsumeError::Protocol(
                 MailboxProtocolError::UnexpectedState {
                     expected: MailboxState::RequestReady,
@@ -861,11 +1002,125 @@ mod tests {
             return_value: 0,
             resume_x16: 0,
             resume_x17: 0,
-            reserved: [0; 72],
+            clock_x9: 0,
+            clock_x10: 0,
+            clock_x11: 0,
+            clock_x12: 0,
+            reserved: [0; 40],
         });
         let pointer = NonNull::from(mailbox.as_mut());
         let binding = unsafe { MailboxBinding::new(lease, pointer, HvfSyscallTransport::Mailbox) };
         (binding, mailbox)
+    }
+
+    #[test]
+    fn kick_normalization_recovers_pre_active_scratch_registers() {
+        let (mut binding, mut mailbox) = binding();
+        mailbox.reserved[0..8].copy_from_slice(&0x1616_u64.to_le_bytes());
+        mailbox.reserved[8..16].copy_from_slice(&0x1717_u64.to_le_bytes());
+        let layout = carrick_mem::memory::clock_handler_layout();
+        let restart = binding
+            .clock_kick_restart(layout.start + 8, 0x4004, 0xA0000000, 0x15 << 26)
+            .expect("normalize")
+            .expect("restart");
+        assert_eq!((restart.pc, restart.pstate), (0x4000, 0xA0000000));
+        assert_eq!(restart.registers, vec![(16, 0x1616), (17, 0x1717)]);
+        assert_eq!(
+            mailbox.flags & carrick_aarch64::mailbox::CLOCK_FORCE_HOST_BOUNDARY,
+            1
+        );
+    }
+
+    #[test]
+    fn kick_normalization_recovers_active_stub_and_cleared_completion_tail() {
+        for (pc, state) in [
+            (
+                carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE,
+                MailboxState::ClockActive,
+            ),
+            (
+                carrick_mem::memory::clock_handler_layout().end - 4,
+                MailboxState::Idle,
+            ),
+        ] {
+            let (mut binding, mut mailbox) = binding();
+            mailbox.state.store(state.raw(), Ordering::Release);
+            mailbox.resume_pc = 0x8004;
+            mailbox.spsr = 0x60000000;
+            mailbox.args = [1, 2, 3, 4, 5, 6];
+            mailbox.x8 = 113;
+            mailbox.clock_x9 = 9;
+            mailbox.clock_x10 = 10;
+            mailbox.clock_x11 = 11;
+            mailbox.clock_x12 = 12;
+            mailbox.resume_x16 = 16;
+            mailbox.resume_x17 = 17;
+            let restart = binding
+                .clock_kick_restart(pc, 0xBAD, 0xBAD, 0xBAD)
+                .expect("normalize")
+                .expect("restart");
+            assert_eq!((restart.pc, restart.pstate), (0x8000, 0x60000000));
+            assert_eq!(
+                restart.registers,
+                vec![
+                    (0, 1),
+                    (1, 2),
+                    (2, 3),
+                    (3, 4),
+                    (4, 5),
+                    (5, 6),
+                    (8, 113),
+                    (9, 9),
+                    (10, 10),
+                    (11, 11),
+                    (12, 12),
+                    (16, 16),
+                    (17, 17)
+                ]
+            );
+            assert_eq!(
+                mailbox.state.load(Ordering::Acquire),
+                MailboxState::Idle.raw()
+            );
+            assert_eq!(mailbox.flags, 1);
+        }
+    }
+
+    #[test]
+    fn unowned_stub_and_non_svc_entry_do_not_restore_stale_frame() {
+        let (mut binding, _mailbox) = binding();
+        assert!(
+            binding
+                .clock_kick_restart(
+                    carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE,
+                    0xBAD,
+                    0xBAD,
+                    0xBAD
+                )
+                .expect("stub")
+                .is_none()
+        );
+        assert!(
+            binding
+                .clock_kick_restart(
+                    carrick_mem::memory::clock_handler_layout().start,
+                    0xBAD,
+                    0xBAD,
+                    0x24 << 26
+                )
+                .expect("fault")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn kick_latch_rejects_stale_generation_and_preserves_other_flags() {
+        let (mut binding, mut mailbox) = binding();
+        mailbox.flags = 0x80;
+        binding.force_clock_host_boundary().expect("latch");
+        assert_eq!(mailbox.flags, 0x81);
+        mailbox.generation = mailbox.generation.wrapping_add(1);
+        assert!(binding.force_clock_host_boundary().is_err());
     }
 
     fn publish_valid_request(binding: &MailboxBinding, mailbox: &mut Aarch64SyscallMailbox) {
@@ -998,7 +1253,11 @@ mod tests {
             return_value: 0,
             resume_x16: 0,
             resume_x17: 0,
-            reserved: [0; 72],
+            clock_x9: 0,
+            clock_x10: 0,
+            clock_x11: 0,
+            clock_x12: 0,
+            reserved: [0; 40],
         });
         let rebuilt_pointer = NonNull::from(rebuilt_mailbox.as_mut());
 
@@ -1042,6 +1301,10 @@ mod tests {
             return_value: old_mailbox.return_value,
             resume_x16: old_mailbox.resume_x16,
             resume_x17: old_mailbox.resume_x17,
+            clock_x9: old_mailbox.clock_x9,
+            clock_x10: old_mailbox.clock_x10,
+            clock_x11: old_mailbox.clock_x11,
+            clock_x12: old_mailbox.clock_x12,
             reserved: old_mailbox.reserved,
         });
         publish_valid_request(&binding, &mut cow_replacement);
@@ -1118,7 +1381,11 @@ mod tests {
             return_value: 0,
             resume_x16: 0,
             resume_x17: 0,
-            reserved: [0; 72],
+            clock_x9: 0,
+            clock_x10: 0,
+            clock_x11: 0,
+            clock_x12: 0,
+            reserved: [0; 40],
         });
         let old_pointer = NonNull::from(old_mailbox.as_mut());
         let mut binding =
@@ -1164,7 +1431,11 @@ mod tests {
             return_value: 0,
             resume_x16: 0,
             resume_x17: 0,
-            reserved: [0; 72],
+            clock_x9: 0,
+            clock_x10: 0,
+            clock_x11: 0,
+            clock_x12: 0,
+            reserved: [0; 40],
         });
         let resumed_pointer = NonNull::from(resumed_mailbox.as_mut());
         unsafe {
@@ -1343,7 +1614,11 @@ mod tests {
             return_value: 0,
             resume_x16: 0,
             resume_x17: 0,
-            reserved: [0; 72],
+            clock_x9: 0,
+            clock_x10: 0,
+            clock_x11: 0,
+            clock_x12: 0,
+            reserved: [0; 40],
         });
         let pointer = NonNull::from(mailbox.as_mut());
         let mut binding =

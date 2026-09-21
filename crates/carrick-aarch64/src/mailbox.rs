@@ -1,7 +1,7 @@
 use std::sync::atomic::AtomicU32;
 
 pub const AARCH64_SYSCALL_MAILBOX_MAGIC: u64 = 0x4341_5252_4d42_4f58;
-pub const AARCH64_SYSCALL_MAILBOX_VERSION: u32 = 1;
+pub const AARCH64_SYSCALL_MAILBOX_VERSION: u32 = 2;
 pub const AARCH64_SYSCALL_MAILBOX_SIZE: u64 = 0x100;
 pub const AARCH64_SYSCALL_MAILBOX_SLOTS: usize = 256;
 
@@ -28,7 +28,11 @@ pub struct Aarch64SyscallMailbox {
     pub return_value: u64,
     pub resume_x16: u64,
     pub resume_x17: u64,
-    pub reserved: [u8; 72],
+    pub clock_x9: u64,
+    pub clock_x10: u64,
+    pub clock_x11: u64,
+    pub clock_x12: u64,
+    pub reserved: [u8; 40],
 }
 
 const _: () = assert!(core::mem::size_of::<Aarch64SyscallMailbox>() == 256);
@@ -54,7 +58,7 @@ const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, esr) == 152);
 const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, return_value) == 160);
 const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, resume_x16) == 168);
 const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, resume_x17) == 176);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, reserved) == 184);
+const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, reserved) == 216);
 // The guest vector lives in `carrick-mem` (below this protocol crate in the
 // dependency graph), so it owns the instruction-immediate constants. Tie every
 // offset it emits back to this wire struct at compile time to prevent drift.
@@ -131,12 +135,15 @@ const _: () = assert!(
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17 as usize
 );
 
+/// Set only while the vCPU is stopped and its owned mailbox is stable.
+pub const CLOCK_FORCE_HOST_BOUNDARY: u32 = carrick_mem::memory::CLOCK_FORCE_HOST_BOUNDARY;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum MailboxState {
     Idle = 0,
     RequestReady = 1,
     ResponseReady = 2,
+    ClockActive = 3,
 }
 
 impl MailboxState {
@@ -150,6 +157,8 @@ impl MailboxState {
             (Self::Idle, Self::RequestReady)
                 | (Self::RequestReady, Self::ResponseReady)
                 | (Self::ResponseReady, Self::Idle)
+                | (Self::Idle, Self::ClockActive)
+                | (Self::ClockActive, Self::Idle)
         )
     }
 }
@@ -190,6 +199,7 @@ impl TryFrom<u32> for MailboxState {
             0 => Ok(Self::Idle),
             1 => Ok(Self::RequestReady),
             2 => Ok(Self::ResponseReady),
+            3 => Ok(Self::ClockActive),
             unknown => Err(UnknownMailboxValue(unknown)),
         }
     }
@@ -332,7 +342,7 @@ mod tests {
             core::mem::offset_of!(Aarch64SyscallMailbox, resume_x17),
             176
         );
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, reserved), 184);
+        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, reserved), 216);
     }
 
     #[test]
@@ -344,7 +354,8 @@ mod tests {
         assert_eq!(MailboxResponseAction::NormalReturn.raw(), 1);
         assert_eq!(MailboxResponseAction::RegistersPrepared.raw(), 2);
 
-        assert_eq!(MailboxState::try_from(3), Err(UnknownMailboxValue(3)));
+        assert_eq!(MailboxState::try_from(3), Ok(MailboxState::ClockActive));
+        assert_eq!(MailboxState::try_from(4), Err(UnknownMailboxValue(4)));
         assert_eq!(MailboxTrapKind::try_from(2), Err(UnknownMailboxValue(2)));
         assert_eq!(
             MailboxResponseAction::try_from(3),
@@ -431,3 +442,27 @@ mod tests {
         assert_eq!(next_nonzero_generation(u64::MAX), 1);
     }
 }
+
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, clock_x9)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X9 as usize
+);
+
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, clock_x10)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X10 as usize
+);
+
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, clock_x11)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X11 as usize
+);
+
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, clock_x12)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X12 as usize
+);
+
+const _: () = assert!(
+    MailboxState::ClockActive.raw() == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_CLOCK_ACTIVE
+);

@@ -162,7 +162,49 @@ fn os_to_trap(e: carrick_hal::OsError) -> TrapError {
     TrapError::Hypervisor(e.to_string())
 }
 
+fn needs_clock_entry_latch(native_nr: u64, esr: u64) -> bool {
+    native_nr == 113 && esr >> 26 == 0x15
+}
+
 impl Aarch64Vcpu for HvfAarch64Vcpu {
+    fn force_clock_host_boundary(&mut self) -> Result<bool, TrapError> {
+        let pc = self.get_reg(Reg::Pc)?;
+        if !carrick_mem::memory::is_carrick_el1_clock_handler_va(pc)
+            && !carrick_mem::memory::is_carrick_el0_clock_stub_va(pc)
+        {
+            if !needs_clock_entry_latch(self.get_reg(Reg::X(8))?, self.get_esr_el1()?) {
+                return Ok(false);
+            }
+            return self
+                .mailbox
+                .force_clock_host_boundary()
+                .map(|()| false)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!("mailbox kick latch failed: {error}"))
+                });
+        }
+        let restart = self
+            .mailbox
+            .clock_kick_restart(
+                pc,
+                hvf_get_reg(&self.inner, Reg::ElrEl1).map_err(os_to_trap)?,
+                hvf_get_reg(&self.inner, Reg::SpsrEl1).map_err(os_to_trap)?,
+                self.get_esr_el1()?,
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("mailbox kick normalization failed: {error}"))
+            })?;
+        if let Some(restart) = restart {
+            for (r, value) in restart.registers {
+                self.set_reg(Reg::X(r), value)?;
+            }
+            self.set_reg(Reg::Pc, restart.pc)?;
+            self.set_reg(Reg::Pstate, restart.pstate)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn get_reg(&self, r: Reg) -> Result<u64, TrapError> {
         hvf_get_reg(&self.inner, r).map_err(os_to_trap)
     }
@@ -2680,5 +2722,20 @@ mod task_only_materializer_tests {
         let idle_worker = crate::trap::hvpatch_neutral_task_state_for_test();
         drop(root_task);
         crate::trap::audit_hvpatch_neutral_task_state_for_test(&idle_worker).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod clock_kick_policy_tests {
+    #[test]
+    fn only_raw_clock_svc_latches_before_handler_entry() {
+        assert!(super::needs_clock_entry_latch(
+            113,
+            (0x15 << 26) | (1 << 25)
+        ));
+        for nr in [80, 172, 178, 114] {
+            assert!(!super::needs_clock_entry_latch(nr, 0x15 << 26));
+        }
+        assert!(!super::needs_clock_entry_latch(113, 0x24 << 26));
     }
 }

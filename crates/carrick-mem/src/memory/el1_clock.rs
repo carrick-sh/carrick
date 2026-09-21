@@ -8,7 +8,7 @@ pub const STUB_SIZE: u64 = 0x4000;
 /// TODO(runtime): publish only for unscaled/unfrozen hardware-counter clocks,
 /// with no observer, seccomp, trap budget, or pending mandatory boundary.
 pub const CLOCK_GATE_OFFSET: u64 = 16;
-const ACTIVE: u16 = 3;
+const ACTIVE: u16 = AARCH64_SYSCALL_MAILBOX_CLOCK_ACTIVE as u16;
 const ENTRY: usize = 0xC00;
 const TMP16: u64 = 216;
 const TMP17: u64 = 224;
@@ -23,10 +23,10 @@ const SAVED: [(u32, u64); 13] = [
     (4, 88),
     (5, 96),
     (8, 104),
-    (9, 184),
-    (10, 192),
-    (11, 200),
-    (12, 208),
+    (9, AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X9),
+    (10, AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X10),
+    (11, AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X11),
+    (12, AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X12),
     (16, 168),
     (17, 176),
 ];
@@ -112,7 +112,7 @@ impl Code<'_> {
     }
 }
 
-pub(super) fn install(bytes: &mut [u8], dispatch: usize) {
+pub(super) fn install(bytes: &mut [u8], dispatch: usize) -> ClockHandlerLayout {
     bytes[dispatch..dispatch + 4]
         .copy_from_slice(&enc_b(dispatch as u64, ENTRY as u64).to_le_bytes());
     let mut c = Code { bytes, pc: ENTRY };
@@ -124,6 +124,10 @@ pub(super) fn install(bytes: &mut [u8], dispatch: usize) {
     let active = c.branch();
     c.emit(enc_cmp_w16_imm(0));
     let busy = c.branch();
+    // Conservatively reject every nonzero flag, including the kick latch.
+    c.emit(enc_ldr_wt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_FLAGS));
+    c.emit(enc_cmp_w16_imm(0));
+    let kicked = c.branch();
     c.emit(AARCH64_MRS_ESR_EL1_X16_OPCODE);
     c.emit(AARCH64_LSR_X16_X16_26_OPCODE);
     c.emit(AARCH64_CMP_X16_SVC64_OPCODE);
@@ -164,7 +168,7 @@ pub(super) fn install(bytes: &mut [u8], dispatch: usize) {
     c.emit(enc_ldr_xt_sp(16, TMP16));
     c.emit(enc_ldr_xt_sp(17, TMP17));
     c.emit(enc_b(c.pc as u64, MAILBOX_HANDLER_OFFSET as u64));
-    for p in [busy, not_svc, wrong_nr, wrong_clock, policy, domain] {
+    for p in [busy, kicked, not_svc, wrong_nr, wrong_clock, policy, domain] {
         c.patch(p, ordinary, Some(false));
     }
 
@@ -178,12 +182,14 @@ pub(super) fn install(bytes: &mut [u8], dispatch: usize) {
     c.imm(17, (0x15u64 << 26) | (1 << 25) | u64::from(MARKER));
     c.emit(0xEB11_021F);
     let wrong_esr = c.branch();
-    // Match the existing identity shim's nominal system-time accounting.
-    // TODO(runtime): exact per-task accounting must precede gate publication.
-    c.imm(17, LINUX_IDENTITY_PAGE_BASE);
-    c.emit(enc_ldr_xt_xn(16, 17, IDENTITY_OFF_SHIM_SYSCALLS));
-    c.emit(enc_add_xd_xn_imm(16, 16, 1));
-    c.emit(enc_str_xt_xn(16, 17, IDENTITY_OFF_SHIM_SYSCALLS));
+    c.emit(enc_ldr_wt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_FLAGS));
+    c.emit(enc_cmp_w16_imm(0));
+    let completion_kicked = c.branch();
+    // Exact per-owner accounting is an enablement prerequisite. Do not reuse
+    // the identity page's non-atomic shared counter: a late kick can normalize
+    // this operation into host dispatch after any chosen completion point and
+    // would double-charge it. Admission remains closed until a per-owner ledger
+    // can be folded exactly once.
     c.restore_frame();
     c.restore_regs(true);
     c.emit(AARCH64_ERET_OPCODE);
@@ -194,10 +200,16 @@ pub(super) fn install(bytes: &mut [u8], dispatch: usize) {
     let retry = c.pc;
     c.patch(wrong_pc, retry, Some(false));
     c.patch(wrong_esr, retry, Some(false));
+    c.patch(completion_kicked, retry, Some(false));
     c.restore_frame();
     c.restore_regs(false);
     c.emit(enc_b(c.pc as u64, MAILBOX_HANDLER_OFFSET as u64));
     assert!(c.pc <= LINUX_EL1_VECTORS_SIZE as usize);
+    ClockHandlerLayout {
+        start: LINUX_EL1_VECTORS_BASE + ENTRY as u64,
+        completion: LINUX_EL1_VECTORS_BASE + completion as u64,
+        end: LINUX_EL1_VECTORS_BASE + c.pc as u64,
+    }
 }
 
 #[cfg(test)]
@@ -350,6 +362,30 @@ pub(super) mod tests {
         }
     }
     #[test]
+    fn kick_before_admission_forces_original_host_syscall() {
+        let mut m = Machine::new();
+        m.mem.insert(SP + AARCH64_SYSCALL_MAILBOX_OFF_FLAGS, 1);
+        let original = (m.regs, m.elr, m.spsr, m.esr);
+        assert_eq!(m.run(), "host");
+        assert_eq!((m.regs, m.elr, m.spsr, m.esr), original);
+    }
+
+    #[test]
+    fn kick_during_active_clock_forces_host_boundary_on_completion() {
+        let mut m = Machine::new();
+        let original = (m.regs, m.elr, m.spsr, m.esr);
+        assert_eq!(m.run(), "eret");
+        m.mem.insert(SP + AARCH64_SYSCALL_MAILBOX_OFF_FLAGS, 1);
+        m.exception(COMPLETION_PC, (0x15 << 26) | (1 << 25) | u64::from(MARKER));
+        assert_eq!(m.run(), "host");
+        assert_eq!((m.regs, m.elr, m.spsr, m.esr), original);
+        assert_eq!(
+            m.read(LINUX_IDENTITY_PAGE_BASE + IDENTITY_OFF_SHIM_SYSCALLS),
+            0
+        );
+    }
+
+    #[test]
     fn completion_restores_all_registers_and_original_frame() {
         let mut m = Machine::new();
         let original = (m.regs, m.elr, m.spsr, m.esr);
@@ -370,7 +406,8 @@ pub(super) mod tests {
         assert_eq!(m.read(SP + 32), 0);
         assert_eq!(
             m.read(LINUX_IDENTITY_PAGE_BASE + IDENTITY_OFF_SHIM_SYSCALLS),
-            1
+            0,
+            "clock accounting stays dormant until exact per-owner folding exists"
         );
     }
     #[test]
