@@ -1,8 +1,8 @@
-//! Perf probe: the syscall trap+dispatch floor. Times raw `getpid` and `gettid`
-//! syscalls in tight loops, plus an equal-loop timing control. Carrick services
-//! both calls from cached process/thread state with ~zero host syscalls, so the
-//! difference from the control approximates the irreducible guest→host
-//! transition and dispatch cost. LOWER is better.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+//! Perf probe: raw identity, clock, and host-dispatch syscall costs.
+//! Identity and monotonic-clock calls can complete through Carrick's EL1 paths;
+//! an invalid-fd lseek measures ordinary host dispatch without host file I/O.
+//! An equal-loop timing control exposes counter/loop overhead. LOWER is better.
 //!
 //! Raw `syscall(172)` (not `getpid()`) so glibc/musl's pid cache can't elide
 //! the trap. Output (key=value, parsed by the perf gate, NOT diffed):
@@ -86,8 +86,8 @@ fn summarize(mut samples: Vec<u64>, frequency: u64) -> TimingSummary {
     };
     let trim = samples.len() / 20;
     let trimmed = &samples[trim..samples.len() - trim];
-    let trimmed_mean_ticks = trimmed.iter().map(|ticks| *ticks as f64).sum::<f64>()
-        / trimmed.len() as f64;
+    let trimmed_mean_ticks =
+        trimmed.iter().map(|ticks| *ticks as f64).sum::<f64>() / trimmed.len() as f64;
     TimingSummary {
         p50_us: percentile(0.50),
         p95_us: percentile(0.95),
@@ -138,16 +138,13 @@ fn print_summary(prefix: &str, summary: TimingSummary) {
     println!("{prefix}_p50_us={:.3}", summary.p50_us);
     println!("{prefix}_p95_us={:.3}", summary.p95_us);
     println!("{prefix}_min_us={:.3}", summary.min_us);
-    println!(
-        "{prefix}_trimmed_mean_us={:.3}",
-        summary.trimmed_mean_us
-    );
+    println!("{prefix}_trimmed_mean_us={:.3}", summary.trimmed_mean_us);
 }
 
 fn main() {
     // Raw getpid by syscall number, arch-correct (aarch64 __NR_getpid=172,
     // x86_64=39): `libc::SYS_getpid` resolves per target. carrick answers from
-    // cached creds, so this measures the bare guest->host trap round trip.
+    // cached creds; with the identity shim enabled this does not reach the host.
     let frequency = counter_frequency();
     let getpid = measure(frequency, || {
         std::hint::black_box(unsafe { libc::syscall(libc::SYS_getpid) });
@@ -167,6 +164,28 @@ fn main() {
     let empty_batch = measure_batched(frequency, || {
         std::hint::black_box(());
     });
+    let mut clock = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let mut clock_errors = 0usize;
+    let raw_clock_batch = measure_batched(frequency, || {
+        let result =
+            unsafe { libc::syscall(libc::SYS_clock_gettime, libc::CLOCK_MONOTONIC, &mut clock) };
+        clock_errors += usize::from(result != 0);
+        std::hint::black_box(&clock);
+    });
+    let mut seek_errors = 0usize;
+    let invalid_seek_batch = measure_batched(frequency, || {
+        let result = unsafe { libc::syscall(libc::SYS_lseek, -1i32, 0i64, libc::SEEK_SET) };
+        seek_errors += usize::from(result != -1);
+    });
+    assert_eq!(clock_errors, 0, "raw monotonic clock must succeed");
+    assert_eq!(seek_errors, 0, "invalid descriptor must be rejected");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EBADF)
+    );
 
     // Retain the established `trap_*` keys for the existing perf runner.
     print_summary("trap", getpid);
@@ -175,6 +194,8 @@ fn main() {
     print_summary("trap_batch", getpid_batch);
     print_summary("gettid_batch", gettid_batch);
     print_summary("empty_batch", empty_batch);
+    print_summary("raw_clock_batch", raw_clock_batch);
+    print_summary("invalid_seek_batch", invalid_seek_batch);
     println!("iters={ITERS}");
     println!("batch={BATCH}");
     println!("batch_samples={BATCH_SAMPLES}");

@@ -265,3 +265,36 @@ digest-pinned image and `/bin/sh -c /opt/ltp/testcases/bin/inotify09` passed
 oracle. An initial attempt to use `time` inside the image failed before LTP
 because that command is absent; the reported run used host `/usr/bin/time`.
 This diagnostic did not rewrite the committed oracle cache.
+
+## Component timing: EL1 versus ordinary host dispatch
+
+Extended the existing `perf_trap_floor` probe with raw `CLOCK_MONOTONIC` and
+invalid-fd `lseek`, retaining its existing identity/control output keys. Clock
+success and rejected seek/EBADF are checked outside the reported results.
+The stale documentation claiming identity calls necessarily reach the host was
+corrected. Both runs used the same freshly built ARM64-musl executable and
+digest-pinned LTP image, serial Carrick then native Docker, with the harness
+trap-limit setting on Carrick.
+
+Final formatted probe source SHA-256:
+`869a08952e9758fb9fdde17080a450d3c3887ce150928fd294bf2823be61f51e`;
+executable SHA-256:
+`d0f0357a2d1272de1cc021d25cab28df239d6f6c18a41eb5a255b80ee6433df8`.
+The Carrick artifact is the namespace-only artifact above. Earlier pre-format
+probe measurements are superseded by this final artifact's receipts.
+
+| Batched p50, microseconds | Carrick | Docker |
+| --- | ---: | ---: |
+| raw getpid | 0.026 | 0.135 |
+| raw gettid | 0.026 | 0.120 |
+| raw monotonic clock | 0.086 | 0.138 |
+| invalid-fd lseek | 1.573 | 0.125 |
+| empty control | 0.000 | 0.000 |
+
+The ordinary host-dispatch case is 12.58x Docker, whereas these EL1 paths are
+already faster. This changes the next target to ordinary syscall dispatch and
+VM entry/exit overhead, not clock transport. The invalid seek is a lower-work
+dispatch case, not a claim about every syscall or full inotify runtime. Zero
+rounded control values are below reporting resolution, not literally free.
+Raw receipts: `target/perf/inotify-sustained/trap-components-carrick.txt` and
+`trap-components-docker.txt`. No acceptance budget is changed or closed.
