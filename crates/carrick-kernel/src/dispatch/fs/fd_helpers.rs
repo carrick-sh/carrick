@@ -529,6 +529,15 @@ impl<'a> FsView<'a> {
         self.inotify_path_kind(path).is_some()
     }
 
+    /// Checks whether `path` exists in rootfs+overlay directly without re-querying mounts.
+    pub(in crate::dispatch) fn rootfs_path_exists(&self, path: &str) -> bool {
+        use carrick_vfs::Vfs as _;
+        if self.fs.rootfs_vfs.dentry_is_dir(path).is_ok() {
+            return true;
+        }
+        self.fs.rootfs_vfs.lookup(path).is_ok()
+    }
+
     /// `Some(is_dir)` if `path` exists, else `None`. Checks the VFS mount table
     /// first (so `/proc`, `/dev`, bind mounts resolve), then the rootfs+overlay.
     pub(in crate::dispatch) fn inotify_path_kind(&self, path: &str) -> Option<bool> {

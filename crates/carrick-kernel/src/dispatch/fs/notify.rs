@@ -311,7 +311,7 @@ impl<'a> FsView<'a> {
                 // guest change without opening and registering a host vnode.
                 // Bind mounts take the branch above and retain native watches
                 // because an external host process can mutate their namespace.
-                if !this.path_exists(&path) {
+                if !this.rootfs_path_exists(&path) {
                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOENT));
                 }
                 state.add_virtual_watch(mask)

@@ -21,7 +21,8 @@
 //! Linux-style basename events. That dir-diff is macOS-only.
 
 use crate::linux_abi::{LINUX_EINVAL, LINUX_ENOSPC, LinuxErrno};
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::os::fd::RawFd;
 
 use parking_lot::Mutex;
@@ -153,13 +154,14 @@ struct WatchedFd {
 #[derive(Debug)]
 struct Inner {
     next_wd: i32,
+    free_wds: BinaryHeap<Reverse<i32>>,
     watches: HashMap<i32, Watch>,
     wd_by_fd: HashMap<RawFd, WatchedFd>,
     /// Encoded `inotify_event` records observed but not yet handed to the guest
     /// (a `read(2)` whose buffer was smaller than the available events keeps the
     /// rest here, like the kernel's event queue). On Linux this only buffers a
     /// short-read remainder; on macOS it also holds synthesized records.
-    pending: std::collections::VecDeque<Vec<u8>>,
+    pending: VecDeque<Vec<u8>>,
     /// Running total of `pending`'s encoded bytes, maintained by
     /// [`Inner::push_record`] and [`drain_pending`] — the only two places that
     /// touch the queue. `ioctl(FIONREAD)` and readiness both need this number
@@ -201,9 +203,10 @@ impl Inner {
     fn new() -> Self {
         Inner {
             next_wd: 1,
+            free_wds: BinaryHeap::new(),
             watches: HashMap::new(),
             wd_by_fd: HashMap::new(),
-            pending: std::collections::VecDeque::new(),
+            pending: VecDeque::new(),
             queued_bytes: 0,
             overflowed: false,
             next_cookie: 1,
@@ -211,6 +214,27 @@ impl Inner {
             dispatch_authoritative: false,
             #[cfg(target_os = "linux")]
             native_wd_to_guest: HashMap::new(),
+        }
+    }
+
+    /// Allocate the lowest available watch descriptor.
+    fn alloc_wd(&mut self) -> i32 {
+        if let Some(Reverse(wd)) = self.free_wds.pop() {
+            wd
+        } else {
+            let wd = self.next_wd;
+            self.next_wd += 1;
+            wd
+        }
+    }
+
+    /// Return a watch descriptor to the pool, resetting the pool if empty.
+    fn free_wd(&mut self, wd: i32) {
+        if self.watches.is_empty() {
+            self.next_wd = 1;
+            self.free_wds.clear();
+        } else {
+            self.free_wds.push(Reverse(wd));
         }
     }
 
@@ -379,8 +403,7 @@ impl InotifyBackend for NativeLinuxInotify {
             unsafe { libc::close(watch_fds[0].host_fd) };
             return Ok(wd);
         }
-        let wd = inner.next_wd;
-        inner.next_wd += 1;
+        let wd = inner.alloc_wd();
         for (watch_fd, native_wd) in watch_fds.iter().zip(native_wds) {
             inner.wd_by_fd.insert(watch_fd.host_fd, WatchedFd { wd });
             inner.native_wd_to_guest.insert(native_wd, wd);
@@ -593,8 +616,7 @@ impl InotifyBackend for VnodeDiffInotify {
             unsafe { libc::close(fd) };
             return Ok(wd);
         }
-        let wd = inner.next_wd;
-        inner.next_wd += 1;
+        let wd = inner.alloc_wd();
         for watch_fd in &watch_fds {
             let scan_dir = watch_fd.scan_dir.as_ref().and_then(|path| {
                 scan_dir_entries(path).ok().map(|entries| ScannedDir {
@@ -917,8 +939,7 @@ impl InotifyState {
     /// real shared vnode) are simply unavailable for such a watch.
     pub(crate) fn add_virtual_watch(&self, mask: u32) -> i32 {
         let mut inner = self.inner.lock();
-        let wd = inner.next_wd;
-        inner.next_wd += 1;
+        let wd = inner.alloc_wd();
         inner.watches.insert(
             wd,
             Watch {
@@ -985,6 +1006,7 @@ impl InotifyState {
         let Some(watch) = inner.watches.remove(&wd) else {
             return Err(LINUX_EINVAL);
         };
+        inner.free_wd(wd);
         for host_fd in &watch.host_fds {
             inner.wd_by_fd.remove(host_fd);
         }
@@ -1190,8 +1212,8 @@ struct RegisteredWatch {
 /// hooks; this index supplies the precise events for mutations that do.
 #[derive(Default)]
 struct RegistryInner {
-    by_path: HashMap<String, Vec<RegisteredWatch>>,
-    by_wd: HashMap<(usize, i32), Vec<String>>,
+    by_path: HashMap<std::sync::Arc<str>, Vec<RegisteredWatch>>,
+    by_wd: HashMap<(usize, i32), Vec<std::sync::Arc<str>>>,
 }
 
 impl RegistryInner {
@@ -1201,7 +1223,7 @@ impl RegistryInner {
         for watch in &watches {
             let key = (std::sync::Arc::as_ptr(&watch.state) as usize, watch.wd);
             if let Some(paths) = self.by_wd.get_mut(&key) {
-                paths.retain(|p| p != path);
+                paths.retain(|p| &**p != path);
                 if paths.is_empty() {
                     self.by_wd.remove(&key);
                 }
@@ -1283,9 +1305,20 @@ impl InotifyRegistry {
     ) {
         let key = normalize_watch_path(path);
         let mut inner = self.inner.write();
-        let entry = match inner.by_path.get_mut(key) {
-            Some(entry) => entry,
-            None => inner.by_path.entry(key.to_owned()).or_default(),
+        let (path_key, entry) = if let Some((k, _)) = inner.by_path.get_key_value(key) {
+            let path_key = std::sync::Arc::clone(k);
+            let entry = match inner.by_path.get_mut(key) {
+                Some(entry) => entry,
+                None => inner
+                    .by_path
+                    .entry(std::sync::Arc::clone(&path_key))
+                    .or_default(),
+            };
+            (path_key, entry)
+        } else {
+            let k: std::sync::Arc<str> = std::sync::Arc::from(key);
+            let entry = inner.by_path.entry(std::sync::Arc::clone(&k)).or_default();
+            (k, entry)
         };
         // Re-adding the same (instance, wd) updates the mask in place (inotify
         // returns the same wd for a re-add and replaces the mask).
@@ -1305,8 +1338,8 @@ impl InotifyRegistry {
         }
         let ptr = std::sync::Arc::as_ptr(state) as usize;
         let paths = inner.by_wd.entry((ptr, wd)).or_default();
-        if !paths.iter().any(|p| p == key) {
-            paths.push(key.to_owned());
+        if !paths.iter().any(|p| &**p == key) {
+            paths.push(path_key);
         }
     }
 
@@ -1319,7 +1352,7 @@ impl InotifyRegistry {
         // Visit only this descriptor's paths, then the watches on those paths.
         if let Some(paths) = inner.by_wd.remove(&(ptr, wd)) {
             for path in paths {
-                if let Some(watches) = inner.by_path.get_mut(&path) {
+                if let Some(watches) = inner.by_path.get_mut(&*path) {
                     let prev_len = watches.len();
                     watches.retain(|w| !(w.wd == wd && std::sync::Arc::ptr_eq(&w.state, state)));
                     let removed = prev_len - watches.len();
@@ -1327,8 +1360,8 @@ impl InotifyRegistry {
                         self.watch_count
                             .fetch_sub(removed, std::sync::atomic::Ordering::Relaxed);
                     }
-                    if watches.is_empty() {
-                        inner.by_path.remove(&path);
+                    if watches.is_empty() && inner.by_path.len() > 128 {
+                        inner.by_path.remove(&*path);
                     }
                 }
             }
@@ -1390,14 +1423,15 @@ impl InotifyRegistry {
                         .fetch_sub(removed, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+            let to_arc: std::sync::Arc<str> = std::sync::Arc::from(to_key);
             for w in &watches {
                 let ptr = std::sync::Arc::as_ptr(&w.state) as usize;
                 let paths = inner.by_wd.entry((ptr, w.wd)).or_default();
-                if !paths.iter().any(|p| p == to_key) {
-                    paths.push(to_key.to_owned());
+                if !paths.iter().any(|p| &**p == to_key) {
+                    paths.push(std::sync::Arc::clone(&to_arc));
                 }
             }
-            inner.by_path.insert(to_key.to_owned(), watches);
+            inner.by_path.insert(to_arc, watches);
         }
     }
 
@@ -1648,7 +1682,7 @@ struct InotifyDispatchEvent<'a> {
 /// holding the read lock. Any `IN_ONESHOT` watch that fires is pushed to
 /// `fired_oneshot` for the caller to retire once the lock is released.
 fn dispatch_in(
-    by_path: &HashMap<String, Vec<RegisteredWatch>>,
+    by_path: &HashMap<std::sync::Arc<str>, Vec<RegisteredWatch>>,
     event: &InotifyDispatchEvent<'_>,
     cookie_for: &mut dyn FnMut(&std::sync::Arc<InotifyState>) -> u32,
     fired_oneshot: &mut Vec<OneshotFire>,
