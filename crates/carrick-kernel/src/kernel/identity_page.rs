@@ -340,6 +340,32 @@ pub fn stamp_write_lease<M: CurrentMmMemory>(
     Ok(())
 }
 
+pub fn revoke_seek_authority_and_write_lease<M: CurrentMmMemory>(
+    memory: &mut M,
+    base: u64,
+) -> Result<(), carrick_guest_mem::MemoryError> {
+    if !crate::syscall_shim_enabled() {
+        return Ok(());
+    }
+    let mut chunk = [0u8; 44];
+    if memory
+        .read_into(base + crate::memory::IDENTITY_OFF_SEEK_GATE, &mut chunk)
+        .is_ok()
+    {
+        let seek_gate = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or([0; 4]));
+        let cur_seek_off = i64::from_le_bytes(chunk[12..20].try_into().unwrap_or([0; 8]));
+        let write_gate = u32::from_le_bytes(chunk[20..24].try_into().unwrap_or([0; 4]));
+        let host_fd = i32::from_le_bytes(chunk[24..28].try_into().unwrap_or([u8::MAX; 4]));
+
+        if seek_gate == 1 && cur_seek_off >= 0 && write_gate == 1 && host_fd >= 0 {
+            unsafe { libc::lseek(host_fd, cur_seek_off as libc::off_t, libc::SEEK_SET) };
+        }
+    }
+    let _ = stamp_seek_authority(memory, base, -1, 0, false);
+    let _ = stamp_write_lease(memory, base, -1, -1, 0, false);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
