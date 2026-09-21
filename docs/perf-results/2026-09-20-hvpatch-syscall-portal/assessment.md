@@ -298,3 +298,37 @@ dispatch case, not a claim about every syscall or full inotify runtime. Zero
 rounded control values are below reporting resolution, not literally free.
 Raw receipts: `target/perf/inotify-sustained/trap-components-carrick.txt` and
 `trap-components-docker.txt`. No acceptance budget is changed or closed.
+
+### Isolated host dispatch and mailbox measurement correction
+
+The probe now accepts `host-dispatch`, performing 10,000,000 invalid-fd seeks
+without LTP synchronization or clock calls. The isolated CPU capture completed
+with zero unexpected results and exact closure of 1,786 samples / 642 stacks.
+782 samples (43.8%) include `Vcpu::run`; register reads also appear through
+the legacy decode closure in `MailboxBinding::decode_request`. This isolates
+transport cost from LTP spinning, but the opaque VCPU frame still cannot be
+attributed wholly to host overhead.
+
+Probe source SHA-256:
+`320b6ab63297e078bfdd993699d541fa8224b2af6aaaf3476659fdeadff19c29`;
+executable SHA-256:
+`e27f0f1e37f62db6b8a10ed2e2f62d6b2ee4ad3ab615431ab4fc3323a3d4498d`.
+The signed Carrick artifact remains unchanged. Local receipts are
+`target/perf/inotify-sustained/isolated-carrier.trace` and
+`isolated-symbols.json` (live image base `0x10067c000`).
+
+An explicit mailbox component run reported invalid-seek p50 1.411 us and raw
+clock 0.083 us (`trap-components-mailbox.txt`). This is a diagnostic observation,
+not a fresh ABBA campaign or promotion result. Mailbox `inotify09` run
+`conf-81801-s00` timed out at 40.215 s; a host debug build overlapped its tail,
+so it is not clean timing evidence. Both raw streams were inspected and process
+cleanup verified. No parity is claimed.
+
+The historical mailbox campaign selected `trap_batch_trimmed_mean_us`, which
+times EL1 identity calls. Its transport metric now selects
+`invalid_seek_batch_trimmed_mean_us`. The regression test failed with the old
+selection and passed after correction. Missing new metrics fail parsing rather
+than falling back to the old identity metric. The historical report is annotated;
+its raw evidence and promotion thresholds are unchanged. Fresh qualification
+must also use the current HVPatch execution lane rather than assume the retired
+VMM campaign invocation remains applicable. No runtime default changes here.

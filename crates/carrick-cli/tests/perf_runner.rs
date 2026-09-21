@@ -362,21 +362,22 @@ fn parse_backend_pair_case_sample(output: &str, case: &PerfCase) -> Result<f64, 
 
 fn hvf_transport_metric(case: &PerfCase) -> (&'static str, &'static str) {
     if case.workload == "trap_floor" {
-        ("trap_batch_trimmed_mean_us", "us")
+        // Identity syscalls complete in EL1 and cannot measure host transport.
+        ("invalid_seek_batch_trimmed_mean_us", "us")
     } else {
         (case.metric_key, case.unit)
     }
 }
 
 #[test]
-fn hvf_transport_uses_batched_trap_metric_to_avoid_counter_quantization() {
+fn hvf_transport_measures_host_dispatch_instead_of_el1_identity() {
     let case = CASES
         .iter()
         .find(|case| case.workload == "trap_floor")
         .expect("trap floor");
     assert_eq!(
         hvf_transport_metric(case),
-        ("trap_batch_trimmed_mean_us", "us")
+        ("invalid_seek_batch_trimmed_mean_us", "us")
     );
 }
 
