@@ -516,6 +516,13 @@ pub(super) fn read_guest_c_string(
     memory: &impl CurrentMmMemory,
     address: u64,
 ) -> Result<String, LinuxErrno> {
+    const CHUNK: usize = 256;
+    let mut stack_chunk = [0u8; CHUNK];
+    if memory.read_into(address, &mut stack_chunk).is_ok() {
+        if let Some(nul) = stack_chunk.iter().position(|&byte| byte == 0) {
+            return Ok(carrick_vfs::pathcodec::encode_bytes(&stack_chunk[..nul]));
+        }
+    }
     Ok(carrick_vfs::pathcodec::encode_bytes(
         &read_guest_c_string_bytes(memory, address)?,
     ))

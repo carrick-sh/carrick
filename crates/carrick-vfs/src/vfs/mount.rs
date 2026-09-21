@@ -38,6 +38,7 @@ pub struct VfsMounts {
 
 struct MountEntry {
     point: PathBuf,
+    point_str: String,
     vfs: Box<dyn Vfs>,
 }
 
@@ -59,8 +60,13 @@ impl VfsMounts {
     /// (start with `/`). Re-mounting an existing point replaces it.
     pub fn mount(&mut self, point: impl Into<PathBuf>, vfs: Box<dyn Vfs>) {
         let point = canonicalise_mount_point(point.into());
+        let point_str = point.to_string_lossy().into_owned();
         self.entries.retain(|e| e.point != point);
-        self.entries.push(MountEntry { point, vfs });
+        self.entries.push(MountEntry {
+            point,
+            point_str,
+            vfs,
+        });
         // Sort descending by component count so longest-prefix-wins
         // is a simple linear walk. Ties broken alphabetically for
         // determinism (matters for the readdir-shadowing logic later).
@@ -111,11 +117,11 @@ impl VfsMounts {
         }
         let norm = path.trim_end_matches('/');
         let norm = if norm.is_empty() { "/" } else { norm };
-        if !path.as_bytes().contains(&b'.') {
+        if !has_dot_components(norm) {
             if !self
                 .entries
                 .iter()
-                .any(|e| path_starts_with_mount(norm, &e.point))
+                .any(|e| path_starts_with_mount(norm, &e.point_str))
             {
                 return false;
             }
@@ -137,11 +143,11 @@ impl VfsMounts {
         }
         let norm = path.trim_end_matches('/');
         let norm = if norm.is_empty() { "/" } else { norm };
-        if !path.as_bytes().contains(&b'.') {
+        if !has_dot_components(norm) {
             let idx = self
                 .entries
                 .iter()
-                .position(|e| path_starts_with_mount(norm, &e.point))?;
+                .position(|e| path_starts_with_mount(norm, &e.point_str))?;
             if self.overridden.read().contains(norm) {
                 return None;
             }
@@ -155,7 +161,7 @@ impl VfsMounts {
         let idx = self
             .entries
             .iter()
-            .position(|e| path_starts_with_mount(&path, &e.point))?;
+            .position(|e| path_starts_with_mount(&path, &e.point_str))?;
         if self.overridden.read().contains(&path) {
             return None;
         }
@@ -174,11 +180,11 @@ impl VfsMounts {
         }
         let norm = path.trim_end_matches('/');
         let norm = if norm.is_empty() { "/" } else { norm };
-        if !path.as_bytes().contains(&b'.') {
+        if !has_dot_components(norm) {
             let idx = self
                 .entries
                 .iter()
-                .position(|e| path_starts_with_mount(norm, &e.point))?;
+                .position(|e| path_starts_with_mount(norm, &e.point_str))?;
             if self.overridden.read().contains(norm) {
                 return None;
             }
@@ -193,7 +199,7 @@ impl VfsMounts {
         let idx = self
             .entries
             .iter()
-            .position(|e| path_starts_with_mount(&path, &e.point))?;
+            .position(|e| path_starts_with_mount(&path, &e.point_str))?;
         if self.overridden.read().contains(&path) {
             return None;
         }
@@ -217,7 +223,7 @@ impl VfsMounts {
         let mount_point = &self
             .entries
             .iter()
-            .find(|e| path_starts_with_mount(&r.full_path, &e.point))?
+            .find(|e| path_starts_with_mount(&r.full_path, &e.point_str))?
             .point;
         let relative = strip_mount_prefix(&r.full_path, mount_point);
         Some(MountRefRelative {
@@ -366,12 +372,35 @@ fn canonicalise_path(path: &str) -> Option<String> {
     }
 }
 
-fn path_starts_with_mount(path: &str, mount: &Path) -> bool {
-    let mount_str = mount.to_string_lossy();
+#[inline]
+fn has_dot_components(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' {
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'.' {
+                i += 1;
+                if i == bytes.len() || bytes[i] == b'/' {
+                    return true;
+                }
+                if bytes[i] == b'.' && (i == bytes.len() - 1 || bytes[i + 1] == b'/') {
+                    return true;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+#[inline]
+fn path_starts_with_mount(path: &str, mount_str: &str) -> bool {
     if mount_str == "/" {
         return true;
     }
-    if !path.starts_with(mount_str.as_ref()) {
+    if !path.starts_with(mount_str) {
         return false;
     }
     // Component boundary: the next byte must be `/` or end-of-string.
