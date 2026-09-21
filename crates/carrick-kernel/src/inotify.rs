@@ -21,7 +21,7 @@
 //! Linux-style basename events. That dir-diff is macOS-only.
 
 use crate::linux_abi::{LINUX_EINVAL, LINUX_ENOSPC, LinuxErrno};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::RawFd;
 
 use parking_lot::Mutex;
@@ -32,8 +32,6 @@ use carrick_hal::event::VnodeEvents;
 use carrick_hal::event::{EventMultiplexer, PollEvent};
 #[cfg(target_os = "linux")]
 use carrick_hal::event::{Interest, TriggerMode};
-#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
-use std::collections::HashSet;
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
