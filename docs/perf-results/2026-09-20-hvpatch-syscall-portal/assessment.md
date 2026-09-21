@@ -162,3 +162,19 @@ Candidate artifact, based on `5bde8b924` plus the descriptor-identity diff:
 
 Contract surfaces remain `kernel.fs.write-seek` and the inotify09 hot path.
 Signed embed/probe, smoke/full promotion and <=2x timing acceptance remain open.
+
+The unchanged candidate artifact subsequently failed the declared 40-second
+`ltp-inotify09` budget (`conf-78564-s00`, 40.242 s), recorded in
+`target/conformance/inode-cache-inotify09.jsonl`. Both raw streams were read;
+the last LTP sampling report showed 1,860 loops and thread B at 8,419 ns.
+That report is not a completion count and does not prove a runtime speedup.
+The Docker row was cached, the binary hash remained unchanged, and no Carrick
+guest remained afterward. The removed metadata syscall is a measured work
+reduction, but the workload remains red.
+
+Source attribution for the next candidate: private-rootfs watch creation calls
+`path_exists -> inotify_path_kind -> RootFsVfs::lookup -> dentry_stat`, which
+refreshes mutable inode metadata after a write invalidates it. The existing
+`DentryCache::lookup_path` can resolve existence/kind without that refresh.
+Before substituting it, cover symlink following, missing paths, unlink/recreate,
+and directory-kind behavior; retain full metadata refresh for actual stat calls.
