@@ -24,6 +24,9 @@
  * ratios, and rankings are citable; elapsed time and absolute service latency
  * from this capture are diagnostic. A nested or mismatched service join makes
  * the receipt incomplete and invalidates its host-syscall attribution.
+ * Join failures emit up to sixteen identity-bearing diagnostics before the
+ * existing completeness check rejects the capture; never interpret their
+ * aggregate timings as an accepted ranking.
  */
 
 #pragma D option quiet
@@ -40,6 +43,7 @@ dtrace:::BEGIN
     nested = 0;
     mismatch = 0;
     stack_samples = 0;
+    join_diagnostics = 0;
     self->active = (int32_t)0;
     self->nr = (uint64_t)0;
     self->guest_pid = (int32_t)0;
@@ -81,6 +85,22 @@ syscall::lseek:entry
     printf("INOTIFYHOT1|stack|nr=64|host=lseek\n");
     ustack(24);
     stack_samples++;
+}
+
+carrick*:::hvpatch-syscall-service,
+carrick*:::hvpatch-syscall-service-clear
+/(pid == $target || progenyof($target)) &&
+ ((uint64_t)arg3 == 27 || (uint64_t)arg3 == 28 ||
+  (uint64_t)arg3 == 62 || (uint64_t)arg3 == 64) &&
+ (!self->active || self->guest_pid != (int32_t)arg0 ||
+  self->guest_tid != (int32_t)arg1 || self->asid != (uint32_t)arg2 ||
+  self->nr != (uint64_t)arg3) && join_diagnostics < 16/
+{
+    printf("INOTIFYHOT1|join_failure|phase=%s|host_pid=%d|host_tid=%d|active=%d|expected_pid=%d|expected_tid=%d|expected_asid=%u|expected_nr=%llu|observed_pid=%d|observed_tid=%d|observed_asid=%u|observed_nr=%llu\n",
+        probename, pid, tid, self->active, self->guest_pid, self->guest_tid,
+        self->asid, self->nr, (int32_t)arg0, (int32_t)arg1,
+        (uint32_t)arg2, (uint64_t)arg3);
+    join_diagnostics++;
 }
 
 carrick*:::hvpatch-syscall-service
