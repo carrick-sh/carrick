@@ -57,7 +57,64 @@ pub fn stamp_identity_page_at<M: CurrentMmMemory>(
     // Close both independent gates before changing any protected-page state.
     stamp_clock_gate(memory, base, 0)?;
     stamp_identity_values(memory, base, id.pid, shim_enabled)?;
-    stamp_clock_gate(memory, base, clock_enabled)
+    stamp_clock_gate(memory, base, clock_enabled)?;
+    let _ = stamp_info_page(memory, kernel_context);
+    Ok(())
+}
+
+/// Stamp the EL0-accessible info page with live PID, credentials, and hierarchy.
+pub fn stamp_info_page<M: CurrentMmMemory>(
+    memory: &mut M,
+    kernel_context: &crate::kernel::KernelContext,
+) -> Result<(), carrick_guest_mem::MemoryError> {
+    stamp_info_page_at(memory, kernel_context, crate::memory::LINUX_INFO_PAGE_BASE)
+}
+
+pub fn stamp_info_page_at<M: CurrentMmMemory>(
+    memory: &mut M,
+    kernel_context: &crate::kernel::KernelContext,
+    base: u64,
+) -> Result<(), carrick_guest_mem::MemoryError> {
+    let task_id = u32::try_from(kernel_context.task().key().id.raw()).unwrap_or(0);
+    let pid = crate::namespace::pid::ns_self_pid_for(kernel_context, task_id);
+    let creds = kernel_context.resources().credentials();
+    let uid = creds.ruid.raw();
+    let gid = creds.rgid.raw();
+    let euid = creds.euid.raw();
+    let egid = creds.egid.raw();
+    let caller = kernel_context.task().key().id;
+    let ppid = kernel_context
+        .kernel()
+        .process_identity(caller)
+        .and_then(|identity| identity.parent)
+        .map_or(0, |parent| {
+            let raw = parent.raw();
+            u32::try_from(raw)
+                .ok()
+                .map(|raw| crate::namespace::pid::host_to_ns_or_self_for(kernel_context, raw))
+                .and_then(|ns| i32::try_from(ns).ok())
+                .unwrap_or(0)
+        }) as u32;
+
+    let _ = memory.write_bytes(base + crate::memory::INFO_PAGE_OFF_PID, &pid.to_le_bytes());
+    let _ = memory.write_bytes(base + crate::memory::INFO_PAGE_OFF_UID, &uid.to_le_bytes());
+    let _ = memory.write_bytes(base + crate::memory::INFO_PAGE_OFF_GID, &gid.to_le_bytes());
+    let _ = memory.write_bytes(
+        base + crate::memory::INFO_PAGE_OFF_EUID,
+        &euid.to_le_bytes(),
+    );
+    let _ = memory.write_bytes(
+        base + crate::memory::INFO_PAGE_OFF_EGID,
+        &egid.to_le_bytes(),
+    );
+    let _ = memory.write_bytes(
+        base + crate::memory::INFO_PAGE_OFF_PPID,
+        &ppid.to_le_bytes(),
+    );
+    if let Some(tid) = crate::namespace::pid::ns_visible_guest_tid(kernel_context) {
+        let _ = memory.write_bytes(base + crate::memory::INFO_PAGE_OFF_TID, &tid.to_le_bytes());
+    }
+    Ok(())
 }
 
 /// The raw CLOCK_MONOTONIC path is valid only for the live system clock and
