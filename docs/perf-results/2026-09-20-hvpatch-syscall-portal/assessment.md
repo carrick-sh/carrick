@@ -439,3 +439,29 @@ already-cached dentry invalidation path. That function still calls
 `host_file_identity(fd)` on every tracked write. The next correction can reuse
 the live owned descriptor's immutable inode identity while preserving mutable
 extent updates, aliasing, and unlink/replacement semantics.
+
+### Owned identity reuse for sparse writes
+
+Production commit `ccc42d7ad` changes sparse-write bookkeeping to accept the
+owned `HostFdRef` and reuse its cached immutable inode identity. Sequential and
+positional writes retain the owner through extent publication. Mutable extents
+are still updated on every successful write. Ten sparse tests, including a new
+alias/unlink/replacement/truncate case, and all 24 kernel-example contract tests
+passed. The prior trace supplies the structural red evidence.
+
+Signed artifact: SHA-256
+`5ac057b96842305f771b7a2b5835dc33c95a4124cafa77b87710e98149916778`,
+CDHash `f073d32e82a0352662651dbfcb279e5520afd3cd`, UUID
+`E6533A16-C092-345C-BE5B-70454838EBB2`, hypervisor entitlement true and
+`__dof_carrick` present. Repeating the bounded metadata trace produced 167 fstat
+events, zero errors, and bound reached, versus 553,136 before the fix. The
+trace is `write-metadata-cache.trace`; its timing is not performance evidence.
+
+The unchanged scaling probe then completed uninstrumented with all rows and
+`probe_complete=1`, empty stderr, exit zero. At scale 65,536, write/seek improved
+from 6,145 to 5,713 ns/iteration (7.0%); persistent-watch write/seek was 5,792,
+watch churn 4,666, serial composition 11,501, concurrent components 8,467.
+Full output: `scale-sparse-cache-carrick.out`. Against the fresh pre-fix Docker
+measurement of 471 ns, write/seek remains 12.13x. This closes the demonstrated
+repeated identity-query defect, not the runtime-ratio failure, full inotify09,
+or signed probe/smoke/full acceptance.
