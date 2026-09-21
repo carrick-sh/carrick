@@ -1,5 +1,10 @@
 #!/usr/sbin/dtrace -qs
-/*
+/* SPDX-License-Identifier: Apache-2.0 OR MIT
+ * USDT-only control for the failing inotify service join. No host syscall
+ * probes are enabled. The unconditional begin-number census distinguishes
+ * absent runtime events from filtered or lost D-script join state.
+ * Derived from hvpatch-inotify09-hotpath.d; the host-count discussion below
+ * describes that parent experiment, not this control.
  * hvpatch-inotify09-hotpath.d — attribute the four LTP inotify09 services.
  *
  * WHAT IT MEASURES
@@ -53,6 +58,10 @@ dtrace:::BEGIN
 }
 
 carrick*:::hvpatch-syscall-service-begin
+/pid == $target || progenyof($target)/
+{ @all_begin_numbers[(uint64_t)arg3] = count(); }
+
+carrick*:::hvpatch-syscall-service-begin
 /(pid == $target || progenyof($target)) &&
  ((uint64_t)arg3 == 27 || (uint64_t)arg3 == 28 ||
   (uint64_t)arg3 == 62 || (uint64_t)arg3 == 64)/
@@ -71,28 +80,6 @@ carrick*:::hvpatch-syscall-service-begin
             self->asid, self->nr);
         begin_diagnostics++;
     }
-}
-
-syscall:::entry
-/(pid == $target || progenyof($target)) && self->active/
-{
-    @host_syscalls[self->nr, probefunc] = count();
-}
-
-syscall::fstat64:entry
-/(pid == $target || progenyof($target)) && self->active && stack_samples < 8/
-{
-    printf("INOTIFYHOT1|stack|nr=%llu|host=fstat64\n", self->nr);
-    ustack(24);
-    stack_samples++;
-}
-
-syscall::lseek:entry
-/(pid == $target || progenyof($target)) && self->nr == 64 && stack_samples < 8/
-{
-    printf("INOTIFYHOT1|stack|nr=64|host=lseek\n");
-    ustack(24);
-    stack_samples++;
 }
 
 carrick*:::hvpatch-syscall-service,
@@ -162,6 +149,7 @@ dtrace:::END
     printf("INOTIFYHOT1|bound_s=%d|selected=%d|nested=%d|mismatch=%d|errors=%d|complete=%d\n",
         BOUND_SECONDS, selected, nested, mismatch, errors, this->complete);
     printa("INOTIFYHOT1|nr=%llu|services=%@d\n", @service_count);
+    printa("INOTIFYHOT1|begin_nr=%llu|count=%@d\n", @all_begin_numbers);
     printa("INOTIFYHOT1|nr=%llu|duration_ns=%@d\n", @service_duration_ns);
-    printa("INOTIFYHOT1|nr=%llu|host=%s|count=%@d\n", @host_syscalls);
+
 }
