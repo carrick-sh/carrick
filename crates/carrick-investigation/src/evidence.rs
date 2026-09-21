@@ -133,6 +133,7 @@ pub fn capture_vm_free(
         .stderr(std::fs::File::create(&stderr)?)
         .spawn()?;
     let start = Instant::now();
+    let poll_interval = Duration::from_millis(100);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -144,7 +145,7 @@ pub fn capture_vm_free(
                 "observation producer exceeded budget; no receipt issued",
             ));
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(poll_interval);
     };
     if !status.success() {
         return Err(invalid("observation producer failed; see captured streams"));
