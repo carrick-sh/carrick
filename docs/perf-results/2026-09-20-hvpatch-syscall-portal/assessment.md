@@ -136,3 +136,29 @@ the stable inode identity with a fresh `fstat`. Any optimization must retain
 invalidation after every mutation, including after a cache refill and across
 descriptor aliases; the prior idea of invalidating only once per open cannot
 establish that invariant.
+
+## Descriptor identity candidate
+
+The next candidate caches only immutable device/inode identity on `HostFdOwner`
+and reuses it for positive regular-file write invalidation. Cache invalidation
+still occurs on every positive write, and failed identity queries are retryable.
+Aliases share the owned descriptor and identity; closing it retires both.
+
+The cache-refill regression failed with invalidation deliberately disabled
+(cached size 64, expected 128), then passed after restoring invalidation.
+A separate test passed for unlink/path replacement and surviving descriptor
+aliases. The signed census passed with 369,966 host seeks, 370,033 writes,
+370,074 `fstat64` and 740,318 `fstatat64`: one repeated `fstat` per write was
+removed, while path metadata work remains. This is a structural improvement,
+not an end-to-end timing or promotion claim. No guest remained after capture.
+
+Candidate artifact, based on `5bde8b924` plus the descriptor-identity diff:
+
+- SHA-256: `4a704873cf7643acabbaf4c24f1750cb7c4360a47f66fde1a7499fffc818bdd9`
+- CDHash: `778cf9d92a3944cca39ffb4440a229bb868f4145`
+- LC_UUID: `246D6BA2-EB1C-3DDF-813D-DF7DDA5525C1`
+- hypervisor entitlement and `__dof_carrick`: present
+- raw capture: `inotify-inode-cache.trace`
+
+Contract surfaces remain `kernel.fs.write-seek` and the inotify09 hot path.
+Signed embed/probe, smoke/full promotion and <=2x timing acceptance remain open.

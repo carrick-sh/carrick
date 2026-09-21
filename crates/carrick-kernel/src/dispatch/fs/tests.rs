@@ -114,6 +114,35 @@ fn host_file_write_does_not_publish_description_mutation() {
     let mut actual = [0u8; 64];
     verify.read_exact(&mut actual).unwrap();
     assert_eq!(actual, expected);
+
+    // Refill the inode cache between writes. Caching immutable identity must
+    // never turn invalidation into a once-per-open operation.
+    use std::os::fd::AsRawFd;
+    for iteration in 1..=4 {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        assert_eq!(
+            unsafe { libc::fstat(verify.as_raw_fd(), stat.as_mut_ptr()) },
+            0
+        );
+        let stat = unsafe { stat.assume_init() };
+        let record = dispatcher
+            .fs
+            .rootfs_vfs
+            .get_or_fill_host_inode(verify.as_raw_fd(), &stat);
+        assert_eq!(record.size, iteration * 64);
+        if iteration == 4 {
+            break;
+        }
+        let result = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(64, SyscallArgs::from([fd as u64, 0x4000, 64, 0, 0, 0])),
+                &mut memory,
+                &CompatReporter::default(),
+            )
+            .unwrap();
+        assert_eq!(result, DispatchOutcome::Returned { value: 64 });
+    }
 }
 
 #[test]
