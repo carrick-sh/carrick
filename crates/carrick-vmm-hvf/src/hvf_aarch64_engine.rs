@@ -370,21 +370,26 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
             })
     }
 
-    fn stamp_guest_thread_id(&self, tid: u64) -> Result<(), TrapError> {
+    fn stamp_guest_thread_id(&self, packed: u64) -> Result<(), TrapError> {
         use applevisor::prelude::SysReg;
         // HVF's `gettid` fast path reads CONTEXTIDR_EL1 (serviced at EL1, no
         // host trap), leaving TPIDR_EL1 free as the syscall-shim scratch that
-        // preserves x16 while checking ESR_EL1. Written via the applevisor
-        // `SysReg` directly: the neutral `carrick_hal::SysReg` has no
-        // CONTEXTIDR_EL1 variant (it is an HVF-private fast-path detail).
+        // preserves x16 while checking ESR_EL1.
+        // Smart island fast paths at EL0 read TPIDRRO_EL0, which holds packed
+        // (pid << 32) | tid for zero-exit getpid and gettid.
+        let tid = packed & 0xffff_ffff;
         let result = self
             .inner
             .set_sys_reg(SysReg::CONTEXTIDR_EL1, tid)
             .map_err(|e| TrapError::Hypervisor(e.to_string()));
+        self.inner
+            .set_sys_reg(SysReg::TPIDRRO_EL0, packed)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
         if std::env::var_os("CARRICK_TIDSTAMP_DEBUG").is_some() {
             let back = self.inner.get_sys_reg(SysReg::CONTEXTIDR_EL1);
+            let back_ro = self.inner.get_sys_reg(SysReg::TPIDRRO_EL0);
             eprintln!(
-                "[TIDSTAMP] set CONTEXTIDR_EL1={tid} -> readback={back:?} set_ok={}",
+                "[TIDSTAMP] set CONTEXTIDR_EL1={tid} -> readback={back:?} TPIDRRO_EL0={packed:#x} -> readback={back_ro:?} set_ok={}",
                 result.is_ok()
             );
         }
