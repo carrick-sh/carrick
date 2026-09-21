@@ -132,14 +132,33 @@ impl VfsMounts {
     /// Returns `None` for an overridden path so it falls through to the
     /// writable rootfs/overlay everywhere (reads included).
     pub fn resolve(&self, path: &str) -> Option<MountRef<'_>> {
-        let path = canonicalise_path(path)?;
-        if self.overridden.read().contains(&path) {
+        if self.entries.is_empty() || !path.starts_with('/') {
             return None;
         }
+        let norm = path.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        if !path.as_bytes().contains(&b'.') {
+            let idx = self
+                .entries
+                .iter()
+                .position(|e| path_starts_with_mount(norm, &e.point))?;
+            if self.overridden.read().contains(norm) {
+                return None;
+            }
+            return Some(MountRef {
+                vfs: self.entries[idx].vfs.as_ref(),
+                full_path: norm.to_owned(),
+                point: self.entries[idx].point.as_path(),
+            });
+        }
+        let path = canonicalise_path(path)?;
         let idx = self
             .entries
             .iter()
             .position(|e| path_starts_with_mount(&path, &e.point))?;
+        if self.overridden.read().contains(&path) {
+            return None;
+        }
         Some(MountRef {
             vfs: self.entries[idx].vfs.as_ref(),
             full_path: path,
@@ -150,14 +169,34 @@ impl VfsMounts {
     /// Mutable variant of [`resolve`](Self::resolve) for ops that need
     /// to write into the mount. Honours the override set like `resolve`.
     pub fn resolve_mut(&mut self, path: &str) -> Option<MountRefMut<'_>> {
-        let path = canonicalise_path(path)?;
-        if self.overridden.read().contains(&path) {
+        if self.entries.is_empty() || !path.starts_with('/') {
             return None;
         }
+        let norm = path.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        if !path.as_bytes().contains(&b'.') {
+            let idx = self
+                .entries
+                .iter()
+                .position(|e| path_starts_with_mount(norm, &e.point))?;
+            if self.overridden.read().contains(norm) {
+                return None;
+            }
+            let entry = &mut self.entries[idx];
+            return Some(MountRefMut {
+                point: entry.point.as_path(),
+                vfs: entry.vfs.as_mut(),
+                full_path: norm.to_owned(),
+            });
+        }
+        let path = canonicalise_path(path)?;
         let idx = self
             .entries
             .iter()
             .position(|e| path_starts_with_mount(&path, &e.point))?;
+        if self.overridden.read().contains(&path) {
+            return None;
+        }
         let entry = &mut self.entries[idx];
         Some(MountRefMut {
             point: entry.point.as_path(),
