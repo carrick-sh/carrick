@@ -830,6 +830,39 @@ where
             return Err(with_settlement_error(error.to_string(), settlement));
         }
         let terminal_retirement = binding.take_address_space_retirement();
+        if terminal_retirement.is_some()
+            || pending_exec_retirement.is_some()
+            || pending_exec_cleanup
+        {
+            // The backend is saved/detached and both boundary audits passed. Return
+            // a borrowed P before retirement can wait for another owner's ASID ack;
+            // that owner may itself be returning from the host wait that lent us P.
+            let consumed = match &settlement_authority {
+                SettlementAuthority::Live => None,
+                SettlementAuthority::PredecessorConsumed(consumed) => Some(consumed),
+            };
+            if let Err(error) = scheduler.release_saved_host_wait_slot(&running, consumed) {
+                let settlement = match settlement_authority {
+                    SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    ),
+                    SettlementAuthority::PredecessorConsumed(consumed) => {
+                        settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            consumed,
+                            receipts,
+                        )
+                    }
+                };
+                return Err(with_settlement_error(error.to_string(), settlement));
+            }
+        }
         if terminal_retirement.is_some() && pending_exec_cleanup {
             carrick_fatal!(
                 "hvpatch::mm_retirement",

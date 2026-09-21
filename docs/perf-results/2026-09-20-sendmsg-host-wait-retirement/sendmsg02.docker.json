@@ -1,0 +1,21 @@
+{
+  "name": "sendmsg02",
+  "image": "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+  "argv": [
+    "docker",
+    "run",
+    "--name",
+    "timeout-attribution-sendmsg02-20260920",
+    "--platform",
+    "linux/arm64",
+    "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+    "/bin/sh",
+    "-c",
+    "/opt/ltp/testcases/bin/sendmsg02"
+  ],
+  "elapsed_s": 15.195398749958258,
+  "deadline_s": 40,
+  "timed_out": false,
+  "exit_code": 0,
+  "cleanup_status": 0
+}

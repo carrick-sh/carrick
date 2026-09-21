@@ -1,0 +1,505 @@
+{
+  "schema": "carrick.kernel-debug-snapshot.v1",
+  "snapshot_schema_version": 6,
+  "threads": [
+    {
+      "key": {
+        "tid": 1,
+        "serial": 7
+      },
+      "execution": "Blocked { generation: ExecutionGeneration(4), reason: HostWait, continuation: Some(ContinuationId(2)) } task_state=true continuation=true control_quantum=None",
+      "continuation": {
+        "id": 2,
+        "family": "wait-on-hvpatch-child",
+        "detail": "process any-child-of=1.6",
+        "deadline_ms_remaining": null,
+        "registration": {
+          "continuation": 2,
+          "thread_serial": 7,
+          "execution_generation": 3,
+          "registration_generation": 2,
+          "service_alive": true,
+          "state": "enrolled",
+          "event": null,
+          "probe": "task-wake observed=0 current=0 events=0",
+          "signal_readiness": "observed_wake=0 current_wake=0 observed_event=0 current_event=0",
+          "poll_fds": [],
+          "subscriptions": 1,
+          "has_task_waker": false
+        }
+      },
+      "task": {
+        "id": 1,
+        "serial": 6
+      },
+      "registry_id": 1,
+      "class": "live",
+      "file_table": 3,
+      "fs_context": 4,
+      "credentials": 5,
+      "exec_invalidation_pending": false
+    },
+    {
+      "key": {
+        "tid": 2,
+        "serial": 67
+      },
+      "execution": "Blocked { generation: ExecutionGeneration(16), reason: HostWait, continuation: Some(ContinuationId(10)) } task_state=true continuation=true control_quantum=None",
+      "continuation": {
+        "id": 10,
+        "family": "wait-on-hvpatch-child",
+        "detail": "process exact=3.134",
+        "deadline_ms_remaining": null,
+        "registration": {
+          "continuation": 10,
+          "thread_serial": 67,
+          "execution_generation": 15,
+          "registration_generation": 10,
+          "service_alive": true,
+          "state": "enrolled",
+          "event": null,
+          "probe": "task-wake observed=60 current=60 events=0",
+          "signal_readiness": "observed_wake=60 current_wake=60 observed_event=0 current_event=0",
+          "poll_fds": [],
+          "subscriptions": 1,
+          "has_task_waker": false
+        }
+      },
+      "task": {
+        "id": 2,
+        "serial": 61
+      },
+      "registry_id": 2,
+      "class": "live",
+      "file_table": 66,
+      "fs_context": 59,
+      "credentials": 60,
+      "exec_invalidation_pending": false
+    },
+    {
+      "key": {
+        "tid": 3,
+        "serial": 135
+      },
+      "execution": "Running { generation: ExecutionGeneration(1023), executor: ExecutorId(10), executor_epoch: 1023, wake_pending: false } task_state=false continuation=false control_quantum=None",
+      "task": {
+        "id": 3,
+        "serial": 134
+      },
+      "registry_id": 3,
+      "class": "live",
+      "file_table": 131,
+      "fs_context": 132,
+      "credentials": 133,
+      "exec_invalidation_pending": false
+    },
+    {
+      "key": {
+        "tid": 4,
+        "serial": 179
+      },
+      "execution": "SwitchingOut { generation: ExecutionGeneration(1236), executor: ExecutorId(16), executor_epoch: 1236, wake_pending: false } task_state=false continuation=false control_quantum=None",
+      "task": {
+        "id": 4,
+        "serial": 178
+      },
+      "registry_id": 4,
+      "class": "draining",
+      "file_table": null,
+      "fs_context": null,
+      "credentials": null,
+      "exec_invalidation_pending": false
+    },
+    {
+      "key": {
+        "tid": 9,
+        "serial": 460
+      },
+      "execution": "SwitchingOut { generation: ExecutionGeneration(1023), executor: ExecutorId(13), executor_epoch: 1023, wake_pending: false } task_state=false continuation=false control_quantum=None",
+      "task": {
+        "id": 9,
+        "serial": 456
+      },
+      "registry_id": 9,
+      "class": "draining",
+      "file_table": null,
+      "fs_context": null,
+      "credentials": null,
+      "exec_invalidation_pending": false
+    },
+    {
+      "key": {
+        "tid": 17,
+        "serial": 866
+      },
+      "execution": "SwitchingOut { generation: ExecutionGeneration(1025), executor: ExecutorId(2), executor_epoch: 1025, wake_pending: false } task_state=false continuation=false control_quantum=None",
+      "task": {
+        "id": 17,
+        "serial": 865
+      },
+      "registry_id": 17,
+      "class": "draining",
+      "file_table": null,
+      "fs_context": null,
+      "credentials": null,
+      "exec_invalidation_pending": false
+    },
+    {
+      "key": {
+        "tid": 32,
+        "serial": 1652
+      },
+      "execution": "Running { generation: ExecutionGeneration(1233), executor: ExecutorId(9), executor_epoch: 1233, wake_pending: false } task_state=false continuation=false control_quantum=None",
+      "task": {
+        "id": 32,
+        "serial": 1651
+      },
+      "registry_id": 32,
+      "class": "live",
+      "file_table": 1648,
+      "fs_context": 1649,
+      "credentials": 1650,
+      "exec_invalidation_pending": false
+    }
+  ],
+  "scheduler": [
+    {
+      "host_wait": {
+        "entered": 32,
+        "resumed": 30,
+        "slots": [
+          {
+            "root": 9,
+            "cpu": 0,
+            "owner": 16,
+            "waiters": [
+              {
+                "executor": 9,
+                "epoch": 1233,
+                "thread": {
+                  "tid": 32,
+                  "serial": 1652
+                },
+                "generation": 1233,
+                "returning": true
+              }
+            ]
+          },
+          {
+            "root": 10,
+            "cpu": 1,
+            "owner": 13,
+            "waiters": [
+              {
+                "executor": 10,
+                "epoch": 1023,
+                "thread": {
+                  "tid": 3,
+                  "serial": 135
+                },
+                "generation": 1023,
+                "returning": true
+              }
+            ]
+          }
+        ]
+      },
+      "lifecycle": "open",
+      "queued_len": 0,
+      "claimed": 5,
+      "waiters": 13,
+      "run_queue_locked": false,
+      "control_epoch": 3006,
+      "need_resched": false,
+      "snapshot_count": 35474,
+      "residencies": [
+        {
+          "executor": 2,
+          "thread": {
+            "tid": 17,
+            "serial": 866
+          },
+          "generation": 1025,
+          "cpu": 1,
+          "ticket": 35535,
+          "budget_ns": 4000000,
+          "reasons": 0,
+          "deadline_remaining_ns": null,
+          "ticket_claimed": false
+        },
+        {
+          "executor": 13,
+          "thread": {
+            "tid": 9,
+            "serial": 460
+          },
+          "generation": 1023,
+          "cpu": 1,
+          "ticket": 35532,
+          "budget_ns": 4000000,
+          "reasons": 0,
+          "deadline_remaining_ns": null,
+          "ticket_claimed": false
+        },
+        {
+          "executor": 16,
+          "thread": {
+            "tid": 4,
+            "serial": 179
+          },
+          "generation": 1236,
+          "cpu": 0,
+          "ticket": 35539,
+          "budget_ns": 4000000,
+          "reasons": 0,
+          "deadline_remaining_ns": null,
+          "ticket_claimed": false
+        }
+      ]
+    }
+  ],
+  "run_queue": [],
+  "executors": [
+    {
+      "id": 1,
+      "epoch": null,
+      "current_binding": null,
+      "control_observation_epoch": 3006,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": false,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 2,
+      "epoch": 1025,
+      "current_binding": {
+        "thread": {
+          "tid": 17,
+          "serial": 866
+        },
+        "generation": 1025
+      },
+      "control_observation_epoch": 25,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": false,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 3,
+      "epoch": null,
+      "current_binding": null,
+      "control_observation_epoch": 3006,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": false,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 4,
+      "epoch": null,
+      "current_binding": null,
+      "control_observation_epoch": 3006,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": false,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 5,
+      "epoch": null,
+      "current_binding": null,
+      "control_observation_epoch": 3006,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": false,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 6,
+      "epoch": null,
+      "current_binding": null,
+      "control_observation_epoch": 3006,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": false,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 7,
+      "epoch": null,
+      "current_binding": null,
+      "control_observation_epoch": 3006,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": false,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 8,
+      "epoch": null,
+      "current_binding": null,
+      "control_observation_epoch": 3006,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": false,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 9,
+      "epoch": 1233,
+      "current_binding": {
+        "thread": {
+          "tid": 32,
+          "serial": 1652
+        },
+        "generation": 1233
+      },
+      "control_observation_epoch": 25,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": true,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 10,
+      "epoch": 1023,
+      "current_binding": {
+        "thread": {
+          "tid": 3,
+          "serial": 135
+        },
+        "generation": 1023
+      },
+      "control_observation_epoch": 24,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": true,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 11,
+      "epoch": null,
+      "current_binding": null,
+      "control_observation_epoch": 3006,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": true,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 12,
+      "epoch": null,
+      "current_binding": null,
+      "control_observation_epoch": 3006,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": true,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 13,
+      "epoch": 1023,
+      "current_binding": {
+        "thread": {
+          "tid": 9,
+          "serial": 460
+        },
+        "generation": 1023
+      },
+      "control_observation_epoch": 24,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": true,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 14,
+      "epoch": null,
+      "current_binding": null,
+      "control_observation_epoch": 3006,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": true,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 15,
+      "epoch": null,
+      "current_binding": null,
+      "control_observation_epoch": 3006,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": true,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 16,
+      "epoch": 1236,
+      "current_binding": {
+        "thread": {
+          "tid": 4,
+          "serial": 179
+        },
+        "generation": 1236
+      },
+      "control_observation_epoch": 27,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": true,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 17,
+      "epoch": null,
+      "current_binding": null,
+      "control_observation_epoch": 3006,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": true,
+      "hardware_kick_published": true
+    },
+    {
+      "id": 18,
+      "epoch": null,
+      "current_binding": null,
+      "control_observation_epoch": 3006,
+      "close_observation_epoch": 0,
+      "pending_commands": null,
+      "need_resched": true,
+      "hardware_kick_published": true
+    }
+  ],
+  "executor_receipt_summary": {
+    "total": 4096,
+    "returned": 500,
+    "message": "showing last 500 of 4096 receipts"
+  },
+  "capture_files": {
+    "sendmsg02-attribution-20260920.kernel-debug.json": {
+      "path": "/private/tmp/carrick-timeout-attribution-20260920/sendmsg-capture/sendmsg02-attribution-20260920.kernel-debug.json",
+      "sha256": "651ea2370a6b7af1e3fcf5a471ede7e46ea86d1dbe09208bdc89703c28e80cc9"
+    },
+    "sendmsg02-attribution-20260920.manifest.txt": {
+      "path": "/private/tmp/carrick-timeout-attribution-20260920/sendmsg-capture/sendmsg02-attribution-20260920.manifest.txt",
+      "sha256": "c1cede5c85bf955bf98e074617f54bfc4c8a668a73ce5702ac0a4b79d76bbe98"
+    },
+    "sendmsg02-attribution-20260920.ps.txt": {
+      "path": "/private/tmp/carrick-timeout-attribution-20260920/sendmsg-capture/sendmsg02-attribution-20260920.ps.txt",
+      "sha256": "4aba990f9d6d1d63afc22140ae829ce3e249889d6420f68a4ab54928c3eff174"
+    },
+    "sendmsg02-attribution-20260920.lldb.txt": {
+      "path": "/private/tmp/carrick-timeout-attribution-20260920/sendmsg-capture/sendmsg02-attribution-20260920.lldb.txt",
+      "sha256": "3160ac99a13658e89d1e21f7f1a0466410e6cc423573fef6d84f00828978ca99"
+    },
+    "sendmsg02-attribution-20260920.guest.log": {
+      "path": "/private/tmp/carrick-timeout-attribution-20260920/sendmsg-capture/sendmsg02-attribution-20260920.guest.log",
+      "sha256": "b1885852eed0fae5e741d9841e8e1a1b2b4ff65df0927ecec3eae5bb3f4cc7f4"
+    },
+    "sendmsg02-attribution-20260920.29806.core": {
+      "path": "/private/tmp/carrick-timeout-attribution-20260920/sendmsg-capture/sendmsg02-attribution-20260920.29806.core",
+      "sha256": "297c6d7827702b4ecd844ff8cdcfaf9b38b25b78ac5af63ada1a5b8a46eabc71"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "shmctl05",
+  "image": "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+  "argv": [
+    "docker",
+    "run",
+    "--name",
+    "timeout-attribution-shmctl05-20260920",
+    "--platform",
+    "linux/arm64",
+    "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+    "/bin/sh",
+    "-c",
+    "/opt/ltp/testcases/bin/shmctl05"
+  ],
+  "elapsed_s": 16.652147000015248,
+  "deadline_s": 40,
+  "timed_out": false,
+  "exit_code": 0,
+  "cleanup_status": 0
+}

@@ -17,13 +17,13 @@ semantic_authority = [
 ]
 fixture = "scheduler_handoff"
 scale_points = [1, 2, 4, 8]
-rationale = "A host wait must relinquish guest CPU ownership without relinquishing the waiting task's exact execution generation or moving its thread-affine vCPU, keeping guest CPUs available when host operations block."
+rationale = "A host wait must relinquish guest CPU ownership without relinquishing the waiting task's exact execution generation or moving its thread-affine vCPU, keeping guest CPUs available when host operations block. A replacement that has saved/detached its task must return a borrowed CPU before waiting for ASID retirement acknowledgements; the returning host waiter may own a required acknowledgement. The deterministic runtime binding is vcpu_loop::executor::tests::saved_replacement_returns_host_wait_slot_before_terminal_retirement."
 
 [bindings]
 vm_free = "carrick-kernel-example::scheduler_handoff"
 embed = "carrick-embed::host_wait_policy"
 docker = "probe:hostwaithandoff"
-ecosystem = ["cpython:io", "go:os"]
+ecosystem = ["cpython:io", "go:os", "ltp:sendmsg02"]
 
 [[structural_budgets]]
 kind = "exact"

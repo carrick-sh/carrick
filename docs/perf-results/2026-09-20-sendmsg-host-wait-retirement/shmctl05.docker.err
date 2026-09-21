@@ -1,0 +1,28 @@
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 7.0.12-linuxkit #1 SMP PREEMPT Thu Aug 27 14:02:21 UTC 2026 aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 01m 10s
+../../../../../include/tst_fuzzy_sync.h:484: TINFO: Minimum sampling period ended
+../../../../../include/tst_fuzzy_sync.h:307: TINFO: loop = 1024, delay_bias = 0
+../../../../../include/tst_fuzzy_sync.h:295: TINFO: start_a - start_b: { avg =   -22ns, avg_dev =    18ns, dev_ratio = 0.79 }
+../../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - start_a  : { avg =  1943ns, avg_dev =    27ns, dev_ratio = 0.01 }
+../../../../../include/tst_fuzzy_sync.h:295: TINFO: end_b - start_b  : { avg =  1748ns, avg_dev =    54ns, dev_ratio = 0.03 }
+../../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - end_b    : { avg =   173ns, avg_dev =    50ns, dev_ratio = 0.29 }
+../../../../../include/tst_fuzzy_sync.h:295: TINFO: spins            : { avg =   223  , avg_dev =    57  , dev_ratio = 0.26 }
+../../../../../include/tst_fuzzy_sync.h:494: TINFO: Reached deviation ratios < 0.10, introducing randomness
+../../../../../include/tst_fuzzy_sync.h:497: TINFO: Delay range is [-1975, 2355]
+../../../../../include/tst_fuzzy_sync.h:307: TINFO: loop = 162380, delay_bias = 0
+../../../../../include/tst_fuzzy_sync.h:295: TINFO: start_a - start_b: { avg =   -41ns, avg_dev =     3ns, dev_ratio = 0.06 }
+../../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - start_a  : { avg =  1892ns, avg_dev =    34ns, dev_ratio = 0.02 }
+../../../../../include/tst_fuzzy_sync.h:295: TINFO: end_b - start_b  : { avg =  1587ns, avg_dev =    36ns, dev_ratio = 0.02 }
+../../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - end_b    : { avg =   265ns, avg_dev =    26ns, dev_ratio = 0.10 }
+../../../../../include/tst_fuzzy_sync.h:295: TINFO: spins            : { avg =   330  , avg_dev =    33  , dev_ratio = 0.10 }
+../../../../../include/tst_fuzzy_sync.h:654: TINFO: Exceeded execution loops, requesting exit
+shmctl05.c:87: TPASS: didn't crash
+
+Summary:
+passed   1
+failed   0
+broken   0
+skipped  0
+warnings 0
