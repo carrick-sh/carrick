@@ -1,6 +1,10 @@
 schema_version = 1
 
 [[surfaces]]
+path = "crates/carrick-observability/src/work_meter.rs"
+contracts = ["hvpatch.syscall.portal"]
+
+[[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/futex.rs"
 contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
 

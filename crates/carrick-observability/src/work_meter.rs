@@ -58,10 +58,21 @@ pub enum WorkMetric {
     VcpuMigrations,
     FutexQueueVisits,
     FutexWaitersWoken,
+    /// Guest syscall boundaries that reached the host through the HVF HVC
+    /// transport. This excludes kicks, faults, and maintenance exits.
+    HvfSyscallExits,
+    /// Fully validated requests accepted by the adaptive syscall portal.
+    PortalRequests,
+    /// Portal requests completed directly back to EL1 with Returned or Errno.
+    PortalCompletions,
+    /// Portal requests forced through the ordinary host-boundary path.
+    PortalFallbacks,
+    /// Requests or responses rejected for stale session identity.
+    PortalStaleRejects,
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 28;
+    pub const COUNT: usize = 33;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -91,6 +102,11 @@ impl WorkMetric {
         Self::VcpuMigrations,
         Self::FutexQueueVisits,
         Self::FutexWaitersWoken,
+        Self::HvfSyscallExits,
+        Self::PortalRequests,
+        Self::PortalCompletions,
+        Self::PortalFallbacks,
+        Self::PortalStaleRejects,
     ];
 }
 

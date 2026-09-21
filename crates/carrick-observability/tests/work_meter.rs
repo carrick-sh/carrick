@@ -23,6 +23,41 @@ fn exact_accumulation_in_scope() {
 
 #[cfg(feature = "conformance-metrics")]
 #[test]
+fn portal_metrics_round_trip() {
+    let meter = WorkMeter::default();
+    let scope = meter.new_scope();
+    for (index, metric) in [
+        WorkMetric::HvfSyscallExits,
+        WorkMetric::PortalRequests,
+        WorkMetric::PortalCompletions,
+        WorkMetric::PortalFallbacks,
+        WorkMetric::PortalStaleRejects,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        scope.add(metric, index as u64 + 1).unwrap();
+    }
+
+    let encoded = serde_json::to_vec(&scope.snapshot().unwrap()).unwrap();
+    let decoded: carrick_observability::work_meter::WorkSnapshot =
+        serde_json::from_slice(&encoded).unwrap();
+    for (index, metric) in [
+        WorkMetric::HvfSyscallExits,
+        WorkMetric::PortalRequests,
+        WorkMetric::PortalCompletions,
+        WorkMetric::PortalFallbacks,
+        WorkMetric::PortalStaleRejects,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(decoded.get(metric), Some(index as u64 + 1));
+    }
+}
+
+#[cfg(feature = "conformance-metrics")]
+#[test]
 fn checked_overflow_sets_flag_and_errors() {
     let meter = WorkMeter::default();
     let scope = meter.new_scope();

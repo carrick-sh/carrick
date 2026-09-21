@@ -395,10 +395,12 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "hvpatch.syscall.portal",
         "kernel.inotify.mark-race-hotpath",
         "kernel.inotify.watch"
       ],
       "claims": [
+        "hvpatch.syscall.portal.scalar-boundary",
         "kernel.inotify.mark-race-hotpath.linear-work",
         "kernel.inotify.watch.host-registration-bound",
         "kernel.inotify.watch.write-completion"
@@ -841,10 +843,12 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "hvpatch.syscall.portal",
         "kernel.fs.write-seek",
         "kernel.inotify.mark-race-hotpath"
       ],
       "claims": [
+        "hvpatch.syscall.portal.scalar-boundary",
         "kernel.fs.write-seek.no-offset-query",
         "kernel.inotify.mark-race-hotpath.linear-work"
       ]

@@ -1,0 +1,44 @@
+schema_version = 1
+id = "hvpatch.syscall.portal"
+title = "HVPatch scalar syscall portal preserves semantics with bounded crossings"
+guest_surfaces = [
+  "syscall:lseek",
+  "syscall:inotify_rm_watch",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 2 lseek",
+  "man 2 inotify_rm_watch",
+]
+fixture = "probe:hvpatch_portal_scalar"
+scale_points = [1, 8, 32, 128]
+rationale = "Eligible scalar syscalls may avoid repeated HVF exits only when the typed portal preserves the ordinary dispatcher result, exact task and address-space identity, signal boundaries, and bounded helper work."
+
+[bindings]
+ecosystem = ["ltp:inotify09"]
+
+[bindings.unresolved]
+vm_free = "Task 3 must bind deterministic portal state-machine and retained-outcome tests."
+embed_structural = "Task 4 must bind a signed guest contract for exact portal and HVC boundary counts."
+docker = "Task 5 must bind the scalar semantics probe to source-hash-validated Docker output."
+embed_timing = "Task 5 must bind signed timing and process-CPU evidence before portal selection can default on."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "portal_requests"
+base = 0
+per_unit = 1
+layers = ["vm-free"]
+rationale = "Each admitted fixture operation publishes exactly one typed request."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "portal_stale_rejects"
+base = 0
+per_unit = 0
+rationale = "A current session must never accept stale state."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20
