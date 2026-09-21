@@ -151,6 +151,80 @@ struct WatchedFd {
     scan_dir: Option<ScannedDir>,
 }
 
+/// In-memory queue entry for an inotify event.
+///
+/// Header-only events (no name payload, such as `IN_IGNORED`, `IN_Q_OVERFLOW`,
+/// and any file-level event) are stored inline as a fixed 16-byte header to
+/// completely eliminate per-event heap allocation in hot notification loops.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingRecord {
+    Header(carrick_abi::LinuxInotifyEventHeader),
+    Named(Vec<u8>),
+}
+
+impl PendingRecord {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Header(_) => INOTIFY_EVENT_HEADER_SIZE,
+            Self::Named(bytes) => bytes.len(),
+        }
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Header(hdr) => hdr.as_bytes(),
+            Self::Named(bytes) => bytes.as_slice(),
+        }
+    }
+}
+
+impl std::ops::Deref for PendingRecord {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_bytes()
+    }
+}
+
+impl From<Vec<u8>> for PendingRecord {
+    fn from(bytes: Vec<u8>) -> Self {
+        if bytes.len() == INOTIFY_EVENT_HEADER_SIZE {
+            if let (Ok(b0), Ok(b1), Ok(b2), Ok(b3)) = (
+                <&[u8; 4]>::try_from(&bytes[0..4]),
+                <&[u8; 4]>::try_from(&bytes[4..8]),
+                <&[u8; 4]>::try_from(&bytes[8..12]),
+                <&[u8; 4]>::try_from(&bytes[12..16]),
+            ) {
+                let len = u32::from_le_bytes(*b3);
+                if len == 0 {
+                    return Self::Header(carrick_abi::LinuxInotifyEventHeader {
+                        wd: i32::from_le_bytes(*b0),
+                        mask: u32::from_le_bytes(*b1),
+                        cookie: u32::from_le_bytes(*b2),
+                        len: 0,
+                    });
+                }
+            }
+        }
+        Self::Named(bytes)
+    }
+}
+
+#[inline]
+fn encode_event_record(wd: i32, mask: u32, cookie: u32, name: Option<&[u8]>) -> PendingRecord {
+    match name {
+        None => PendingRecord::Header(carrick_abi::LinuxInotifyEventHeader {
+            wd,
+            mask,
+            cookie,
+            len: 0,
+        }),
+        Some(name) => PendingRecord::Named(encode_event_raw(wd, mask, cookie, Some(name))),
+    }
+}
+
 #[derive(Debug)]
 struct Inner {
     next_wd: i32,
@@ -161,7 +235,7 @@ struct Inner {
     /// (a `read(2)` whose buffer was smaller than the available events keeps the
     /// rest here, like the kernel's event queue). On Linux this only buffers a
     /// short-read remainder; on macOS it also holds synthesized records.
-    pending: VecDeque<Vec<u8>>,
+    pending: VecDeque<PendingRecord>,
     /// Running total of `pending`'s encoded bytes, maintained by
     /// [`Inner::push_record`] and [`drain_pending`] — the only two places that
     /// touch the queue. `ioctl(FIONREAD)` and readiness both need this number
@@ -246,7 +320,8 @@ impl Inner {
     ///
     /// Returns true iff the queue transitioned from empty to having queued
     /// records (i.e. readiness transitioned and the backend must be pulsed).
-    fn push_record(&mut self, record: Vec<u8>) -> bool {
+    fn push_record(&mut self, record: impl Into<PendingRecord>) -> bool {
+        let record = record.into();
         if self.overflowed {
             return false;
         }
@@ -257,13 +332,18 @@ impl Inner {
         // exactly wd|mask|cookie|len|name, so a byte-equal tail record is an
         // identical event — drop the new one. (inotify02 renames the watched dir
         // twice back-to-back, expecting a single coalesced IN_MOVE_SELF.)
-        if self.pending.back().is_some_and(|tail| *tail == record) {
+        if self.pending.back().is_some_and(|tail| tail == &record) {
             return false;
         }
         let was_empty = self.pending.is_empty();
         if self.pending.len() >= INOTIFY_MAX_QUEUED_EVENTS {
             self.overflowed = true;
-            let overflow = encode_event_raw(-1, carrick_abi::LINUX_IN_Q_OVERFLOW, 0, None);
+            let overflow = PendingRecord::Header(carrick_abi::LinuxInotifyEventHeader {
+                wd: -1,
+                mask: carrick_abi::LINUX_IN_Q_OVERFLOW,
+                cookie: 0,
+                len: 0,
+            });
             self.queued_bytes += overflow.len();
             self.pending.push_back(overflow);
             return was_empty;
@@ -882,6 +962,7 @@ pub struct InotifyState {
     observed: std::sync::atomic::AtomicBool,
     inner: Mutex<Inner>,
     work_scope: parking_lot::RwLock<Option<carrick_observability::work_meter::WorkScope>>,
+    has_work_scope: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for InotifyState {
@@ -902,15 +983,32 @@ impl InotifyState {
             observed: std::sync::atomic::AtomicBool::new(false),
             inner: Mutex::new(Inner::new()),
             work_scope: parking_lot::RwLock::new(None),
+            has_work_scope: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     pub(crate) fn set_work_scope(&self, scope: carrick_observability::work_meter::WorkScope) {
         *self.work_scope.write() = Some(scope);
+        self.has_work_scope
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn has_work_scope(&self) -> bool {
+        self.has_work_scope
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn work_scope(&self) -> Option<carrick_observability::work_meter::WorkScope> {
         self.work_scope.read().clone()
+    }
+
+    /// The backing pollable fd without marking this instance as observed
+    /// for readiness polling. Used for diagnostic/event ring recording where no
+    /// wait or readiness observation is established.
+    #[inline]
+    pub(crate) fn raw_poll_fd(&self) -> RawFd {
+        self.poll_fd
     }
 
     /// The backing pollable fd (the kqueue fd on macOS, the inotify fd on
@@ -1036,14 +1134,21 @@ impl InotifyState {
         for host_fd in &watch.host_fds {
             inner.wd_by_fd.remove(host_fd);
         }
-        let scope = self.work_scope();
-        self.backend
-            .deregister_batch(&watch.host_fds, wd, &mut inner, scope.as_ref());
-        for host_fd in watch.host_fds {
-            unsafe { libc::close(host_fd) };
+        if !watch.host_fds.is_empty() {
+            let scope = self.work_scope();
+            self.backend
+                .deregister_batch(&watch.host_fds, wd, &mut inner, scope.as_ref());
+            for host_fd in watch.host_fds {
+                unsafe { libc::close(host_fd) };
+            }
         }
         if !inner.overflowed {
-            let record = encode_event_raw(wd, carrick_abi::LINUX_IN_IGNORED, 0, None);
+            let record = PendingRecord::Header(carrick_abi::LinuxInotifyEventHeader {
+                wd,
+                mask: carrick_abi::LINUX_IN_IGNORED,
+                cookie: 0,
+                len: 0,
+            });
             if inner.push_record(record) {
                 self.maybe_wake();
             }
@@ -1064,14 +1169,10 @@ impl InotifyState {
         if inner.overflowed {
             return;
         }
-        if inner
-            .pending
-            .back()
-            .is_some_and(|tail| encoded_event_matches(tail, wd, mask, cookie, name))
-        {
+        let record = encode_event_record(wd, mask, cookie, name);
+        if inner.pending.back().is_some_and(|tail| tail == &record) {
             return;
         }
-        let record = encode_event_raw(wd, mask, cookie, name);
         // Pulse the backend multiplexer only when the queue transitions from empty
         // to non-empty (level readiness). Subsequent enqueues leave the backend
         // readable without repeated host wake syscalls.
@@ -1150,34 +1251,6 @@ impl InotifyState {
     }
 }
 
-fn encoded_event_matches(
-    encoded: &[u8],
-    wd: i32,
-    mask: u32,
-    cookie: u32,
-    name: Option<&[u8]>,
-) -> bool {
-    let name_len = name.map(|name| align4(name.len() + 1)).unwrap_or(0);
-    if encoded.len() != INOTIFY_EVENT_HEADER_SIZE + name_len
-        || encoded.get(0..4) != Some(wd.to_le_bytes().as_slice())
-        || encoded.get(4..8) != Some(mask.to_le_bytes().as_slice())
-        || encoded.get(8..12) != Some(cookie.to_le_bytes().as_slice())
-        || encoded.get(12..16) != Some((name_len as u32).to_le_bytes().as_slice())
-    {
-        return false;
-    }
-    match name {
-        Some(name) => {
-            encoded.get(INOTIFY_EVENT_HEADER_SIZE..INOTIFY_EVENT_HEADER_SIZE + name.len())
-                == Some(name)
-                && encoded
-                    .get(INOTIFY_EVENT_HEADER_SIZE + name.len())
-                    .is_some_and(|nul| *nul == 0)
-        }
-        None => true,
-    }
-}
-
 /// Pop whole `inotify_event` records from `inner.pending` up to `max_bytes`.
 /// Empty queue → empty Vec (caller maps to EAGAIN); a buffer too small for the
 /// first queued record → `Err(EINVAL)`, matching Linux.
@@ -1202,7 +1275,7 @@ fn drain_pending(inner: &mut Inner, max_bytes: usize) -> Result<Vec<u8>, LinuxEr
             break;
         };
         inner.queued_bytes = inner.queued_bytes.saturating_sub(record.len());
-        out.extend_from_slice(&record);
+        out.extend_from_slice(record.as_bytes());
     }
     // Once the queue is fully drained the overflow latch lifts, so a watch that
     // keeps firing after the guest catches up can re-fill and overflow again.
@@ -1237,10 +1310,70 @@ struct RegisteredWatch {
 /// This is the payload shared by [`InotifyRegistry`] clones. The native backend
 /// still covers host mutations that do not pass through Carrick's dispatch
 /// hooks; this index supplies the precise events for mutations that do.
+#[derive(Clone, Debug)]
+enum WatchPaths {
+    One(std::sync::Arc<str>),
+    Many(Vec<std::sync::Arc<str>>),
+}
+
+impl WatchPaths {
+    #[inline]
+    fn contains(&self, key: &str) -> bool {
+        match self {
+            Self::One(p) => &**p == key,
+            Self::Many(paths) => paths.iter().any(|p| &**p == key),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, path: std::sync::Arc<str>) {
+        match self {
+            Self::One(existing) => {
+                let first = std::sync::Arc::clone(existing);
+                *self = Self::Many(vec![first, path]);
+            }
+            Self::Many(paths) => {
+                paths.push(path);
+            }
+        }
+    }
+
+    #[inline]
+    fn retain(&mut self, mut f: impl FnMut(&std::sync::Arc<str>) -> bool) {
+        match self {
+            Self::One(p) => {
+                if !f(p) {
+                    *self = Self::Many(Vec::new());
+                }
+            }
+            Self::Many(paths) => {
+                paths.retain(f);
+            }
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::One(_) => false,
+            Self::Many(paths) => paths.is_empty(),
+        }
+    }
+
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = &std::sync::Arc<str>> {
+        let (one, slice) = match self {
+            Self::One(p) => (Some(p), [].as_slice()),
+            Self::Many(paths) => (None, paths.as_slice()),
+        };
+        one.into_iter().chain(slice.iter())
+    }
+}
+
 #[derive(Default)]
 struct RegistryInner {
     by_path: HashMap<std::sync::Arc<str>, Vec<RegisteredWatch>>,
-    by_wd: HashMap<(usize, i32), Vec<std::sync::Arc<str>>>,
+    by_wd: HashMap<(usize, i32), WatchPaths>,
 }
 
 impl RegistryInner {
@@ -1364,9 +1497,16 @@ impl InotifyRegistry {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let ptr = std::sync::Arc::as_ptr(state) as usize;
-        let paths = inner.by_wd.entry((ptr, wd)).or_default();
-        if !paths.iter().any(|p| &**p == key) {
-            paths.push(path_key);
+        match inner.by_wd.entry((ptr, wd)) {
+            std::collections::hash_map::Entry::Occupied(mut occ) => {
+                let paths = occ.get_mut();
+                if !paths.contains(key) {
+                    paths.push(path_key);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(vac) => {
+                vac.insert(WatchPaths::One(path_key));
+            }
         }
     }
 
@@ -1378,8 +1518,8 @@ impl InotifyRegistry {
         let ptr = std::sync::Arc::as_ptr(state) as usize;
         // Visit only this descriptor's paths, then the watches on those paths.
         if let Some(paths) = inner.by_wd.remove(&(ptr, wd)) {
-            for path in paths {
-                if let Some(watches) = inner.by_path.get_mut(&*path) {
+            for path in paths.iter() {
+                if let Some(watches) = inner.by_path.get_mut(&**path) {
                     let prev_len = watches.len();
                     watches.retain(|w| !(w.wd == wd && std::sync::Arc::ptr_eq(&w.state, state)));
                     let removed = prev_len - watches.len();
@@ -1388,7 +1528,7 @@ impl InotifyRegistry {
                             .fetch_sub(removed, std::sync::atomic::Ordering::Relaxed);
                     }
                     if watches.is_empty() && inner.by_path.len() > 128 {
-                        inner.by_path.remove(&*path);
+                        inner.by_path.remove(&**path);
                     }
                 }
             }
@@ -1453,9 +1593,16 @@ impl InotifyRegistry {
             let to_arc: std::sync::Arc<str> = std::sync::Arc::from(to_key);
             for w in &watches {
                 let ptr = std::sync::Arc::as_ptr(&w.state) as usize;
-                let paths = inner.by_wd.entry((ptr, w.wd)).or_default();
-                if !paths.iter().any(|p| &**p == to_key) {
-                    paths.push(std::sync::Arc::clone(&to_arc));
+                match inner.by_wd.entry((ptr, w.wd)) {
+                    std::collections::hash_map::Entry::Occupied(mut occ) => {
+                        let paths = occ.get_mut();
+                        if !paths.contains(to_key) {
+                            paths.push(std::sync::Arc::clone(&to_arc));
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(vac) => {
+                        vac.insert(WatchPaths::One(std::sync::Arc::clone(&to_arc)));
+                    }
                 }
             }
             inner.by_path.insert(to_arc, watches);
@@ -2085,7 +2232,7 @@ mod registry_tests {
     /// return, through coalescing, overflow, a short read and a full drain.
     #[test]
     fn maintained_queued_bytes_equals_the_true_pending_sum() {
-        let truth = |inner: &Inner| inner.pending.iter().map(Vec::len).sum::<usize>();
+        let truth = |inner: &Inner| inner.pending.iter().map(PendingRecord::len).sum::<usize>();
         let mut inner = Inner::new();
         assert_eq!(inner.queued_bytes(), 0);
 
@@ -2112,7 +2259,7 @@ mod registry_tests {
         assert_eq!(inner.queued_bytes(), truth(&inner), "after coalescing");
 
         // A short read leaves the remainder counted exactly.
-        let first_len = inner.pending.front().map(Vec::len).unwrap_or(0);
+        let first_len = inner.pending.front().map(PendingRecord::len).unwrap_or(0);
         let short = drain_pending(&mut inner, first_len).expect("short read");
         assert_eq!(short.len(), first_len);
         assert_eq!(inner.queued_bytes(), truth(&inner), "after a short read");
