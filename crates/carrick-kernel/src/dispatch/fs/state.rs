@@ -156,7 +156,9 @@ pub(in crate::dispatch) struct FsState {
     /// precise `IN_OPEN`/`IN_ACCESS`/`IN_MODIFY`/`IN_CLOSE_*`/`IN_CREATE`/
     /// `IN_DELETE`/`IN_MOVED_*` events the coarse kqueue `NOTE_*` set cannot
     /// express for same-process operations. Empty (the common case) → the
-    /// handlers' notify calls are a single `is_empty` read and return.
+    /// handlers' notify calls are a single `is_empty` read and return. Shared
+    /// across guest fork because inherited inotify instances keep one watch
+    /// set in Linux, and every HVPatch task mutates through one kernel graph.
     pub(in crate::dispatch) inotify_registry: crate::inotify::InotifyRegistry,
 
     /// Dispatch-layer fanotify mark table. Same seam as `inotify_registry`, but
@@ -671,6 +673,8 @@ impl FsState {
             rootfs_vfs: std::sync::Arc::clone(&self.rootfs_vfs),
             executable_authorities: std::sync::Arc::clone(&self.executable_authorities),
             pty_table: std::sync::Arc::clone(&self.pty_table),
+            // Arc-backed clone: inherited inotify instances keep one watch set,
+            // so later add/remove operations are coherent across guest fork.
             inotify_registry: self.inotify_registry.clone(),
             // Arc clone: the SAME table, not a copy. See the field docs.
             fanotify_registry: self.fanotify_registry.clone(),
