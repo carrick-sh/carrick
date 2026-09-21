@@ -15,61 +15,6 @@ use crate::trap::{SyscallTrap, TrapError};
 
 use carrick_fatal::carrick_fatal;
 
-/// ISA-neutral authority stamped into a shared syscall-portal request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PortalSessionWire {
-    pub executor_generation: u64,
-    pub task_serial: u64,
-    pub mm_generation: u64,
-    pub quantum_epoch: u64,
-}
-
-/// One validated scalar request read from a backend-owned portal transport.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PortalWireRequest {
-    pub mailbox_generation: u64,
-    pub sequence: u64,
-    pub session: PortalSessionWire,
-    pub native_nr: u64,
-    pub args: [u64; 6],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PortalPoll {
-    Idle,
-    Request(PortalWireRequest),
-    HostBoundary,
-    Cancelling,
-    Disabled,
-}
-
-/// Backend transport used by the runtime's adaptive portal helper.
-///
-/// Implementations authenticate the complete mailbox generation, sequence,
-/// and session on every publication. A backend that cannot share a typed
-/// transport with a helper simply returns no [`PortalEndpoint`].
-pub trait PortalTransport: Send + Sync {
-    fn generation(&self) -> Option<u64>;
-    fn arm(&self, session: PortalSessionWire) -> Result<u64, TrapError>;
-    fn cancel(&self, next_quantum_epoch: u64) -> Result<(), TrapError>;
-    fn poll(&self) -> Result<PortalPoll, TrapError>;
-    fn publish_returned(&self, request: PortalWireRequest, value: i64) -> Result<(), TrapError>;
-    fn publish_host_boundary(&self, request: PortalWireRequest) -> Result<(), TrapError>;
-}
-
-#[derive(Clone)]
-pub struct PortalEndpoint(Arc<dyn PortalTransport>);
-
-impl PortalEndpoint {
-    pub fn new(transport: Arc<dyn PortalTransport>) -> Self {
-        Self(transport)
-    }
-
-    pub fn transport(&self) -> &dyn PortalTransport {
-        self.0.as_ref()
-    }
-}
-
 /// The process-local thread/vCPU **registry key**.
 ///
 /// This is the key a guest thread is filed under in every per-process table:
@@ -2468,12 +2413,6 @@ impl HvpatchVerifiedChildKernelBinding {
 }
 
 pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
-    /// Optional shared syscall portal. The default keeps every non-HVF backend
-    /// on its existing trap path.
-    fn portal_endpoint(&self) -> Option<PortalEndpoint> {
-        None
-    }
-
     /// Optional backend-owned sink for the carrier-global descriptor ceiling.
     /// Unsupported execution lanes leave the optimization disabled.
     fn fd_ceiling_publisher(&self) -> Option<Arc<dyn crate::FdCeilingPublisher>> {

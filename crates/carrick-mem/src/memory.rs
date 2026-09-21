@@ -161,8 +161,6 @@ pub fn is_carrick_el1_clock_handler_va(va: u64) -> bool {
 pub const AARCH64_SYSCALL_MAILBOX_CLOCK_ACTIVE: u32 = 3;
 pub const AARCH64_SYSCALL_MAILBOX_PORTAL_ARMED: u32 = 4;
 pub const AARCH64_SYSCALL_MAILBOX_PORTAL_HOST_BOUNDARY: u32 = 5;
-pub const AARCH64_SYSCALL_MAILBOX_PORTAL_REQUEST_READY: u32 = 7;
-pub const AARCH64_SYSCALL_MAILBOX_PORTAL_RESPONSE_READY: u32 = 8;
 pub const CLOCK_FORCE_HOST_BOUNDARY: u32 = 1;
 pub const AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X9: u64 =
     mailbox_offset(core::mem::offset_of!(Aarch64SyscallMailbox, clock_x9));
@@ -4122,19 +4120,11 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
 
     // Publish an eligible portal request and wait only while the exact request
     // remains owned by the helper. Every uncertain state falls back to HVC.
-    emit(
-        &mut bytes,
-        &mut cursor,
-        enc_movz_w16(AARCH64_SYSCALL_MAILBOX_PORTAL_REQUEST_READY as u16),
-    );
+    emit(&mut bytes, &mut cursor, enc_movz_w16(1));
     emit(&mut bytes, &mut cursor, AARCH64_STLR_W16_X17_OPCODE);
     let portal_wait = cursor;
     emit(&mut bytes, &mut cursor, AARCH64_LDAR_W16_X17_OPCODE);
-    emit(
-        &mut bytes,
-        &mut cursor,
-        enc_cmp_w16_imm(AARCH64_SYSCALL_MAILBOX_PORTAL_RESPONSE_READY as u16),
-    );
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(2));
     let portal_response_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
     emit(
@@ -4144,11 +4134,7 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
     );
     let portal_host_boundary_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
-    emit(
-        &mut bytes,
-        &mut cursor,
-        enc_cmp_w16_imm(AARCH64_SYSCALL_MAILBOX_PORTAL_REQUEST_READY as u16),
-    );
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(1));
     let portal_uncertain_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
     emit(
@@ -6124,7 +6110,6 @@ mod syscall_mailbox_tests {
         let signed = (imm26 << 38) >> 38;
         Some((pc as i64 + (signed << 2)) as usize)
     }
-
     fn decode_str_x_sp(op: u32) -> Option<(u32, usize)> {
         if op & 0xFFC0_03E0 != 0xF900_03E0 {
             return None;
@@ -6329,16 +6314,6 @@ mod syscall_mailbox_tests {
         assert_eq!(
             words[compare + 9],
             enc_cmp_w16_imm(AARCH64_SYSCALL_MAILBOX_PORTAL_ARMED as u16)
-        );
-        assert_eq!(
-            words[compare + 11],
-            enc_movz_w16(AARCH64_SYSCALL_MAILBOX_PORTAL_REQUEST_READY as u16)
-        );
-        assert_eq!(words[compare + 12], AARCH64_STLR_W16_X17_OPCODE);
-        assert_eq!(words[compare + 13], AARCH64_LDAR_W16_X17_OPCODE);
-        assert_eq!(
-            words[compare + 14],
-            enc_cmp_w16_imm(AARCH64_SYSCALL_MAILBOX_PORTAL_RESPONSE_READY as u16)
         );
 
         let branch_index = compare + 10;

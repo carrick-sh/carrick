@@ -6893,7 +6893,6 @@ fn run_production_exec_failure_pool_case(boundary: InjectedExecFailureBoundary, 
         pending_terminal_retirement: None,
         pending_terminal_inventory: None,
         external_exec: None,
-        portal_quantum_epoch: 0,
     };
     let job = crate::vcpu_loop::binding::HvpatchLoopJob::production(production, injected_lease);
     let quantum = Arc::new(crate::vcpu_loop::continuation::HvpatchTaskQuantum::new(
