@@ -366,13 +366,53 @@ impl<'a> FsView<'a> {
         // so it is not keyed here.
         let is_atfdcwd = (dirfd as i32) as i64 as u64 == LINUX_AT_FDCWD;
         let fs_context = self.captured_fs_context();
-        let cache_key: Option<String> = if std::path::Path::new(path).is_absolute() {
+        enum LookupKey<'a> {
+            Borrowed(&'a str),
+            Owned(String),
+        }
+        impl<'a> LookupKey<'a> {
+            fn as_str(&self) -> &str {
+                match self {
+                    LookupKey::Borrowed(s) => s,
+                    LookupKey::Owned(s) => s.as_str(),
+                }
+            }
+            fn into_owned(self) -> String {
+                match self {
+                    LookupKey::Borrowed(s) => (*s).to_owned(),
+                    LookupKey::Owned(s) => s,
+                }
+            }
+        }
+        let mut inline_buf = [0u8; 512];
+        let lookup_key: Option<LookupKey<'_>> = if std::path::Path::new(path).is_absolute() {
             match fs_context.chroot_root().as_deref() {
-                Some(root) if root != "/" => Some(format!("{root}\u{0}{path}")),
-                _ => Some(path.to_owned()),
+                Some(root) if root != "/" => {
+                    let total = root.len() + 1 + path.len();
+                    if total <= 512 {
+                        inline_buf[..root.len()].copy_from_slice(root.as_bytes());
+                        inline_buf[root.len()] = 0;
+                        inline_buf[root.len() + 1..total].copy_from_slice(path.as_bytes());
+                        let s = std::str::from_utf8(&inline_buf[..total]).unwrap_or("");
+                        Some(LookupKey::Borrowed(s))
+                    } else {
+                        Some(LookupKey::Owned(format!("{root}\u{0}{path}")))
+                    }
+                }
+                _ => Some(LookupKey::Borrowed(path)),
             }
         } else if is_atfdcwd {
-            Some(format!("{}\u{0}{}", fs_context.cwd(), path))
+            let cwd = fs_context.cwd();
+            let total = cwd.len() + 1 + path.len();
+            if total <= 512 {
+                inline_buf[..cwd.len()].copy_from_slice(cwd.as_bytes());
+                inline_buf[cwd.len()] = 0;
+                inline_buf[cwd.len() + 1..total].copy_from_slice(path.as_bytes());
+                let s = std::str::from_utf8(&inline_buf[..total]).unwrap_or("");
+                Some(LookupKey::Borrowed(s))
+            } else {
+                Some(LookupKey::Owned(format!("{cwd}\u{0}{path}")))
+            }
         } else {
             None
         };
@@ -380,15 +420,14 @@ impl<'a> FsView<'a> {
         // entry is stamped with this, so a mutation racing our resolve (which
         // bumps to a higher generation) leaves the entry born stale.
         let gen_at_entry = carrick_vfs::fs_resolve_cache::current_generation();
-        if let Some(ref key) = cache_key {
+        if let Some(ref key) = lookup_key {
             // Validate the lookup against the FRESH current generation (read
             // now, not `gen_at_entry`) so a mutation between entry and here also
             // invalidates.
-            if let Some(hit) = self
-                .fs
-                .resolve_cache
-                .get(key, carrick_vfs::fs_resolve_cache::current_generation())
-            {
+            if let Some(hit) = self.fs.resolve_cache.get(
+                key.as_str(),
+                carrick_vfs::fs_resolve_cache::current_generation(),
+            ) {
                 // Still enforce DAC search permission per call — it depends on
                 // live creds, not the path structure (a no-op for root, the hot
                 // case). The resolution itself is what the cache elides.
@@ -415,10 +454,10 @@ impl<'a> FsView<'a> {
             }
         };
         self.check_search_access(&resolved)?;
-        if let Some(key) = cache_key {
+        if let Some(key) = lookup_key {
             self.fs
                 .resolve_cache
-                .put(key, resolved.clone(), gen_at_entry);
+                .put(key.into_owned(), resolved.clone(), gen_at_entry);
         }
         Ok(resolved)
     }
