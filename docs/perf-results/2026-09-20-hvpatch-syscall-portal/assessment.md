@@ -581,3 +581,25 @@ Next attribution work must isolate host-dispatch transition cost with the
 existing finite `perf_trap_floor host-dispatch` reduction and qualified probes,
 not equate time under Vcpu::run with host overhead. Meanwhile the restored live
 Docker oracle permits closing the previously skipped signed gate observations.
+
+
+### Restored live-oracle public probe gate
+
+`post-sparse-live-oracle.json` records a completed public probe gate (exit 0):
+all three generic ARM64 shards, dedicated signed scenarios, negative entitlement
+controls and CLI contract passed. The retained set produced 33 musl and 33 GNU
+ARM64 PASS rows against Linux, with no canonical missing-oracle observations.
+The legacy retained harness labels GNU report-only; this is not a strict
+closure-mode result. AMD64 report-only diffs/skips are outside the canonical lane.
+
+CLI SHA-256, CDHash and LC_UUID match the previous signed artifact; hypervisor
+entitlement and DOF remain present. Both scoped cleanup counts are zero.
+The generic signed receipt names aea6ecb76 and the dedicated receipt names
+25415c7b7; the intervening commit changed only these performance documents and
+trace receipts, not compilation inputs. Both original signed manifests are
+preserved here as `live-oracle-{generic,dedicated}-signed-artifacts.jsonl`.
+
+This closes the prior public-gate missing-oracle observation. It does not
+close strict probe closure, the frozen 2,127-suite full gate, or <=2x performance.
+The demonstrated inotify performance violation remains a correctness blocker;
+no smoke/full promotion or parity claim follows from this probe pass.
