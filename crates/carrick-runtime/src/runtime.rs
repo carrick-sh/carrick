@@ -841,7 +841,7 @@ fn with_hvf_syscall_mailbox(
     // identity-page gate decide whether matched calls return in EL1 or fall
     // through to the host dispatcher.
     let identity_fast_path = carrick_kernel::syscall_shim_enabled();
-    let image = image.with_el1_vectors_mailbox_fd_ceiling(identity_fast_path)?;
+    let image = image.with_el1_vectors_mailbox_clock(identity_fast_path, true)?;
     // The page is part of the compile-enabled transport shape even when its
     // runtime gate is closed. Boot/fork/exec stampers still publish the task
     // identity there; interceptor/observer visibility keeps the gate at zero
@@ -3023,6 +3023,14 @@ mod tests {
             .expect("unrestricted initial image");
 
         image_region(&image, carrick_mem::memory::LINUX_IDENTITY_PAGE_BASE);
+        let clock_stub = image
+            .regions()
+            .iter()
+            .find(|region| region.start == carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE)
+            .expect("production image must install the raw-clock EL0 transport");
+        assert!(clock_stub.perms.read);
+        assert!(!clock_stub.perms.write);
+        assert!(clock_stub.perms.execute);
         let vdso = image_region(&image, carrick_mem::vdso::LINUX_VDSO_BASE);
         assert_eq!(&vdso[..HvfArch::vdso_bytes().len()], HvfArch::vdso_bytes());
     }
