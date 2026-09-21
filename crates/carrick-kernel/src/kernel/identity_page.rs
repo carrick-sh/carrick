@@ -157,6 +157,18 @@ pub fn stamp_identity_values<M: CurrentMmMemory>(
         base + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS,
         &0_u64.to_le_bytes(),
     )?;
+    memory.write_bytes(
+        base + crate::memory::IDENTITY_OFF_SEEK_GATE,
+        &0_u32.to_le_bytes(),
+    )?;
+    memory.write_bytes(
+        base + crate::memory::IDENTITY_OFF_SEEK_FD,
+        &(-1_i32).to_le_bytes(),
+    )?;
+    memory.write_bytes(
+        base + crate::memory::IDENTITY_OFF_SEEK_OFFSET,
+        &0_i64.to_le_bytes(),
+    )?;
     // RELEASE the identity before opening the gate.
     //
     // Ordering the stores in program order is necessary but NOT sufficient.
@@ -174,6 +186,36 @@ pub fn stamp_identity_values<M: CurrentMmMemory>(
         base + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
         &shim_enabled.to_le_bytes(),
     )?;
+    Ok(())
+}
+
+pub fn stamp_seek_authority<M: CurrentMmMemory>(
+    memory: &mut M,
+    base: u64,
+    fd: i32,
+    offset: i64,
+    enabled: bool,
+) -> Result<(), carrick_guest_mem::MemoryError> {
+    memory.write_bytes(
+        base + crate::memory::IDENTITY_OFF_SEEK_GATE,
+        &0_u32.to_le_bytes(),
+    )?;
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    memory.write_bytes(
+        base + crate::memory::IDENTITY_OFF_SEEK_FD,
+        &fd.to_le_bytes(),
+    )?;
+    memory.write_bytes(
+        base + crate::memory::IDENTITY_OFF_SEEK_OFFSET,
+        &offset.to_le_bytes(),
+    )?;
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    if enabled {
+        memory.write_bytes(
+            base + crate::memory::IDENTITY_OFF_SEEK_GATE,
+            &1_u32.to_le_bytes(),
+        )?;
+    }
     Ok(())
 }
 
