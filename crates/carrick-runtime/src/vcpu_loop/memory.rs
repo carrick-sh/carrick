@@ -582,7 +582,10 @@ pub(crate) fn stamp_ns_visible_guest_tid_with(
             context.thread().key().tid.raw()
         ))
     })?;
-    set(u64::from(tid))
+    let task_id = u32::try_from(context.task().key().id.raw()).unwrap_or(0);
+    let pid = carrick_kernel::namespace::pid::ns_self_pid_for(context, task_id);
+    let packed = (u64::from(pid) << 32) | u64::from(tid);
+    set(packed)
 }
 
 pub(crate) fn proc_maps_from_address_space(image: &AddressSpace) -> Vec<ProcMapsEntry> {
