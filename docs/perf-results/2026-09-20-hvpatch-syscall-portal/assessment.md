@@ -332,3 +332,27 @@ than falling back to the old identity metric. The historical report is annotated
 its raw evidence and promotion thresholds are unchanged. Fresh qualification
 must also use the current HVPatch execution lane rather than assume the retired
 VMM campaign invocation remains applicable. No runtime default changes here.
+
+### Balanced HVPatch boundary comparison
+
+At source `5acff4f74`, explicit `run-elf --raw --exec-backend hvpatch` completed
+10 warmup ABBA blocks followed by 30 measurement blocks, 60 samples per mode,
+with four exposed CPUs. Each leg ran serially on the same signed binary and
+static-musl probe identified above; both hashes were verified unchanged after
+sampling. All 160 invocations returned zero and reported `nproc=4`; no guest
+processes remained after the campaign.
+
+Median `invalid_seek_batch_trimmed_mean_us` was 1.7105 us legacy and 1.537 us
+mailbox. The mailbox/legacy ratio was 0.89857, with a percentile bootstrap 95%
+interval [0.89586, 0.90170] (10,000 resamples, seed 5634344305327363654).
+This clears the existing boundary estimate <=0.90 / upper <1.00 threshold.
+It does not qualify end-to-end guards, Linux parity, or signed promotion.
+The diagnostic uses the current static-musl ELF rather than the historical
+native-PIE build; it is a fresh HVPatch comparison, not the old full campaign.
+Every invocation and raw output is retained in `mailbox-hvpatch-abba.jsonl`.
+
+The reusable transport campaign command was separately corrected from retired
+`vmm` to explicit `hvpatch`, with an argv regression test red on `vmm` and
+green on `hvpatch`. Historical native-versus-VMM comparators remain untouched.
+The full transport campaign still requires freshly built probe artifacts and
+all end-to-end rows before a default change can be considered.
