@@ -289,10 +289,10 @@ impl<'a> FsView<'a> {
             // virtual dispatch-only one when the backend declines) is recorded
             // in the dispatch registry so the fs handlers can synthesize the
             // precise same-process events the coarse kqueue NOTE_* set misses.
-            let wd = if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
+            let (wd, is_virtual) = if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
                 match m.vfs.watch_fds(&m.full_path) {
                     Ok(watch_fds) => match state.add_watch_fds(watch_fds, mask) {
-                        Ok(wd) => wd,
+                        Ok(wd) => (wd, false),
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     },
                     // Backend can't hand back a host vnode: fall back to a
@@ -301,7 +301,7 @@ impl<'a> FsView<'a> {
                         if !this.path_exists(&path) {
                             return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOENT));
                         }
-                        state.add_virtual_watch(mask)
+                        (state.add_virtual_watch(mask), true)
                     }
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
@@ -314,11 +314,11 @@ impl<'a> FsView<'a> {
                 if !this.rootfs_path_exists(&path) {
                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOENT));
                 }
-                state.add_virtual_watch(mask)
+                (state.add_virtual_watch(mask), true)
             } else {
                 match this.fs.rootfs_vfs.watch_fds(&path) {
                     Ok(watch_fds) => match state.add_watch_fds(watch_fds, mask) {
-                        Ok(wd) => wd,
+                        Ok(wd) => (wd, false),
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     },
                     Err(errno) if errno == LINUX_ENOSYS => {
@@ -331,12 +331,12 @@ impl<'a> FsView<'a> {
                         {
                             Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::HostFile { host_fd, .. }) => {
                                 match state.add_watch(host_fd, mask) {
-                                    Ok(wd) => wd,
+                                    Ok(wd) => (wd, false),
                                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                                 }
                             }
                             // No host vnode (in-memory overlay): dispatch-only.
-                            Ok(_) => state.add_virtual_watch(mask),
+                            Ok(_) => (state.add_virtual_watch(mask), true),
                             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                         }
                     }
@@ -345,8 +345,11 @@ impl<'a> FsView<'a> {
             };
             // The dispatch registry now owns same-process event generation for
             // this instance; suppress the kqueue backend's duplicate synthesis
-            // (it stays a poll_fd readiness source only).
-            state.mark_dispatch_authoritative();
+            // (it stays a poll_fd readiness source only). Virtual watches set
+            // this directly under their watch allocation lock.
+            if !is_virtual {
+                state.mark_dispatch_authoritative();
+            }
             this.fs
                 .inotify_registry
                 .register(&path, &state, wd, mask);
