@@ -874,10 +874,11 @@ pub struct InotifyState {
     /// Cached pollable fd — stable for the instance's life, read lock-free
     /// (`mux.poll_fd()` on macOS, the inotify fd on Linux).
     poll_fd: RawFd,
-    /// Has this instance's `poll_fd` ever been observed by `poll`, `epoll`, or
-    /// blocking read? When false, nobody is waiting on the backend multiplexer,
-    /// so synthetic record pushes can skip pulsing the host multiplexer
-    /// (`libc::kevent`), saving a Darwin syscall per event on non-polled instances.
+    /// Has this instance's `poll_fd` ever been queried for multiplexed or
+    /// blocking wait readiness? When false, nobody is waiting on the backend
+    /// multiplexer, so synthetic record pushes can skip pulsing the host
+    /// multiplexer (`libc::kevent`), saving a Darwin syscall per event on
+    /// non-polled instances.
     observed: std::sync::atomic::AtomicBool,
     inner: Mutex<Inner>,
     work_scope: parking_lot::RwLock<Option<carrick_observability::work_meter::WorkScope>>,
