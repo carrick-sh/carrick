@@ -135,6 +135,17 @@ impl MmapRequest {
     }
 }
 
+/// Runtime-owned clock transport is sealed against guest VMA mutations. Match
+/// Linux sealed system mappings (EPERM), while callers retain NOREPLACE's
+/// EEXIST collision result. Lengths are page-rounded by the syscall boundary.
+/// No VMA lookup or backend work is needed: the reserved ABI span is fixed.
+fn overlaps_clock_stub(address: u64, length: u64) -> Result<bool, LinuxErrno> {
+    let end = address.checked_add(length).ok_or(LINUX_ENOMEM)?;
+    let base = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE;
+    let limit = base + carrick_mem::memory::LINUX_EL0_CLOCK_STUB_SIZE;
+    Ok(length != 0 && address < limit && base < end)
+}
+
 impl<'a> MemView<'a> {
     define_syscall! {
         mm_mutation fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
@@ -309,6 +320,19 @@ impl<'a> MemView<'a> {
                     ));
                 }
             };
+            if map_flags.contains(LinuxMmapFlags::FIXED) {
+                let refusal = match overlaps_clock_stub(requested.0, length) {
+                    Ok(false) => None,
+                    Ok(true) => Some(if fixed_noreplace { LINUX_EEXIST } else { LINUX_EPERM }),
+                    Err(errno) => Some(errno),
+                };
+                if let Some(errno) = refusal {
+                    return Ok(request.refused(
+                        MmapRefusal::Spec("fixed range overflows or overlaps sealed clock transport"),
+                        errno,
+                    ));
+                }
+            }
             let length_usize =
                 usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
 
@@ -2198,6 +2222,11 @@ impl<'a> MemView<'a> {
             let Some(aligned_len) = align_up_u64(length, page_size) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
+            match overlaps_clock_stub(address.0, aligned_len) {
+                Ok(false) => {},
+                Ok(true) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            }
             let had_vma = guest_vma_overlaps_locked(&this.mem().lock(), address.0, aligned_len);
             let (
                 shared_owned,
@@ -2458,6 +2487,21 @@ impl<'a> MemView<'a> {
                     new_address.0.saturating_add(new_size),
                 ) {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+            }
+            // A zero old_size duplicates a mapping, so it still names a
+            // source page. In-place growth must not consume the sealed span.
+            let source_len = if move_fixed { old_size.max(page_size) } else { old_size.max(new_size) };
+            match overlaps_clock_stub(old_address.0, source_len) {
+                Ok(false) => {},
+                Ok(true) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            }
+            if move_fixed {
+                match overlaps_clock_stub(new_address.0, new_size) {
+                    Ok(false) => {},
+                    Ok(true) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
             }
             if this
@@ -3765,6 +3809,11 @@ impl<'a> MemView<'a> {
             let Some(length) = align_up_u64(length, page_size) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
+            match overlaps_clock_stub(address.0, length) {
+                Ok(false) => {},
+                Ok(true) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            }
             let Ok(len) = usize::try_from(length) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };

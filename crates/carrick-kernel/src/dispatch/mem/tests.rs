@@ -74,6 +74,7 @@ pub struct CountingMmapMemory {
     pub(crate) write_bytes_total: Cell<usize>,
     pub(crate) zero_backing_calls: Cell<usize>,
     pub(crate) protect_calls: Cell<usize>,
+    unmap_calls: Cell<usize>,
     pub(crate) protect_log: RefCell<Vec<(u64, usize, u64)>>,
 }
 
@@ -126,6 +127,7 @@ impl CountingMmapMemory {
             write_bytes_total: Cell::new(0),
             zero_backing_calls: Cell::new(0),
             protect_calls: Cell::new(0),
+            unmap_calls: Cell::new(0),
             protect_log: RefCell::new(Vec::new()),
         }
     }
@@ -179,6 +181,11 @@ impl GuestMemory for CountingMmapMemory {
         self.zero_backing_calls
             .set(self.zero_backing_calls.get() + 1);
         self.bytes[offset..offset + len].fill(0);
+        Ok(())
+    }
+
+    fn unmap_range(&mut self, _address: u64, _len: usize) -> Result<(), MemoryError> {
+        self.unmap_calls.set(self.unmap_calls.get() + 1);
         Ok(())
     }
 
@@ -6631,5 +6638,241 @@ mod serial_host {
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
         assert!(libc::WIFSIGNALED(status), "child status was 0x{status:x}");
         assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
+    }
+}
+
+// Raw-clock transport protection: Linux sealed system mappings reject mutation
+// with EPERM; FIXED_NOREPLACE preserves the existing EEXIST collision contract.
+// These VM-free tests intentionally supply writable backing: refusal must come
+// from the kernel range guard, never accidentally from a backend access failure.
+fn assert_clock_stub_refused(request: SyscallRequest, errno: LinuxErrno, page_size: u64) {
+    let dispatcher = if page_size == 16384 {
+        native16k_dispatcher()
+    } else {
+        SyscallDispatcher::new()
+    };
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1000));
+    let reporter = CompatReporter::default();
+    let base = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE;
+    let size = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_SIZE;
+    let mut memory = CountingMmapMemory::new(base - page_size, (size + page_size * 2) as usize);
+    memory.bytes.fill(0x5a);
+    let result = threaded_memory_call(&dispatcher, &mut memory, &registry, &reporter, request);
+    assert_eq!(result, DispatchOutcome::errno(errno));
+    assert_eq!(memory.write_calls.get(), 0);
+    assert_eq!(memory.zero_backing_calls.get(), 0);
+    assert_eq!(memory.protect_calls.get(), 0);
+    assert_eq!(memory.unmap_calls.get(), 0);
+    assert!(memory.bytes.iter().all(|byte| *byte == 0x5a));
+}
+
+#[test]
+fn clock_stub_protection_fixed_mmap() {
+    let base = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE;
+    let size = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_SIZE;
+    for page in [4096, 16384] {
+        for (start, length) in [(base, 1), (base - page, page + 1), (base + size - page, 1)] {
+            for (fixed, errno) in [
+                (LINUX_MAP_FIXED, LINUX_EPERM),
+                (LINUX_MAP_FIXED_NOREPLACE, LINUX_EEXIST),
+            ] {
+                assert_clock_stub_refused(
+                    SyscallRequest::new(
+                        222,
+                        SyscallArgs([
+                            start,
+                            length,
+                            LINUX_PROT_READ | LINUX_PROT_WRITE,
+                            LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | fixed,
+                            u64::MAX,
+                            0,
+                        ]),
+                    ),
+                    errno,
+                    page,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn clock_stub_protection_munmap() {
+    let base = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE;
+    for page in [4096, 16384] {
+        for (start, length) in [(base, 1), (base - page, page + 1)] {
+            assert_clock_stub_refused(
+                SyscallRequest::new(215, SyscallArgs([start, length, 0, 0, 0, 0])),
+                LINUX_EPERM,
+                page,
+            );
+        }
+    }
+}
+
+#[test]
+fn clock_stub_protection_mprotect() {
+    let base = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE;
+    for page in [4096, 16384] {
+        for (start, length) in [(base, 1), (base - page, page + 1)] {
+            for prot in [0, LINUX_PROT_READ, LINUX_PROT_READ | LINUX_PROT_WRITE] {
+                assert_clock_stub_refused(
+                    SyscallRequest::new(226, SyscallArgs([start, length, prot, 0, 0, 0])),
+                    LINUX_EPERM,
+                    page,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn clock_stub_protection_mremap_source_and_destination() {
+    let base = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE;
+    let size = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_SIZE;
+    for page in [4096, 16384] {
+        for (start, length) in [(base, 1), (base - page, page + 1)] {
+            assert_clock_stub_refused(
+                SyscallRequest::new(216, SyscallArgs([start, length, page, 0, 0, 0])),
+                LINUX_EPERM,
+                page,
+            );
+            assert_clock_stub_refused(
+                SyscallRequest::new(
+                    216,
+                    SyscallArgs([
+                        base + size + page,
+                        page,
+                        length,
+                        LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED,
+                        start,
+                        0,
+                    ]),
+                ),
+                LINUX_EPERM,
+                page,
+            );
+        }
+        // old_size=0 duplicates a shareable mapping; it is not an empty source.
+        assert_clock_stub_refused(
+            SyscallRequest::new(
+                216,
+                SyscallArgs([base, 0, page, LINUX_MREMAP_MAYMOVE, 0, 0]),
+            ),
+            LINUX_EPERM,
+            page,
+        );
+    }
+}
+
+#[test]
+fn clock_stub_protection_nonfixed_hint_is_not_a_target() {
+    let dispatcher = SyscallDispatcher::new();
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1000));
+    let reporter = CompatReporter::default();
+    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, 0x10000);
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            222,
+            SyscallArgs([
+                carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE,
+                4096,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                u64::MAX,
+                0,
+            ]),
+        ),
+    );
+    let DispatchOutcome::Returned { value } = outcome else {
+        panic!("non-fixed hint failed: {outcome:?}");
+    };
+    let stub = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE;
+    assert!(
+        !(stub..stub + carrick_mem::memory::LINUX_EL0_CLOCK_STUB_SIZE).contains(&(value as u64))
+    );
+}
+
+#[test]
+fn clock_stub_protection_overflow_and_empty_requests() {
+    let base = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE;
+    for page in [4096, 16384] {
+        // Rounding overflow and addition overflow are separate failure cases.
+        for length in [u64::MAX, u64::MAX - page + 1] {
+            for request in [
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs([
+                        base,
+                        length,
+                        LINUX_PROT_READ,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+                SyscallRequest::new(215, SyscallArgs([base, length, 0, 0, 0, 0])),
+                SyscallRequest::new(226, SyscallArgs([base, length, LINUX_PROT_READ, 0, 0, 0])),
+                SyscallRequest::new(216, SyscallArgs([base, length, page, 0, 0, 0])),
+            ] {
+                assert_clock_stub_refused(request, LINUX_ENOMEM, page);
+            }
+        }
+        assert_clock_stub_refused(
+            SyscallRequest::new(215, SyscallArgs([base, 0, 0, 0, 0, 0])),
+            LINUX_EINVAL,
+            page,
+        );
+        assert_clock_stub_refused(
+            SyscallRequest::new(226, SyscallArgs([base + 1, page, LINUX_PROT_READ, 0, 0, 0])),
+            LINUX_EINVAL,
+            page,
+        );
+    }
+}
+
+#[test]
+fn clock_stub_protection_adjacent_ranges_remain_mutable() {
+    let base = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE;
+    let size = carrick_mem::memory::LINUX_EL0_CLOCK_STUB_SIZE;
+    for page in [4096, 16384] {
+        let dispatcher = if page == 16384 {
+            native16k_dispatcher()
+        } else {
+            SyscallDispatcher::new()
+        };
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1000));
+        let reporter = CompatReporter::default();
+        let mut memory = CountingMmapMemory::new(base - page, (size + page * 2) as usize);
+        for start in [base - page, base + size] {
+            let result = threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(226, SyscallArgs([start, page, LINUX_PROT_READ, 0, 0, 0])),
+            );
+            assert_eq!(result, DispatchOutcome::Returned { value: 0 });
+        }
+        let result = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(226, SyscallArgs([base, 0, LINUX_PROT_READ, 0, 0, 0])),
+        );
+        assert_eq!(result, DispatchOutcome::Returned { value: 0 });
+        assert_clock_stub_refused(
+            SyscallRequest::new(216, SyscallArgs([base - page, page, page * 2, 0, 0, 0])),
+            LINUX_EPERM,
+            page,
+        );
     }
 }
