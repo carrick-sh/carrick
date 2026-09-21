@@ -874,6 +874,11 @@ pub struct InotifyState {
     /// Cached pollable fd — stable for the instance's life, read lock-free
     /// (`mux.poll_fd()` on macOS, the inotify fd on Linux).
     poll_fd: RawFd,
+    /// Has this instance's `poll_fd` ever been observed by `poll`, `epoll`, or
+    /// blocking read? When false, nobody is waiting on the backend multiplexer,
+    /// so synthetic record pushes can skip pulsing the host multiplexer
+    /// (`libc::kevent`), saving a Darwin syscall per event on non-polled instances.
+    observed: std::sync::atomic::AtomicBool,
     inner: Mutex<Inner>,
     work_scope: parking_lot::RwLock<Option<carrick_observability::work_meter::WorkScope>>,
 }
@@ -881,7 +886,7 @@ pub struct InotifyState {
 impl std::fmt::Debug for InotifyState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InotifyState")
-            .field("poll_fd", &self.poll_fd())
+            .field("poll_fd", &self.poll_fd)
             .finish_non_exhaustive()
     }
 }
@@ -893,6 +898,7 @@ impl InotifyState {
         Some(Self {
             backend,
             poll_fd,
+            observed: std::sync::atomic::AtomicBool::new(false),
             inner: Mutex::new(Inner::new()),
             work_scope: parking_lot::RwLock::new(None),
         })
@@ -910,7 +916,22 @@ impl InotifyState {
     /// Linux), so poll/epoll/blocking-read can wait on inotify readiness the
     /// same way they do for timerfd/pidfd.
     pub(crate) fn poll_fd(&self) -> RawFd {
+        if !self
+            .observed
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            if self.has_queued_records() {
+                self.backend.wake();
+            }
+        }
         self.poll_fd
+    }
+
+    #[inline]
+    fn maybe_wake(&self) {
+        if self.observed.load(std::sync::atomic::Ordering::Acquire) {
+            self.backend.wake();
+        }
     }
 
     /// Register a watch on an already-open host fd, taking ownership of it.
@@ -947,6 +968,10 @@ impl InotifyState {
                 mask,
             },
         );
+        #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+        {
+            inner.dispatch_authoritative = true;
+        }
         wd
     }
 
@@ -1019,7 +1044,7 @@ impl InotifyState {
         if !inner.overflowed {
             let record = encode_event_raw(wd, carrick_abi::LINUX_IN_IGNORED, 0, None);
             if inner.push_record(record) {
-                self.backend.wake();
+                self.maybe_wake();
             }
         }
         Ok(())
@@ -1050,7 +1075,7 @@ impl InotifyState {
         // to non-empty (level readiness). Subsequent enqueues leave the backend
         // readable without repeated host wake syscalls.
         if inner.push_record(record) {
-            self.backend.wake();
+            self.maybe_wake();
         }
     }
 
@@ -1062,7 +1087,8 @@ impl InotifyState {
     pub(crate) fn mark_dispatch_authoritative(&self) {
         #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
         {
-            self.inner.lock().dispatch_authoritative = true;
+            let mut inner = self.inner.lock();
+            inner.dispatch_authoritative = true;
         }
     }
 
@@ -1091,7 +1117,7 @@ impl InotifyState {
         // EINVAL leaves complete records queued so readiness remains level-
         // triggered until the queue is fully drained.
         if self.has_queued_records() {
-            self.backend.wake();
+            self.maybe_wake();
         }
         result
     }
