@@ -35,34 +35,9 @@ pub struct OpenAtArgs<'a> {
 impl<'a> FsView<'a> {
     pub(in crate::dispatch) fn maybe_grant_seek_authority<M: CurrentMmMemory>(
         &self,
-        cx: &mut SyscallCtx<'_, M>,
-        outcome: &DispatchOutcome,
+        _cx: &mut SyscallCtx<'_, M>,
+        _outcome: &DispatchOutcome,
     ) {
-        if !crate::syscall_shim_enabled() {
-            return;
-        }
-        if let DispatchOutcome::Returned { value } = outcome {
-            let fd = *value as i32;
-            if let Some(open_file) = self.open_file(fd) {
-                if let Some(open) = open_file.description.read() {
-                    if let OpenDescription::HostFile { writable, .. } = &*open {
-                        let is_append = LinuxOpenFlags::from_bits_truncate(
-                            open_file.description.common().status_flags(),
-                        )
-                        .contains(LinuxOpenFlags::APPEND);
-                        if *writable && !is_append {
-                            let _ = crate::kernel::identity_page::stamp_seek_authority(
-                                &mut *cx.memory,
-                                crate::memory::LINUX_IDENTITY_PAGE_BASE,
-                                fd,
-                                0,
-                                true,
-                            );
-                        }
-                    }
-                }
-            }
-        }
     }
 
     fn open_at_path<M: CurrentMmMemory>(

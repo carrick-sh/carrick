@@ -367,6 +367,9 @@ impl<'a> FsView<'a> {
         {
             if seek_authority_active {
                 let new_offset = current_seek_offset.saturating_add(value as i64);
+                unsafe {
+                    libc::lseek(raw_fd, new_offset as libc::off_t, libc::SEEK_SET);
+                }
                 let _ = cx.memory.write_bytes(
                     crate::memory::LINUX_IDENTITY_PAGE_BASE
                         + crate::memory::IDENTITY_OFF_SEEK_OFFSET,
@@ -498,6 +501,43 @@ impl<'a> FsView<'a> {
                             0,
                             false,
                         );
+                    }
+                } else if crate::syscall_shim_enabled()
+                    && offset == 0
+                    && whence as i32 == libc::SEEK_SET
+                    && matches!(outcome, DispatchOutcome::Returned { value: 0 })
+                {
+                    if let OpenDescription::HostFile {
+                        writable, host_fd, ..
+                    } = &*open
+                    {
+                        let is_append = LinuxOpenFlags::from_bits_truncate(
+                            open_file.description.common().status_flags(),
+                        )
+                        .contains(LinuxOpenFlags::APPEND);
+                        if *writable && !is_append {
+                            let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+                            let _ = crate::kernel::identity_page::stamp_seek_authority(
+                                &mut *cx.memory,
+                                base,
+                                fd.0,
+                                0,
+                                true,
+                            );
+                            let rlim_fsize = this
+                                .effective_resource_limit(carrick_abi::LINUX_RLIMIT_FSIZE)
+                                .rlim_cur;
+                            if rlim_fsize == carrick_abi::LINUX_RLIM_INFINITY {
+                                let _ = crate::kernel::identity_page::stamp_write_lease(
+                                    &mut *cx.memory,
+                                    base,
+                                    fd.0,
+                                    host_fd.raw(),
+                                    0,
+                                    true,
+                                );
+                            }
+                        }
                     }
                 }
                 return Ok(outcome);
@@ -1329,6 +1369,28 @@ impl<'a> FsView<'a> {
                 // memory-into-guest read(2) wrapper.
                 OpenDescription::HostFile { host_fd, .. } => {
                     let host_fd_raw = host_fd.raw();
+                    if crate::syscall_shim_enabled() {
+                        let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+                        if let (Ok(gate_b), Ok(fd_b), Ok(off_b)) = (
+                            memory.read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_GATE, 4),
+                            memory.read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_FD, 4),
+                            memory.read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_OFFSET, 8),
+                        ) {
+                            let gate = u32::from_le_bytes(gate_b.as_slice().try_into().unwrap_or([0; 4]));
+                            let s_fd = i32::from_le_bytes(fd_b.as_slice().try_into().unwrap_or([u8::MAX; 4]));
+                            let cur_off = i64::from_le_bytes(off_b.as_slice().try_into().unwrap_or([0; 8]));
+                            if gate == 1 && s_fd == fd.0 && cur_off >= 0 {
+                                unsafe { libc::lseek(host_fd_raw, cur_off as libc::off_t, libc::SEEK_SET) };
+                                let _ = crate::kernel::identity_page::stamp_seek_authority(
+                                    &mut *memory,
+                                    base,
+                                    -1,
+                                    0,
+                                    false,
+                                );
+                            }
+                        }
+                    }
                     let host_fd_owner = host_fd.clone();
                     host_fd_owner.record_sequential_io();
                     drop(open);
@@ -2651,16 +2713,20 @@ impl<'a> FsView<'a> {
         fn write(this, cx, fd: Fd, buf: GuestPtr, count: u64) {
 
             let fd = fd.0;
-            // An O_PATH descriptor is not open for I/O (open13 → EBADF).
-            if this.fd_is_o_path(fd) {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            }
-            if this.io_uring_description(fd).is_some() {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            // memfd_secret: no file write method → EINVAL (memfdsecret probe).
-            if this.fd_is_secretmem(fd) {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            let open_file = this.open_file(fd);
+            if let Some(ref of) = open_file {
+                let common = of.description.common();
+                // An O_PATH descriptor is not open for I/O (open13 → EBADF).
+                if LinuxOpenFlags::from_bits_truncate(common.status_flags()).contains(LinuxOpenFlags::PATH) {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
+                if of.description.concrete_backing::<super::ioring::IoUringBacking>().is_some() {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                // memfd_secret: no file write method → EINVAL (memfdsecret probe).
+                if common.secretmem() {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
             }
             if this.fd_is_controlling_tty(cx.kernel, fd)
                 && cx.kernel.kernel().tty_caller_is_background(cx.kernel)
@@ -2722,11 +2788,16 @@ impl<'a> FsView<'a> {
                 }
             };
 
-            let nonblocking = this.io_is_nonblocking(fd, 0);
+            let nonblocking = open_file
+                .as_ref()
+                .is_some_and(|of| {
+                    LinuxOpenFlags::from_bits_truncate(of.description.common().status_flags())
+                        .contains(LinuxOpenFlags::NONBLOCK)
+                });
 
             #[cfg(feature = "trace-io")]
             if !bytes.is_empty() {
-                let has = this.open_file(fd).is_some();
+                let has = open_file.is_some();
                 eprintln!(
                     "[WRDBG] guest_fd={fd} in_table={has} n={} bytes={:02x?}",
                     bytes.len(),
@@ -2738,7 +2809,7 @@ impl<'a> FsView<'a> {
             // a pipe, an eventfd, or some other resource. Only after we've
             // confirmed there's no open description do we fall back to the
             // dispatcher's built-in stdout/stderr buffers.
-            if let Some(open_file) = this.open_file(fd) {
+            if let Some(open_file) = open_file {
                 if cx.can_host_wait() {
                     super::resources::stage_io_rearm(
                         cx.kernel,

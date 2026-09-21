@@ -2253,6 +2253,13 @@ impl SyscallDispatcher {
         }
     }
 
+    pub(crate) fn drain_write_lease_dirty<M: carrick_guest_mem::CurrentMmMemory>(
+        &self,
+        cx: &mut crate::dispatch::SyscallCtx<'_, M>,
+    ) {
+        self.fs_view().drain_write_lease_dirty(cx);
+    }
+
     #[inline]
     pub fn net_view(&self) -> NetView<'_> {
         NetView {

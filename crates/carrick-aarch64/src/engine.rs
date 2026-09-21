@@ -26,8 +26,8 @@ use std::sync::Arc;
 use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{
-    CurrentMmMemory, Gpa, GuestMemory, GuestVa, MappingSharing, MemoryError, RepointPrivateError,
-    SharedFutexLocation,
+    Aarch64SyscallFrame, CurrentMmMemory, Gpa, GuestMemory, GuestVa, MappingSharing, MemoryError,
+    RepointPrivateError, SharedFutexLocation,
 };
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
@@ -712,6 +712,98 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         self.last_fault_esr = state.last_fault_esr;
         self.last_exit_class = state.last_exit_class;
         self.is_forked_child = state.is_forked_child;
+    }
+
+    fn try_fast_write(&mut self, frame: &Aarch64SyscallFrame) -> Option<usize> {
+        let base = carrick_mem::memory::LINUX_IDENTITY_PAGE_BASE;
+        let mut lease_buf = [0u8; 24];
+        if self
+            .read_into_raw(
+                base + carrick_mem::memory::IDENTITY_OFF_WRITE_LEASE_GATE,
+                &mut lease_buf,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        let gate = u32::from_le_bytes(lease_buf[0..4].try_into().ok()?);
+        if gate != 1 {
+            return None;
+        }
+        let host_fd = i32::from_le_bytes(lease_buf[4..8].try_into().ok()?);
+        let guest_fd = i32::from_le_bytes(lease_buf[16..20].try_into().ok()?);
+        if guest_fd != frame.x0 as i32 || host_fd < 0 {
+            return None;
+        }
+
+        // Verify seek authority is also active for this exact guest fd.
+        let mut seek_buf = [0u8; 20];
+        if self
+            .read_into_raw(
+                base + carrick_mem::memory::IDENTITY_OFF_SEEK_GATE,
+                &mut seek_buf,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        let seek_gate = u32::from_le_bytes(seek_buf[0..4].try_into().ok()?);
+        let seek_fd = i32::from_le_bytes(seek_buf[4..8].try_into().ok()?);
+        let cur_seek_off = i64::from_le_bytes(seek_buf[12..20].try_into().ok()?);
+        if seek_gate != 1 || seek_fd != guest_fd || cur_seek_off < 0 {
+            return None;
+        }
+        let offset = cur_seek_off as u64;
+        let buf_gva = frame.x1;
+        let count = frame.x2 as usize;
+        let written = if count <= 4096 {
+            let mut stack_buf = [0u8; 4096];
+            if self
+                .read_into_raw(buf_gva, &mut stack_buf[..count])
+                .is_err()
+            {
+                return None;
+            }
+            unsafe {
+                libc::pwrite(
+                    host_fd,
+                    stack_buf.as_ptr() as *const libc::c_void,
+                    count,
+                    offset as libc::off_t,
+                )
+            }
+        } else if let Some(host_ptr) = self.vm.host_ptr_for_read(buf_gva, count) {
+            unsafe {
+                libc::pwrite(
+                    host_fd,
+                    host_ptr as *const libc::c_void,
+                    count,
+                    offset as libc::off_t,
+                )
+            }
+        } else {
+            return None;
+        };
+        if written < 0 {
+            return None;
+        }
+        let new_offset = offset.saturating_add(written as u64);
+        unsafe {
+            libc::lseek(host_fd, new_offset as libc::off_t, libc::SEEK_SET);
+        }
+        let _ = self.write_bytes(
+            base + carrick_mem::memory::IDENTITY_OFF_WRITE_LEASE_OFFSET,
+            &new_offset.to_le_bytes(),
+        );
+        let _ = self.write_bytes(
+            base + carrick_mem::memory::IDENTITY_OFF_SEEK_OFFSET,
+            &(new_offset as i64).to_le_bytes(),
+        );
+        let _ = self.write_bytes(
+            base + carrick_mem::memory::IDENTITY_OFF_WRITE_LEASE_DIRTY,
+            &1_u32.to_le_bytes(),
+        );
+        Some(written as usize)
     }
 
     /// Build an engine around an already-constructed VM + vCPU (the backend's
@@ -2381,6 +2473,12 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                 .map_err(|error| self.vm.enrich_vcpu_run_error(&self.vcpu, error))?
             {
                 Aarch64Exit::Syscall { frame, resume_pc } => {
+                    if frame.x8 == 64
+                        && let Some(written) = self.try_fast_write(&frame)
+                    {
+                        self.complete_syscall(written as i64)?;
+                        continue;
+                    }
                     // The EL0 `svc` re-entered EL1 and hit the sentinel store. The
                     // hardware already set ELR_EL1 = (svc addr + 4); the EL1
                     // vector's own `eret` (after the sentinel store) consumes it —
