@@ -21,25 +21,35 @@ rationale = "The serial fixture isolates the exact four-syscall body of LTP inot
 
 [bindings]
 vm_free = "carrick-kernel-example::inotify_hotpath_contract"
+embed = "carrick-embed::contracts::inotify_hotpath_structural_contract"
 docker = "probe:perf_inotify09_scale"
 ecosystem = ["ltp:inotify09"]
 
 [bindings.unresolved]
-embed_structural = "The signed decomposition probe reports phase timing; a fail-closed work-meter parser is still required before it can supply structural evidence."
+embed_timing = "The decomposition probe emits 21-sample timing distributions; its signed-vs-Docker ratio parser is still required before timing evidence is accepted automatically."
 
 [[structural_budgets]]
 kind = "affine"
 metric = "kernel_dispatches"
 base = 6
 per_unit = 4
+layers = ["vm-free"]
 rationale = "Setup, FIONREAD, cleanup, and exit cost six dispatches; each iteration issues exactly add-watch, write, lseek, and remove-watch."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_dispatches"
+base = 34
+per_unit = 4
+layers = ["embed-structural"]
+rationale = "The signed container contributes 34 fixed loader, setup, cleanup, and exit dispatches; each measured iteration then issues exactly add-watch, write, lseek, and remove-watch."
 
 [[structural_budgets]]
 kind = "affine"
 metric = "host_backend_calls"
 base = 0
-per_unit = 2
-rationale = "Each iteration performs one vnode registration batch and one deregistration batch."
+per_unit = 0
+rationale = "The private rootfs is mutated only through the unified kernel graph, so watch lifecycle is dispatch-authoritative and performs no native vnode registration or deregistration. Bind mounts and externally mutable paths retain native watches under a separate capability."
 
 [[structural_budgets]]
 kind = "affine"

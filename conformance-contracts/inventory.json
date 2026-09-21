@@ -376,10 +376,12 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.inotify.mark-race-hotpath",
         "kernel.inotify.readiness",
         "kernel.inotify.watch"
       ],
       "claims": [
+        "kernel.inotify.mark-race-hotpath.linear-work",
         "kernel.inotify.readiness.depth-independent",
         "kernel.inotify.watch.host-registration-bound",
         "kernel.inotify.watch.write-completion"
@@ -393,9 +395,11 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.inotify.mark-race-hotpath",
         "kernel.inotify.watch"
       ],
       "claims": [
+        "kernel.inotify.mark-race-hotpath.linear-work",
         "kernel.inotify.watch.host-registration-bound",
         "kernel.inotify.watch.write-completion"
       ]
@@ -837,10 +841,12 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
-        "kernel.fs.write-seek"
+        "kernel.fs.write-seek",
+        "kernel.inotify.mark-race-hotpath"
       ],
       "claims": [
-        "kernel.fs.write-seek.no-offset-query"
+        "kernel.fs.write-seek.no-offset-query",
+        "kernel.inotify.mark-race-hotpath.linear-work"
       ]
     },
     {
@@ -868,11 +874,13 @@
       "authority": "host",
       "contracts": [
         "kernel.fs.write-seek",
+        "kernel.inotify.mark-race-hotpath",
         "kernel.inotify.watch",
         "kernel.scheduler.host-wait-handoff"
       ],
       "claims": [
         "kernel.fs.write-seek.no-offset-query",
+        "kernel.inotify.mark-race-hotpath.linear-work",
         "kernel.inotify.watch.host-registration-bound",
         "kernel.inotify.watch.write-completion",
         "kernel.scheduler.host-wait-handoff.zero-migration"

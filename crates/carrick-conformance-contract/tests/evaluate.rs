@@ -103,6 +103,7 @@ fn exact_budget_success_and_failure() {
             metric: WorkMetric::ContinuationEnrollments,
             value: 1,
         },
+        layers: vec![ExecutionLayer::VmFree, ExecutionLayer::EmbedStructural],
         rationale: Some("exact test".into()),
     }];
 
@@ -129,6 +130,7 @@ fn upper_bound_budget_failure() {
             metric: WorkMetric::FutexQueueVisits,
             maximum: 5,
         },
+        layers: vec![ExecutionLayer::VmFree, ExecutionLayer::EmbedStructural],
         rationale: Some("upper bound test".into()),
     }];
 
@@ -139,6 +141,35 @@ fn upper_bound_budget_failure() {
             metric: WorkMetric::FutexQueueVisits,
             actual: 6,
             maximum: 5,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn structural_budget_applies_only_to_named_layer() {
+    let mut contract = futex_contract();
+    contract.structural_budgets = vec![StructuralBudget {
+        budget: Budget::Exact {
+            metric: WorkMetric::ContinuationEnrollments,
+            value: 1,
+        },
+        layers: vec![ExecutionLayer::VmFree],
+        rationale: Some("VM-free fixture body only".into()),
+    }];
+
+    assert!(
+        evaluate(
+            &contract,
+            &[observation(ExecutionLayer::EmbedStructural, 8)]
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        evaluate(&contract, &[observation(ExecutionLayer::VmFree, 8)]),
+        Err(ContractFailure::WorkBudgetExceeded {
+            actual: 8,
+            maximum: 1,
             ..
         })
     ));

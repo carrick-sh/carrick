@@ -134,6 +134,9 @@ pub fn evaluate(
                 }
                 Some(work) => {
                     for sb in &contract.structural_budgets {
+                        if !sb.layers.contains(&obs.layer) {
+                            continue;
+                        }
                         match &sb.budget {
                             Budget::Exact { metric, value } => {
                                 let actual = work.get(*metric).ok_or_else(|| {

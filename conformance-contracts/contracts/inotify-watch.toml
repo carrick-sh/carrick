@@ -1,6 +1,6 @@
 schema_version = 1
 id = "kernel.inotify.watch"
-title = "Inotify watch scaling"
+title = "Private-rootfs inotify watch scaling"
 guest_surfaces = [
   "syscall:inotify_init1",
   "syscall:inotify_add_watch",
@@ -18,7 +18,7 @@ semantic_authority = [
 ]
 fixture = "probe:inotifymatrix"
 scale_points = [1, 8, 32, 128]
-rationale = "Inotify directory watch registration and removal must batch backend filter updates into a bounded number of host operations rather than issuing per-entry host calls."
+rationale = "The fixture watches Carrick's private rootfs, whose mutations are complete in the unified kernel graph. Registration and removal stay virtual there; externally mutable bind mounts retain native vnode watches."
 
 [bindings]
 vm_free = "carrick-kernel-example::inotify_watch_contract"
@@ -29,8 +29,8 @@ ecosystem = ["ltp:inotify09", "ltp:inotify11"]
 [[structural_budgets]]
 kind = "exact"
 metric = "host_backend_calls"
-value = 2
-rationale = "Directory watch registration and removal issue exactly one batched host call each (1 register_vnodes and 1 deregister_vnodes), regardless of directory entry count."
+value = 0
+rationale = "A private-rootfs watch performs no native registration or deregistration because every guest mutation is delivered by the fork-coherent dispatch registry."
 
 [runtime_ratio]
 maximum = 2.0

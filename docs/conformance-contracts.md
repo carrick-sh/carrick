@@ -77,6 +77,13 @@ Budgets have three forms:
 - Upper bound: `host_backend_calls <= 2`.
 - Affine scaling: `queue_visits(n) <= base + per_unit * n`.
 
+A structural budget may set `layers = ["vm-free"]` or
+`layers = ["embed-structural"]` when the evidence fixtures have different
+fixed scaffolding costs. Omitting `layers` enforces the budget in both
+structural layers. Layer-specific budgets must describe the same guest
+operation and may account only for measured fixture overhead; they must not be
+used to hide different per-operation slopes.
+
 Use at least three deterministic scale points for a scaling claim. Prefer a
 formula justified by the intended algorithm over a fixed ceiling that allows a
 small fixture to hide quadratic behavior.

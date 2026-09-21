@@ -180,6 +180,19 @@ fn validate_contract(contract: &ConformanceContract) -> Result<(), RegistryError
         }
     }
     for (index, budget) in contract.structural_budgets.iter().enumerate() {
+        if budget.layers.is_empty()
+            || budget.layers.iter().any(|layer| {
+                !matches!(
+                    layer,
+                    ExecutionLayer::VmFree | ExecutionLayer::EmbedStructural
+                )
+            })
+        {
+            return Err(RegistryError::InvalidBudgetLayers {
+                id: contract.id.clone(),
+                index,
+            });
+        }
         if budget
             .rationale
             .as_deref()
@@ -270,6 +283,8 @@ pub enum RegistryError {
     DuplicateClaim(ClaimId),
     #[error("contract {id} has no rationale for budget {index}")]
     MissingBudgetRationale { id: ContractId, index: usize },
+    #[error("contract {id} budget {index} must name at least one structural evidence layer")]
+    InvalidBudgetLayers { id: ContractId, index: usize },
     #[error("contract {id} scaling budget requires at least three scale points")]
     InsufficientScalePoints { id: ContractId },
     #[error("surface {surface} references unknown contract family {contract}")]
