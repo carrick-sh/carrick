@@ -2923,7 +2923,7 @@ impl<'a> FsView<'a> {
                                 }
                                 // The host write already changed bytes even if
                                 // subsequent sparse maintenance failed.
-                                this.notify_file_write_result(cx.kernel, modified_path.as_deref(), &out);
+                                this.notify_host_file_write_result(cx.kernel, &open_file, &out);
                                 punch_result?;
                             }
                             return Ok(out);

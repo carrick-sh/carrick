@@ -36,10 +36,30 @@ impl<'a> FsView<'a> {
         match open {
             OpenDescription::File { .. }
             | OpenDescription::InMemoryFile { .. }
-            | OpenDescription::HostFile { .. }
             | OpenDescription::SyntheticFile { .. } => open.open_path().map(str::to_owned),
             _ => None,
         }
+    }
+
+    /// Notify a host-file write while borrowing its stable open-description
+    /// path. The retained `OpenFile` keeps the description alive after the
+    /// host call, avoiding one heap clone per write on watched files.
+    pub(super) fn notify_host_file_write_result(
+        &self,
+        context: &crate::kernel::KernelContext,
+        open_file: &OpenFile,
+        outcome: &DispatchOutcome,
+    ) {
+        if self.fs.inotify_registry.is_empty() && self.fs.fanotify_registry.is_empty() {
+            return;
+        }
+        let Some(open) = open_file.description.read() else {
+            return;
+        };
+        let OpenDescription::HostFile { .. } = &*open else {
+            return;
+        };
+        self.notify_file_write_result(context, open.open_path(), outcome);
     }
 
     /// Failed and empty writes do not modify contents and must not consume an

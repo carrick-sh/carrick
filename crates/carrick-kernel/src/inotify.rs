@@ -981,6 +981,13 @@ impl InotifyState {
         if inner.overflowed {
             return;
         }
+        if inner
+            .pending
+            .back()
+            .is_some_and(|tail| encoded_event_matches(tail, wd, mask, cookie, name))
+        {
+            return;
+        }
         let record = encode_event_raw(wd, mask, cookie, name);
         // Pulse the backend multiplexer only when the queue transitions from empty
         // to non-empty (level readiness). Subsequent enqueues leave the backend
@@ -1056,6 +1063,34 @@ impl InotifyState {
             }
         }
         out
+    }
+}
+
+fn encoded_event_matches(
+    encoded: &[u8],
+    wd: i32,
+    mask: u32,
+    cookie: u32,
+    name: Option<&[u8]>,
+) -> bool {
+    let name_len = name.map(|name| align4(name.len() + 1)).unwrap_or(0);
+    if encoded.len() != INOTIFY_EVENT_HEADER_SIZE + name_len
+        || encoded.get(0..4) != Some(wd.to_le_bytes().as_slice())
+        || encoded.get(4..8) != Some(mask.to_le_bytes().as_slice())
+        || encoded.get(8..12) != Some(cookie.to_le_bytes().as_slice())
+        || encoded.get(12..16) != Some((name_len as u32).to_le_bytes().as_slice())
+    {
+        return false;
+    }
+    match name {
+        Some(name) => {
+            encoded.get(INOTIFY_EVENT_HEADER_SIZE..INOTIFY_EVENT_HEADER_SIZE + name.len())
+                == Some(name)
+                && encoded
+                    .get(INOTIFY_EVENT_HEADER_SIZE + name.len())
+                    .is_some_and(|nul| *nul == 0)
+        }
+        None => true,
     }
 }
 
