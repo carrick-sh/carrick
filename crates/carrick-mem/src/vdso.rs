@@ -46,19 +46,33 @@ pub const VVAR_OFF_MONOTONIC_OFF_NS: usize = 32;
 /// boot-stamped counter offset, so LTP clock_gettime04 — which reads each clock
 /// via BOTH paths and forbids backwards travel — saw REALTIME jitter backwards.
 ///
-/// The VMM's vvar stamper publishes the IDENTICAL value it writes at
-/// `VVAR_OFF_REALTIME_OFF_NS` (see [`set_realtime_off_ns`]); the dispatch layer
-/// reads it back via [`realtime_off_ns`]. `0` means "not yet calibrated" (a
-/// Unix-epoch nanosecond delta is never legitimately 0). A process-local atomic
-/// suffices: a forked guest child COW-inherits the parent's value, which stays
-/// valid because the guest counter epoch is continuous across the carrick fork.
+/// Every VMM vvar stamper uses the first published calibration, returned by
+/// [`set_realtime_off_ns`]; the dispatcher reads that same value through
+/// [`realtime_off_ns`]. Guest fork/exec shares one host carrier, so replacing
+/// this base would make existing vvar pages disagree with the syscall clock.
+/// `0` means "not yet calibrated" (a Unix-epoch nanosecond delta is never
+/// legitimately 0). Guest clock adjustments remain per-container deltas.
 static REALTIME_OFF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Publish the guest's CLOCK_REALTIME base offset (`unix_ns - uptime_ns`). Call
-/// from the vvar stamper with the SAME value written to `VVAR_OFF_REALTIME_OFF_NS`
-/// so the syscall path and the vDSO compute REALTIME identically.
-pub fn set_realtime_off_ns(off_ns: u64) {
-    REALTIME_OFF_NS.store(off_ns, std::sync::atomic::Ordering::Relaxed);
+/// Publish the initial CLOCK_REALTIME base, returning the canonical value that
+/// every vvar page must use. Later or concurrent calibrations cannot replace it.
+#[must_use]
+pub fn set_realtime_off_ns(off_ns: u64) -> u64 {
+    publish_realtime_off_ns(&REALTIME_OFF_NS, off_ns)
+}
+
+fn publish_realtime_off_ns(calibration: &std::sync::atomic::AtomicU64, off_ns: u64) -> u64 {
+    // This atomic word is the complete publication: no accompanying memory
+    // depends on it, so relaxed ordering suffices. Exactly one attempt, no loop.
+    match calibration.compare_exchange(
+        0,
+        off_ns,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    ) {
+        Ok(_) => off_ns,
+        Err(published) => published,
+    }
 }
 
 /// The published CLOCK_REALTIME base offset, or `None` if the vvar has not been
@@ -861,6 +875,25 @@ fn w64(b: &mut [u8], o: usize, v: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn realtime_calibration_is_shared_by_existing_and_new_address_spaces() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        for scale in [1, 8, 32, 128] {
+            let calibration = AtomicU64::new(0);
+            let original_vvar = publish_realtime_off_ns(&calibration, 1_000_000);
+            for exec in 0..scale {
+                // Exec calibrations can move either direction as the two host
+                // clock samples experience different scheduling delays.
+                let candidate = if exec % 2 == 0 { 999_000 } else { 1_001_000 };
+                let new_vvar = publish_realtime_off_ns(&calibration, candidate);
+                let syscall_base = calibration.load(Ordering::Relaxed);
+                assert_eq!(original_vvar, syscall_base, "scale={scale}, exec={exec}");
+                assert_eq!(new_vvar, syscall_base, "scale={scale}, exec={exec}");
+            }
+        }
+    }
 
     #[test]
     fn vdso_elf_parses_and_exports_clock_gettime() {

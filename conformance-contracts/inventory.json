@@ -1516,7 +1516,9 @@
       "support": "bring_up",
       "handler": "time",
       "authority": "hybrid",
-      "contracts": [],
+      "contracts": [
+        "kernel.time.realtime-calibration"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2244,7 +2246,9 @@
       "support": "bring_up",
       "handler": "time",
       "authority": "hybrid",
-      "contracts": [],
+      "contracts": [
+        "kernel.time.realtime-calibration"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2925,7 +2929,9 @@
       "support": "bring_up",
       "handler": "lifecycle",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.time.realtime-calibration"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"

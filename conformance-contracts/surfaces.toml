@@ -58,7 +58,15 @@ contracts = ["kernel.fork.filetable", "kernel.fork.mappings"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs"
-contracts = ["kernel.fork.mappings", "kernel.fork.stage1-image"]
+contracts = ["kernel.fork.mappings", "kernel.fork.stage1-image", "kernel.time.realtime-calibration"]
+
+[[surfaces]]
+path = "crates/carrick-mem/src/vdso.rs"
+contracts = ["kernel.time.realtime-calibration"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/realtime_calibration.rs"
+contracts = ["kernel.time.realtime-calibration"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/process_plan.rs"
@@ -216,4 +224,3 @@ contracts = [
   "kernel.scheduler.preemption-lifecycle",
   "kernel.scheduler.preemption-cost",
 ]
-
