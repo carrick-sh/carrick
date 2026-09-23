@@ -126,6 +126,70 @@ PRODUCT_SOURCE_PATHS = (
     "fixtures",
     "scripts",
 )
+
+
+def _workspace_path_dependency_roots(root: Path) -> tuple[str, ...]:
+    """Repo-relative roots of workspace path dependencies outside the base set.
+
+    Cargo, not a hand-kept list, decides which directories a workspace build
+    resolves. `carrick-runtime` gained a dev-dependency on
+    `experiments/native-syscall-slice`; the snapshot omitted it, so every
+    profile build failed before a census candidate existed. Reading the
+    dependency graph from `cargo metadata` closes that class of omission
+    rather than this one instance. Only `path` dependencies count, and a
+    path that escapes the repository is a fail-closed error.
+    """
+    completed = subprocess.run(
+        [
+            "cargo",
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--offline",
+            "--locked",
+            "--manifest-path",
+            str(root / "Cargo.toml"),
+        ],
+        cwd=str(CARGO_CWD),
+        env={"PATH": os.environ.get("PATH", os.defpath), "HOME": os.environ.get("HOME", "/")},
+        capture_output=True,
+        text=True,
+        check=False,
+        shell=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip()
+        raise InventoryError(f"cannot resolve workspace path dependencies: {detail}")
+    try:
+        metadata = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise InventoryError(f"invalid cargo metadata JSON: {error}") from error
+    resolved_root = root.resolve(strict=True)
+    extra: set[str] = set()
+    for package in metadata.get("packages", ()):
+        for dependency in package.get("dependencies", ()):
+            raw_path = dependency.get("path")
+            if not raw_path:
+                continue
+            dependency_path = Path(raw_path).resolve(strict=False)
+            try:
+                relative = dependency_path.relative_to(resolved_root)
+            except ValueError as error:
+                raise InventoryError(
+                    f"workspace path dependency escapes the repository: {raw_path}"
+                ) from error
+            if not relative.parts:
+                continue
+            if relative.parts[0] in PRODUCT_SOURCE_PATHS:
+                continue
+            extra.add(relative.as_posix())
+    return tuple(sorted(extra))
+
+
+def product_source_paths(root: Path) -> tuple[str, ...]:
+    """The base product paths plus every out-of-tree workspace path dependency."""
+    return (*PRODUCT_SOURCE_PATHS, *_workspace_path_dependency_roots(root))
 SOURCE_PROVENANCE_FIELDS = {
     "source_head",
     "source_git_tree",
@@ -2132,7 +2196,7 @@ def _git_tree_entries(root: Path, source_head: str) -> tuple[dict[str, str], ...
             "--full-tree",
             source_head,
             "--",
-            *PRODUCT_SOURCE_PATHS,
+            *product_source_paths(root),
         ],
         "snapshot path manifest",
     )
@@ -2336,7 +2400,7 @@ def product_source_snapshot(root: Path):
             "-z",
             "--untracked-files=no",
             "--",
-            *PRODUCT_SOURCE_PATHS,
+            *product_source_paths(root),
         ],
         "clean snapshot inputs",
     )
@@ -2358,7 +2422,7 @@ def product_source_snapshot(root: Path):
     manifest_paths = {entry["path"] for entry in entries}
     archive_paths = [
         path
-        for path in PRODUCT_SOURCE_PATHS
+        for path in product_source_paths(root)
         if path in manifest_paths
         or any(candidate.startswith(f"{path}/") for candidate in manifest_paths)
     ]
