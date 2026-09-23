@@ -13,7 +13,12 @@ mod tests {
         let header = ImageHeader::read_from_prefix(IMAGE).expect("valid ImageHeader in IMAGE");
         assert_eq!(header.magic, IMAGE_MAGIC);
         assert_eq!(header.version, IMAGE_VERSION);
-        assert_eq!(header.image_size, IMAGE.len() as u64);
-        assert!(header.entry_offset < header.image_size);
+        // `image_size` is the loaded memory footprint (`_image_end` includes
+        // `.bss`); `objcopy -O binary` omits the trailing zero-initialised
+        // `.bss`, so the flat file may be shorter. The loader places IMAGE at
+        // the start of a freshly zeroed region, which zero-fills the rest.
+        assert!(IMAGE.len() as u64 <= header.image_size);
+        assert!(header.image_size <= carrick_el1_abi::EL1_IMAGE_SIZE);
+        assert!(header.entry_offset < IMAGE.len() as u64);
     }
 }
