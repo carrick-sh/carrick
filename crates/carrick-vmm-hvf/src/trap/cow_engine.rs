@@ -5706,7 +5706,9 @@ pub(crate) fn fork_mapping_disposition(
     mapping: &ThreadMappingDesc,
     shares_mm: bool,
 ) -> ForkMappingDisposition {
-    if mapping.sharing.shares_across_fork() {
+    if mapping.start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE {
+        ForkMappingDisposition::SharedFrameWritable
+    } else if mapping.sharing.shares_across_fork() {
         ForkMappingDisposition::SharedFrameWritable
     } else if mapping.start == crate::memory::LINUX_PAGE_TABLES_BASE {
         ForkMappingDisposition::IndependentPageTables
