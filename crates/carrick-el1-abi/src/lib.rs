@@ -139,6 +139,9 @@ pub enum Action {
     Served = 0,
     /// Syscall was not handled at EL1; restore registers and fall through to host mailbox capture.
     Forward = 1,
+    /// Syscall was serviced at EL1, but return-to-user host work is pending; take the forward path
+    /// with the completed result in frame.x0 to deliver to the host without replaying the syscall.
+    ServedWithWork = 2,
 }
 
 /// Register trap frame saved by the exception vector before calling `carrick_el1_syscall`.
@@ -170,8 +173,10 @@ pub struct CurrentTask {
     pub file_table: AtomicU64,
     /// Per-vCPU fixup PC for EL1 user copies (0 = unarmed).
     pub fixup_pc: AtomicU64,
-    /// Reserved padding to 32 bytes for clean power-of-two indexing.
-    pub _reserved: u64,
+    /// Return-to-user work pending flag set by the host before kicks/signals/teardown.
+    pub pending_host_work: AtomicU32,
+    /// Flag indicating this syscall completed at EL1 with return value in x0/args[0].
+    pub served_with_work: AtomicU32,
 }
 
 impl CurrentTask {
@@ -180,7 +185,8 @@ impl CurrentTask {
             generation: AtomicU64::new(0),
             file_table: AtomicU64::new(0),
             fixup_pc: AtomicU64::new(0),
-            _reserved: 0,
+            pending_host_work: AtomicU32::new(0),
+            served_with_work: AtomicU32::new(0),
         }
     }
 
@@ -189,12 +195,29 @@ impl CurrentTask {
         self.file_table.store(0, Ordering::Release);
         self.generation.store(0, Ordering::Release);
         self.fixup_pc.store(0, Ordering::Relaxed);
+        self.pending_host_work.store(0, Ordering::Release);
+        self.served_with_work.store(0, Ordering::Release);
     }
 
     #[inline]
     pub fn set(&self, generation: u64, file_table: u64) {
         self.generation.store(generation, Ordering::Release);
         self.file_table.store(file_table, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn has_pending_host_work(&self) -> bool {
+        self.pending_host_work.load(Ordering::Acquire) != 0
+    }
+
+    #[inline]
+    pub fn mark_pending_host_work(&self) {
+        self.pending_host_work.store(1, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn clear_pending_host_work(&self) {
+        self.pending_host_work.store(0, Ordering::Release);
     }
 }
 
@@ -275,7 +298,7 @@ impl DelegatedFile {
     #[inline]
     pub fn try_lock(&self) -> bool {
         self.lock
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
     }
 
@@ -451,6 +474,81 @@ const _: () = assert!(EL1_OBJECT_TABLE_OFFSET + EL1_OBJECT_TABLE_SIZE <= EL1_FD_
 const _: () = assert!(EL1_FD_MAP_OFFSET + EL1_FD_MAP_SIZE <= EL1_CACHE_OFFSET);
 const _: () = assert!(EL1_CACHE_OFFSET + EL1_CACHE_SIZE <= EL1_REGION_SIZE);
 
+use core::sync::atomic::AtomicUsize;
+
+static EL1_REGION_HOST_PTR: AtomicUsize = AtomicUsize::new(0);
+
+/// Record the host virtual address of the mapped EL1 region.
+pub fn record_el1_region_host_ptr(ptr: usize) {
+    EL1_REGION_HOST_PTR.store(ptr, Ordering::Release);
+}
+
+/// Read the host virtual address of the mapped EL1 region.
+pub fn get_el1_region_host_ptr() -> usize {
+    EL1_REGION_HOST_PTR.load(Ordering::Acquire)
+}
+
+/// Mark return-to-user work pending for the vCPU at `slot`.
+pub fn mark_pending_host_work(slot: usize) {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
+        return;
+    }
+    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+    let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+    current_task.pending_host_work.store(1, Ordering::Release);
+}
+
+/// Clear return-to-user work for the vCPU at `slot`.
+pub fn clear_pending_host_work(slot: usize) {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
+        return;
+    }
+    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+    let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+    current_task.pending_host_work.store(0, Ordering::Release);
+}
+
+/// Mark return-to-user work pending for all vCPU slots.
+pub fn mark_pending_host_work_all() {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 {
+        return;
+    }
+    for slot in 0..EL1_STACK_SLOTS as usize {
+        let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+        let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+        current_task.pending_host_work.store(1, Ordering::Release);
+    }
+}
+
+/// Mark return-to-user work pending for any vCPU slot running the given task generation.
+pub fn mark_pending_host_work_for_task(generation: u64) {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 {
+        return;
+    }
+    for slot in 0..EL1_STACK_SLOTS as usize {
+        let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+        let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+        if current_task.generation.load(Ordering::Relaxed) == generation {
+            current_task.pending_host_work.store(1, Ordering::Release);
+        }
+    }
+}
+
+/// Check and atomically clear the `served_with_work` flag for an executor slot.
+pub fn take_served_with_work(slot: usize) -> bool {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
+        return false;
+    }
+    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+    let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+    current_task.served_with_work.swap(0, Ordering::AcqRel) != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,6 +599,8 @@ mod tests {
         assert_eq!(core::mem::offset_of!(CurrentTask, generation), 0);
         assert_eq!(core::mem::offset_of!(CurrentTask, file_table), 8);
         assert_eq!(core::mem::offset_of!(CurrentTask, fixup_pc), 16);
+        assert_eq!(core::mem::offset_of!(CurrentTask, pending_host_work), 24);
+        assert_eq!(core::mem::offset_of!(CurrentTask, served_with_work), 28);
     }
 
     #[test]
@@ -568,5 +668,33 @@ mod tests {
         let va2 = delegated_file_cache_va(2);
         assert_eq!(va1, EL1_CACHE_BASE);
         assert_eq!(va2, EL1_CACHE_BASE + DELEGATED_FILE_MAX_SIZE);
+    }
+
+    #[test]
+    fn test_pending_host_work_helpers() {
+        extern crate std;
+        let mut arena = std::vec![0u8; EL1_CURRENT_TASKS_OFFSET as usize + 256 * 32];
+        let ptr = arena.as_mut_ptr() as usize;
+        record_el1_region_host_ptr(ptr);
+        assert_eq!(get_el1_region_host_ptr(), ptr);
+
+        mark_pending_host_work(5);
+        let task_5 =
+            unsafe { &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 5 * 32) as *const CurrentTask) };
+        assert!(task_5.has_pending_host_work());
+
+        clear_pending_host_work(5);
+        assert!(!task_5.has_pending_host_work());
+
+        task_5.generation.store(42, Ordering::Relaxed);
+        mark_pending_host_work_for_task(42);
+        assert!(task_5.has_pending_host_work());
+
+        task_5.served_with_work.store(1, Ordering::Relaxed);
+        assert!(take_served_with_work(5));
+        assert!(!take_served_with_work(5)); // cleared after take
+
+        record_el1_region_host_ptr(0);
+        assert_eq!(get_el1_region_host_ptr(), 0);
     }
 }

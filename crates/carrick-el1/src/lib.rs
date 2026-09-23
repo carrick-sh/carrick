@@ -60,6 +60,20 @@ pub fn dispatch_syscall_with_regions<F>(
 where
     F: Fn(u32) -> *mut u8,
 {
+    let slot = frame.slot as usize;
+    let cur_task = current_tasks.get(slot);
+
+    // Entry check: if pending_host_work is set, forward immediately without serving.
+    if let Some(task) = cur_task
+        && task.has_pending_host_work()
+    {
+        let nr = frame.x[8] as usize;
+        if nr < 512 {
+            counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
+        }
+        return Action::Forward;
+    }
+
     let nr = frame.x[8] as usize;
     match nr {
         62 | 63 | 64 | 67 | 68 => {
@@ -74,6 +88,13 @@ where
                 frame.x[0] = res as u64;
                 if nr < 512 {
                     counters.served[nr].fetch_add(1, Ordering::Relaxed);
+                }
+                // Exit check: before returning to user, check pending_host_work.
+                if let Some(task) = cur_task
+                    && task.has_pending_host_work()
+                {
+                    task.served_with_work.store(1, Ordering::Release);
+                    return Action::ServedWithWork;
                 }
                 return Action::Served;
             }
@@ -238,7 +259,6 @@ mod tests {
             .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
 
         let mut frame = TrapFrame::default();
-        frame.slot = 0;
         frame.x[0] = 3; // fd
         frame.x[1] = 50; // offset
         frame.x[2] = 0; // SEEK_SET
@@ -257,5 +277,149 @@ mod tests {
         assert_eq!(frame.x[0], 50);
         assert_eq!(counters.served[62].load(Ordering::Relaxed), 1);
         assert_eq!(counters.forwarded[62].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_dispatch_syscall_with_regions_entry_pending_work() {
+        let counters = Counters::default();
+        let tasks = [CurrentTask::new()];
+        tasks[0].set(1, 100);
+        tasks[0].mark_pending_host_work(); // pending host work set at entry
+
+        let fd_map = [FdMapSlot::new()];
+        fd_map[0].set(100, 3, 1);
+
+        let object_table = [DelegatedFile::new()];
+        object_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        object_table[0].generation.store(1, Ordering::Relaxed);
+        object_table[0].size.store(100, Ordering::Relaxed);
+        object_table[0].offset.store(10, Ordering::Relaxed);
+
+        let mut frame = TrapFrame::default();
+        frame.x[0] = 3;
+        frame.x[1] = 50;
+        frame.x[2] = 0;
+        frame.x[8] = 62; // lseek
+
+        let action = dispatch_syscall_with_regions(
+            &mut frame,
+            &counters,
+            &tasks,
+            &fd_map,
+            &object_table,
+            |_| core::ptr::null_mut(),
+        );
+
+        // Entry check: must forward immediately without modifying file state
+        assert_eq!(action, Action::Forward);
+        assert_eq!(object_table[0].offset.load(Ordering::Relaxed), 10);
+        assert_eq!(counters.served[62].load(Ordering::Relaxed), 0);
+        assert_eq!(counters.forwarded[62].load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_dispatch_syscall_with_regions_exit_pending_work() {
+        let counters = Counters::default();
+        let tasks = [CurrentTask::new()];
+        tasks[0].set(1, 100);
+
+        let fd_map = [FdMapSlot::new()];
+        fd_map[0].set(100, 3, 1);
+
+        let object_table = [DelegatedFile::new()];
+        object_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        object_table[0].generation.store(1, Ordering::Relaxed);
+        object_table[0].size.store(100, Ordering::Relaxed);
+        object_table[0].offset.store(10, Ordering::Relaxed);
+        object_table[0]
+            .flags
+            .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
+
+        let mut frame = TrapFrame::default();
+        frame.x[0] = 3;
+        frame.x[1] = 50;
+        frame.x[2] = 0;
+        frame.x[8] = 62; // lseek
+
+        // Simulate host marking pending work while/right before syscall exit
+        tasks[0].mark_pending_host_work();
+
+        // Note: entry check would forward if pending_host_work is already set, so
+        // to test the exit check specifically, we test that when an operation completes
+        // and pending_host_work is set, ServedWithWork is returned:
+        let action = dispatch_syscall_with_regions(
+            &mut frame,
+            &counters,
+            &tasks,
+            &fd_map,
+            &object_table,
+            |_| core::ptr::null_mut(),
+        );
+        // At entry, pending_host_work is already set, so it forwards
+        assert_eq!(action, Action::Forward);
+
+        // Now test exit check: pending_host_work starts clear, then gets set during operation
+        tasks[0].clear_pending_host_work();
+        let mut frame2 = TrapFrame::default();
+        frame2.x[0] = 3;
+        frame2.x[1] = 50;
+        frame2.x[2] = 0;
+        frame2.x[8] = 62;
+
+        let action2 = dispatch_syscall_with_regions(
+            &mut frame2,
+            &counters,
+            &tasks,
+            &fd_map,
+            &object_table,
+            |_| {
+                // If this were a read/write cache lookup, host work could be marked here:
+                core::ptr::null_mut()
+            },
+        );
+        // Without work pending, it is served normally
+        assert_eq!(action2, Action::Served);
+        assert_eq!(frame2.x[0], 50);
+
+        // Exit check test: operation succeeds, but host marked pending work during the operation.
+        // We simulate this by having cache_lookup mark pending host work before try_serve completes.
+        tasks[0].clear_pending_host_work();
+        tasks[0].served_with_work.store(0, Ordering::Relaxed);
+        let mut buf = [0u8; 16];
+        let mut cache_mem = [0u8; 4096];
+        let cache_ptr = cache_mem.as_mut_ptr();
+        let task_ref = &tasks[0];
+        object_table[0]
+            .flags
+            .store(carrick_el1_abi::DELEGATED_FLAG_WRITABLE, Ordering::Relaxed);
+        object_table[0].offset.store(0, Ordering::Relaxed);
+
+        let mut frame_write = TrapFrame::default();
+        frame_write.x[0] = 3; // fd
+        frame_write.x[1] = buf.as_mut_ptr() as u64; // buf
+        frame_write.x[2] = 16; // count
+        frame_write.x[8] = 64; // SYS_write
+
+        let action_write = dispatch_syscall_with_regions(
+            &mut frame_write,
+            &counters,
+            &tasks,
+            &fd_map,
+            &object_table,
+            move |_| {
+                // Host marks pending work during write operation
+                task_ref.mark_pending_host_work();
+                cache_ptr
+            },
+        );
+
+        assert_eq!(action_write, Action::ServedWithWork);
+        assert_eq!(frame_write.x[0], 16);
+        assert_eq!(tasks[0].served_with_work.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.served[64].load(Ordering::Relaxed), 1);
     }
 }

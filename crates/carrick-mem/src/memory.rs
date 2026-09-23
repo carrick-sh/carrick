@@ -4584,8 +4584,42 @@ fn write_el1_vector_hook(bytes: &mut [u8], hook_offset: usize, mailbox_capture: 
 
     // ===== SERVED PATH (x0 == 0) =====
     emit(bytes, &mut cursor, 0x9100_03F0); // mov x16, sp (TrapFrame pointer)
-    // Restore SP_EL1 to mailbox pointer
     emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 272)); // ldr x17, [x16, #272] (slot)
+
+    // Check pending_host_work before eret
+    let tasks_base = carrick_el1_abi::EL1_CURRENT_TASKS_BASE;
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movz_xn(1, (tasks_base & 0xFFFF) as u16, 0),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(1, ((tasks_base >> 16) & 0xFFFF) as u16, 1),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(1, ((tasks_base >> 32) & 0xFFFF) as u16, 2),
+    );
+    emit(bytes, &mut cursor, 0x8B11_1421); // add x1, x1, x17, lsl #5 (CurrentTask[slot])
+    emit(bytes, &mut cursor, 0x9100_6021); // add x1, x1, #24 (&pending_host_work)
+    emit(bytes, &mut cursor, enc_ldar_wt_xn(2, 1)); // ldar w2, [x1]
+    let cbz_skip = cursor;
+    emit(bytes, &mut cursor, 0); // cbz w2, skip_label (placeholder)
+    emit(bytes, &mut cursor, 0x9100_1021); // add x1, x1, #4 (&served_with_work)
+    emit(bytes, &mut cursor, 0x889F_FC22); // stlr w2, [x1] (mark served_with_work = 1)
+    let branch_to_forward = cursor;
+    emit(bytes, &mut cursor, 0); // b forward_target (placeholder)
+    let skip_label = cursor;
+    put(
+        bytes,
+        cbz_skip,
+        enc_cbz_wn(2, cbz_skip as u64, skip_label as u64),
+    );
+
+    // Restore SP_EL1 to mailbox pointer
     emit(
         bytes,
         &mut cursor,
@@ -4620,12 +4654,17 @@ fn write_el1_vector_hook(bytes: &mut [u8], hook_offset: usize, mailbox_capture: 
     emit(bytes, &mut cursor, enc_ldr_xt_xn(16, 16, 128)); // x16
     emit(bytes, &mut cursor, 0xD69F_03E0); // eret
 
-    // ===== FORWARD PATH (x0 == 1) =====
+    // ===== FORWARD PATH (x0 != 0) =====
     let forward_target = cursor;
     put(
         bytes,
         forward_branch,
         enc_bne(forward_branch as u64, forward_target as u64),
+    );
+    put(
+        bytes,
+        branch_to_forward,
+        enc_b(branch_to_forward as u64, forward_target as u64),
     );
 
     emit(bytes, &mut cursor, 0x9100_03F0); // mov x16, sp (TrapFrame pointer)
