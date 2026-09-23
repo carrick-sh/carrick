@@ -1850,6 +1850,17 @@
       "rationale": "Physical stage-2 mapping or unmapping transition already completed in the hypervisor while typed receipt construction failed, leaving the physical boundary unpublishable and unverifiable.",
       "sink": "fatal",
       "domain": "hvpatch::frame_inventory"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfInner::run_to_exit",
+      "ordinal_in_function": 1,
+      "fingerprint": "e78a5e02814b97bedbb9adf1549c450210007741d523c8ae46696a1765777652",
+      "verdict": "carrier_fault",
+      "failure_domain": "trap::run_to_exit",
+      "rationale": "vCPU exceeded 1000 consecutive EL1 resumes without making forward progress to user mode or host boundary, indicating EL1 loop deadlock or infinite trap recursion.",
+      "sink": "fatal",
+      "domain": "trap::run_to_exit"
     }
   ]
 }

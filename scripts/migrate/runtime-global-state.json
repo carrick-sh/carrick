@@ -323,6 +323,110 @@
     },
     {
       "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "symbol": "tests::native_data_activation_cost_contract::CARRICK_NATIVE_SCOPE_REVISION",
+      "fingerprint": "37f7985a81952af5d5ab1c66677521aadfc38b67dc31557ac98ebac928c8c427",
+      "classification": "test_only",
+      "rationale": "Test-only source-identity stamp for the native-scope cost contract receipt; read once inside the test and never by product code."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
+      "symbol": "carrier_buffer_elf_control::CARRICK_NATIVE_BUFFER_ELF",
+      "fingerprint": "5ddec15dd05e932a25d00d2415c66a45f67c1f0d5414710dcddf1c9344b3ca4f",
+      "classification": "test_only",
+      "rationale": "Test-only fixture control CARRICK_NATIVE_BUFFER_ELF for the carrier-buffer ELF control test; selects fixture inputs for that test and is never read by product code."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
+      "symbol": "carrier_buffer_elf_control::CARRICK_NATIVE_BUFFER_READ_CACHE",
+      "fingerprint": "f1868bfb0c0220b778a3ab0ff4acea372b904550112750ef91a8e5ac336621bd",
+      "classification": "test_only",
+      "rationale": "Test-only fixture control CARRICK_NATIVE_BUFFER_READ_CACHE for the carrier-buffer ELF control test; selects fixture inputs for that test and is never read by product code."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
+      "symbol": "carrier_buffer_elf_control::CARRICK_NATIVE_BUFFER_RESULT",
+      "fingerprint": "cb6bda754f6388215644187d3760438caf3f133bdc8e08b89442f93c0bc29717",
+      "classification": "test_only",
+      "rationale": "Test-only fixture control CARRICK_NATIVE_BUFFER_RESULT for the carrier-buffer ELF control test; selects fixture inputs for that test and is never read by product code."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
+      "symbol": "carrier_buffer_elf_control::CARRICK_NATIVE_CODE_LAYOUT",
+      "fingerprint": "3b74a5f8ac3f5a80473dcae0ae96431c94bfa3efd57ca46809df82f9b5dd8127",
+      "classification": "test_only",
+      "rationale": "Test-only fixture control CARRICK_NATIVE_CODE_LAYOUT for the carrier-buffer ELF control test; selects fixture inputs for that test and is never read by product code."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
+      "symbol": "carrier_buffer_elf_control::CARRICK_NATIVE_DATA_DEMAND",
+      "fingerprint": "32162174c8cac60a2efb8d1ee932d5759403187f882aeb5b0427167c2e74abf4",
+      "classification": "test_only",
+      "rationale": "Test-only fixture control CARRICK_NATIVE_DATA_DEMAND for the carrier-buffer ELF control test; selects fixture inputs for that test and is never read by product code."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
+      "symbol": "current_buffer_invalid_fd_cost_contract::CARRICK_NATIVE_BUFFER_OBSERVATIONS",
+      "fingerprint": "4c5967be3e14d4d37d6789f42568f6d9e0a3b2c0cf0417d46ac4e854fd540fb6",
+      "classification": "test_only",
+      "rationale": "Test-only observation sink CARRICK_NATIVE_BUFFER_OBSERVATIONS: the cost contract appends its measured counts there for the receipt; read only inside that test."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
+      "symbol": "current_buffer_invalid_fd_cost_contract::CARRICK_NATIVE_SCOPE_REVISION",
+      "fingerprint": "58c18bf95e1b7778e722578d9a97a7be12e2e941a98c44f0566bc16f869d6f88",
+      "classification": "test_only",
+      "rationale": "Test-only source-identity stamp for the native-scope cost contract receipt; read once inside the test and never by product code."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
+      "symbol": "current_read_reuse_cost_contract::CARRICK_CURRENT_READ_OBSERVATIONS",
+      "fingerprint": "3d0ea2215d84cbab2f2b58fe93e121257349a0dee5a5d3bf49e92239f874ad37",
+      "classification": "test_only",
+      "rationale": "Test-only observation sink CARRICK_CURRENT_READ_OBSERVATIONS: the cost contract appends its measured counts there for the receipt; read only inside that test."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
+      "symbol": "current_read_reuse_cost_contract::CARRICK_NATIVE_SCOPE_REVISION",
+      "fingerprint": "58c18bf95e1b7778e722578d9a97a7be12e2e941a98c44f0566bc16f869d6f88",
+      "classification": "test_only",
+      "rationale": "Test-only source-identity stamp for the native-scope cost contract receipt; read once inside the test and never by product code."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs",
+      "symbol": "native_code_density_contract::CARRICK_NATIVE_SCOPE_REVISION",
+      "fingerprint": "094da56b92c5efc56a1c2f5a62a69b4426b76308ded816e3bd6e47b17b747c70",
+      "classification": "test_only",
+      "rationale": "Test-only source-identity stamp for the native-scope cost contract receipt; read once inside the test and never by product code."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs",
+      "symbol": "native_data_demand_contract::CARRICK_NATIVE_DATA_DEMAND_OBSERVATIONS",
+      "fingerprint": "808d9f21975a3cb82e883cd7d827233c17ba521571a71896a3e9f7369641c6b0",
+      "classification": "test_only",
+      "rationale": "Test-only observation sink CARRICK_NATIVE_DATA_DEMAND_OBSERVATIONS: the cost contract appends its measured counts there for the receipt; read only inside that test."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs",
+      "symbol": "native_data_demand_contract::CARRICK_NATIVE_SCOPE_REVISION",
+      "fingerprint": "094da56b92c5efc56a1c2f5a62a69b4426b76308ded816e3bd6e47b17b747c70",
+      "classification": "test_only",
+      "rationale": "Test-only source-identity stamp for the native-scope cost contract receipt; read once inside the test and never by product code."
+    },
+    {
+      "kind": "env_var",
       "file": "crates/carrick-runtime/src/vcpu_loop/outcome.rs",
       "symbol": "abort::CARRICK_RUN_ID",
       "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
@@ -635,6 +739,14 @@
     },
     {
       "kind": "env_var_os",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "delegate::CARRICK_EL1",
+      "fingerprint": "579801ddcfcc6665984c1e49d675aad4d9096e8ef461f019f0de8ac034b5da76",
+      "classification": "config_debug",
+      "rationale": "Operator environment override to disable in-guest EL1 regular file delegation."
+    },
+    {
+      "kind": "env_var_os",
       "file": "crates/carrick-kernel/src/exec_stamps.rs",
       "symbol": "stamp_record::CARRICK_EXEC_STAMPS",
       "fingerprint": "857b733af0acdc35b398e51cf338091b3948d948728d2bcecabe8ce4ac86a6c1",
@@ -688,6 +800,14 @@
       "fingerprint": "74a10faac7acd44b2a482888e2c4ab78e4f4976ecc57aa0f8be30f5d095f97f0",
       "classification": "config_debug",
       "rationale": "Environment variable DISABLE_ENV read in install::DISABLE_ENV (crates/carrick-runtime/src/kernel/debug/server.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-kernel/src/kernel/guest_execution.rs",
+      "symbol": "tests::duplicate_admission_preserves_live_pause_endpoint::CARRICK_ADMISSION_RECEIPT_DIR",
+      "fingerprint": "aa41d8c77a73c3f559a81a08b4e432cc8472d02d1031d38d457e6af1f2a5d1e5",
+      "classification": "test_only",
+      "rationale": "Test-only output directory CARRICK_ADMISSION_RECEIPT_DIR: when set, the test writes its receipt there; it never influences guest or carrier behaviour."
     },
     {
       "kind": "env_var_os",
@@ -872,6 +992,14 @@
       "fingerprint": "aff99ea176e234e486ad57820720ef9f768be471aa94e729627b0f8b49a0cd9d",
       "classification": "test_only",
       "rationale": "Test-only child sentinel owned by the pending-exec regression's self-spawn; it selects the isolated child half because the tested abort is process-global, prevents recursive spawning, and is absent from production builds."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "symbol": "tests::native_carrier_elf_memory_control_round_trip::CARRICK_NATIVE_SCOPE_RECEIPT_DIR",
+      "fingerprint": "e13a662ed63255904a3cc1bc232804da59a77373fc9a1b0fcbb0cf3ad40328b9",
+      "classification": "test_only",
+      "rationale": "Test-only output directory CARRICK_NATIVE_SCOPE_RECEIPT_DIR: when set, the test writes its receipt there; it never influences guest or carrier behaviour."
     },
     {
       "kind": "env_var_os",
@@ -1395,6 +1523,30 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "ALLOCATED_HANDLES",
+      "fingerprint": "7a81dbddfe836aaa3157b9b85c8e1bb33b960cfb01969d131cdc050a741177fc",
+      "classification": "carrier_infra",
+      "rationale": "Allocation bitmap tracking assigned in-guest EL1 file delegation handles."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "DELEGATED_DESCRIPTIONS",
+      "fingerprint": "0fe669e6e836183b91c3bad0b2d805ca0297e6b999a7f58e0013770198de8d58",
+      "classification": "carrier_infra",
+      "rationale": "Weak table of delegated file descriptions used to recall files when watched by inotify or fanotify."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "tests::TEST_LOCK",
+      "fingerprint": "b45f2e0792f4c7c840555bdf52882bf567b1f7f35998d77b3e2084e080d8479d",
+      "classification": "test_only",
+      "rationale": "Test-only mutex serializing unit tests for EL1 file delegation."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-kernel/src/event_ring.rs",
       "symbol": "IDX",
       "fingerprint": "e0fd7642873c3b616f1a67936622eb4441990ca5cd85d8e6b7f513432bc88994",
@@ -1872,6 +2024,14 @@
       "fingerprint": "45bc010bdbb41963d263ca602e8a97759c89d7012ee1f19bbb6056b47b1b1735",
       "classification": "monotonic_allocator",
       "rationale": "Carrier-wide monotonic allocator issue_hvpatch_child_token::NEXT_AUTHORITY_ID in crates/carrick-runtime/src/vcpu_loop/memory.rs generating unique IDs across the host process."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "symbol": "tests::activation_allocator::ALLOCATOR",
+      "fingerprint": "3ad9424fd7b96ede9a57db73ad3c295e1cbc3930b0828b52bfd130e26278a618",
+      "classification": "test_only",
+      "rationale": "Test-only counting allocator state ALLOCATOR used to assert an allocation budget inside one test module; compiled under cfg(test) only."
     },
     {
       "kind": "static",
@@ -2451,6 +2611,14 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests/syscall_writes.rs",
+      "symbol": "allocations::ALLOCATOR",
+      "fingerprint": "b202b60af1c1b1e4952dc61be4ef0764e60c61cfd63b8f84b4a0a1bc6ef692a0",
+      "classification": "test_only",
+      "rationale": "Test-only counting allocator state ALLOCATOR used to assert an allocation budget inside one test module; compiled under cfg(test) only."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
       "symbol": "private_backing_identity::NEXT",
       "fingerprint": "a9778af5ccd1c6630d44c1e80c649fc3ac982ad5cc21d72bb30a021510749473",
@@ -2576,6 +2744,14 @@
       "fingerprint": "74269fd071612aacbfa59305659478ad55c83dcf4d13580c553606ce1913b8f4",
       "classification": "carrier_infra",
       "rationale": "Process-global atomic pointer to the active carrier's EL1 kernel counters region in host virtual memory, allowing host verification and observability of in-guest EL1 dispatch counters."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
+      "symbol": "EL1_REGION_HOST_PTR",
+      "fingerprint": "95b66e8ea7ea27b8a42c2040c289e999e6e4e1c5c80c6ff93fffa30de9b05ea5",
+      "classification": "carrier_infra",
+      "rationale": "Process-global atomic pointer to the active carrier's EL1 kernel aperture in host virtual memory."
     },
     {
       "kind": "static",
@@ -2747,6 +2923,14 @@
     },
     {
       "kind": "thread_local",
+      "file": "crates/carrick-kernel/src/kernel/mm_access.rs",
+      "symbol": "copy_work_for_test::SNAPSHOTS",
+      "fingerprint": "f3721f5321ba64009c79f403bd08c99691abbdb93dd1c24bfdde3856263eb7b9",
+      "classification": "config_debug",
+      "rationale": "Feature-gated (`conformance-metrics`) structural instrument counting current-copy work inside a contract window; it changes instrumentation only and cannot select or overwrite container-owned state."
+    },
+    {
+      "kind": "thread_local",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
       "symbol": "SYSTEM_CHARGE_WINDOW",
       "fingerprint": "761f744a623027ad2ff9fefe442521860f8fcfae43bd03d5dd2c8dbd9b920fee",
@@ -2784,6 +2968,14 @@
       "fingerprint": "010de993528a592dd7082d6906e8eb3e2163d1bdc15fd4e309d33551793cd1c0",
       "classification": "config_debug",
       "rationale": "Process diagnostic or tuning configuration; it changes instrumentation only and cannot select or overwrite container-owned state."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "symbol": "tests::activation_allocator::ALLOCATIONS",
+      "fingerprint": "480d1f5fd037a29e0b2ad0a60678eb0c97a67e97f9c300f2a09bdcd6cfc71a51",
+      "classification": "test_only",
+      "rationale": "Test-only counting allocator state ALLOCATIONS used to assert an allocation budget inside one test module; compiled under cfg(test) only."
     },
     {
       "kind": "thread_local",
@@ -2883,6 +3075,14 @@
     },
     {
       "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests/syscall_writes.rs",
+      "symbol": "allocations::COUNT",
+      "fingerprint": "b6e6d33a5983cad3f78f07ce45ed3e9c52c6fd2c93f07ce1c15a8a734ae85796",
+      "classification": "test_only",
+      "rationale": "Test-only counting allocator state COUNT used to assert an allocation budget inside one test module; compiled under cfg(test) only."
+    },
+    {
+      "kind": "thread_local",
       "file": "crates/carrick-vmm-hvf/src/trap/memory_protection.rs",
       "symbol": "ALIAS_ROWS_MOVED",
       "fingerprint": "8ae7f3ad5c12a753b3b3b403f1e3f87169a7e25d685eb5000a247823a0726955",
@@ -2896,166 +3096,6 @@
       "fingerprint": "f4a8dd5e57f884559783cd3de35e10deac5ea59dfd6c204ad6ecdf6f75b88658",
       "classification": "test_only",
       "rationale": "Test-only thread-local cell STAGE2_AUDIT_STATE in crates/carrick-vmm-hvf/src/trap.rs enabling hypervisor stage-2 audit and failure injection in unit tests."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "symbol": "tests::native_data_activation_cost_contract::CARRICK_NATIVE_SCOPE_REVISION",
-      "fingerprint": "37f7985a81952af5d5ab1c66677521aadfc38b67dc31557ac98ebac928c8c427",
-      "classification": "test_only",
-      "rationale": "Test-only source-identity stamp for the native-scope cost contract receipt; read once inside the test and never by product code."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
-      "symbol": "carrier_buffer_elf_control::CARRICK_NATIVE_BUFFER_ELF",
-      "fingerprint": "5ddec15dd05e932a25d00d2415c66a45f67c1f0d5414710dcddf1c9344b3ca4f",
-      "classification": "test_only",
-      "rationale": "Test-only fixture control CARRICK_NATIVE_BUFFER_ELF for the carrier-buffer ELF control test; selects fixture inputs for that test and is never read by product code."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
-      "symbol": "carrier_buffer_elf_control::CARRICK_NATIVE_BUFFER_READ_CACHE",
-      "fingerprint": "f1868bfb0c0220b778a3ab0ff4acea372b904550112750ef91a8e5ac336621bd",
-      "classification": "test_only",
-      "rationale": "Test-only fixture control CARRICK_NATIVE_BUFFER_READ_CACHE for the carrier-buffer ELF control test; selects fixture inputs for that test and is never read by product code."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
-      "symbol": "carrier_buffer_elf_control::CARRICK_NATIVE_BUFFER_RESULT",
-      "fingerprint": "cb6bda754f6388215644187d3760438caf3f133bdc8e08b89442f93c0bc29717",
-      "classification": "test_only",
-      "rationale": "Test-only fixture control CARRICK_NATIVE_BUFFER_RESULT for the carrier-buffer ELF control test; selects fixture inputs for that test and is never read by product code."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
-      "symbol": "carrier_buffer_elf_control::CARRICK_NATIVE_CODE_LAYOUT",
-      "fingerprint": "3b74a5f8ac3f5a80473dcae0ae96431c94bfa3efd57ca46809df82f9b5dd8127",
-      "classification": "test_only",
-      "rationale": "Test-only fixture control CARRICK_NATIVE_CODE_LAYOUT for the carrier-buffer ELF control test; selects fixture inputs for that test and is never read by product code."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
-      "symbol": "carrier_buffer_elf_control::CARRICK_NATIVE_DATA_DEMAND",
-      "fingerprint": "32162174c8cac60a2efb8d1ee932d5759403187f882aeb5b0427167c2e74abf4",
-      "classification": "test_only",
-      "rationale": "Test-only fixture control CARRICK_NATIVE_DATA_DEMAND for the carrier-buffer ELF control test; selects fixture inputs for that test and is never read by product code."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
-      "symbol": "current_buffer_invalid_fd_cost_contract::CARRICK_NATIVE_BUFFER_OBSERVATIONS",
-      "fingerprint": "4c5967be3e14d4d37d6789f42568f6d9e0a3b2c0cf0417d46ac4e854fd540fb6",
-      "classification": "test_only",
-      "rationale": "Test-only observation sink CARRICK_NATIVE_BUFFER_OBSERVATIONS: the cost contract appends its measured counts there for the receipt; read only inside that test."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
-      "symbol": "current_buffer_invalid_fd_cost_contract::CARRICK_NATIVE_SCOPE_REVISION",
-      "fingerprint": "58c18bf95e1b7778e722578d9a97a7be12e2e941a98c44f0566bc16f869d6f88",
-      "classification": "test_only",
-      "rationale": "Test-only source-identity stamp for the native-scope cost contract receipt; read once inside the test and never by product code."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
-      "symbol": "current_read_reuse_cost_contract::CARRICK_CURRENT_READ_OBSERVATIONS",
-      "fingerprint": "3d0ea2215d84cbab2f2b58fe93e121257349a0dee5a5d3bf49e92239f874ad37",
-      "classification": "test_only",
-      "rationale": "Test-only observation sink CARRICK_CURRENT_READ_OBSERVATIONS: the cost contract appends its measured counts there for the receipt; read only inside that test."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
-      "symbol": "current_read_reuse_cost_contract::CARRICK_NATIVE_SCOPE_REVISION",
-      "fingerprint": "58c18bf95e1b7778e722578d9a97a7be12e2e941a98c44f0566bc16f869d6f88",
-      "classification": "test_only",
-      "rationale": "Test-only source-identity stamp for the native-scope cost contract receipt; read once inside the test and never by product code."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs",
-      "symbol": "native_code_density_contract::CARRICK_NATIVE_SCOPE_REVISION",
-      "fingerprint": "094da56b92c5efc56a1c2f5a62a69b4426b76308ded816e3bd6e47b17b747c70",
-      "classification": "test_only",
-      "rationale": "Test-only source-identity stamp for the native-scope cost contract receipt; read once inside the test and never by product code."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs",
-      "symbol": "native_data_demand_contract::CARRICK_NATIVE_DATA_DEMAND_OBSERVATIONS",
-      "fingerprint": "808d9f21975a3cb82e883cd7d827233c17ba521571a71896a3e9f7369641c6b0",
-      "classification": "test_only",
-      "rationale": "Test-only observation sink CARRICK_NATIVE_DATA_DEMAND_OBSERVATIONS: the cost contract appends its measured counts there for the receipt; read only inside that test."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs",
-      "symbol": "native_data_demand_contract::CARRICK_NATIVE_SCOPE_REVISION",
-      "fingerprint": "094da56b92c5efc56a1c2f5a62a69b4426b76308ded816e3bd6e47b17b747c70",
-      "classification": "test_only",
-      "rationale": "Test-only source-identity stamp for the native-scope cost contract receipt; read once inside the test and never by product code."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-kernel/src/kernel/guest_execution.rs",
-      "symbol": "tests::duplicate_admission_preserves_live_pause_endpoint::CARRICK_ADMISSION_RECEIPT_DIR",
-      "fingerprint": "aa41d8c77a73c3f559a81a08b4e432cc8472d02d1031d38d457e6af1f2a5d1e5",
-      "classification": "test_only",
-      "rationale": "Test-only output directory CARRICK_ADMISSION_RECEIPT_DIR: when set, the test writes its receipt there; it never influences guest or carrier behaviour."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "symbol": "tests::native_carrier_elf_memory_control_round_trip::CARRICK_NATIVE_SCOPE_RECEIPT_DIR",
-      "fingerprint": "e13a662ed63255904a3cc1bc232804da59a77373fc9a1b0fcbb0cf3ad40328b9",
-      "classification": "test_only",
-      "rationale": "Test-only output directory CARRICK_NATIVE_SCOPE_RECEIPT_DIR: when set, the test writes its receipt there; it never influences guest or carrier behaviour."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "symbol": "tests::activation_allocator::ALLOCATOR",
-      "fingerprint": "3ad9424fd7b96ede9a57db73ad3c295e1cbc3930b0828b52bfd130e26278a618",
-      "classification": "test_only",
-      "rationale": "Test-only counting allocator state ALLOCATOR used to assert an allocation budget inside one test module; compiled under cfg(test) only."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests/syscall_writes.rs",
-      "symbol": "allocations::ALLOCATOR",
-      "fingerprint": "b202b60af1c1b1e4952dc61be4ef0764e60c61cfd63b8f84b4a0a1bc6ef692a0",
-      "classification": "test_only",
-      "rationale": "Test-only counting allocator state ALLOCATOR used to assert an allocation budget inside one test module; compiled under cfg(test) only."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-kernel/src/kernel/mm_access.rs",
-      "symbol": "copy_work_for_test::SNAPSHOTS",
-      "fingerprint": "f3721f5321ba64009c79f403bd08c99691abbdb93dd1c24bfdde3856263eb7b9",
-      "classification": "config_debug",
-      "rationale": "Feature-gated (`conformance-metrics`) structural instrument counting current-copy work inside a contract window; it changes instrumentation only and cannot select or overwrite container-owned state."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "symbol": "tests::activation_allocator::ALLOCATIONS",
-      "fingerprint": "480d1f5fd037a29e0b2ad0a60678eb0c97a67e97f9c300f2a09bdcd6cfc71a51",
-      "classification": "test_only",
-      "rationale": "Test-only counting allocator state ALLOCATIONS used to assert an allocation budget inside one test module; compiled under cfg(test) only."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests/syscall_writes.rs",
-      "symbol": "allocations::COUNT",
-      "fingerprint": "b6e6d33a5983cad3f78f07ce45ed3e9c52c6fd2c93f07ce1c15a8a734ae85796",
-      "classification": "test_only",
-      "rationale": "Test-only counting allocator state COUNT used to assert an allocation budget inside one test module; compiled under cfg(test) only."
     }
   ]
 }

@@ -285,6 +285,7 @@ impl<'a> FsView<'a> {
                 this.fs
                     .inotify_registry
                     .register(&path, &state, wd, effective);
+                crate::el1_delegation::recall_all_watched(this.fs);
                 return Ok(DispatchOutcome::returned_i32(wd));
             }
             // Try the per-instance backend first (kqueue host-vnode watch on
@@ -368,6 +369,7 @@ impl<'a> FsView<'a> {
                     .inotify_registry
                     .register(&path, &state, wd, mask);
             }
+            crate::el1_delegation::recall_all_watched(this.fs);
             Ok(DispatchOutcome::returned_i32(wd))
         }
 
@@ -563,6 +565,7 @@ impl<'a> FsView<'a> {
                 this.fs
                     .fanotify_registry
                     .add_mark(&resolved, mark_type, &group, events, ignored);
+                crate::el1_delegation::recall_all_watched(this.fs);
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             // REMOVE from an object this group never marked is ENOENT.

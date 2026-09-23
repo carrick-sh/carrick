@@ -5,7 +5,7 @@
 //! the description or its authority.
 
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 use carrick_abi::*;
 use carrick_el1_abi::*;
@@ -16,21 +16,15 @@ use crate::dispatch::fs::FsState;
 use crate::kernel::objects::FileDescription;
 use crate::kernel::{FileTableId, RlimitSet};
 
-static EL1_REGION_HOST_PTR: AtomicUsize = AtomicUsize::new(0);
-
-/// Record the host virtual address of the shared 64 MiB EL1 kernel aperture.
-pub fn record_el1_region_host_ptr(ptr: usize) {
-    EL1_REGION_HOST_PTR.store(ptr, Ordering::Release);
-}
+pub use carrick_el1_abi::{
+    clear_pending_host_work, get_el1_region_host_ptr, mark_pending_host_work,
+    mark_pending_host_work_all, mark_pending_host_work_for_task, record_el1_region_host_ptr,
+    take_served_with_work,
+};
 
 /// Clear the recorded host virtual address of the EL1 kernel aperture.
 pub fn clear_el1_region_host_ptr() {
-    EL1_REGION_HOST_PTR.store(0, Ordering::Release);
-}
-
-/// Retrieve the host virtual address of the EL1 kernel aperture, or 0 if not mapped.
-pub fn get_el1_region_host_ptr() -> usize {
-    EL1_REGION_HOST_PTR.load(Ordering::Acquire)
+    carrick_el1_abi::record_el1_region_host_ptr(0);
 }
 
 /// Publish the current task binding for an executor vCPU mailbox slot into the EL1 aperture.
@@ -41,6 +35,8 @@ pub fn publish_current_task(slot: usize, generation: u64, file_table: u64) {
     }
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+    current_task.pending_host_work.store(0, Ordering::Relaxed);
+    current_task.served_with_work.store(0, Ordering::Relaxed);
     current_task.file_table.store(file_table, Ordering::Relaxed);
     current_task.generation.store(generation, Ordering::Release);
 }
@@ -53,18 +49,26 @@ pub fn clear_current_task(slot: usize) {
     }
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+    current_task.pending_host_work.store(0, Ordering::Relaxed);
+    current_task.served_with_work.store(0, Ordering::Relaxed);
     current_task.file_table.store(0, Ordering::Relaxed);
     current_task.generation.store(0, Ordering::Release);
 }
 
+use std::sync::{Arc, Weak};
+
 static ALLOCATED_HANDLES: Mutex<[bool; MAX_DELEGATED_FILES]> =
     Mutex::new([false; MAX_DELEGATED_FILES]);
+static DELEGATED_DESCRIPTIONS: Mutex<[Option<Weak<FileDescription>>; MAX_DELEGATED_FILES]> =
+    Mutex::new([const { None }; MAX_DELEGATED_FILES]);
 
-fn allocate_handle() -> Option<u32> {
+fn allocate_handle(description: &Arc<FileDescription>) -> Option<u32> {
     let mut handles = ALLOCATED_HANDLES.lock();
     for (i, in_use) in handles.iter_mut().enumerate() {
         if !*in_use {
             *in_use = true;
+            let mut descs = DELEGATED_DESCRIPTIONS.lock();
+            descs[i] = Some(Arc::downgrade(description));
             return Some((i + 1) as u32);
         }
     }
@@ -75,6 +79,43 @@ fn free_handle(handle: u32) {
     if handle >= 1 && (handle as usize) <= MAX_DELEGATED_FILES {
         let mut handles = ALLOCATED_HANDLES.lock();
         handles[handle as usize - 1] = false;
+        let mut descs = DELEGATED_DESCRIPTIONS.lock();
+        descs[handle as usize - 1] = None;
+    }
+}
+
+/// Recall all currently delegated files whose paths are covered by inotify watches or if fanotify is active.
+pub(crate) fn recall_all_watched(fs: &FsState) {
+    if fs.inotify_registry.is_empty() && fs.fanotify_registry.is_empty() {
+        return;
+    }
+    let candidates: Vec<Arc<FileDescription>> = {
+        let descs = DELEGATED_DESCRIPTIONS.lock();
+        descs.iter().filter_map(|w| w.as_ref()?.upgrade()).collect()
+    };
+    for desc in candidates {
+        if desc.delegation_handle() == 0 {
+            continue;
+        }
+        let Some(d) = desc.open_description() else {
+            continue;
+        };
+        let should_recall = {
+            let guard = d.read();
+            let path = match &*guard {
+                OpenDescription::HostFile { metadata, .. } => metadata.path.to_str(),
+                OpenDescription::File { path, .. } => Some(path.as_str()),
+                _ => None,
+            };
+            if let Some(p) = path {
+                !fs.fanotify_registry.is_empty() || fs.inotify_registry.has_watches_covering(p)
+            } else {
+                false
+            }
+        };
+        if should_recall {
+            recall(&desc);
+        }
     }
 }
 
@@ -120,7 +161,7 @@ pub(crate) fn delegate(
     fs: &FsState,
     rlimits: Option<&RlimitSet>,
 ) -> Result<u32, NotEligible> {
-    if std::env::var_os("CARRICK_EL1").map_or(false, |val| val == "0") {
+    if std::env::var_os("CARRICK_EL1").is_some_and(|val| val == "0") {
         return Err(NotEligible::Disabled);
     }
     let region_ptr = get_el1_region_host_ptr();
@@ -225,7 +266,7 @@ pub(crate) fn delegate(
         _ => return Err(NotEligible::NotRegularFile),
     };
 
-    let handle = allocate_handle().ok_or(NotEligible::TableFull)?;
+    let handle = allocate_handle(&open_file.description).ok_or(NotEligible::TableFull)?;
 
     let cache_ptr = (region_ptr
         + EL1_CACHE_OFFSET as usize
@@ -341,6 +382,7 @@ pub(crate) fn recall_if_delegated(description: &FileDescription) {
 }
 
 fn recall_locked(description: &FileDescription, open: &mut OpenDescription, handle: u32) {
+    mark_pending_host_work_all();
     let region_ptr = get_el1_region_host_ptr();
     if region_ptr == 0 {
         description.set_delegation_handle(0);

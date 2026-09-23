@@ -401,7 +401,7 @@ impl<'a> FsView<'a> {
                 Ok(DispatchOutcome::Returned { value: 0 })
             };
 
-            let outcome = if !flags.contains(carrick_abi::LinuxCloseRangeFlags::UNSHARE) {
+            if !flags.contains(carrick_abi::LinuxCloseRangeFlags::UNSHARE) {
                 close_selected()
             } else {
                 let unshared: crate::kernel::CloseRangeUnshare = match cx
@@ -431,8 +431,7 @@ impl<'a> FsView<'a> {
                     Some(&successor),
                 );
                 this.with_kernel_resources(unshared.context(), close_selected)
-            };
-            outcome
+            }
 
         }
 
