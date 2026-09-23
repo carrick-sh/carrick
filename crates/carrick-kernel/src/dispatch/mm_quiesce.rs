@@ -422,8 +422,8 @@ fn drain_exact_mm<'mm>(
     let start = Instant::now();
     let deadline = start + budget.drain;
     let mut spins: i32 = 0;
+    census.kick_all_in_guest();
     while census.any_in_guest() {
-        census.kick_all_in_guest();
         if Instant::now() >= deadline {
             crate::probes::pt_pause_timeout(tid.raw(), start.elapsed().as_micros() as i64);
             // Roll back BOTH persistent request bits and wake every sibling that
@@ -433,6 +433,9 @@ fn drain_exact_mm<'mm>(
             return Err(PtPauseError::TimedOut);
         }
         spins = spins.saturating_add(1);
+        if spins % 64 == 0 {
+            census.kick_all_in_guest();
+        }
         std::thread::yield_now();
     }
     crate::probes::pt_pause_ready(tid.raw(), spins, start.elapsed().as_micros() as i64);

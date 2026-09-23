@@ -1446,14 +1446,35 @@ where
         let request = SyscallRequest::from_raw(frame)
             .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
             .with_guest_sp_fallback(|| engine.get_reg(carrick_hal::Reg::Sp).ok());
-        let (syscall, prepared_outcome) =
+
+        let served_with_work = if let Some(slot) = engine.mailbox_slot() {
+            let served = carrick_kernel::el1_delegation::take_served_with_work(slot);
+            carrick_kernel::el1_delegation::clear_pending_host_work(slot);
+            served
+        } else {
+            false
+        };
+
+        let (syscall, prepared_outcome) = if served_with_work {
+            let syscall = PreparedSyscall {
+                original_args: request.args,
+                request,
+            };
+            (
+                syscall,
+                Some(DispatchOutcome::Returned {
+                    value: frame.args[0] as i64,
+                }),
+            )
+        } else {
             match kernel
                 .dispatcher
                 .prepare_syscall(&kernel_context, request, &kernel.reporter)?
             {
                 PreparedDispatch::Invoke(syscall) => (syscall, None),
                 PreparedDispatch::Complete { syscall, outcome } => (syscall, Some(outcome)),
-            };
+            }
+        };
         self.syscall_completion = SyscallCompletionOwnership::Guest(SyscallCompletionToken::new(
             syscall,
             kernel_context.retain_exact(),

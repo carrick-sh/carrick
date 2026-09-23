@@ -368,6 +368,7 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
 pub fn publish_pending_for_with_wake(tid: i32, signum: i32, wake: PublicationWake) {
     crate::probes::signal_publish(tid, signum, 1);
     carrick_signal_core::publish_pending_for(tid, signum);
+    carrick_el1_abi::mark_pending_host_work_for_task(tid as u64);
     if !wake_thread_waiter(tid) {
         notify_waiters_fallback();
     }
@@ -1098,6 +1099,7 @@ pub fn publish_process_signal_with_wake(signum: i32, wake: PublicationWake) {
     if bit != 0 {
         proc_pending_fetch_or(bit);
     }
+    carrick_el1_abi::mark_pending_host_work_all();
     notify_waiters_fallback();
     if wake == PublicationWake::SignalPump {
         mark_signal_pump_publication();

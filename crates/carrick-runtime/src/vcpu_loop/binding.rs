@@ -3911,6 +3911,9 @@ where
         let frame = match next {
             Ok(Some(frame)) => frame,
             Ok(None) => {
+                if let Some(slot) = engine.mailbox_slot() {
+                    carrick_kernel::el1_delegation::clear_pending_host_work(slot);
+                }
                 // The vCPU was forced out of the guest by a cross-thread kick
                 // (hv_vcpus_exit) with no syscall pending — deliver a signal at
                 // the interrupted PC, then resume.

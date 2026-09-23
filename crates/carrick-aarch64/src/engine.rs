@@ -2548,10 +2548,10 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                     // is reported (`Ok(None)`).
                     let pc = self.vcpu.get_reg(Reg::Pc)?;
                     let in_vector = carrick_mem::memory::is_carrick_el1_vector_va(pc);
-                    let in_el1_image = pc >= carrick_mem::memory::LINUX_EL1_KERNEL_BASE
-                        && pc
-                            < carrick_mem::memory::LINUX_EL1_KERNEL_BASE
-                                + carrick_mem::memory::LINUX_EL1_IMAGE_SIZE;
+                    let in_el1_image = (carrick_mem::memory::LINUX_EL1_KERNEL_BASE
+                        ..carrick_mem::memory::LINUX_EL1_KERNEL_BASE
+                            + carrick_mem::memory::LINUX_EL1_IMAGE_SIZE)
+                        .contains(&pc);
                     if in_vector
                         || in_el1_image
                         || carrick_mem::memory::is_carrick_el0_clock_stub_va(pc)
@@ -2984,6 +2984,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn audit_executor_boundary(&mut self) -> Result<(), TrapError> {
         self.vm.audit_executor_boundary(&mut self.vcpu)
+    }
+
+    fn mailbox_slot(&self) -> Option<usize> {
+        self.vcpu.mailbox_slot()
     }
 
     fn bind_task_snapshot_identity(&mut self, mm_generation: u64, asid_generation: u64) {

@@ -749,6 +749,11 @@ fn run_address_space_with_hvf_and_dispatcher(
         // trampoline) — the shared `Aarch64EngineCore<HvfAarch64Vmm>` bring-up.
         let mut trap = crate::trap::new_hvf_trap_engine(&image)?;
         carrick_hal::ThreadedEngine::set_persistent_vm_lifecycle(&mut trap, true);
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let ptr = carrick_vmm_hvf::read_el1_region_host_ptr();
+            carrick_kernel::el1_delegation::record_el1_region_host_ptr(ptr);
+        }
         // Hand the dispatcher the real region list + auxv so /proc/self/maps
         // (regions, bootstrap pages, stack) and /proc/self/auxv reflect the loaded
         // ELF instead of the legacy summary. Language runtimes, malloc
