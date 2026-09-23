@@ -11,9 +11,9 @@ rationale = "Copied and zero-copy host writes invalidate physical code dependenc
 vm_free = "carrick-vmm-hvf::trap::foreign_mm::tests::syscall_writes::syscall_code_write_cost_contract; native_code_content_syscall_copy_revokes_physical_dependencies; syscall_writes semantic controls for fragment crossings, stale pointers, owner generations, permissions, structural backing, alias fallback and error/unwind cleanup; carrick-kernel::dispatch::fs::tests::readonly_destination_offsets (read/readv into an unwritable destination: EFAULT with the regular-file offset untouched, delivered prefix and per-iovec partial counts advance it by exactly the delivered bytes)"
 
 [bindings.unresolved]
-embed_structural = "The signed syscall_write_destinations fixture checks copies, zero-copy destinations and COW, but its read-only readv offset assertion is still red on the before-step runtime and candidate. It does not observe native code revocation. Active native drain, remaining raw/hardware writes and private RX admission remain unbound."
+embed_structural = "The signed syscall_write_destinations fixture (copies, zero-copy destinations, COW and the read-only readv offset) passes on artifact dbf360ebb, SHA-256 0f657b02..., after the staged reader fix; the same script passes through `carrick run` on that binary. It does not observe native code revocation. Active native drain, remaining raw/hardware writes and private RX admission remain unbound."
 embed_timing = "No new original inotify09 timing or mixed native/HVF performance acceptance."
-docker = "The exact syscall_write_destinations.py fixture passes on native ARM64 Docker; the Carrick read-only readv offset differential remains open. Backing invalidation is internal and executable publication still needs mixed-engine differentials."
+docker = "The exact syscall_write_destinations.py fixture passes on native ARM64 Docker and, since dbf360ebb, on signed Carrick, closing the read-only readv offset differential. Backing invalidation is internal and executable publication still needs mixed-engine differentials."
 
 [[structural_budgets]]
 kind = "exact"
