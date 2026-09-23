@@ -38,7 +38,7 @@ rules:
     severity: ERROR
     paths:
       exclude:
-        - /crates/carrick-el1/**
+        - /crates/carrick-el1/src/file.rs
         - /crates/carrick-kernel-example/src/bin/kernel-syscall-floor/gateway.rs
         - /crates/carrick-runtime/src/vcpu_loop/native_probe.rs
         - /crates/carrick-runtime/tools/vdso_getrandom_blob.rs
