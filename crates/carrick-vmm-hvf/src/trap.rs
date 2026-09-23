@@ -7461,6 +7461,13 @@ impl HvfInner {
                 let elr_el1 = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
                 let far_el1 = vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
                 let spsr_el1 = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
+                let x0 = vcpu.get_reg(Reg::X0).unwrap_or(0);
+                if x0 == carrick_el1_abi::PANIC_SENTINEL {
+                    carrick_fatal!(
+                        "el1",
+                        "EL1 panic handler invoked: panic sentinel {x0:#x} at elr_el1={elr_el1:#x}"
+                    );
+                }
                 if is_stage1_cow_write_fault(esr_el1) {
                     vcpu.set_reg(Reg::PC, elr_el1).map_err(hvf_error)?;
                     vcpu.set_reg(Reg::CPSR, spsr_el1).map_err(hvf_error)?;
@@ -7468,13 +7475,6 @@ impl HvfInner {
                         syndrome: esr_el1,
                         far: far_el1,
                     });
-                }
-                let x0 = vcpu.get_reg(Reg::X0).unwrap_or(0);
-                if x0 == carrick_el1_abi::PANIC_SENTINEL {
-                    carrick_fatal!(
-                        "el1",
-                        "EL1 panic handler invoked: panic sentinel {x0:#x} at elr_el1={elr_el1:#x}"
-                    );
                 }
                 let ec = (esr_el1 >> 26) & 0x3f;
                 let mailbox_diagnostics = mailbox.diagnostics();
@@ -7905,5 +7905,13 @@ mod el1_resume_tests {
         let kick_syndrome = (0x16 << 26) | carrick_hal::AARCH64_HVC_KICK_IMM;
         assert!(carrick_hal::is_aarch64_hvc_kick(kick_syndrome));
         assert!(!carrick_hal::is_aarch64_syscall_exception(kick_syndrome));
+    }
+
+    #[test]
+    fn test_panic_sentinel_precedes_cow_check() {
+        let stale_cow_esr = (0x24 << 26) | (1 << 6) | 0x0f;
+        assert!(super::is_stage1_cow_write_fault(stale_cow_esr));
+        let x0 = carrick_el1_abi::PANIC_SENTINEL;
+        assert_eq!(x0, 0xDEAD_CAFE_DEAD_BEEF);
     }
 }
