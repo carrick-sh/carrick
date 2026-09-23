@@ -1565,6 +1565,13 @@ pub(in crate::dispatch) trait ProcCrossSubsystem: Send + Sync {
         ctx: &mut dyn MmExecutorReleaser,
         op: &mut dyn FnMut(),
     ) -> Result<(), super::outcome::DispatchError>;
+    fn close_draining_file_table(
+        &self,
+        kernel: &Arc<crate::kernel::Kernel>,
+        files: &Arc<crate::kernel::FileTable>,
+        owner: Option<crate::kernel::TaskKey>,
+        exec_successor: Option<&Arc<crate::kernel::FileTable>>,
+    );
 }
 
 impl ProcCrossSubsystem for SyscallDispatcher {
@@ -1646,6 +1653,15 @@ impl ProcCrossSubsystem for SyscallDispatcher {
         op: &mut dyn FnMut(),
     ) -> Result<(), super::outcome::DispatchError> {
         ctx.release_and_run(self, op)
+    }
+    fn close_draining_file_table(
+        &self,
+        kernel: &Arc<crate::kernel::Kernel>,
+        files: &Arc<crate::kernel::FileTable>,
+        owner: Option<crate::kernel::TaskKey>,
+        exec_successor: Option<&Arc<crate::kernel::FileTable>>,
+    ) {
+        self.close_draining_file_table(kernel, files, owner, exec_successor);
     }
 }
 

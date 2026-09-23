@@ -438,7 +438,9 @@ impl SyscallDispatcher {
         // consume writable capacity and must not synthesize another OUT edge.
         if let Some(rearm) = resources::take_io_rearm() {
             rearm.complete(&outcome);
-        } else if !resources::files_finished() {
+        } else if !resources::files_finished()
+            && Self::epoll_rearm_is_candidate(request.number.raw())
+        {
             resources::with_captured_resources(kernel, || {
                 self.epoll_rearm_after_io(&request, &outcome);
             });
@@ -646,9 +648,15 @@ impl SyscallDispatcher {
         if let Some(result) = route.dispatch(self, kernel, request, memory, reporter, thread) {
             let outcome = lower_handler_result(result)?;
             // Consumption-based EPOLLET re-arm (see `epoll_rearm_after_io`).
-            resources::with_captured_resources(kernel, || {
-                self.epoll_rearm_after_io(&request, &outcome);
-            });
+            if let Some(rearm) = resources::take_io_rearm() {
+                rearm.complete(&outcome);
+            } else if !resources::files_finished()
+                && Self::epoll_rearm_is_candidate(request.number.raw())
+            {
+                resources::with_captured_resources(kernel, || {
+                    self.epoll_rearm_after_io(&request, &outcome);
+                });
+            }
             return Ok(outcome);
         }
 

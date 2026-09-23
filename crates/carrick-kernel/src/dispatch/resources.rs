@@ -315,6 +315,27 @@ pub(super) fn finish_files_for_host_wait(
     Ok(())
 }
 
+/// Update the active dispatch scope's captured file table and lease when a task
+/// transitions to a successor file table (e.g. unshare or close_range unshare).
+/// Releases the functional lease on the old file table so it can drain without
+/// self-deadlock, and acquires a lease on the new table.
+pub(crate) fn update_captured_file_table(new_files: &Arc<crate::kernel::FileTable>) {
+    CAPTURED_RESOURCES.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if let Some(resources) = stack.last_mut() {
+            resources.file_lease = None;
+            resources.files = Arc::clone(new_files);
+            resources.file_lease =
+                Some(new_files.acquire_functional_lease().unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "dispatch::file_table_lease",
+                        "new FileTable reached a draining FileTable generation"
+                    );
+                }));
+        }
+    });
+}
+
 pub(super) fn with_retiring_file_table<R>(
     files: Arc<crate::kernel::FileTable>,
     operation: impl FnOnce() -> R,

@@ -1077,6 +1077,11 @@ impl Kernel {
             thread.replace_resources(Arc::clone(&resources));
             self.observe_thread_publication(&thread, &resources, revision);
             drop(state);
+            crate::dispatch::resources::update_captured_file_table(&files);
+            crate::el1_delegation::update_current_task_file_table_for_task(
+                context.thread.key().tid.raw() as u64,
+                files.id().raw(),
+            );
             self.retire_file_table_generation(&old_files, Some(&files), None);
             return Ok(CloseRangeUnshare {
                 context: KernelContext::from_parts(
