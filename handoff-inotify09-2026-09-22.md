@@ -123,7 +123,16 @@ Do not quietly replace these failures with a later passing focused test:
 5. Earlier broad Clippy found six `manual_is_multiple_of` diagnostics in
    `carrick-aarch64`; subsequent scoped checks used `--no-deps`. Whole-workspace
    CI is not green by implication.
-6. Full signed probes, smoke/full promotion, cross-engine state/atomics/signals,
+6. **Post-merge governance is not green.** The position reconciler updated only
+   seven existing dispatch-lock line numbers. It refused the new `madvise`
+   abort site and K1 category-count changes (mapping 1109→1117,
+   description_guard 210→203, epoll 419→421); these need review, not a blind
+   re-bless. A direct host-authority diagnostic names a tooling defect:
+   `scripts/migrate/check-host-authority-transitions.py::PRODUCT_SOURCE_PATHS`
+   omits `experiments/native-syscall-slice` from its temporary source snapshot,
+   so resolving the runtime dev-dependency fails before a census candidate
+   exists. Preserve snapshot completeness and authority when fixing this.
+7. Full signed probes, smoke/full promotion, cross-engine state/atomics/signals,
    private RX authority and original mixed-engine timing remain open. The latest
    drain step has **no signed binding yet**. A normal HVF ptrace text-patching
    pass from an earlier step does not qualify mixed native/HVF publication.
