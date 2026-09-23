@@ -225,6 +225,100 @@ fn exit_group_stress(file_path: &str) -> i32 {
     0
 }
 
+static SIGNAL_RECEIVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn sigusr1_handler(_sig: libc::c_int) {
+    SIGNAL_RECEIVED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn signal_stress(file_path: &str) -> i32 {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigusr1_handler as *const () as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        if libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut()) != 0 {
+            return 10;
+        }
+    }
+
+    let path_c = match std::ffi::CString::new(file_path) {
+        Ok(c) => c,
+        Err(_) => return 11,
+    };
+    let fd = unsafe {
+        libc::open(
+            path_c.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+            0o666,
+        )
+    };
+    if fd < 0 {
+        return 12;
+    }
+
+    unsafe {
+        libc::syscall(libc::SYS_write, fd, b"warmup\n".as_ptr() as *const libc::c_void, 7);
+        libc::syscall(libc::SYS_lseek, fd, 0, libc::SEEK_SET);
+    }
+
+    let target_tid = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let target_tid_clone = target_tid.clone();
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let running_clone = running.clone();
+
+    let worker = std::thread::spawn(move || {
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        target_tid_clone.store(tid, std::sync::atomic::Ordering::Release);
+
+        let buf = b"signal-stress-hammering-write-and-lseek-at-el1\n";
+        while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_write,
+                    fd,
+                    buf.as_ptr() as *const libc::c_void,
+                    buf.len(),
+                );
+                libc::syscall(libc::SYS_lseek, fd, 0, libc::SEEK_SET);
+            }
+        }
+    });
+
+    while target_tid.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        std::thread::yield_now();
+    }
+    let tid = target_tid.load(std::sync::atomic::Ordering::Acquire);
+    let pid = unsafe { libc::getpid() };
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    let ret = unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGUSR1) };
+    if ret != 0 {
+        running.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = worker.join();
+        return 20;
+    }
+
+    let start = std::time::Instant::now();
+    let mut received = false;
+    while start.elapsed() < std::time::Duration::from_secs(1) {
+        if SIGNAL_RECEIVED.load(std::sync::atomic::Ordering::Acquire) {
+            received = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = worker.join();
+
+    if received {
+        0
+    } else {
+        21
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -241,6 +335,10 @@ fn main() {
         "exit-group-stress" => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("/tmp/stress.txt");
             exit_group_stress(path)
+        }
+        "signal-stress" => {
+            let path = args.get(2).map(|s| s.as_str()).unwrap_or("/tmp/sigstress.txt");
+            signal_stress(path)
         }
         _ => 64,
     };
