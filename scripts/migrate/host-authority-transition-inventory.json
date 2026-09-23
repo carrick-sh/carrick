@@ -1982,18 +1982,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-mem/src/memory.rs:2621 in `fill_random_bytes`, `std::fs::File::open` accesses only the fixed host entropy source used for guest stack randomization used by `fill_random_bytes`.",
+    "rationale": "At crates/carrick-mem/src/memory.rs:2848 in `fill_random_bytes`, `std::fs::File::open` accesses only the fixed host entropy source used for guest stack randomization used by `fill_random_bytes`.",
     "review_id": "HA-000090",
     "source": {
-      "byte_end": 115288,
-      "byte_start": 115274,
+      "byte_end": 122461,
+      "byte_start": 122447,
       "column": 20,
       "column_end": 34,
       "column_start": 20,
       "file": "crates/carrick-mem/src/memory.rs",
-      "line": 2621,
-      "line_end": 2621,
-      "line_start": 2621
+      "line": 2848,
+      "line_end": 2848,
+      "line_start": 2848
     }
   },
   {
@@ -5289,18 +5289,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-mem/src/memory.rs:1149 in `load_elf_for`, `std::fs::read` accesses only the selected guest executable image used by `load_elf_for`.",
+    "rationale": "At crates/carrick-mem/src/memory.rs:1316 in `load_elf_for`, `std::fs::read` accesses only the selected guest executable image used by `load_elf_for`.",
     "review_id": "HA-000227",
     "source": {
-      "byte_end": 58018,
-      "byte_start": 58010,
+      "byte_end": 63287,
+      "byte_start": 63279,
       "column": 20,
       "column_end": 28,
       "column_start": 20,
       "file": "crates/carrick-mem/src/memory.rs",
-      "line": 1149,
-      "line_end": 1149,
-      "line_start": 1149
+      "line": 1316,
+      "line_end": 1316,
+      "line_start": 1316
     }
   },
   {
@@ -5317,18 +5317,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-mem/src/memory.rs:1151 in `load_elf_for`, `std::fs::read` accesses only the selected guest interpreter image used by `load_elf_for`.",
+    "rationale": "At crates/carrick-mem/src/memory.rs:1318 in `load_elf_for`, `std::fs::read` accesses only the selected guest interpreter image used by `load_elf_for`.",
     "review_id": "HA-000228",
     "source": {
-      "byte_end": 58127,
-      "byte_start": 58119,
+      "byte_end": 63396,
+      "byte_start": 63388,
       "column": 81,
       "column_end": 89,
       "column_start": 81,
       "file": "crates/carrick-mem/src/memory.rs",
-      "line": 1151,
-      "line_end": 1151,
-      "line_start": 1151
+      "line": 1318,
+      "line_end": 1318,
+      "line_start": 1318
     }
   },
   {
@@ -6704,18 +6704,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/lib.rs:241 in `rosetta_interpreter_path`, `std::fs::read_to_string` accesses only the fixed binfmt_misc Rosetta registration object at /proc/sys/fs/binfmt_misc/rosetta.",
+    "rationale": "At crates/carrick-runtime/src/lib.rs:252 in `rosetta_interpreter_path`, `std::fs::read_to_string` accesses only the fixed binfmt_misc Rosetta registration object at /proc/sys/fs/binfmt_misc/rosetta.",
     "review_id": "HA-000294",
     "source": {
-      "byte_end": 13713,
-      "byte_start": 13690,
+      "byte_end": 14074,
+      "byte_start": 14051,
       "column": 22,
       "column_end": 45,
       "column_start": 22,
       "file": "crates/carrick-runtime/src/lib.rs",
-      "line": 241,
-      "line_end": 241,
-      "line_start": 241
+      "line": 252,
+      "line_end": 252,
+      "line_start": 252
     }
   },
   {
