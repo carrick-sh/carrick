@@ -12,8 +12,13 @@ pub static SIMULATE_COPY_FAULT: core::sync::atomic::AtomicBool =
 
 /// Copy `len` bytes from `src` to `dest` (user virtual address), guarded by EL1 exception fixup.
 /// Returns `true` if copy succeeded, `false` if a fault occurred and was intercepted by fixup.
+///
+/// # Safety
+///
+/// `dest` and `src` must be valid for pointer arithmetic. Faults on accessing user memory
+/// are safely caught by the EL1 fixup mechanism.
 #[inline(never)]
-pub unsafe fn copy_to_user_guarded(
+pub(crate) unsafe fn copy_to_user_guarded(
     cur_task: &CurrentTask,
     dest: *mut u8,
     src: *const u8,
@@ -23,30 +28,33 @@ pub unsafe fn copy_to_user_guarded(
     {
         let fixup_ptr = &cur_task.fixup_pc as *const _ as *const u64;
         let mut success: u64 = 1;
-        core::arch::asm!(
-            "adr {tmp}, 2f",
-            "str {tmp}, [{fixup}]",
-            "cbz {len}, 1f",
-            "0:",
-            "ldrb {tmp:w}, [{src}], #1",
-            "strb {tmp:w}, [{dst}], #1",
-            "sub {len}, {len}, #1",
-            "cbnz {len}, 0b",
-            "1:",
-            "str xzr, [{fixup}]",
-            "b 3f",
-            "2:",
-            "str xzr, [{fixup}]",
-            "mov {succ}, #0",
-            "3:",
-            tmp = out(reg) _,
-            fixup = in(reg) fixup_ptr,
-            dst = inout(reg) dest => _,
-            src = inout(reg) src => _,
-            len = inout(reg) len => _,
-            succ = inout(reg) success,
-            options(nostack)
-        );
+        unsafe {
+            core::arch::asm!(
+                "adr {tmp}, 2f",
+                "str {tmp}, [{fixup}]",
+                "cbz {len}, 1f",
+                "0:",
+                "ldrb {tmp:w}, [{src}], #1",
+                "sttrb {tmp:w}, [{dst}]",
+                "add {dst}, {dst}, #1",
+                "sub {len}, {len}, #1",
+                "cbnz {len}, 0b",
+                "1:",
+                "str xzr, [{fixup}]",
+                "b 3f",
+                "2:",
+                "str xzr, [{fixup}]",
+                "mov {succ}, #0",
+                "3:",
+                tmp = out(reg) _,
+                fixup = in(reg) fixup_ptr,
+                dst = inout(reg) dest => _,
+                src = inout(reg) src => _,
+                len = inout(reg) len => _,
+                succ = inout(reg) success,
+                options(nostack)
+            );
+        }
         success != 0
     }
     #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
@@ -65,8 +73,13 @@ pub unsafe fn copy_to_user_guarded(
 
 /// Copy `len` bytes from `src` (user virtual address) to `dest`, guarded by EL1 exception fixup.
 /// Returns `true` if copy succeeded, `false` if a fault occurred and was intercepted by fixup.
+///
+/// # Safety
+///
+/// `dest` and `src` must be valid for pointer arithmetic. Faults on accessing user memory
+/// are safely caught by the EL1 fixup mechanism.
 #[inline(never)]
-pub unsafe fn copy_from_user_guarded(
+pub(crate) unsafe fn copy_from_user_guarded(
     cur_task: &CurrentTask,
     dest: *mut u8,
     src: *const u8,
@@ -76,30 +89,33 @@ pub unsafe fn copy_from_user_guarded(
     {
         let fixup_ptr = &cur_task.fixup_pc as *const _ as *const u64;
         let mut success: u64 = 1;
-        core::arch::asm!(
-            "adr {tmp}, 2f",
-            "str {tmp}, [{fixup}]",
-            "cbz {len}, 1f",
-            "0:",
-            "ldrb {tmp:w}, [{src}], #1",
-            "strb {tmp:w}, [{dst}], #1",
-            "sub {len}, {len}, #1",
-            "cbnz {len}, 0b",
-            "1:",
-            "str xzr, [{fixup}]",
-            "b 3f",
-            "2:",
-            "str xzr, [{fixup}]",
-            "mov {succ}, #0",
-            "3:",
-            tmp = out(reg) _,
-            fixup = in(reg) fixup_ptr,
-            dst = inout(reg) dest => _,
-            src = inout(reg) src => _,
-            len = inout(reg) len => _,
-            succ = inout(reg) success,
-            options(nostack)
-        );
+        unsafe {
+            core::arch::asm!(
+                "adr {tmp}, 2f",
+                "str {tmp}, [{fixup}]",
+                "cbz {len}, 1f",
+                "0:",
+                "ldtrb {tmp:w}, [{src}]",
+                "add {src}, {src}, #1",
+                "strb {tmp:w}, [{dst}], #1",
+                "sub {len}, {len}, #1",
+                "cbnz {len}, 0b",
+                "1:",
+                "str xzr, [{fixup}]",
+                "b 3f",
+                "2:",
+                "str xzr, [{fixup}]",
+                "mov {succ}, #0",
+                "3:",
+                tmp = out(reg) _,
+                fixup = in(reg) fixup_ptr,
+                dst = inout(reg) dest => _,
+                src = inout(reg) src => _,
+                len = inout(reg) len => _,
+                succ = inout(reg) success,
+                options(nostack)
+            );
+        }
         success != 0
     }
     #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
@@ -243,7 +259,7 @@ pub fn el1_lseek(file: &DelegatedFile, offset: i64, whence: u32) -> Result<i64, 
 }
 
 /// Service `read` at EL1.
-pub fn el1_read<V: MemoryValidator>(
+pub(crate) fn el1_read<V: MemoryValidator>(
     file: &DelegatedFile,
     cur_task: &CurrentTask,
     cache_base: *const u8,
@@ -284,7 +300,7 @@ pub fn el1_read<V: MemoryValidator>(
 }
 
 /// Service `pread64` at EL1.
-pub fn el1_pread64<V: MemoryValidator>(
+pub(crate) fn el1_pread64<V: MemoryValidator>(
     file: &DelegatedFile,
     cur_task: &CurrentTask,
     cache_base: *const u8,
@@ -328,7 +344,7 @@ pub fn el1_pread64<V: MemoryValidator>(
 }
 
 /// Service `write` at EL1.
-pub fn el1_write<V: MemoryValidator>(
+pub(crate) fn el1_write<V: MemoryValidator>(
     file: &DelegatedFile,
     cur_task: &CurrentTask,
     cache_base: *mut u8,
@@ -380,7 +396,7 @@ pub fn el1_write<V: MemoryValidator>(
 }
 
 /// Service `pwrite64` at EL1.
-pub fn el1_pwrite64<V: MemoryValidator>(
+pub(crate) fn el1_pwrite64<V: MemoryValidator>(
     file: &DelegatedFile,
     cur_task: &CurrentTask,
     cache_base: *mut u8,
@@ -436,7 +452,7 @@ fn mark_dirty_pages(file: &DelegatedFile, start: u64, end: u64) {
         return;
     }
     let start_p = (start / DELEGATED_PAGE_SIZE) as usize;
-    let end_p = ((end + DELEGATED_PAGE_SIZE - 1) / DELEGATED_PAGE_SIZE) as usize;
+    let end_p = end.div_ceil(DELEGATED_PAGE_SIZE) as usize;
     let mut mask = 0u64;
     for p in start_p..core::cmp::min(end_p, 64) {
         mask |= 1u64 << p;
@@ -447,6 +463,7 @@ fn mark_dirty_pages(file: &DelegatedFile, start: u64, end: u64) {
 }
 
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     extern crate std;
     use super::*;
@@ -544,8 +561,8 @@ mod tests {
     fn test_read_and_pread64_model() {
         let task = CurrentTask::new();
         let (file, mut cache) = fixture_file(200, 0, DELEGATED_FLAG_READABLE);
-        for i in 0..200 {
-            cache[i] = (i % 251) as u8;
+        for (i, byte) in cache.iter_mut().enumerate().take(200) {
+            *byte = (i % 251) as u8;
         }
 
         let mut user_buf = vec![0u8; 100];
@@ -650,8 +667,8 @@ mod tests {
             8192,
             DELEGATED_FLAG_READABLE | DELEGATED_FLAG_WRITABLE,
         );
-        for i in 0..16384 {
-            cache[i] = (i % 251) as u8;
+        for (i, byte) in cache.iter_mut().enumerate().take(16384) {
+            *byte = (i % 251) as u8;
         }
 
         let mut user_buffer = vec![0u8; 8192];
