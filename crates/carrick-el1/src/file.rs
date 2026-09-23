@@ -388,8 +388,19 @@ pub(crate) fn el1_write<V: MemoryValidator>(
         return Err(Action::Forward);
     }
     let delivered_end = cur_off + count as u64;
-    mark_dirty_pages(file, cur_off, delivered_end);
     let old_size = file.size.load(Ordering::Acquire);
+    if cur_off > old_size {
+        unsafe {
+            core::ptr::write_bytes(
+                cache_base.add(old_size as usize),
+                0,
+                (cur_off - old_size) as usize,
+            );
+        }
+        mark_dirty_pages(file, old_size, delivered_end);
+    } else {
+        mark_dirty_pages(file, cur_off, delivered_end);
+    }
     if delivered_end > old_size {
         file.size.store(delivered_end, Ordering::Release);
     }
@@ -441,8 +452,19 @@ pub(crate) fn el1_pwrite64<V: MemoryValidator>(
         return Err(Action::Forward);
     }
     let delivered_end = off + count as u64;
-    mark_dirty_pages(file, off, delivered_end);
     let old_size = file.size.load(Ordering::Acquire);
+    if off > old_size {
+        unsafe {
+            core::ptr::write_bytes(
+                cache_base.add(old_size as usize),
+                0,
+                (off - old_size) as usize,
+            );
+        }
+        mark_dirty_pages(file, old_size, delivered_end);
+    } else {
+        mark_dirty_pages(file, off, delivered_end);
+    }
     if delivered_end > old_size {
         file.size.store(delivered_end, Ordering::Release);
     }
@@ -786,5 +808,41 @@ mod tests {
         let n = el1_read(&file, &task, cache.as_ptr(), user_va, 50, &oracle).unwrap();
         assert_eq!(n, 50);
         assert_eq!(file.offset.load(Ordering::Relaxed), 50);
+    }
+
+    #[test]
+    fn test_write_extension_zeroes_hole() {
+        let task = CurrentTask::new();
+        let (file, mut cache) =
+            fixture_file(10, 0, DELEGATED_FLAG_WRITABLE | DELEGATED_FLAG_READABLE);
+        // Fill cache with non-zero garbage simulating previous file contents
+        cache.fill(0xFE);
+
+        let mut user_data = vec![b'x'];
+        let user_va = user_data.as_mut_ptr() as u64;
+        let validator = FakeOracleValidator {
+            writable_regions: vec![],
+            readable_regions: vec![user_va..user_va + 1],
+        };
+
+        // Pwrite at offset 8000: extends size from 10 to 8001
+        let n = el1_pwrite64(
+            &file,
+            &task,
+            cache.as_mut_ptr(),
+            user_va,
+            1,
+            8000,
+            &validator,
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(file.size.load(Ordering::Relaxed), 8001);
+
+        // Gap [10, 8000) must be zero-filled!
+        for i in 10..8000 {
+            assert_eq!(cache[i], 0, "byte at offset {i} was not zeroed");
+        }
+        assert_eq!(cache[8000], b'x');
     }
 }
