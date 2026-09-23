@@ -1709,25 +1709,65 @@ pub(in crate::dispatch) enum InMemoryPipeEndpoint {
 
 pub type OpenFile = crate::kernel::FileSlot;
 
-impl OpenFile {
-    pub(in crate::dispatch) fn host_file_info(&self) -> Option<(HostFdRef, bool)> {
-        let open = self.description.read()?;
-        match &*open {
+#[derive(Debug)]
+pub(crate) struct HostFileIo<'guard> {
+    host_fd: &'guard HostFdRef,
+    writable: bool,
+    open_path: Option<&'guard str>,
+}
+
+impl<'guard> HostFileIo<'guard> {
+    pub(crate) fn from_read(open: &'guard OpenDescription) -> Option<Self> {
+        match open {
             OpenDescription::HostFile {
                 host_fd, writable, ..
-            } => Some((host_fd.clone(), *writable)),
+            } => Some(Self {
+                host_fd,
+                writable: *writable,
+                open_path: open.open_path(),
+            }),
             _ => None,
         }
     }
 
-    pub(in crate::dispatch) fn host_file_open_path(&self) -> Option<String> {
-        let open = self.description.read()?;
-        match &*open {
-            OpenDescription::HostFile { .. } => open.open_path().map(|p| p.to_string()),
-            _ => None,
-        }
+    pub(crate) fn from_write(open: &'guard mut OpenDescription) -> Option<Self> {
+        Self::from_read(open)
     }
 
+    pub(crate) fn open_path(&self) -> Option<&str> {
+        self.open_path
+    }
+
+    pub(crate) fn raw(&self) -> i32 {
+        self.host_fd.raw()
+    }
+
+    pub(crate) fn is_writable(&self) -> bool {
+        self.writable
+    }
+
+    pub(crate) fn offset_may_be_nonzero(&self) -> bool {
+        self.host_fd.offset_may_be_nonzero()
+    }
+
+    pub(crate) fn record_sequential_io(&self) {
+        self.host_fd.record_sequential_io();
+    }
+
+    pub(crate) fn record_absolute_offset(&self, offset: i64) {
+        self.host_fd.record_absolute_offset(offset);
+    }
+
+    pub(crate) fn inode_identity(&self) -> Option<carrick_vfs::vfs::InodeIdentity> {
+        self.host_fd.inode_identity()
+    }
+
+    pub(crate) fn host_fd_ref(&self) -> &HostFdRef {
+        self.host_fd
+    }
+}
+
+impl OpenFile {
     pub(in crate::dispatch) fn record_host_file_absolute_offset(&self, offset: i64) {
         let Some(open) = self.description.read() else {
             return;
@@ -2914,33 +2954,68 @@ impl crate::kernel::FileDescription {
     }
 
     pub(crate) fn read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
-        crate::el1_delegation::recall_if_delegated(self);
-        self.open_description().map(|d| d.read())
+        let d = self.open_description()?;
+        loop {
+            let guard = d.read();
+            if self.delegation_handle() == 0 {
+                return Some(guard);
+            }
+            drop(guard);
+            let mut write_guard = d.write();
+            let handle = self.delegation_handle();
+            if handle != 0 {
+                crate::el1_delegation::recall_locked(self, &mut write_guard, handle);
+            }
+            drop(write_guard);
+        }
     }
 
     pub(crate) fn try_read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
-        crate::el1_delegation::recall_if_delegated(self);
-        self.open_description().and_then(|d| d.try_read())
+        let d = self.open_description()?;
+        let guard = d.try_read()?;
+        if self.delegation_handle() == 0 {
+            return Some(guard);
+        }
+        drop(guard);
+        let mut write_guard = d.try_write()?;
+        let handle = self.delegation_handle();
+        if handle != 0 {
+            crate::el1_delegation::recall_locked(self, &mut write_guard, handle);
+        }
+        drop(write_guard);
+        let guard = d.try_read()?;
+        if self.delegation_handle() == 0 {
+            Some(guard)
+        } else {
+            None
+        }
     }
 
     pub(crate) fn write(&self) -> Option<FileDescriptionWriteGuard<'_>> {
-        crate::el1_delegation::recall_if_delegated(self);
-        self.open_description()
-            .map(|guard| FileDescriptionWriteGuard {
-                guard: guard.write(),
-                description: self,
-            })
+        let d = self.open_description()?;
+        let mut guard = d.write();
+        let handle = self.delegation_handle();
+        if handle != 0 {
+            crate::el1_delegation::recall_locked(self, &mut guard, handle);
+        }
+        Some(FileDescriptionWriteGuard {
+            guard,
+            description: self,
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn try_write_for_test(&self) -> Option<FileDescriptionWriteGuard<'_>> {
-        crate::el1_delegation::recall_if_delegated(self);
-        self.open_description()
-            .and_then(|guard| guard.try_write())
-            .map(|guard| FileDescriptionWriteGuard {
-                guard,
-                description: self,
-            })
+        let d = self.open_description()?;
+        let mut guard = d.try_write()?;
+        let handle = self.delegation_handle();
+        if handle != 0 {
+            crate::el1_delegation::recall_locked(self, &mut guard, handle);
+        }
+        Some(FileDescriptionWriteGuard {
+            guard,
+            description: self,
+        })
     }
 }
 
@@ -2965,7 +3040,9 @@ impl DerefMut for FileDescriptionWriteGuard<'_> {
 
 impl Drop for FileDescriptionWriteGuard<'_> {
     fn drop(&mut self) {
-        self.description.publish_mutation();
+        if !matches!(&*self.guard, OpenDescription::HostFile { .. }) {
+            self.description.publish_mutation();
+        }
     }
 }
 

@@ -2253,6 +2253,14 @@ impl SyscallDispatcher {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_before_host_write_test_hook(
+        &mut self,
+        hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.fs.before_host_write_test_hook = hook;
+    }
+
     #[inline]
     pub fn net_view(&self) -> NetView<'_> {
         NetView {

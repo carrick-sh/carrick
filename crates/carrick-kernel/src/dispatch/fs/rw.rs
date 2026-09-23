@@ -10,7 +10,10 @@ use carrick_guest_mem::CurrentMmMemory;
 
 use super::pipe::{PipeWriteNotification, PipeWriteOperation};
 use super::*;
-use crate::dispatch::fd_table::{DirListing, HostFdRef, HostWriteKind, is_anon_overlay_path};
+use crate::dispatch::fd_table::{
+    DirListing, FileDescriptionWriteGuard, HostFdRef, HostFileIo, HostWriteKind,
+    is_anon_overlay_path,
+};
 use crate::dispatch::io_pipe::{
     HostPipeReadTarget, HostPipeWriteTarget, HostWaitRunner, read_host_pipe, read_host_pipe_at,
     write_host_pipe, write_host_pipe_at, write_host_pipe_owned, write_host_pipe_owned_at,
@@ -263,100 +266,114 @@ impl<'a> FsView<'a> {
         tid: crate::thread::ThreadId,
         bytes: &[u8],
         open_file: &OpenFile,
-        host_fd: HostFdRef,
-        writable: bool,
+        open: &mut FileDescriptionWriteGuard<'_>,
         nonblocking: bool,
         slot_authority: Option<crate::kernel::objects::FileSlotAuthority>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        if !writable {
-            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        #[cfg(test)]
+        if let Some(hook) = self.fs.before_host_write_test_hook.as_ref() {
+            hook();
         }
-        let is_append =
-            LinuxOpenFlags::from_bits_truncate(open_file.description.common().status_flags())
-                .contains(LinuxOpenFlags::APPEND);
-        let file_limit = self.fsize_soft_limit();
-        let offset_may_be_nonzero = host_fd.offset_may_be_nonzero();
-        let pos = if is_append {
-            unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) }
-        } else if offset_may_be_nonzero || file_limit.is_some() {
-            #[cfg(feature = "conformance-metrics")]
-            if let Some(scope) = cx.kernel.kernel().work_scope() {
-                let _ = scope.add(
-                    carrick_observability::work_meter::WorkMetric::HostWritePositionQueries,
-                    1,
-                );
+        let (out, punch_result) = {
+            let Some(host_io) = HostFileIo::from_read(open) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            if !host_io.is_writable() {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
-            unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) }
-        } else {
-            0
-        };
-        let write_offset = (pos >= 0).then_some(pos as u64);
-        let old_len = if !is_append && offset_may_be_nonzero && pos > 0 {
-            let mut st: libc::stat = unsafe { core::mem::zeroed() };
-            if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0
-                && (pos as u64) > st.st_size as u64
-            {
-                Some((st.st_size as u64, pos as u64))
+            let is_append =
+                LinuxOpenFlags::from_bits_truncate(open_file.description.common().status_flags())
+                    .contains(LinuxOpenFlags::APPEND);
+            let file_limit = self.fsize_soft_limit();
+            let offset_may_be_nonzero = host_io.offset_may_be_nonzero();
+            let pos = if is_append {
+                unsafe { libc::lseek(host_io.raw(), 0, libc::SEEK_END) }
+            } else if offset_may_be_nonzero || file_limit.is_some() {
+                #[cfg(feature = "conformance-metrics")]
+                if let Some(scope) = cx.kernel.kernel().work_scope() {
+                    let _ = scope.add(
+                        carrick_observability::work_meter::WorkMetric::HostWritePositionQueries,
+                        1,
+                    );
+                }
+                unsafe { libc::lseek(host_io.raw(), 0, libc::SEEK_CUR) }
+            } else {
+                0
+            };
+            let write_offset = (pos >= 0).then_some(pos as u64);
+            let old_len = if !is_append && offset_may_be_nonzero && pos > 0 {
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                if unsafe { libc::fstat(host_io.raw(), &mut st) } == 0
+                    && (pos as u64) > st.st_size as u64
+                {
+                    Some((st.st_size as u64, pos as u64))
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
-        let bytes = if file_limit.is_some() && pos >= 0 {
-            match self.fsize_write_len(cx, pos as u64, bytes.len()) {
-                Ok(len) => &bytes[..len.min(bytes.len())],
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            }
-        } else {
-            bytes
-        };
-        let raw_fd = host_fd.raw();
-        host_fd.record_sequential_io();
-        let Some(wait_authority) = slot_authority
-            .or_else(|| self.captured_slot_authority(fd))
-            .map(WaitFdAuthority::logical)
-        else {
-            return Ok(DispatchOutcome::errno(LINUX_EBADF));
-        };
-        let host_wait_runner = self.host_wait_runner_for_ctx(cx);
-        let host_wait_ref = host_wait_runner
-            .as_ref()
-            .map(|runner| runner as &dyn HostWaitRunner);
-        let target = HostPipeWriteTarget::new(
-            raw_fd,
-            Some(host_fd.clone()),
-            nonblocking,
-            HostWriteKind::RegularFile,
-            tid,
-            wait_authority,
-            self.cross.host_signal(),
-        )
-        .with_host_wait(host_wait_ref);
-        let out = write_host_pipe(bytes, target)?;
-        if let DispatchOutcome::Returned { value } = out
-            && value > 0
-        {
-            if self.fs.rootfs_vfs.dentry_cache.has_cached_inodes()
-                && let Some(identity) = host_fd.inode_identity()
-            {
-                self.fs.rootfs_vfs.notify_inode_changed("", Some(identity));
-            }
-            let punch_result = if let Some((old_len, pos)) = old_len {
-                punch_unwritten_host_blocks(raw_fd, old_len, pos)
-            } else {
-                Ok(())
             };
-            if let Some(write_offset) = write_offset {
-                self.fs
-                    .record_host_sparse_write(&host_fd, write_offset, value as usize);
+            let bytes = if file_limit.is_some() && pos >= 0 {
+                match self.fsize_write_len(cx, pos as u64, bytes.len()) {
+                    Ok(len) => &bytes[..len.min(bytes.len())],
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                }
+            } else {
+                bytes
+            };
+            let raw_fd = host_io.raw();
+            host_io.record_sequential_io();
+            let Some(wait_authority) = slot_authority
+                .or_else(|| self.captured_slot_authority(fd))
+                .map(WaitFdAuthority::logical)
+            else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let host_wait_runner = self.host_wait_runner_for_ctx(cx);
+            let host_wait_ref = host_wait_runner
+                .as_ref()
+                .map(|runner| runner as &dyn HostWaitRunner);
+            let target = HostPipeWriteTarget::new(
+                raw_fd,
+                None,
+                nonblocking,
+                HostWriteKind::RegularFile,
+                tid,
+                wait_authority,
+                self.cross.host_signal(),
+            )
+            .with_host_wait(host_wait_ref);
+            let out = write_host_pipe(bytes, target)?;
+            let mut punch = Ok(());
+            if let DispatchOutcome::Returned { value } = out
+                && value > 0
+            {
+                if self.fs.rootfs_vfs.dentry_cache.has_cached_inodes()
+                    && let Some(identity) = host_io.inode_identity()
+                {
+                    self.fs.rootfs_vfs.notify_inode_changed("", Some(identity));
+                }
+                punch = if let Some((old_len, pos)) = old_len {
+                    punch_unwritten_host_blocks(raw_fd, old_len, pos)
+                } else {
+                    Ok(())
+                };
+                if let Some(write_offset) = write_offset {
+                    self.fs.record_host_sparse_write(
+                        host_io.host_fd_ref(),
+                        write_offset,
+                        value as usize,
+                    );
+                }
+                self.notify_host_file_write_result(cx.kernel, host_io.open_path(), &out);
             }
-            self.notify_host_file_write_result(cx.kernel, open_file, &out);
-            punch_result?;
-        }
+            (out, punch)
+        };
+        punch_result?;
         if matches!(out, DispatchOutcome::Returned { .. }) {
-            let _ = crate::el1_delegation::delegate(
+            let _ = crate::el1_delegation::delegate_locked(
                 open_file,
+                open,
                 self.captured_file_table().id(),
                 fd,
                 self.fs,
@@ -366,21 +383,26 @@ impl<'a> FsView<'a> {
         Ok(out)
     }
 
-    fn lseek_host_file(&self, host_fd: &HostFdRef, offset: i64, whence: u64) -> DispatchOutcome {
+    fn lseek_host_file(
+        &self,
+        host_io: &HostFileIo<'_>,
+        offset: i64,
+        whence: u64,
+    ) -> DispatchOutcome {
         if (whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE) && offset >= 0 {
             if let Some(next) = self.fs.seek_host_sparse_extents(
-                host_fd.raw(),
+                host_io.raw(),
                 offset as u64,
                 whence == LINUX_SEEK_DATA,
             ) {
                 return match next {
                     Some(next) => {
                         let positioned = unsafe {
-                            libc::lseek(host_fd.raw(), next as libc::off_t, libc::SEEK_SET)
+                            libc::lseek(host_io.raw(), next as libc::off_t, libc::SEEK_SET)
                         };
                         match positioned.host_syscall_errno() {
                             Ok(positioned) => {
-                                host_fd.record_absolute_offset(positioned);
+                                host_io.record_absolute_offset(positioned);
                                 DispatchOutcome::returned_offset_or_errno(positioned)
                             }
                             Err(errno) => DispatchOutcome::errno(errno),
@@ -402,11 +424,11 @@ impl<'a> FsView<'a> {
         if (whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE) && offset < 0 {
             return DispatchOutcome::errno(LINUX_ENXIO);
         }
-        match (unsafe { libc::lseek(host_fd.raw(), offset as libc::off_t, host_whence) })
+        match (unsafe { libc::lseek(host_io.raw(), offset as libc::off_t, host_whence) })
             .host_syscall_errno()
         {
             Ok(positioned) => {
-                host_fd.record_absolute_offset(positioned);
+                host_io.record_absolute_offset(positioned);
                 DispatchOutcome::returned_offset_or_errno(positioned)
             }
             Err(errno) => DispatchOutcome::errno(errno),
@@ -431,11 +453,21 @@ impl<'a> FsView<'a> {
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            if let Some((host_fd, _writable)) = open_file.host_file_info() {
-                let outcome = this.lseek_host_file(&host_fd, offset, whence);
+            let Some(mut open) = open_file.description.write() else {
+                if is_stdio_fd(fd.0) && !this.stdio_is_closed(fd.0) {
+                    return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
+                }
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            if matches!(&*open, OpenDescription::HostFile { .. }) {
+                let Some(host_io) = HostFileIo::from_read(&open) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
+                let outcome = this.lseek_host_file(&host_io, offset, whence);
                 if matches!(outcome, DispatchOutcome::Returned { .. }) {
-                    let _ = crate::el1_delegation::delegate(
+                    let _ = crate::el1_delegation::delegate_locked(
                         &open_file,
+                        &mut open,
                         this.captured_file_table().id(),
                         fd.0,
                         this.fs,
@@ -444,12 +476,6 @@ impl<'a> FsView<'a> {
                 }
                 return Ok(outcome);
             }
-            let Some(mut open) = open_file.description.write() else {
-                if is_stdio_fd(fd.0) && !this.stdio_is_closed(fd.0) {
-                    return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
-                }
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
 
             // A CHARACTER device (/dev/null, /dev/zero, /dev/full, /dev/random,
             // /dev/urandom) is backed by a host fd but lands here as a HostPipe
@@ -1279,18 +1305,19 @@ impl<'a> FsView<'a> {
                 // Real host file: libc::read advances the kernel offset
                 // (shared across fork). read_host_pipe is just a
                 // memory-into-guest read(2) wrapper.
-                OpenDescription::HostFile { host_fd, .. } => {
-                    let host_fd_raw = host_fd.raw();
-                    let host_fd_owner = host_fd.clone();
-                    host_fd_owner.record_sequential_io();
-                    drop(open);
+                OpenDescription::HostFile { .. } => {
+                    let Some(host_io) = HostFileIo::from_write(&mut open) else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    let host_fd_raw = host_io.raw();
+                    host_io.record_sequential_io();
                     let outcome = read_host_pipe(
                         memory,
                         address,
                         length,
                         HostPipeReadTarget::new(
                             host_fd_raw,
-                            Some(host_fd_owner),
+                            None,
                             nonblocking,
                             WaitFdAuthority::logical(
                                 this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
@@ -1299,8 +1326,9 @@ impl<'a> FsView<'a> {
                         .with_host_wait(host_wait_ref),
                     );
                     if let Ok(DispatchOutcome::Returned { .. }) = &outcome {
-                        let _ = crate::el1_delegation::delegate(
+                        let _ = crate::el1_delegation::delegate_locked(
                             &open_file,
+                            &mut open,
                             files.id(),
                             fd.0,
                             this.fs,
@@ -1310,18 +1338,19 @@ impl<'a> FsView<'a> {
                     return outcome;
                 }
             };
-            drop(open);
-            memory.write_bytes(address, &bytes)?;
             let outcome = DispatchOutcome::returned_len_or_errno(read_len);
             if matches!(outcome, DispatchOutcome::Returned { .. }) {
-                let _ = crate::el1_delegation::delegate(
+                let _ = crate::el1_delegation::delegate_locked(
                     &open_file,
+                    &mut open,
                     files.id(),
                     fd.0,
                     this.fs,
                     Some(&this.task_rlimits()),
                 );
             }
+            drop(open);
+            memory.write_bytes(address, &bytes)?;
             Ok(outcome)
 
         }
@@ -1698,10 +1727,8 @@ impl<'a> FsView<'a> {
             }
             // Real host file: positional read via libc::pread (doesn't
             // disturb the shared kernel offset).
-            if let OpenDescription::HostFile { host_fd, .. } = &*open {
-                let host_fd_raw = host_fd.raw();
-                let host_fd_owner = host_fd.clone();
-                drop(open);
+            if let Some(host_io) = HostFileIo::from_read(&open) {
+                let host_fd_raw = host_io.raw();
                 let length = length.min(crate::dispatch::MAX_RW_COUNT);
                 let outcome = read_host_pipe_at(
                     memory,
@@ -1710,7 +1737,7 @@ impl<'a> FsView<'a> {
                     offset as i64,
                     HostPipeReadTarget::new(
                         host_fd_raw,
-                        Some(host_fd_owner),
+                        None,
                         false,
                         WaitFdAuthority::logical(
                             this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
@@ -1718,6 +1745,7 @@ impl<'a> FsView<'a> {
                     )
                     .with_host_wait(host_wait_ref),
                 )?;
+                drop(open);
                 if matches!(outcome, DispatchOutcome::Returned { .. }) {
                     let _ = crate::el1_delegation::delegate(
                         &open_file,
@@ -1886,9 +1914,8 @@ impl<'a> FsView<'a> {
             }
             // Real host file: positional readv via libc::pread per iovec
             // (kernel offset untouched).
-            if let OpenDescription::HostFile { host_fd, .. } = &*open {
-                let hfd = host_fd.raw();
-                let host_fd_owner = host_fd.clone();
+            if let Some(host_io) = HostFileIo::from_read(&open) {
+                let hfd = host_io.raw();
                 if host_wait_ref.is_none() {
                     if let Some(targets) = prepare_readv_targets(memory, &iovecs)? {
                         if targets.host_iovecs.is_empty() {
@@ -1918,7 +1945,6 @@ impl<'a> FsView<'a> {
                         return Ok(DispatchOutcome::returned_isize_or_errno(n));
                     }
                 }
-                drop(open);
                 let Some(wait_authority) = this
                     .captured_slot_authority(fd.0)
                     .map(WaitFdAuthority::logical)
@@ -1935,7 +1961,7 @@ impl<'a> FsView<'a> {
                     }
                     let target = HostPipeReadTarget::new(
                         hfd,
-                        Some(host_fd_owner.clone()),
+                        None,
                         false,
                         wait_authority.clone(),
                     )
@@ -1957,6 +1983,7 @@ impl<'a> FsView<'a> {
                         other => return Ok(other),
                     }
                 }
+                drop(open);
                 return Ok(DispatchOutcome::Returned { value: total });
             }
             let read_len = match &*open {
@@ -2062,7 +2089,7 @@ impl<'a> FsView<'a> {
                     super::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
                 )?;
             }
-            let Some(open) = open_file.description.read() else {
+            let Some(mut open) = open_file.description.write() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             // An O_APPEND fd forces EVERY write to EOF, ignoring the supplied
@@ -2085,70 +2112,72 @@ impl<'a> FsView<'a> {
             }
             // Real host file: positional write via libc::pwrite (visible
             // across fork; kernel offset untouched).
-            if let OpenDescription::HostFile {
-                host_fd, writable, ..
-            } = &*open
-            {
-                if !*writable {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
-                let raw_fd = host_fd.raw();
-                let host_fd_owner = host_fd.clone();
-                let old_len = if !is_append {
-                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                    if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
-                        Some(st.st_size as u64)
-                    } else {
-                        None
+            if matches!(&*open, OpenDescription::HostFile { .. }) {
+                let outcome = {
+                    let Some(host_io) = HostFileIo::from_read(&open) else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    if !host_io.is_writable() {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
-                } else {
-                    None
-                };
-                drop(open);
-                let Some(wait_authority) = this
-                    .captured_slot_authority(fd.0)
-                    .map(WaitFdAuthority::logical)
-                else {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                };
-                let host_wait_runner = this.host_wait_runner_for_ctx(cx);
-                let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
-                let outcome = write_host_pipe_owned_at(
-                    bytes,
-                    offset,
-                    HostPipeWriteTarget::new(
-                        raw_fd,
-                        Some(host_fd_owner.clone()),
-                        false,
-                        HostWriteKind::RegularFile,
-                        tid,
-                        wait_authority,
-                        this.cross.host_signal(),
-                    )
-                    .with_append(is_append)
-                    .with_host_wait(host_wait_ref),
-                )?;
-                if let DispatchOutcome::Returned { value } = outcome && value > 0 {
-                    if let Some(old_len) = old_len {
-                        punch_unwritten_host_blocks(raw_fd, old_len, offset as u64)?;
-                    }
-                    this.invalidate_dentry_host_fd(raw_fd);
-                    let write_offset = if is_append {
+                    let raw_fd = host_io.raw();
+                    let old_len = if !is_append {
                         let mut st: libc::stat = unsafe { core::mem::zeroed() };
                         if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
-                            (st.st_size as u64).saturating_sub(value as u64)
+                            Some(st.st_size as u64)
                         } else {
-                            offset as u64
+                            None
                         }
                     } else {
-                        offset as u64
+                        None
                     };
-                    this.fs
-                        .record_host_sparse_write(&host_fd_owner, write_offset, value as usize);
-                }
+                    let Some(wait_authority) = this
+                        .captured_slot_authority(fd.0)
+                        .map(WaitFdAuthority::logical)
+                    else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    let host_wait_runner = this.host_wait_runner_for_ctx(cx);
+                    let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
+                    let outcome = write_host_pipe_owned_at(
+                        bytes,
+                        offset,
+                        HostPipeWriteTarget::new(
+                            raw_fd,
+                            None,
+                            false,
+                            HostWriteKind::RegularFile,
+                            tid,
+                            wait_authority,
+                            this.cross.host_signal(),
+                        )
+                        .with_append(is_append)
+                        .with_host_wait(host_wait_ref),
+                    )?;
+                    if let DispatchOutcome::Returned { value } = outcome && value > 0 {
+                        if let Some(old_len) = old_len {
+                            punch_unwritten_host_blocks(raw_fd, old_len, offset as u64)?;
+                        }
+                        this.invalidate_dentry_host_fd(raw_fd);
+                        let write_offset = if is_append {
+                            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                            if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
+                                (st.st_size as u64).saturating_sub(value as u64)
+                            } else {
+                                offset as u64
+                            }
+                        } else {
+                            offset as u64
+                        };
+                        this.fs
+                            .record_host_sparse_write(host_io.host_fd_ref(), write_offset, value as usize);
+                    }
+                    outcome
+                };
                 if matches!(outcome, DispatchOutcome::Returned { .. }) {
-                    let _ = crate::el1_delegation::delegate(
+                    let _ = crate::el1_delegation::delegate_locked(
                         &open_file,
+                        &mut open,
                         this.captured_file_table().id(),
                         fd.0,
                         this.fs,
@@ -2354,7 +2383,7 @@ impl<'a> FsView<'a> {
                     super::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
                 )?;
             }
-            let Some(open) = open_file.description.read() else {
+            let Some(mut open) = open_file.description.write() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             // An O_APPEND fd writes at EOF regardless of the offset, but pwritev
@@ -2386,7 +2415,7 @@ impl<'a> FsView<'a> {
                 offset: current_offset,
                 max_size,
                 ..
-            } = &*open
+            } = &mut *open
             {
                 if !*writable {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -2464,25 +2493,35 @@ impl<'a> FsView<'a> {
                 }
                 drop(data);
                 if write_at_current {
-                    drop(open);
-                    if let Some(mut open_write) = open_file.description.write() {
-                        if let OpenDescription::InMemoryFile { offset: off, .. } = &mut *open_write {
-                            *off = cur;
-                        }
-                    }
+                    *current_offset = cur;
                 }
                 return Ok(DispatchOutcome::Returned { value: total });
             }
-            // Real host file: positional writev via libc::pwrite per iovec.
-            if let OpenDescription::HostFile {
-                host_fd, writable, ..
-            } = &*open
-            {
-                if !*writable {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
-                let hfd = host_fd.raw();
-                let host_fd_owner = host_fd.clone();
+            if matches!(&*open, OpenDescription::HostFile { .. }) {
+                let (hfd, is_append, old_len, at_current) = {
+                    let Some(host_io) = HostFileIo::from_read(&open) else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    if !host_io.is_writable() {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    }
+                    let hfd = host_io.raw();
+                    let at_current = write_at_current || is_append;
+                    if at_current {
+                        host_io.record_sequential_io();
+                    }
+                    let old_len = if !at_current {
+                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                        if unsafe { libc::fstat(hfd, &mut st) } == 0 {
+                            Some(st.st_size as u64)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    (hfd, is_append, old_len, at_current)
+                };
                 let saved_offset =
                     is_append.then(|| unsafe { libc::lseek(hfd, 0, libc::SEEK_CUR) });
                 if is_append {
@@ -2494,20 +2533,6 @@ impl<'a> FsView<'a> {
                     {
                         unsafe { libc::lseek(hfd, s, libc::SEEK_SET) };
                     }
-                };
-                let at_current = write_at_current || is_append;
-                if at_current {
-                    host_fd_owner.record_sequential_io();
-                }
-                let old_len = if !at_current {
-                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                    if unsafe { libc::fstat(hfd, &mut st) } == 0 {
-                        Some(st.st_size as u64)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
                 };
                 let host_wait_runner = this.host_wait_runner_for_ctx(cx);
                 let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
@@ -2537,11 +2562,18 @@ impl<'a> FsView<'a> {
                                 punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
                             }
                             this.invalidate_dentry_host_fd(hfd);
+                            let _ = crate::el1_delegation::delegate_locked(
+                                &open_file,
+                                &mut open,
+                                this.captured_file_table().id(),
+                                fd.0,
+                                this.fs,
+                                Some(&this.task_rlimits()),
+                            );
                         }
                         return Ok(DispatchOutcome::returned_isize_or_errno(n));
                     }
                 }
-                drop(open);
                 let Some(wait_authority) = this
                     .captured_slot_authority(fd.0)
                     .map(WaitFdAuthority::logical)
@@ -2560,7 +2592,7 @@ impl<'a> FsView<'a> {
                     let len = buf.len();
                     let target = HostPipeWriteTarget::new(
                         hfd,
-                        Some(host_fd_owner.clone()),
+                        None,
                         false,
                         HostWriteKind::RegularFile,
                         tid,
@@ -2598,6 +2630,14 @@ impl<'a> FsView<'a> {
                         punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
                     }
                     this.invalidate_dentry_host_fd(hfd);
+                    let _ = crate::el1_delegation::delegate_locked(
+                        &open_file,
+                        &mut open,
+                        this.captured_file_table().id(),
+                        fd.0,
+                        this.fs,
+                        Some(&this.task_rlimits()),
+                    );
                 }
                 return Ok(DispatchOutcome::Returned { value: total });
             }
@@ -2752,15 +2792,18 @@ impl<'a> FsView<'a> {
                 let Some(io_lease) = open_file.description.retain_fd_lease() else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
-                if let Some((host_fd, writable)) = open_file.host_file_info() {
+                let Some(mut open) = open_file.description.write() else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
+                if matches!(&*open, OpenDescription::HostFile { .. }) {
+                    drop(io_lease);
                     return this.write_host_file(
                         cx,
                         fd,
                         tid,
                         bytes,
                         &open_file,
-                        host_fd,
-                        writable,
+                        &mut open,
                         nonblocking,
                         slot_authority,
                     );
@@ -2779,9 +2822,6 @@ impl<'a> FsView<'a> {
                 let writeback: Option<FileWriteback>;
                 let modified_path;
                 {
-                    let Some(mut open) = open_file.description.write() else {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    };
                     modified_path = this.file_write_notification_path(&open, length);
                     match &mut *open {
                         OpenDescription::SyntheticDevice { kind, .. } => {
@@ -3223,6 +3263,7 @@ impl<'a> FsView<'a> {
                         }
                         _ => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                     }
+                    drop(open);
                 }
                 if let Some(FileWriteback::Range {
                     path,
