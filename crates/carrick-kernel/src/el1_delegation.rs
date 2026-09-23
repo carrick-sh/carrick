@@ -1968,5 +1968,23 @@ mod tests {
                 "unshare(CLONE_FILES) must update EL1 file_table"
             );
         }
+
+        #[test]
+        fn test_lock_delegated_file_spins_and_yields() {
+            let file = DelegatedFile::new();
+            assert!(file.try_lock()); // locked
+            let file_ptr = &file as *const DelegatedFile as usize;
+
+            let handle = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let f = unsafe { &*(file_ptr as *const DelegatedFile) };
+                f.unlock();
+            });
+
+            lock_delegated_file(&file, 1);
+            assert!(file.is_locked());
+            file.unlock();
+            handle.join().unwrap();
+        }
     }
 }
