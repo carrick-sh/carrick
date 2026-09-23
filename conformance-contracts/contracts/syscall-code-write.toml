@@ -8,7 +8,7 @@ scale_points = [1, 8, 32, 128]
 rationale = "Copied and zero-copy host writes invalidate physical code dependencies before bytes can change. Zero-copy admission authenticates the exact selected host pointer and retains every destination through the host call, including partial failure and unwind. The current-MM read projection stays scalar. These byte-write observations do not authorize native execution."
 
 [bindings]
-vm_free = "carrick-vmm-hvf::trap::foreign_mm::tests::syscall_writes::syscall_code_write_cost_contract; native_code_content_syscall_copy_revokes_physical_dependencies; syscall_writes semantic controls for fragment crossings, stale pointers, owner generations, permissions, structural backing, alias fallback and error/unwind cleanup"
+vm_free = "carrick-vmm-hvf::trap::foreign_mm::tests::syscall_writes::syscall_code_write_cost_contract; native_code_content_syscall_copy_revokes_physical_dependencies; syscall_writes semantic controls for fragment crossings, stale pointers, owner generations, permissions, structural backing, alias fallback and error/unwind cleanup; carrick-kernel::dispatch::fs::tests::readonly_destination_offsets (read/readv into an unwritable destination: EFAULT with the regular-file offset untouched, delivered prefix and per-iovec partial counts advance it by exactly the delivered bytes)"
 
 [bindings.unresolved]
 embed_structural = "The signed syscall_write_destinations fixture checks copies, zero-copy destinations and COW, but its read-only readv offset assertion is still red on the before-step runtime and candidate. It does not observe native code revocation. Active native drain, remaining raw/hardware writes and private RX admission remain unbound."

@@ -10127,3 +10127,249 @@ fn test_host_write_ranges() -> [carrick_guest_mem::HostWriteRange; 2] {
         host: carrick_guest_mem::HostVa(address as usize),
     })
 }
+
+/// A current-MM test memory with one page range the guest cannot write:
+/// the VM-free stand-in for a `PROT_READ` destination page. Reads and the
+/// writable remainder go straight to the underlying [`LinearMemory`].
+struct ReadOnlyWindow {
+    inner: LinearMemory,
+    denied: std::ops::Range<u64>,
+}
+
+impl GuestMemory for ReadOnlyWindow {
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        self.inner.read_bytes_raw(address, length)
+    }
+
+    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        let end = address + bytes.len() as u64;
+        if address < self.denied.end && end > self.denied.start {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            });
+        }
+        self.inner.write_bytes_raw(address, bytes)
+    }
+}
+
+impl CurrentMmMemory for ReadOnlyWindow {}
+
+/// A host regular file holding `content`, installed as a guest fd, plus the
+/// raw host fd so a test can observe the shared open-file offset directly.
+fn host_file_fixture(content: &[u8]) -> (SyscallDispatcher, i32, i32) {
+    use std::io::Write;
+    use std::os::fd::IntoRawFd;
+
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(content).unwrap();
+    let raw = file.into_raw_fd();
+    let dispatcher = SyscallDispatcher::new();
+    let fd = dispatcher
+        .install_fd_at_or_above(
+            3,
+            OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::HostFile {
+                    host_fd: HostFdRef::new(raw),
+                    metadata: RootFsMetadata {
+                        path: "/readonly-destination".into(),
+                        kind: RootFsEntryKind::File,
+                        mode: 0o600,
+                        size: content.len(),
+                    },
+                    base: OpenDescriptionBase::new(LINUX_O_RDONLY),
+                    writable: false,
+                })),
+                LINUX_O_RDONLY,
+                0,
+            ),
+        )
+        .unwrap();
+    (dispatcher, fd, raw)
+}
+
+fn host_offset(raw: i32) -> i64 {
+    // SAFETY: `raw` is a live host fd owned by the fixture's HostFdRef.
+    unsafe { libc::lseek(raw, 0, libc::SEEK_CUR) as i64 }
+}
+
+/// Linux `read(2)`/`readv(2)` on a regular file advance the offset only by
+/// the bytes actually delivered to user memory. A destination the guest
+/// cannot write yields `EFAULT` with the offset untouched, and a partially
+/// writable destination yields the delivered prefix with the offset advanced
+/// by exactly that much. The signed `syscall_write_destinations` fixture
+/// recorded Carrick advancing 8192 -> 8196 on the `EFAULT` case while native
+/// Linux left it at 8192.
+mod readonly_destination_offsets {
+    use super::*;
+
+    const MEM_BASE: u64 = 0x1_0000;
+    const IOV_ADDR: u64 = 0x1_0000;
+    const WRITABLE_PAGE: u64 = 0x1_2000;
+    const READONLY_PAGE: u64 = 0x1_3000;
+    const FILE_OFFSET: i64 = 8192;
+
+    fn memory() -> ReadOnlyWindow {
+        ReadOnlyWindow {
+            inner: LinearMemory::new(MEM_BASE, vec![0; 0x8000]),
+            denied: READONLY_PAGE..READONLY_PAGE + 4096,
+        }
+    }
+
+    fn content() -> Vec<u8> {
+        (0..16384u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn call(
+        dispatcher: &SyscallDispatcher,
+        nr: u64,
+        args: [u64; 6],
+        memory: &mut ReadOnlyWindow,
+    ) -> DispatchOutcome {
+        let ctx = dispatcher.capture_one_task_context().unwrap();
+        dispatcher
+            .dispatch_normalized(
+                &ctx,
+                SyscallRequest::new(nr, SyscallArgs::from(args)),
+                memory,
+                &CompatReporter::default(),
+                None,
+            )
+            .expect("claimed")
+            .expect("outcome")
+    }
+
+    fn iovecs(memory: &mut ReadOnlyWindow, iov: &[LinuxIovec]) {
+        for (i, entry) in iov.iter().enumerate() {
+            write_kernel_struct_raw(&mut memory.inner, IOV_ADDR + 16 * i as u64, entry)
+                .expect("write iov");
+        }
+    }
+
+    #[test]
+    fn readv_efault_into_readonly_destination_preserves_host_file_offset() {
+        let (dispatcher, fd, raw) = host_file_fixture(&content());
+        let mut memory = memory();
+        assert_eq!(
+            call(
+                &dispatcher,
+                62,
+                [fd as u64, FILE_OFFSET as u64, 0, 0, 0, 0],
+                &mut memory
+            ),
+            DispatchOutcome::Returned { value: FILE_OFFSET }
+        );
+        iovecs(
+            &mut memory,
+            &[LinuxIovec {
+                iov_base: READONLY_PAGE,
+                iov_len: 4,
+            }],
+        );
+        assert_eq!(
+            call(
+                &dispatcher,
+                65,
+                [fd as u64, IOV_ADDR, 1, 0, 0, 0],
+                &mut memory
+            ),
+            DispatchOutcome::errno(LINUX_EFAULT)
+        );
+        assert_eq!(
+            host_offset(raw),
+            FILE_OFFSET,
+            "EFAULT must not consume input"
+        );
+    }
+
+    #[test]
+    fn read_efault_into_readonly_destination_preserves_host_file_offset() {
+        let (dispatcher, fd, raw) = host_file_fixture(&content());
+        let mut memory = memory();
+        call(
+            &dispatcher,
+            62,
+            [fd as u64, FILE_OFFSET as u64, 0, 0, 0, 0],
+            &mut memory,
+        );
+        assert_eq!(
+            call(
+                &dispatcher,
+                63,
+                [fd as u64, READONLY_PAGE, 4, 0, 0, 0],
+                &mut memory
+            ),
+            DispatchOutcome::errno(LINUX_EFAULT)
+        );
+        assert_eq!(
+            host_offset(raw),
+            FILE_OFFSET,
+            "EFAULT must not consume input"
+        );
+    }
+
+    #[test]
+    fn readv_partial_delivery_advances_offset_by_delivered_bytes_only() {
+        let (dispatcher, fd, raw) = host_file_fixture(&content());
+        let mut memory = memory();
+        call(
+            &dispatcher,
+            62,
+            [fd as u64, FILE_OFFSET as u64, 0, 0, 0, 0],
+            &mut memory,
+        );
+        iovecs(
+            &mut memory,
+            &[
+                LinuxIovec {
+                    iov_base: WRITABLE_PAGE,
+                    iov_len: 16,
+                },
+                LinuxIovec {
+                    iov_base: READONLY_PAGE,
+                    iov_len: 16,
+                },
+            ],
+        );
+        assert_eq!(
+            call(
+                &dispatcher,
+                65,
+                [fd as u64, IOV_ADDR, 2, 0, 0, 0],
+                &mut memory
+            ),
+            DispatchOutcome::Returned { value: 16 }
+        );
+        assert_eq!(
+            memory.read_bytes(WRITABLE_PAGE, 16).unwrap(),
+            content()[FILE_OFFSET as usize..FILE_OFFSET as usize + 16]
+        );
+        assert_eq!(host_offset(raw), FILE_OFFSET + 16);
+    }
+
+    #[test]
+    fn read_delivers_writable_page_prefix_before_readonly_page() {
+        let (dispatcher, fd, raw) = host_file_fixture(&content());
+        let mut memory = memory();
+        call(
+            &dispatcher,
+            62,
+            [fd as u64, FILE_OFFSET as u64, 0, 0, 0, 0],
+            &mut memory,
+        );
+        assert_eq!(
+            call(
+                &dispatcher,
+                63,
+                [fd as u64, WRITABLE_PAGE, 8192, 0, 0, 0],
+                &mut memory
+            ),
+            DispatchOutcome::Returned { value: 4096 }
+        );
+        assert_eq!(
+            memory.read_bytes(WRITABLE_PAGE, 4096).unwrap(),
+            content()[FILE_OFFSET as usize..FILE_OFFSET as usize + 4096]
+        );
+        assert_eq!(host_offset(raw), FILE_OFFSET + 4096);
+    }
+}
