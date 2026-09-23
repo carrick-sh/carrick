@@ -715,6 +715,8 @@ impl HvpatchRuntimeDirectory {
             .map_err(|error| RuntimeError::Configuration(error.to_string()))
         })?;
         *pool = Some(started);
+        let ptr = carrick_vmm_hvf::read_el1_region_host_ptr();
+        carrick_kernel::el1_delegation::record_el1_region_host_ptr(ptr);
         Ok(true)
     }
 
@@ -733,6 +735,7 @@ impl HvpatchRuntimeDirectory {
         for endpoint in self.endpoints.lock().values_mut() {
             endpoint.scheduler = None;
         }
+        carrick_kernel::el1_delegation::clear_el1_region_host_ptr();
         result
     }
 

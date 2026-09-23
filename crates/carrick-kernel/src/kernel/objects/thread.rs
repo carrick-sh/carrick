@@ -17,7 +17,7 @@ use carrick_hal::threaded::GuestCpuState;
 use carrick_hal::{CpuAffinity, ThreadId};
 
 use crate::kernel::crash_capture::{CrashCaptureGeneration, CrashRegisterVote};
-use crate::kernel::ids::{LinuxSignal, LinuxTid, MmId, ThreadSerial};
+use crate::kernel::ids::{FileTableId, LinuxSignal, LinuxTid, MmId, ThreadSerial};
 use crate::kernel::objects::signal::ThreadSignalState;
 use crate::kernel::objects::{
     ObjectGraphError, ObjectRevision, SYSTEM_CHARGE_WINDOW, SystemChargeWindow, Task, TaskKey,
@@ -616,6 +616,12 @@ impl ThreadExecutionLease {
 
     pub const fn executor_epoch(&self) -> u64 {
         self.executor_epoch
+    }
+
+    pub fn file_table_id(&self) -> Option<FileTableId> {
+        self.owner
+            .upgrade()
+            .map(|thread| thread.resources().files().id())
     }
 
     /// Exact address-space authority carried by the architectural snapshot.
