@@ -1,0 +1,20 @@
+[package]
+name = "carrick-el1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+carrick-el1-abi = { path = "../carrick-el1-abi" }
+
+[features]
+default = []
+host-test = []
+
+[[bin]]
+name = "carrick-el1"
+path = "src/entry.rs"
+
+[lib]
+path = "src/lib.rs"
