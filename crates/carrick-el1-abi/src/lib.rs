@@ -45,6 +45,15 @@ pub const EL1_STACK_SIZE: u64 = 0x4000;
 /// Number of vCPU stack slots supported in the stack arena (matches mailbox slots).
 pub const EL1_STACK_SLOTS: u64 = 256;
 
+/// Byte offset of the per-vCPU current-task array within the region.
+pub const EL1_CURRENT_TASKS_OFFSET: u64 = 0x60_0000;
+
+/// Base guest virtual address of the per-vCPU current-task array.
+pub const EL1_CURRENT_TASKS_BASE: u64 = EL1_REGION_BASE + EL1_CURRENT_TASKS_OFFSET;
+
+/// Size of the per-vCPU current-task array area (1 MiB).
+pub const EL1_CURRENT_TASKS_SIZE: u64 = 0x10_0000;
+
 /// Byte offset of the EL1 kernel heap within the region.
 pub const EL1_HEAP_OFFSET: u64 = 0x100_0000;
 
@@ -53,6 +62,33 @@ pub const EL1_HEAP_BASE: u64 = EL1_REGION_BASE + EL1_HEAP_OFFSET;
 
 /// Size of the EL1 kernel heap (48 MiB).
 pub const EL1_HEAP_SIZE: u64 = EL1_REGION_SIZE - EL1_HEAP_OFFSET;
+
+/// Byte offset of the object table within the region (at start of heap).
+pub const EL1_OBJECT_TABLE_OFFSET: u64 = EL1_HEAP_OFFSET;
+
+/// Base guest virtual address of the object table.
+pub const EL1_OBJECT_TABLE_BASE: u64 = EL1_REGION_BASE + EL1_OBJECT_TABLE_OFFSET;
+
+/// Size of the object table area (64 KiB).
+pub const EL1_OBJECT_TABLE_SIZE: u64 = 0x1_0000;
+
+/// Byte offset of the fd map within the region.
+pub const EL1_FD_MAP_OFFSET: u64 = EL1_OBJECT_TABLE_OFFSET + EL1_OBJECT_TABLE_SIZE;
+
+/// Base guest virtual address of the fd map.
+pub const EL1_FD_MAP_BASE: u64 = EL1_REGION_BASE + EL1_FD_MAP_OFFSET;
+
+/// Size of the fd map area (64 KiB).
+pub const EL1_FD_MAP_SIZE: u64 = 0x1_0000;
+
+/// Byte offset of the file page cache arena within the region.
+pub const EL1_CACHE_OFFSET: u64 = EL1_HEAP_OFFSET + 0x10_0000; // 1 MiB into heap
+
+/// Base guest virtual address of the file page cache arena.
+pub const EL1_CACHE_BASE: u64 = EL1_REGION_BASE + EL1_CACHE_OFFSET;
+
+/// Size of the file page cache arena (32 MiB).
+pub const EL1_CACHE_SIZE: u64 = (MAX_DELEGATED_FILES as u64) * DELEGATED_FILE_MAX_SIZE;
 
 /// Magic bytes at offset 0 of the EL1 image header: `CEL1`.
 pub const IMAGE_MAGIC: [u8; 4] = *b"CEL1";
@@ -121,7 +157,216 @@ pub struct TrapFrame {
     pub slot: u64,
 }
 
-pub use core::sync::atomic::{AtomicU64, Ordering};
+pub use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+/// Per-vCPU slot task record published by the host runtime before running
+/// a vCPU and cleared when unloaded.
+#[repr(C)]
+#[derive(Debug)]
+pub struct CurrentTask {
+    /// Host-managed generation of the currently loaded task.
+    pub generation: AtomicU64,
+    /// Raw FileTableId of the currently loaded task (0 = none/unbound).
+    pub file_table: AtomicU64,
+}
+
+impl CurrentTask {
+    pub const fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            file_table: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    pub fn clear(&self) {
+        self.file_table.store(0, Ordering::Release);
+        self.generation.store(0, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn set(&self, generation: u64, file_table: u64) {
+        self.generation.store(generation, Ordering::Release);
+        self.file_table.store(file_table, Ordering::Release);
+    }
+}
+
+impl Default for CurrentTask {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Lifecycle state of a delegated file object in the EL1 object table: Dead.
+pub const DELEGATED_STATE_DEAD: u32 = 0;
+/// Lifecycle state of a delegated file object in the EL1 object table: Guest-owned.
+pub const DELEGATED_STATE_GUEST: u32 = 1;
+/// Lifecycle state of a delegated file object in the EL1 object table: Being recalled by host.
+pub const DELEGATED_STATE_RECALLING: u32 = 2;
+
+/// File access flag: Readable.
+pub const DELEGATED_FLAG_READABLE: u32 = 1 << 0;
+/// File access flag: Writable.
+pub const DELEGATED_FLAG_WRITABLE: u32 = 1 << 1;
+/// File access flag: Append.
+pub const DELEGATED_FLAG_APPEND: u32 = 1 << 2;
+
+/// Maximum number of simultaneously delegated files.
+pub const MAX_DELEGATED_FILES: usize = 128;
+
+/// Maximum size of a delegated regular file (256 KiB).
+pub const DELEGATED_FILE_MAX_SIZE: u64 = 256 * 1024;
+
+/// Page size used for delegated cache pages (4 KiB).
+pub const DELEGATED_PAGE_SIZE: u64 = 4096;
+
+/// Number of 4 KiB pages per delegated file cache (64 pages).
+pub const DELEGATED_MAX_PAGES: usize = 64;
+
+/// Capacity of the EL1 fd map (512 slots).
+pub const FD_MAP_CAPACITY: usize = 512;
+
+/// EL1 object table entry representing a delegated regular file.
+#[repr(C)]
+#[repr(align(64))]
+pub struct DelegatedFile {
+    /// Object lifecycle state: Dead (0), Guest (1), Recalling (2).
+    pub state: AtomicU32,
+    /// Spinlock word usable by both host and guest: 0 = unlocked, 1 = locked.
+    pub lock: AtomicU32,
+    /// Owner generation word.
+    pub generation: AtomicU64,
+    /// Current logical file offset.
+    pub offset: AtomicU64,
+    /// Current file size in bytes.
+    pub size: AtomicU64,
+    /// File access flags (`DELEGATED_FLAG_*`).
+    pub flags: AtomicU32,
+    pub _reserved0: u32,
+    /// 64-bit dirty page mask (bit i indicates 4 KiB page i is dirty).
+    pub dirty_mask: AtomicU64,
+    pub _pad: [u8; 16],
+}
+
+impl DelegatedFile {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU32::new(DELEGATED_STATE_DEAD),
+            lock: AtomicU32::new(0),
+            generation: AtomicU64::new(0),
+            offset: AtomicU64::new(0),
+            size: AtomicU64::new(0),
+            flags: AtomicU32::new(0),
+            _reserved0: 0,
+            dirty_mask: AtomicU64::new(0),
+            _pad: [0; 16],
+        }
+    }
+
+    /// Try to acquire the spinlock without blocking.
+    /// Guest calls this; if it returns `false`, guest must FORWARD.
+    #[inline]
+    pub fn try_lock(&self) -> bool {
+        self.lock
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Release the spinlock.
+    #[inline]
+    pub fn unlock(&self) {
+        self.lock.store(0, Ordering::Release);
+    }
+
+    /// Check if the lock is currently held.
+    #[inline]
+    pub fn is_locked(&self) -> bool {
+        self.lock.load(Ordering::Relaxed) != 0
+    }
+
+    /// Host spin-waits until the lock is acquired.
+    pub fn host_lock(&self) {
+        while self
+            .lock
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+impl Default for DelegatedFile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Mapping from `(file_table, fd)` to a 1-based delegated file `handle`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct FdMapSlot {
+    /// Owning FileTableId (0 = empty).
+    pub file_table: AtomicU64,
+    /// Guest file descriptor number.
+    pub fd: AtomicU32,
+    /// 1-based delegated file handle (0 = empty).
+    pub handle: AtomicU32,
+}
+
+impl FdMapSlot {
+    pub const fn new() -> Self {
+        Self {
+            file_table: AtomicU64::new(0),
+            fd: AtomicU32::new(0),
+            handle: AtomicU32::new(0),
+        }
+    }
+
+    #[inline]
+    pub fn clear(&self) {
+        self.handle.store(0, Ordering::Release);
+        self.fd.store(0, Ordering::Release);
+        self.file_table.store(0, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn set(&self, file_table: u64, fd: u32, handle: u32) {
+        self.file_table.store(file_table, Ordering::Relaxed);
+        self.fd.store(fd, Ordering::Relaxed);
+        self.handle.store(handle, Ordering::Release);
+    }
+}
+
+impl Default for FdMapSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Lookup a delegated file handle for a given `(file_table, fd)`.
+pub fn fd_map_lookup(map: &[FdMapSlot], file_table: u64, fd: i32) -> Option<u32> {
+    if file_table == 0 || fd < 0 {
+        return None;
+    }
+    let ufd = fd as u32;
+    for slot in map.iter().take(FD_MAP_CAPACITY) {
+        let h = slot.handle.load(Ordering::Acquire);
+        if h != 0
+            && slot.fd.load(Ordering::Relaxed) == ufd
+            && slot.file_table.load(Ordering::Relaxed) == file_table
+        {
+            return Some(h);
+        }
+    }
+    None
+}
+
+/// Calculate the guest virtual address of a delegated file's cache.
+#[inline]
+pub const fn delegated_file_cache_va(handle: u32) -> u64 {
+    EL1_CACHE_BASE + ((handle - 1) as u64) * DELEGATED_FILE_MAX_SIZE
+}
 
 /// Total size of the EL1 kernel image area (1 MiB).
 pub const EL1_IMAGE_SIZE: u64 = 0x10_0000;
@@ -187,8 +432,11 @@ const _: () = assert!(EL1_COUNTERS_OFFSET + EL1_COUNTERS_SIZE <= EL1_STACKS_OFFS
 const _: () = assert!(
     EL1_STACKS_OFFSET + EL1_STACK_SLOTS * EL1_STACK_SIZE <= EL1_STACKS_OFFSET + EL1_STACKS_SIZE
 );
-const _: () = assert!(EL1_STACKS_OFFSET + EL1_STACKS_SIZE <= EL1_HEAP_OFFSET);
-const _: () = assert!(EL1_HEAP_OFFSET + EL1_HEAP_SIZE <= EL1_REGION_SIZE);
+const _: () = assert!(EL1_STACKS_OFFSET + EL1_STACKS_SIZE <= EL1_CURRENT_TASKS_OFFSET);
+const _: () = assert!(EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE <= EL1_HEAP_OFFSET);
+const _: () = assert!(EL1_OBJECT_TABLE_OFFSET + EL1_OBJECT_TABLE_SIZE <= EL1_FD_MAP_OFFSET);
+const _: () = assert!(EL1_FD_MAP_OFFSET + EL1_FD_MAP_SIZE <= EL1_CACHE_OFFSET);
+const _: () = assert!(EL1_CACHE_OFFSET + EL1_CACHE_SIZE <= EL1_REGION_SIZE);
 
 #[cfg(test)]
 mod tests {
@@ -231,5 +479,78 @@ mod tests {
         assert_eq!(core::mem::offset_of!(ImageHeader, version), 4);
         assert_eq!(core::mem::offset_of!(ImageHeader, entry_offset), 8);
         assert_eq!(core::mem::offset_of!(ImageHeader, image_size), 16);
+    }
+
+    #[test]
+    fn test_current_task_layout() {
+        assert_eq!(core::mem::size_of::<CurrentTask>(), 16);
+        assert_eq!(core::mem::align_of::<CurrentTask>(), 8);
+    }
+
+    #[test]
+    fn test_delegated_file_layout() {
+        assert_eq!(core::mem::size_of::<DelegatedFile>(), 64);
+        assert_eq!(core::mem::align_of::<DelegatedFile>(), 64);
+    }
+
+    #[test]
+    fn test_fd_map_slot_layout() {
+        assert_eq!(core::mem::size_of::<FdMapSlot>(), 16);
+        assert_eq!(core::mem::align_of::<FdMapSlot>(), 8);
+    }
+
+    #[test]
+    fn test_current_task_operations() {
+        let task = CurrentTask::new();
+        assert_eq!(task.generation.load(Ordering::Relaxed), 0);
+        assert_eq!(task.file_table.load(Ordering::Relaxed), 0);
+
+        task.set(42, 100);
+        assert_eq!(task.generation.load(Ordering::Relaxed), 42);
+        assert_eq!(task.file_table.load(Ordering::Relaxed), 100);
+
+        task.clear();
+        assert_eq!(task.generation.load(Ordering::Relaxed), 0);
+        assert_eq!(task.file_table.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_delegated_file_locking() {
+        let file = DelegatedFile::new();
+        assert!(!file.is_locked());
+        assert!(file.try_lock());
+        assert!(file.is_locked());
+        assert!(!file.try_lock());
+        file.unlock();
+        assert!(!file.is_locked());
+        assert!(file.try_lock());
+        file.unlock();
+    }
+
+    #[test]
+    fn test_fd_map_operations() {
+        let slots = [const { FdMapSlot::new() }; FD_MAP_CAPACITY];
+        assert_eq!(fd_map_lookup(&slots, 10, 3), None);
+
+        slots[0].set(10, 3, 1);
+        slots[1].set(10, 4, 2);
+        slots[2].set(20, 3, 3);
+
+        assert_eq!(fd_map_lookup(&slots, 10, 3), Some(1));
+        assert_eq!(fd_map_lookup(&slots, 10, 4), Some(2));
+        assert_eq!(fd_map_lookup(&slots, 20, 3), Some(3));
+        assert_eq!(fd_map_lookup(&slots, 10, 5), None);
+        assert_eq!(fd_map_lookup(&slots, 30, 3), None);
+
+        slots[0].clear();
+        assert_eq!(fd_map_lookup(&slots, 10, 3), None);
+    }
+
+    #[test]
+    fn test_delegated_file_cache_va() {
+        let va1 = delegated_file_cache_va(1);
+        let va2 = delegated_file_cache_va(2);
+        assert_eq!(va1, EL1_CACHE_BASE);
+        assert_eq!(va2, EL1_CACHE_BASE + DELEGATED_FILE_MAX_SIZE);
     }
 }
