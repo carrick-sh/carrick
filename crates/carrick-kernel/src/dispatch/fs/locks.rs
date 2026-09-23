@@ -1709,7 +1709,7 @@ impl<'a> FsView<'a> {
                     // kernel signals the F_SETOWN owner on a readiness edge).
                     const LINUX_F_SETFL_MUTABLE: u64 =
                         LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_ASYNC;
-                    let Some(open) = open_file.description.read() else {
+                    let Some(open) = open_file.description.write() else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
                     let next_flags = (open_file.description.common().status_flags()
@@ -1761,8 +1761,8 @@ impl<'a> FsView<'a> {
                         }
                         _ => {}
                     }
-                    drop(open);
                     open_file.description.common().set_status_flags(next_flags);
+                    drop(open);
                     // Reflect the new O_ASYNC state into the fork-coherent FASYNC
                     // registry so a WRITER in another guest process can deliver the
                     // owner's signal on the readiness edge (the arming lives on the

@@ -204,6 +204,8 @@ pub(crate) struct FsState {
     host_sparse_extents:
         std::sync::Arc<parking_lot::Mutex<HashMap<HostFileIdentity, HostSparseExtents>>>,
     has_sparse_extents: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    pub(crate) before_host_write_test_hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -663,6 +665,8 @@ impl FsState {
             classic_record_locks: std::sync::Arc::new(super::LogicalRecordLocks::default()),
             host_sparse_extents: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             has_sparse_extents: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            before_host_write_test_hook: None,
         }
     }
 
@@ -684,6 +688,8 @@ impl FsState {
             classic_record_locks: std::sync::Arc::clone(&self.classic_record_locks),
             host_sparse_extents: std::sync::Arc::clone(&self.host_sparse_extents),
             has_sparse_extents: std::sync::Arc::clone(&self.has_sparse_extents),
+            #[cfg(test)]
+            before_host_write_test_hook: self.before_host_write_test_hook.clone(),
         }
     }
 

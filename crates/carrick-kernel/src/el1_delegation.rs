@@ -164,6 +164,21 @@ pub(crate) fn delegate(
     fs: &FsState,
     rlimits: Option<&RlimitSet>,
 ) -> Result<u32, NotEligible> {
+    let Some(d) = open_file.description.open_description() else {
+        return Err(NotEligible::NotRegularFile);
+    };
+    let mut open = d.write();
+    delegate_locked(open_file, &mut open, file_table, fd, fs, rlimits)
+}
+
+pub(crate) fn delegate_locked(
+    open_file: &OpenFile,
+    open: &mut OpenDescription,
+    file_table: FileTableId,
+    fd: i32,
+    fs: &FsState,
+    rlimits: Option<&RlimitSet>,
+) -> Result<u32, NotEligible> {
     if std::env::var_os("CARRICK_EL1").is_some_and(|val| val == "0") {
         return Err(NotEligible::Disabled);
     }
@@ -192,11 +207,6 @@ pub(crate) fn delegate(
     if !fs.fanotify_registry.is_empty() {
         return Err(NotEligible::Watched);
     }
-
-    let Some(d) = open_file.description.open_description() else {
-        return Err(NotEligible::NotRegularFile);
-    };
-    let open = d.write();
 
     let status = open_file.description.common().status_flags();
     let open_flags = LinuxOpenFlags::from_bits_truncate(status);
@@ -383,7 +393,11 @@ pub(crate) fn recall_if_delegated(description: &FileDescription) {
     }
 }
 
-fn recall_locked(description: &FileDescription, open: &mut OpenDescription, handle: u32) {
+pub(crate) fn recall_locked(
+    description: &FileDescription,
+    open: &mut OpenDescription,
+    handle: u32,
+) {
     mark_pending_host_work_all();
     let region_ptr = get_el1_region_host_ptr();
     if region_ptr == 0 {
@@ -795,5 +809,106 @@ mod tests {
             "dup must recall delegated description"
         );
         host_file.description.release_fd_ref();
+    }
+
+    #[test]
+    fn test_host_write_interleaved_with_delegate_race() {
+        let _region = TestEl1Region::new();
+        let (_tmp, host_file) = create_test_host_file(b"");
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            1,
+            crate::thread::ThreadId::synthetic_for_tests(1),
+            "test-write-race".to_owned(),
+        )
+        .expect("root bootstrap");
+        let ctx = crate::kernel::Kernel::bootstrap_root(bootstrap)
+            .expect("root kernel")
+            .1;
+        let table = ctx.task().leader_file_table().unwrap();
+        let reservation = table.reserve_exact_target(3, 1024).unwrap();
+        let slot = FileSlot::new(Arc::clone(&host_file.description), 0);
+        reservation.commit(slot).unwrap();
+        assert_eq!(host_file.description.common().fd_refs(), 1);
+        let fd = 3;
+        let table_id = table.id();
+
+        let (in_hook_tx, in_hook_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let continue_rx = Arc::new(parking_lot::Mutex::new(continue_rx));
+
+        let continue_rx_clone = Arc::clone(&continue_rx);
+        dispatcher.set_before_host_write_test_hook(Some(Arc::new(move || {
+            let _ = in_hook_tx.send(());
+            let _ = continue_rx_clone.lock().recv();
+        })));
+
+        let thread2 = std::thread::spawn(move || {
+            let reporter = carrick_observability::compat::CompatReporter::default();
+            let mut mem = crate::dispatch::LinearMemory::new(0x10000, b"thread2 data".to_vec());
+            let tid = crate::thread::ThreadId::from_guest_supplied_tid(1);
+            let registry = crate::thread::ThreadRegistry::new(tid);
+            let futex = crate::thread::FutexTable::new();
+            let req = crate::dispatch::SyscallRequest::new(
+                64, // SYS_write
+                crate::dispatch::SyscallArgs([fd as u64, 0x10000, 12, 0, 0, 0]),
+            );
+            dispatcher
+                .dispatch_threaded(
+                    &ctx,
+                    req,
+                    &mut mem,
+                    &reporter,
+                    crate::dispatch::ThreadCtx::new(tid, &registry, &futex),
+                )
+                .expect("dispatch write")
+        });
+
+        // Wait for thread 2 to reach the hook
+        in_hook_rx.recv().unwrap();
+
+        // While thread 2 is paused in the hook, verify write lock is held by thread 2!
+        let desc = host_file.description.open_description().unwrap();
+        assert!(
+            desc.try_write().is_none(),
+            "write lock must be held across host write"
+        );
+
+        // Thread 1 attempts to delegate concurrently while thread 2 is in the hook.
+        // It must block until thread 2 finishes its write under the lock discipline.
+        let host_file_clone = host_file.clone();
+        let (thread1_started_tx, thread1_started_rx) = std::sync::mpsc::channel();
+        let thread1 = std::thread::spawn(move || {
+            let _ = thread1_started_tx.send(());
+            delegate_for_test(&host_file_clone, table_id, fd)
+        });
+        thread1_started_rx.recv().unwrap();
+        // Brief pause to ensure thread 1 has contested the lock
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Resume thread 2
+        continue_tx.send(()).unwrap();
+        let outcome = thread2.join().unwrap();
+        assert_eq!(
+            outcome,
+            crate::dispatch::DispatchOutcome::Returned { value: 12 }
+        );
+
+        let delegate_res = thread1.join().unwrap();
+        eprintln!("delegate_res = {:?}", delegate_res);
+
+        // Recall to verify writeback / offset integrity
+        recall(&host_file.description);
+
+        // Check host file size and content
+        let open_desc = host_file.description.open_description().unwrap().read();
+        let OpenDescription::HostFile { host_fd, .. } = &*open_desc else {
+            panic!("HostFile");
+        };
+        let mut buf = [0u8; 12];
+        let n = unsafe { libc::pread(host_fd.raw(), buf.as_mut_ptr() as *mut libc::c_void, 12, 0) };
+        assert_eq!(n, 12, "thread 2 bytes were lost/truncated!");
+        assert_eq!(&buf, b"thread2 data");
     }
 }

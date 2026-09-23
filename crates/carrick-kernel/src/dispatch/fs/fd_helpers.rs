@@ -47,14 +47,14 @@ impl<'a> FsView<'a> {
     pub(super) fn notify_host_file_write_result(
         &self,
         context: &crate::kernel::KernelContext,
-        open_file: &OpenFile,
+        open_path: Option<&str>,
         outcome: &DispatchOutcome,
     ) {
         if self.fs.inotify_registry.is_empty() && self.fs.fanotify_registry.is_empty() {
             return;
         }
-        if let Some(open_path) = open_file.host_file_open_path() {
-            self.notify_file_write_result(context, Some(&open_path), outcome);
+        if let Some(open_path) = open_path {
+            self.notify_file_write_result(context, Some(open_path), outcome);
         }
     }
 
