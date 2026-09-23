@@ -144,6 +144,7 @@ pub(crate) fn from_neutral(s: &Aarch64VcpuSnapshot) -> VcpuSnapshot {
 pub struct HvfAarch64Vcpu {
     pub(crate) inner: std::mem::ManuallyDrop<applevisor::vcpu::Vcpu>,
     pub(crate) mailbox: MailboxBinding,
+    tidstamp_debug: Option<bool>,
 }
 
 impl HvfAarch64Vcpu {
@@ -151,6 +152,7 @@ impl HvfAarch64Vcpu {
         Self {
             inner: std::mem::ManuallyDrop::new(vcpu),
             mailbox,
+            tidstamp_debug: None,
         }
     }
 }
@@ -388,6 +390,7 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         self.inner
             .set_sys_reg(SysReg::TPIDRRO_EL0, packed)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+
         if std::env::var_os("CARRICK_TIDSTAMP_DEBUG").is_some() {
             let back = self.inner.get_sys_reg(SysReg::CONTEXTIDR_EL1);
             let back_ro = self.inner.get_sys_reg(SysReg::TPIDRRO_EL0);
@@ -401,7 +404,10 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
 
     fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
         let exit = HvfInner::run_to_exit(&mut self.inner, &mut self.mailbox);
-        if std::env::var_os("CARRICK_TIDSTAMP_DEBUG").is_some() {
+        let tidstamp_debug = *self
+            .tidstamp_debug
+            .get_or_insert_with(|| std::env::var_os("CARRICK_TIDSTAMP_DEBUG").is_some());
+        if tidstamp_debug {
             use applevisor::prelude::SysReg;
             // Does the tid stamp SURVIVE a run/trap round trip? The stamp itself
             // reads back fine immediately after `set_sys_reg`, so if the EL1
