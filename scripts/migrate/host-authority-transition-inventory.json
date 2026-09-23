@@ -6379,6 +6379,32 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "user-selected completed inotify09 population capture"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_to_string",
+    "profiles": [
+      "macos-cli-default"
+    ],
+    "rationale": "At crates/carrick-cli/src/commands.rs:1219 in `run_cli`, `std::fs::read_to_string` accesses only the user-selected completed inotify09 population capture.",
+    "review_id": "HA-000670",
+    "source": {
+      "byte_end": 57985,
+      "byte_start": 57962,
+      "column": 39,
+      "column_end": 62,
+      "column_start": 39,
+      "file": "crates/carrick-cli/src/commands.rs",
+      "line": 1219,
+      "line_end": 1219,
+      "line_start": 1219
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "user-selected HVPatch carrier low-rate profile receipt"
     },
     "expansion": null,
@@ -9886,32 +9912,6 @@
       "line": 563,
       "line_end": 563,
       "line_start": 563
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
-      "resource": "user-selected completed inotify09 population capture"
-    },
-    "expansion": null,
-    "operation": "std::fs::read_to_string",
-    "profiles": [
-      "macos-cli-default"
-    ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1219 in `run_cli`, `std::fs::read_to_string` accesses only the user-selected completed inotify09 population capture.",
-    "review_id": "HA-000670",
-    "source": {
-      "byte_end": 57985,
-      "byte_start": 57962,
-      "column": 39,
-      "column_end": 62,
-      "column_start": 39,
-      "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1219,
-      "line_end": 1219,
-      "line_start": 1219
     }
   },
   {
