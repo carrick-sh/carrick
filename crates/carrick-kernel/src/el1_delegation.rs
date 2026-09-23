@@ -70,6 +70,8 @@ static DELEGATED_INODES: Mutex<Option<HashMap<InodeIdentity, (u32, Weak<FileDesc
     Mutex::new(None);
 static DELEGATED_HANDLE_INODES: Mutex<[Option<InodeIdentity>; MAX_DELEGATED_FILES]> =
     Mutex::new([const { None }; MAX_DELEGATED_FILES]);
+static DELEGATED_ROOTFS: Mutex<[Option<Weak<carrick_vfs::RootFsVfs>>; MAX_DELEGATED_FILES]> =
+    Mutex::new([const { None }; MAX_DELEGATED_FILES]);
 static HOOK_INIT: std::sync::Once = std::sync::Once::new();
 
 pub(crate) fn init_delegation_hooks() {
@@ -140,7 +142,7 @@ pub(crate) fn recall_by_inode(inode: InodeIdentity) -> bool {
         }
     };
     if let Some(desc) = desc {
-        recall(&desc);
+        let _ = recall(&desc);
         true
     } else {
         false
@@ -167,6 +169,8 @@ fn free_handle(handle: u32) {
         handles[idx] = false;
         let mut descs = DELEGATED_DESCRIPTIONS.lock();
         descs[idx] = None;
+        let mut rootfs = DELEGATED_ROOTFS.lock();
+        rootfs[idx] = None;
         let inode = {
             let mut handle_inodes = DELEGATED_HANDLE_INODES.lock();
             handle_inodes[idx].take()
@@ -213,7 +217,7 @@ pub(crate) fn recall_all_watched(fs: &FsState) {
             }
         };
         if should_recall {
-            recall(&desc);
+            let _ = recall(&desc);
         }
     }
 }
@@ -409,6 +413,8 @@ pub(crate) fn delegate_locked(
         map_ref.insert(inode, (handle, Arc::downgrade(&open_file.description)));
         let mut handle_inodes = DELEGATED_HANDLE_INODES.lock();
         handle_inodes[(handle - 1) as usize] = Some(inode);
+        let mut rootfs = DELEGATED_ROOTFS.lock();
+        rootfs[(handle - 1) as usize] = Some(Arc::downgrade(&fs.rootfs_vfs));
         HAS_DELEGATED_FILES.store(true, Ordering::Release);
     }
 
@@ -508,26 +514,30 @@ pub fn delegate_for_test(
 }
 
 /// Recall a delegated file description back to host authority.
-pub(crate) fn recall(description: &FileDescription) {
+pub(crate) fn recall(description: &FileDescription) -> Result<(), carrick_abi::LinuxErrno> {
     let handle = description.delegation_handle();
     if handle == 0 {
-        return;
+        return Ok(());
     }
     let Some(d) = description.open_description() else {
-        return;
+        return Ok(());
     };
     let mut guard = d.write();
     let handle = description.delegation_handle();
     if handle == 0 {
-        return;
+        return Ok(());
     }
-    recall_locked(description, &mut guard, handle);
+    recall_locked(description, &mut guard, handle)
 }
 
 /// Recall a file description if it is currently delegated.
-pub(crate) fn recall_if_delegated(description: &FileDescription) {
+pub(crate) fn recall_if_delegated(
+    description: &FileDescription,
+) -> Result<(), carrick_abi::LinuxErrno> {
     if description.delegation_handle() != 0 {
-        recall(description);
+        recall(description)
+    } else {
+        Ok(())
     }
 }
 
@@ -535,14 +545,19 @@ pub(crate) fn recall_locked(
     description: &FileDescription,
     open: &mut OpenDescription,
     handle: u32,
-) {
+) -> Result<(), carrick_abi::LinuxErrno> {
     mark_pending_host_work_all();
     let region_ptr = get_el1_region_host_ptr();
     if region_ptr == 0 {
-        description.set_delegation_handle(0);
-        free_handle(handle);
-        return;
+        carrick_fatal!(
+            "el1_delegation",
+            "recall called with null EL1 region pointer (handle={handle})"
+        );
     }
+    let rootfs_vfs = DELEGATED_ROOTFS.lock()[(handle - 1) as usize]
+        .as_ref()
+        .and_then(|w| w.upgrade());
+
     let file_ptr = (region_ptr
         + EL1_OBJECT_TABLE_OFFSET as usize
         + (handle as usize - 1) * core::mem::size_of::<DelegatedFile>())
@@ -560,6 +575,7 @@ pub(crate) fn recall_locked(
         + EL1_CACHE_OFFSET as usize
         + (handle as usize - 1) * DELEGATED_FILE_MAX_SIZE as usize) as *mut u8;
 
+    let mut write_error = None;
     if dirty_mask != 0 {
         for i in 0..64 {
             if (dirty_mask & (1 << i)) != 0 {
@@ -568,19 +584,16 @@ pub(crate) fn recall_locked(
                     let page_len = std::cmp::min(4096, (guest_size - page_offset) as usize);
                     let page_slice =
                         unsafe { std::slice::from_raw_parts(cache_ptr.add(i * 4096), page_len) };
-                    match open {
-                        OpenDescription::HostFile { host_fd, .. } => unsafe {
-                            libc::pwrite(
-                                host_fd.raw(),
-                                page_slice.as_ptr() as *const libc::c_void,
-                                page_len,
-                                page_offset as libc::off_t,
-                            );
-                        },
-                        OpenDescription::File { contents, .. } => {
-                            let _ = contents.write_at(page_offset, page_slice);
+                    if let Err(err) = crate::dispatch::fs::rw::commit_bytes_at_offset(
+                        open,
+                        page_offset,
+                        page_slice,
+                        rootfs_vfs.as_deref(),
+                    ) {
+                        description.common().record_writeback_error(err);
+                        if write_error.is_none() {
+                            write_error = Some(err);
                         }
-                        _ => {}
                     }
                 }
             }
@@ -591,21 +604,70 @@ pub(crate) fn recall_locked(
         OpenDescription::HostFile {
             host_fd, metadata, ..
         } => {
-            unsafe {
-                libc::lseek(host_fd.raw(), guest_offset as libc::off_t, libc::SEEK_SET);
-                libc::ftruncate(host_fd.raw(), guest_size as libc::off_t);
+            let trunc_res = unsafe { libc::ftruncate(host_fd.raw(), guest_size as libc::off_t) };
+            if trunc_res != 0 {
+                let err = crate::host_to_linux_errno(
+                    std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO),
+                );
+                description.common().record_writeback_error(err);
+                if write_error.is_none() {
+                    write_error = Some(err);
+                }
+            }
+            let seek_res =
+                unsafe { libc::lseek(host_fd.raw(), guest_offset as libc::off_t, libc::SEEK_SET) };
+            if seek_res < 0 {
+                let err = crate::host_to_linux_errno(
+                    std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO),
+                );
+                description.common().record_writeback_error(err);
+                if write_error.is_none() {
+                    write_error = Some(err);
+                }
             }
             metadata.size = guest_size as usize;
         }
         OpenDescription::File {
+            path,
             contents,
             offset,
             metadata,
             ..
         } => {
-            let _ = contents.resize(guest_size);
+            if let Err(err) = contents.resize(guest_size) {
+                description.common().record_writeback_error(err);
+                if write_error.is_none() {
+                    write_error = Some(err);
+                }
+            }
             *offset = guest_offset as usize;
             metadata.size = guest_size as usize;
+            if let Some(vfs) = rootfs_vfs.as_deref() {
+                if !crate::dispatch::fd_table::is_anon_overlay_path(path) {
+                    if let Err(e) = vfs.write_file_range(path, 0, &[], guest_size as usize) {
+                        let err = match e {
+                            carrick_vfs::fs_backend::BackendError::Host(err)
+                            | carrick_vfs::fs_backend::BackendError::Namespace(err) => err,
+                            carrick_vfs::fs_backend::BackendError::Invalid => {
+                                carrick_abi::LINUX_EINVAL
+                            }
+                            carrick_vfs::fs_backend::BackendError::Unsupported => {
+                                carrick_abi::LINUX_ENOTSUP
+                            }
+                            carrick_vfs::fs_backend::BackendError::Io => carrick_abi::LINUX_EIO,
+                        };
+                        description.common().record_writeback_error(err);
+                        if write_error.is_none() {
+                            write_error = Some(err);
+                        }
+                    }
+                    vfs.notify_inode_changed(path, None);
+                }
+            }
         }
         _ => {}
     }
@@ -624,6 +686,12 @@ pub(crate) fn recall_locked(
     file.unlock();
 
     description.set_delegation_handle(0);
+
+    if let Some(err) = write_error {
+        Err(err)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -722,7 +790,7 @@ mod tests {
         assert!(res.is_ok(), "expected valid file to delegate: {res:?}");
         let handle = res.unwrap();
         assert_eq!(valid_file.description.delegation_handle(), handle);
-        recall(&valid_file.description);
+        let _ = recall(&valid_file.description);
         assert_eq!(valid_file.description.delegation_handle(), 0);
 
         // 2. Already delegated
@@ -732,7 +800,7 @@ mod tests {
             delegate_for_test(&file2, table_id, 4),
             Err(NotEligible::AlreadyDelegated)
         );
-        recall(&file2.description);
+        let _ = recall(&file2.description);
 
         // 3. File too large (> 256 KiB)
         let large_data = vec![0xAAu8; (DELEGATED_FILE_MAX_SIZE + 1) as usize];
@@ -811,7 +879,7 @@ mod tests {
         file.dirty_mask.store(1, Ordering::Release); // page 0 dirty
 
         // Recall back to host
-        recall(&host_file.description);
+        let _ = recall(&host_file.description);
         assert_eq!(host_file.description.delegation_handle(), 0);
 
         // Verify host file contents, size, and offset
@@ -861,7 +929,7 @@ mod tests {
         file.dirty_mask.store(1, Ordering::Release);
 
         // Recall back to host
-        recall(&mem_file.description);
+        let _ = recall(&mem_file.description);
         assert_eq!(mem_file.description.delegation_handle(), 0);
 
         let open_desc = mem_file.description.open_description().unwrap().read();
@@ -1037,7 +1105,7 @@ mod tests {
         eprintln!("delegate_res = {:?}", delegate_res);
 
         // Recall to verify writeback / offset integrity
-        recall(&host_file.description);
+        let _ = recall(&host_file.description);
 
         // Check host file size and content
         let open_desc = host_file.description.open_description().unwrap().read();
@@ -1263,7 +1331,7 @@ mod tests {
         assert_eq!(handle_p, 1);
 
         // Recall P -> frees handle 1
-        recall(&open_p.description);
+        let _ = recall(&open_p.description);
         assert_eq!(open_p.description.delegation_handle(), 0);
 
         // 2. Create file Q (10 bytes) with 0xBB
@@ -1290,5 +1358,147 @@ mod tests {
                 "offset {i} in reused handle cache was not zeroed upon delegate"
             );
         }
+    }
+
+    fn fsync_for_test(
+        dispatcher: &mut crate::dispatch::SyscallDispatcher,
+        fd: i32,
+    ) -> Result<i64, carrick_abi::LinuxErrno> {
+        let mut memory = crate::dispatch::LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let reporter = carrick_observability::compat::CompatReporter::default();
+        let outcome = dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                crate::dispatch::request::SyscallRequest::new(
+                    carrick_abi::syscall::nr::FSYNC.0,
+                    carrick_observability::compat::SyscallArgs([fd as u64, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        match outcome {
+            crate::dispatch::DispatchOutcome::Returned { value } => Ok(value),
+            crate::dispatch::DispatchOutcome::Errno { errno } => Err(errno),
+            other => panic!("unexpected outcome: {:?}", other),
+        }
+    }
+
+    fn close_for_test(
+        dispatcher: &mut crate::dispatch::SyscallDispatcher,
+        fd: i32,
+    ) -> Result<i64, carrick_abi::LinuxErrno> {
+        let mut memory = crate::dispatch::LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let reporter = carrick_observability::compat::CompatReporter::default();
+        let outcome = dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                crate::dispatch::request::SyscallRequest::new(
+                    carrick_abi::syscall::nr::CLOSE.0,
+                    carrick_observability::compat::SyscallArgs([fd as u64, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        match outcome {
+            crate::dispatch::DispatchOutcome::Returned { value } => Ok(value),
+            crate::dispatch::DispatchOutcome::Errno { errno } => Err(errno),
+            other => panic!("unexpected outcome: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_el1_writeback_memory_backend_and_enospc_fsync() {
+        let _region = TestEl1Region::new();
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            1,
+            crate::thread::ThreadId::synthetic_for_tests(1),
+            "test-inmem-writeback".to_owned(),
+        )
+        .expect("root bootstrap");
+        let ctx = crate::kernel::Kernel::bootstrap_root(bootstrap)
+            .expect("root kernel")
+            .1;
+        let table = ctx.task().leader_file_table().unwrap();
+        let table_id = table.id();
+
+        // 1. Create and open an in-memory file on rootfs
+        let fd = open_path_for_test(
+            &dispatcher,
+            &ctx,
+            "/test_inmem_wb.txt",
+            carrick_abi::LINUX_O_CREAT | carrick_abi::LINUX_O_RDWR,
+        );
+        let open_file = dispatcher.open_file(fd).unwrap();
+        let handle = delegate(&open_file, table_id, fd, dispatcher.fs(), None).unwrap();
+        assert_eq!(handle, 1);
+
+        // Simulate EL1 write
+        let region_ptr = get_el1_region_host_ptr();
+        let cache_ptr = (region_ptr
+            + EL1_CACHE_OFFSET as usize
+            + (handle as usize - 1) * DELEGATED_FILE_MAX_SIZE as usize)
+            as *mut u8;
+        let file_ptr = (region_ptr
+            + EL1_OBJECT_TABLE_OFFSET as usize
+            + (handle as usize - 1) * core::mem::size_of::<DelegatedFile>())
+            as *const DelegatedFile;
+        let file = unsafe { &*file_ptr };
+
+        let el1_data = b"el1 memory backend write";
+        unsafe {
+            std::ptr::copy_nonoverlapping(el1_data.as_ptr(), cache_ptr, el1_data.len());
+        }
+        file.size.store(el1_data.len() as u64, Ordering::Release);
+        file.dirty_mask.store(1, Ordering::Release);
+
+        // Close the file (calls recall_if_delegated)
+        close_for_test(&mut dispatcher, fd).unwrap();
+        assert_eq!(open_file.description.delegation_handle(), 0);
+
+        // Reopen the path: bytes must be current!
+        let fd_reopened = open_path_for_test(
+            &dispatcher,
+            &ctx,
+            "/test_inmem_wb.txt",
+            carrick_abi::LINUX_O_RDONLY,
+        );
+        let open_reopened = dispatcher.open_file(fd_reopened).unwrap();
+        let guard = open_reopened.description.read().unwrap();
+        let OpenDescription::File { contents, .. } = &*guard else {
+            panic!("expected File");
+        };
+        let mut read_buf = vec![0u8; el1_data.len()];
+        let n = contents.read_at(0, &mut read_buf).unwrap();
+        assert_eq!(n, el1_data.len());
+        assert_eq!(
+            &read_buf, el1_data,
+            "reopened file must see EL1 written bytes"
+        );
+        drop(guard);
+
+        let entry = dispatcher
+            .fs()
+            .rootfs_vfs
+            .overlay
+            .lookup("/test_inmem_wb.txt");
+        assert_eq!(
+            entry,
+            Some(carrick_vfs::fs_backend::OverlayEntry::File(
+                el1_data.to_vec()
+            )),
+            "overlay backend must have updated bytes from write-back"
+        );
+
+        // 2. Test ENOSPC injection reports at fsync
+        open_reopened
+            .description
+            .common()
+            .record_writeback_error(carrick_abi::LINUX_ENOSPC);
+        let sync_res = fsync_for_test(&mut dispatcher, fd_reopened);
+        assert_eq!(sync_res, Err(carrick_abi::LINUX_ENOSPC));
     }
 }

@@ -208,6 +208,81 @@ pub(crate) fn punch_unwritten_host_blocks(
     Ok(())
 }
 
+/// Commit bytes at an offset into an open file description, updating both the
+/// description's contents and the underlying filesystem backend uniformly across
+/// host writes and EL1 recall.
+pub(crate) fn commit_bytes_at_offset(
+    open: &mut OpenDescription,
+    offset: u64,
+    bytes: &[u8],
+    rootfs_vfs: Option<&carrick_vfs::RootFsVfs>,
+) -> Result<usize, LinuxErrno> {
+    match open {
+        OpenDescription::File {
+            path,
+            contents,
+            metadata,
+            writable,
+            ..
+        } => {
+            if !*writable {
+                return Err(LINUX_EBADF);
+            }
+            let end = offset.checked_add(bytes.len() as u64).ok_or(LINUX_EFBIG)?;
+            if !contents.accepts_len(end) {
+                return Err(LINUX_EFBIG);
+            }
+            let written = contents.write_at(offset, bytes)?;
+            let cur_len = contents.len().unwrap_or(0) as usize;
+            let new_len = cur_len.max(offset as usize + written);
+            metadata.size = new_len;
+            if let Some(vfs) = rootfs_vfs {
+                if !crate::dispatch::is_anon_overlay_path(path) {
+                    vfs.write_file_range(path, offset as usize, &bytes[..written], new_len)
+                        .map_err(|e| match e {
+                            carrick_vfs::fs_backend::BackendError::Host(err)
+                            | carrick_vfs::fs_backend::BackendError::Namespace(err) => err,
+                            carrick_vfs::fs_backend::BackendError::Invalid => LINUX_EINVAL,
+                            carrick_vfs::fs_backend::BackendError::Unsupported => LINUX_ENOTSUP,
+                            carrick_vfs::fs_backend::BackendError::Io => LINUX_EIO,
+                        })?;
+                    vfs.notify_inode_changed(path, None);
+                }
+            }
+            Ok(written)
+        }
+        OpenDescription::HostFile {
+            host_fd,
+            metadata,
+            writable,
+            ..
+        } => {
+            if !*writable {
+                return Err(LINUX_EBADF);
+            }
+            let res = unsafe {
+                libc::pwrite(
+                    host_fd.raw(),
+                    bytes.as_ptr() as *const libc::c_void,
+                    bytes.len(),
+                    offset as libc::off_t,
+                )
+            };
+            if res < 0 {
+                return Err(crate::host_to_linux_errno(
+                    std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO),
+                ));
+            }
+            let written = res as usize;
+            metadata.size = metadata.size.max(offset as usize + written);
+            Ok(written)
+        }
+        _ => Err(LINUX_EBADF),
+    }
+}
+
 /// Guest-visible aggregate boundary completed by the in-memory pipe iterator
 /// before it encounters a later writev copy fault. Linux copies in guest-page
 /// blocks across iovecs, so the partial final block is not published.
@@ -2225,17 +2300,7 @@ impl<'a> FsView<'a> {
                     this.fs.rootfs_vfs.notify_inode_changed(path, None);
                     return Ok(DispatchOutcome::returned_len_or_errno(bytes.len()));
                 }
-                if let OpenDescription::File {
-                    path,
-                    contents,
-                    writable,
-                    metadata,
-                    ..
-                } = &mut *open
-                {
-                    if !*writable {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    }
+                if let OpenDescription::File { contents, .. } = &mut *open {
                     let cur_len = match contents.len() {
                         Ok(l) => l as usize,
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
@@ -2253,25 +2318,15 @@ impl<'a> FsView<'a> {
                     ) {
                         return Ok(DispatchOutcome::errno(errno));
                     }
-                    let mut off = write_at;
-                    let written = match write_into_file_contents(contents, &mut off, &bytes) {
+                    let written = match commit_bytes_at_offset(
+                        &mut open,
+                        write_at as u64,
+                        &bytes,
+                        Some(&this.fs.rootfs_vfs),
+                    ) {
                         Ok(n) => n,
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
-                    let new_len = match contents.len() {
-                        Ok(l) => l as usize,
-                        Err(errno) if written == 0 => return Ok(DispatchOutcome::errno(errno)),
-                        Err(_) => cur_len.max(write_at.saturating_add(written)),
-                    };
-                    metadata.size = new_len;
-                    let writeback = (!is_anon_overlay_path(path)).then(|| (path.clone(), new_len));
-                    drop(open);
-                    if let Some((path, final_size)) = writeback {
-                        let _ = this
-                            .fs
-                            .rootfs_vfs
-                            .write_file_range(&path, write_at, &bytes[..written], final_size);
-                    }
                     let outcome = DispatchOutcome::returned_len_or_errno(written);
                     if matches!(outcome, DispatchOutcome::Returned { .. }) {
                         let _ = crate::el1_delegation::delegate(
