@@ -3646,9 +3646,7 @@ pub fn el1_vectors_bytes() -> Vec<u8> {
             cursor += hvc.len();
             bytes[cursor..cursor + eret.len()].copy_from_slice(&eret);
             cursor += eret.len();
-        } else if slot_offset == AARCH64_VECTOR_CUR_EL_SP0_SYNC_OFFSET
-            || slot_offset == AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET
-        {
+        } else if slot_offset == AARCH64_VECTOR_CUR_EL_SP0_SYNC_OFFSET {
             // Fail loud: a synchronous exception at EL1 is carrick corruption,
             // never a legitimate guest event. Trap to the host (`hvc #3`) so it
             // reports ESR_EL1/ELR_EL1/FAR_EL1 instead of bare-`eret` spinning on
@@ -3656,6 +3654,9 @@ pub fn el1_vectors_bytes() -> Vec<u8> {
             // the rest of the slot is harmless `nop` padding (filled below).
             bytes[cursor..cursor + hvc_fault.len()].copy_from_slice(&hvc_fault);
             cursor += hvc_fault.len();
+        } else if slot_offset == AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET {
+            write_el1_cur_el_sync_slot(&mut bytes, slot_offset);
+            cursor += AARCH64_VECTOR_SLOT_SIZE;
         } else {
             bytes[cursor..cursor + eret.len()].copy_from_slice(&eret);
             cursor += eret.len();
@@ -3708,6 +3709,15 @@ fn enc_blt(pc: u64, target: u64) -> u32 {
 fn enc_bls(pc: u64, target: u64) -> u32 {
     let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
     0x5400_0009 | (imm19 << 5)
+}
+fn enc_bhs(pc: u64, target: u64) -> u32 {
+    let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
+    0x5400_0002 | (imm19 << 5)
+}
+#[allow(dead_code)]
+fn enc_blo(pc: u64, target: u64) -> u32 {
+    let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
+    0x5400_0003 | (imm19 << 5)
 }
 fn enc_b(pc: u64, target: u64) -> u32 {
     let imm26 = (((target as i64 - pc as i64) >> 2) as u32) & 0x03FF_FFFF;
@@ -3837,6 +3847,135 @@ fn write_x16_address(bytes: &mut [u8], cursor: &mut usize, base: u64) {
         };
         put(bytes, *cursor, op);
         *cursor += 4;
+    }
+}
+
+/// Emit the EL1 exception-fixup handler for current-EL SPx synchronous exceptions (slot 0x200).
+/// When ELR_EL1 is inside the EL1 image and `fixup_pc` is armed in CurrentTask, redirects
+/// ELR_EL1 to `fixup_pc` and erets. Otherwise, traps loud via `hvc #3`.
+fn write_el1_cur_el_sync_slot(bytes: &mut [u8], slot_offset: usize) {
+    let mut cursor = slot_offset;
+    let put = |bytes: &mut [u8], off: usize, op: u32| {
+        bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
+    };
+    let emit = |bytes: &mut [u8], cursor: &mut usize, opcode: u32| {
+        put(bytes, *cursor, opcode);
+        *cursor += 4;
+    };
+
+    // 1. Alloc scratch space and save x16, x17
+    emit(bytes, &mut cursor, 0xD100_83FF); // sub sp, sp, #32
+    emit(bytes, &mut cursor, 0xA900_47F0); // stp x16, x17, [sp]
+    // 2. Read faulting PC
+    emit(bytes, &mut cursor, AARCH64_MRS_ELR_EL1_X16_OPCODE); // mrs x16, elr_el1
+
+    // 3. Check if ELR_EL1 is inside the EL1 kernel image (EL1_REGION_BASE..+EL1_IMAGE_SIZE)
+    let el1_base = carrick_el1_abi::EL1_REGION_BASE + carrick_el1_abi::EL1_IMAGE_OFFSET;
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movz_xn(17, ((el1_base >> 16) & 0xFFFF) as u16, 1),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(17, ((el1_base >> 32) & 0xFFFF) as u16, 2),
+    );
+    emit(bytes, &mut cursor, 0xCB11_0210); // sub x16, x16, x17
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movz_xn(
+            17,
+            ((carrick_el1_abi::EL1_IMAGE_SIZE >> 16) & 0xFFFF) as u16,
+            1,
+        ),
+    );
+    emit(bytes, &mut cursor, 0xEB11_021F); // cmp x16, x17
+    let bhs_fail1 = cursor;
+    emit(bytes, &mut cursor, 0); // bhs fail_loud
+
+    // 4. Compute slot index from SP_EL1 before the exception:
+    //    original_sp = sp + 32; slot = (original_sp - EL1_STACKS_BASE) >> 14
+    emit(bytes, &mut cursor, enc_add_xd_sp(16, 32));
+    let stacks_base = carrick_el1_abi::EL1_STACKS_BASE;
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movz_xn(17, ((stacks_base >> 16) & 0xFFFF) as u16, 1),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(17, ((stacks_base >> 32) & 0xFFFF) as u16, 2),
+    );
+    emit(bytes, &mut cursor, 0xCB11_0210); // sub x16, x16, x17
+    let stacks_size = carrick_el1_abi::EL1_STACKS_SIZE;
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movz_xn(17, ((stacks_size >> 16) & 0xFFFF) as u16, 1),
+    );
+    emit(bytes, &mut cursor, 0xEB11_021F); // cmp x16, x17
+    let bhs_fail2 = cursor;
+    emit(bytes, &mut cursor, 0); // bhs fail_loud
+    emit(bytes, &mut cursor, 0xD34E_FE10); // lsr x16, x16, #14 (slot index 0..255)
+
+    // 5. Load fixup_pc from CurrentTask[slot]:
+    //    task_addr = EL1_CURRENT_TASKS_BASE + (slot << 5)
+    let tasks_base = carrick_el1_abi::EL1_CURRENT_TASKS_BASE;
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movz_xn(17, ((tasks_base >> 16) & 0xFFFF) as u16, 1),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(17, ((tasks_base >> 32) & 0xFFFF) as u16, 2),
+    );
+    emit(bytes, &mut cursor, 0x8B10_1631); // add x17, x17, x16, lsl #5
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(16, 17, 16)); // ldr x16, [x17, #16] (fixup_pc)
+    let cbz_fail = cursor;
+    emit(bytes, &mut cursor, 0); // cbz x16, fail_loud
+
+    // 6. Fixup armed: clear fixup_pc and redirect ELR_EL1
+    emit(bytes, &mut cursor, enc_str_xt_xn(31, 17, 16)); // str xzr, [x17, #16]
+    emit(bytes, &mut cursor, 0xD518_4030); // msr elr_el1, x16
+
+    // 7. Restore scratch registers and resume at fixup_pc via eret
+    emit(bytes, &mut cursor, 0xA940_47F0); // ldp x16, x17, [sp]
+    emit(bytes, &mut cursor, 0x9100_83FF); // add sp, sp, #32
+    emit(bytes, &mut cursor, AARCH64_ERET_OPCODE);
+
+    // 8. Fail loud: restore registers and issue hvc #3
+    let fail_loud = cursor;
+    emit(bytes, &mut cursor, 0xA940_47F0); // ldp x16, x17, [sp]
+    emit(bytes, &mut cursor, 0x9100_83FF); // add sp, sp, #32
+    emit(bytes, &mut cursor, AARCH64_HVC_FAULT_OPCODE);
+
+    // Patch forward branches to fail_loud
+    put(
+        bytes,
+        bhs_fail1,
+        enc_bhs(bhs_fail1 as u64, fail_loud as u64),
+    );
+    put(
+        bytes,
+        bhs_fail2,
+        enc_bhs(bhs_fail2 as u64, fail_loud as u64),
+    );
+    put(
+        bytes,
+        cbz_fail,
+        enc_cbz_xn(16, cbz_fail as u64, fail_loud as u64),
+    );
+
+    // Pad remaining instructions with nop
+    let nop = AARCH64_NOP_OPCODE.to_le_bytes();
+    while cursor + 4 <= slot_offset + AARCH64_VECTOR_SLOT_SIZE {
+        bytes[cursor..cursor + 4].copy_from_slice(&nop);
+        cursor += 4;
     }
 }
 
@@ -7565,8 +7704,16 @@ mod el1_shim_tests {
             );
             assert_eq!(
                 rd_u32(&page, AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET),
-                HVC3,
-                "current-EL SP_ELx sync slot (0x200) must trap loud"
+                0xD100_83FF,
+                "current-EL SP_ELx sync slot (0x200) must begin with fixup check"
+            );
+            let slot_bytes = &page[AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET
+                ..AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET + AARCH64_VECTOR_SLOT_SIZE];
+            assert!(
+                slot_bytes
+                    .chunks_exact(4)
+                    .any(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()) == HVC3),
+                "current-EL SP_ELx sync slot (0x200) must contain HVC3 fail-loud trap"
             );
             // A non-sync spurious slot (0x080 = current-EL SP_EL0 IRQ) is still a
             // bare eret — harmless interrupts are ignored, not aborted.

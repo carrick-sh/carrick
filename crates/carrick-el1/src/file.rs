@@ -1,10 +1,120 @@
 //! File operations for delegated regular files at EL1.
 
 use carrick_el1_abi::{
-    Action, DELEGATED_FILE_MAX_SIZE, DELEGATED_FLAG_APPEND, DELEGATED_FLAG_READABLE,
+    Action, CurrentTask, DELEGATED_FILE_MAX_SIZE, DELEGATED_FLAG_APPEND, DELEGATED_FLAG_READABLE,
     DELEGATED_FLAG_WRITABLE, DELEGATED_PAGE_SIZE, DelegatedFile,
 };
 use core::sync::atomic::Ordering;
+
+#[cfg(test)]
+pub static SIMULATE_COPY_FAULT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Copy `len` bytes from `src` to `dest` (user virtual address), guarded by EL1 exception fixup.
+/// Returns `true` if copy succeeded, `false` if a fault occurred and was intercepted by fixup.
+#[inline(never)]
+pub unsafe fn copy_to_user_guarded(
+    cur_task: &CurrentTask,
+    dest: *mut u8,
+    src: *const u8,
+    len: usize,
+) -> bool {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let fixup_ptr = &cur_task.fixup_pc as *const _ as *const u64;
+        let mut success: u64 = 1;
+        core::arch::asm!(
+            "adr {tmp}, 2f",
+            "str {tmp}, [{fixup}]",
+            "cbz {len}, 1f",
+            "0:",
+            "ldrb {tmp:w}, [{src}], #1",
+            "strb {tmp:w}, [{dst}], #1",
+            "sub {len}, {len}, #1",
+            "cbnz {len}, 0b",
+            "1:",
+            "str xzr, [{fixup}]",
+            "b 3f",
+            "2:",
+            "str xzr, [{fixup}]",
+            "mov {succ}, #0",
+            "3:",
+            tmp = out(reg) _,
+            fixup = in(reg) fixup_ptr,
+            dst = inout(reg) dest => _,
+            src = inout(reg) src => _,
+            len = inout(reg) len => _,
+            succ = inout(reg) success,
+            options(nostack)
+        );
+        success != 0
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        let _ = cur_task;
+        #[cfg(test)]
+        if SIMULATE_COPY_FAULT.load(Ordering::Relaxed) {
+            return false;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(src, dest, len);
+        }
+        true
+    }
+}
+
+/// Copy `len` bytes from `src` (user virtual address) to `dest`, guarded by EL1 exception fixup.
+/// Returns `true` if copy succeeded, `false` if a fault occurred and was intercepted by fixup.
+#[inline(never)]
+pub unsafe fn copy_from_user_guarded(
+    cur_task: &CurrentTask,
+    dest: *mut u8,
+    src: *const u8,
+    len: usize,
+) -> bool {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let fixup_ptr = &cur_task.fixup_pc as *const _ as *const u64;
+        let mut success: u64 = 1;
+        core::arch::asm!(
+            "adr {tmp}, 2f",
+            "str {tmp}, [{fixup}]",
+            "cbz {len}, 1f",
+            "0:",
+            "ldrb {tmp:w}, [{src}], #1",
+            "strb {tmp:w}, [{dst}], #1",
+            "sub {len}, {len}, #1",
+            "cbnz {len}, 0b",
+            "1:",
+            "str xzr, [{fixup}]",
+            "b 3f",
+            "2:",
+            "str xzr, [{fixup}]",
+            "mov {succ}, #0",
+            "3:",
+            tmp = out(reg) _,
+            fixup = in(reg) fixup_ptr,
+            dst = inout(reg) dest => _,
+            src = inout(reg) src => _,
+            len = inout(reg) len => _,
+            succ = inout(reg) success,
+            options(nostack)
+        );
+        success != 0
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        let _ = cur_task;
+        #[cfg(test)]
+        if SIMULATE_COPY_FAULT.load(Ordering::Relaxed) {
+            return false;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(src, dest, len);
+        }
+        true
+    }
+}
 
 pub const EBADF: i64 = -9;
 pub const EFAULT: i64 = -14;
@@ -135,6 +245,7 @@ pub fn el1_lseek(file: &DelegatedFile, offset: i64, whence: u32) -> Result<i64, 
 /// Service `read` at EL1.
 pub fn el1_read<V: MemoryValidator>(
     file: &DelegatedFile,
+    cur_task: &CurrentTask,
     cache_base: *const u8,
     buf_va: u64,
     count: usize,
@@ -157,8 +268,16 @@ pub fn el1_read<V: MemoryValidator>(
     if valid_bytes < avail {
         return Err(Action::Forward);
     }
-    unsafe {
-        core::ptr::copy_nonoverlapping(cache_base.add(cur_off as usize), buf_va as *mut u8, avail);
+    let copy_ok = unsafe {
+        copy_to_user_guarded(
+            cur_task,
+            buf_va as *mut u8,
+            cache_base.add(cur_off as usize),
+            avail,
+        )
+    };
+    if !copy_ok {
+        return Err(Action::Forward);
     }
     file.offset.store(cur_off + avail as u64, Ordering::Release);
     Ok(avail as i64)
@@ -167,6 +286,7 @@ pub fn el1_read<V: MemoryValidator>(
 /// Service `pread64` at EL1.
 pub fn el1_pread64<V: MemoryValidator>(
     file: &DelegatedFile,
+    cur_task: &CurrentTask,
     cache_base: *const u8,
     buf_va: u64,
     count: usize,
@@ -193,8 +313,16 @@ pub fn el1_pread64<V: MemoryValidator>(
     if valid_bytes < avail {
         return Err(Action::Forward);
     }
-    unsafe {
-        core::ptr::copy_nonoverlapping(cache_base.add(off as usize), buf_va as *mut u8, avail);
+    let copy_ok = unsafe {
+        copy_to_user_guarded(
+            cur_task,
+            buf_va as *mut u8,
+            cache_base.add(off as usize),
+            avail,
+        )
+    };
+    if !copy_ok {
+        return Err(Action::Forward);
     }
     Ok(avail as i64)
 }
@@ -202,6 +330,7 @@ pub fn el1_pread64<V: MemoryValidator>(
 /// Service `write` at EL1.
 pub fn el1_write<V: MemoryValidator>(
     file: &DelegatedFile,
+    cur_task: &CurrentTask,
     cache_base: *mut u8,
     buf_va: u64,
     count: usize,
@@ -229,12 +358,16 @@ pub fn el1_write<V: MemoryValidator>(
     if valid_bytes < count {
         return Err(Action::Forward);
     }
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            buf_va as *const u8,
+    let copy_ok = unsafe {
+        copy_from_user_guarded(
+            cur_task,
             cache_base.add(cur_off as usize),
+            buf_va as *const u8,
             count,
-        );
+        )
+    };
+    if !copy_ok {
+        return Err(Action::Forward);
     }
     let delivered_end = cur_off + count as u64;
     mark_dirty_pages(file, cur_off, delivered_end);
@@ -249,6 +382,7 @@ pub fn el1_write<V: MemoryValidator>(
 /// Service `pwrite64` at EL1.
 pub fn el1_pwrite64<V: MemoryValidator>(
     file: &DelegatedFile,
+    cur_task: &CurrentTask,
     cache_base: *mut u8,
     buf_va: u64,
     count: usize,
@@ -277,8 +411,16 @@ pub fn el1_pwrite64<V: MemoryValidator>(
     if valid_bytes < count {
         return Err(Action::Forward);
     }
-    unsafe {
-        core::ptr::copy_nonoverlapping(buf_va as *const u8, cache_base.add(off as usize), count);
+    let copy_ok = unsafe {
+        copy_from_user_guarded(
+            cur_task,
+            cache_base.add(off as usize),
+            buf_va as *const u8,
+            count,
+        )
+    };
+    if !copy_ok {
+        return Err(Action::Forward);
     }
     let delivered_end = off + count as u64;
     mark_dirty_pages(file, off, delivered_end);
@@ -400,6 +542,7 @@ mod tests {
 
     #[test]
     fn test_read_and_pread64_model() {
+        let task = CurrentTask::new();
         let (file, mut cache) = fixture_file(200, 0, DELEGATED_FLAG_READABLE);
         for i in 0..200 {
             cache[i] = (i % 251) as u8;
@@ -413,31 +556,32 @@ mod tests {
         };
 
         // Read 50 bytes from offset 0
-        let n = el1_read(&file, cache.as_ptr(), user_va, 50, &validator).unwrap();
+        let n = el1_read(&file, &task, cache.as_ptr(), user_va, 50, &validator).unwrap();
         assert_eq!(n, 50);
         assert_eq!(file.offset.load(Ordering::Relaxed), 50);
         assert_eq!(&user_buf[0..50], &cache[0..50]);
 
         // Pread 30 bytes from offset 100 (should not change file offset 50)
-        let n = el1_pread64(&file, cache.as_ptr(), user_va, 30, 100, &validator).unwrap();
+        let n = el1_pread64(&file, &task, cache.as_ptr(), user_va, 30, 100, &validator).unwrap();
         assert_eq!(n, 30);
         assert_eq!(file.offset.load(Ordering::Relaxed), 50);
         assert_eq!(&user_buf[0..30], &cache[100..130]);
 
         // Read past EOF
         file.offset.store(200, Ordering::Relaxed);
-        let n = el1_read(&file, cache.as_ptr(), user_va, 50, &validator).unwrap();
+        let n = el1_read(&file, &task, cache.as_ptr(), user_va, 50, &validator).unwrap();
         assert_eq!(n, 0);
 
         // Pread negative offset -> EINVAL
         assert_eq!(
-            el1_pread64(&file, cache.as_ptr(), user_va, 30, -1, &validator),
+            el1_pread64(&file, &task, cache.as_ptr(), user_va, 30, -1, &validator),
             Ok(EINVAL)
         );
     }
 
     #[test]
     fn test_write_and_pwrite64_model() {
+        let task = CurrentTask::new();
         let (file, mut cache) = fixture_file(0, 0, DELEGATED_FLAG_WRITABLE);
         let mut user_data = vec![0xABu8; 8192];
         let user_va = user_data.as_mut_ptr() as u64;
@@ -447,7 +591,7 @@ mod tests {
         };
 
         // Write 4096 bytes: extends size from 0 to 4096, sets dirty bit 0
-        let n = el1_write(&file, cache.as_mut_ptr(), user_va, 4096, &validator).unwrap();
+        let n = el1_write(&file, &task, cache.as_mut_ptr(), user_va, 4096, &validator).unwrap();
         assert_eq!(n, 4096);
         assert_eq!(file.size.load(Ordering::Relaxed), 4096);
         assert_eq!(file.offset.load(Ordering::Relaxed), 4096);
@@ -455,20 +599,37 @@ mod tests {
         assert_eq!(&cache[0..4096], &user_data[0..4096]);
 
         // Write another 4096 bytes: extends size from 4096 to 8192, sets dirty bit 1
-        let n = el1_write(&file, cache.as_mut_ptr(), user_va, 4096, &validator).unwrap();
+        let n = el1_write(&file, &task, cache.as_mut_ptr(), user_va, 4096, &validator).unwrap();
         assert_eq!(n, 4096);
         assert_eq!(file.size.load(Ordering::Relaxed), 8192);
         assert_eq!(file.offset.load(Ordering::Relaxed), 8192);
         assert_eq!(file.dirty_mask.load(Ordering::Relaxed), (1 << 0) | (1 << 1));
 
         // Pwrite at offset 0 (does not change file offset 8192)
-        let n = el1_pwrite64(&file, cache.as_mut_ptr(), user_va, 100, 0, &validator).unwrap();
+        let n = el1_pwrite64(
+            &file,
+            &task,
+            cache.as_mut_ptr(),
+            user_va,
+            100,
+            0,
+            &validator,
+        )
+        .unwrap();
         assert_eq!(n, 100);
         assert_eq!(file.offset.load(Ordering::Relaxed), 8192);
 
         // Pwrite with negative offset -> EINVAL
         assert_eq!(
-            el1_pwrite64(&file, cache.as_mut_ptr(), user_va, 100, -5, &validator),
+            el1_pwrite64(
+                &file,
+                &task,
+                cache.as_mut_ptr(),
+                user_va,
+                100,
+                -5,
+                &validator
+            ),
             Ok(EINVAL)
         );
 
@@ -476,13 +637,14 @@ mod tests {
         file.offset
             .store(DELEGATED_FILE_MAX_SIZE - 10, Ordering::Relaxed);
         assert_eq!(
-            el1_write(&file, cache.as_mut_ptr(), user_va, 100, &validator),
+            el1_write(&file, &task, cache.as_mut_ptr(), user_va, 100, &validator),
             Err(Action::Forward)
         );
     }
 
     #[test]
     fn test_efault_forward_semantics() {
+        let task = CurrentTask::new();
         let (file, mut cache) = fixture_file(
             16384,
             8192,
@@ -504,20 +666,20 @@ mod tests {
         // Read 8192 bytes into user_va: partial user range fails AT check.
         // EL1 must return Err(Action::Forward) without touching the file (no partial service).
         assert_eq!(
-            el1_read(&file, cache.as_ptr(), user_va, 8192, &oracle),
+            el1_read(&file, &task, cache.as_ptr(), user_va, 8192, &oracle),
             Err(Action::Forward)
         );
         assert_eq!(file.offset.load(Ordering::Relaxed), 8192);
 
         // Read 4096 bytes: entire range is valid in AT check -> served at EL1!
-        let n = el1_read(&file, cache.as_ptr(), user_va, 4096, &oracle).unwrap();
+        let n = el1_read(&file, &task, cache.as_ptr(), user_va, 4096, &oracle).unwrap();
         assert_eq!(n, 4096);
         assert_eq!(file.offset.load(Ordering::Relaxed), 8192 + 4096);
         assert_eq!(&user_buffer[0..4096], &cache[8192..8192 + 4096]);
 
         // Next read at readonly page: fails AT check -> Action::Forward, offset untouched.
         assert_eq!(
-            el1_read(&file, cache.as_ptr(), user_va + 4096, 4096, &oracle),
+            el1_read(&file, &task, cache.as_ptr(), user_va + 4096, 4096, &oracle),
             Err(Action::Forward)
         );
         assert_eq!(file.offset.load(Ordering::Relaxed), 8192 + 4096);
@@ -525,22 +687,85 @@ mod tests {
         // Same for write: partial user range fails AT check -> Action::Forward, file untouched.
         file.offset.store(0, Ordering::Relaxed);
         assert_eq!(
-            el1_write(&file, cache.as_mut_ptr(), user_va, 8192, &oracle),
+            el1_write(&file, &task, cache.as_mut_ptr(), user_va, 8192, &oracle),
             Err(Action::Forward)
         );
         assert_eq!(file.offset.load(Ordering::Relaxed), 0);
         assert_eq!(file.size.load(Ordering::Relaxed), 16384);
 
         // Write 4096 bytes: entire range is readable in AT check -> served at EL1!
-        let n = el1_write(&file, cache.as_mut_ptr(), user_va, 4096, &oracle).unwrap();
+        let n = el1_write(&file, &task, cache.as_mut_ptr(), user_va, 4096, &oracle).unwrap();
         assert_eq!(n, 4096);
         assert_eq!(file.offset.load(Ordering::Relaxed), 4096);
 
         // Next write from denied address: fails AT check -> Action::Forward, offset untouched.
         assert_eq!(
-            el1_write(&file, cache.as_mut_ptr(), user_va + 4096, 4096, &oracle),
+            el1_write(
+                &file,
+                &task,
+                cache.as_mut_ptr(),
+                user_va + 4096,
+                4096,
+                &oracle
+            ),
             Err(Action::Forward)
         );
         assert_eq!(file.offset.load(Ordering::Relaxed), 4096);
+    }
+
+    #[test]
+    fn test_fixup_fault_interception() {
+        let task = CurrentTask::new();
+        let (file, mut cache) =
+            fixture_file(4096, 0, DELEGATED_FLAG_READABLE | DELEGATED_FLAG_WRITABLE);
+        let mut user_buffer = vec![0u8; 100];
+        let user_va = user_buffer.as_mut_ptr() as u64;
+        let oracle = FakeOracleValidator {
+            writable_regions: vec![user_va..user_va + 100],
+            readable_regions: vec![user_va..user_va + 100],
+        };
+
+        // When SIMULATE_COPY_FAULT is set (simulating concurrent unmap during copy):
+        SIMULATE_COPY_FAULT.store(true, Ordering::Relaxed);
+
+        // Read must return Err(Action::Forward) and leave offset unchanged at 0
+        assert_eq!(
+            el1_read(&file, &task, cache.as_ptr(), user_va, 50, &oracle),
+            Err(Action::Forward)
+        );
+        assert_eq!(file.offset.load(Ordering::Relaxed), 0);
+
+        // Pread must return Err(Action::Forward) and leave offset unchanged
+        assert_eq!(
+            el1_pread64(&file, &task, cache.as_ptr(), user_va, 50, 0, &oracle),
+            Err(Action::Forward)
+        );
+        assert_eq!(file.offset.load(Ordering::Relaxed), 0);
+
+        // Write must return Err(Action::Forward) and leave offset/size/dirty_mask unchanged
+        assert_eq!(
+            el1_write(&file, &task, cache.as_mut_ptr(), user_va, 50, &oracle),
+            Err(Action::Forward)
+        );
+        assert_eq!(file.offset.load(Ordering::Relaxed), 0);
+        assert_eq!(file.size.load(Ordering::Relaxed), 4096);
+        assert_eq!(file.dirty_mask.load(Ordering::Relaxed), 0);
+
+        // Pwrite must return Err(Action::Forward) and leave offset/size/dirty_mask unchanged
+        assert_eq!(
+            el1_pwrite64(&file, &task, cache.as_mut_ptr(), user_va, 50, 0, &oracle),
+            Err(Action::Forward)
+        );
+        assert_eq!(file.offset.load(Ordering::Relaxed), 0);
+        assert_eq!(file.size.load(Ordering::Relaxed), 4096);
+        assert_eq!(file.dirty_mask.load(Ordering::Relaxed), 0);
+
+        // Clear fault simulation
+        SIMULATE_COPY_FAULT.store(false, Ordering::Relaxed);
+
+        // Now read and write succeed
+        let n = el1_read(&file, &task, cache.as_ptr(), user_va, 50, &oracle).unwrap();
+        assert_eq!(n, 50);
+        assert_eq!(file.offset.load(Ordering::Relaxed), 50);
     }
 }
