@@ -154,19 +154,14 @@ pub fn el1_read<V: MemoryValidator>(
     }
     let avail = core::cmp::min(count, (size - cur_off) as usize);
     let valid_bytes = validator.writable_bytes(buf_va, avail);
-    if valid_bytes == 0 {
-        return Ok(EFAULT);
+    if valid_bytes < avail {
+        return Err(Action::Forward);
     }
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            cache_base.add(cur_off as usize),
-            buf_va as *mut u8,
-            valid_bytes,
-        );
+        core::ptr::copy_nonoverlapping(cache_base.add(cur_off as usize), buf_va as *mut u8, avail);
     }
-    file.offset
-        .store(cur_off + valid_bytes as u64, Ordering::Release);
-    Ok(valid_bytes as i64)
+    file.offset.store(cur_off + avail as u64, Ordering::Release);
+    Ok(avail as i64)
 }
 
 /// Service `pread64` at EL1.
@@ -195,17 +190,13 @@ pub fn el1_pread64<V: MemoryValidator>(
     }
     let avail = core::cmp::min(count, (size - off) as usize);
     let valid_bytes = validator.writable_bytes(buf_va, avail);
-    if valid_bytes == 0 {
-        return Ok(EFAULT);
+    if valid_bytes < avail {
+        return Err(Action::Forward);
     }
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            cache_base.add(off as usize),
-            buf_va as *mut u8,
-            valid_bytes,
-        );
+        core::ptr::copy_nonoverlapping(cache_base.add(off as usize), buf_va as *mut u8, avail);
     }
-    Ok(valid_bytes as i64)
+    Ok(avail as i64)
 }
 
 /// Service `write` at EL1.
@@ -235,24 +226,24 @@ pub fn el1_write<V: MemoryValidator>(
         return Err(Action::Forward);
     }
     let valid_bytes = validator.readable_bytes(buf_va, count);
-    if valid_bytes == 0 {
-        return Ok(EFAULT);
+    if valid_bytes < count {
+        return Err(Action::Forward);
     }
     unsafe {
         core::ptr::copy_nonoverlapping(
             buf_va as *const u8,
             cache_base.add(cur_off as usize),
-            valid_bytes,
+            count,
         );
     }
-    let delivered_end = cur_off + valid_bytes as u64;
+    let delivered_end = cur_off + count as u64;
     mark_dirty_pages(file, cur_off, delivered_end);
     let old_size = file.size.load(Ordering::Acquire);
     if delivered_end > old_size {
         file.size.store(delivered_end, Ordering::Release);
     }
     file.offset.store(delivered_end, Ordering::Release);
-    Ok(valid_bytes as i64)
+    Ok(count as i64)
 }
 
 /// Service `pwrite64` at EL1.
@@ -283,23 +274,19 @@ pub fn el1_pwrite64<V: MemoryValidator>(
         return Err(Action::Forward);
     }
     let valid_bytes = validator.readable_bytes(buf_va, count);
-    if valid_bytes == 0 {
-        return Ok(EFAULT);
+    if valid_bytes < count {
+        return Err(Action::Forward);
     }
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            buf_va as *const u8,
-            cache_base.add(off as usize),
-            valid_bytes,
-        );
+        core::ptr::copy_nonoverlapping(buf_va as *const u8, cache_base.add(off as usize), count);
     }
-    let delivered_end = off + valid_bytes as u64;
+    let delivered_end = off + count as u64;
     mark_dirty_pages(file, off, delivered_end);
     let old_size = file.size.load(Ordering::Acquire);
     if delivered_end > old_size {
         file.size.store(delivered_end, Ordering::Release);
     }
-    Ok(valid_bytes as i64)
+    Ok(count as i64)
 }
 
 fn mark_dirty_pages(file: &DelegatedFile, start: u64, end: u64) {
@@ -495,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn test_efault_prefix_semantics() {
+    fn test_efault_forward_semantics() {
         let (file, mut cache) = fixture_file(
             16384,
             8192,
@@ -514,28 +501,46 @@ mod tests {
             readable_regions: vec![user_va..user_va + 4096],
         };
 
-        // Read 8192 bytes into user_va: should deliver 4096 bytes (writable prefix),
-        // return 4096, and advance offset from 8192 to 12288!
-        let n = el1_read(&file, cache.as_ptr(), user_va, 8192, &oracle).unwrap();
+        // Read 8192 bytes into user_va: partial user range fails AT check.
+        // EL1 must return Err(Action::Forward) without touching the file (no partial service).
+        assert_eq!(
+            el1_read(&file, cache.as_ptr(), user_va, 8192, &oracle),
+            Err(Action::Forward)
+        );
+        assert_eq!(file.offset.load(Ordering::Relaxed), 8192);
+
+        // Read 4096 bytes: entire range is valid in AT check -> served at EL1!
+        let n = el1_read(&file, cache.as_ptr(), user_va, 4096, &oracle).unwrap();
         assert_eq!(n, 4096);
         assert_eq!(file.offset.load(Ordering::Relaxed), 8192 + 4096);
         assert_eq!(&user_buffer[0..4096], &cache[8192..8192 + 4096]);
 
-        // Next read at offset 12288 starts at the readonly page (user_va + 4096):
-        // 0 writable bytes delivered -> must return EFAULT and NOT advance offset!
-        let n = el1_read(&file, cache.as_ptr(), user_va + 4096, 4096, &oracle).unwrap();
-        assert_eq!(n, EFAULT);
+        // Next read at readonly page: fails AT check -> Action::Forward, offset untouched.
+        assert_eq!(
+            el1_read(&file, cache.as_ptr(), user_va + 4096, 4096, &oracle),
+            Err(Action::Forward)
+        );
         assert_eq!(file.offset.load(Ordering::Relaxed), 8192 + 4096);
 
-        // Same for write:
+        // Same for write: partial user range fails AT check -> Action::Forward, file untouched.
         file.offset.store(0, Ordering::Relaxed);
-        let n = el1_write(&file, cache.as_mut_ptr(), user_va, 8192, &oracle).unwrap();
+        assert_eq!(
+            el1_write(&file, cache.as_mut_ptr(), user_va, 8192, &oracle),
+            Err(Action::Forward)
+        );
+        assert_eq!(file.offset.load(Ordering::Relaxed), 0);
+        assert_eq!(file.size.load(Ordering::Relaxed), 16384);
+
+        // Write 4096 bytes: entire range is readable in AT check -> served at EL1!
+        let n = el1_write(&file, cache.as_mut_ptr(), user_va, 4096, &oracle).unwrap();
         assert_eq!(n, 4096);
         assert_eq!(file.offset.load(Ordering::Relaxed), 4096);
 
-        // Next write from denied address:
-        let n = el1_write(&file, cache.as_mut_ptr(), user_va + 4096, 4096, &oracle).unwrap();
-        assert_eq!(n, EFAULT);
+        // Next write from denied address: fails AT check -> Action::Forward, offset untouched.
+        assert_eq!(
+            el1_write(&file, cache.as_mut_ptr(), user_va + 4096, 4096, &oracle),
+            Err(Action::Forward)
+        );
         assert_eq!(file.offset.load(Ordering::Relaxed), 4096);
     }
 }
