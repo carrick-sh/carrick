@@ -184,7 +184,11 @@ fn free_handle(handle: u32) {
         if let Some(inode) = inode {
             let mut map = DELEGATED_INODES.lock();
             if let Some(map) = map.as_mut() {
-                map.remove(&inode);
+                if let std::collections::hash_map::Entry::Occupied(entry) = map.entry(inode) {
+                    if entry.get().0 == handle {
+                        entry.remove();
+                    }
+                }
                 if map.is_empty() {
                     HAS_DELEGATED_FILES.store(false, Ordering::Release);
                 }
@@ -476,20 +480,21 @@ pub(crate) fn delegate_locked(
 
     init_delegation_hooks();
 
-    {
-        let mut map = DELEGATED_INODES.lock();
-        let map_ref = map.get_or_insert_with(HashMap::new);
-        if map_ref.contains_key(&inode) {
-            return Err(NotEligible::AlreadyDelegated);
-        }
-    }
-
     let handle = allocate_handle(&open_file.description).ok_or(NotEligible::TableFull)?;
 
     {
         let mut map = DELEGATED_INODES.lock();
         let map_ref = map.get_or_insert_with(HashMap::new);
-        map_ref.insert(inode, (handle, Arc::downgrade(&open_file.description)));
+        match map_ref.entry(inode) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                drop(map);
+                free_handle(handle);
+                return Err(NotEligible::AlreadyDelegated);
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert((handle, Arc::downgrade(&open_file.description)));
+            }
+        }
         let mut handle_inodes = DELEGATED_HANDLE_INODES.lock();
         handle_inodes[(handle - 1) as usize] = Some(inode);
         let mut rootfs = DELEGATED_ROOTFS.lock();
@@ -2070,6 +2075,48 @@ mod tests {
             let open_file = dispatcher.open_file(fd).unwrap();
             let err = delegate(&open_file, table_id, fd, dispatcher.fs(), None, None).unwrap_err();
             assert!(matches!(err, NotEligible::UnsupportedFlags));
+        }
+
+        #[test]
+        fn test_atomic_check_and_insert_and_conditional_removal() {
+            let _region = TestEl1Region::new();
+            let dispatcher = crate::dispatch::SyscallDispatcher::new();
+            let ctx = dispatcher.capture_one_task_context().unwrap();
+            let table = ctx.task().leader_file_table().unwrap();
+            let table_id = table.id();
+
+            let fd1 = open_path_for_test(
+                &dispatcher,
+                &ctx,
+                "/test_atomic_insert.txt",
+                carrick_abi::LINUX_O_CREAT | carrick_abi::LINUX_O_RDWR,
+            );
+            let fd2 = open_path_for_test(
+                &dispatcher,
+                &ctx,
+                "/test_atomic_insert.txt",
+                carrick_abi::LINUX_O_RDWR,
+            );
+
+            let open1 = dispatcher.open_file(fd1).unwrap();
+            let open2 = dispatcher.open_file(fd2).unwrap();
+
+            let h1 = delegate(&open1, table_id, fd1, dispatcher.fs(), None, None).unwrap();
+            // Second delegate of same inode must return AlreadyDelegated
+            let err = delegate(&open2, table_id, fd2, dispatcher.fs(), None, None).unwrap_err();
+            assert!(matches!(err, NotEligible::AlreadyDelegated));
+
+            // Freeing a non-matching handle must not remove h1's entry
+            free_handle(h1 + 1);
+            {
+                let map = DELEGATED_INODES.lock();
+                let map_ref = map.as_ref().unwrap();
+                let inode = DELEGATED_HANDLE_INODES.lock()[(h1 - 1) as usize].unwrap();
+                assert_eq!(map_ref.get(&inode).unwrap().0, h1);
+            }
+
+            // Freeing h1 removes it cleanly
+            free_handle(h1);
         }
     }
 }
