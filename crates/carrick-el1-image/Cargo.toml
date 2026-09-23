@@ -1,0 +1,9 @@
+[package]
+name = "carrick-el1-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+carrick-el1-abi = { path = "../carrick-el1-abi" }

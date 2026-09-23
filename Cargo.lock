@@ -429,6 +429,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-el1"
+version = "0.1.0"
+dependencies = [
+ "carrick-el1-abi",
+]
+
+[[package]]
+name = "carrick-el1-abi"
+version = "0.1.0"
+
+[[package]]
+name = "carrick-el1-image"
+version = "0.1.0"
+dependencies = [
+ "carrick-el1-abi",
+]
+
+[[package]]
 name = "carrick-embed"
 version = "0.1.0"
 dependencies = [
