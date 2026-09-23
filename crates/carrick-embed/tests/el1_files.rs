@@ -355,3 +355,24 @@ print "memfd_seal_ok\n";
         "expected at least 50 writes served at EL1 before seal, got {served_writes}"
     );
 }
+
+/// Multi-threaded kick delivery: Thread 1 opens a file, does one EL1-served write/seek,
+/// then enters an EL0 spin loop (`while(1){}`). Thread 2 sleeps briefly (50 ms) then calls
+/// `exit_group(0)`. Watchdog bounds at 2 s. Assert exit succeeds; run 20 iterations.
+#[test]
+fn el1_files_kick_delivery_spin_loop() {
+    let _guard = common::guest_lock();
+
+    for iteration in 1..=20 {
+        let watchdog = Watchdog::start(std::time::Duration::from_secs(2));
+        let builder = common::interceptor_probe_builder("spin-loop-exit");
+        let result = common::run_or_fail(builder.run_blocking());
+        watchdog.disarm();
+        assert!(
+            result.success(),
+            "iteration {iteration} failed with exit_code={}, stderr: {}",
+            result.exit_code,
+            result.stderr_utf8()
+        );
+    }
+}

@@ -225,6 +225,54 @@ fn exit_group_stress(file_path: &str) -> i32 {
     0
 }
 
+fn spin_loop_exit(file_path: &str) -> i32 {
+    let path = file_path.to_string();
+    let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started_clone = started.clone();
+
+    let _thread1 = std::thread::spawn(move || {
+        let path_c = match std::ffi::CString::new(path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let fd = unsafe {
+            libc::open(
+                path_c.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+                0o666,
+            )
+        };
+        if fd < 0 {
+            return;
+        }
+        let buf = b"kick-spin-loop-write\n";
+        unsafe {
+            libc::syscall(
+                libc::SYS_write,
+                fd,
+                buf.as_ptr() as *const libc::c_void,
+                buf.len(),
+            );
+            libc::syscall(libc::SYS_lseek, fd, 0, libc::SEEK_SET);
+        }
+        started_clone.store(true, std::sync::atomic::Ordering::Release);
+        loop {
+            std::hint::spin_loop();
+        }
+    });
+
+    while !started.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    unsafe {
+        libc::syscall(libc::SYS_exit_group, 0);
+    }
+    0
+}
+
 static SIGNAL_RECEIVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 extern "C" fn sigusr1_handler(_sig: libc::c_int) {
@@ -339,6 +387,10 @@ fn main() {
         "signal-stress" => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("/tmp/sigstress.txt");
             signal_stress(path)
+        }
+        "spin-loop-exit" => {
+            let path = args.get(2).map(|s| s.as_str()).unwrap_or("/tmp/spinloop.txt");
+            spin_loop_exit(path)
         }
         _ => 64,
     };

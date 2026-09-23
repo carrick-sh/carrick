@@ -534,6 +534,8 @@ const AARCH64_HVC_SYSCALL_OPCODE: u32 = AARCH64_HVC0_OPCODE | (2 << 5);
 // this so the host sees ESR_EL1/ELR_EL1/FAR_EL1 and FAILS LOUD, instead of the
 // old bare `eret` that silently re-faulted at 100 % CPU forever.
 const AARCH64_HVC_FAULT_OPCODE: u32 = AARCH64_HVC0_OPCODE | (3 << 5);
+// AArch64 `hvc #4` — the EL1 vector's lower-EL IRQ kick boundary trap.
+const AARCH64_HVC_KICK_OPCODE: u32 = AARCH64_HVC0_OPCODE | (4 << 5);
 // AArch64 `mov x8, #139`, the Linux aarch64 rt_sigreturn syscall number.
 const AARCH64_MOV_X8_RT_SIGRETURN_OPCODE: u32 = 0xd280_1168;
 // AArch64 `svc #0`, used by the user-mode sigreturn trampoline.
@@ -584,6 +586,9 @@ pub const AARCH64_VECTOR_SLOT_SIZE: usize = 0x80;
 // Offset of the "Lower EL using AArch64, synchronous" slot in the vector
 // table. EL0 `svc #0` from AArch64 lands here.
 const AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET: usize = 0x400;
+// Offset of the "Lower EL using AArch64, IRQ" slot in the vector table.
+// Virtual IRQ injected on an EL1 kick lands here upon eret to EL0.
+const AARCH64_VECTOR_LOWER_EL_IRQ_OFFSET: usize = 0x480;
 // Offsets of the two "Current EL" SYNCHRONOUS slots: SP_EL0 (0x000) and SP_ELx
 // (0x200). A synchronous exception here means carrick's own EL1 trampoline code
 // faulted — only possible if the guest was wrongly left at EL1 (the fail-loud
@@ -3633,6 +3638,7 @@ pub fn el1_vectors_bytes() -> Vec<u8> {
     let mut bytes = vec![0_u8; size];
     let hvc = AARCH64_HVC_SYSCALL_OPCODE.to_le_bytes();
     let hvc_fault = AARCH64_HVC_FAULT_OPCODE.to_le_bytes();
+    let hvc_kick = AARCH64_HVC_KICK_OPCODE.to_le_bytes();
     let eret = AARCH64_ERET_OPCODE.to_le_bytes();
     let nop = AARCH64_NOP_OPCODE.to_le_bytes();
 
@@ -3645,6 +3651,13 @@ pub fn el1_vectors_bytes() -> Vec<u8> {
         if slot_offset == AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET {
             bytes[cursor..cursor + hvc.len()].copy_from_slice(&hvc);
             cursor += hvc.len();
+            bytes[cursor..cursor + eret.len()].copy_from_slice(&eret);
+            cursor += eret.len();
+        } else if slot_offset == AARCH64_VECTOR_LOWER_EL_IRQ_OFFSET {
+            // Lower-EL IRQ slot: takes the virtual IRQ armed on an EL1 kick the
+            // moment eret unmasks IRQs at EL0. Forwards to host via hvc #4.
+            bytes[cursor..cursor + hvc_kick.len()].copy_from_slice(&hvc_kick);
+            cursor += hvc_kick.len();
             bytes[cursor..cursor + eret.len()].copy_from_slice(&eret);
             cursor += eret.len();
         } else if slot_offset == AARCH64_VECTOR_CUR_EL_SP0_SYNC_OFFSET {
@@ -7775,6 +7788,28 @@ mod el1_shim_tests {
             rd_u32(&el1_vectors_bytes(), AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET),
             HVC2
         );
+    }
+
+    /// Lower-EL IRQ slot (0x480) forwards to the host via `hvc #4` then `eret`.
+    #[test]
+    fn lower_el_irq_slot_forwards_via_hvc4() {
+        const HVC4: u32 = 0xd400_0002 | (4 << 5);
+        for page in [
+            el1_vectors_bytes(),
+            el1_vectors_bytes_shim(),
+            el1_vectors_bytes_mailbox(true),
+        ] {
+            assert_eq!(
+                rd_u32(&page, AARCH64_VECTOR_LOWER_EL_IRQ_OFFSET),
+                HVC4,
+                "lower-EL IRQ slot (0x480) must forward via hvc #4"
+            );
+            assert_eq!(
+                rd_u32(&page, AARCH64_VECTOR_LOWER_EL_IRQ_OFFSET + 4),
+                ERET,
+                "lower-EL IRQ slot (0x480) must eret after hvc #4"
+            );
+        }
     }
 
     fn minimal_image() -> AddressSpace {

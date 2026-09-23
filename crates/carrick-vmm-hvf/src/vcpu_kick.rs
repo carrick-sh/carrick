@@ -404,39 +404,11 @@ fn reconcile_durable_signal_state_until_stable(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn durable_signal_retry_is_owed() -> bool {
-    crate::host_signal::has_process_pending()
-        || crate::host_signal::xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE)
-        || !crate::host_signal::pending_thread_tids().is_empty()
-}
-
-/// Retry only the HVF kick half of durable signal delivery, and only for vCPUs
-/// still entering or executing guest code. The initial reconciliation already
-/// notified futex waiters and carrier continuations; repeating those broad wake
-/// paths for an unchanged blocked pending bit turns the pump into a 1 kHz spin.
-/// A vCPU still in guest code is the one case where the one-shot
-/// `hv_vcpus_exit` may have landed at an EL1 boundary and needs another chance.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn retry_durable_signal_kicks(kicker: &dyn carrick_hal::VcpuRegistry) -> bool {
-    if crate::host_signal::has_process_pending()
-        || crate::host_signal::xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE)
-    {
-        return kicker.kick_all_in_guest();
-    }
-
-    let mut kicked = false;
-    for tid in crate::host_signal::pending_thread_tids() {
-        kicked |= kicker.kick_if_in_guest(carrick_hal::ThreadId::from_wire_key(tid));
-    }
-    kicked
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn spawn_signal_pump_inner(
     kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
     futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
     monitor_hvf_events: bool,
-    kernel_retry: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    _kernel_retry: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> SignalPump {
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let exited = ExitSignal::new();
@@ -510,16 +482,8 @@ fn spawn_signal_pump_inner(
             // state can predate this pump and therefore its local sequence.
             let mut observed_publication =
                 reconcile_durable_signal_state_until_stable(kicker.as_ref(), futex.as_ref());
-            // A publication gets one unconditional reconciliation. Further
-            // retry is useful only while a target remains in guest code; the
-            // first timeout below discovers that state without repeatedly
-            // waking parked host-side waiters.
-            let mut retry_armed = durable_signal_retry_is_owed();
             thread_ready.raise();
             while thread_running.load(std::sync::atomic::Ordering::SeqCst) {
-                if let Some(retry) = kernel_retry.as_ref() {
-                    retry_armed |= retry();
-                }
                 // Pipes and kqueue user events are notifications, never the
                 // source of truth. Reconcile before the FIRST wait and every
                 // subsequent wait so pre-start publication, fork pipe
@@ -531,7 +495,6 @@ fn spawn_signal_pump_inner(
                         kicker.as_ref(),
                         futex.as_ref(),
                     );
-                    retry_armed |= durable_signal_retry_is_owed();
                 }
                 // Reconcile registered timers with the armed slots BEFORE waiting,
                 // so a just-armed (or re-armed) timer is registered in this
@@ -560,27 +523,7 @@ fn spawn_signal_pump_inner(
                         }
                     }
                 }
-                // A pending signal whose one delivery kick was swallowed at
-                // an EL1 boundary (the sched_yield fast path never VM-exits,
-                // and a CANCELED exit at EL1 consumes the one-shot
-                // hv_vcpus_exit) is otherwise NEVER retried: the publication
-                // generation is unchanged, so this pump blocked forever while
-                // the guest's __synccall handshake starved
-                // (setidthreadchurn's 45 s livelock). After a publication,
-                // briefly arm a short cadence; each timeout retries only vCPUs
-                // still reporting in-guest and disarms as soon as none remain.
-                // With no viable retry target, block indefinitely as before (a
-                // poll would keep an idle process SRUN).
-                let retry_timeout = libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 1_000_000,
-                };
-                let timeout = if retry_armed {
-                    Some(&retry_timeout)
-                } else {
-                    None
-                };
-                let n = match kq.wait(&[], &mut out, timeout) {
+                let n = match kq.wait(&[], &mut out, None) {
                     Ok(n) => n,
                     Err(errno) => {
                         if errno == libc::EINTR {
@@ -589,15 +532,6 @@ fn spawn_signal_pump_inner(
                         break;
                     }
                 };
-                if n == 0 && retry_armed {
-                    // A one-shot HVF exit can be swallowed at EL1. Retry only
-                    // vCPUs that are still in guest code; once every target is
-                    // back in host code, disarm the timeout and genuinely park.
-                    let host_retry_owed = retry_durable_signal_kicks(kicker.as_ref());
-                    let kernel_retry_owed = kernel_retry.as_ref().is_some_and(|retry| retry());
-                    retry_armed = host_retry_owed || kernel_retry_owed;
-                    continue;
-                }
                 for event in out.iter().take(n) {
                     if event.is_read() {
                         crate::host_signal::drain_pump_pipe();
