@@ -337,11 +337,6 @@ impl DelegatedFile {
         }
         false
     }
-
-    /// Host spin-waits until the lock is acquired (up to default 10,000,000 spins).
-    pub fn host_lock(&self) -> bool {
-        self.host_lock_bounded(10_000_000)
-    }
 }
 
 impl Default for DelegatedFile {
