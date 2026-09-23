@@ -1734,7 +1734,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
       "ordinal_in_function": 2,
-      "fingerprint": "ce2635738ccc429c0992a7a2c47a2c2b2116bf6907acddff34d00edb22012bcd",
+      "fingerprint": "fea6ac02514e18fb83ac098c8b3d87bd5d3f3ecd0caccb5dab9d20f6222fa907",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization_tlbi",
       "rationale": "Sparse page-table descriptors were committed but exact-ASID invalidation failed; continuing could execute through stale stage-1 translations.",
