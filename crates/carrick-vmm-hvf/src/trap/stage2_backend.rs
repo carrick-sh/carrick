@@ -931,8 +931,8 @@ pub(crate) fn record_el1_counters_host_ptr(ptr: usize) {
 pub(crate) fn snapshot_and_clear_el1_counters() {
     let ptr = EL1_COUNTERS_HOST_PTR.swap(0, std::sync::atomic::Ordering::AcqRel);
     if ptr != 0 {
-        let counters = unsafe { std::ptr::read_volatile(ptr as *const carrick_el1_abi::Counters) };
-        *LAST_EL1_COUNTERS.lock() = Some(counters);
+        let counters_ref = unsafe { &*(ptr as *const carrick_el1_abi::Counters) };
+        *LAST_EL1_COUNTERS.lock() = Some(counters_ref.copy_snapshot());
     }
 }
 
@@ -944,9 +944,10 @@ pub fn reset_el1_counters() {
 pub fn read_el1_counters() -> Option<carrick_el1_abi::Counters> {
     let ptr = EL1_COUNTERS_HOST_PTR.load(std::sync::atomic::Ordering::Acquire);
     if ptr != 0 {
-        Some(unsafe { std::ptr::read_volatile(ptr as *const carrick_el1_abi::Counters) })
+        let counters_ref = unsafe { &*(ptr as *const carrick_el1_abi::Counters) };
+        Some(counters_ref.copy_snapshot())
     } else {
-        *LAST_EL1_COUNTERS.lock()
+        LAST_EL1_COUNTERS.lock().as_ref().map(|c| c.copy_snapshot())
     }
 }
 

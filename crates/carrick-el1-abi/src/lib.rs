@@ -121,24 +121,16 @@ pub struct TrapFrame {
     pub slot: u64,
 }
 
-/// Per-syscall accounting counters maintained by the EL1 kernel in the shared aperture.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct Counters {
-    /// Number of times syscall nr was serviced at EL1 without VM exit.
-    pub served: [u64; 512],
-    /// Number of times syscall nr was forwarded to the host.
-    pub forwarded: [u64; 512],
-}
+pub use core::sync::atomic::{AtomicU64, Ordering};
 
-impl Default for Counters {
-    fn default() -> Self {
-        Self {
-            served: [0; 512],
-            forwarded: [0; 512],
-        }
-    }
-}
+/// Total size of the EL1 kernel image area (1 MiB).
+pub const EL1_IMAGE_SIZE: u64 = 0x10_0000;
+
+/// Total size of the EL1 kernel counters area (1 MiB).
+pub const EL1_COUNTERS_SIZE: u64 = 0x10_0000;
+
+/// Total size of the EL1 kernel stacks area (4 MiB).
+pub const EL1_STACKS_SIZE: u64 = 0x40_0000;
 
 /// Sentinel value written by `carrick-el1` panic handler into [`Counters`] before spinning.
 pub const PANIC_SENTINEL: u64 = 0xDEAD_CAFE_DEAD_BEEF;
@@ -146,12 +138,58 @@ pub const PANIC_SENTINEL: u64 = 0xDEAD_CAFE_DEAD_BEEF;
 /// Syscall counter index used by the panic handler to store the sentinel.
 pub const PANIC_SENTINEL_SYSCALL_NR: usize = 511;
 
+/// Per-syscall accounting counters maintained by the EL1 kernel in the shared aperture.
+#[repr(C)]
+pub struct Counters {
+    /// Number of times syscall nr was serviced at EL1 without VM exit.
+    pub served: [AtomicU64; 512],
+    /// Number of times syscall nr was forwarded to the host.
+    pub forwarded: [AtomicU64; 512],
+}
+
+impl Counters {
+    pub const fn new() -> Self {
+        const ZERO: AtomicU64 = AtomicU64::new(0);
+        Self {
+            served: [ZERO; 512],
+            forwarded: [ZERO; 512],
+        }
+    }
+
+    pub fn copy_snapshot(&self) -> Self {
+        let snapshot = Self::new();
+        for i in 0..512 {
+            snapshot.served[i].store(self.served[i].load(Ordering::Relaxed), Ordering::Relaxed);
+            snapshot.forwarded[i]
+                .store(self.forwarded[i].load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        snapshot
+    }
+}
+
+impl Default for Counters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl core::fmt::Debug for Counters {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Counters")
+            .field("forwarded_64", &self.forwarded[64].load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 const _: () = assert!(EL1_REGION_BASE.is_multiple_of(0x0400_0000));
 const _: () = assert!(EL1_REGION_SIZE == 64 * 1024 * 1024);
-const _: () = assert!(EL1_IMAGE_OFFSET < EL1_COUNTERS_OFFSET);
-const _: () = assert!(EL1_COUNTERS_OFFSET < EL1_STACKS_OFFSET);
-const _: () = assert!(EL1_STACKS_OFFSET + EL1_STACK_SLOTS * EL1_STACK_SIZE <= EL1_HEAP_OFFSET);
-const _: () = assert!(EL1_HEAP_OFFSET < EL1_REGION_SIZE);
+const _: () = assert!(EL1_IMAGE_OFFSET + EL1_IMAGE_SIZE <= EL1_COUNTERS_OFFSET);
+const _: () = assert!(EL1_COUNTERS_OFFSET + EL1_COUNTERS_SIZE <= EL1_STACKS_OFFSET);
+const _: () = assert!(
+    EL1_STACKS_OFFSET + EL1_STACK_SLOTS * EL1_STACK_SIZE <= EL1_STACKS_OFFSET + EL1_STACKS_SIZE
+);
+const _: () = assert!(EL1_STACKS_OFFSET + EL1_STACKS_SIZE <= EL1_HEAP_OFFSET);
+const _: () = assert!(EL1_HEAP_OFFSET + EL1_HEAP_SIZE <= EL1_REGION_SIZE);
 
 #[cfg(test)]
 mod tests {
