@@ -10560,7 +10560,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 3281,
+      "line": 3278,
       "categories": [
         "description_guard"
       ],
@@ -10569,7 +10569,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 5796,
+      "line": 5793,
       "categories": [
         "mapping"
       ],
@@ -12608,7 +12608,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/core.rs",
-      "line": 2013,
+      "line": 2019,
       "categories": [
         "mapping"
       ],
