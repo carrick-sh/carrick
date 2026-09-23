@@ -157,7 +157,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/fs/open.rs::FsView::open_at_path_string::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/fs/open.rs",
-      "line": 188,
+      "line": 181,
       "item": "FsView::open_at_path_string",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -166,7 +166,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/fs/open.rs::FsView::try_vfs_open::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/fs/open.rs",
-      "line": 1404,
+      "line": 1397,
       "item": "FsView::try_vfs_open",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -292,7 +292,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::DispatchError::hvpatch_process::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 814,
+      "line": 826,
       "item": "DispatchError::hvpatch_process",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -301,7 +301,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::DispatchError::is_forked_guest_process::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 852,
+      "line": 864,
       "item": "DispatchError::is_forked_guest_process",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -310,7 +310,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::DispatchError::bootstrap_host_pid::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 858,
+      "line": 870,
       "item": "DispatchError::bootstrap_host_pid",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -319,7 +319,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::DispatchError::is_ptrace_traceme::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 863,
+      "line": 875,
       "item": "DispatchError::is_ptrace_traceme",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -328,7 +328,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::FnOnce::hvpatch_orphan_adopter::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 886,
+      "line": 898,
       "item": "FnOnce::hvpatch_orphan_adopter",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -337,7 +337,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::FnOnce::install_seccomp_filter::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 937,
+      "line": 949,
       "item": "FnOnce::install_seccomp_filter",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -346,7 +346,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::personality::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1357,
+      "line": 1378,
       "item": "ProcView::personality",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -355,7 +355,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1409,
+      "line": 1430,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -364,7 +364,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#2",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1422,
+      "line": 1443,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -373,7 +373,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#3",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1430,
+      "line": 1451,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -382,7 +382,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#4",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1434,
+      "line": 1455,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -391,7 +391,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#5",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1446,
+      "line": 1467,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -400,7 +400,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#6",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1456,
+      "line": 1477,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -409,7 +409,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#7",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1460,
+      "line": 1481,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -418,7 +418,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#8",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1513,
+      "line": 1534,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -427,7 +427,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#9",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1521,
+      "line": 1542,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -436,7 +436,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#10",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1529,
+      "line": 1550,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -445,7 +445,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#11",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1533,
+      "line": 1554,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -454,7 +454,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#12",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1538,
+      "line": 1559,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -463,7 +463,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#13",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1549,
+      "line": 1570,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -472,7 +472,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#14",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1560,
+      "line": 1581,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -481,7 +481,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#15",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1566,
+      "line": 1587,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -490,7 +490,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::prctl::proc#16",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1570,
+      "line": 1591,
       "item": "ProcView::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -499,7 +499,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::uname::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 2477,
+      "line": 2526,
       "item": "ProcView::uname",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -508,7 +508,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::ptrace::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 2507,
+      "line": 2556,
       "item": "ProcView::ptrace",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -611,7 +611,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::for_fork_copy::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1985,
+      "line": 2003,
       "item": "FileTable::for_fork_copy",
       "category": "file_table_internals",
       "expression": ".open_files.read()",
@@ -620,7 +620,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::for_fork_copy::file_table_internals#2",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1998,
+      "line": 2016,
       "item": "FileTable::for_fork_copy",
       "category": "file_table_internals",
       "expression": ".next_fd.lock()",
@@ -629,7 +629,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::for_fork_copy::file_table_internals#3",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1999,
+      "line": 2017,
       "item": "FileTable::for_fork_copy",
       "category": "file_table_internals",
       "expression": ".stdio_cloexec.lock()",
@@ -638,7 +638,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::for_fork_copy::file_table_internals#4",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2000,
+      "line": 2018,
       "item": "FileTable::for_fork_copy",
       "category": "file_table_internals",
       "expression": ".closed_stdio.lock()",
@@ -647,7 +647,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::for_fork_copy::file_table_internals#5",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2002,
+      "line": 2020,
       "item": "FileTable::for_fork_copy",
       "category": "file_table_internals",
       "expression": ".fd_open_paths.read()",
@@ -656,7 +656,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::for_fork_copy::file_table_internals#6",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2010,
+      "line": 2028,
       "item": "FileTable::for_fork_copy",
       "category": "file_table_internals",
       "expression": ".epoll_fds.read()",
@@ -665,7 +665,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::for_exec::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2043,
+      "line": 2061,
       "item": "FileTable::for_exec",
       "category": "file_table_internals",
       "expression": ".open_files.read()",
@@ -674,7 +674,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::for_exec::file_table_internals#2",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2050,
+      "line": 2068,
       "item": "FileTable::for_exec",
       "category": "file_table_internals",
       "expression": ".closed_stdio.lock()",
@@ -683,7 +683,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::for_exec::file_table_internals#3",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2053,
+      "line": 2071,
       "item": "FileTable::for_exec",
       "category": "file_table_internals",
       "expression": ".stdio_cloexec.lock()",
@@ -692,7 +692,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::for_exec::file_table_internals#4",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2068,
+      "line": 2086,
       "item": "FileTable::for_exec",
       "category": "file_table_internals",
       "expression": ".next_fd.lock()",
@@ -701,7 +701,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::for_exec::file_table_internals#5",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2071,
+      "line": 2089,
       "item": "FileTable::for_exec",
       "category": "file_table_internals",
       "expression": ".fd_open_paths.read()",
@@ -710,7 +710,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::for_exec::file_table_internals#6",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2081,
+      "line": 2099,
       "item": "FileTable::for_exec",
       "category": "file_table_internals",
       "expression": ".epoll_fds.read()",
@@ -719,7 +719,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::install::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2367,
+      "line": 2385,
       "item": "FileTable::install",
       "category": "file_table_internals",
       "expression": ".open_files.write()",
@@ -728,7 +728,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::capture_slot_authority::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2383,
+      "line": 2401,
       "item": "FileTable::capture_slot_authority",
       "category": "file_table_internals",
       "expression": ".open_files.read()",
@@ -737,7 +737,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::capture_open_slot_authority::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2399,
+      "line": 2417,
       "item": "FileTable::capture_open_slot_authority",
       "category": "file_table_internals",
       "expression": ".open_files.read()",
@@ -746,7 +746,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::validate_slot_authority::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2440,
+      "line": 2458,
       "item": "FileTable::validate_slot_authority",
       "category": "file_table_internals",
       "expression": ".open_files.read()",
@@ -755,7 +755,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::resolve_slot_authority::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2475,
+      "line": 2493,
       "item": "FileTable::resolve_slot_authority",
       "category": "file_table_internals",
       "expression": ".open_files.read()",
@@ -764,7 +764,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::retain_slot_lease::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2490,
+      "line": 2508,
       "item": "FileTable::retain_slot_lease",
       "category": "file_table_internals",
       "expression": ".open_files.read()",
@@ -773,7 +773,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::subscribe_slot_authority::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2535,
+      "line": 2553,
       "item": "FileTable::subscribe_slot_authority",
       "category": "file_table_internals",
       "expression": ".open_files.read()",
@@ -782,7 +782,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::slot::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2556,
+      "line": 2574,
       "item": "FileTable::slot",
       "category": "file_table_internals",
       "expression": ".open_files.read()",
@@ -791,7 +791,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::slot_count::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2560,
+      "line": 2578,
       "item": "FileTable::slot_count",
       "category": "file_table_internals",
       "expression": ".open_files.read()",
@@ -800,7 +800,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::read_open_files::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2564,
+      "line": 2582,
       "item": "FileTable::read_open_files",
       "category": "file_table_internals",
       "expression": ".open_files.read()",
@@ -809,7 +809,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::write_open_files::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2569,
+      "line": 2587,
       "item": "FileTable::write_open_files",
       "category": "file_table_internals",
       "expression": ".open_files.write()",
@@ -818,7 +818,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::read_fd_open_paths::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2602,
+      "line": 2620,
       "item": "FileTable::read_fd_open_paths",
       "category": "file_table_internals",
       "expression": ".fd_open_paths.read()",
@@ -827,7 +827,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::read_epoll_fds::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2628,
+      "line": 2646,
       "item": "FileTable::read_epoll_fds",
       "category": "file_table_internals",
       "expression": ".epoll_fds.read()",
@@ -836,7 +836,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::drain_functional_refs::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2669,
+      "line": 2687,
       "item": "FileTable::drain_functional_refs",
       "category": "file_table_internals",
       "expression": ".open_files.read()",
@@ -845,7 +845,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::snapshot_until::file_table_internals#1",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2718,
+      "line": 2736,
       "item": "FileTable::snapshot_until",
       "category": "file_table_internals",
       "expression": ".open_files.try_read_until()",
@@ -854,7 +854,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::snapshot_until::file_table_internals#2",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2719,
+      "line": 2737,
       "item": "FileTable::snapshot_until",
       "category": "file_table_internals",
       "expression": ".next_fd.try_lock_until()",
@@ -863,7 +863,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::snapshot_until::file_table_internals#3",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2720,
+      "line": 2738,
       "item": "FileTable::snapshot_until",
       "category": "file_table_internals",
       "expression": ".stdio_cloexec.try_lock_until()",
@@ -872,7 +872,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::snapshot_until::file_table_internals#4",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2721,
+      "line": 2739,
       "item": "FileTable::snapshot_until",
       "category": "file_table_internals",
       "expression": ".closed_stdio.try_lock_until()",
@@ -881,7 +881,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::snapshot_until::file_table_internals#5",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2722,
+      "line": 2740,
       "item": "FileTable::snapshot_until",
       "category": "file_table_internals",
       "expression": ".fd_open_paths.try_read_until()",
@@ -890,7 +890,7 @@
     {
       "id": "crates/carrick-kernel/src/kernel/objects.rs::FileTable::snapshot_until::file_table_internals#6",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2723,
+      "line": 2741,
       "item": "FileTable::snapshot_until",
       "category": "file_table_internals",
       "expression": ".epoll_fds.try_read_until()",
