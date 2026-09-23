@@ -76,6 +76,7 @@ static DELEGATED_ROOTFS: Mutex<[Option<Weak<carrick_vfs::RootFsVfs>>; MAX_DELEGA
 static DELEGATED_SPARSE: Mutex<
     [Option<crate::dispatch::fs::HostSparseExtentsRegistry>; MAX_DELEGATED_FILES],
 > = Mutex::new([const { None }; MAX_DELEGATED_FILES]);
+static FD_MAP_LOCK: Mutex<()> = Mutex::new(());
 static HOOK_INIT: std::sync::Once = std::sync::Once::new();
 
 pub(crate) fn init_delegation_hooks() {
@@ -565,11 +566,12 @@ pub(crate) fn delegate_locked(
     file.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
     file.unlock();
 
+    let _fd_map_guard = FD_MAP_LOCK.lock();
     let fd_map_base = (region_ptr + EL1_FD_MAP_OFFSET as usize) as *const FdMapSlot;
     let mut slot_found = false;
     for slot_idx in 0..FD_MAP_CAPACITY {
         let slot = unsafe { &*fd_map_base.add(slot_idx) };
-        if slot.handle.load(Ordering::Relaxed) == 0 {
+        if slot.incarnation.load(Ordering::Relaxed) == 0 {
             slot.set(file_table.raw(), fd as u32, handle, incarnation);
             slot_found = true;
             break;
@@ -790,11 +792,14 @@ pub(crate) fn recall_locked(
         _ => {}
     }
 
-    let fd_map_base = (region_ptr + EL1_FD_MAP_OFFSET as usize) as *const FdMapSlot;
-    for slot_idx in 0..FD_MAP_CAPACITY {
-        let slot = unsafe { &*fd_map_base.add(slot_idx) };
-        if slot.handle.load(Ordering::Acquire) == handle {
-            slot.clear();
+    {
+        let _fd_map_guard = FD_MAP_LOCK.lock();
+        let fd_map_base = (region_ptr + EL1_FD_MAP_OFFSET as usize) as *const FdMapSlot;
+        for slot_idx in 0..FD_MAP_CAPACITY {
+            let slot = unsafe { &*fd_map_base.add(slot_idx) };
+            if slot.handle.load(Ordering::Acquire) == handle {
+                slot.clear();
+            }
         }
     }
 
