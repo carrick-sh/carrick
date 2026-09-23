@@ -17,7 +17,7 @@ use crate::kernel::objects::FileDescription;
 use crate::kernel::{FileTableId, RlimitSet};
 
 pub use carrick_el1_abi::{
-    clear_pending_host_work, get_el1_region_host_ptr, mark_pending_host_work,
+    clear_pending_host_work, get_el1_region_host_ptr, get_orig_arg0, mark_pending_host_work,
     mark_pending_host_work_all, mark_pending_host_work_for_task, record_el1_region_host_ptr,
     take_served_with_work,
 };
@@ -28,7 +28,7 @@ pub fn clear_el1_region_host_ptr() {
 }
 
 /// Publish the current task binding for an executor vCPU mailbox slot into the EL1 aperture.
-pub fn publish_current_task(slot: usize, generation: u64, file_table: u64) {
+pub fn publish_current_task(slot: usize, task_id: u64, generation: u64, file_table: u64) {
     let ptr = get_el1_region_host_ptr();
     if ptr == 0 || slot >= 256 {
         return;
@@ -37,6 +37,7 @@ pub fn publish_current_task(slot: usize, generation: u64, file_table: u64) {
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
     current_task.pending_host_work.store(0, Ordering::Relaxed);
     current_task.served_with_work.store(0, Ordering::Relaxed);
+    current_task.task_id.store(task_id, Ordering::Relaxed);
     current_task.file_table.store(file_table, Ordering::Relaxed);
     current_task.generation.store(generation, Ordering::Release);
 }
@@ -49,14 +50,12 @@ pub fn clear_current_task(slot: usize) {
     }
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    current_task.pending_host_work.store(0, Ordering::Relaxed);
-    current_task.served_with_work.store(0, Ordering::Relaxed);
-    current_task.file_table.store(0, Ordering::Relaxed);
-    current_task.generation.store(0, Ordering::Release);
+    current_task.clear();
 }
 
 use std::sync::{Arc, Weak};
 
+static NEXT_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static ALLOCATED_HANDLES: Mutex<[bool; MAX_DELEGATED_FILES]> =
     Mutex::new([false; MAX_DELEGATED_FILES]);
 static DELEGATED_DESCRIPTIONS: Mutex<[Option<Weak<FileDescription>>; MAX_DELEGATED_FILES]> =
@@ -138,18 +137,22 @@ pub enum NotEligible {
     IoError,
 }
 
-fn lock_delegated_file(file: &mut DelegatedFile, handle: u32) {
-    const MAX_SPINS: u64 = 10_000_000;
-    if !file.host_lock_bounded(MAX_SPINS) {
-        let state = file.state.load(Ordering::Relaxed);
-        let generation = file.generation.load(Ordering::Relaxed);
-        carrick_fatal!(
-            "el1_delegation",
-            "DelegatedFile::host_lock timed out spinning for handle={}, state={}, generation={}",
-            handle,
-            state,
-            generation
-        );
+fn lock_delegated_file(file: &DelegatedFile, handle: u32) {
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(30);
+    while !file.host_lock_bounded(64) {
+        if start.elapsed() >= timeout {
+            let state = file.state.load(Ordering::Relaxed);
+            let generation = file.generation.load(Ordering::Relaxed);
+            carrick_fatal!(
+                "el1_delegation",
+                "DelegatedFile::host_lock timed out spinning for handle={}, state={}, generation={}",
+                handle,
+                state,
+                generation
+            );
+        }
+        std::thread::yield_now();
     }
 }
 
@@ -303,10 +306,11 @@ pub(crate) fn delegate(
     let file_ptr = (region_ptr
         + EL1_OBJECT_TABLE_OFFSET as usize
         + (handle as usize - 1) * core::mem::size_of::<DelegatedFile>())
-        as *mut DelegatedFile;
-    let file = unsafe { &mut *file_ptr };
+        as *const DelegatedFile;
+    let file = unsafe { &*file_ptr };
+    let incarnation = NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed);
     lock_delegated_file(file, handle);
-    file.generation.store(1, Ordering::Relaxed);
+    file.generation.store(incarnation, Ordering::Relaxed);
     file.offset.store(offset, Ordering::Relaxed);
     file.size.store(size, Ordering::Relaxed);
     let mut flags_val = 0;
@@ -326,9 +330,7 @@ pub(crate) fn delegate(
     for slot_idx in 0..FD_MAP_CAPACITY {
         let slot = unsafe { &*fd_map_base.add(slot_idx) };
         if slot.handle.load(Ordering::Relaxed) == 0 {
-            slot.file_table.store(file_table.raw(), Ordering::Relaxed);
-            slot.fd.store(fd as u32, Ordering::Relaxed);
-            slot.handle.store(handle, Ordering::Release);
+            slot.set(file_table.raw(), fd as u32, handle, incarnation);
             slot_found = true;
             break;
         }
@@ -392,8 +394,8 @@ fn recall_locked(description: &FileDescription, open: &mut OpenDescription, hand
     let file_ptr = (region_ptr
         + EL1_OBJECT_TABLE_OFFSET as usize
         + (handle as usize - 1) * core::mem::size_of::<DelegatedFile>())
-        as *mut DelegatedFile;
-    let file = unsafe { &mut *file_ptr };
+        as *const DelegatedFile;
+    let file = unsafe { &*file_ptr };
     lock_delegated_file(file, handle);
     file.state
         .store(DELEGATED_STATE_RECALLING, Ordering::Release);
@@ -460,9 +462,7 @@ fn recall_locked(description: &FileDescription, open: &mut OpenDescription, hand
     for slot_idx in 0..FD_MAP_CAPACITY {
         let slot = unsafe { &*fd_map_base.add(slot_idx) };
         if slot.handle.load(Ordering::Acquire) == handle {
-            slot.handle.store(0, Ordering::Release);
-            slot.file_table.store(0, Ordering::Release);
-            slot.fd.store(0, Ordering::Release);
+            slot.clear();
         }
     }
 
@@ -643,8 +643,8 @@ mod tests {
         let file_ptr = (region_ptr
             + EL1_OBJECT_TABLE_OFFSET as usize
             + (handle as usize - 1) * core::mem::size_of::<DelegatedFile>())
-            as *mut DelegatedFile;
-        let file = unsafe { &mut *file_ptr };
+            as *const DelegatedFile;
+        let file = unsafe { &*file_ptr };
         let cache_ptr = (region_ptr
             + EL1_CACHE_OFFSET as usize
             + (handle as usize - 1) * DELEGATED_FILE_MAX_SIZE as usize)
@@ -693,8 +693,8 @@ mod tests {
         let file_ptr = (region_ptr
             + EL1_OBJECT_TABLE_OFFSET as usize
             + (handle as usize - 1) * core::mem::size_of::<DelegatedFile>())
-            as *mut DelegatedFile;
-        let file = unsafe { &mut *file_ptr };
+            as *const DelegatedFile;
+        let file = unsafe { &*file_ptr };
         let cache_ptr = (region_ptr
             + EL1_CACHE_OFFSET as usize
             + (handle as usize - 1) * DELEGATED_FILE_MAX_SIZE as usize)

@@ -164,29 +164,38 @@ pub use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Per-vCPU slot task record published by the host runtime before running
 /// a vCPU and cleared when unloaded.
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Debug)]
 pub struct CurrentTask {
     /// Host-managed generation of the currently loaded task.
     pub generation: AtomicU64,
+    /// Task ID / LinuxTid of the currently loaded task.
+    pub task_id: AtomicU64,
     /// Raw FileTableId of the currently loaded task (0 = none/unbound).
     pub file_table: AtomicU64,
     /// Per-vCPU fixup PC for EL1 user copies (0 = unarmed).
     pub fixup_pc: AtomicU64,
+    /// Original x0 / arg0 before EL1 served the syscall (for reconstruction on served_with_work).
+    pub orig_arg0: AtomicU64,
     /// Return-to-user work pending flag set by the host before kicks/signals/teardown.
     pub pending_host_work: AtomicU32,
     /// Flag indicating this syscall completed at EL1 with return value in `x0`/`args[0]`.
     pub served_with_work: AtomicU32,
+    /// Reserved padding to align struct to 64 bytes (1 << 6).
+    pub _reserved: [u64; 2],
 }
 
 impl CurrentTask {
     pub const fn new() -> Self {
         Self {
             generation: AtomicU64::new(0),
+            task_id: AtomicU64::new(0),
             file_table: AtomicU64::new(0),
             fixup_pc: AtomicU64::new(0),
+            orig_arg0: AtomicU64::new(0),
             pending_host_work: AtomicU32::new(0),
             served_with_work: AtomicU32::new(0),
+            _reserved: [0; 2],
         }
     }
 
@@ -194,13 +203,16 @@ impl CurrentTask {
     pub fn clear(&self) {
         self.file_table.store(0, Ordering::Release);
         self.generation.store(0, Ordering::Release);
+        self.task_id.store(0, Ordering::Release);
         self.fixup_pc.store(0, Ordering::Relaxed);
+        self.orig_arg0.store(0, Ordering::Relaxed);
         self.pending_host_work.store(0, Ordering::Release);
         self.served_with_work.store(0, Ordering::Release);
     }
 
     #[inline]
-    pub fn set(&self, generation: u64, file_table: u64) {
+    pub fn set(&self, task_id: u64, generation: u64, file_table: u64) {
+        self.task_id.store(task_id, Ordering::Relaxed);
         self.generation.store(generation, Ordering::Release);
         self.file_table.store(file_table, Ordering::Release);
     }
@@ -338,7 +350,7 @@ impl Default for DelegatedFile {
     }
 }
 
-/// Mapping from `(file_table, fd)` to a 1-based delegated file `handle`.
+/// Mapping from `(file_table, fd)` to a 1-based delegated file `handle` and its host incarnation.
 #[repr(C)]
 #[derive(Debug)]
 pub struct FdMapSlot {
@@ -348,6 +360,8 @@ pub struct FdMapSlot {
     pub fd: AtomicU32,
     /// 1-based delegated file handle (0 = empty).
     pub handle: AtomicU32,
+    /// Host-assigned incarnation of the delegated file.
+    pub incarnation: AtomicU64,
 }
 
 impl FdMapSlot {
@@ -356,20 +370,23 @@ impl FdMapSlot {
             file_table: AtomicU64::new(0),
             fd: AtomicU32::new(0),
             handle: AtomicU32::new(0),
+            incarnation: AtomicU64::new(0),
         }
     }
 
     #[inline]
     pub fn clear(&self) {
         self.handle.store(0, Ordering::Release);
-        self.fd.store(0, Ordering::Release);
+        self.incarnation.store(0, Ordering::Relaxed);
+        self.fd.store(0, Ordering::Relaxed);
         self.file_table.store(0, Ordering::Release);
     }
 
     #[inline]
-    pub fn set(&self, file_table: u64, fd: u32, handle: u32) {
+    pub fn set(&self, file_table: u64, fd: u32, handle: u32, incarnation: u64) {
         self.file_table.store(file_table, Ordering::Relaxed);
         self.fd.store(fd, Ordering::Relaxed);
+        self.incarnation.store(incarnation, Ordering::Relaxed);
         self.handle.store(handle, Ordering::Release);
     }
 }
@@ -380,19 +397,19 @@ impl Default for FdMapSlot {
     }
 }
 
-/// Lookup a delegated file handle for a given `(file_table, fd)`.
-pub fn fd_map_lookup(map: &[FdMapSlot], file_table: u64, fd: i32) -> Option<u32> {
+/// Lookup a delegated file handle and slot index for a given `(file_table, fd)`.
+pub fn fd_map_lookup(map: &[FdMapSlot], file_table: u64, fd: i32) -> Option<(u32, usize)> {
     if file_table == 0 || fd < 0 {
         return None;
     }
     let ufd = fd as u32;
-    for slot in map.iter().take(FD_MAP_CAPACITY) {
+    for (idx, slot) in map.iter().take(FD_MAP_CAPACITY).enumerate() {
         let h = slot.handle.load(Ordering::Acquire);
         if h != 0
             && slot.fd.load(Ordering::Relaxed) == ufd
             && slot.file_table.load(Ordering::Relaxed) == file_table
         {
-            return Some(h);
+            return Some((h, idx));
         }
     }
     None
@@ -523,8 +540,8 @@ pub fn mark_pending_host_work_all() {
     }
 }
 
-/// Mark return-to-user work pending for any vCPU slot running the given task generation.
-pub fn mark_pending_host_work_for_task(generation: u64) {
+/// Mark return-to-user work pending for any vCPU slot running the given task identity (tid).
+pub fn mark_pending_host_work_for_task(tid: u64) {
     let ptr = get_el1_region_host_ptr();
     if ptr == 0 {
         return;
@@ -532,7 +549,7 @@ pub fn mark_pending_host_work_for_task(generation: u64) {
     for slot in 0..EL1_STACK_SLOTS as usize {
         let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
         let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-        if current_task.generation.load(Ordering::Relaxed) == generation {
+        if current_task.task_id.load(Ordering::Relaxed) == tid {
             current_task.pending_host_work.store(1, Ordering::Release);
         }
     }
@@ -547,6 +564,17 @@ pub fn take_served_with_work(slot: usize) -> bool {
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
     current_task.served_with_work.swap(0, Ordering::AcqRel) != 0
+}
+
+/// Read the preserved original argument 0 for an executor slot.
+pub fn get_orig_arg0(slot: usize) -> u64 {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
+        return 0;
+    }
+    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+    let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+    current_task.orig_arg0.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -574,6 +602,7 @@ mod tests {
     fn test_action_discriminants() {
         assert_eq!(Action::Served as u64, 0);
         assert_eq!(Action::Forward as u64, 1);
+        assert_eq!(Action::ServedWithWork as u64, 2);
     }
 
     #[test]
@@ -594,13 +623,15 @@ mod tests {
 
     #[test]
     fn test_current_task_layout() {
-        assert_eq!(core::mem::size_of::<CurrentTask>(), 32);
+        assert_eq!(core::mem::size_of::<CurrentTask>(), 64);
         assert_eq!(core::mem::align_of::<CurrentTask>(), 8);
         assert_eq!(core::mem::offset_of!(CurrentTask, generation), 0);
-        assert_eq!(core::mem::offset_of!(CurrentTask, file_table), 8);
-        assert_eq!(core::mem::offset_of!(CurrentTask, fixup_pc), 16);
-        assert_eq!(core::mem::offset_of!(CurrentTask, pending_host_work), 24);
-        assert_eq!(core::mem::offset_of!(CurrentTask, served_with_work), 28);
+        assert_eq!(core::mem::offset_of!(CurrentTask, task_id), 8);
+        assert_eq!(core::mem::offset_of!(CurrentTask, file_table), 16);
+        assert_eq!(core::mem::offset_of!(CurrentTask, fixup_pc), 24);
+        assert_eq!(core::mem::offset_of!(CurrentTask, orig_arg0), 32);
+        assert_eq!(core::mem::offset_of!(CurrentTask, pending_host_work), 40);
+        assert_eq!(core::mem::offset_of!(CurrentTask, served_with_work), 44);
     }
 
     #[test]
@@ -611,21 +642,28 @@ mod tests {
 
     #[test]
     fn test_fd_map_slot_layout() {
-        assert_eq!(core::mem::size_of::<FdMapSlot>(), 16);
+        assert_eq!(core::mem::size_of::<FdMapSlot>(), 24);
         assert_eq!(core::mem::align_of::<FdMapSlot>(), 8);
+        assert_eq!(core::mem::offset_of!(FdMapSlot, file_table), 0);
+        assert_eq!(core::mem::offset_of!(FdMapSlot, fd), 8);
+        assert_eq!(core::mem::offset_of!(FdMapSlot, handle), 12);
+        assert_eq!(core::mem::offset_of!(FdMapSlot, incarnation), 16);
     }
 
     #[test]
     fn test_current_task_operations() {
         let task = CurrentTask::new();
+        assert_eq!(task.task_id.load(Ordering::Relaxed), 0);
         assert_eq!(task.generation.load(Ordering::Relaxed), 0);
         assert_eq!(task.file_table.load(Ordering::Relaxed), 0);
 
-        task.set(42, 100);
+        task.set(7, 42, 100);
+        assert_eq!(task.task_id.load(Ordering::Relaxed), 7);
         assert_eq!(task.generation.load(Ordering::Relaxed), 42);
         assert_eq!(task.file_table.load(Ordering::Relaxed), 100);
 
         task.clear();
+        assert_eq!(task.task_id.load(Ordering::Relaxed), 0);
         assert_eq!(task.generation.load(Ordering::Relaxed), 0);
         assert_eq!(task.file_table.load(Ordering::Relaxed), 0);
     }
@@ -648,13 +686,13 @@ mod tests {
         let slots = [const { FdMapSlot::new() }; FD_MAP_CAPACITY];
         assert_eq!(fd_map_lookup(&slots, 10, 3), None);
 
-        slots[0].set(10, 3, 1);
-        slots[1].set(10, 4, 2);
-        slots[2].set(20, 3, 3);
+        slots[0].set(10, 3, 1, 101);
+        slots[1].set(10, 4, 2, 102);
+        slots[2].set(20, 3, 3, 103);
 
-        assert_eq!(fd_map_lookup(&slots, 10, 3), Some(1));
-        assert_eq!(fd_map_lookup(&slots, 10, 4), Some(2));
-        assert_eq!(fd_map_lookup(&slots, 20, 3), Some(3));
+        assert_eq!(fd_map_lookup(&slots, 10, 3), Some((1, 0)));
+        assert_eq!(fd_map_lookup(&slots, 10, 4), Some((2, 1)));
+        assert_eq!(fd_map_lookup(&slots, 20, 3), Some((3, 2)));
         assert_eq!(fd_map_lookup(&slots, 10, 5), None);
         assert_eq!(fd_map_lookup(&slots, 30, 3), None);
 
@@ -673,22 +711,27 @@ mod tests {
     #[test]
     fn test_pending_host_work_helpers() {
         extern crate std;
-        let mut arena = std::vec![0u8; EL1_CURRENT_TASKS_OFFSET as usize + 256 * 32];
+        let mut arena = std::vec![0u8; EL1_CURRENT_TASKS_OFFSET as usize + 256 * 64];
         let ptr = arena.as_mut_ptr() as usize;
         record_el1_region_host_ptr(ptr);
         assert_eq!(get_el1_region_host_ptr(), ptr);
 
         mark_pending_host_work(5);
         let task_5 =
-            unsafe { &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 5 * 32) as *const CurrentTask) };
+            unsafe { &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 5 * 64) as *const CurrentTask) };
         assert!(task_5.has_pending_host_work());
 
         clear_pending_host_work(5);
         assert!(!task_5.has_pending_host_work());
 
-        task_5.generation.store(42, Ordering::Relaxed);
+        let task_6 =
+            unsafe { &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 6 * 64) as *const CurrentTask) };
+        task_6.task_id.store(43, Ordering::Relaxed);
+
+        task_5.task_id.store(42, Ordering::Relaxed);
         mark_pending_host_work_for_task(42);
         assert!(task_5.has_pending_host_work());
+        assert!(!task_6.has_pending_host_work()); // sibling task remains untouched
 
         task_5.served_with_work.store(1, Ordering::Relaxed);
         assert!(take_served_with_work(5));

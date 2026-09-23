@@ -1456,8 +1456,12 @@ where
         };
 
         let (syscall, prepared_outcome) = if served_with_work {
+            let mut original_args = request.args;
+            if let Some(slot) = engine.mailbox_slot() {
+                original_args.0[0] = carrick_kernel::el1_delegation::get_orig_arg0(slot);
+            }
             let syscall = PreparedSyscall {
-                original_args: request.args,
+                original_args,
                 request,
             };
             (

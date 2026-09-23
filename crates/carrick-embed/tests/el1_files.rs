@@ -180,3 +180,63 @@ fn el1_files_signal_stress() {
         );
     }
 }
+
+/// B1 test: serving thread blocks (nanosleep 10 ms) between batches and
+/// served[64] keeps growing afterwards (would fail if generation was tied to task scheduling generation).
+#[test]
+fn el1_files_blocking_survives_task_reschedule() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+
+    for iteration in 1..=20 {
+        let watchdog = Watchdog::start(std::time::Duration::from_secs(30));
+        let result = common::run_or_fail(
+            ContainerBuilder::from_image(common::SMOKE_IMAGE)
+                .pull_policy(PullPolicy::Missing)
+                .command([
+                    "/usr/bin/perl",
+                    "-e",
+                    r#"
+open(my $fh, "+>", "/tmp/blocking_test.txt") or die "open: $!";
+syswrite($fh, "x") or die "warmup write: $!";
+sysseek($fh, 0, 0) or die "warmup seek: $!";
+
+# Batch 1
+for (my $i = 0; $i < 500; $i++) {
+    syswrite($fh, "x") or die "write 1: $!";
+    sysseek($fh, 0, 0) or die "seek 1: $!";
+}
+
+# Block / sleep to force task switch-out and bump task scheduling generation
+select(undef, undef, undef, 0.01); # 10 ms sleep
+
+# Batch 2
+for (my $i = 0; $i < 500; $i++) {
+    syswrite($fh, "x") or die "write 2: $!";
+    sysseek($fh, 0, 0) or die "seek 2: $!";
+}
+
+close($fh);
+print "blocking_ok\n";
+"#,
+                ])
+                .run_blocking(),
+        );
+        watchdog.disarm();
+
+        assert!(
+            result.success(),
+            "iteration {iteration} failed with exit_code={}, stderr: {}",
+            result.exit_code,
+            result.stderr_utf8()
+        );
+        assert_eq!(result.stdout_utf8().trim(), "blocking_ok");
+
+        let counters = read_el1_counters().expect("EL1 counters should be populated");
+        let served_writes = counters.served[64].load(Ordering::Relaxed);
+        assert!(
+            served_writes >= 950,
+            "iteration {iteration}: expected at least 950 writes served at EL1 across sleep boundary, got {served_writes}"
+        );
+    }
+}
