@@ -186,11 +186,54 @@ pub(crate) fn read_host_pipe_into(
         );
     }
     if n_usize > 0 && memory.write_bytes(guest_addr, &buf[..n_usize]).is_err() {
-        return Ok(DispatchOutcome::Errno {
-            errno: LINUX_EFAULT,
-        });
+        // Linux advances a regular file's offset only by the bytes it
+        // delivered to user memory: a destination the guest cannot write
+        // yields EFAULT with the offset untouched, and a fault part-way
+        // through yields the delivered prefix (faults are page-granular).
+        // The host `read` already consumed `n` bytes, so deliver what the
+        // destination can take and hand the rest back to the host offset.
+        let delivered = deliver_writable_prefix(memory, guest_addr, &buf[..n_usize]);
+        if offset.is_none() {
+            let undelivered = n_usize - delivered;
+            // A pipe, socket or tty cannot give bytes back (ESPIPE); those
+            // stay consumed, which is the documented residual of this path.
+            // SAFETY: plain lseek on a host fd this dispatch owns for the call.
+            let _ = unsafe { libc::lseek(host_fd, -(undelivered as libc::off_t), libc::SEEK_CUR) };
+        }
+        if delivered == 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
+        return Ok(DispatchOutcome::returned_len_or_errno(delivered));
     }
     Ok(DispatchOutcome::returned_isize_or_errno(n))
+}
+
+/// Copy `bytes` to `guest_addr` one guest page at a time and stop at the
+/// first page the destination refuses; returns the bytes delivered. Only the
+/// slow path after a whole-range copy failed pays this, so it never adds
+/// work to a read that lands in full.
+fn deliver_writable_prefix(
+    memory: &mut impl CurrentMmMemory,
+    guest_addr: u64,
+    bytes: &[u8],
+) -> usize {
+    const PAGE: u64 = 4096;
+    let mut delivered = 0usize;
+    while delivered < bytes.len() {
+        let cursor = guest_addr + delivered as u64;
+        let page_end = (cursor & !(PAGE - 1)) + PAGE;
+        let chunk = ((page_end - cursor) as usize).min(bytes.len() - delivered);
+        if memory
+            .write_bytes(cursor, &bytes[delivered..delivered + chunk])
+            .is_err()
+        {
+            break;
+        }
+        delivered += chunk;
+    }
+    delivered
 }
 
 pub(crate) fn read_host_pipe_at(
