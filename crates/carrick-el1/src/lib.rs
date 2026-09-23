@@ -140,14 +140,15 @@ where
     }
     // Re-validate fd_map slot and object incarnation after taking the lock
     let map_slot = fd_map.get(slot_idx)?;
-    let slot_handle = map_slot.handle.load(Ordering::Acquire);
+    let slot_incarnation = map_slot.incarnation.load(Ordering::Acquire);
+    let slot_handle = map_slot.handle.load(Ordering::Relaxed);
     let slot_fd = map_slot.fd.load(Ordering::Relaxed);
     let slot_file_table = map_slot.file_table.load(Ordering::Relaxed);
-    let slot_incarnation = map_slot.incarnation.load(Ordering::Relaxed);
     let file_incarnation = file.generation.load(Ordering::Acquire);
     let file_state = file.state.load(Ordering::Acquire);
 
-    if slot_handle != handle
+    if slot_incarnation == 0
+        || slot_handle != handle
         || slot_fd != fd as u32
         || slot_file_table != file_table
         || slot_incarnation != file_incarnation

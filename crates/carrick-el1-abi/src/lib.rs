@@ -371,18 +371,18 @@ impl FdMapSlot {
 
     #[inline]
     pub fn clear(&self) {
-        self.handle.store(0, Ordering::Release);
-        self.incarnation.store(0, Ordering::Relaxed);
+        self.incarnation.store(0, Ordering::Release);
+        self.handle.store(0, Ordering::Relaxed);
         self.fd.store(0, Ordering::Relaxed);
-        self.file_table.store(0, Ordering::Release);
+        self.file_table.store(0, Ordering::Relaxed);
     }
 
     #[inline]
     pub fn set(&self, file_table: u64, fd: u32, handle: u32, incarnation: u64) {
         self.file_table.store(file_table, Ordering::Relaxed);
         self.fd.store(fd, Ordering::Relaxed);
-        self.incarnation.store(incarnation, Ordering::Relaxed);
-        self.handle.store(handle, Ordering::Release);
+        self.handle.store(handle, Ordering::Relaxed);
+        self.incarnation.store(incarnation, Ordering::Release);
     }
 }
 
@@ -399,12 +399,15 @@ pub fn fd_map_lookup(map: &[FdMapSlot], file_table: u64, fd: i32) -> Option<(u32
     }
     let ufd = fd as u32;
     for (idx, slot) in map.iter().take(FD_MAP_CAPACITY).enumerate() {
-        let h = slot.handle.load(Ordering::Acquire);
-        if h != 0
+        let inc = slot.incarnation.load(Ordering::Acquire);
+        if inc != 0
             && slot.fd.load(Ordering::Relaxed) == ufd
             && slot.file_table.load(Ordering::Relaxed) == file_table
         {
-            return Some((h, idx));
+            let h = slot.handle.load(Ordering::Relaxed);
+            if h != 0 {
+                return Some((h, idx));
+            }
         }
     }
     None
