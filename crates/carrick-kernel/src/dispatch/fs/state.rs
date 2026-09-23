@@ -201,9 +201,7 @@ pub(crate) struct FsState {
     /// physical extent for a small write, so its SEEK_DATA/SEEK_HOLE answers
     /// cannot describe the sparse layout Linux callers created. Key by host
     /// object identity so dup/open/fork aliases observe one layout.
-    host_sparse_extents:
-        std::sync::Arc<parking_lot::Mutex<HashMap<HostFileIdentity, HostSparseExtents>>>,
-    has_sparse_extents: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) host_sparse_extents: HostSparseExtentsRegistry,
     #[cfg(test)]
     pub(crate) before_host_write_test_hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
@@ -663,8 +661,7 @@ impl FsState {
             resolve_cache: carrick_vfs::fs_resolve_cache::ResolveCache::new(),
             hvpatch_exec_cache: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             classic_record_locks: std::sync::Arc::new(super::LogicalRecordLocks::default()),
-            host_sparse_extents: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            has_sparse_extents: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            host_sparse_extents: HostSparseExtentsRegistry::new(),
             #[cfg(test)]
             before_host_write_test_hook: None,
         }
@@ -686,41 +683,25 @@ impl FsState {
             resolve_cache: carrick_vfs::fs_resolve_cache::ResolveCache::new(),
             hvpatch_exec_cache: std::sync::Arc::clone(&self.hvpatch_exec_cache),
             classic_record_locks: std::sync::Arc::clone(&self.classic_record_locks),
-            host_sparse_extents: std::sync::Arc::clone(&self.host_sparse_extents),
-            has_sparse_extents: std::sync::Arc::clone(&self.has_sparse_extents),
+            host_sparse_extents: self.host_sparse_extents.clone(),
             #[cfg(test)]
             before_host_write_test_hook: self.before_host_write_test_hook.clone(),
         }
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub(in crate::dispatch) fn has_host_sparse_extents(&self) -> bool {
-        self.has_sparse_extents
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.host_sparse_extents.has_host_sparse_extents()
     }
 
     pub(in crate::dispatch) fn reset_host_sparse_extents(&self, fd: i32, len: u64) {
-        if let Some(identity) = host_file_identity(fd) {
-            self.has_sparse_extents
-                .store(true, std::sync::atomic::Ordering::Release);
-            self.host_sparse_extents
-                .lock()
-                .insert(identity, HostSparseExtents::empty(len));
-        }
+        self.host_sparse_extents.reset_host_sparse_extents(fd, len);
     }
 
     pub(in crate::dispatch) fn truncate_host_sparse_extents(&self, fd: i32, len: u64) {
-        let Some(identity) = host_file_identity(fd) else {
-            return;
-        };
-        let mut files = self.host_sparse_extents.lock();
-        if len == 0 {
-            self.has_sparse_extents
-                .store(true, std::sync::atomic::Ordering::Release);
-            files.insert(identity, HostSparseExtents::empty(0));
-        } else if let Some(extents) = files.get_mut(&identity) {
-            extents.truncate(len);
-        }
+        self.host_sparse_extents
+            .truncate_host_sparse_extents(fd, len);
     }
 
     pub(in crate::dispatch) fn record_host_sparse_write(
@@ -729,15 +710,76 @@ impl FsState {
         offset: u64,
         len: usize,
     ) {
+        self.host_sparse_extents
+            .record_host_sparse_write(fd, offset, len);
+    }
+
+    pub(in crate::dispatch) fn seek_host_sparse_extents(
+        &self,
+        fd: i32,
+        offset: u64,
+        data: bool,
+    ) -> Option<Option<u64>> {
+        self.host_sparse_extents
+            .seek_host_sparse_extents(fd, offset, data)
+    }
+
+    pub(crate) fn host_sparse_extents_registry(&self) -> &HostSparseExtentsRegistry {
+        &self.host_sparse_extents
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct HostSparseExtentsRegistry {
+    extents: std::sync::Arc<parking_lot::Mutex<HashMap<HostFileIdentity, HostSparseExtents>>>,
+    has_sparse: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HostSparseExtentsRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            extents: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            has_sparse: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn has_host_sparse_extents(&self) -> bool {
+        self.has_sparse.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn reset_host_sparse_extents(&self, fd: i32, len: u64) {
+        if let Some(identity) = host_file_identity(fd) {
+            self.has_sparse
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.extents
+                .lock()
+                .insert(identity, HostSparseExtents::empty(len));
+        }
+    }
+
+    pub(crate) fn truncate_host_sparse_extents(&self, fd: i32, len: u64) {
+        let Some(identity) = host_file_identity(fd) else {
+            return;
+        };
+        let mut files = self.extents.lock();
+        if len == 0 {
+            self.has_sparse
+                .store(true, std::sync::atomic::Ordering::Release);
+            files.insert(identity, HostSparseExtents::empty(0));
+        } else if let Some(extents) = files.get_mut(&identity) {
+            extents.truncate(len);
+        }
+    }
+
+    pub(crate) fn record_host_sparse_write(&self, fd: &HostFdRef, offset: u64, len: usize) {
         if !self.has_host_sparse_extents() {
             return;
         }
-        let mut extents = self.host_sparse_extents.lock();
+        let mut extents = self.extents.lock();
         if extents.is_empty() {
             return;
         }
-        // The owned descriptor pins dev/ino across aliasing and unlink. Cache
-        // only that immutable identity; extent contents remain live below.
         let Some(identity) = fd.inode_identity() else {
             return;
         };
@@ -750,10 +792,23 @@ impl FsState {
         }
     }
 
-    /// `None` means the file predates Carrick's sparse metadata and must use
-    /// the host answer. `Some(None)` is Linux ENXIO; `Some(Some(offset))` is a
-    /// tracked Linux-visible extent boundary.
-    pub(in crate::dispatch) fn seek_host_sparse_extents(
+    pub(crate) fn record_host_sparse_write_raw(&self, fd: i32, offset: u64, len: usize) {
+        if !self.has_host_sparse_extents() {
+            return;
+        }
+        let mut extents = self.extents.lock();
+        if extents.is_empty() {
+            return;
+        }
+        let Some(identity) = host_file_identity(fd) else {
+            return;
+        };
+        if let Some(extents) = extents.get_mut(&identity) {
+            extents.record_write(offset, len as u64);
+        }
+    }
+
+    pub(crate) fn seek_host_sparse_extents(
         &self,
         fd: i32,
         offset: u64,
@@ -762,7 +817,7 @@ impl FsState {
         if !self.has_host_sparse_extents() {
             return None;
         }
-        let extents = self.host_sparse_extents.lock();
+        let extents = self.extents.lock();
         if extents.is_empty() {
             return None;
         }
