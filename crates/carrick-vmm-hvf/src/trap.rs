@@ -7477,6 +7477,15 @@ impl HvfInner {
                     spsr_el1,
                 });
             }
+            if is_aarch64_hvc_kick(exception.syndrome) {
+                vcpu.set_pending_interrupt(InterruptType::IRQ, false)
+                    .map_err(hvf_error)?;
+                let elr = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
+                let spsr = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
+                vcpu.set_reg(Reg::PC, elr).map_err(hvf_error)?;
+                vcpu.set_reg(Reg::CPSR, spsr).map_err(hvf_error)?;
+                return Ok(Aarch64Exit::Kicked);
+            }
             if !is_aarch64_syscall_exception(exception.syndrome) {
                 return Err(TrapError::UnexpectedException {
                     syndrome: exception.syndrome,
@@ -7489,15 +7498,6 @@ impl HvfInner {
             // to see what actually trapped to EL1; if it's not an SVC, either
             // emulate it (sys64 MRS read → re-run) or surface it as an EL0Fault.
             if is_aarch64_hvc_exception(exception.syndrome) {
-                if is_aarch64_hvc_kick(exception.syndrome) {
-                    vcpu.set_pending_interrupt(InterruptType::IRQ, false)
-                        .map_err(hvf_error)?;
-                    let elr = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
-                    let spsr = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
-                    vcpu.set_reg(Reg::PC, elr).map_err(hvf_error)?;
-                    vcpu.set_reg(Reg::CPSR, spsr).map_err(hvf_error)?;
-                    return Ok(Aarch64Exit::Kicked);
-                }
                 let mut overhead = SyscallTransportOverhead::default();
                 match decode_hvc_syscall_exit(exception.syndrome, vcpu, mailbox, &mut overhead)? {
                     HvcExitOutcome::Syscall(exit) => {
@@ -7880,5 +7880,12 @@ mod el1_resume_tests {
         // Stepping to a new PC resets the count to 1
         simulate_resume(0x2000, &mut last_pc, &mut consecutive_without_progress);
         assert_eq!(consecutive_without_progress, 1);
+    }
+
+    #[test]
+    fn test_hvc_kick_syndrome_ordering() {
+        let kick_syndrome = (0x16 << 26) | carrick_hal::AARCH64_HVC_KICK_IMM;
+        assert!(carrick_hal::is_aarch64_hvc_kick(kick_syndrome));
+        assert!(!carrick_hal::is_aarch64_syscall_exception(kick_syndrome));
     }
 }
